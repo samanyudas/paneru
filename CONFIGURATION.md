@@ -9,6 +9,9 @@ order):
 3.  `$HOME/.paneru.toml`
 4.  `$XDG_CONFIG_HOME/paneru/paneru.toml`
 
+A path in `$PANERU_CONFIG` is final. When that file is missing, Paneru creates
+the default configuration there instead of searching the other locations.
+
 The configuration is automatically reloaded when the file is saved.
 
 If an `init.lua` exists (see [Lua Scripting Guide](./SCRIPTING.md)), it takes over
@@ -120,6 +123,7 @@ Basic settings for the menubar display.
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `visible` | Boolean | `true` | Shows the Paneru menubar item. An app that embeds Paneru and has its own menubar item sets `false`. |
 | `orientation` | String | `'default'` | Which of the menubar elements appears first, the descriptor `'default'` or the indicator `'flipped'`. |
 | `colors` | [String] | `['#FFFFFF']` | An array of hex colors defining a linear gradient (left to right) coloring the menubar display. Set a solid color by including only one element. |
 | `angle` | Float | `90.0` | The angle (in degrees) of the gradient. |
