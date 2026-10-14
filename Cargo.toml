@@ -36,6 +36,8 @@ pedantic = "warn"
 #   cargo build --release --lib --no-default-features --features module,lua54
 [features]
 default = ["lua", "vendored"]
+# Embeds the Miri development build identity instead of the release identity.
+miri-developer = []
 vendored = ["mlua/vendored"]
 module = ["lua-base", "mlua/module"]
 lua = [

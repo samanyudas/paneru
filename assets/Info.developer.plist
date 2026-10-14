@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.samanyudas.miri.dev.engine</string>
+    <key>CFBundleName</key>
+    <string>Miri Developer Engine</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.5.2</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright (c) 2025 Karinushka@github. All rights reserved.</string>
+  </dict>
+</plist>

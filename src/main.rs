@@ -32,7 +32,12 @@ pub use paneru::types;
 #[cfg(test)]
 mod tests;
 
+// Miri development builds carry a separate identity, so macOS keeps their
+// Accessibility grant apart from an installed release.
+#[cfg(not(feature = "miri-developer"))]
 embed_plist::embed_info_plist!("../assets/Info.plist");
+#[cfg(feature = "miri-developer")]
+embed_plist::embed_info_plist!("../assets/Info.developer.plist");
 
 use events::{Event, EventSender};
 
