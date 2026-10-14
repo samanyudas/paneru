@@ -20,6 +20,7 @@ mod events;
 mod lua;
 mod manager;
 mod menubar;
+mod miri_ax_probe;
 mod overlay;
 mod pasteboard;
 mod platform;
@@ -183,6 +184,9 @@ pub enum QueryCmd {
 ///
 /// `Ok(())` if the application runs successfully, otherwise `Err(Error)`.
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("miri-ax-probe") {
+        return miri_ax_probe::run();
+    }
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(
