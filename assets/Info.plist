@@ -3,7 +3,9 @@
 <plist version="1.0">
   <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.github.karinushka.paneru</string>
+    <string>io.github.samanyudas.miri.engine</string>
+    <key>CFBundleName</key>
+    <string>Miri Engine</string>
     <key>CFBundleShortVersionString</key>
     <string>0.5.2</string>
     <key>CFBundlePackageType</key>
