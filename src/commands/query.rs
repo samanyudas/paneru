@@ -549,7 +549,7 @@ mod tests {
             StateBroadcastSignals::default(),
         );
 
-        assert!(duplicate.is_empty());
+        assert!(duplicate.is_empty(), "{duplicate:?}");
     }
 
     #[test]
@@ -591,7 +591,7 @@ mod tests {
         let duplicate =
             collect_state_broadcast_events(events.iter(), &state, &mut cache, |_| None, signals);
 
-        assert!(duplicate.is_empty());
+        assert!(duplicate.is_empty(), "{duplicate:?}");
 
         let changed_state = query_state_with_active_window(
             26_261,
@@ -658,7 +658,7 @@ mod tests {
             |_| None,
             StateBroadcastSignals::default(),
         );
-        assert!(repeat.is_empty());
+        assert!(repeat.is_empty(), "{repeat:?}");
     }
 
     #[test]
