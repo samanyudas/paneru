@@ -3,7 +3,7 @@ use std::time::Duration;
 use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
 
-use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
+use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation, Side};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::{DockPosition, Timeout};
@@ -720,7 +720,7 @@ fn test_vertical_swap_within_stack_stays_on_display() {
             command: Command::Window(Operation::Focus(Direction::Last)),
         },
         Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+            command: Command::Window(Operation::Stack(Side::West)),
         },
         Event::Command {
             command: Command::Window(Operation::Focus(Direction::North)),
@@ -782,7 +782,7 @@ fn test_hidden_stack_stays_off_the_display_below() {
             command: Command::Window(Operation::Focus(Direction::Last)),
         },
         Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+            command: Command::Window(Operation::Stack(Side::West)),
         },
         Event::Command {
             command: Command::Window(Operation::VirtualNumber(1)),

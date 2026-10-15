@@ -31,7 +31,7 @@ use crate::platform::WorkspaceId;
 use crate::util::round_px;
 
 pub use crate::types::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
+    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, Side,
 };
 
 /// The strips that are selected on their display but not the one on screen —
@@ -979,7 +979,7 @@ fn full_width_window(
             .and_then(|idx| strip.get(idx).ok())
             .is_some_and(|col| matches!(col, Column::Stack(_)))
         {
-            _ = strip.unstack(entity);
+            _ = strip.unstack(entity, Side::East);
         }
         let width_ratio = windows.width_ratio(entity).unwrap_or(0.5);
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -1426,9 +1426,11 @@ pub fn stack_windows_handler(
     // config: Res<Config>,
     mut commands: Commands,
 ) {
-    let Some(Operation::Stack(stack)) =
-        filter_window_operations(&mut messages, |op| matches!(op, Operation::Stack(_))).next()
-    else {
+    let Some(operation) = filter_window_operations(&mut messages, |op| {
+        matches!(op, Operation::Stack(_) | Operation::Unstack(_))
+    })
+    .next()
+    .cloned() else {
         return;
     };
 
@@ -1443,14 +1445,14 @@ pub fn stack_windows_handler(
             entity_commands.try_remove::<FullWidthMarker>();
         }
         let strip = active_display.active_strip();
-        if *stack {
-            _ = strip.stack(entity);
-        } else {
-            _ = strip.unstack(entity);
-        }
+        _ = match operation {
+            Operation::Stack(side) => strip.stack(entity, side),
+            Operation::Unstack(side) => strip.unstack(entity, side),
+            _ => Ok(()),
+        };
 
         // Stacking/unstacking moves the focused window to a new column slot
-        // (onto the left master, or out to its own column on the right).
+        // (into a neighbouring column, or out to its own column).
         // Reshuffle around it so it is brought fully back into view; the
         // edge-clamp in reshuffle_layout_strip keeps the strip pinned so the
         // leftmost window touches the left edge and the rightmost the right.
@@ -1651,7 +1653,7 @@ mod tests {
         strip.append(entities[1]);
         strip.append(entities[2]);
         strip.append(entities[3]);
-        strip.stack(entities[1]).unwrap(); // Stack e1 onto e0
+        strip.stack(entities[1], Side::West).unwrap(); // Stack e1 onto e0
 
         (world, strip, entities)
     }
@@ -1708,8 +1710,8 @@ mod tests {
         strip.append(entities[1]);
         strip.append(entities[2]);
         strip.append(entities[3]);
-        strip.stack(entities[1]).unwrap(); // Stack e1 onto e0: [Stack(e0, e1), e2, e3]
-        strip.stack(entities[3]).unwrap(); // Stack e3 onto e2: [Stack(e0, e1), Stack(e2, e3)]
+        strip.stack(entities[1], Side::West).unwrap(); // Stack e1 onto e0: [Stack(e0, e1), e2, e3]
+        strip.stack(entities[3], Side::West).unwrap(); // Stack e3 onto e2: [Stack(e0, e1), Stack(e2, e3)]
 
         let east = Direction::East;
         let west = Direction::West;

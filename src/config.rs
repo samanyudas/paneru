@@ -23,7 +23,7 @@ use self::decorations::{
 use self::swipe::SwipeGestureDirection;
 
 #[cfg(test)]
-use crate::commands::{MoveFocus, Operation, ResizeDirection};
+use crate::commands::{MoveFocus, Operation, ResizeDirection, Side};
 use crate::{
     commands::Command,
     manager::ProcessApi,
@@ -42,6 +42,8 @@ pub mod swipe;
 
 /// A `LazyLock` that determines the path to the application's configuration file.
 /// It checks the `PANERU_CONFIG` environment variable first, then standard XDG locations and user home directory.
+/// A path in `PANERU_CONFIG` is final: when that file is missing, the default
+/// configuration is created there instead of searching the other locations.
 /// If no configuration file is found, a minimal one is created in the user's
 /// XDG configuration directory so a fresh app installation can start with the
 /// built-in defaults.
@@ -57,6 +59,18 @@ pub static CONFIGURATION_FILE: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
             script.display()
         );
         return None;
+    }
+    if let Some(path) = explicit_configuration_file() {
+        if create_configuration_file_at(&path).unwrap_or_else(|error| {
+            panic!(
+                "{}: Unable to create {}: {error}",
+                function_name!(),
+                path.display()
+            )
+        }) {
+            info!("Created default configuration at {}", path.display());
+        }
+        return Some(path);
     }
     if let Some(path) = discover_configuration_file() {
         return Some(path);
@@ -109,19 +123,30 @@ fn create_configuration_file_at(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// The path in `PANERU_CONFIG`, when it is set and not empty.
+fn explicit_configuration_file() -> Option<PathBuf> {
+    explicit_configuration_path(env::var_os("PANERU_CONFIG"))
+}
+
+fn explicit_configuration_path(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|path| !path.is_empty()).map(PathBuf::from)
+}
+
 /// Finds the first existing configuration file from supported locations.
 /// Unlike [`CONFIGURATION_FILE`], this does not panic when no file is found.
+/// A path in `PANERU_CONFIG` is final: when that file is missing, this returns
+/// `None` rather than a file from another location.
 pub fn discover_configuration_file() -> Option<PathBuf> {
-    if let Ok(path_str) = env::var("PANERU_CONFIG") {
-        let path = PathBuf::from(path_str);
+    if let Some(path) = explicit_configuration_file() {
         if path.exists() {
             return Some(path);
         }
         warn!(
-            "{}: $PANERU_CONFIG is set to {}, but the file does not exist. Falling back to default locations.",
+            "{}: $PANERU_CONFIG is set to {}, but the file does not exist.",
             function_name!(),
             path.display()
         );
+        return None;
     }
 
     let standard_paths = [
@@ -870,6 +895,15 @@ impl Config {
             .create_virtual_workspace_automatically
             .is_some_and(|enabled| enabled)
     }
+    pub fn menubar_visible(&self) -> bool {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.visible)
+            .unwrap_or(true)
+    }
+
     pub fn menubar_orientation(&self) -> MenubarOrientation {
         self.inner()
             .decorations
@@ -2077,32 +2111,32 @@ index = 1
     let keycode = find_key('s');
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::CTRL),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Command::Window(Operation::Stack(Side::West)))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::LCTRL),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Command::Window(Operation::Stack(Side::West)))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::RCTRL),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Command::Window(Operation::Stack(Side::West)))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::ALT),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Command::Window(Operation::Stack(Side::West)))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::LALT),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Command::Window(Operation::Stack(Side::West)))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::RALT),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Command::Window(Operation::Stack(Side::West)))
     ));
 
     let keycode = find_key('d');
@@ -2169,6 +2203,45 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
             MoveFocus::Stay
         )))
     ));
+}
+
+#[test]
+fn test_config_parsing_stack_bindings() {
+    let input = r#"
+[options]
+
+[bindings]
+window_stack = "alt - 1"
+window_stack_west = "alt - 2"
+window_stack_east = "alt - 3"
+window_unstack = "alt - 4"
+window_unstack_east = "alt - 5"
+window_unstack_west = "alt - 6"
+"#;
+    let virtual_keys = test_virtual_keymap();
+    let config = Config {
+        inner: Arc::new(ArcSwap::from_pointee(
+            InnerConfig::parse_config_with_virtual_keys(input, &virtual_keys)
+                .expect("Failed to parse config"),
+        )),
+    };
+    let bound = |key: char| {
+        let keycode = virtual_keycode()
+            .find_map(|(s, v)| (format!("{key}") == *s).then_some(*v))
+            .unwrap();
+        config.find_keybind(keycode, Modifiers::ALT)
+    };
+    let expected = [
+        ('1', Operation::Stack(Side::West)),
+        ('2', Operation::Stack(Side::West)),
+        ('3', Operation::Stack(Side::East)),
+        ('4', Operation::Unstack(Side::East)),
+        ('5', Operation::Unstack(Side::East)),
+        ('6', Operation::Unstack(Side::West)),
+    ];
+    for (key, operation) in expected {
+        assert_eq!(bound(key), Some(Command::Window(operation)), "alt - {key}");
+    }
 }
 
 #[test]
@@ -2580,4 +2653,37 @@ mod lua_setup_tests {
         let lua = Lua::new();
         assert!(config_from_lua(&lua, mlua::Value::Integer(3)).is_err());
     }
+}
+
+#[test]
+fn menubar_visibility_defaults_to_shown_and_can_be_turned_off() {
+    let shown = Config::try_from("").expect("an empty config parses");
+    assert!(shown.menubar_visible());
+    let hidden =
+        Config::try_from("[decorations.menu]\nvisible = false\n").expect("the menu config parses");
+    assert!(!hidden.menubar_visible());
+}
+
+#[test]
+fn an_explicit_configuration_path_is_used_only_when_not_empty() {
+    assert_eq!(explicit_configuration_path(None), None);
+    assert_eq!(explicit_configuration_path(Some("".into())), None);
+    assert_eq!(
+        explicit_configuration_path(Some("/tmp/miri/config.toml".into())),
+        Some(PathBuf::from("/tmp/miri/config.toml"))
+    );
+}
+
+#[test]
+fn a_missing_explicit_configuration_is_created_at_that_path() {
+    let directory = std::env::temp_dir().join(format!("paneru-explicit-{}", std::process::id()));
+    let path = directory.join("nested").join("config.toml");
+    let _ = std::fs::remove_dir_all(&directory);
+    assert!(create_configuration_file_at(&path).expect("the file is created"));
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the file is readable"),
+        DEFAULT_CONFIGURATION
+    );
+    assert!(!create_configuration_file_at(&path).expect("an existing file is kept"));
+    let _ = std::fs::remove_dir_all(&directory);
 }

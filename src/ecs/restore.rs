@@ -23,6 +23,7 @@ use crate::ecs::{
 };
 use crate::manager::{Application, Display, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
+use crate::types::commands::Side;
 
 #[derive(Debug, Resource)]
 pub(crate) struct SessionRestore {
@@ -712,7 +713,7 @@ fn append_stack(strip: &mut LayoutStrip, items: &[PlannedStackItem]) {
         if first {
             first = false;
         } else {
-            _ = strip.stack(leader);
+            _ = strip.stack(leader, Side::West);
         }
     }
 }

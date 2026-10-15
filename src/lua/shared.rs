@@ -54,7 +54,7 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::types::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, parse_command,
+    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, Side, parse_command,
 };
 
 /// Issues a [`Command`]. The only thing the two hosts differ by.
@@ -182,8 +182,10 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
         ("manage", Operation::Manage),
         ("equalize", Operation::Equalize),
         ("balance", Operation::Balance),
-        ("stack", Operation::Stack(true)),
-        ("unstack", Operation::Stack(false)),
+        ("stack", Operation::Stack(Side::West)),
+        ("stack_east", Operation::Stack(Side::East)),
+        ("unstack", Operation::Unstack(Side::East)),
+        ("unstack_west", Operation::Unstack(Side::West)),
         ("full_width", Operation::FullWidth),
         ("grow", Operation::Resize(ResizeDirection::Grow)),
         ("shrink", Operation::Resize(ResizeDirection::Shrink)),
@@ -475,6 +477,27 @@ mod tests {
                 Command::Window(Operation::Focus(Direction::Nth(2))),
                 Command::Window(Operation::Balance),
                 Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+            ])
+        );
+    }
+
+    #[test]
+    fn stack_verbs_reach_both_sides() {
+        let commands = run(r"
+            paneru.window.stack()
+            paneru.window.stack_east()
+            paneru.window.unstack()
+            paneru.window.unstack_west()
+        ")
+        .unwrap();
+
+        assert_eq!(
+            debug(&commands),
+            debug(&[
+                Command::Window(Operation::Stack(Side::West)),
+                Command::Window(Operation::Stack(Side::East)),
+                Command::Window(Operation::Unstack(Side::East)),
+                Command::Window(Operation::Unstack(Side::West)),
             ])
         );
     }

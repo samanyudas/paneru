@@ -8,7 +8,7 @@ use bevy::prelude::*;
 
 use crate::assert_focused;
 use crate::assert_window_size;
-use crate::commands::{Command, Direction, Operation};
+use crate::commands::{Command, Direction, Operation, Side};
 use crate::ecs::layout::LayoutStrip;
 use crate::events::Event;
 
@@ -32,13 +32,13 @@ fn stack_first_three(commands: &mut Vec<Event>) {
             command: Command::Window(Operation::Focus(Direction::East)),
         },
         Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+            command: Command::Window(Operation::Stack(Side::West)),
         },
         Event::Command {
             command: Command::Window(Operation::Focus(Direction::East)),
         },
         Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+            command: Command::Window(Operation::Stack(Side::West)),
         },
     ]);
 }
@@ -147,7 +147,7 @@ fn test_close_active_tab_focuses_sibling_not_other_column() {
         command: Command::Window(Operation::Focus(Direction::East)),
     });
     commands.push(Event::Command {
-        command: Command::Window(Operation::Stack(true)),
+        command: Command::Window(Operation::Stack(Side::West)),
     });
     commands.push(Event::Command {
         command: Command::Window(Operation::ToggleTabbedDisplay),

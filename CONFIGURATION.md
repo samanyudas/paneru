@@ -9,6 +9,9 @@ order):
 3.  `$HOME/.paneru.toml`
 4.  `$XDG_CONFIG_HOME/paneru/paneru.toml`
 
+A path in `$PANERU_CONFIG` is final. When that file is missing, Paneru creates
+the default configuration there instead of searching the other locations.
+
 The configuration is automatically reloaded when the file is saved.
 
 If an `init.lua` exists (see [Lua Scripting Guide](./SCRIPTING.md)), it takes over
@@ -120,6 +123,7 @@ Basic settings for the menubar display.
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `visible` | Boolean | `true` | Shows the Paneru menubar item. An app that embeds Paneru and has its own menubar item sets `false`. |
 | `orientation` | String | `'default'` | Which of the menubar elements appears first, the descriptor `'default'` or the indicator `'flipped'`. |
 | `colors` | [String] | `['#FFFFFF']` | An array of hex colors defining a linear gradient (left to right) coloring the menubar display. Set a solid color by including only one element. |
 | `angle` | Float | `90.0` | The angle (in degrees) of the gradient. |
@@ -202,8 +206,10 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_vertical_shrink` | Cycle a stacked window through preset heights (Shrink). |
 | `window_fullwidth` | Toggle full-width mode. |
 | `window_manage` | Toggle between tiled and floating state. |
-| `window_stack` | Stack the current window into the column on the left. |
-| `window_unstack` | Pull a window out of a stack into its own column. |
+| `window_stack` | Alias for `window_stack_west`. |
+| `window_stack_west` / `_east` | Move the current window to the bottom of the column on the left/right. The rest of its old stack stays in place. No-op at the edge of the strip. |
+| `window_unstack` | Alias for `window_unstack_east`. |
+| `window_unstack_east` / `_west` | Pull the current window out of its stack into a new column right/left of the stack. No-op outside a stack. |
 | `window_tabbeddisplay` | Toggle the focused stack between a normal split display and a tabbed display (one window visible at a time, sharing the full column). Cycle tabs with `window_focus_north`/`window_focus_south`. |
 | `window_equalize` | Make all windows in a stack equal height. |
 | `window_balance` | Make all columns in the strip the same width as the focused window. |

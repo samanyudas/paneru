@@ -157,7 +157,9 @@ impl MenuBarManager {
 
         menu.setAutoenablesItems(false);
         status_item.setMenu(Some(&menu));
-        status_item.setVisible(true);
+        // Hidden until `sync_menu_bar_visibility` reads the configuration, so
+        // an app that turns the item off never shows it, even for a frame.
+        status_item.setVisible(false);
 
         Self {
             mtm,
@@ -178,6 +180,7 @@ impl MenuBarManager {
         let mut manager = Self::new(mtm, events);
         manager.rebuild_accessibility_menu();
         manager.show_text("!");
+        manager.status_item.setVisible(true);
         manager
     }
 
@@ -622,6 +625,17 @@ impl MenuBarManager {
 impl Drop for MenuBarManager {
     fn drop(&mut self) {
         self.status_bar.removeStatusItem(&self.status_item);
+    }
+}
+
+/// Shows or hides the menubar item whenever the configuration changes.
+pub fn sync_menu_bar_visibility(config: Res<Config>, menu_bar: Option<NonSendMut<MenuBarManager>>) {
+    let Some(menu_bar) = menu_bar else {
+        return;
+    };
+    let visible = config.menubar_visible();
+    if menu_bar.status_item.isVisible() != visible {
+        menu_bar.status_item.setVisible(visible);
     }
 }
 

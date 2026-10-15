@@ -9,7 +9,7 @@ use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
-use bevy::ecs::schedule::common_conditions::{not, resource_exists};
+use bevy::ecs::schedule::common_conditions::{not, resource_exists, resource_exists_and_changed};
 use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
@@ -203,6 +203,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .chain(),
             crate::menubar::update_menu_bar
                 .run_if(vw_indicator_dirty.or_eager(strip_count_changed)),
+            crate::menubar::sync_menu_bar_visibility.run_if(resource_exists_and_changed::<Config>),
         ),
     );
 }
