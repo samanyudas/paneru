@@ -1243,18 +1243,10 @@ pub(super) fn apply_window_positions(
             continue;
         };
 
-        if crate::ecs::restore::matches_startup_restore_state(
-            window,
-            app,
-            restore.as_deref(),
-            restoration.as_deref(),
-            &ctx.config,
-        ) {
-            continue;
-        }
-
         let properties = WindowProperties::new(app, window, &ctx.config);
 
+        // A floating rule wins over a saved tiled placement, so a rule added
+        // after the session was saved still applies.
         if properties.floating() {
             if let Some(mut strip) = workspaces
                 .iter_mut()
@@ -1266,6 +1258,16 @@ pub(super) fn apply_window_positions(
                 // Avoid managing window if it's floating.
                 entity_commands.try_insert(Unmanaged::Floating);
             }
+            continue;
+        }
+
+        if crate::ecs::restore::matches_startup_restore_state(
+            window,
+            app,
+            restore.as_deref(),
+            restoration.as_deref(),
+            &ctx.config,
+        ) {
             continue;
         }
 
