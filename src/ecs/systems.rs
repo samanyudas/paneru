@@ -1155,16 +1155,18 @@ pub(super) fn commit_window_size(
 
 /// Restores user-visible window state before Paneru shuts down: clears any
 /// brightness dim, removes the dim/border overlay window, and centers every
-/// managed window on the display its frame center falls in.
+/// tiled window on the display its frame center falls in, so none is left
+/// parked off-screen. Floating, minimized, and hidden windows stay where they
+/// are.
 pub(crate) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    mut all_windows: Query<&mut Window>,
+    mut all_windows: Query<(&mut Window, Has<Unmanaged>)>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
 ) {
     for _ in exit_events.read() {
-        let ids = all_windows.iter().map(|w| w.id()).collect::<Vec<_>>();
+        let ids = all_windows.iter().map(|(w, _)| w.id()).collect::<Vec<_>>();
         info!("exit cleanup: restoring {} window(s)", ids.len());
         window_manager.dim_windows(&ids, 0.0);
 
@@ -1177,7 +1179,10 @@ pub(crate) fn cleanup_on_exit(
             return;
         }
 
-        for mut window in &mut all_windows {
+        for (mut window, unmanaged) in &mut all_windows {
+            if unmanaged {
+                continue;
+            }
             let frame = window.frame();
             let center = frame.center();
             let bounds = display_bounds
