@@ -4,7 +4,7 @@ use std::time::Duration;
 use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
 
-use crate::commands::{Command, Direction, MoveFocus, Operation};
+use crate::commands::{Command, Direction, MoveFocus, Operation, Side};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
@@ -1740,7 +1740,7 @@ fn test_snap_strip_marker_forces_snap_for_under_threshold_move() {
 
     pump(&mut h, Command::PrintState);
     pump(&mut h, Command::Window(Operation::Focus(Direction::East)));
-    pump(&mut h, Command::Window(Operation::Stack(true)));
+    pump(&mut h, Command::Window(Operation::Stack(Side::West)));
     // Let the stack's own build-out animation fully settle before
     // perturbing anything, so the "before" position is a true resting
     // state, not a value still mid-transit.
@@ -1833,7 +1833,7 @@ fn test_under_threshold_move_animates_without_snap_strip_marker() {
 
     pump(&mut h, Command::PrintState);
     pump(&mut h, Command::Window(Operation::Focus(Direction::East)));
-    pump(&mut h, Command::Window(Operation::Stack(true)));
+    pump(&mut h, Command::Window(Operation::Stack(Side::West)));
     // Let the stack's own build-out animation fully settle before
     // perturbing anything, so the "before" position is a true resting
     // state, not a value still mid-transit.
@@ -2513,7 +2513,7 @@ fn test_stack_unstack_brings_focused_window_into_view() {
         // Noop to let the scroll settle.
         Event::MenuOpened { window_id: 0 },
         Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+            command: Command::Window(Operation::Stack(Side::West)),
         },
         // Now swipe the stacked windows off screen again.
         Event::Swipe {
@@ -2523,7 +2523,7 @@ fn test_stack_unstack_brings_focused_window_into_view() {
         // Noop to let the scroll settle.
         Event::MenuOpened { window_id: 0 },
         Event::Command {
-            command: Command::Window(Operation::Stack(false)),
+            command: Command::Window(Operation::Unstack(Side::East)),
         },
     ];
 
@@ -3397,4 +3397,61 @@ fn test_virtual_move_number_recreates_missing_baseline_row() {
         vec![true],
         "the moved window should land on a single recreated row 0"
     );
+}
+
+/// The (column, row) slot of each window in the active strip, by window id.
+fn strip_slots(world: &mut World, count: WinID) -> Vec<(usize, usize)> {
+    let entities = (0..count)
+        .map(|id| find_window_entity(id, world))
+        .collect::<Vec<_>>();
+    let mut query = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+    let strip = query.single(world).expect("an active strip");
+    entities
+        .into_iter()
+        .map(|entity| {
+            let column = strip.index_of(entity).expect("window in the strip");
+            let row = strip.get(column).unwrap().position_of(entity).unwrap();
+            (column, row)
+        })
+        .collect()
+}
+
+/// The stack commands move only the focused window, one column per press, and
+/// pop it out on the requested side.
+#[test]
+fn test_stack_commands_move_only_the_focused_window() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(Side::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(Side::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(Side::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Unstack(Side::West)),
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(2, |world, _state| {
+            assert_eq!(strip_slots(world, 3), [(0, 1), (0, 0), (1, 0)]);
+        })
+        .on_iteration(3, |world, _state| {
+            assert_eq!(strip_slots(world, 3), [(1, 1), (0, 0), (1, 0)]);
+        })
+        .on_iteration(4, |world, _state| {
+            assert_eq!(strip_slots(world, 3), [(1, 1), (0, 0), (1, 0)]);
+        })
+        .on_iteration(5, |world, _state| {
+            assert_eq!(strip_slots(world, 3), [(1, 0), (0, 0), (2, 0)]);
+        })
+        .run(commands);
 }

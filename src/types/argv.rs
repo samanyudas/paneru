@@ -5,7 +5,7 @@
 //! together here and are checked against each other by round-trip tests.
 
 use crate::types::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
+    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, Side,
     parse_virtual_workspace_number,
 };
 
@@ -91,8 +91,8 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "manage" => Operation::Manage,
         "equalize" => Operation::Equalize,
         "balance" => Operation::Balance,
-        "stack" => Operation::Stack(true),
-        "unstack" => Operation::Stack(false),
+        "stack" => Operation::Stack(side_or(argv.get(1).copied(), Side::West)?),
+        "unstack" => Operation::Unstack(side_or(argv.get(1).copied(), Side::East)?),
         "tabbeddisplay" => Operation::ToggleTabbedDisplay,
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
@@ -126,6 +126,11 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         ),
         _ => return Err(err()),
     })
+}
+
+/// `stack` and `unstack` keep their original meaning when the side is omitted.
+fn side_or(argument: Option<&str>, default: Side) -> Result<Side> {
+    argument.map_or(Ok(default), Side::parse)
 }
 
 /// Resolves a `virtual*` argument that may be a direction or a 1-based number.
@@ -194,8 +199,8 @@ impl Operation {
             Operation::Equalize => owned(&["equalize"]),
             Operation::Balance => owned(&["balance"]),
             Operation::Manage => owned(&["manage"]),
-            Operation::Stack(true) => owned(&["stack"]),
-            Operation::Stack(false) => owned(&["unstack"]),
+            Operation::Stack(side) => owned(&["stack", side.token()]),
+            Operation::Unstack(side) => owned(&["unstack", side.token()]),
             Operation::ToggleTabbedDisplay => owned(&["tabbeddisplay"]),
             Operation::Snap => owned(&["snap"]),
             Operation::Virtual(direction) => vec!["virtual".to_string(), direction.token()],
@@ -253,8 +258,10 @@ mod tests {
             Operation::Equalize,
             Operation::Balance,
             Operation::Manage,
-            Operation::Stack(true),
-            Operation::Stack(false),
+            Operation::Stack(Side::West),
+            Operation::Stack(Side::East),
+            Operation::Unstack(Side::West),
+            Operation::Unstack(Side::East),
             Operation::ToggleTabbedDisplay,
             Operation::Snap,
             Operation::Virtual(Direction::First),
@@ -314,9 +321,23 @@ mod tests {
     }
 
     #[test]
+    fn stacking_without_a_side_keeps_its_original_direction() {
+        assert_eq!(
+            parse_command(&["window", "stack"]),
+            Ok(Command::Window(Operation::Stack(Side::West)))
+        );
+        assert_eq!(
+            parse_command(&["window", "unstack"]),
+            Ok(Command::Window(Operation::Unstack(Side::East)))
+        );
+    }
+
+    #[test]
     fn invalid_commands_are_rejected() {
         assert!(parse_command(&["definitely", "not", "a", "command"]).is_err());
         assert!(parse_command(&["window", "focus"]).is_err());
         assert!(parse_command(&["window", "swap", "3"]).is_err());
+        assert!(parse_command(&["window", "stack", "north"]).is_err());
+        assert!(parse_command(&["window", "unstack", "first"]).is_err());
     }
 }

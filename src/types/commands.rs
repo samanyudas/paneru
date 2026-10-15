@@ -149,6 +149,36 @@ impl<'de> Deserialize<'de> for Direction {
     }
 }
 
+/// The horizontal neighbour a stacking operation targets: the column to the
+/// left (`West`) or to the right (`East`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    West,
+    East,
+}
+
+impl Side {
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if `input` is neither `west` nor `east`.
+    pub fn parse(input: &str) -> Result<Self, ParseError> {
+        Ok(match input {
+            "west" => Side::West,
+            "east" => Side::East,
+            other => return Err(ParseError::new(format!("unhandled side '{other}'"))),
+        })
+    }
+
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Side::West => "west",
+            Side::East => "east",
+        }
+    }
+}
+
 /// Direction used when cycling preset resize widths and heights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -240,8 +270,12 @@ pub enum Operation {
     Balance,
     /// Toggles the managed state of the focused window.
     Manage,
-    /// Stacks or unstacks a window. The boolean indicates whether to stack (`true`) or unstack (`false`).
-    Stack(bool),
+    /// Moves the focused window out of its column to the bottom of the
+    /// neighbouring column on the given side.
+    Stack(Side),
+    /// Moves the focused window out of its stack into a new column on the
+    /// given side of the stack.
+    Unstack(Side),
     /// Toggles the focused window's stack between a normal split display
     /// (all windows visible, sharing height) and a tabbed display (one
     /// window visible at a time, sharing the full column). Cycle tabs with

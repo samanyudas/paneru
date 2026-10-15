@@ -9,7 +9,7 @@
 use bevy::prelude::*;
 
 use crate::assert_focused;
-use crate::commands::{Command, Direction, Operation};
+use crate::commands::{Command, Direction, Operation, Side};
 use crate::ecs::ActiveWorkspaceMarker;
 use crate::ecs::layout::LayoutStrip;
 use crate::events::Event;
@@ -32,7 +32,7 @@ fn test_focus_or_virtual_south_focuses_stack_sibling_before_switching_workspace(
             command: Command::Window(Operation::Focus(Direction::East)),
         },
         Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+            command: Command::Window(Operation::Stack(Side::West)),
         },
         // Jump to VW1 and straight back so it exists for the eventual
         // fallback switch, without relying on auto-create being enabled.
@@ -115,7 +115,7 @@ fn test_plain_virtual_south_switches_workspace_even_with_a_stack_sibling() {
             command: Command::Window(Operation::Focus(Direction::East)),
         },
         Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+            command: Command::Window(Operation::Stack(Side::West)),
         },
         Event::Command {
             command: Command::Window(Operation::VirtualNumber(1)),

@@ -15,7 +15,7 @@ use bevy::ecs::system::{Commands, Query};
 use bevy::platform::collections::HashSet;
 use tracing::debug;
 
-use crate::commands::{Command, MoveFocus, Operation};
+use crate::commands::{Command, MoveFocus, Operation, Side};
 use crate::ecs::focus::FocusWindow;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::Windows;
@@ -237,7 +237,7 @@ fn apply(
                 debug!(target: "paneru::lua", "skipping {op:?}: the two windows share no strip");
                 return;
             };
-            if strip.stack(entity).is_err() {
+            if strip.stack(entity, Side::West).is_err() {
                 debug!(target: "paneru::lua", "skipping {op:?}: the layout refused the stack");
                 return;
             }
@@ -252,7 +252,7 @@ fn apply(
             else {
                 return;
             };
-            if strip.unstack(entity).is_err() {
+            if strip.unstack(entity, Side::East).is_err() {
                 debug!(target: "paneru::lua", "skipping {op:?}: the window is not in a stack");
                 return;
             }

@@ -282,8 +282,8 @@ $ paneru send-cmd <command> [args...]
 | `window manage`            | Toggle managed/floating state                    |
 | `window equalize`          | Distribute equal heights in the focused stack    |
 | `window balance`           | Make all columns match the focused window width  |
-| `window stack`             | Stack the focused window onto its left neighbour |
-| `window unstack`           | Unstack the focused window into its own column   |
+| `window stack [west\|east]` | Move the focused window into the neighbouring column (default west) |
+| `window unstack [east\|west]` | Pop the focused window out of its stack into a new column (default east) |
 | `window nextdisplay`       | Move the focused window to the next display      |
 | `window nextdisplaysend`   | Move the window to the next display but stay here |
 | `window virtual <dir>`     | Switch to the previous/next virtual workspace     |
