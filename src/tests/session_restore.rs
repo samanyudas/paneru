@@ -513,17 +513,20 @@ fn test_startup_restore_uses_first_restored_row_when_active_metadata_is_missing(
 }
 
 #[test]
-fn test_startup_restore_overrides_floating_config_for_matched_window() {
-    let mut params = WindowParams::new(".*", Some("test".to_string()));
+fn test_startup_floating_rule_wins_over_saved_tiled_placement() {
+    let mut params = WindowParams::new("^Window 1$", Some("test".to_string()));
     params.floating = Some(true);
     let config: Config = (MainOptions::default(), vec![params]).into();
-    let mut harness = TestHarness::new().with_config(config).with_windows(1);
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
     harness
         .app
         .world_mut()
         .insert_resource(state_with_strips(vec![SavedStrip {
             virtual_index: 0,
-            columns: vec![SavedColumn::Single(saved_window(0))],
+            columns: vec![
+                SavedColumn::Single(saved_window(0)),
+                SavedColumn::Single(saved_window(1)),
+            ],
         }]));
 
     for _ in 0..5 {
@@ -531,10 +534,32 @@ fn test_startup_restore_overrides_floating_config_for_matched_window() {
     }
 
     let world = harness.world();
-    let restored_window = crate::tests::harness::find_window_entity(0, world);
+    let tiled = find_window_entity(0, world);
+    let floating = find_window_entity(1, world);
+    let mut query = world.query::<&LayoutStrip>();
+    let strip_windows = query
+        .iter(world)
+        .flat_map(LayoutStrip::all_windows)
+        .collect::<Vec<_>>();
+
     assert!(
-        world.entity(restored_window).get::<Unmanaged>().is_none(),
-        "matched restore windows should not inherit floating config"
+        strip_windows.contains(&tiled),
+        "a saved window without a floating rule should be restored into a strip"
+    );
+    assert!(
+        world.entity(tiled).get::<Unmanaged>().is_none(),
+        "a saved window without a floating rule should stay managed"
+    );
+    assert!(
+        !strip_windows.contains(&floating),
+        "a window matching a floating rule must not be restored into a strip"
+    );
+    assert!(
+        matches!(
+            world.entity(floating).get::<Unmanaged>(),
+            Some(Unmanaged::Floating)
+        ),
+        "a window matching a floating rule must float even when saved as tiled"
     );
 }
 
@@ -589,6 +614,68 @@ fn test_late_startup_window_restores_during_grace_period() {
             assert!(
                 restored.is_some(),
                 "late startup window should restore into saved row"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_late_startup_window_with_floating_rule_is_not_restored() {
+    let mut params = WindowParams::new("^Window 99$", Some("test".to_string()));
+    params.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config);
+    harness
+        .app
+        .world_mut()
+        .insert_resource(state_with_strips(vec![SavedStrip {
+            virtual_index: 1,
+            columns: vec![SavedColumn::Single(saved_window(99))],
+        }]));
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    harness
+        .on_iteration(1, move |world, state| {
+            assert!(world.contains_resource::<crate::ecs::restore::SessionRestore>());
+
+            let origin = Origin::new(0, 0);
+            let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let window = state.spawn_window(
+                TEST_PROCESS_ID,
+                TEST_WORKSPACE_ID,
+                99,
+                IRect::from_corners(origin, origin + size),
+            );
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(2, |world, _state| {
+            let window = find_window_entity(99, world);
+            let mut query = world.query::<&LayoutStrip>();
+            assert!(
+                !query.iter(world).any(|strip| strip.contains(window)),
+                "a late window matching a floating rule must not be restored into a strip"
+            );
+            assert!(
+                !query
+                    .iter(world)
+                    .any(|strip| strip.id() == TEST_WORKSPACE_ID && strip.virtual_index == 1),
+                "restore must not create a saved row that only held a floating window"
+            );
+            assert!(
+                matches!(
+                    world.entity(window).get::<Unmanaged>(),
+                    Some(Unmanaged::Floating)
+                ),
+                "a late window matching a floating rule must float even when saved as tiled"
             );
         })
         .run(commands);
