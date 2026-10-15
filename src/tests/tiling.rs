@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::commands::{Command, Direction, Operation, ResizeDirection};
+use crate::commands::{Command, Direction, Operation, ResizeDirection, Side};
 use crate::config::{
     Config, InitialWindowWidth, InitialWindowWidthMode, MainOptions, WindowParams,
 };
@@ -130,7 +130,7 @@ fn test_window_shuffle() {
             command: Command::Window(Operation::Focus(Direction::East)),
         }, // 4
         Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+            command: Command::Window(Operation::Stack(Side::West)),
         }, // 5
         Event::Command {
             command: Command::Window(Operation::Center),
@@ -139,7 +139,7 @@ fn test_window_shuffle() {
             command: Command::Window(Operation::Focus(Direction::East)),
         }, // 7
         Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+            command: Command::Window(Operation::Stack(Side::West)),
         }, // 8
         Event::Command {
             command: Command::Window(Operation::Center),
@@ -327,7 +327,7 @@ fn test_window_vertical_resize_grow_and_shrink_cycle() {
             command: Command::Window(Operation::Focus(Direction::East)),
         }, // 2
         Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+            command: Command::Window(Operation::Stack(Side::West)),
         }, // 3
         Event::Command {
             command: Command::Window(Operation::ResizeVertical(ResizeDirection::Grow)),
@@ -390,7 +390,7 @@ fn test_window_vertical_resize_leaves_the_neighbour_its_minimum() {
             command: Command::Window(Operation::Focus(Direction::East)),
         },
         Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+            command: Command::Window(Operation::Stack(Side::West)),
         },
         Event::Command {
             command: Command::Window(Operation::ResizeVertical(ResizeDirection::Grow)),

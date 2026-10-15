@@ -23,7 +23,7 @@ use self::decorations::{
 use self::swipe::SwipeGestureDirection;
 
 #[cfg(test)]
-use crate::commands::{MoveFocus, Operation, ResizeDirection};
+use crate::commands::{MoveFocus, Operation, ResizeDirection, Side};
 use crate::{
     commands::Command,
     manager::ProcessApi,
@@ -2111,32 +2111,32 @@ index = 1
     let keycode = find_key('s');
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::CTRL),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Command::Window(Operation::Stack(Side::West)))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::LCTRL),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Command::Window(Operation::Stack(Side::West)))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::RCTRL),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Command::Window(Operation::Stack(Side::West)))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::ALT),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Command::Window(Operation::Stack(Side::West)))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::LALT),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Command::Window(Operation::Stack(Side::West)))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::RALT),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Command::Window(Operation::Stack(Side::West)))
     ));
 
     let keycode = find_key('d');
@@ -2203,6 +2203,45 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
             MoveFocus::Stay
         )))
     ));
+}
+
+#[test]
+fn test_config_parsing_stack_bindings() {
+    let input = r#"
+[options]
+
+[bindings]
+window_stack = "alt - 1"
+window_stack_west = "alt - 2"
+window_stack_east = "alt - 3"
+window_unstack = "alt - 4"
+window_unstack_east = "alt - 5"
+window_unstack_west = "alt - 6"
+"#;
+    let virtual_keys = test_virtual_keymap();
+    let config = Config {
+        inner: Arc::new(ArcSwap::from_pointee(
+            InnerConfig::parse_config_with_virtual_keys(input, &virtual_keys)
+                .expect("Failed to parse config"),
+        )),
+    };
+    let bound = |key: char| {
+        let keycode = virtual_keycode()
+            .find_map(|(s, v)| (format!("{key}") == *s).then_some(*v))
+            .unwrap();
+        config.find_keybind(keycode, Modifiers::ALT)
+    };
+    let expected = [
+        ('1', Operation::Stack(Side::West)),
+        ('2', Operation::Stack(Side::West)),
+        ('3', Operation::Stack(Side::East)),
+        ('4', Operation::Unstack(Side::East)),
+        ('5', Operation::Unstack(Side::East)),
+        ('6', Operation::Unstack(Side::West)),
+    ];
+    for (key, operation) in expected {
+        assert_eq!(bound(key), Some(Command::Window(operation)), "alt - {key}");
+    }
 }
 
 #[test]

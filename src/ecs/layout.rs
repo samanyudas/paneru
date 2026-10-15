@@ -23,6 +23,7 @@ use crate::ecs::{
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WorkspaceId;
+use crate::types::commands::Side;
 use crate::util::round_px;
 
 /// The floor every window in a column is packed against. Heights that would
@@ -226,6 +227,14 @@ impl StackItem {
             StackItem::Tabs(tabs) => StackItemIter::Tabs(tabs.iter().copied()),
         }
     }
+
+    /// The column this item forms on its own.
+    fn into_column(self) -> Column {
+        match self {
+            StackItem::Single(id) => Column::Single(id),
+            StackItem::Tabs(tabs) => Column::Tabs(tabs),
+        }
+    }
 }
 
 pub enum StackItemIter<'a> {
@@ -321,6 +330,17 @@ impl Column {
         }
     }
 
+    /// The stack items this column holds, or `None` for a fullscreen column,
+    /// which nothing can join.
+    fn stack_items(&self) -> Option<Vec<StackItem>> {
+        match self {
+            Column::Single(id) => Some(vec![StackItem::Single(*id)]),
+            Column::Tabs(tabs) => Some(vec![StackItem::Tabs(tabs.clone())]),
+            Column::Stack(items) => Some(items.clone()),
+            Column::Fullscren(_) => None,
+        }
+    }
+
     /// Moves the specified entity to the front of stack-local ordering.
     /// Native tab ordering is stable; the focused tab is tracked by `FocusedMarker`.
     pub fn move_to_front(&mut self, entity: Entity) {
@@ -377,10 +397,10 @@ pub struct LayoutStrip {
     /// Entities belonging to a `Column::Stack` currently displayed as tabs (one visible, sharing
     /// the full column rect) instead of split heights. Membership, not a `Column` variant — a Stack
     /// is "tabbed" iff any of its member entities is in this set; the invariant that either all or
-    /// none of one Stack's members are present is maintained by `toggle_tabbed_display` and by the
-    /// cleanup in `remove_column`/ `unstack`/`stack`. This is deliberately independent of
-    /// `Column::Tabs`/`StackItem::Tabs` (native-OS-tab detection, see `tabbed`/`tab_group` below)
-    /// and of `LayoutStrip::tabbed()`, which callers like
+    /// none of one Stack's members are present is maintained by `toggle_tabbed_display`, by
+    /// `stack`, and by the cleanup in `detach_item`/`collapse_stack`. This is deliberately
+    /// independent of `Column::Tabs`/`StackItem::Tabs` (native-OS-tab detection, see
+    /// `tabbed`/`tab_group` below) and of `LayoutStrip::tabbed()`, which callers like
     /// `apply_window_positions`/`give_away_focus` already key off for that unrelated feature.
     tabbed_stacks: EntityHashSet,
 }
@@ -578,23 +598,8 @@ impl LayoutStrip {
                         StackItem::Single(id) => *id != entity,
                         StackItem::Tabs(tabs) => !tabs.is_empty(),
                     });
-                    if stack.len() > 1 {
-                        self.columns.insert(index, Column::Stack(stack));
-                    } else if let Some(remaining_item) = stack.first() {
-                        // A single surviving item can no longer be a tabbed
-                        // display (nothing left to switch between) — drop
-                        // its membership so a stale entry can't linger.
-                        for e in remaining_item.window_iter() {
-                            self.tabbed_stacks.remove(&e);
-                        }
-                        match remaining_item {
-                            StackItem::Single(id) => {
-                                self.columns.insert(index, Column::Single(*id));
-                            }
-                            StackItem::Tabs(tabs) => {
-                                self.columns.insert(index, Column::Tabs(tabs.clone()));
-                            }
-                        }
+                    if let Some(rest) = self.collapse_stack(stack) {
+                        self.columns.insert(index, rest);
                     }
                 }
                 Column::Tabs(mut tabs) => {
@@ -689,119 +694,119 @@ impl LayoutStrip {
             .and_then(|col| col.at_or_last(stack_pos))
     }
 
-    /// Stacks the window with the given ID onto the panel to its left.
-    /// If the window is already in a stack or is the leftmost window, no action is taken.
+    /// The index of the column next to `index` on `side`, if there is one.
+    fn neighbour_index(&self, index: usize, side: Side) -> Option<usize> {
+        match side {
+            Side::West => index.checked_sub(1),
+            Side::East => Some(index + 1).filter(|next| *next < self.len()),
+        }
+    }
+
+    /// Moves the stack item holding `entity` (the window, or the native tab
+    /// group it belongs to) to the bottom of the neighbouring column on
+    /// `side`. The rest of its old column stays in place. A no-op when there
+    /// is no neighbour on that side or either column is fullscreen.
     ///
-    /// # Arguments
+    /// # Errors
     ///
-    /// * `entity` - Entity of the window to stack.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the stacking is successful or not needed, otherwise `Err(Error)` if the window is not found.
-    pub fn stack(&mut self, entity: Entity) -> Result<()> {
-        let index = self.index_of(entity)?;
-        if index == 0 {
-            // Can not stack to the left if left most window already.
+    /// Returns `Err(Error)` if the window is not in the strip.
+    pub fn stack(&mut self, entity: Entity, side: Side) -> Result<()> {
+        let source = self.index_of(entity)?;
+        let Some(target) = self.neighbour_index(source, side) else {
             return Ok(());
-        }
-
-        let column_to_stack = self.columns.remove(index).unwrap();
-        let items_to_stack = match column_to_stack {
-            Column::Fullscren(_) => return Ok(()),
-            Column::Single(id) => vec![StackItem::Single(id)],
-            Column::Tabs(tabs) => vec![StackItem::Tabs(tabs)],
-            Column::Stack(items) => items,
+        };
+        let Some(mut joined) = self.columns.get(target).and_then(Column::stack_items) else {
+            return Ok(());
+        };
+        let Some((item, source_kept)) = self.detach_item(source, entity) else {
+            return Ok(());
+        };
+        let target = if source_kept || target < source {
+            target
+        } else {
+            target - 1
         };
 
-        let target_column = self.columns.remove(index - 1).unwrap();
-        // If the column being merged into is already a tabbed display, the
-        // newly-joined items must join `tabbed_stacks` too — otherwise the
-        // merged Stack would end up with a mix of tabbed and split members,
-        // which `relative_positions`'s tabbed-column geometry branch isn't
-        // designed to represent.
-        if let Column::Stack(items) = &target_column
-            && items
-                .iter()
-                .flat_map(StackItem::window_iter)
-                .any(|e| self.tabbed_stacks.contains(&e))
+        // Joining a tabbed stack makes the newcomer tabbed too, so the stack
+        // never mixes tabbed and split members (see `tabbed_stacks`).
+        if joined
+            .iter()
+            .flat_map(StackItem::window_iter)
+            .any(|e| self.tabbed_stacks.contains(&e))
         {
-            for item in &items_to_stack {
-                self.tabbed_stacks.extend(item.window_iter());
-            }
+            self.tabbed_stacks.extend(item.window_iter());
         }
-        let new_column = match target_column {
-            Column::Fullscren(_) => return Ok(()),
-            Column::Single(id) => {
-                Column::Stack([vec![StackItem::Single(id)], items_to_stack].concat())
-            }
-            Column::Tabs(tabs) => {
-                Column::Stack([vec![StackItem::Tabs(tabs)], items_to_stack].concat())
-            }
-            Column::Stack(items) => Column::Stack([items, items_to_stack].concat()),
-        };
-
-        self.columns.insert(index - 1, new_column);
+        joined.push(item);
+        if let Some(column) = self.columns.get_mut(target) {
+            *column = Column::Stack(joined);
+        }
         Ok(())
     }
 
-    /// Unstacks the window with the given ID from its entity stack.
-    /// If the window is in a single panel, no action is taken.
+    /// Moves the stack item holding `entity` out of its stack into a new
+    /// column on `side` of the stack. A no-op if the window is not stacked.
     ///
-    /// # Arguments
+    /// # Errors
     ///
-    /// * `entity` - Entity of the window to unstack.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the unstacking is successful or not needed, otherwise `Err(Error)` if the window is not found.
-    pub fn unstack(&mut self, entity: Entity) -> Result<()> {
+    /// Returns `Err(Error)` if the window is not in the strip.
+    pub fn unstack(&mut self, entity: Entity, side: Side) -> Result<()> {
         let index = self.index_of(entity)?;
-        let column = self.columns.remove(index).unwrap();
+        if !matches!(self.columns.get(index), Some(Column::Stack(_))) {
+            return Ok(());
+        }
+        let Some((item, source_kept)) = self.detach_item(index, entity) else {
+            return Ok(());
+        };
+        let at = match side {
+            Side::West => index,
+            Side::East => index + usize::from(source_kept),
+        };
+        self.columns.insert(at, item.into_column());
+        Ok(())
+    }
 
-        if let Column::Stack(mut items) = column {
-            let item_index = items
-                .iter()
-                .position(|item| item.contains(entity))
-                .ok_or(Error::NotFound(format!("Entity {entity} not in stack")))?;
-
-            let removed_item = items.remove(item_index);
-
-            // The unstacked item no longer shares a column with its former
-            // stack-mates, so it can't remain part of a tabbed display.
-            for e in removed_item.window_iter() {
-                self.tabbed_stacks.remove(&e);
+    /// Takes the stack item holding `entity` out of column `index`, and
+    /// returns it with whether any of the column remains. Leaves the strip
+    /// untouched and returns `None` for a fullscreen column.
+    fn detach_item(&mut self, index: usize, entity: Entity) -> Option<(StackItem, bool)> {
+        let position = match self.columns.get(index)? {
+            Column::Fullscren(_) => return None,
+            column => column.position_of(entity)?,
+        };
+        let item = match self.columns.remove(index)? {
+            Column::Single(id) | Column::Fullscren(id) => StackItem::Single(id),
+            Column::Tabs(tabs) => StackItem::Tabs(tabs),
+            Column::Stack(mut items) => {
+                let item = items.remove(position);
+                // The item no longer shares a column with its former
+                // stack-mates, so it can't remain part of a tabbed display.
+                for e in item.window_iter() {
+                    self.tabbed_stacks.remove(&e);
+                }
+                if let Some(rest) = self.collapse_stack(items) {
+                    self.columns.insert(index, rest);
+                    return Some((item, true));
+                }
+                item
             }
+        };
+        Some((item, false))
+    }
 
-            // Re-insert the unstacked item as a single/tabs panel
-            let unstacked_column = match removed_item {
-                StackItem::Single(id) => Column::Single(id),
-                StackItem::Tabs(tabs) => Column::Tabs(tabs),
-            };
-            self.columns.insert(index, unstacked_column);
-
-            // Re-insert the modified stack (if not empty) at the original position
-            if !items.is_empty() {
-                let new_column = if items.len() == 1 {
-                    // A single surviving item can no longer be a tabbed
-                    // display — drop its membership (see remove_column).
-                    for e in items[0].window_iter() {
-                        self.tabbed_stacks.remove(&e);
-                    }
-                    match items.remove(0) {
-                        StackItem::Single(id) => Column::Single(id),
-                        StackItem::Tabs(tabs) => Column::Tabs(tabs),
-                    }
-                } else {
-                    Column::Stack(items)
-                };
-                self.columns.insert(index, new_column);
+    /// The column a stack's remaining `items` form: none when empty, the
+    /// lone item as its own column, otherwise a stack. A lone item has
+    /// nothing to switch between, so it also loses tabbed membership.
+    fn collapse_stack(&mut self, mut items: Vec<StackItem>) -> Option<Column> {
+        match items.len() {
+            0 => None,
+            1 => {
+                let item = items.remove(0);
+                for e in item.window_iter() {
+                    self.tabbed_stacks.remove(&e);
+                }
+                Some(item.into_column())
             }
-            Ok(())
-        } else {
-            // Not in a stack, put it back
-            self.columns.insert(index, column);
-            Ok(())
+            _ => Some(Column::Stack(items)),
         }
     }
 
@@ -1779,10 +1784,170 @@ mod tests {
         (world, strip, entities)
     }
 
+    /// Renders the strip with each window named by its letter in `names`:
+    /// `A | [B, {C D}] | !E`, where `[..]` is a stack, `{..}` native tabs and
+    /// `!` a fullscreen column.
+    fn render(strip: &LayoutStrip, names: &[Entity]) -> String {
+        let name = |entity: &Entity| {
+            let index = names.iter().position(|e| e == entity).unwrap();
+            char::from(b'A' + u8::try_from(index).unwrap()).to_string()
+        };
+        let tabs = |tabs: &[Entity]| {
+            format!(
+                "{{{}}}",
+                tabs.iter().map(name).collect::<Vec<_>>().join(" ")
+            )
+        };
+        strip
+            .columns()
+            .map(|column| match column {
+                Column::Single(entity) => name(entity),
+                Column::Fullscren(entity) => format!("!{}", name(entity)),
+                Column::Tabs(entities) => tabs(entities),
+                Column::Stack(items) => format!(
+                    "[{}]",
+                    items
+                        .iter()
+                        .map(|item| match item {
+                            StackItem::Single(entity) => name(entity),
+                            StackItem::Tabs(entities) => tabs(entities),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    fn strip_of(count: usize) -> (World, LayoutStrip, Vec<Entity>) {
+        let mut world = World::new();
+        let entities = world
+            .spawn_batch(std::iter::repeat_n((), count))
+            .collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::default();
+        for entity in &entities {
+            strip.append(*entity);
+        }
+        (world, strip, entities)
+    }
+
+    #[test]
+    fn stacking_next_to_a_fullscreen_column_keeps_every_window() {
+        let (_world, mut strip, e) = strip_of(3);
+        *strip.get_column_mut(1).unwrap() = Column::Fullscren(e[1]);
+
+        strip.stack(e[1], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "A | !B | C");
+
+        strip.stack(e[2], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "A | !B | C");
+
+        strip.stack(e[0], Side::East).unwrap();
+        assert_eq!(render(&strip, &e), "A | !B | C");
+    }
+
+    #[test]
+    fn stacking_west_moves_only_the_window_one_column_per_press() {
+        let (_world, mut strip, e) = strip_of(4);
+
+        strip.stack(e[3], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "A | B | [C, D]");
+        strip.stack(e[3], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "A | [B, D] | C");
+        strip.stack(e[3], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "[A, D] | B | C");
+        strip.stack(e[3], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "[A, D] | B | C");
+    }
+
+    #[test]
+    fn stacking_east_moves_only_the_window_one_column_per_press() {
+        let (_world, mut strip, e) = strip_of(4);
+
+        strip.stack(e[0], Side::East).unwrap();
+        assert_eq!(render(&strip, &e), "[B, A] | C | D");
+        strip.stack(e[0], Side::East).unwrap();
+        assert_eq!(render(&strip, &e), "B | [C, A] | D");
+        strip.stack(e[0], Side::East).unwrap();
+        assert_eq!(render(&strip, &e), "B | C | [D, A]");
+        strip.stack(e[0], Side::East).unwrap();
+        assert_eq!(render(&strip, &e), "B | C | [D, A]");
+    }
+
+    #[test]
+    fn stacking_from_inside_a_stack_leaves_the_rest_in_place() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[2], Side::West).unwrap();
+        strip.stack(e[3], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "A | [B, C, D]");
+
+        strip.stack(e[2], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "[A, C] | [B, D]");
+
+        strip.stack(e[1], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "[A, C, B] | D");
+
+        strip.stack(e[2], Side::East).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B] | [D, C]");
+    }
+
+    #[test]
+    fn stacking_a_native_tab_moves_its_whole_tab_group() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[2], Side::West).unwrap();
+        strip.convert_to_tabs(e[2], e[3]).unwrap();
+        assert_eq!(render(&strip, &e), "A | [B, {D C}]");
+
+        strip.stack(e[2], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "[A, {D C}] | B");
+    }
+
+    #[test]
+    fn unstacking_opens_a_column_on_the_chosen_side() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[1], Side::West).unwrap();
+        strip.stack(e[2], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B, C] | D");
+
+        strip.unstack(e[1], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "B | [A, C] | D");
+
+        strip.unstack(e[2], Side::East).unwrap();
+        assert_eq!(render(&strip, &e), "B | A | C | D");
+
+        strip.unstack(e[2], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "B | A | C | D");
+    }
+
+    #[test]
+    fn stacking_carries_tabbed_display_membership_with_the_stack() {
+        let (_world, mut strip, e) = strip_of(5);
+        strip.stack(e[2], Side::West).unwrap();
+        strip.stack(e[3], Side::West).unwrap();
+        assert_eq!(strip.toggle_tabbed_display(e[1]), Some(true));
+
+        strip.stack(e[4], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "A | [B, C, D, E]");
+        assert!(strip.is_tabbed_display(e[4]), "joining a tabbed stack");
+
+        strip.stack(e[1], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B] | [C, D, E]");
+        assert!(!strip.is_tabbed_display(e[0]));
+        assert!(!strip.is_tabbed_display(e[1]), "leaving a tabbed stack");
+        assert!(strip.is_tabbed_display(e[2]));
+
+        strip.stack(e[2], Side::West).unwrap();
+        strip.stack(e[3], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B, C, D] | E");
+        assert!(!strip.is_tabbed_display(e[3]), "joining a split stack");
+        assert!(!strip.is_tabbed_display(e[4]), "a lone survivor");
+    }
+
     #[test]
     fn strip_has_changed_window_matches_nested_entities() {
         let (mut world, mut strip, entities) = setup_world_and_strip();
-        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
         strip.convert_to_tabs(entities[0], entities[1]).unwrap();
 
         let mut changed = EntityHashSet::default();
@@ -1799,7 +1964,7 @@ mod tests {
     #[test]
     fn strip_window_contexts_capture_stack_membership_once() {
         let (mut world, mut strip, entities) = setup_world_and_strip();
-        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
         let display_entity = world.spawn_empty().id();
         let strip_position = Origin::new(10, 20);
         let mut contexts = EntityHashMap::default();
@@ -1846,7 +2011,7 @@ mod tests {
         let (_world, mut strip, entities) = setup_world_and_strip();
 
         // Stack [1] onto [0]
-        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
         assert_eq!(strip.len(), 2);
         assert_eq!(strip.index_of(entities[0]).unwrap(), 0);
         assert_eq!(strip.index_of(entities[1]).unwrap(), 0); // Both in the same panel
@@ -1864,7 +2029,7 @@ mod tests {
         }
 
         // Unstack [0]
-        strip.unstack(entities[0]).unwrap();
+        strip.unstack(entities[0], Side::East).unwrap();
         assert_eq!(strip.len(), 3);
         assert_eq!(strip.index_of(entities[1]).unwrap(), 0);
         assert_eq!(strip.index_of(entities[0]).unwrap(), 1);
@@ -1911,7 +2076,7 @@ mod tests {
         strip.append(entities[2]);
         strip.append(entities[3]);
 
-        _ = strip.stack(entities[2]);
+        _ = strip.stack(entities[2], Side::West);
         let get_window_frame = |_| Some(sizes[0]);
         let out = strip
             .relative_positions(500, &get_window_frame)
@@ -1964,8 +2129,8 @@ mod tests {
             strip.append(e);
         }
         // Stack e1, e2 onto e0: [Stack(e0, e1, e2), Single(e3)]
-        strip.stack(entities[1]).unwrap();
-        strip.stack(entities[2]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
+        strip.stack(entities[2], Side::West).unwrap();
 
         // Give the master (e0) a distinct width so we can verify children
         // adopt it. Here e0 is 500px while its stacked children are 300px;
@@ -2026,8 +2191,8 @@ mod tests {
         for &e in &entities {
             strip.append(e);
         }
-        strip.stack(entities[1]).unwrap();
-        strip.stack(entities[2]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
+        strip.stack(entities[2], Side::West).unwrap();
 
         assert!(entities.iter().all(|&e| !strip.is_tabbed_display(e)));
 
@@ -2065,8 +2230,8 @@ mod tests {
         for &e in &entities {
             strip.append(e);
         }
-        strip.stack(entities[1]).unwrap();
-        strip.stack(entities[2]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
+        strip.stack(entities[2], Side::West).unwrap();
         strip.toggle_tabbed_display(entities[1]);
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 400, 300));
@@ -2096,8 +2261,8 @@ mod tests {
         for &e in &entities {
             strip.append(e);
         }
-        strip.stack(entities[1]).unwrap();
-        strip.stack(entities[2]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
+        strip.stack(entities[2], Side::West).unwrap();
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 400, 200));
 
@@ -2135,8 +2300,8 @@ mod tests {
         for &e in &entities {
             strip.append(e);
         }
-        strip.stack(entities[1]).unwrap();
-        strip.stack(entities[2]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
+        strip.stack(entities[2], Side::West).unwrap();
         strip.toggle_tabbed_display(entities[1]);
 
         let index = strip.index_of(entities[2]).unwrap();
@@ -2159,8 +2324,8 @@ mod tests {
         for &e in &entities {
             strip.append(e);
         }
-        strip.stack(entities[1]).unwrap();
-        strip.stack(entities[2]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
+        strip.stack(entities[2], Side::West).unwrap();
         strip.toggle_tabbed_display(entities[1]);
 
         assert_eq!(strip.tab_display_sibling(entities[0]), Some(entities[1]));
@@ -2178,7 +2343,7 @@ mod tests {
         for &e in &entities {
             strip.append(e);
         }
-        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
         strip.toggle_tabbed_display(entities[1]);
         assert!(strip.is_tabbed_display(entities[0]));
 
@@ -2206,7 +2371,7 @@ mod tests {
         strip.append(e3);
 
         // [Single(e1), Single(e2), Single(e3)]
-        strip.stack(e2).unwrap();
+        strip.stack(e2, Side::West).unwrap();
         // [Stack([Single(e1), Single(e2)]), Single(e3)]
 
         // Convert e1 (in stack) to tabs with e4
@@ -2251,7 +2416,7 @@ mod tests {
             strip.append(e);
         }
         // [Stack(e0, e1), Single(e2)]
-        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 250));
 
@@ -2266,7 +2431,7 @@ mod tests {
         assert!(e1_height < 500, "stacked e1 should not have full height");
 
         // Unstack e1: [Single(e0), Single(e1), Single(e2)]
-        strip.unstack(entities[1]).unwrap();
+        strip.unstack(entities[1], Side::East).unwrap();
         assert_eq!(strip.len(), 3);
 
         let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
@@ -2292,21 +2457,21 @@ mod tests {
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 250));
 
         // Stack: [Stack(e0, e1)]
-        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
         let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(heights.iter().sum::<i32>(), 500);
         assert_eq!(heights.len(), 2);
 
         // Unstack: [Single(e0), Single(e1)]
-        strip.unstack(entities[1]).unwrap();
+        strip.unstack(entities[1], Side::East).unwrap();
         let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
         for (_, f) in &out {
             assert_eq!(f.height(), 500);
         }
 
         // Re-stack: [Stack(e0, e1)] — e1 stacks onto left neighbor e0
-        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[1], Side::West).unwrap();
         let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(heights.iter().sum::<i32>(), 500);
