@@ -20,6 +20,7 @@ use crate::ecs::state::{
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, RestoreWindowState, SpawnCommandsExt, Unmanaged,
+    WindowProperties,
 };
 use crate::manager::{Application, Display, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
@@ -433,7 +434,7 @@ pub(super) fn restore_window_state(
         restoration
     };
 
-    let current = current_window_identities(&ctx.windows, &apps, restoration);
+    let current = current_window_identities(&ctx.windows, &apps, restoration, &ctx.config);
     let plan = RestorePlanner::new(restoration).plan(&current);
 
     if plan.consumed_entities.is_empty() {
@@ -586,11 +587,16 @@ fn current_window_identities(
     windows: &Windows,
     apps: &Query<&Application>,
     restoration: &PaneruState,
+    config: &Config,
 ) -> Vec<CurrentWindowIdentity> {
     let mut current = windows
         .managed_iter()
         .filter_map(|(window, entity, child)| {
             let app = apps.get(child.parent()).ok()?;
+            // Windows that match a floating rule are never restored into a strip.
+            if WindowProperties::new(app, window, config).floating() {
+                return None;
+            }
             Some(CurrentWindowIdentity {
                 entity,
                 window_id: window.id(),
