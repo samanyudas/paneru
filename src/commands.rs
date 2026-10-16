@@ -373,13 +373,6 @@ fn command_move_focus(
         return;
     }
 
-    // If focus is on a window that no longer lives in the active strip
-    // (e.g. it just became floating, was minimised on another row, or
-    // the OS handed focus to a window we don't track on this strip),
-    // `get_window_in_direction` would return None and the user would
-    // be unable to leave that window. Enter the active strip from the
-    // appropriate side so subsequent presses behave normally.
-    // A jump to a column returns to the window that last had focus in it.
     let column_jump = match direction {
         Direction::First => active_strip.first().ok(),
         Direction::Last => active_strip.last().ok(),
@@ -412,8 +405,6 @@ fn command_move_focus(
         }
     };
 
-    // Focus stays on this display at a column's edge. Only `FocusDisplay`
-    // crosses to another one.
     if let Some(entity) = candidate {
         focus_with_verification(entity, Some(focused_entity), &mut commands);
         // Explicitly reshuffle so the target window is brought into view.
@@ -601,22 +592,7 @@ fn command_toggle_floating_layer(
     debug!("floating layer -> front: {floating_front}");
 }
 
-/// Handles the "swap" command, swapping the positions of the current window with another window in a specified direction.
-///
-/// # Arguments
-///
-/// * `direction` - The `Direction` to swap the window (e.g., `Direction::West`).
-/// * `current` - The `Entity` of the currently focused `Window`.
-/// * `active_display` - A mutable reference to the `ActiveDisplayMut` representing the active display.
-/// * `windows` - A mutable query for all `Window` components.
-/// * `commands` - Bevy commands to trigger events.
-///
-/// # Returns
-///
-/// `Some(Entity)` with the entity that was swapped with, otherwise `None`.
 #[instrument(level = Level::DEBUG, skip_all)]
-/// Swaps the focused window with its neighbour in a direction. At a column's
-/// edge it does nothing: only `MoveToDisplay` crosses to another display.
 fn command_swap_focus(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -1858,7 +1834,6 @@ mod tests {
     #[test]
     fn display_in_direction_follows_a_horizontal_arrangement() {
         let built_in = IRect::new(0, 0, 1512, 982);
-        // A larger display to the right, aligned at the top.
         let right = IRect::new(1512, -200, 1512 + 2560, 1240);
         let displays = [(2, right)];
 
@@ -1898,7 +1873,6 @@ mod tests {
     #[test]
     fn display_in_direction_prefers_an_overlapping_display_then_the_nearest() {
         let center = IRect::new(0, 0, 1000, 800);
-        // Both lie to the right; only `beside` shares a vertical range.
         let beside = IRect::new(3000, 0, 4000, 800);
         let diagonal = IRect::new(1000, -900, 2000, -100);
         let near = IRect::new(1000, 100, 2000, 900);
