@@ -175,7 +175,7 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     )?;
     window.set(
         "focus_display",
-        directional(
+        compass_directional(
             lua,
             dispatch,
             "window.focus_display",
@@ -184,7 +184,7 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     )?;
     window.set(
         "move_display",
-        directional(
+        compass_directional(
             lua,
             dispatch,
             "window.move_display",
@@ -310,6 +310,27 @@ fn directional(
     lua.create_function(move |lua, opts: Value| {
         let direction = Opts::read(lua, &opts)?.target(what)?;
         dispatch(lua, Command::Window(operation(direction)))
+    })
+}
+
+/// A display verb accepting only north, south, west, or east.
+fn compass_directional(
+    lua: &Lua,
+    dispatch: &Dispatch,
+    what: &'static str,
+    operation: impl Fn(Direction) -> Operation + 'static,
+) -> Result<Function> {
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, opts: Value| {
+        let direction = Opts::read(lua, &opts)?.target(what)?;
+        match direction {
+            Direction::North | Direction::South | Direction::West | Direction::East => {
+                dispatch(lua, Command::Window(operation(direction)))
+            }
+            Direction::First | Direction::Last | Direction::Nth(_) => Err(
+                mlua::Error::RuntimeError(format!("{what} expects north, south, west, or east")),
+            ),
+        }
     })
 }
 
@@ -552,6 +573,54 @@ mod tests {
                 Command::Window(Operation::ResizeVerticalStep(ResizeDirection::Shrink)),
             ])
         );
+    }
+
+    #[test]
+    fn display_verbs_reject_positional_directions_before_dispatch() {
+        let commands = run(r#"
+            for _, verb in ipairs({ "focus_display", "move_display" }) do
+                for _, target in ipairs({ "first", "last", 1, 9,
+                    { direction = "first" }, { direction = "last" },
+                    { direction = 3 }, { number = 3 } }) do
+                    local ok, err = pcall(paneru.window[verb], target)
+                    assert(not ok, verb .. " accepted a positional direction")
+                    assert(string.find(tostring(err), "north, south, west, or east", 1, true), tostring(err))
+                end
+            end
+        "#)
+        .unwrap();
+
+        assert!(
+            commands.is_empty(),
+            "invalid display calls must not dispatch"
+        );
+    }
+
+    #[test]
+    fn display_verbs_accept_each_compass_direction() {
+        for direction in [
+            Direction::North,
+            Direction::South,
+            Direction::West,
+            Direction::East,
+        ] {
+            for argument in [
+                format!("{:?}", direction.token()),
+                format!("{{ direction = {:?} }}", direction.token()),
+            ] {
+                let commands = run(&format!(
+                    "paneru.window.focus_display({argument})\npaneru.window.move_display({argument})"
+                ))
+                .unwrap();
+                assert_eq!(
+                    commands,
+                    vec![
+                        Command::Window(Operation::FocusDisplay(direction.clone())),
+                        Command::Window(Operation::MoveToDisplay(direction.clone())),
+                    ]
+                );
+            }
+        }
     }
 
     #[test]
