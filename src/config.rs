@@ -1096,6 +1096,15 @@ impl OneOrMore {
             OneOrMore::Multiple(many) => many.iter_mut().collect::<Vec<_>>(),
         }
     }
+
+    fn retain(&mut self, keep: impl FnMut(&mut Keybinding) -> bool) {
+        let mut many = match std::mem::replace(self, OneOrMore::Multiple(Vec::new())) {
+            OneOrMore::Single(one) => vec![one],
+            OneOrMore::Multiple(many) => many,
+        };
+        many.retain_mut(keep);
+        *self = OneOrMore::Multiple(many);
+    }
 }
 
 /// `InnerConfig` holds the actual configuration data parsed from a file, including options, keybindings, and window parameters.
@@ -1159,14 +1168,19 @@ impl InnerConfig {
             let argv = command.split('_').collect::<Vec<_>>();
             for binding in bindings.all_mut() {
                 binding.command = parse_command(&argv)?;
-
+            }
+            // A binding keeps the deserialized code 0 until its key resolves, and
+            // 0 is the A key, so a binding whose key name is unknown must go.
+            bindings.retain(|binding| {
                 if let Some(code) = keycode_for_key_name(&binding.key, virtual_keys) {
                     binding.code = code;
                     info!("bind: {binding:?}");
+                    true
                 } else {
                     error!("{}: invalid key '{}'", function_name!(), &binding.key);
+                    false
                 }
-            }
+            });
         }
 
         // Resolve passthrough keybinding strings into (keycode, modifiers) pairs.
@@ -2203,6 +2217,37 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
             MoveFocus::Stay
         )))
     ));
+}
+
+#[test]
+fn test_config_parsing_drops_binding_with_unknown_key() {
+    let input = r#"
+[bindings]
+window_focus_west = ["ctrl+alt-lefarrow", "ctrl+alt-h"]
+window_focus_east = "ctrl+alt-rigtharrow"
+"#;
+    let virtual_keys = test_virtual_keymap();
+    let config = Config {
+        inner: Arc::new(ArcSwap::from_pointee(
+            InnerConfig::parse_config_with_virtual_keys(input, &virtual_keys)
+                .expect("an unknown key must not reject the whole file"),
+        )),
+    };
+    let keycode = |name: &str| keycode_for_key_name(name, &virtual_keys).unwrap();
+    let chord = Modifiers::CTRL | Modifiers::ALT;
+
+    assert_eq!(
+        config.find_keybind(keycode("a"), chord),
+        None,
+        "a mistyped key name must not bind the A key, whose keycode is 0"
+    );
+    assert_eq!(
+        config.find_keybind(keycode("h"), chord),
+        Some(Command::Window(Operation::Focus(
+            crate::commands::Direction::West
+        ))),
+        "the binding's valid chords must still work"
+    );
 }
 
 #[test]
