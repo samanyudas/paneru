@@ -7,6 +7,7 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::system::{Commands, NonSendMut, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
+use bevy::time::{Time, Timer, TimerMode};
 use notify::event::{DataChange, MetadataKind, ModifyKind};
 use notify::{EventKind, Watcher};
 use std::cmp::Ordering;
@@ -14,9 +15,9 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive,
-    PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme,
-    Timeout, Unmanaged,
+    ActiveDisplayMarker, AwaitingHandle, BProcess, FocusedMarker, FreshMarker,
+    MissionControlActive, PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger,
+    StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -898,6 +899,92 @@ pub(super) fn window_managed_trigger(
     ctx.commands.reshuffle_around(entity);
 }
 
+const HANDLE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Defers ambiguous SLS destruction while the window remains ordered in.
+pub(super) fn claim_replaced_window_handles(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    for event in messages.read() {
+        let Event::WindowDestroyed {
+            window_id,
+            source: DestroySource::SpaceNotification,
+        } = event
+        else {
+            continue;
+        };
+        let Some((window, entity)) = windows.find(*window_id) else {
+            continue;
+        };
+        if window.role().is_err()
+            && matches!(window_manager.window_ordered_in(*window_id), Ok(true))
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            debug!("Window {window_id} is still ordered in with a dead AX element.");
+            entity_commands.try_insert_if_new(AwaitingHandle(Timer::new(
+                HANDLE_RECOVERY_TIMEOUT,
+                TimerMode::Once,
+            )));
+        }
+    }
+}
+
+/// Replaces stale AX handles while preserving window entities and layout state.
+pub(super) fn recover_window_handles(
+    awaiting: Populated<(Entity, &mut Window, &ChildOf, &mut AwaitingHandle)>,
+    mut apps: Query<&mut Application>,
+    window_manager: Res<WindowManager>,
+    config: Res<Config>,
+    clock: Res<Time>,
+    mut commands: Commands,
+) {
+    for (entity, mut window, child, mut deadline) in awaiting {
+        deadline.0.tick(clock.delta());
+        let window_id = window.id();
+        let ordered_in = window_manager.window_ordered_in(window_id);
+        let recovered = matches!(ordered_in, Ok(true))
+            && (window.role().is_ok()
+                || apps
+                    .get_mut(child.parent())
+                    .is_ok_and(|mut app| adopt_fresh_handle(&mut window, &mut app, &config)));
+
+        if !recovered && !deadline.0.is_finished() && !matches!(ordered_in, Ok(false)) {
+            continue;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<AwaitingHandle>();
+        }
+        if !recovered {
+            debug!("Window {window_id} has no new AX element; closing it.");
+            commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
+                window_id,
+                source: DestroySource::Accessibility { element: None },
+            }));
+        }
+    }
+}
+
+fn adopt_fresh_handle(window: &mut Window, app: &mut Application, config: &Config) -> bool {
+    let window_id = window.id();
+    let Some(old) = app
+        .window_list(config)
+        .into_iter()
+        .filter(|fresh| fresh.id() == window_id && fresh.role().is_ok())
+        .find_map(|fresh| window.replace_handle(fresh).ok())
+    else {
+        return false;
+    };
+    debug!("Window {window_id} has a new AX element; keeping its entity.");
+    app.unobserve_window(&old);
+    if app.observe_window(window).is_err() {
+        warn!("Error observing window {window_id}.");
+    }
+    true
+}
+
 /// Handles the event when a window is destroyed. The windows itself is not removed from the layout
 /// strip. This happens in the On<Remove, Window> trigger.
 ///
@@ -909,7 +996,9 @@ pub(super) fn window_managed_trigger(
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `focus_history` - Per-workspace record of what was focused last.
 /// * `windows` - A query for all windows with their parent.
+/// * `awaiting` - Windows waiting for the app to replace their AX element.
 /// * `commands` - Bevy commands to despawn entities and trigger events.
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn window_destroyed_trigger(
     mut messages: MessageReader<Event>,
@@ -918,6 +1007,7 @@ pub(super) fn window_destroyed_trigger(
     mut global_state: GlobalState,
     mut focus_history: ResMut<FocusHistory>,
     windows: Windows,
+    awaiting: Query<(), With<AwaitingHandle>>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
@@ -938,12 +1028,23 @@ pub(super) fn window_destroyed_trigger(
         // the app's AX window list is still warm for a moment after the close. Re-checking them
         // raced the window back to life, leaving the entity in the strip and a permanent gap where
         // the window had been.
-        if matches!(source, DestroySource::SpaceNotification) && window.role().is_ok() {
-            debug!(
-                "Window {} still present, this was SLS workspace change.",
-                window.id()
-            );
-            continue;
+        match source {
+            DestroySource::SpaceNotification
+                if awaiting.contains(entity) || window.role().is_ok() =>
+            {
+                debug!(
+                    "Window {} still present, this was SLS workspace change.",
+                    window.id()
+                );
+                continue;
+            }
+            DestroySource::Accessibility {
+                element: Some(element),
+            } if !window.is_current_element(element) => {
+                debug!("Window {window_id} lost a replaced AX element.");
+                continue;
+            }
+            _ => {}
         }
 
         let Ok(mut app) = apps.get_mut(parent) else {

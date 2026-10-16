@@ -506,7 +506,7 @@ impl ObserverContext {
     fn notify(&self, notification: &str, element: AXUIElementRef) {
         match self.which {
             ObserverType::Application => self.notify_app(notification, element),
-            ObserverType::Window(id) => self.notify_window(notification, id),
+            ObserverType::Window(id) => self.notify_window(notification, id, element),
         }
     }
 
@@ -550,7 +550,8 @@ impl ObserverContext {
     ///
     /// * `notification` - The name of the accessibility notification as a `&str`.
     /// * `window_id` - The ID of the window associated with the notification.
-    fn notify_window(&self, notification: &str, window_id: WinID) {
+    /// * `element` - The window's AX element that sent the notification.
+    fn notify_window(&self, notification: &str, window_id: WinID, element: AXUIElementRef) {
         let event = match notification {
             accessibility_sys::kAXWindowMiniaturizedNotification => {
                 Event::WindowMinimized { window_id }
@@ -560,7 +561,9 @@ impl ObserverContext {
             }
             accessibility_sys::kAXUIElementDestroyedNotification => Event::WindowDestroyed {
                 window_id,
-                source: DestroySource::Accessibility,
+                source: DestroySource::Accessibility {
+                    element: AXUIWrapper::retain(element).ok(),
+                },
             },
             accessibility_sys::kAXTitleChangedNotification => {
                 Event::WindowTitleChanged { window_id }

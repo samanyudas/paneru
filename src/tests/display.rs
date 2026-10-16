@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use bevy::prelude::*;
@@ -970,6 +972,13 @@ fn window_command(operation: Operation) -> Event {
     }
 }
 
+fn window_entity(world: &mut World, id: WinID) -> Option<Entity> {
+    world
+        .query::<(&Window, Entity)>()
+        .iter(world)
+        .find_map(|(window, entity)| (window.id() == id).then_some(entity))
+}
+
 /// The external display sits above the built-in one, with window 100 on it.
 fn harness_with_display_above() -> TestHarness {
     let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
@@ -1120,6 +1129,255 @@ fn test_move_to_display_follows_the_physical_arrangement() {
             window_command(Operation::Focus(Direction::First)),
             window_command(Operation::MoveToDisplay(Direction::East)),
             window_command(Operation::MoveToDisplay(Direction::North)),
+        ]);
+}
+
+#[test]
+fn test_move_to_display_keeps_focus_when_the_app_rebuilds_the_ax_element() {
+    let moved = Rc::new(Cell::new(None));
+    let recorded = moved.clone();
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            recorded.set(Some(find_window_entity(0, world)));
+            state.os_transfer_window(0, EXT_WORKSPACE_ID);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, move |world, state| {
+            assert_eq!(
+                state.focused_window_id(TEST_PROCESS_ID),
+                Some(0),
+                "the app should still report the moved window as focused"
+            );
+            assert_focused!(world, 0);
+            assert_eq!(
+                window_entity(world, 0),
+                moved.get(),
+                "the moved window should keep its entity"
+            );
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+        })
+        .on_iteration(4, |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_on_workspace!(world, 100, EXT_WORKSPACE_ID);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            window_command(Operation::MoveToDisplay(Direction::South)),
+        ]);
+}
+
+/// Sending a window away leaves focus on its source neighbour, and the sent
+/// window stays managed on the target even when its AX element is rebuilt.
+#[test]
+fn test_send_to_display_keeps_the_window_when_the_app_rebuilds_the_ax_element() {
+    let moved = Rc::new(Cell::new(None));
+    let recorded = moved.clone();
+    harness_with_display_above()
+        .with_window(1, |_| {})
+        .on_iteration(2, move |world, state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            recorded.set(Some(find_window_entity(0, world)));
+            state.os_transfer_window(0, EXT_WORKSPACE_ID);
+        })
+        .on_iteration(3, move |world, state| {
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(1));
+            assert_focused!(world, 1);
+            assert_eq!(
+                window_entity(world, 0),
+                moved.get(),
+                "the sent window should keep its entity"
+            );
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::ToNextDisplay(MoveFocus::Stay)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// Closing a window after it moved displays still removes it and hands focus
+/// to the window beside it.
+#[test]
+fn test_close_after_move_to_display_still_removes_the_window() {
+    harness_with_display_above()
+        .on_iteration(2, |_world, state| {
+            state.os_transfer_window(0, EXT_WORKSPACE_ID);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, |_world, state| {
+            state.os_close_window(0);
+        })
+        .on_iteration(4, |world, state| {
+            assert_eq!(window_entity(world, 0), None);
+            assert_focused!(world, 100);
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(100));
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// The app tears the old AX element down after replacing it. That teardown
+/// names an element the moved window no longer uses, so the window stays.
+#[test]
+fn test_move_to_display_ignores_the_teardown_of_the_replaced_ax_element() {
+    let moved = Rc::new(Cell::new(None));
+    let recorded = moved.clone();
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            recorded.set(Some(find_window_entity(0, world)));
+            state.os_transfer_window(0, EXT_WORKSPACE_ID);
+            state.os_tear_down_replaced_element(0);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, move |world, state| {
+            assert_eq!(window_entity(world, 0), moved.get());
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(0));
+            assert_focused!(world, 0);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// The app may list the fresh AX element a while after the old one died. The
+/// moved window keeps its entity and focus while it waits, then takes the
+/// fresh element, so the reverse move takes it back.
+#[test]
+fn test_move_to_display_waits_for_a_late_ax_element() {
+    let moved = Rc::new(Cell::new(None));
+    let (recorded, waiting) = (moved.clone(), moved.clone());
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            recorded.set(Some(find_window_entity(0, world)));
+            state.os_transfer_window_late(0, EXT_WORKSPACE_ID);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, move |world, state| {
+            assert_eq!(window_entity(world, 0), waiting.get());
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(0));
+            assert_focused!(world, 0);
+            state.os_list_window(0);
+        })
+        .on_iteration(4, move |world, state| {
+            let entity = window_entity(world, 0);
+            assert_eq!(entity, moved.get());
+            let window = world.get::<Window>(entity.unwrap()).unwrap();
+            assert!(
+                window.role().is_ok(),
+                "the window should use the fresh element"
+            );
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(0));
+            assert_focused!(world, 0);
+        })
+        .on_iteration(5, |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_on_workspace!(world, 100, EXT_WORKSPACE_ID);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            window_command(Operation::MoveToDisplay(Direction::South)),
+        ]);
+}
+
+/// A window closed while it waits for a fresh AX element is removed as soon
+/// as the window server drops it, not when the wait runs out.
+#[test]
+fn test_close_while_waiting_for_a_late_ax_element_removes_the_window() {
+    harness_with_display_above()
+        .on_iteration(2, |_world, state| {
+            state.os_transfer_window_late(0, EXT_WORKSPACE_ID);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, |_world, state| {
+            state.os_close_window(0);
+        })
+        .on_iteration(4, |world, state| {
+            assert_eq!(window_entity(world, 0), None);
+            assert_focused!(world, 100);
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(100));
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// With no fresh AX element, the window is closed the usual way after a
+/// bounded wait, and repeated notifications do not extend that wait.
+#[test]
+fn test_move_to_display_stops_waiting_for_an_ax_element_that_never_comes() {
+    let moved = Rc::new(Cell::new(None));
+    let (recorded, waiting) = (moved.clone(), moved.clone());
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            recorded.set(Some(find_window_entity(0, world)));
+            state.os_transfer_window_late(0, EXT_WORKSPACE_ID);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, move |world, state| {
+            assert_eq!(window_entity(world, 0), waiting.get());
+            state.os_repeat_space_destroy(0);
+        })
+        .on_iteration(4, |_world, state| {
+            state.os_repeat_space_destroy(0);
+        })
+        .on_iteration(5, move |world, state| {
+            assert_ne!(window_entity(world, 0), moved.get());
+            assert_focused!(world, 100);
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(100));
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
         ]);
 }
 

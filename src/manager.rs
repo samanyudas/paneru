@@ -169,8 +169,9 @@ pub trait WindowManagerApi: Send + Sync {
     ///
     /// `Ok(Vec<WinID>)` containing the list of window IDs, otherwise `Err(Error)`.
     fn windows_in_workspace(&self, space_id: WorkspaceId) -> Result<Vec<WinID>>;
-    /// Returns `true` when a window is no longer ordered into the window list.
-    fn window_is_unordered(&self, window_id: WinID) -> bool;
+    /// Whether the window server has the window ordered in. A failed query is
+    /// an `Err`, never an answer: it is no evidence the window exists or is gone.
+    fn window_ordered_in(&self, window_id: WinID) -> Result<bool>;
 
     /// Sends an `Event::Exit` to the event loop, signaling the application to quit.
     ///
@@ -521,12 +522,11 @@ impl WindowManagerApi for WindowManagerOS {
         space_window_list_for_connection(self.main_cid, &[space_id], None, true)
     }
 
-    fn window_is_unordered(&self, window_id: WinID) -> bool {
+    fn window_ordered_in(&self, window_id: WinID) -> Result<bool> {
         let mut ordered_in = 0;
-        let ordered_status =
-            unsafe { SLSWindowIsOrderedIn(self.main_cid, window_id, &mut ordered_in) };
-
-        ordered_status == 0 && ordered_in == 0
+        unsafe { SLSWindowIsOrderedIn(self.main_cid, window_id, &mut ordered_in) }
+            .to_result(function_name!())?;
+        Ok(ordered_in != 0)
     }
 
     fn quit(&self) -> Result<()> {
