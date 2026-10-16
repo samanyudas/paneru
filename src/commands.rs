@@ -282,6 +282,7 @@ fn command_move_focus(
     workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
+    focus_history: Res<FocusHistory>,
     mut commands: Commands,
 ) {
     let Some(Operation::Focus(direction)) =
@@ -342,7 +343,17 @@ fn command_move_focus(
     // `get_window_in_direction` would return None and the user would
     // be unable to leave that window. Enter the active strip from the
     // appropriate side so subsequent presses behave normally.
-    let candidate = if active_strip.contains(focused_entity) {
+    // A jump to a column returns to the window that last had focus in it.
+    let column_jump = match direction {
+        Direction::First => active_strip.first().ok(),
+        Direction::Last => active_strip.last().ok(),
+        Direction::Nth(index) => active_strip.get(*index).ok(),
+        Direction::North | Direction::South | Direction::West | Direction::East => None,
+    }
+    .map(|column| focus_history.last_focused_in(&column));
+    let candidate = if let Some(target) = column_jump {
+        target
+    } else if active_strip.contains(focused_entity) {
         get_window_in_direction(direction, focused_entity, active_strip).or_else(|| {
             // At the right edge going East, enter the fullscreen workspaces.
             (matches!(direction, Direction::East)
@@ -359,15 +370,9 @@ fn command_move_focus(
         })
     } else {
         match direction {
-            Direction::East | Direction::First => {
-                active_strip.first().ok().and_then(|col| col.top())
-            }
-            Direction::West | Direction::Last => active_strip.last().ok().and_then(|col| col.top()),
-            Direction::Nth(index) => active_strip
-                .get(*index)
-                .ok()
-                .and_then(|column| column.top()),
-            Direction::North | Direction::South => None,
+            Direction::East => active_strip.first().ok().and_then(|col| col.top()),
+            Direction::West => active_strip.last().ok().and_then(|col| col.top()),
+            _ => None,
         }
     };
 

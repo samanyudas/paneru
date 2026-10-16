@@ -3537,3 +3537,71 @@ fn exit_cleanup_restores_tiled_windows_and_leaves_floating_windows_alone() {
         "exit cleanup must bring a tiled window fully onto a display, got {tiled_frame:?}"
     );
 }
+
+fn focus(direction: Direction) -> Event {
+    Event::Command {
+        command: Command::Window(Operation::Focus(direction)),
+    }
+}
+
+/// A numbered, first, or last jump into a stack focuses the window that last
+/// had focus in that column, not the stack's top window.
+#[test]
+fn test_column_jumps_focus_the_stacks_last_focused_window() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        focus(Direction::First),
+        // Column 0 becomes [1, 0], with window 0 focused at the bottom.
+        Event::Command {
+            command: Command::Window(Operation::Stack(Side::East)),
+        },
+        focus(Direction::Last),
+        focus(Direction::First),
+        focus(Direction::Last),
+        focus(Direction::Nth(0)),
+        // Window 1, at the top, now has focus last.
+        focus(Direction::North),
+        focus(Direction::Last),
+        focus(Direction::Nth(0)),
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(2, |world, _state| {
+            assert_eq!(strip_slots(world, 3), [(0, 1), (0, 0), (1, 0)]);
+            assert_focused!(world, 0);
+        })
+        .on_iteration(3, |world, _state| assert_focused!(world, 2))
+        .on_iteration(4, |world, _state| assert_focused!(world, 0))
+        .on_iteration(5, |world, _state| assert_focused!(world, 2))
+        .on_iteration(6, |world, _state| assert_focused!(world, 0))
+        .on_iteration(7, |world, _state| assert_focused!(world, 1))
+        .on_iteration(8, |world, _state| assert_focused!(world, 2))
+        .on_iteration(9, |world, _state| assert_focused!(world, 1))
+        .run(commands);
+}
+
+/// The same for a stack in the last column.
+#[test]
+fn test_last_column_jump_focuses_the_stacks_last_focused_window() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        focus(Direction::Last),
+        // Column 1 becomes [1, 2], with window 2 focused at the bottom.
+        Event::Command {
+            command: Command::Window(Operation::Stack(Side::West)),
+        },
+        focus(Direction::First),
+        focus(Direction::Last),
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(2, |world, _state| {
+            assert_eq!(strip_slots(world, 3), [(0, 0), (1, 0), (1, 1)]);
+            assert_focused!(world, 2);
+        })
+        .on_iteration(3, |world, _state| assert_focused!(world, 0))
+        .on_iteration(4, |world, _state| assert_focused!(world, 2))
+        .run(commands);
+}
