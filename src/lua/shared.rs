@@ -173,6 +173,24 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
         "next_display",
         follower(lua, dispatch, Operation::ToNextDisplay)?,
     )?;
+    window.set(
+        "focus_display",
+        directional(
+            lua,
+            dispatch,
+            "window.focus_display",
+            Operation::FocusDisplay,
+        )?,
+    )?;
+    window.set(
+        "move_display",
+        directional(
+            lua,
+            dispatch,
+            "window.move_display",
+            Operation::MoveToDisplay,
+        )?,
+    )?;
 
     for (name, operation) in [
         ("focus_managed", Operation::FocusManaged),
@@ -196,6 +214,19 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
         (
             "vertical_shrink",
             Operation::ResizeVertical(ResizeDirection::Shrink),
+        ),
+        ("step_grow", Operation::ResizeStep(ResizeDirection::Grow)),
+        (
+            "step_shrink",
+            Operation::ResizeStep(ResizeDirection::Shrink),
+        ),
+        (
+            "vertical_step_grow",
+            Operation::ResizeVerticalStep(ResizeDirection::Grow),
+        ),
+        (
+            "vertical_step_shrink",
+            Operation::ResizeVerticalStep(ResizeDirection::Shrink),
         ),
         ("raise_floating", Operation::RaiseFloating),
         ("toggle_float_layer", Operation::ToggleFloatingLayer),
@@ -498,6 +529,27 @@ mod tests {
                 Command::Window(Operation::Stack(Side::East)),
                 Command::Window(Operation::Unstack(Side::East)),
                 Command::Window(Operation::Unstack(Side::West)),
+            ])
+        );
+    }
+
+    #[test]
+    fn display_and_step_verbs_build_their_commands() {
+        let commands = run(r#"
+            paneru.window.focus_display("north")
+            paneru.window.move_display({ direction = "west" })
+            paneru.window.step_grow()
+            paneru.window.vertical_step_shrink()
+        "#)
+        .unwrap();
+
+        assert_eq!(
+            debug(&commands),
+            debug(&[
+                Command::Window(Operation::FocusDisplay(Direction::North)),
+                Command::Window(Operation::MoveToDisplay(Direction::West)),
+                Command::Window(Operation::ResizeStep(ResizeDirection::Grow)),
+                Command::Window(Operation::ResizeVerticalStep(ResizeDirection::Shrink)),
             ])
         );
     }

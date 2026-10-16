@@ -58,6 +58,20 @@ impl Direction {
         })
     }
 
+    /// Parses `north`, `south`, `west`, or `east`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if `name` is not one of the four compass directions.
+    pub fn parse_compass(name: &str) -> Result<Self, ParseError> {
+        match Direction::parse(name)? {
+            Direction::First | Direction::Last | Direction::Nth(_) => Err(ParseError::new(
+                format!("'{name}' is not north, south, west, or east"),
+            )),
+            direction => Ok(direction),
+        }
+    }
+
     /// Parses a direction name or a 1-based position (`"3"` → `Nth(2)`).
     ///
     /// # Errors
@@ -258,12 +272,25 @@ pub enum Operation {
     /// Cycles the focused window's height through the preset stack heights.
     /// Only applies to windows inside a stack.
     ResizeVertical(ResizeDirection),
+    /// Grows or shrinks the focused column's width by `window_resize_step` of
+    /// the display width. It stops at the limits instead of wrapping.
+    ResizeStep(ResizeDirection),
+    /// Grows or shrinks the focused window's height by `window_resize_step` of
+    /// the display height, taking the difference from its neighbour. Only
+    /// applies to windows inside a stack, and stops at the limits.
+    ResizeVerticalStep(ResizeDirection),
     /// Resizes the focused window to an exact display-width ratio.
     SetWidth(f64),
     /// Toggles the focused window to full width or a preset width.
     FullWidth,
     /// Moves the focused window to the next available display.
     ToNextDisplay(MoveFocus),
+    /// Focuses the display that lies north, south, west, or east of the active
+    /// display in the physical arrangement.
+    FocusDisplay(Direction),
+    /// Moves the focused window to the display that lies north, south, west,
+    /// or east of the active display, and follows it there.
+    MoveToDisplay(Direction),
     /// Distributes heights equally among windows in the focused stack.
     Equalize,
     /// Makes all columns in the active strip the same width as the focused window.

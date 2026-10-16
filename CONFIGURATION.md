@@ -38,6 +38,7 @@ General behavior settings for the window manager.
 | `menubar_height` | Integer (px) | *Auto* | Manually override the detected macOS menubar height. |
 | `window_hidden_ratio` | Float (0.0–1.0) | `0.0` | How much of a window can be hidden before it's forced into view on focus change. `0.0` = eager, `1.0` = lazy. |
 | `window_resize_cycle` | Boolean | `true` | If disabled, `window_resize` and `window_shrink` (and their `window_vertical_*` counterparts) stop at the largest/smallest preset instead of cycling back. |
+| `window_resize_step` | Float (0.0-1.0) | `0.05` | Share of the display width or height that `window_step_*` and `window_vertical_step_*` add or remove. |
 | `mouse_resize_modifier` | String | *None* | If enabled allows window resizing using mouse movement. For example `cmd + shift` will allow resizing of the window when holding those keys. Proximity of the pointer to left or right window edge determines which side will be adjusted. |
 | `reap_empty_workspaces` | String | `false` | If enabled, a virtual workspace without any windows will be removed. |
 | `disable_native_tabs` | Boolean | `false` | If enabled, Paneru will not auto-merge a window into a tab group with an existing same-app sibling that shares its frame. Merging happens when the window is created, and again for a background tab that the window server stops showing while a sibling of the same app holds the same frame — an app that hides its old tab a moment late would otherwise leave a column nothing can appear in. Use this if you find unrelated windows being grouped together. |
@@ -190,12 +191,12 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | Action | Description |
 | :--- | :--- |
 | `window_focus_west` / `_east` | Focus window to the left/right. |
-| `window_focus_north` / `_south` | Focus window above/below. If no window exists, switches focus to the display in that direction. |
-| `window_focus_first` / `_last` | Jump to the start/end of the strip. |
+| `window_focus_north` / `_south` | Focus window above/below within the column. Stays on the display at the column's edge. |
+| `window_focus_first` / `_last` | Jump to the start/end of the strip. In a stack, focuses the window that last had focus in that column. |
 | `window_focus_managed` | Switch to a previously focused window on this workspace. |
 | `window_focus_unmanaged` | Switch to a previously focused floating window on this workspace. |
 | `window_swap_west` / `_east` | Swap current window with neighbor. |
-| `window_swap_north` / `_south` | Swap current window above/below. If no window exists, moves the window to the display in that direction. |
+| `window_swap_north` / `_south` | Swap current window above/below within the column. Does nothing at the column's edge. |
 | `window_swap_first` / `_last` | Move current window to start/end of strip. |
 | `window_center` | Center the current window in the viewport. |
 | `window_resize` | Cycle through preset widths (Grow). |
@@ -204,6 +205,8 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_vertical_resize` | Cycle a stacked window through preset heights (Grow). No-op outside a stack. |
 | `window_vertical_grow` | Alias for `window_vertical_resize`. |
 | `window_vertical_shrink` | Cycle a stacked window through preset heights (Shrink). |
+| `window_step_grow` / `_shrink` | Widen/narrow the column by `window_resize_step` of the display width. Stops at full width and at one step, without wrapping. |
+| `window_vertical_step_grow` / `_shrink` | Make a stacked window taller/shorter by `window_resize_step` of the display height. Its neighbour absorbs the difference. No-op outside a stack. |
 | `window_fullwidth` | Toggle full-width mode. |
 | `window_manage` | Toggle between tiled and floating state. |
 | `window_stack` | Alias for `window_stack_west`. |
@@ -216,6 +219,8 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_nextdisplay` | Move focused window to the next monitor and follow it. |
 | `window_nextdisplaysend` | Move focused window to the next monitor but stay on current. |
 | `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
+| `window_focusdisplay_north` / `_south` / `_west` / `_east` | Focus the display in that direction in the physical arrangement, on its last-focused or most visible window. |
+| `window_movedisplay_north` / `_south` / `_west` / `_east` | Move the focused window to the display in that direction and follow it. |
 | `window_snap` | Snap an overflowing window into the viewport. |
 | `window_raise_floating` | Make the floating windows layer visible on the current workspace. |
 | `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |

@@ -10,7 +10,10 @@ use crate::ecs::{DockPosition, Timeout};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WinID;
-use crate::{assert_not_on_workspace, assert_on_workspace, assert_window_at, assert_window_size};
+use crate::{
+    assert_focused, assert_not_on_workspace, assert_on_workspace, assert_window_at,
+    assert_window_size,
+};
 
 use super::*;
 
@@ -959,4 +962,88 @@ fn test_empty_baseline_row_survives_display_removal() {
             );
         })
         .run(commands);
+}
+
+fn window_command(operation: Operation) -> Event {
+    Event::Command {
+        command: Command::Window(operation),
+    }
+}
+
+/// The external display sits above the built-in one, with window 100 on it.
+fn harness_with_display_above() -> TestHarness {
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID])
+        .with_window(100, |data| {
+            data.workspace_id = EXT_WORKSPACE_ID;
+            data.frame = IRect::new(100, -EXT_DISPLAY_HEIGHT + 100, 900, -100);
+        })
+}
+
+/// Focus moves to the display in the pressed direction and nowhere else.
+#[test]
+fn test_focus_display_follows_the_physical_arrangement() {
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            assert_focused!(world, 0);
+            assert!(
+                !ext_bounds.contains(state.cursor_position()),
+                "no display lies below the built-in one"
+            );
+        })
+        .on_iteration(3, move |world, state| {
+            assert_focused!(world, 100);
+            assert!(ext_bounds.contains(state.cursor_position()));
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::FocusDisplay(Direction::South)),
+            window_command(Operation::FocusDisplay(Direction::North)),
+        ]);
+}
+
+/// The focused window moves to the display in the pressed direction only.
+#[test]
+fn test_move_to_display_follows_the_physical_arrangement() {
+    harness_with_display_above()
+        .on_iteration(2, |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .on_iteration(3, |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::East)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+        ]);
+}
+
+/// Focus and swap within a column stay on the display at the column's edge.
+/// Only the display commands cross to another display.
+#[test]
+fn test_vertical_focus_and_swap_stay_on_the_display_at_a_column_edge() {
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            assert_focused!(world, 0);
+            assert!(!ext_bounds.contains(state.cursor_position()));
+        })
+        .on_iteration(3, |world, _state| {
+            assert_focused!(world, 0);
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::Focus(Direction::North)),
+            window_command(Operation::Swap(Direction::North)),
+        ]);
 }

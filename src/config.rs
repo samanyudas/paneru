@@ -811,6 +811,15 @@ impl Config {
         self.options().window_resize_cycle.unwrap_or(true)
     }
 
+    /// The share of the display that one step resize adds or removes, five
+    /// percentage points unless the option holds a ratio above 0 and up to 1.
+    pub fn window_resize_step(&self) -> f64 {
+        self.options()
+            .window_resize_step
+            .filter(|step| step.is_finite() && *step > 0.0 && *step <= 1.0)
+            .unwrap_or(0.05)
+    }
+
     pub fn auto_center(&self) -> bool {
         self.options().auto_center.is_some_and(|center| center)
     }
@@ -1300,6 +1309,10 @@ pub struct MainOptions {
     /// to both the horizontal and the vertical resize commands.
     /// Default: true (cycles). Set to false to stop at the limits.
     pub window_resize_cycle: Option<bool>,
+
+    /// The share of the display width or height (0.0-1.0) that the step
+    /// resize commands add or remove. Default: 0.05.
+    pub window_resize_step: Option<f64>,
 
     /// If enabled, an empty virtual workspace will be removed.
     /// Default: true.
