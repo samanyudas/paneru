@@ -1006,6 +1006,104 @@ fn test_focus_display_follows_the_physical_arrangement() {
         ]);
 }
 
+#[test]
+fn test_focus_display_preserves_the_selected_virtual_workspace() {
+    harness_with_display_above()
+        .with_window(101, |data| {
+            data.workspace_id = EXT_WORKSPACE_ID;
+            data.frame = IRect::new(900, -EXT_DISPLAY_HEIGHT + 100, 1300, -100);
+        })
+        .on_iteration(2, |world, _state| {
+            let target = world
+                .query::<(Entity, &Display)>()
+                .iter(world)
+                .find(|(_, display)| display.id() == EXT_DISPLAY_ID)
+                .map(|(entity, _)| entity)
+                .expect("the target display should exist");
+            world
+                .entity_mut(target)
+                .insert(crate::ecs::ActiveDisplayMarker);
+        })
+        .on_iteration(5, |world, state| {
+            assert_focused!(world, 100);
+            let selected = world
+                .query_filtered::<&LayoutStrip, With<crate::ecs::ActiveWorkspaceMarker>>()
+                .single(world)
+                .expect("the target display should have an active workspace");
+            assert_eq!(selected.virtual_index, 1);
+            let source = world
+                .query::<(Entity, &Display)>()
+                .iter(world)
+                .find(|(_, display)| display.id() == TEST_DISPLAY_ID)
+                .map(|(entity, _)| entity)
+                .expect("the source display should exist");
+            world
+                .entity_mut(source)
+                .insert(crate::ecs::ActiveDisplayMarker);
+            state.focus_window(0);
+        })
+        .on_iteration(7, |world, _state| {
+            assert_focused!(world, 100);
+            let selected = world
+                .query_filtered::<&LayoutStrip, With<crate::ecs::ActiveWorkspaceMarker>>()
+                .single(world)
+                .expect("the target display should have an active workspace");
+            assert_eq!(selected.virtual_index, 1);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::FocusDisplay(Direction::North)),
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+            window_command(Operation::Center),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            window_command(Operation::FocusDisplay(Direction::North)),
+        ]);
+}
+
+#[test]
+fn test_focus_display_keeps_the_foreground_native_tab() {
+    for remember_background in [false, true] {
+        harness_with_display_above()
+            .with_window(101, |data| {
+                data.workspace_id = EXT_WORKSPACE_ID;
+                data.frame = IRect::new(900, -EXT_DISPLAY_HEIGHT + 100, 1300, -100);
+            })
+            .on_iteration(1, move |world, state| {
+                let front = find_window_entity(100, world);
+                let back = find_window_entity(101, world);
+                for mut strip in world.query::<&mut LayoutStrip>().iter_mut(world) {
+                    if strip.id() == EXT_WORKSPACE_ID {
+                        strip.append_tab_group(&[front, back]);
+                    }
+                }
+                let mut history = world.resource_mut::<crate::ecs::focus::FocusHistory>();
+                history.forget(front);
+                history.forget(back);
+                if remember_background {
+                    history.record(EXT_WORKSPACE_ID, back, None);
+                }
+                state.window_visible(101, false);
+            })
+            .on_iteration(3, |world, _state| {
+                assert_focused!(world, 100);
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: 0 },
+                window_command(Operation::Focus(Direction::First)),
+                Event::Command {
+                    command: Command::PrintState,
+                },
+                window_command(Operation::FocusDisplay(Direction::North)),
+            ]);
+    }
+}
+
 /// The focused window moves to the display in the pressed direction only.
 #[test]
 fn test_move_to_display_follows_the_physical_arrangement() {

@@ -1278,7 +1278,7 @@ fn focus_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
     active_display: ActiveDisplay,
-    layout_strips: Query<&LayoutStrip>,
+    layout_strips: Query<&LayoutStrip, With<SelectedVirtualMarker>>,
     focus_history: Res<FocusHistory>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
@@ -1302,16 +1302,22 @@ fn focus_display(
     };
     let target_bounds = target.bounds();
 
+    let strip = window_manager
+        .active_display_space(target.id())
+        .ok()
+        .and_then(|id| layout_strips.iter().find(|strip| strip.id() == id));
     let visible = |entity: Entity| {
+        if strip?
+            .tab_group(entity)
+            .is_some_and(|tabs| tabs.first() != Some(&entity))
+        {
+            return None;
+        }
         windows
             .frame(entity)
             .map(|frame| target_bounds.intersect(frame))
             .filter(|visible| !visible.is_empty())
     };
-    let strip = window_manager
-        .active_display_space(target.id())
-        .ok()
-        .and_then(|id| layout_strips.iter().find(|strip| strip.id() == id));
     let entity = strip.and_then(|strip| {
         focus_history
             .last_managed(strip.id())
