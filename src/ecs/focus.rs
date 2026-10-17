@@ -377,7 +377,8 @@ fn autocenter_window_on_focus(
             let visible_fraction = f64::from(meaningful) / f64::from(frame.width().max(1));
             let strip_movement =
                 (clamp_origin_to_viewport(projected, frame.size(), viewport).x - projected.x).abs();
-            if 1.0 - visible_fraction <= hidden_ratio
+            if visible_width > 0
+                && 1.0 - visible_fraction <= hidden_ratio
                 && frame.width() - visible_width >= strip_movement
             {
                 return;
