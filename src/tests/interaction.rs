@@ -121,6 +121,42 @@ fn test_hidden_ratio_focus_during_center_animation_matches_settled_focus() {
 }
 
 #[test]
+fn test_fully_hidden_focus_during_center_animation_matches_settled_focus() {
+    for center_duration in [Duration::from_secs(3), Duration::from_millis(60)] {
+        let config: Config = (
+            MainOptions {
+                continuous_swipe: Some(true),
+                window_hidden_ratio: Some(1.0),
+                animation_speed: Some(8.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(3);
+        harness.run(vec![
+            Event::MenuOpened { window_id: 0 },
+            focus(Direction::First),
+        ]);
+        harness.world().write_message(Event::Command {
+            command: Command::Window(Operation::Center),
+        });
+        harness.advance(center_duration);
+        harness.mock_state.set_focused_window(2);
+        harness
+            .world()
+            .write_message(Event::WindowFocused { window_id: 2 });
+        harness.advance(Duration::from_secs(3));
+        assert_focused!(harness.world(), 2);
+        let x = window_x(harness.world(), 2);
+        assert!(
+            x >= 0 && x + TEST_WINDOW_WIDTH <= TEST_DISPLAY_WIDTH,
+            "fully hidden window must return into view after focus at {center_duration:?}, got x={x}"
+        );
+    }
+}
+
+#[test]
 fn native_fullscreen_transition_removes_window_from_original_strip_without_focus_marker() {
     const FULLSCREEN_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 100;
 
