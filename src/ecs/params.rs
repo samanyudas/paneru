@@ -415,7 +415,7 @@ mod tests {
         assert!(world.run_system_once(active).unwrap());
         world.entity_mut(window).remove::<AwaitingHandle>();
         assert!(!world.run_system_once(active).unwrap());
-        world.entity_mut(window).insert(VerifyWindowSize);
+        world.entity_mut(window).insert(VerifyWindowSize::default());
         assert!(world.run_system_once(active).unwrap());
         world.entity_mut(window).remove::<VerifyWindowSize>();
         assert!(!world.run_system_once(active).unwrap());

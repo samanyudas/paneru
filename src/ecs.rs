@@ -472,8 +472,17 @@ pub enum DockPosition {
 
 /// Asks `window_resize_verifier` to read back a window's native size once no
 /// resize animation or handle recovery is pending for it.
+/// Transient read failures are retried for at most three attempts.
 #[derive(Component)]
-pub struct VerifyWindowSize;
+pub struct VerifyWindowSize {
+    remaining: u8,
+}
+
+impl Default for VerifyWindowSize {
+    fn default() -> Self {
+        Self { remaining: 3 }
+    }
+}
 
 #[derive(Component)]
 pub struct VerifyWindowPosition {

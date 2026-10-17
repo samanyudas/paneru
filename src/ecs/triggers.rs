@@ -51,11 +51,7 @@ type AwaitingWindow = (
     Has<Unmanaged>,
 );
 
-type SizeCheckReady = (
-    With<VerifyWindowSize>,
-    Without<ResizeMarker>,
-    Without<AwaitingHandle>,
-);
+type SizeCheckReady = (Without<ResizeMarker>, Without<AwaitingHandle>);
 
 type AddedWindowDefaults<'w, 's> = Populated<
     'w,
@@ -970,7 +966,8 @@ pub(super) fn recover_window_handles(
             && (window.role().is_ok()
                 || apps
                     .get_mut(child.parent())
-                    .is_ok_and(|mut app| adopt_fresh_handle(&mut window, &mut app, &config)));
+                    .is_ok_and(|mut app| adopt_fresh_handle(&mut window, &mut app, &config)))
+            && (unmanaged || geometry.is_none() || window.update_frame().is_ok());
 
         if !recovered && !deadline.0.is_finished() && !matches!(ordered_in, Ok(false)) {
             continue;
@@ -980,12 +977,11 @@ pub(super) fn recover_window_handles(
             if recovered
                 && !unmanaged
                 && let Some((position, bounds)) = geometry
-                && window.update_frame().is_ok()
             {
                 window.reposition(position.0);
                 window.resize(bounds.0);
                 entity_commands
-                    .try_insert(VerifyWindowSize)
+                    .try_insert(VerifyWindowSize::default())
                     .try_insert_if_new(VerifyWindowPosition::default());
             }
         }
@@ -1570,22 +1566,36 @@ pub(super) fn cleanup_timeout_trigger(
 
 pub(super) fn window_resize_verifier(
     mut removed: RemovedComponents<ResizeMarker>,
-    requested: Query<Entity, SizeCheckReady>,
+    mut requested: Query<(Entity, &mut VerifyWindowSize), SizeCheckReady>,
     mut windows: Query<(&mut Window, &Position, &mut Bounds)>,
     layout_strips: Query<&LayoutStrip>,
     mut commands: Commands,
 ) {
     use std::cmp::Ordering;
-    let removed: EntityHashSet = removed.read().collect();
-    let pending = requested.iter().filter(|entity| !removed.contains(entity));
-    for entity in removed.iter().copied().chain(pending) {
+    let mut pending: EntityHashSet = removed.read().collect();
+    pending.extend(requested.iter().map(|(entity, _)| entity));
+    for entity in pending {
+        let Ok((mut window, _, mut bounds)) = windows.get_mut(entity) else {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<VerifyWindowSize>();
+            }
+            continue;
+        };
+        let frame = window.update_frame();
+        if frame.is_err()
+            && requested
+                .get_mut(entity)
+                .is_ok_and(|(_, mut verification)| {
+                    verification.remaining = verification.remaining.saturating_sub(1);
+                    verification.remaining > 0
+                })
+        {
+            continue;
+        }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<VerifyWindowSize>();
         }
-        let Ok((mut window, _, mut bounds)) = windows.get_mut(entity) else {
-            continue;
-        };
-        let Ok(frame) = window.update_frame() else {
+        let Ok(frame) = frame else {
             continue;
         };
 
@@ -1664,5 +1674,133 @@ where
         Ordering::Greater
     } else {
         Ordering::Equal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_handle_recovery_retries_a_transient_frame_refresh_failure() {
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_millis(2000));
+        harness.advance(Duration::from_millis(20));
+        let entity = find_window_entity(0, harness.world());
+        let mut size = harness.world().get::<Bounds>(entity).unwrap().0;
+        size.x = 800;
+        harness.world().get_mut::<Bounds>(entity).unwrap().0 = size;
+        harness.mock_state.update_window(0, |window| {
+            window.frame_read_failures = 1;
+        });
+        harness
+            .world()
+            .entity_mut(entity)
+            .insert(AwaitingHandle(Timer::new(
+                HANDLE_RECOVERY_TIMEOUT,
+                TimerMode::Once,
+            )));
+        harness
+            .world()
+            .run_system_once(super::recover_window_handles)
+            .unwrap();
+        assert!(
+            harness.world().get::<AwaitingHandle>(entity).is_some(),
+            "a failed frame refresh must not finish recovery"
+        );
+        harness
+            .world()
+            .run_system_once(super::recover_window_handles)
+            .unwrap();
+        assert!(harness.world().get::<AwaitingHandle>(entity).is_none());
+        assert_eq!(harness.mock_state.create_window(0).frame().width(), 800);
+    }
+    use crate::tests::{TestHarness, find_window_entity};
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::math::IVec2;
+    use std::time::Duration;
+
+    #[test]
+    fn test_size_verification_retries_a_transient_read_failure() {
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_millis(2000));
+        let entity = find_window_entity(0, harness.world());
+        let mut size = harness.world().get::<crate::ecs::Bounds>(entity).unwrap().0;
+        size.x = 800;
+        harness.mock_state.update_window(0, |window| {
+            window.maximum_size = Some(IVec2::new(600, 2000));
+            window.frame_read_failures = 1;
+        });
+        harness
+            .world()
+            .get_mut::<Window>(entity)
+            .unwrap()
+            .resize(size);
+        harness
+            .world()
+            .get_mut::<crate::ecs::Bounds>(entity)
+            .unwrap()
+            .0 = size;
+        harness
+            .world()
+            .entity_mut(entity)
+            .insert(crate::ecs::VerifyWindowSize::default());
+        for _ in 0..2 {
+            harness
+                .world()
+                .run_system_once(super::window_resize_verifier)
+                .unwrap();
+        }
+        assert_eq!(
+            harness
+                .world()
+                .get::<crate::ecs::Bounds>(entity)
+                .unwrap()
+                .0
+                .x,
+            600,
+            "a successful retry must reconcile the native size constraint"
+        );
+        assert!(
+            harness
+                .world()
+                .get::<crate::ecs::VerifyWindowSize>(entity)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_size_verification_stops_after_persistent_read_failures() {
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_millis(2000));
+        let entity = find_window_entity(0, harness.world());
+        harness.mock_state.update_window(0, |window| {
+            window.frame_read_failures = u8::MAX;
+        });
+        harness
+            .world()
+            .entity_mut(entity)
+            .insert(crate::ecs::VerifyWindowSize::default());
+        for _ in 0..3 {
+            harness
+                .world()
+                .run_system_once(super::window_resize_verifier)
+                .unwrap();
+        }
+        assert!(
+            harness
+                .world()
+                .get::<crate::ecs::VerifyWindowSize>(entity)
+                .is_none()
+        );
+        assert!(
+            !harness
+                .world()
+                .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
+                .unwrap()
+        );
     }
 }

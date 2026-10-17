@@ -35,6 +35,7 @@ pub(crate) struct MockWindowData {
     pub(crate) pid: Pid,
     pub(crate) frame: IRect,
     pub(crate) maximum_size: Option<Size>,
+    pub(crate) frame_read_failures: u8,
     pub(crate) title: String,
     pub(crate) minimized: bool,
     pub(crate) workspace_id: WorkspaceId,
@@ -62,6 +63,7 @@ impl Default for MockWindowData {
             pid: 0,
             frame: IRect::default(),
             maximum_size: None,
+            frame_read_failures: 0,
             title: String::new(),
             minimized: false,
             workspace_id: 0,
@@ -605,13 +607,17 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_update_frame().returning(move || {
-            s.inner
-                .force_read()
+            let mut inner = s.inner.force_write();
+            let window = inner
                 .windows
-                .get(&id)
+                .get_mut(&id)
                 .filter(|w| w.ax_generation == ax_generation)
-                .map(|w| w.frame)
-                .ok_or(Error::InvalidWindow)
+                .ok_or(Error::InvalidWindow)?;
+            if window.frame_read_failures > 0 {
+                window.frame_read_failures -= 1;
+                return Err(Error::InvalidWindow);
+            }
+            Ok(window.frame)
         });
 
         let s = self.clone();
