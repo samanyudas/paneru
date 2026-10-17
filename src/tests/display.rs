@@ -1133,6 +1133,122 @@ fn test_move_to_display_follows_the_physical_arrangement() {
 }
 
 #[test]
+fn test_move_to_display_round_trip_refits_source_strip_with_continuous_swipe() {
+    assert_display_round_trip_refits_source_strip(true);
+}
+
+#[test]
+fn test_move_to_display_round_trip_refits_source_strip_without_continuous_swipe() {
+    assert_display_round_trip_refits_source_strip(false);
+}
+
+fn assert_display_round_trip_refits_source_strip(continuous_swipe: bool) {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(false),
+            continuous_swipe: Some(continuous_swipe),
+            padding_left: Some(4),
+            padding_right: Some(4),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 1440, 2048, 2772),
+            vec![TEST_WORKSPACE_ID],
+        )
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, 0, 2560, 1440),
+            vec![EXT_WORKSPACE_ID],
+        );
+
+    for (id, x, width) in [(1, 4, 508), (2, 512, 890), (3, 1402, 508)] {
+        harness = harness.with_workspace_window(id, TEST_WORKSPACE_ID, |window| {
+            window.frame = IRect::new(x, 1460, x + width, 2772);
+        });
+    }
+    harness = harness.with_workspace_window(0, EXT_WORKSPACE_ID, |window| {
+        window.frame = IRect::new(996, 20, 1706, 1440);
+    });
+
+    harness
+        .on_iteration(2, |world, state| {
+            assert_focused!(world, 0);
+            assert_window_at!(world, 1, 4, 1460);
+            assert_window_at!(world, 2, 512, 1460);
+            assert_window_at!(world, 3, 1402, 1460);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(4, |world, state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            state.update_window(0, |window| window.workspace_id = TEST_WORKSPACE_ID);
+            state.os_activate_display(TEST_DISPLAY_ID);
+        })
+        .on_iteration(5, |world, state| {
+            assert_focused!(world, 0);
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_eq!(state.active_display(), TEST_DISPLAY_ID);
+            let first = find_window_entity(1, world);
+            assert!(
+                world.get::<Window>(first).unwrap().frame().min.x < 4,
+                "inserting the fourth column must scroll the overflowing strip"
+            );
+        })
+        .on_iteration(6, |world, state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            state.update_window(0, |window| window.workspace_id = EXT_WORKSPACE_ID);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(7, |world, state| {
+            assert_focused!(world, 0);
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_eq!(state.active_display(), EXT_DISPLAY_ID);
+
+            let frames: Vec<_> = [1, 2, 3]
+                .into_iter()
+                .map(|id| {
+                    assert_on_workspace!(world, id, TEST_WORKSPACE_ID);
+                    let entity = find_window_entity(id, world);
+                    world.get::<Window>(entity).unwrap().frame()
+                })
+                .collect();
+            assert_eq!(
+                frames.iter().map(IRect::width).collect::<Vec<_>>(),
+                vec![508, 890, 508],
+                "the surviving columns must retain their widths"
+            );
+            assert!(
+                frames.iter().all(|frame| frame.min.x >= 4 && frame.max.x <= 2044),
+                "all three surviving columns fit and must remain visible after the round trip: {frames:?}"
+            );
+            assert_eq!(frames[1].min.x - frames[0].min.x, 508);
+            assert_eq!(frames[2].min.x - frames[1].min.x, 890);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 1 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::FocusDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            window_command(Operation::MoveToDisplay(Direction::South)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+#[test]
 fn test_move_to_display_keeps_focus_when_the_app_rebuilds_the_ax_element() {
     let moved = Rc::new(Cell::new(None));
     let recorded = moved.clone();
