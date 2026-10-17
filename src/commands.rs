@@ -796,15 +796,26 @@ fn resize_window(
     let new_width = round_px(next_ratio * f64::from(viewport.width()));
     let size = Size::new(new_width, frame.height());
 
-    let origin = clamp_origin_to_viewport(
+    let mut origin = clamp_origin_to_viewport(
         IRect::from_center_size(frame.center(), size).min,
         size,
         viewport,
     );
+    let strip = active_display.active_strip();
+    if !config.auto_center() {
+        if strip.index_of(entity).ok() == Some(0) && frame.min.x == viewport.min.x {
+            origin.x = viewport.min.x;
+        } else if strip
+            .last()
+            .is_ok_and(|column| column.window_iter().any(|window| window == entity))
+            && frame.max.x == viewport.max.x
+        {
+            origin.x = viewport.max.x - new_width;
+        }
+    }
     commands.reposition_entity(entity, origin);
 
     // Resize all windows in the column so stacked siblings share the new width.
-    let strip = active_display.active_strip();
     if let Some(Column::Stack(stack)) = strip
         .index_of(entity)
         .ok()
