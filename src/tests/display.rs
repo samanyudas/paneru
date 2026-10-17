@@ -1322,6 +1322,32 @@ fn test_source_refit_preserves_overflow_and_auto_center_anchoring() {
 }
 
 #[test]
+fn test_source_refit_preserves_fixed_edge_after_stale_center() {
+    let mut harness = display_round_trip_harness(
+        MainOptions {
+            continuous_swipe: Some(false),
+            ..Default::default()
+        },
+        0,
+        890,
+    );
+    harness.run(vec![
+        Event::MenuOpened { window_id: 1 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::Center),
+    ]);
+    assert_eq!(source_frames(&harness)[0].min.x, 770);
+    harness.run(vec![window_command(Operation::MoveToDisplay(
+        Direction::North,
+    ))]);
+    assert_eq!(
+        source_frames(&harness)[1].min.x,
+        4,
+        "removing a centered column must restore the noncontinuous left edge"
+    );
+}
+
+#[test]
 fn test_source_refit_discards_stale_center_placement() {
     let mut harness = source_strip_after_arrival(MainOptions::default(), 0, 890);
     harness.run(vec![window_command(Operation::Center)]);
@@ -1381,10 +1407,27 @@ fn test_source_refit_preserves_a_fitting_pending_target() {
 
 #[test]
 fn test_source_refit_survives_delayed_stay_focus_during_animation() {
-    let mut harness = source_strip_after_arrival(MainOptions::default(), 0, 890);
+    assert_source_refit_survives_delayed_stay_focus(0.0);
+}
+
+#[test]
+fn test_source_refit_survives_delayed_stay_focus_with_hidden_ratio() {
+    assert_source_refit_survives_delayed_stay_focus(0.5);
+}
+
+fn assert_source_refit_survives_delayed_stay_focus(hidden_ratio: f64) {
+    let mut harness = source_strip_after_arrival(
+        MainOptions {
+            window_hidden_ratio: Some(hidden_ratio),
+            ..Default::default()
+        },
+        0,
+        890,
+    );
     let config: Config = (
         MainOptions {
             animation_speed: Some(8.0),
+            window_hidden_ratio: Some(hidden_ratio),
             padding_left: Some(4),
             padding_right: Some(4),
             ..Default::default()

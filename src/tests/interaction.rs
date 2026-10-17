@@ -49,6 +49,78 @@ fn test_auto_center_keeps_new_focus_centered_during_strip_animation() {
 }
 
 #[test]
+fn test_fixed_edge_focus_during_center_animation_matches_settled_focus() {
+    for center_duration in [Duration::from_secs(3), Duration::from_millis(60)] {
+        let config: Config = (
+            MainOptions {
+                continuous_swipe: Some(false),
+                animation_speed: Some(8.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(2);
+        harness.run(vec![
+            Event::MenuOpened { window_id: 0 },
+            focus(Direction::First),
+        ]);
+        harness.world().write_message(Event::Command {
+            command: Command::Window(Operation::Center),
+        });
+        harness.advance(center_duration);
+        harness.mock_state.set_focused_window(1);
+        harness
+            .world()
+            .write_message(Event::WindowFocused { window_id: 1 });
+        harness.advance(Duration::from_secs(3));
+        assert_focused!(harness.world(), 1);
+        assert_eq!(
+            window_x(harness.world(), 0),
+            0,
+            "focus timing {center_duration:?}"
+        );
+    }
+}
+
+#[test]
+fn test_hidden_ratio_focus_during_center_animation_matches_settled_focus() {
+    for center_duration in [Duration::from_secs(3), Duration::from_millis(60)] {
+        let config: Config = (
+            MainOptions {
+                continuous_swipe: Some(true),
+                window_hidden_ratio: Some(0.5),
+                animation_speed: Some(8.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(3);
+        harness.run(vec![
+            Event::MenuOpened { window_id: 0 },
+            focus(Direction::East),
+        ]);
+        assert_focused!(harness.world(), 1);
+        harness.world().write_message(Event::Command {
+            command: Command::Window(Operation::Center),
+        });
+        harness.advance(center_duration);
+        harness.mock_state.set_focused_window(0);
+        harness
+            .world()
+            .write_message(Event::WindowFocused { window_id: 0 });
+        harness.advance(Duration::from_secs(3));
+        assert_focused!(harness.world(), 0);
+        assert_eq!(
+            window_x(harness.world(), 0),
+            -88,
+            "focus timing {center_duration:?}"
+        );
+    }
+}
+
+#[test]
 fn native_fullscreen_transition_removes_window_from_original_strip_without_focus_marker() {
     const FULLSCREEN_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 100;
 
