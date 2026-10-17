@@ -1142,14 +1142,16 @@ fn test_move_to_display_round_trip_refits_source_strip_without_continuous_swipe(
     assert_display_round_trip_refits_source_strip(false);
 }
 
-fn assert_display_round_trip_refits_source_strip(continuous_swipe: bool) {
+fn display_round_trip_harness(
+    options: MainOptions,
+    origin_x: i32,
+    middle_width: i32,
+) -> TestHarness {
     let config: Config = (
         MainOptions {
-            auto_center: Some(false),
-            continuous_swipe: Some(continuous_swipe),
             padding_left: Some(4),
             padding_right: Some(4),
-            ..Default::default()
+            ..options
         },
         vec![],
     )
@@ -1158,7 +1160,7 @@ fn assert_display_round_trip_refits_source_strip(continuous_swipe: bool) {
         .with_config(config)
         .with_display(
             TEST_DISPLAY_ID,
-            IRect::new(0, 1440, 2048, 2772),
+            IRect::new(origin_x, 1440, origin_x + 2048, 2772),
             vec![TEST_WORKSPACE_ID],
         )
         .with_display(
@@ -1167,15 +1169,30 @@ fn assert_display_round_trip_refits_source_strip(continuous_swipe: bool) {
             vec![EXT_WORKSPACE_ID],
         );
 
-    for (id, x, width) in [(1, 4, 508), (2, 512, 890), (3, 1402, 508)] {
+    for (id, x, width) in [
+        (1, 4, 508),
+        (2, 512, middle_width),
+        (3, 512 + middle_width, 508),
+    ] {
         harness = harness.with_workspace_window(id, TEST_WORKSPACE_ID, |window| {
-            window.frame = IRect::new(x, 1460, x + width, 2772);
+            window.frame = IRect::new(origin_x + x, 1460, origin_x + x + width, 2772);
         });
     }
-    harness = harness.with_workspace_window(0, EXT_WORKSPACE_ID, |window| {
+    harness.with_workspace_window(0, EXT_WORKSPACE_ID, |window| {
         window.frame = IRect::new(996, 20, 1706, 1440);
-    });
+    })
+}
 
+fn assert_display_round_trip_refits_source_strip(continuous_swipe: bool) {
+    let harness = display_round_trip_harness(
+        MainOptions {
+            auto_center: Some(false),
+            continuous_swipe: Some(continuous_swipe),
+            ..Default::default()
+        },
+        0,
+        890,
+    );
     harness
         .on_iteration(2, |world, state| {
             assert_focused!(world, 0);
@@ -1246,6 +1263,160 @@ fn assert_display_round_trip_refits_source_strip(continuous_swipe: bool) {
                 command: Command::PrintState,
             },
         ]);
+}
+
+fn source_strip_after_arrival(
+    options: MainOptions,
+    origin_x: i32,
+    middle_width: i32,
+) -> TestHarness {
+    let mut harness = display_round_trip_harness(options, origin_x, middle_width);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 1 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::FocusDisplay(Direction::North)),
+    ]);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.run(vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        window_command(Operation::MoveToDisplay(Direction::South)),
+    ]);
+    harness
+        .mock_state
+        .update_window(0, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(TEST_DISPLAY_ID);
+    harness.advance(Duration::from_millis(500));
+    assert_focused!(harness.world(), 0);
+    assert_on_workspace!(harness.world(), 0, TEST_WORKSPACE_ID);
+    harness
+}
+
+fn source_frames(harness: &TestHarness) -> [IRect; 3] {
+    [1, 2, 3].map(|id| harness.mock_state.create_window(id).frame())
+}
+
+#[test]
+fn test_source_refit_preserves_overflow_and_auto_center_anchoring() {
+    for (auto_center, middle_width) in [(false, 1400), (true, 890)] {
+        let mut harness = source_strip_after_arrival(
+            MainOptions {
+                auto_center: Some(auto_center),
+                ..Default::default()
+            },
+            0,
+            middle_width,
+        );
+        let before = source_frames(&harness);
+        assert!(before[2].min.x >= 4 && before[2].max.x <= 2044);
+        harness.run(vec![window_command(Operation::MoveToDisplay(
+            Direction::North,
+        ))]);
+        assert_eq!(
+            source_frames(&harness),
+            before,
+            "source neighbour anchoring must remain unchanged"
+        );
+    }
+}
+
+#[test]
+fn test_source_refit_discards_stale_center_placement() {
+    let mut harness = source_strip_after_arrival(MainOptions::default(), 0, 890);
+    harness.run(vec![window_command(Operation::Center)]);
+    assert!(source_frames(&harness)[0].min.x < 4);
+    harness.run(vec![window_command(Operation::MoveToDisplay(
+        Direction::North,
+    ))]);
+    assert!(
+        source_frames(&harness)
+            .iter()
+            .all(|frame| frame.min.x >= 4 && frame.max.x <= 2044)
+    );
+}
+
+#[test]
+fn test_source_refit_uses_nonzero_viewport_and_ignores_hidden_ratio() {
+    let mut harness = source_strip_after_arrival(
+        MainOptions {
+            window_hidden_ratio: Some(1.0),
+            ..Default::default()
+        },
+        -2048,
+        890,
+    );
+    harness.run(vec![window_command(Operation::MoveToDisplay(
+        Direction::North,
+    ))]);
+    assert!(
+        source_frames(&harness)
+            .iter()
+            .all(|frame| frame.min.x >= -2044 && frame.max.x <= -4)
+    );
+}
+
+#[test]
+fn test_source_refit_preserves_a_fitting_pending_target() {
+    let mut harness = source_strip_after_arrival(MainOptions::default(), 0, 890);
+    let world = harness.world();
+    let strip = world
+        .query::<(Entity, &LayoutStrip)>()
+        .iter(world)
+        .find(|(_, strip)| strip.id() == TEST_WORKSPACE_ID)
+        .unwrap()
+        .0;
+    world
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(IVec2::new(100, 1460)));
+    harness.run(vec![window_command(Operation::MoveToDisplay(
+        Direction::North,
+    ))]);
+    assert_eq!(
+        source_frames(&harness)[0].min.x,
+        100,
+        "an already fitting target needs no correction"
+    );
+}
+
+#[test]
+fn test_source_refit_survives_delayed_stay_focus_during_animation() {
+    let mut harness = source_strip_after_arrival(MainOptions::default(), 0, 890);
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(8.0),
+            padding_left: Some(4),
+            padding_right: Some(4),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    harness.world().insert_resource(config);
+    harness
+        .world()
+        .write_message(window_command(Operation::ToNextDisplay(MoveFocus::Stay)));
+    harness.advance(Duration::from_millis(60));
+    harness
+        .mock_state
+        .update_window(0, |window| window.workspace_id = EXT_WORKSPACE_ID);
+    assert!(
+        source_frames(&harness)[0].min.x < 4,
+        "the focus event must arrive before the animation finishes"
+    );
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 3 });
+    harness.advance(Duration::from_millis(2000));
+    assert_focused!(harness.world(), 3);
+    assert_eq!(harness.mock_state.active_display(), TEST_DISPLAY_ID);
+    assert!(
+        source_frames(&harness)
+            .iter()
+            .all(|frame| frame.min.x >= 4 && frame.max.x <= 2044),
+        "delayed source focus must not stop the fitting correction: {:?}",
+        source_frames(&harness)
+    );
 }
 
 #[test]
