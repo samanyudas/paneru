@@ -157,6 +157,57 @@ fn test_fully_hidden_focus_during_center_animation_matches_settled_focus() {
 }
 
 #[test]
+fn test_edge_touching_focus_during_center_animation_returns_into_view() {
+    let mut placements = Vec::new();
+    for (centered, focused) in [(0, 2), (2, 0)] {
+        for center_duration in [Duration::from_secs(3), Duration::from_millis(60)] {
+            let config: Config = (
+                MainOptions {
+                    continuous_swipe: Some(true),
+                    window_hidden_ratio: Some(1.0),
+                    animation_speed: Some(8.0),
+                    ..Default::default()
+                },
+                vec![],
+            )
+                .into();
+            let mut harness = TestHarness::new()
+                .with_config(config)
+                .with_window(0, |window| window.frame.max.x = 512)
+                .with_window(1, |window| window.frame.max.x = 256)
+                .with_window(2, |window| window.frame.max.x = 512);
+            harness.run(vec![
+                Event::MenuOpened { window_id: 0 },
+                focus(if centered == 0 {
+                    Direction::First
+                } else {
+                    Direction::Last
+                }),
+            ]);
+            assert_focused!(harness.world(), centered);
+            harness.world().write_message(Event::Command {
+                command: Command::Window(Operation::Center),
+            });
+            harness.advance(center_duration);
+            harness.mock_state.set_focused_window(focused);
+            harness
+                .world()
+                .write_message(Event::WindowFocused { window_id: focused });
+            harness.advance(Duration::from_secs(3));
+            assert_focused!(harness.world(), focused);
+            let x = window_x(harness.world(), focused);
+            placements.push((focused, center_duration, x));
+        }
+    }
+    assert!(
+        placements
+            .iter()
+            .all(|(_, _, x)| *x >= 0 && *x + 512 <= TEST_DISPLAY_WIDTH),
+        "edge-touching windows must return into view after focus, got {placements:?}"
+    );
+}
+
+#[test]
 fn native_fullscreen_transition_removes_window_from_original_strip_without_focus_marker() {
     const FULLSCREEN_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 100;
 
