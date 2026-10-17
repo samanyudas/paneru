@@ -1488,6 +1488,7 @@ fn test_late_handle_reconciles_native_size_constraints() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn test_late_handle_keeps_width_ratio_after_active_display_changes() {
     let mut harness = harness_with_display_above().with_window(1, |_| {});
     harness.run(vec![
