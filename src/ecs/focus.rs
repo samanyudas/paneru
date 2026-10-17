@@ -331,7 +331,7 @@ fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
     restored: Query<&RestoreFocusMarker>,
-    moving_strips: Query<(), (With<LayoutStrip>, With<RepositionMarker>)>,
+    moving_strips: Query<&RepositionMarker, With<LayoutStrip>>,
     global_state: GlobalState,
     active_display: ActiveDisplay,
     mut ctx: WindowCtx,
@@ -360,7 +360,25 @@ fn autocenter_window_on_focus(
         origin.x = center.x - size.x / 2;
         ctx.commands.reposition_entity(entity, origin);
     }
-    if !ctx.config.auto_center() && moving_strips.contains(active_display.active_strip_entity()) {
+    if !ctx.config.auto_center()
+        && ctx.config.continuous_swipe()
+        && let Ok(target) = moving_strips.get(active_display.active_strip_entity())
+    {
+        let hidden_ratio = ctx.config.window_hidden_ratio();
+        if hidden_ratio > 0.0
+            && let Some(slot) = ctx.windows.layout_position(entity)
+            && let Some(frame) = ctx.windows.moving_frame(entity)
+        {
+            let projected = slot.0 + target.0;
+            let frame = IRect::from_corners(projected, projected + frame.size());
+            let viewport = active_display.actual_bounds(&ctx.config);
+            let visible_width = viewport.intersect(frame).width();
+            let meaningful = (visible_width - ctx.config.sliver_width()).max(0);
+            let visible_fraction = f64::from(meaningful) / f64::from(frame.width().max(1));
+            if 1.0 - visible_fraction <= hidden_ratio {
+                return;
+            }
+        }
         ctx.commands.ensure_visible(entity);
     } else {
         ctx.commands.reshuffle_around(entity);
