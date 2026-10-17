@@ -1,5 +1,5 @@
 use bevy::ecs::change_detection::DetectChangesMut;
-use bevy::ecs::entity::Entity;
+use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::message::{MessageReader, MessageWriter};
@@ -7,6 +7,7 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::system::{Commands, NonSendMut, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
+use bevy::time::{Time, Timer, TimerMode};
 use notify::event::{DataChange, MetadataKind, ModifyKind};
 use notify::{EventKind, Watcher};
 use std::cmp::Ordering;
@@ -14,9 +15,9 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive,
-    PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme,
-    Timeout, Unmanaged,
+    ActiveDisplayMarker, AwaitingHandle, BProcess, FocusedMarker, FreshMarker,
+    MissionControlActive, PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger,
+    StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -27,7 +28,7 @@ use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
     ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    VerifyWindowPosition, WidthRatio, WindowProperties,
+    VerifyWindowPosition, VerifyWindowSize, WidthRatio, WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -40,6 +41,17 @@ use crate::util::{round_px, symlink_target};
 /// give the usable viewport a window has to be fitted into.
 type ActiveDisplayViewport<'w, 's> =
     Single<'w, 's, (&'static Display, Option<&'static DockPosition>), With<ActiveDisplayMarker>>;
+
+type AwaitingWindow = (
+    Entity,
+    &'static mut Window,
+    &'static ChildOf,
+    &'static mut AwaitingHandle,
+    Option<(&'static Position, &'static Bounds)>,
+    Has<Unmanaged>,
+);
+
+type SizeCheckReady = (Without<ResizeMarker>, Without<AwaitingHandle>);
 
 type AddedWindowDefaults<'w, 's> = Populated<
     'w,
@@ -898,6 +910,110 @@ pub(super) fn window_managed_trigger(
     ctx.commands.reshuffle_around(entity);
 }
 
+const HANDLE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Defers ambiguous SLS destruction while the window remains ordered in.
+pub(super) fn claim_replaced_window_handles(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    for event in messages.read() {
+        let Event::WindowDestroyed {
+            window_id,
+            source: DestroySource::SpaceNotification,
+        } = event
+        else {
+            continue;
+        };
+        let Some((window, entity)) = windows.find(*window_id) else {
+            continue;
+        };
+        if window.role().is_err()
+            && matches!(window_manager.window_ordered_in(*window_id), Ok(true))
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            debug!("Window {window_id} is still ordered in with a dead AX element.");
+            entity_commands.try_insert_if_new(AwaitingHandle(Timer::new(
+                HANDLE_RECOVERY_TIMEOUT,
+                TimerMode::Once,
+            )));
+        }
+    }
+}
+
+/// Replaces stale AX handles while preserving window entities and layout state.
+///
+/// Geometry committed while the handle was dead never reached the window, and
+/// `Changed<Bounds>`/`Changed<Position>` will not fire again for it, so a
+/// recovered managed window gets its current layout frame written directly.
+/// Writing here instead of marking the components changed keeps
+/// `window_resize_verifier` from reading the stale native size back into `Bounds`.
+pub(super) fn recover_window_handles(
+    awaiting: Populated<AwaitingWindow>,
+    mut apps: Query<&mut Application>,
+    window_manager: Res<WindowManager>,
+    config: Res<Config>,
+    clock: Res<Time>,
+    mut commands: Commands,
+) {
+    for (entity, mut window, child, mut deadline, geometry, unmanaged) in awaiting {
+        deadline.0.tick(clock.delta());
+        let window_id = window.id();
+        let ordered_in = window_manager.window_ordered_in(window_id);
+        let handle_recovered = matches!(ordered_in, Ok(true))
+            && (window.role().is_ok()
+                || apps
+                    .get_mut(child.parent())
+                    .is_ok_and(|mut app| adopt_fresh_handle(&mut window, &mut app, &config)));
+        let frame_ready =
+            handle_recovered && (unmanaged || geometry.is_none() || window.update_frame().is_ok());
+
+        if !frame_ready && !deadline.0.is_finished() && !matches!(ordered_in, Ok(false)) {
+            continue;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<AwaitingHandle>();
+            if frame_ready
+                && !unmanaged
+                && let Some((position, bounds)) = geometry
+            {
+                window.reposition(position.0);
+                window.resize(bounds.0);
+                entity_commands
+                    .try_insert(VerifyWindowSize::default())
+                    .try_insert_if_new(VerifyWindowPosition::default());
+            }
+        }
+        if !handle_recovered {
+            debug!("Window {window_id} has no new AX element; closing it.");
+            commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
+                window_id,
+                source: DestroySource::Accessibility { element: None },
+            }));
+        }
+    }
+}
+
+fn adopt_fresh_handle(window: &mut Window, app: &mut Application, config: &Config) -> bool {
+    let window_id = window.id();
+    let Some(old) = app
+        .window_list(config)
+        .into_iter()
+        .filter(|fresh| fresh.id() == window_id && fresh.role().is_ok())
+        .find_map(|fresh| window.replace_handle(fresh).ok())
+    else {
+        return false;
+    };
+    debug!("Window {window_id} has a new AX element; keeping its entity.");
+    app.unobserve_window(&old);
+    if app.observe_window(window).is_err() {
+        warn!("Error observing window {window_id}.");
+    }
+    true
+}
+
 /// Handles the event when a window is destroyed. The windows itself is not removed from the layout
 /// strip. This happens in the On<Remove, Window> trigger.
 ///
@@ -907,8 +1023,8 @@ pub(super) fn window_managed_trigger(
 /// * `active_display` - The active display and its layout strip.
 /// * `apps` - A query for all applications.
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
-/// * `focus_history` - Per-workspace record of what was focused last.
 /// * `windows` - A query for all windows with their parent.
+/// * `awaiting` - Windows waiting for the app to replace their AX element.
 /// * `commands` - Bevy commands to despawn entities and trigger events.
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn window_destroyed_trigger(
@@ -916,8 +1032,8 @@ pub(super) fn window_destroyed_trigger(
     active_display: ActiveDisplay,
     mut apps: Query<&mut Application>,
     mut global_state: GlobalState,
-    mut focus_history: ResMut<FocusHistory>,
     windows: Windows,
+    awaiting: Query<(), With<AwaitingHandle>>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
@@ -938,12 +1054,23 @@ pub(super) fn window_destroyed_trigger(
         // the app's AX window list is still warm for a moment after the close. Re-checking them
         // raced the window back to life, leaving the entity in the strip and a permanent gap where
         // the window had been.
-        if matches!(source, DestroySource::SpaceNotification) && window.role().is_ok() {
-            debug!(
-                "Window {} still present, this was SLS workspace change.",
-                window.id()
-            );
-            continue;
+        match source {
+            DestroySource::SpaceNotification
+                if awaiting.contains(entity) || window.role().is_ok() =>
+            {
+                debug!(
+                    "Window {} still present, this was SLS workspace change.",
+                    window.id()
+                );
+                continue;
+            }
+            DestroySource::Accessibility {
+                element: Some(element),
+            } if !window.is_current_element(element) => {
+                debug!("Window {window_id} lost a replaced AX element.");
+                continue;
+            }
+            _ => {}
         }
 
         let Ok(mut app) = apps.get_mut(parent) else {
@@ -961,7 +1088,6 @@ pub(super) fn window_destroyed_trigger(
             &mut global_state,
             &mut commands,
         );
-        focus_history.forget(entity);
 
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_despawn();
@@ -1404,8 +1530,10 @@ pub(super) fn refresh_configuration_trigger(
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
     mut workspaces: Query<&mut LayoutStrip>,
+    mut focus_history: ResMut<FocusHistory>,
 ) {
     let entity = trigger.event().entity;
+    focus_history.forget(entity);
 
     if let Some(mut strip) = workspaces.iter_mut().find(|strip| strip.contains(entity)) {
         debug!(
@@ -1439,16 +1567,36 @@ pub(super) fn cleanup_timeout_trigger(
 
 pub(super) fn window_resize_verifier(
     mut removed: RemovedComponents<ResizeMarker>,
+    mut requested: Query<(Entity, &mut VerifyWindowSize), SizeCheckReady>,
     mut windows: Query<(&mut Window, &Position, &mut Bounds)>,
     layout_strips: Query<&LayoutStrip>,
     mut commands: Commands,
 ) {
     use std::cmp::Ordering;
-    for entity in removed.read() {
+    let mut pending: EntityHashSet = removed.read().collect();
+    pending.extend(requested.iter().map(|(entity, _)| entity));
+    for entity in pending {
         let Ok((mut window, _, mut bounds)) = windows.get_mut(entity) else {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<VerifyWindowSize>();
+            }
             continue;
         };
-        let Ok(frame) = window.update_frame() else {
+        let frame = window.update_frame();
+        if frame.is_err()
+            && requested
+                .get_mut(entity)
+                .is_ok_and(|(_, mut verification)| {
+                    verification.remaining = verification.remaining.saturating_sub(1);
+                    verification.remaining > 0
+                })
+        {
+            continue;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<VerifyWindowSize>();
+        }
+        let Ok(frame) = frame else {
             continue;
         };
 
@@ -1527,5 +1675,163 @@ where
         Ordering::Greater
     } else {
         Ordering::Equal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::{TestHarness, find_window_entity};
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::math::IVec2;
+    use std::time::Duration;
+
+    #[test]
+    fn test_persistent_frame_refresh_failure_keeps_the_live_window() {
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_millis(2000));
+        let entity = find_window_entity(0, harness.world());
+        harness.mock_state.update_window(0, |window| {
+            window.frame_read_failures = u8::MAX;
+        });
+        harness
+            .world()
+            .entity_mut(entity)
+            .insert(AwaitingHandle(Timer::new(
+                HANDLE_RECOVERY_TIMEOUT,
+                TimerMode::Once,
+            )));
+        harness.advance(Duration::from_millis(1500));
+        assert!(
+            harness.world().get::<Window>(entity).is_some(),
+            "an ordered-in window with a valid handle must not be closed"
+        );
+        assert!(harness.world().get::<AwaitingHandle>(entity).is_none());
+        assert!(
+            !harness
+                .world()
+                .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
+                .unwrap()
+        );
+        crate::assert_focused!(harness.world(), 0);
+    }
+
+    #[test]
+    fn test_handle_recovery_retries_a_transient_frame_refresh_failure() {
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_millis(2000));
+        harness.advance(Duration::from_millis(20));
+        let entity = find_window_entity(0, harness.world());
+        let mut size = harness.world().get::<Bounds>(entity).unwrap().0;
+        size.x = 800;
+        harness.world().get_mut::<Bounds>(entity).unwrap().0 = size;
+        harness.mock_state.update_window(0, |window| {
+            window.frame_read_failures = 1;
+        });
+        harness
+            .world()
+            .entity_mut(entity)
+            .insert(AwaitingHandle(Timer::new(
+                HANDLE_RECOVERY_TIMEOUT,
+                TimerMode::Once,
+            )));
+        harness
+            .world()
+            .run_system_once(super::recover_window_handles)
+            .unwrap();
+        assert!(
+            harness.world().get::<AwaitingHandle>(entity).is_some(),
+            "a failed frame refresh must not finish recovery"
+        );
+        harness
+            .world()
+            .run_system_once(super::recover_window_handles)
+            .unwrap();
+        assert!(harness.world().get::<AwaitingHandle>(entity).is_none());
+        assert_eq!(harness.mock_state.create_window(0).frame().width(), 800);
+    }
+    #[test]
+    fn test_size_verification_retries_a_transient_read_failure() {
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_millis(2000));
+        let entity = find_window_entity(0, harness.world());
+        let mut size = harness.world().get::<crate::ecs::Bounds>(entity).unwrap().0;
+        size.x = 800;
+        harness.mock_state.update_window(0, |window| {
+            window.maximum_size = Some(IVec2::new(600, 2000));
+            window.frame_read_failures = 1;
+        });
+        harness
+            .world()
+            .get_mut::<Window>(entity)
+            .unwrap()
+            .resize(size);
+        harness
+            .world()
+            .get_mut::<crate::ecs::Bounds>(entity)
+            .unwrap()
+            .0 = size;
+        harness
+            .world()
+            .entity_mut(entity)
+            .insert(crate::ecs::VerifyWindowSize::default());
+        for _ in 0..2 {
+            harness
+                .world()
+                .run_system_once(super::window_resize_verifier)
+                .unwrap();
+        }
+        assert_eq!(
+            harness
+                .world()
+                .get::<crate::ecs::Bounds>(entity)
+                .unwrap()
+                .0
+                .x,
+            600,
+            "a successful retry must reconcile the native size constraint"
+        );
+        assert!(
+            harness
+                .world()
+                .get::<crate::ecs::VerifyWindowSize>(entity)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_size_verification_stops_after_persistent_read_failures() {
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_millis(2000));
+        let entity = find_window_entity(0, harness.world());
+        harness.mock_state.update_window(0, |window| {
+            window.frame_read_failures = u8::MAX;
+        });
+        harness
+            .world()
+            .entity_mut(entity)
+            .insert(crate::ecs::VerifyWindowSize::default());
+        for _ in 0..3 {
+            harness
+                .world()
+                .run_system_once(super::window_resize_verifier)
+                .unwrap();
+        }
+        assert!(
+            harness
+                .world()
+                .get::<crate::ecs::VerifyWindowSize>(entity)
+                .is_none()
+        );
+        assert!(
+            !harness
+                .world()
+                .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
+                .unwrap()
+        );
     }
 }

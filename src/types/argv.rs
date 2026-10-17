@@ -79,14 +79,20 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         ),
         "grow" => Operation::Resize(ResizeDirection::Grow),
         "shrink" => Operation::Resize(ResizeDirection::Shrink),
+        // `window_step_grow` / `_shrink`, growing when the direction is absent.
+        "step" => Operation::ResizeStep(resize_direction_or_grow(argv.get(1).copied())?),
         // `window_vertical_resize` / `_grow` / `_shrink`, plus the explicit
-        // `window_vertical_resize_shrink` mirroring `window_resize_shrink`.
-        "vertical" => Operation::ResizeVertical(match argv.get(1).copied() {
-            None | Some("resize") => argv
-                .get(2)
-                .map_or(Ok(ResizeDirection::Grow), |arg| ResizeDirection::parse(arg))?,
-            Some(arg) => ResizeDirection::parse(arg)?,
-        }),
+        // `window_vertical_resize_shrink` mirroring `window_resize_shrink`, and
+        // `window_vertical_step_grow` / `_shrink`.
+        "vertical" => match argv.get(1).copied() {
+            None | Some("resize") => {
+                Operation::ResizeVertical(resize_direction_or_grow(argv.get(2).copied())?)
+            }
+            Some("step") => {
+                Operation::ResizeVerticalStep(resize_direction_or_grow(argv.get(2).copied())?)
+            }
+            Some(arg) => Operation::ResizeVertical(ResizeDirection::parse(arg)?),
+        },
         "fullwidth" => Operation::FullWidth,
         "manage" => Operation::Manage,
         "equalize" => Operation::Equalize,
@@ -96,6 +102,8 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "tabbeddisplay" => Operation::ToggleTabbedDisplay,
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
+        "focusdisplay" => Operation::FocusDisplay(Direction::parse_compass(argument()?)?),
+        "movedisplay" => Operation::MoveToDisplay(Direction::parse_compass(argument()?)?),
         "snap" => Operation::Snap,
         "copyrule" => Operation::CopyRule,
         // The `virtual*` verbs take either a direction or a workspace number,
@@ -126,6 +134,11 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         ),
         _ => return Err(err()),
     })
+}
+
+/// The resize verbs grow when the direction is omitted.
+fn resize_direction_or_grow(argument: Option<&str>) -> Result<ResizeDirection> {
+    argument.map_or(Ok(ResizeDirection::Grow), ResizeDirection::parse)
 }
 
 /// `stack` and `unstack` keep their original meaning when the side is omitted.
@@ -191,11 +204,21 @@ impl Operation {
             Operation::ResizeVertical(direction) => {
                 owned(&["vertical", "resize", direction.token()])
             }
+            Operation::ResizeStep(direction) => owned(&["step", direction.token()]),
+            Operation::ResizeVerticalStep(direction) => {
+                owned(&["vertical", "step", direction.token()])
+            }
             // `SetWidth` comes from window rules, not from a command line; it has
             // no argv verb, so encode it as the equivalent full-width toggle.
             Operation::SetWidth(_) | Operation::FullWidth => owned(&["fullwidth"]),
             Operation::ToNextDisplay(MoveFocus::Follow) => owned(&["nextdisplay"]),
             Operation::ToNextDisplay(MoveFocus::Stay) => owned(&["nextdisplaysend"]),
+            Operation::FocusDisplay(direction) => {
+                vec!["focusdisplay".to_string(), direction.token()]
+            }
+            Operation::MoveToDisplay(direction) => {
+                vec!["movedisplay".to_string(), direction.token()]
+            }
             Operation::Equalize => owned(&["equalize"]),
             Operation::Balance => owned(&["balance"]),
             Operation::Manage => owned(&["manage"]),
@@ -243,6 +266,34 @@ mod tests {
     }
 
     #[test]
+    fn binding_keys_name_the_step_and_display_commands() {
+        let parse = |key: &str| parse_command(&key.split('_').collect::<Vec<_>>());
+        let window = |operation| Ok(Command::Window(operation));
+        assert_eq!(
+            parse("window_step_shrink"),
+            window(Operation::ResizeStep(ResizeDirection::Shrink))
+        );
+        assert_eq!(
+            parse("window_step"),
+            window(Operation::ResizeStep(ResizeDirection::Grow))
+        );
+        assert_eq!(
+            parse("window_vertical_step_grow"),
+            window(Operation::ResizeVerticalStep(ResizeDirection::Grow))
+        );
+        assert_eq!(
+            parse("window_focusdisplay_east"),
+            window(Operation::FocusDisplay(Direction::East))
+        );
+        assert_eq!(
+            parse("window_movedisplay_south"),
+            window(Operation::MoveToDisplay(Direction::South))
+        );
+        assert!(parse("window_focusdisplay_first").is_err());
+        assert!(parse("window_movedisplay_2").is_err());
+    }
+
+    #[test]
     fn every_operation_round_trips_through_argv() {
         let operations = [
             Operation::Focus(Direction::East),
@@ -252,9 +303,17 @@ mod tests {
             Operation::Resize(ResizeDirection::Shrink),
             Operation::ResizeVertical(ResizeDirection::Grow),
             Operation::ResizeVertical(ResizeDirection::Shrink),
+            Operation::ResizeStep(ResizeDirection::Grow),
+            Operation::ResizeStep(ResizeDirection::Shrink),
+            Operation::ResizeVerticalStep(ResizeDirection::Grow),
+            Operation::ResizeVerticalStep(ResizeDirection::Shrink),
             Operation::FullWidth,
             Operation::ToNextDisplay(MoveFocus::Follow),
             Operation::ToNextDisplay(MoveFocus::Stay),
+            Operation::FocusDisplay(Direction::North),
+            Operation::FocusDisplay(Direction::West),
+            Operation::MoveToDisplay(Direction::South),
+            Operation::MoveToDisplay(Direction::East),
             Operation::Equalize,
             Operation::Balance,
             Operation::Manage,

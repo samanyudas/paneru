@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy::app::{App, Plugin, PostUpdate, Update};
-use bevy::ecs::entity::Entity;
+use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::observer::On;
@@ -17,7 +17,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, VerifyFocus};
 use crate::config::Config;
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
@@ -44,6 +44,10 @@ pub struct TierMemory {
 #[derive(Default, Resource)]
 pub struct FocusHistory {
     by_workspace: HashMap<WorkspaceId, TierMemory>,
+    /// When each managed window last had focus, as a count of focus records,
+    /// so a jump into a column can return to the window that had it last.
+    managed_recency: EntityHashMap<u64>,
+    records: u64,
 }
 
 impl FocusHistory {
@@ -55,7 +59,11 @@ impl FocusHistory {
     ) {
         let slot = self.by_workspace.entry(workspace).or_default();
         match unmanaged {
-            None => slot.last_managed = Some(entity),
+            None => {
+                slot.last_managed = Some(entity);
+                self.records += 1;
+                self.managed_recency.insert(entity, self.records);
+            }
             Some(Unmanaged::Floating) => slot.last_floating = Some(entity),
             Some(_) => {}
         }
@@ -73,7 +81,19 @@ impl FocusHistory {
             .and_then(|t| t.last_floating)
     }
 
+    /// The window in `column` that had focus most recently, or its top window
+    /// when none of them has had focus.
+    pub fn last_focused_in(&self, column: &Column) -> Option<Entity> {
+        column
+            .window_iter()
+            .filter_map(|entity| Some((entity, *self.managed_recency.get(&entity)?)))
+            .max_by_key(|(_, recency)| *recency)
+            .map(|(entity, _)| entity)
+            .or_else(|| column.top())
+    }
+
     pub fn forget(&mut self, entity: Entity) {
+        self.managed_recency.remove(&entity);
         for slot in self.by_workspace.values_mut() {
             if slot.last_managed == Some(entity) {
                 slot.last_managed = None;
@@ -662,6 +682,33 @@ mod tests {
     }
 
     #[test]
+    fn last_focused_in_prefers_the_most_recent_window_then_the_top() {
+        use crate::ecs::layout::StackItem;
+
+        let mut world = World::new();
+        let top = world.spawn(()).id();
+        let bottom = world.spawn(()).id();
+        let column = Column::Stack(vec![StackItem::Single(top), StackItem::Single(bottom)]);
+        let mut history = FocusHistory::default();
+
+        assert_eq!(history.last_focused_in(&column), Some(top));
+
+        history.record(1, top, None);
+        history.record(2, bottom, None);
+        assert_eq!(history.last_focused_in(&column), Some(bottom));
+
+        history.record(1, top, Some(&Unmanaged::Floating));
+        assert_eq!(
+            history.last_focused_in(&column),
+            Some(bottom),
+            "focus while floating does not count as focus in the column"
+        );
+
+        history.forget(bottom);
+        assert_eq!(history.last_focused_in(&column), Some(top));
+    }
+
+    #[test]
     fn forget_workspace_drops_entry() {
         let mut world = World::new();
         let entity = world.spawn(()).id();
@@ -763,5 +810,46 @@ mod tests {
         );
         assert!(world.get::<Timeout>(first).is_none());
         assert!(world.get::<VerifyFocus>(second).is_some());
+    }
+
+    #[test]
+    fn test_application_exit_prunes_managed_recency() {
+        let mut harness = crate::tests::TestHarness::new().with_windows(1);
+        harness.run(vec![crate::events::Event::MenuOpened { window_id: 0 }]);
+        let window = harness
+            .world()
+            .query::<(Entity, &crate::manager::Window)>()
+            .iter(harness.world())
+            .next()
+            .unwrap()
+            .0;
+        harness
+            .world()
+            .resource_mut::<FocusHistory>()
+            .record(2, window, None);
+        let psn = harness
+            .world()
+            .query::<&crate::ecs::BProcess>()
+            .iter(harness.world())
+            .next()
+            .unwrap()
+            .psn();
+        harness
+            .world()
+            .write_message(crate::events::Event::ApplicationTerminated { psn });
+        harness.advance(std::time::Duration::from_millis(100));
+        assert!(harness.world().get_entity(window).is_err());
+        assert!(
+            harness
+                .world()
+                .resource::<FocusHistory>()
+                .managed_recency
+                .is_empty(),
+            "application exit must not retain dead entities in the unbounded recency map"
+        );
+        assert_eq!(
+            harness.world().resource::<FocusHistory>().last_managed(2),
+            None
+        );
     }
 }

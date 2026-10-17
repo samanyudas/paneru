@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use bevy::prelude::*;
@@ -10,7 +12,10 @@ use crate::ecs::{DockPosition, Timeout};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WinID;
-use crate::{assert_not_on_workspace, assert_on_workspace, assert_window_at, assert_window_size};
+use crate::{
+    assert_focused, assert_not_on_workspace, assert_on_workspace, assert_window_at,
+    assert_window_size,
+};
 
 use super::*;
 
@@ -959,4 +964,628 @@ fn test_empty_baseline_row_survives_display_removal() {
             );
         })
         .run(commands);
+}
+
+fn window_command(operation: Operation) -> Event {
+    Event::Command {
+        command: Command::Window(operation),
+    }
+}
+
+fn window_entity(world: &mut World, id: WinID) -> Option<Entity> {
+    world
+        .query::<(&Window, Entity)>()
+        .iter(world)
+        .find_map(|(window, entity)| (window.id() == id).then_some(entity))
+}
+
+/// The external display sits above the built-in one, with window 100 on it.
+fn harness_with_display_above() -> TestHarness {
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID])
+        .with_window(100, |data| {
+            data.workspace_id = EXT_WORKSPACE_ID;
+            data.frame = IRect::new(100, -EXT_DISPLAY_HEIGHT + 100, 900, -100);
+        })
+}
+
+/// Focus moves to the display in the pressed direction and nowhere else.
+#[test]
+fn test_focus_display_follows_the_physical_arrangement() {
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            assert_focused!(world, 0);
+            assert!(
+                !ext_bounds.contains(state.cursor_position()),
+                "no display lies below the built-in one"
+            );
+        })
+        .on_iteration(3, move |world, state| {
+            assert_focused!(world, 100);
+            assert!(ext_bounds.contains(state.cursor_position()));
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::FocusDisplay(Direction::South)),
+            window_command(Operation::FocusDisplay(Direction::North)),
+        ]);
+}
+
+#[test]
+fn test_focus_display_preserves_the_selected_virtual_workspace() {
+    harness_with_display_above()
+        .with_window(101, |data| {
+            data.workspace_id = EXT_WORKSPACE_ID;
+            data.frame = IRect::new(900, -EXT_DISPLAY_HEIGHT + 100, 1300, -100);
+        })
+        .on_iteration(2, |world, _state| {
+            let target = world
+                .query::<(Entity, &Display)>()
+                .iter(world)
+                .find(|(_, display)| display.id() == EXT_DISPLAY_ID)
+                .map(|(entity, _)| entity)
+                .expect("the target display should exist");
+            world
+                .entity_mut(target)
+                .insert(crate::ecs::ActiveDisplayMarker);
+        })
+        .on_iteration(5, |world, state| {
+            assert_focused!(world, 100);
+            let selected = world
+                .query_filtered::<&LayoutStrip, With<crate::ecs::ActiveWorkspaceMarker>>()
+                .single(world)
+                .expect("the target display should have an active workspace");
+            assert_eq!(selected.virtual_index, 1);
+            let source = world
+                .query::<(Entity, &Display)>()
+                .iter(world)
+                .find(|(_, display)| display.id() == TEST_DISPLAY_ID)
+                .map(|(entity, _)| entity)
+                .expect("the source display should exist");
+            world
+                .entity_mut(source)
+                .insert(crate::ecs::ActiveDisplayMarker);
+            state.focus_window(0);
+        })
+        .on_iteration(7, |world, _state| {
+            assert_focused!(world, 100);
+            let selected = world
+                .query_filtered::<&LayoutStrip, With<crate::ecs::ActiveWorkspaceMarker>>()
+                .single(world)
+                .expect("the target display should have an active workspace");
+            assert_eq!(selected.virtual_index, 1);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::FocusDisplay(Direction::North)),
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+            window_command(Operation::Center),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            window_command(Operation::FocusDisplay(Direction::North)),
+        ]);
+}
+
+#[test]
+fn test_focus_display_keeps_the_foreground_native_tab() {
+    for remember_background in [false, true] {
+        harness_with_display_above()
+            .with_window(101, |data| {
+                data.workspace_id = EXT_WORKSPACE_ID;
+                data.frame = IRect::new(900, -EXT_DISPLAY_HEIGHT + 100, 1300, -100);
+            })
+            .on_iteration(1, move |world, state| {
+                let front = find_window_entity(100, world);
+                let back = find_window_entity(101, world);
+                for mut strip in world.query::<&mut LayoutStrip>().iter_mut(world) {
+                    if strip.id() == EXT_WORKSPACE_ID {
+                        strip.append_tab_group(&[front, back]);
+                    }
+                }
+                let mut history = world.resource_mut::<crate::ecs::focus::FocusHistory>();
+                history.forget(front);
+                history.forget(back);
+                if remember_background {
+                    history.record(EXT_WORKSPACE_ID, back, None);
+                }
+                state.window_visible(101, false);
+            })
+            .on_iteration(3, |world, _state| {
+                assert_focused!(world, 100);
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: 0 },
+                window_command(Operation::Focus(Direction::First)),
+                Event::Command {
+                    command: Command::PrintState,
+                },
+                window_command(Operation::FocusDisplay(Direction::North)),
+            ]);
+    }
+}
+
+/// The focused window moves to the display in the pressed direction only.
+#[test]
+fn test_move_to_display_follows_the_physical_arrangement() {
+    harness_with_display_above()
+        .on_iteration(2, |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .on_iteration(3, |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::East)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+        ]);
+}
+
+#[test]
+fn test_move_to_display_keeps_focus_when_the_app_rebuilds_the_ax_element() {
+    let moved = Rc::new(Cell::new(None));
+    let recorded = moved.clone();
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            recorded.set(Some(find_window_entity(0, world)));
+            state.os_transfer_window(0, EXT_WORKSPACE_ID);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, move |world, state| {
+            assert_eq!(
+                state.focused_window_id(TEST_PROCESS_ID),
+                Some(0),
+                "the app should still report the moved window as focused"
+            );
+            assert_focused!(world, 0);
+            assert_eq!(
+                window_entity(world, 0),
+                moved.get(),
+                "the moved window should keep its entity"
+            );
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+        })
+        .on_iteration(4, |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_on_workspace!(world, 100, EXT_WORKSPACE_ID);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            window_command(Operation::MoveToDisplay(Direction::South)),
+        ]);
+}
+
+/// Sending a window away leaves focus on its source neighbour, and the sent
+/// window stays managed on the target even when its AX element is rebuilt.
+#[test]
+fn test_send_to_display_keeps_the_window_when_the_app_rebuilds_the_ax_element() {
+    let moved = Rc::new(Cell::new(None));
+    let recorded = moved.clone();
+    harness_with_display_above()
+        .with_window(1, |_| {})
+        .on_iteration(2, move |world, state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            recorded.set(Some(find_window_entity(0, world)));
+            state.os_transfer_window(0, EXT_WORKSPACE_ID);
+        })
+        .on_iteration(3, move |world, state| {
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(1));
+            assert_focused!(world, 1);
+            assert_eq!(
+                window_entity(world, 0),
+                moved.get(),
+                "the sent window should keep its entity"
+            );
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::ToNextDisplay(MoveFocus::Stay)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// Closing a window after it moved displays still removes it and hands focus
+/// to the window beside it.
+#[test]
+fn test_close_after_move_to_display_still_removes_the_window() {
+    harness_with_display_above()
+        .on_iteration(2, |_world, state| {
+            state.os_transfer_window(0, EXT_WORKSPACE_ID);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, |_world, state| {
+            state.os_close_window(0);
+        })
+        .on_iteration(4, |world, state| {
+            assert_eq!(window_entity(world, 0), None);
+            assert_focused!(world, 100);
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(100));
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// The app tears the old AX element down after replacing it. That teardown
+/// names an element the moved window no longer uses, so the window stays.
+#[test]
+fn test_move_to_display_ignores_the_teardown_of_the_replaced_ax_element() {
+    let moved = Rc::new(Cell::new(None));
+    let recorded = moved.clone();
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            recorded.set(Some(find_window_entity(0, world)));
+            state.os_transfer_window(0, EXT_WORKSPACE_ID);
+            state.os_tear_down_replaced_element(0);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, move |world, state| {
+            assert_eq!(window_entity(world, 0), moved.get());
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(0));
+            assert_focused!(world, 0);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// The app may list the fresh AX element a while after the old one died. The
+/// moved window keeps its entity and focus while it waits, then takes the
+/// fresh element, so the reverse move takes it back.
+#[test]
+fn test_move_to_display_waits_for_a_late_ax_element() {
+    let moved = Rc::new(Cell::new(None));
+    let (recorded, waiting) = (moved.clone(), moved.clone());
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            recorded.set(Some(find_window_entity(0, world)));
+            state.os_transfer_window_late(0, EXT_WORKSPACE_ID);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, move |world, state| {
+            assert_eq!(window_entity(world, 0), waiting.get());
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(0));
+            assert_focused!(world, 0);
+            state.os_list_window(0);
+        })
+        .on_iteration(4, move |world, state| {
+            let entity = window_entity(world, 0);
+            assert_eq!(entity, moved.get());
+            let window = world.get::<Window>(entity.unwrap()).unwrap();
+            assert!(
+                window.role().is_ok(),
+                "the window should use the fresh element"
+            );
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(0));
+            assert_focused!(world, 0);
+        })
+        .on_iteration(5, |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_on_workspace!(world, 100, EXT_WORKSPACE_ID);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            window_command(Operation::MoveToDisplay(Direction::South)),
+        ]);
+}
+
+#[test]
+fn test_close_while_waiting_for_a_late_ax_element_removes_the_window() {
+    harness_with_display_above()
+        .on_iteration(2, |_world, state| {
+            state.os_transfer_window_late(0, EXT_WORKSPACE_ID);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, |_world, state| {
+            state.os_close_window(0);
+        })
+        .on_iteration(4, |world, state| {
+            assert_eq!(window_entity(world, 0), None);
+            assert_focused!(world, 100);
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(100));
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// With no fresh AX element, the window is closed the usual way after a
+/// bounded wait, and repeated notifications do not extend that wait.
+#[test]
+fn test_move_to_display_stops_waiting_for_an_ax_element_that_never_comes() {
+    let moved = Rc::new(Cell::new(None));
+    let (recorded, waiting) = (moved.clone(), moved.clone());
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            recorded.set(Some(find_window_entity(0, world)));
+            state.os_transfer_window_late(0, EXT_WORKSPACE_ID);
+            state.os_activate_display(EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, move |world, state| {
+            assert_eq!(window_entity(world, 0), waiting.get());
+            state.os_repeat_space_destroy(0);
+        })
+        .on_iteration(4, |_world, state| {
+            state.os_repeat_space_destroy(0);
+        })
+        .on_iteration(5, move |world, state| {
+            assert_ne!(window_entity(world, 0), moved.get());
+            assert_focused!(world, 100);
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(100));
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// Focus and swap within a column stay on the display at the column's edge.
+/// Only the display commands cross to another display.
+#[test]
+fn test_vertical_focus_and_swap_stay_on_the_display_at_a_column_edge() {
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            assert_focused!(world, 0);
+            assert!(!ext_bounds.contains(state.cursor_position()));
+        })
+        .on_iteration(3, |world, _state| {
+            assert_focused!(world, 0);
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::Focus(Direction::North)),
+            window_command(Operation::Swap(Direction::North)),
+        ]);
+}
+
+#[test]
+fn test_late_handle_replays_pending_geometry() {
+    let mut harness = harness_with_display_above();
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+    ]);
+    let entity = find_window_entity(0, harness.world());
+    harness
+        .world()
+        .write_message(window_command(Operation::MoveToDisplay(Direction::North)));
+    harness.advance(Duration::from_millis(60));
+    harness
+        .mock_state
+        .os_transfer_window_late(0, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(600));
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::AwaitingHandle>(entity)
+            .is_some()
+    );
+    let expected = harness.world().get::<crate::ecs::Bounds>(entity).unwrap().0;
+    let expected_origin = harness
+        .world()
+        .get::<crate::ecs::Position>(entity)
+        .unwrap()
+        .0;
+    harness.mock_state.os_list_window(0);
+    harness.advance(Duration::from_millis(2000));
+    assert_eq!(window_entity(harness.world(), 0), Some(entity));
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::AwaitingHandle>(entity)
+            .is_none()
+    );
+    let actual = harness.mock_state.create_window(0).frame();
+    assert_eq!(
+        actual.size(),
+        expected,
+        "native size must catch up after handle recovery"
+    );
+    assert_eq!(
+        actual.min, expected_origin,
+        "native position must catch up after handle recovery"
+    );
+}
+
+#[test]
+fn test_late_handle_reconciles_native_size_constraints() {
+    let mut harness = harness_with_display_above();
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+    ]);
+    let entity = find_window_entity(0, harness.world());
+    harness
+        .world()
+        .write_message(window_command(Operation::MoveToDisplay(Direction::North)));
+    harness.advance(Duration::from_millis(60));
+    harness
+        .mock_state
+        .os_transfer_window_late(0, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(600));
+    harness.mock_state.update_window(0, |window| {
+        window.maximum_size = Some(IVec2::new(600, 2000));
+    });
+    harness.mock_state.os_list_window(0);
+    harness.advance(Duration::from_millis(2000));
+    assert_eq!(window_entity(harness.world(), 0), Some(entity));
+    assert_eq!(harness.mock_state.create_window(0).frame().width(), 600);
+    assert_eq!(
+        harness
+            .world()
+            .get::<crate::ecs::Bounds>(entity)
+            .unwrap()
+            .0
+            .x,
+        600
+    );
+}
+
+#[test]
+fn test_late_handle_keeps_width_ratio_after_active_display_changes() {
+    let mut harness = harness_with_display_above().with_window(1, |_| {});
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+    ]);
+    let entity = find_window_entity(0, harness.world());
+    harness
+        .world()
+        .write_message(window_command(Operation::MoveToDisplay(Direction::North)));
+    harness.advance(Duration::from_millis(60));
+    harness
+        .mock_state
+        .os_transfer_window_late(0, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(600));
+    harness.mock_state.focus_window(1);
+    harness.mock_state.os_activate_display(TEST_DISPLAY_ID);
+    harness.advance(Duration::from_millis(100));
+    let expected = harness
+        .world()
+        .get::<crate::ecs::WidthRatio>(entity)
+        .unwrap()
+        .0;
+    harness.mock_state.os_list_window(0);
+    harness.advance(Duration::from_millis(2000));
+    assert_eq!(window_entity(harness.world(), 0), Some(entity));
+    assert_eq!(
+        harness
+            .world()
+            .get::<crate::ecs::WidthRatio>(entity)
+            .unwrap()
+            .0,
+        expected
+    );
+}
+
+#[test]
+fn test_late_recovery_respects_new_user_focus() {
+    let mut harness = harness_with_display_above();
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::MoveToDisplay(Direction::North)),
+    ]);
+    let entity = find_window_entity(0, harness.world());
+    harness
+        .mock_state
+        .os_transfer_window_late(0, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(200));
+    harness.mock_state.focus_window(100);
+    harness.advance(Duration::from_millis(100));
+    harness.mock_state.os_list_window(0);
+    harness.advance(Duration::from_millis(200));
+    assert_eq!(window_entity(harness.world(), 0), Some(entity));
+    assert_eq!(
+        harness.mock_state.focused_window_id(TEST_PROCESS_ID),
+        Some(100)
+    );
+    assert_focused!(harness.world(), 100);
+}
+
+#[test]
+fn test_current_close_with_warm_membership_is_authoritative() {
+    let mut harness = harness_with_display_above();
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::MoveToDisplay(Direction::North)),
+    ]);
+    harness.mock_state.os_transfer_window(0, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(100));
+    let entity = find_window_entity(0, harness.world());
+    let element = harness.world().get::<Window>(entity).unwrap().element();
+    harness.world().write_message(Event::WindowDestroyed {
+        window_id: 0,
+        source: crate::events::DestroySource::Accessibility { element },
+    });
+    harness.advance(Duration::from_millis(40));
+    assert_eq!(window_entity(harness.world(), 0), None);
+}
+
+#[test]
+fn test_close_new_generation_before_recovery_is_not_a_ghost() {
+    let mut harness = harness_with_display_above();
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::MoveToDisplay(Direction::North)),
+    ]);
+    harness
+        .mock_state
+        .os_transfer_window_late(0, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(200));
+    harness.mock_state.os_close_window(0);
+    harness.advance(Duration::from_millis(100));
+    assert_eq!(window_entity(harness.world(), 0), None);
 }

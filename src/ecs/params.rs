@@ -15,9 +15,10 @@ use super::{ActiveDisplayMarker, FocusFollowsMouse, SkipReshuffle};
 use crate::{
     config::Config,
     ecs::{
-        ActiveWorkspaceMarker, Bounds, DockPosition, FlashMessage, FocusedMarker, FullWidthMarker,
-        Initializing, LayoutPosition, NativeFullscreenMarker, Position, RepositionMarker,
-        ResizeMarker, Scrolling, Unmanaged, WidthRatio, layout::LayoutStrip,
+        ActiveWorkspaceMarker, AwaitingHandle, Bounds, DockPosition, FlashMessage, FocusedMarker,
+        FullWidthMarker, Initializing, LayoutPosition, NativeFullscreenMarker, Position,
+        RepositionMarker, ResizeMarker, Scrolling, Unmanaged, VerifyWindowSize, WidthRatio,
+        layout::LayoutStrip,
     },
     manager::{Application, Display, Origin, Size, Window},
     platform::{ProcessSerialNumber, WinID},
@@ -197,24 +198,26 @@ impl ActiveDisplayMut<'_, '_> {
     }
 }
 
-/// Markers indicating something on screen is still animating; used by the
-/// event pump to decide how long it may sleep.
+/// Work that needs prompt frames without another external event.
 #[derive(SystemParam)]
 pub struct FrameActivity<'w, 's> {
     repositioning: Query<'w, 's, (), With<RepositionMarker>>,
     resizing: Query<'w, 's, (), With<ResizeMarker>>,
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
+    awaiting_handles: Query<'w, 's, (), With<AwaitingHandle>>,
+    size_checks: Query<'w, 's, (), With<VerifyWindowSize>>,
 }
 
 impl FrameActivity<'_, '_> {
-    /// Returns `true` while any window is being moved, resized or scrolled, or
-    /// a flash message is on screen — i.e. while frames still need drawing.
+    /// Returns `true` while drawing or handle recovery needs another frame.
     pub fn mid_frame(&self) -> bool {
         !self.repositioning.is_empty()
             || !self.resizing.is_empty()
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
+            || !self.awaiting_handles.is_empty()
+            || !self.size_checks.is_empty()
     }
 }
 
@@ -390,5 +393,31 @@ impl Windows<'_, '_> {
             .get(entity)
             .ok()
             .map(|(layout_position, _, _, _, _, _)| layout_position)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::prelude::{Timer, TimerMode, World};
+
+    use super::FrameActivity;
+    use crate::ecs::{AwaitingHandle, VerifyWindowSize};
+
+    #[test]
+    fn handle_recovery_keeps_frames_active_until_it_finishes() {
+        let mut world = World::new();
+        let active = |activity: FrameActivity| activity.mid_frame();
+        assert!(!world.run_system_once(active).unwrap());
+        let window = world
+            .spawn(AwaitingHandle(Timer::from_seconds(1.0, TimerMode::Once)))
+            .id();
+        assert!(world.run_system_once(active).unwrap());
+        world.entity_mut(window).remove::<AwaitingHandle>();
+        assert!(!world.run_system_once(active).unwrap());
+        world.entity_mut(window).insert(VerifyWindowSize::default());
+        assert!(world.run_system_once(active).unwrap());
+        world.entity_mut(window).remove::<VerifyWindowSize>();
+        assert!(!world.run_system_once(active).unwrap());
     }
 }

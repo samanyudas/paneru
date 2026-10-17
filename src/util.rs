@@ -57,6 +57,14 @@ pub fn is_dark_mode() -> bool {
 pub struct AXUIWrapper;
 unsafe impl objc2_core_foundation::Type for AXUIWrapper {}
 
+/// `CFEqual`, which for AX elements compares the UI element they name rather
+/// than the wrapper's address.
+impl PartialEq for AXUIWrapper {
+    fn eq(&self, other: &Self) -> bool {
+        AsRef::<CFType>::as_ref(self) == AsRef::<CFType>::as_ref(other)
+    }
+}
+
 impl AXUIWrapper {
     /// Converts `self` into a raw mutable pointer of type `T`.
     ///

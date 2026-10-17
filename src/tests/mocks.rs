@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use bevy::prelude::*;
-use objc2_core_foundation::CGPoint;
+use objc2_core_foundation::{CFNumber, CFRetained, CGPoint};
 use objc2_core_graphics::CGDirectDisplayID;
 use stdext::prelude::RwLockExt;
 
@@ -14,6 +14,7 @@ use crate::manager::{
     Window, origin_from, origin_to,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
+use crate::util::AXUIWrapper;
 
 use super::*;
 
@@ -33,6 +34,8 @@ pub(crate) struct MockWindowData {
     pub(crate) id: WinID,
     pub(crate) pid: Pid,
     pub(crate) frame: IRect,
+    pub(crate) maximum_size: Option<Size>,
+    pub(crate) frame_read_failures: u8,
     pub(crate) title: String,
     pub(crate) minimized: bool,
     pub(crate) workspace_id: WorkspaceId,
@@ -45,6 +48,12 @@ pub(crate) struct MockWindowData {
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
     pub(crate) child_role: bool,
+    /// Bumped when the app replaces the window's AX element. A `Window`
+    /// handle created before the bump is stale and its `role()` fails.
+    pub(crate) ax_generation: u32,
+    /// The app has not put the window's current AX element in its window
+    /// list yet.
+    pub(crate) ax_unlisted: bool,
 }
 
 impl Default for MockWindowData {
@@ -53,6 +62,8 @@ impl Default for MockWindowData {
             id: 0,
             pid: 0,
             frame: IRect::default(),
+            maximum_size: None,
+            frame_read_failures: 0,
             title: String::new(),
             minimized: false,
             workspace_id: 0,
@@ -65,6 +76,8 @@ impl Default for MockWindowData {
             horizontal_padding: 0,
             vertical_padding: 0,
             child_role: false,
+            ax_generation: 0,
+            ax_unlisted: false,
         }
     }
 }
@@ -185,6 +198,7 @@ impl MockState {
                 ..default()
             },
         );
+        drop(inner);
         self.create_window(id)
     }
 
@@ -198,6 +212,14 @@ impl MockState {
         if let Some(app) = inner.apps.get_mut(&pid) {
             app.focused_window_id = Some(id);
         }
+    }
+
+    pub fn focused_window_id(&self, pid: Pid) -> Option<WinID> {
+        self.inner
+            .force_read()
+            .apps
+            .get(&pid)
+            .and_then(|app| app.focused_window_id)
     }
 
     pub fn focus_window(&self, id: WinID) {
@@ -244,6 +266,14 @@ impl MockState {
         if inner.active_display_id == id {
             inner.active_display_id = inner.displays.keys().copied().next().unwrap_or(0);
         }
+    }
+
+    /// Makes `id` the active display and reports it, as macOS does once the
+    /// focused window lands on another display.
+    pub fn os_activate_display(&self, id: u32) {
+        let mut inner = self.inner.force_write();
+        inner.active_display_id = id;
+        inner.event_queue.push_back(Event::DisplayChanged);
     }
 
     pub fn active_display(&self) -> CGDirectDisplayID {
@@ -357,7 +387,68 @@ impl MockState {
         });
         inner.event_queue.push_back(Event::WindowDestroyed {
             window_id: id,
-            source: DestroySource::Accessibility,
+            source: DestroySource::Accessibility {
+                element: Some(mock_element(id, window.ax_generation)),
+            },
+        });
+    }
+
+    /// Moves a window to `workspace_id` the way an app that rebuilds its AX
+    /// element on a display change reports it. The window server keeps the
+    /// window ID ordered in on the new space, but every `Window` handle created
+    /// before the move fails `role()`. The app's window list returns a fresh
+    /// handle, and only the SLS space notification arrives for the old space.
+    pub fn os_transfer_window(&self, id: WinID, workspace_id: WorkspaceId) {
+        let mut inner = self.inner.force_write();
+        let Some(window) = inner.windows.get_mut(&id) else {
+            return;
+        };
+        window.workspace_id = workspace_id;
+        window.ax_generation += 1;
+        inner.event_queue.push_back(Event::WindowDestroyed {
+            window_id: id,
+            source: DestroySource::SpaceNotification,
+        });
+    }
+
+    /// Like [`Self::os_transfer_window`], but the app lists the fresh element
+    /// only once [`Self::os_list_window`] is called.
+    pub fn os_transfer_window_late(&self, id: WinID, workspace_id: WorkspaceId) {
+        self.os_transfer_window(id, workspace_id);
+        if let Some(window) = self.inner.force_write().windows.get_mut(&id) {
+            window.ax_unlisted = true;
+        }
+    }
+
+    pub fn os_list_window(&self, id: WinID) {
+        if let Some(window) = self.inner.force_write().windows.get_mut(&id) {
+            window.ax_unlisted = false;
+        }
+    }
+
+    /// Repeats the SLS space notification for a window that left a space.
+    pub fn os_repeat_space_destroy(&self, id: WinID) {
+        self.inner
+            .force_write()
+            .event_queue
+            .push_back(Event::WindowDestroyed {
+                window_id: id,
+                source: DestroySource::SpaceNotification,
+            });
+    }
+
+    /// Tears down the AX element a transferred window had before the app
+    /// replaced it.
+    pub fn os_tear_down_replaced_element(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        let Some(generation) = inner.windows.get(&id).map(|w| w.ax_generation) else {
+            return;
+        };
+        inner.event_queue.push_back(Event::WindowDestroyed {
+            window_id: id,
+            source: DestroySource::Accessibility {
+                element: Some(mock_element(id, generation - 1)),
+            },
         });
     }
 
@@ -431,6 +522,12 @@ impl MockState {
     #[allow(clippy::too_many_lines)]
     pub fn create_window(&self, id: WinID) -> Window {
         let mut mw = MockWindowApi::new();
+        let ax_generation = self
+            .inner
+            .force_read()
+            .windows
+            .get(&id)
+            .map_or(0, |w| w.ax_generation);
 
         mw.expect_id().return_const(id);
 
@@ -457,7 +554,12 @@ impl MockState {
         let s = self.clone();
         mw.expect_resize().returning(move |size| {
             let mut inner = s.inner.force_write();
-            if let Some(w) = inner.windows.get_mut(&id) {
+            if let Some(w) = inner
+                .windows
+                .get_mut(&id)
+                .filter(|w| w.ax_generation == ax_generation)
+            {
+                let size = w.maximum_size.map_or(size, |maximum| size.min(maximum));
                 w.frame.max = w.frame.min + size;
             }
         });
@@ -465,7 +567,11 @@ impl MockState {
         let s_move = self.clone();
         mw.expect_reposition().returning(move |origin| {
             let mut inner = s_move.inner.force_write();
-            if let Some(w) = inner.windows.get_mut(&id) {
+            if let Some(w) = inner
+                .windows
+                .get_mut(&id)
+                .filter(|w| w.ax_generation == ax_generation)
+            {
                 let size = w.frame.size();
                 w.frame.min = origin;
                 w.frame.max = origin + size;
@@ -501,12 +607,17 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_update_frame().returning(move || {
-            s.inner
-                .force_read()
+            let mut inner = s.inner.force_write();
+            let window = inner
                 .windows
-                .get(&id)
-                .map(|w| w.frame)
-                .ok_or(Error::InvalidWindow)
+                .get_mut(&id)
+                .filter(|w| w.ax_generation == ax_generation)
+                .ok_or(Error::InvalidWindow)?;
+            if window.frame_read_failures > 0 {
+                window.frame_read_failures -= 1;
+                return Err(Error::InvalidWindow);
+            }
+            Ok(window.frame)
         });
 
         let s = self.clone();
@@ -525,6 +636,7 @@ impl MockState {
                 .force_read()
                 .windows
                 .get(&id)
+                .filter(|w| w.ax_generation == ax_generation)
                 .map(|w| w.role.clone())
                 .ok_or_else(|| crate::errors::Error::Generic(format!("window {id} not found")))
         });
@@ -587,7 +699,8 @@ impl MockState {
         });
 
         // Fill in remaining defaults
-        mw.expect_element().return_const(None);
+        mw.expect_element()
+            .return_const(Some(mock_element(id, ax_generation)));
         mw.expect_raise_without_focus().return_const(());
 
         // Focusing without raising still moves the OS focus, it just leaves the
@@ -627,13 +740,15 @@ impl MockState {
 
         let s = self.clone();
         ma.expect_focused_window().returning(move |_config| {
-            let inner = s.inner.force_read();
-            let focused_id = inner.apps.get(&pid).and_then(|a| a.focused_window_id)?;
-            if inner.windows.contains_key(&focused_id) {
-                Some(s.create_window(focused_id))
-            } else {
-                None
-            }
+            let focused_id = {
+                let inner = s.inner.force_read();
+                let focused_id = inner.apps.get(&pid).and_then(|a| a.focused_window_id)?;
+                inner
+                    .windows
+                    .contains_key(&focused_id)
+                    .then_some(focused_id)
+            }?;
+            Some(s.create_window(focused_id))
         });
 
         let s = self.clone();
@@ -681,7 +796,7 @@ impl MockState {
             inner
                 .windows
                 .values()
-                .filter(|w| w.pid == pid)
+                .filter(|w| w.pid == pid && !w.ax_unlisted)
                 .map(|w| w.id)
                 .chain(
                     inner
@@ -716,9 +831,10 @@ impl MockState {
         wm.expect_dim_windows().returning(|_, _| ());
 
         let s = self.clone();
-        wm.expect_window_is_unordered().returning(move |window_id| {
+        wm.expect_window_ordered_in().returning(move |window_id| {
             let inner = s.inner.force_read();
-            inner.unordered_windows.contains(&window_id) || !inner.windows.contains_key(&window_id)
+            Ok(inner.windows.contains_key(&window_id)
+                && !inner.unordered_windows.contains(&window_id))
         });
 
         let s = self.clone();
@@ -765,17 +881,17 @@ impl MockState {
         wm.expect_find_existing_application_windows()
             .returning(move |app, spaces, _config| {
                 let pid = app.pid();
-                let mut windows = s
+                let mut ids = s
                     .inner
                     .force_read()
                     .windows
                     .values()
                     .filter_map(|w| {
-                        (w.pid == pid && spaces.contains(&w.workspace_id))
-                            .then_some(s.create_window(w.id))
+                        (w.pid == pid && spaces.contains(&w.workspace_id)).then_some(w.id)
                     })
                     .collect::<Vec<_>>();
-                windows.sort_unstable_by_key(|window| window.id());
+                ids.sort_unstable();
+                let windows = ids.into_iter().map(|id| s.create_window(id)).collect();
                 Ok((windows, vec![]))
             });
 
@@ -855,4 +971,11 @@ impl MockState {
 
         mp
     }
+}
+
+/// A stand-in AX element: one per window and element generation, equal only
+/// to another for the same pair, as `CFEqual` treats real elements.
+fn mock_element(id: WinID, generation: u32) -> CFRetained<AXUIWrapper> {
+    let number = CFNumber::new_i64(i64::from(id) << 32 | i64::from(generation));
+    unsafe { CFRetained::cast_unchecked(number) }
 }

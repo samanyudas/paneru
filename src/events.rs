@@ -18,11 +18,15 @@ use crate::util::AXUIWrapper;
 /// Where a [`Event::WindowDestroyed`] came from, which decides how far it can be
 /// trusted. macOS reports a closing window through two unrelated channels, and
 /// only one of them actually means "this window is gone".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum DestroySource {
     /// `kAXUIElementDestroyedNotification` on the window's own AX element. The
-    /// element itself has been torn down, so the window is definitively gone.
-    Accessibility,
+    /// element itself has been torn down, so the window is definitively gone,
+    /// unless the app already replaced `element` with a fresh one for the same
+    /// window. `None` when paneru itself concluded the window is gone.
+    Accessibility {
+        element: Option<CFRetained<AXUIWrapper>>,
+    },
     /// SLS `SpaceWindowDestroyed`. Despite the name this also fires when a
     /// window merely leaves a space, so it has to be confirmed before acting.
     SpaceNotification,

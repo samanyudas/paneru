@@ -278,6 +278,8 @@ $ paneru send-cmd <command> [args...]
 | `window vertical resize`   | Cycle a stacked window through `preset_stack_heights` |
 | `window vertical grow`     | Grow a stacked window to the next preset height  |
 | `window vertical shrink`   | Shrink a stacked window to the previous preset height |
+| `window step [grow\|shrink]` | Change the column width by `window_resize_step` |
+| `window vertical step [grow\|shrink]` | Change a stacked window's height by `window_resize_step` |
 | `window fullwidth`         | Toggle full-width mode for the focused window    |
 | `window manage`            | Toggle managed/floating state                    |
 | `window equalize`          | Distribute equal heights in the focused stack    |
@@ -286,6 +288,8 @@ $ paneru send-cmd <command> [args...]
 | `window unstack [east\|west]` | Pop the focused window out of its stack into a new column (default east) |
 | `window nextdisplay`       | Move the focused window to the next display      |
 | `window nextdisplaysend`   | Move the window to the next display but stay here |
+| `window focusdisplay <direction>` | Focus the display north, south, west, or east |
+| `window movedisplay <direction>` | Move the window to the display in that direction |
 | `window virtual <dir>`     | Switch to the previous/next virtual workspace     |
 | `window virtualnum <n>`    | Switch directly to numbered virtual workspace    |
 | `window virtualmove <dir>` | Move the window to a different virtual workspace  |

@@ -118,6 +118,33 @@ impl Window {
     pub fn new(window: Box<dyn WindowApi>) -> Self {
         Window(window)
     }
+
+    /// Whether `element` is this window's AX element. A window without an
+    /// element cannot tell, so it claims every element.
+    pub fn is_current_element(&self, element: &AXUIWrapper) -> bool {
+        self.element().is_none_or(|own| *own == *element)
+    }
+
+    /// Swaps in `fresh`, a new AX element the app made for this same window,
+    /// keeping the padding applied to the old one. Returns the old handle.
+    ///
+    /// # Errors
+    ///
+    /// Fails, leaving `self` unchanged, unless `fresh` names the same window
+    /// through a different element and its frame can be read.
+    pub fn replace_handle(&mut self, mut fresh: Window) -> Result<Window> {
+        let replaces = fresh.id() == self.id()
+            && fresh
+                .element()
+                .is_some_and(|element| !self.is_current_element(&element));
+        if !replaces {
+            return Err(Error::InvalidWindow);
+        }
+        fresh.set_padding(WindowPadding::Horizontal(self.horizontal_padding()));
+        fresh.set_padding(WindowPadding::Vertical(self.vertical_padding()));
+        fresh.update_frame()?;
+        Ok(std::mem::replace(self, fresh))
+    }
 }
 
 /// Retrieves the window ID (`WinID`) from an `AXUIElementRef`.

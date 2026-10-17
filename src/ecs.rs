@@ -9,7 +9,9 @@ use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
-use bevy::ecs::schedule::common_conditions::{not, resource_exists, resource_exists_and_changed};
+use bevy::ecs::schedule::common_conditions::{
+    not, on_message, resource_exists, resource_exists_and_changed,
+};
 use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
@@ -218,7 +220,12 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::mission_control_trigger,
             triggers::application_event_trigger,
             triggers::dispatch_application_messages,
-            triggers::window_destroyed_trigger,
+            (
+                triggers::claim_replaced_window_handles.run_if(on_message::<Event>),
+                triggers::recover_window_handles,
+                triggers::window_destroyed_trigger,
+            )
+                .chain(),
             triggers::invalidate_window_title,
             triggers::refresh_configuration_trigger,
             triggers::theme_change_trigger,
@@ -447,6 +454,11 @@ pub struct RetryFrontSwitch(pub Entity);
 #[derive(Component)]
 pub struct VerifyFocus;
 
+/// Waits for a replacement AX handle without discarding the window entity.
+/// Uses its own timer because the window's `Timeout` can verify focus.
+#[derive(Component)]
+pub struct AwaitingHandle(pub Timer);
+
 #[derive(Component)]
 pub struct BruteforceWindows(Task<Vec<Window>>);
 
@@ -456,6 +468,20 @@ pub enum DockPosition {
     Left(i32),
     Right(i32),
     Hidden,
+}
+
+/// Asks `window_resize_verifier` to read back a window's native size once no
+/// resize animation or handle recovery is pending for it.
+/// Transient read failures are retried for at most three attempts.
+#[derive(Component)]
+pub struct VerifyWindowSize {
+    remaining: u8,
+}
+
+impl Default for VerifyWindowSize {
+    fn default() -> Self {
+        Self { remaining: 3 }
+    }
 }
 
 #[derive(Component)]

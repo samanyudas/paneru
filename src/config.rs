@@ -811,6 +811,15 @@ impl Config {
         self.options().window_resize_cycle.unwrap_or(true)
     }
 
+    /// The share of the display that one step resize adds or removes, five
+    /// percentage points unless the option holds a ratio above 0 and up to 1.
+    pub fn window_resize_step(&self) -> f64 {
+        self.options()
+            .window_resize_step
+            .filter(|step| step.is_finite() && *step > 0.0 && *step <= 1.0)
+            .unwrap_or(0.05)
+    }
+
     pub fn auto_center(&self) -> bool {
         self.options().auto_center.is_some_and(|center| center)
     }
@@ -1096,6 +1105,15 @@ impl OneOrMore {
             OneOrMore::Multiple(many) => many.iter_mut().collect::<Vec<_>>(),
         }
     }
+
+    fn retain(&mut self, keep: impl FnMut(&mut Keybinding) -> bool) {
+        let mut many = match std::mem::replace(self, OneOrMore::Multiple(Vec::new())) {
+            OneOrMore::Single(one) => vec![one],
+            OneOrMore::Multiple(many) => many,
+        };
+        many.retain_mut(keep);
+        *self = OneOrMore::Multiple(many);
+    }
 }
 
 /// `InnerConfig` holds the actual configuration data parsed from a file, including options, keybindings, and window parameters.
@@ -1159,14 +1177,19 @@ impl InnerConfig {
             let argv = command.split('_').collect::<Vec<_>>();
             for binding in bindings.all_mut() {
                 binding.command = parse_command(&argv)?;
-
+            }
+            // A binding keeps the deserialized code 0 until its key resolves, and
+            // 0 is the A key, so a binding whose key name is unknown must go.
+            bindings.retain(|binding| {
                 if let Some(code) = keycode_for_key_name(&binding.key, virtual_keys) {
                     binding.code = code;
                     info!("bind: {binding:?}");
+                    true
                 } else {
                     error!("{}: invalid key '{}'", function_name!(), &binding.key);
+                    false
                 }
-            }
+            });
         }
 
         // Resolve passthrough keybinding strings into (keycode, modifiers) pairs.
@@ -1286,6 +1309,10 @@ pub struct MainOptions {
     /// to both the horizontal and the vertical resize commands.
     /// Default: true (cycles). Set to false to stop at the limits.
     pub window_resize_cycle: Option<bool>,
+
+    /// The share of the display width or height (0.0-1.0) that the step
+    /// resize commands add or remove. Default: 0.05.
+    pub window_resize_step: Option<f64>,
 
     /// If enabled, an empty virtual workspace will be removed.
     /// Default: true.
@@ -2203,6 +2230,37 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
             MoveFocus::Stay
         )))
     ));
+}
+
+#[test]
+fn test_config_parsing_drops_binding_with_unknown_key() {
+    let input = r#"
+[bindings]
+window_focus_west = ["ctrl+alt-lefarrow", "ctrl+alt-h"]
+window_focus_east = "ctrl+alt-rigtharrow"
+"#;
+    let virtual_keys = test_virtual_keymap();
+    let config = Config {
+        inner: Arc::new(ArcSwap::from_pointee(
+            InnerConfig::parse_config_with_virtual_keys(input, &virtual_keys)
+                .expect("an unknown key must not reject the whole file"),
+        )),
+    };
+    let keycode = |name: &str| keycode_for_key_name(name, &virtual_keys).unwrap();
+    let chord = Modifiers::CTRL | Modifiers::ALT;
+
+    assert_eq!(
+        config.find_keybind(keycode("a"), chord),
+        None,
+        "a mistyped key name must not bind the A key, whose keycode is 0"
+    );
+    assert_eq!(
+        config.find_keybind(keycode("h"), chord),
+        Some(Command::Window(Operation::Focus(
+            crate::commands::Direction::West
+        ))),
+        "the binding's valid chords must still work"
+    );
 }
 
 #[test]

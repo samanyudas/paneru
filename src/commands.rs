@@ -23,7 +23,7 @@ use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
     FullWidthMarker, ManualStripOffset, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
-    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
+    SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -100,7 +100,14 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // A default dialect so the mock harness has one; the real app overwrites it
     // once it knows whether a Lua script took over the configuration.
     app.init_resource::<SnippetDialect>();
-    app.add_systems(PreUpdate, (copy_window_rule, toggle_tabbed_display_handler));
+    app.add_systems(
+        PreUpdate,
+        (
+            copy_window_rule,
+            toggle_tabbed_display_handler,
+            focus_display,
+        ),
+    );
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -200,6 +207,35 @@ fn pick_nearest_in_direction(
         .map(|(entity, _)| entity)
 }
 
+/// The display that lies in `direction` from the display bounded by `from`, in
+/// the physical arrangement: the nearest one wholly on that side, preferring
+/// one that overlaps `from` along the other axis. Only the four compass
+/// directions name a display.
+pub(crate) fn display_in_direction<T>(
+    direction: &Direction,
+    from: IRect,
+    displays: impl IntoIterator<Item = (T, IRect)>,
+) -> Option<T> {
+    let overlaps = |a: (i32, i32), b: (i32, i32)| a.0 < b.1 && b.0 < a.1;
+    displays
+        .into_iter()
+        .filter_map(|(display, bounds)| {
+            let horizontal = overlaps((bounds.min.x, bounds.max.x), (from.min.x, from.max.x));
+            let vertical = overlaps((bounds.min.y, bounds.max.y), (from.min.y, from.max.y));
+            let (beyond, overlap) = match direction {
+                Direction::East => (bounds.min.x >= from.max.x, vertical),
+                Direction::West => (bounds.max.x <= from.min.x, vertical),
+                Direction::North => (bounds.max.y <= from.min.y, horizontal),
+                Direction::South => (bounds.min.y >= from.max.y, horizontal),
+                Direction::First | Direction::Last | Direction::Nth(_) => return None,
+            };
+            let offset = (bounds.center() - from.center()).as_i64vec2();
+            beyond.then_some((display, !overlap, offset.length_squared()))
+        })
+        .min_by_key(|(_, apart, distance)| (*apart, *distance))
+        .map(|(display, _, _)| display)
+}
+
 fn visible_floating_entities(
     windows: &Windows,
     window_manager: &WindowManager,
@@ -282,6 +318,7 @@ fn command_move_focus(
     workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
+    focus_history: Res<FocusHistory>,
     mut commands: Commands,
 ) {
     let Some(Operation::Focus(direction)) =
@@ -336,13 +373,16 @@ fn command_move_focus(
         return;
     }
 
-    // If focus is on a window that no longer lives in the active strip
-    // (e.g. it just became floating, was minimised on another row, or
-    // the OS handed focus to a window we don't track on this strip),
-    // `get_window_in_direction` would return None and the user would
-    // be unable to leave that window. Enter the active strip from the
-    // appropriate side so subsequent presses behave normally.
-    let candidate = if active_strip.contains(focused_entity) {
+    let column_jump = match direction {
+        Direction::First => active_strip.first().ok(),
+        Direction::Last => active_strip.last().ok(),
+        Direction::Nth(index) => active_strip.get(*index).ok(),
+        Direction::North | Direction::South | Direction::West | Direction::East => None,
+    }
+    .map(|column| focus_history.last_focused_in(&column));
+    let candidate = if let Some(target) = column_jump {
+        target
+    } else if active_strip.contains(focused_entity) {
         get_window_in_direction(direction, focused_entity, active_strip).or_else(|| {
             // At the right edge going East, enter the fullscreen workspaces.
             (matches!(direction, Direction::East)
@@ -359,15 +399,9 @@ fn command_move_focus(
         })
     } else {
         match direction {
-            Direction::East | Direction::First => {
-                active_strip.first().ok().and_then(|col| col.top())
-            }
-            Direction::West | Direction::Last => active_strip.last().ok().and_then(|col| col.top()),
-            Direction::Nth(index) => active_strip
-                .get(*index)
-                .ok()
-                .and_then(|column| column.top()),
-            Direction::North | Direction::South => None,
+            Direction::East => active_strip.first().ok().and_then(|col| col.top()),
+            Direction::West => active_strip.last().ok().and_then(|col| col.top()),
+            _ => None,
         }
     };
 
@@ -377,23 +411,6 @@ fn command_move_focus(
         // This avoids a race where focus-follows-mouse leaves skip_reshuffle
         // set, causing the WindowFocused handler to skip the reshuffle.
         commands.reshuffle_around(entity);
-        return;
-    }
-
-    // Check if the movement can switch to another display.
-    let Some(other_display) = active_display.other().next() else {
-        return;
-    };
-    let change_display = match direction {
-        Direction::North => active_display.bounds().min.y > other_display.bounds().min.y,
-        Direction::South => active_display.bounds().min.y < other_display.bounds().min.y,
-        _ => false,
-    };
-    debug!("moving focus to another display: {change_display}");
-    if change_display {
-        commands.trigger(SendMessageTrigger(Event::Command {
-            command: Command::Mouse(MouseMove::ToNextDisplay),
-        }));
     }
 }
 
@@ -575,19 +592,6 @@ fn command_toggle_floating_layer(
     debug!("floating layer -> front: {floating_front}");
 }
 
-/// Handles the "swap" command, swapping the positions of the current window with another window in a specified direction.
-///
-/// # Arguments
-///
-/// * `direction` - The `Direction` to swap the window (e.g., `Direction::West`).
-/// * `current` - The `Entity` of the currently focused `Window`.
-/// * `active_display` - A mutable reference to the `ActiveDisplayMut` representing the active display.
-/// * `windows` - A mutable query for all `Window` components.
-/// * `commands` - Bevy commands to trigger events.
-///
-/// # Returns
-///
-/// `Some(Entity)` with the entity that was swapped with, otherwise `None`.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn command_swap_focus(
     mut messages: MessageReader<Event>,
@@ -633,8 +637,7 @@ fn command_swap_focus(
     // stays put and per-window animation slides the window into the slot.
     // Only when the slot would fall off the edge does the strip scroll —
     // and only by the shortfall.
-    let swapped = handler();
-    if let Some(window) = swapped {
+    if let Some(window) = handler() {
         commands.ensure_visible(window);
     } else {
         debug!(
@@ -642,30 +645,6 @@ fn command_swap_focus(
             windows.focused().map(|(_, e)| e),
             active_strip.len()
         );
-    }
-
-    // Only fall through to the neighbouring display when there was nothing to
-    // swap with in the first place. Re-querying the strip here would look at
-    // the layout *after* the swap, where the window has by definition no
-    // neighbour left in that direction - which sent every successful vertical
-    // swap straight on to the other display.
-    if swapped.is_none() {
-        // Check if the movement can swap to another display.
-        let bounds = active_display.bounds();
-        let Some(other_display) = active_display.other().next() else {
-            return;
-        };
-        let change_display = match direction {
-            Direction::North => bounds.min.y > other_display.bounds().min.y,
-            Direction::South => bounds.min.y < other_display.bounds().min.y,
-            _ => false,
-        };
-        debug!("swapping window to another display: {change_display}");
-        if change_display {
-            commands.trigger(SendMessageTrigger(Event::Command {
-                command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
-            }));
-        }
     }
 }
 
@@ -732,7 +711,8 @@ fn command_center_window(
     }
 }
 
-/// Resizes the focused window based on preset column widths.
+/// Resizes the focused window to the next or previous preset column width, or
+/// by one `window_resize_step` of the display width.
 ///
 /// # Arguments
 ///
@@ -749,7 +729,10 @@ fn resize_window(
     mut commands: Commands,
 ) {
     let Some(operation) = filter_window_operations(&mut messages, |op| {
-        matches!(op, Operation::Resize(_) | Operation::SetWidth(_))
+        matches!(
+            op,
+            Operation::Resize(_) | Operation::ResizeStep(_) | Operation::SetWidth(_)
+        )
     })
     .next() else {
         return;
@@ -797,6 +780,16 @@ fn resize_window(
                     fallback
                 }
             }),
+        Operation::ResizeStep(direction) => {
+            // Pending resizes count, so a held key keeps stepping.
+            let width = windows.moving_frame(entity).unwrap_or(frame).width();
+            step_ratio(
+                f64::from(width) / f64::from(viewport.width()),
+                *direction,
+                config.window_resize_step(),
+                1.0,
+            )
+        }
         _ => return,
     };
 
@@ -830,9 +823,18 @@ fn resize_window(
     commands.reshuffle_around(entity);
 }
 
-/// Cycles the focused window's height through `preset_stack_heights`, letting
-/// the neighbour below (or above, when the window is last) absorb the
-/// difference.
+/// One step from `ratio` in `direction`, kept between one step and `maximum`.
+/// A ratio already outside that range never moves further out of it.
+fn step_ratio(ratio: f64, direction: ResizeDirection, step: f64, maximum: f64) -> f64 {
+    match direction {
+        ResizeDirection::Grow => (ratio + step).min(maximum.max(ratio)),
+        ResizeDirection::Shrink => (ratio - step).max(step.min(ratio)),
+    }
+}
+
+/// Cycles the focused window's height through `preset_stack_heights`, or
+/// changes it by one `window_resize_step` of the display height, letting the
+/// neighbour below (or above, when the window is last) absorb the difference.
 ///
 /// Only stacks are eligible: `binpack_heights` stretches a column's lone member
 /// to the full strip height, so a height written anywhere else is overwritten on
@@ -844,12 +846,17 @@ fn resize_window_vertical(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let Some(&Operation::ResizeVertical(direction)) =
-        filter_window_operations(&mut messages, |op| {
-            matches!(op, Operation::ResizeVertical(_))
-        })
-        .next()
-    else {
+    let Some((direction, stepped)) = filter_window_operations(&mut messages, |op| {
+        matches!(
+            op,
+            Operation::ResizeVertical(_) | Operation::ResizeVerticalStep(_)
+        )
+    })
+    .find_map(|op| match *op {
+        Operation::ResizeVertical(direction) => Some((direction, false)),
+        Operation::ResizeVerticalStep(direction) => Some((direction, true)),
+        _ => None,
+    }) else {
         return;
     };
 
@@ -903,6 +910,7 @@ fn resize_window_vertical(
     // The presets are assumed sorted ascending, and the `0.05` dead-band keeps
     // float noise from re-selecting the preset the window is already at.
     let next_ratio = match direction {
+        _ if stepped => step_ratio(current_ratio, direction, config.window_resize_step(), 1.0),
         ResizeDirection::Grow => heights
             .iter()
             .copied()
@@ -1117,12 +1125,17 @@ fn to_next_display(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let Some(Operation::ToNextDisplay(move_focus)) =
-        filter_window_operations(&mut messages, |op| {
-            matches!(op, Operation::ToNextDisplay(_))
-        })
-        .next()
-    else {
+    let Some((move_focus, direction)) = filter_window_operations(&mut messages, |op| {
+        matches!(
+            op,
+            Operation::ToNextDisplay(_) | Operation::MoveToDisplay(_)
+        )
+    })
+    .find_map(|op| match op {
+        Operation::ToNextDisplay(move_focus) => Some((*move_focus, None)),
+        Operation::MoveToDisplay(direction) => Some((MoveFocus::Follow, Some(direction.clone()))),
+        _ => None,
+    }) else {
         return;
     };
 
@@ -1143,8 +1156,19 @@ fn to_next_display(
     // for on both the source and target displays.
     let source_viewport_width = active_display.actual_bounds(&config).width();
 
-    let Some(other) = active_display.other().next() else {
-        debug!("no other display to move window to.");
+    let source_bounds = active_display.bounds();
+    let target_id = match &direction {
+        None => active_display.other().next().map(|display| display.id()),
+        Some(direction) => display_in_direction(
+            direction,
+            source_bounds,
+            active_display
+                .other()
+                .map(|display| (display.id(), display.bounds())),
+        ),
+    };
+    let Some(other) = target_id.and_then(|id| active_display.other().find(|d| d.id() == id)) else {
+        debug!("no display to move window to ({direction:?}).");
         return;
     };
 
@@ -1220,6 +1244,75 @@ fn to_next_display(
         };
         let system_id = commands.register_system(refresh_size);
         Timeout::callback(Duration::from_millis(150), system_id, &mut commands);
+    }
+}
+
+/// Focuses the display in a compass direction from the active one: the window
+/// that last had focus on it when that window is visible, otherwise its most
+/// visible window, with the pointer moved onto that window.
+fn focus_display(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    active_display: ActiveDisplay,
+    layout_strips: Query<&LayoutStrip, With<SelectedVirtualMarker>>,
+    focus_history: Res<FocusHistory>,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    let Some(Operation::FocusDisplay(direction)) =
+        filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusDisplay(_)))
+            .next()
+    else {
+        return;
+    };
+
+    let Some(target) = display_in_direction(
+        direction,
+        active_display.bounds(),
+        active_display
+            .other()
+            .map(|display| (display, display.bounds())),
+    ) else {
+        debug!("no display {direction:?} of the active one.");
+        return;
+    };
+    let target_bounds = target.bounds();
+
+    let strip = window_manager
+        .active_display_space(target.id())
+        .ok()
+        .and_then(|id| layout_strips.iter().find(|strip| strip.id() == id));
+    let visible = |entity: Entity| {
+        if strip?
+            .tab_group(entity)
+            .is_some_and(|tabs| tabs.first() != Some(&entity))
+        {
+            return None;
+        }
+        windows
+            .frame(entity)
+            .map(|frame| target_bounds.intersect(frame))
+            .filter(|visible| !visible.is_empty())
+    };
+    let entity = strip.and_then(|strip| {
+        focus_history
+            .last_managed(strip.id())
+            .filter(|entity| strip.contains(*entity) && visible(*entity).is_some())
+            .or_else(|| {
+                strip
+                    .all_windows()
+                    .into_iter()
+                    .filter_map(|entity| Some((entity, visible(entity)?.width())))
+                    .max_by_key(|(_, width)| *width)
+                    .map(|(entity, _)| entity)
+            })
+    });
+
+    if let Some((entity, frame)) = entity.and_then(|entity| Some((entity, visible(entity)?))) {
+        window_manager.warp_mouse(frame.center());
+        commands.focus_entity(entity, true);
+    } else {
+        window_manager.warp_mouse(target_bounds.center());
     }
 }
 
@@ -1735,6 +1828,66 @@ mod tests {
         assert_eq!(
             get_window_in_direction(&west, entities[3], &strip),
             Some(entities[1])
+        );
+    }
+
+    #[test]
+    fn display_in_direction_follows_a_horizontal_arrangement() {
+        let built_in = IRect::new(0, 0, 1512, 982);
+        let right = IRect::new(1512, -200, 1512 + 2560, 1240);
+        let displays = [(2, right)];
+
+        assert_eq!(
+            display_in_direction(&Direction::East, built_in, displays),
+            Some(2)
+        );
+        assert_eq!(
+            display_in_direction(&Direction::West, right, [(1, built_in)]),
+            Some(1)
+        );
+        for direction in [Direction::West, Direction::North, Direction::South] {
+            assert_eq!(display_in_direction(&direction, built_in, displays), None);
+        }
+    }
+
+    #[test]
+    fn display_in_direction_follows_a_vertical_arrangement() {
+        let built_in = IRect::new(0, 0, 1512, 982);
+        // A wider display above, offset to the left.
+        let above = IRect::new(-500, -1440, 2060, 0);
+        let displays = [(2, above)];
+
+        assert_eq!(
+            display_in_direction(&Direction::North, built_in, displays),
+            Some(2)
+        );
+        assert_eq!(
+            display_in_direction(&Direction::South, above, [(1, built_in)]),
+            Some(1)
+        );
+        for direction in [Direction::South, Direction::West, Direction::East] {
+            assert_eq!(display_in_direction(&direction, built_in, displays), None);
+        }
+    }
+
+    #[test]
+    fn display_in_direction_prefers_an_overlapping_display_then_the_nearest() {
+        let center = IRect::new(0, 0, 1000, 800);
+        let beside = IRect::new(3000, 0, 4000, 800);
+        let diagonal = IRect::new(1000, -900, 2000, -100);
+        let near = IRect::new(1000, 100, 2000, 900);
+
+        assert_eq!(
+            display_in_direction(&Direction::East, center, [(1, diagonal), (2, beside)]),
+            Some(2)
+        );
+        assert_eq!(
+            display_in_direction(&Direction::East, center, [(2, beside), (3, near)]),
+            Some(3)
+        );
+        assert_eq!(
+            display_in_direction(&Direction::First, center, [(3, near)]),
+            None
         );
     }
 
