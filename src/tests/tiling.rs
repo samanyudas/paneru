@@ -561,6 +561,44 @@ fn test_step_grow_then_shrink_keeps_a_fitting_strip_at_viewport_edges() {
     }
 }
 
+#[test]
+fn test_rapid_step_resize_keeps_the_right_edge_during_animation() {
+    let options = MainOptions {
+        auto_center: Some(false),
+        continuous_swipe: Some(true),
+        animation_speed: Some(30.0),
+        ..Default::default()
+    };
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Ratio(0.5));
+    let config: Config = (options, vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    for direction in [
+        ResizeDirection::Grow,
+        ResizeDirection::Grow,
+        ResizeDirection::Grow,
+        ResizeDirection::Shrink,
+        ResizeDirection::Shrink,
+        ResizeDirection::Shrink,
+    ] {
+        harness
+            .app
+            .world_mut()
+            .write_message(step(Operation::ResizeStep, direction));
+        harness.advance(Duration::from_millis(20));
+    }
+    harness.advance(Duration::from_secs(3));
+    assert_window_size!(harness.world(), 1, 512, 748);
+    assert_window_at!(harness.world(), 0, 0, TEST_MENUBAR_HEIGHT);
+    assert_window_at!(harness.world(), 1, 512, TEST_MENUBAR_HEIGHT);
+}
+
 /// In a stack, the height steps by `window_resize_step` of the display, the
 /// neighbour absorbs the difference, and the neighbour keeps its minimum.
 #[test]
