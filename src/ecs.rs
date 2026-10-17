@@ -278,6 +278,11 @@ pub struct ReshuffleAroundMarker;
 #[derive(Component)]
 pub struct RefitAfterRemoval;
 
+#[derive(Component)]
+pub struct PlaceAfterArrival {
+    pub destination: Entity,
+}
+
 /// Marker component requesting that the strip scroll *minimally* to keep the
 /// entity's NEW layout position inside the viewport. Unlike
 /// [`ReshuffleAroundMarker`], this does not anchor the entity to its old visual
@@ -426,16 +431,6 @@ impl Timeout {
             }),
         }
     }
-
-    /// Creates an action timeout, which oneshots a provided system id.
-    pub fn callback(duration: Duration, system_id: SystemId, commands: &mut Commands) {
-        let timer = Timer::new(duration, bevy::time::TimerMode::Once);
-        commands.spawn(Self {
-            timer,
-            system_id: Some(system_id),
-            on_expire: None,
-        });
-    }
 }
 
 /// Component used as a retry mechanism for stray focus events that arrive before the target window is fully created.
@@ -557,6 +552,8 @@ pub trait SpawnCommandsExt {
 
     fn refit_after_removal(&mut self, entity: Entity);
 
+    fn place_after_arrival(&mut self, entity: Entity, destination: Entity);
+
     fn ensure_visible(&mut self, entity: Entity);
 
     /// Like [`SpawnCommandsExt::ensure_visible`], but `snap` controls whether
@@ -608,6 +605,13 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     fn refit_after_removal(&mut self, entity: Entity) {
         if let Ok(mut entity_commands) = self.get_entity(entity) {
             entity_commands.try_insert((ReshuffleAroundMarker, RefitAfterRemoval));
+        }
+    }
+
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn place_after_arrival(&mut self, entity: Entity, destination: Entity) {
+        if let Ok(mut entity_commands) = self.get_entity(entity) {
+            entity_commands.try_insert((ReshuffleAroundMarker, PlaceAfterArrival { destination }));
         }
     }
 

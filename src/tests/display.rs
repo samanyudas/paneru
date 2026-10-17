@@ -1338,6 +1338,310 @@ fn test_move_to_display_right_aligns_overflowing_arrival_after_width_adaptation(
     );
 }
 
+fn pending_display_arrival(options: MainOptions, origin_x: i32, middle_width: i32) -> TestHarness {
+    begin_display_arrival(display_round_trip_harness(options, origin_x, middle_width))
+}
+
+fn begin_display_arrival(harness: TestHarness) -> TestHarness {
+    send_display_arrival(prepare_display_arrival(harness))
+}
+
+fn prepare_display_arrival(mut harness: TestHarness) -> TestHarness {
+    harness.run(vec![
+        Event::MenuOpened { window_id: 1 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::FocusDisplay(Direction::North)),
+    ]);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+    harness
+}
+
+fn send_display_arrival(mut harness: TestHarness) -> TestHarness {
+    harness
+        .world()
+        .write_message(window_command(Operation::MoveToDisplay(Direction::South)));
+    harness.advance(Duration::from_millis(20));
+    harness
+        .mock_state
+        .update_window(0, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(TEST_DISPLAY_ID);
+    harness.advance(Duration::from_millis(60));
+    harness
+}
+
+#[test]
+fn test_overflowing_arrival_uses_pending_width_and_survives_delayed_focus() {
+    for continuous_swipe in [false, true] {
+        for hidden_ratio in [0.0, 0.5, 1.0] {
+            let mut harness = pending_display_arrival(
+                MainOptions {
+                    animation_speed: Some(8.0),
+                    continuous_swipe: Some(continuous_swipe),
+                    window_hidden_ratio: Some(hidden_ratio),
+                    ..Default::default()
+                },
+                -2048,
+                890,
+            );
+            let world = harness.world();
+            let entity = find_window_entity(0, world);
+            let slot = world.get::<crate::ecs::LayoutPosition>(entity).unwrap().0;
+            let target = world
+                .query::<(&LayoutStrip, &crate::ecs::RepositionMarker)>()
+                .iter(world)
+                .find(|(strip, _)| strip.contains(entity))
+                .unwrap()
+                .1
+                .0;
+            assert_eq!(slot.x + target.x + 568, -4);
+            harness.advance(Duration::from_millis(140));
+            if continuous_swipe {
+                harness
+                    .world()
+                    .write_message(Event::WindowFocused { window_id: 0 });
+            }
+            harness.advance(Duration::from_secs(3));
+            assert_focused!(harness.world(), 0);
+            let frame = harness.mock_state.create_window(0).frame();
+            assert_eq!(frame.width(), 568);
+            assert_eq!(
+                frame.max.x, -4,
+                "continuous={continuous_swipe}, hidden={hidden_ratio}"
+            );
+            assert_window_at!(harness.world(), 0, -572, 1460);
+        }
+    }
+}
+
+#[test]
+fn test_arrival_keeps_all_fit_and_auto_center_placement() {
+    for (auto_center, middle_width) in [(false, 200), (true, 890)] {
+        let mut harness = source_strip_after_arrival(
+            MainOptions {
+                auto_center: Some(auto_center),
+                ..Default::default()
+            },
+            0,
+            middle_width,
+        );
+        assert_eq!(harness.mock_state.create_window(0).frame().min.x, 669);
+        assert_window_at!(harness.world(), 0, 669, 1460);
+    }
+}
+
+#[test]
+fn test_arrival_keeps_a_later_center_or_snap() {
+    for operation in [Operation::Center, Operation::Snap] {
+        let mut harness = pending_display_arrival(MainOptions::default(), 0, 890);
+        harness.world().write_message(window_command(operation));
+        harness.advance(Duration::from_millis(40));
+        let placed = harness.mock_state.create_window(0).frame().min.x;
+        harness.advance(Duration::from_millis(500));
+        let frame = harness.mock_state.create_window(0).frame();
+        assert_eq!(frame.width(), 568);
+        assert_eq!(
+            frame.min.x, placed,
+            "arrival must preserve the newer placement"
+        );
+    }
+}
+
+#[test]
+fn test_arrival_allows_free_panning_after_placement() {
+    let mut harness = source_strip_after_arrival(
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        0,
+        890,
+    );
+    assert_eq!(harness.mock_state.create_window(0).frame().max.x, 2044);
+    harness.run(vec![Event::Swipe {
+        delta: -0.04,
+        fingers: 3,
+    }]);
+    assert_ne!(harness.mock_state.create_window(0).frame().max.x, 2044);
+    let frames = [1, 2, 3, 0].map(|id| harness.mock_state.create_window(id).frame());
+    assert!(frames.windows(2).all(|pair| pair[0].max.x == pair[1].min.x));
+}
+
+#[test]
+fn test_arrival_preserves_a_completed_modifier_scroll() {
+    let mut harness = pending_display_arrival(MainOptions::default(), 0, 890);
+    harness.world().write_message(Event::Scroll { delta: -0.1 });
+    harness.advance(Duration::from_millis(40));
+    let before = harness.mock_state.create_window(0).frame().min.x;
+    harness.advance(Duration::from_millis(40));
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    let strip = world
+        .query::<(Entity, &LayoutStrip)>()
+        .iter(world)
+        .find(|(_, strip)| strip.contains(entity))
+        .unwrap()
+        .0;
+    assert!(world.get::<crate::ecs::Scrolling>(strip).is_none());
+    harness.advance(Duration::from_millis(500));
+    let after = harness.mock_state.create_window(0).frame().min.x;
+    assert_eq!(
+        after, before,
+        "arrival must preserve a completed modifier-scroll"
+    );
+}
+
+#[test]
+fn test_repeated_display_transfer_preserves_width_ratio() {
+    let mut harness = pending_display_arrival(MainOptions::default(), 0, 890);
+    harness
+        .world()
+        .write_message(window_command(Operation::MoveToDisplay(Direction::North)));
+    harness.advance(Duration::from_millis(60));
+    harness
+        .mock_state
+        .update_window(0, |window| window.workspace_id = EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(60));
+    assert_on_workspace!(harness.world(), 0, EXT_WORKSPACE_ID);
+    harness.advance(Duration::from_millis(500));
+    assert_eq!(harness.mock_state.create_window(0).frame().width(), 711);
+}
+
+#[test]
+fn test_arrival_keeps_a_later_reorder() {
+    let mut harness = pending_display_arrival(MainOptions::default(), 0, 890);
+    harness
+        .world()
+        .write_message(window_command(Operation::Swap(Direction::West)));
+    harness.advance(Duration::from_millis(40));
+    let placed = harness.mock_state.create_window(0).frame().min.x;
+    harness.advance(Duration::from_millis(500));
+    let frame = harness.mock_state.create_window(0).frame();
+    assert_eq!(frame.width(), 568);
+    assert_eq!(frame.min.x, placed);
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    assert!(world.query::<&LayoutStrip>().iter(world).any(|strip| {
+        strip.contains(entity) && !matches!(strip.last(), Ok(crate::ecs::layout::Column::Single(last)) if last == entity)
+    }));
+}
+
+#[test]
+fn test_arrival_consumes_intent_when_native_width_is_constrained() {
+    let harness =
+        prepare_display_arrival(display_round_trip_harness(MainOptions::default(), 0, 890));
+    harness
+        .mock_state
+        .update_window(0, |window| window.maximum_size = Some(Size::new(500, 1312)));
+    let mut harness = send_display_arrival(harness);
+    harness.advance(Duration::from_secs(2));
+    let frame = harness.mock_state.create_window(0).frame();
+    assert_eq!(frame.width(), 500);
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    assert_eq!(world.get::<crate::ecs::Bounds>(entity).unwrap().x, 500);
+    assert!(world.get::<crate::ecs::PlaceAfterArrival>(entity).is_none());
+    assert!(
+        world
+            .get::<crate::ecs::ReshuffleAroundMarker>(entity)
+            .is_none()
+    );
+}
+
+#[test]
+fn test_arrival_width_is_set_before_destination_workspace_switch() {
+    let mut harness = pending_display_arrival(MainOptions::default(), 0, 890);
+    harness
+        .world()
+        .write_message(window_command(Operation::VirtualAdd));
+    harness.advance(Duration::from_millis(40));
+    harness
+        .world()
+        .write_message(window_command(Operation::VirtualNumber(2)));
+    harness.advance(Duration::from_millis(500));
+    assert_eq!(harness.mock_state.create_window(0).frame().width(), 568);
+    assert_on_workspace!(harness.world(), 0, TEST_WORKSPACE_ID);
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    assert!(world.get::<crate::ecs::PlaceAfterArrival>(entity).is_none());
+    assert!(
+        world
+            .query_filtered::<&LayoutStrip, With<crate::ecs::SelectedVirtualMarker>>()
+            .iter(world)
+            .all(|strip| !strip.contains(entity))
+    );
+}
+
+#[test]
+fn test_arrival_window_close_clears_intent() {
+    let mut harness = pending_display_arrival(MainOptions::default(), 0, 890);
+    harness.mock_state.os_close_window(0);
+    harness.advance(Duration::from_secs(1));
+    let world = harness.world();
+    assert!(
+        world
+            .query::<&Window>()
+            .iter(world)
+            .all(|window| window.id() != 0)
+    );
+    assert!(
+        world
+            .query::<&crate::ecs::PlaceAfterArrival>()
+            .iter(world)
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn test_arrival_uses_the_destination_width_before_layout() {
+    let mut grows = begin_display_arrival(
+        display_round_trip_harness(MainOptions::default(), 0, 700)
+            .with_display(
+                TEST_DISPLAY_ID,
+                IRect::new(0, 1440, 2560, 2772),
+                vec![TEST_WORKSPACE_ID],
+            )
+            .with_display(
+                EXT_DISPLAY_ID,
+                IRect::new(0, 0, 2048, 1440),
+                vec![EXT_WORKSPACE_ID],
+            ),
+    );
+    assert_eq!(grows.mock_state.create_window(0).frame().max.x, 2556);
+    grows.advance(Duration::from_millis(500));
+    let frame = grows.mock_state.create_window(0).frame();
+    assert_eq!(frame.width(), 888);
+    assert_eq!(frame.max.x, 2556);
+
+    let mut shrinks = pending_display_arrival(MainOptions::default(), 0, 400);
+    let initial = shrinks.mock_state.create_window(0).frame();
+    assert_eq!(initial.min.x, 669);
+    shrinks.advance(Duration::from_millis(500));
+    let frame = shrinks.mock_state.create_window(0).frame();
+    assert_eq!(frame.width(), 568);
+    assert_eq!(
+        frame.min.x, initial.min.x,
+        "fitting content keeps generic placement"
+    );
+}
+
+#[test]
+fn test_arrival_resize_survives_a_replaced_native_handle() {
+    let mut harness = pending_display_arrival(MainOptions::default(), 0, 890);
+    let original = find_window_entity(0, harness.world());
+    harness.mock_state.os_transfer_window(0, TEST_WORKSPACE_ID);
+    harness.advance(Duration::from_secs(2));
+    assert_eq!(find_window_entity(0, harness.world()), original);
+    assert_on_workspace!(harness.world(), 0, TEST_WORKSPACE_ID);
+    assert_focused!(harness.world(), 0);
+    assert_eq!(harness.mock_state.create_window(0).frame().max.x, 2044);
+    assert_eq!(harness.mock_state.create_window(0).frame().width(), 568);
+}
+
 #[test]
 fn test_source_refit_preserves_overflow_and_auto_center_anchoring() {
     for (auto_center, middle_width) in [(false, 1400), (true, 890)] {
