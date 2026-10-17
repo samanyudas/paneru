@@ -1298,6 +1298,47 @@ fn source_frames(harness: &TestHarness) -> [IRect; 3] {
 }
 
 #[test]
+fn test_move_to_display_right_aligns_overflowing_arrival_after_width_adaptation() {
+    let mut harness = source_strip_after_arrival(
+        MainOptions {
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        0,
+        890,
+    );
+    assert_focused!(harness.world(), 0);
+    assert_eq!(harness.mock_state.active_display(), TEST_DISPLAY_ID);
+    for id in [1, 2, 3, 0] {
+        assert_on_workspace!(harness.world(), id, TEST_WORKSPACE_ID);
+        assert_not_on_workspace!(harness.world(), id, EXT_WORKSPACE_ID);
+    }
+
+    let frames = [1, 2, 3, 0].map(|id| harness.mock_state.create_window(id).frame());
+    assert_eq!(
+        frames.map(|frame| frame.width()),
+        [508, 890, 508, 568],
+        "the arriving width must adapt from 710/2552 to the 2040-point viewport"
+    );
+    let world = harness.world();
+    let expected_columns = [1, 2, 3, 0].map(|id| find_window_entity(id, world));
+    let destination = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .unwrap();
+    assert_eq!(
+        destination.all_columns(),
+        expected_columns,
+        "arrival must append the column without changing the existing order"
+    );
+    assert_eq!(
+        frames[3].max.x, 2044,
+        "the focused last column must finish at the usable right edge after width adaptation"
+    );
+}
+
+#[test]
 fn test_source_refit_preserves_overflow_and_auto_center_anchoring() {
     for (auto_center, middle_width) in [(false, 1400), (true, 890)] {
         let mut harness = source_strip_after_arrival(
