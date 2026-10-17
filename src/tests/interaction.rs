@@ -20,6 +20,35 @@ use crate::{assert_focused, assert_window_at, assert_window_size};
 use super::*;
 
 #[test]
+fn test_auto_center_keeps_new_focus_centered_during_strip_animation() {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(true),
+            animation_speed: Some(8.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        focus(Direction::First),
+    ]);
+    harness.world().write_message(focus(Direction::Last));
+    harness.advance(Duration::from_millis(40));
+    harness.world().write_message(focus(Direction::First));
+    harness.advance(Duration::from_secs(3));
+    assert_focused!(harness.world(), 0);
+    assert_window_at!(
+        harness.world(),
+        0,
+        (TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH) / 2,
+        TEST_MENUBAR_HEIGHT
+    );
+}
+
+#[test]
 fn native_fullscreen_transition_removes_window_from_original_strip_without_focus_marker() {
     const FULLSCREEN_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 100;
 
