@@ -1648,9 +1648,11 @@ mod tests {
             .run_system_once(super::commit_window_frame)
             .unwrap();
         assert_eq!(harness.mock_state.create_window(0).frame().width(), 700);
-        assert_eq!(
-            harness.world().get::<WidthRatio>(entity).unwrap().0,
-            700.0 / f64::from(crate::tests::TEST_DISPLAY_WIDTH)
+        assert!(
+            (harness.world().get::<WidthRatio>(entity).unwrap().0
+                - 700.0 / f64::from(crate::tests::TEST_DISPLAY_WIDTH))
+            .abs()
+                < f64::EPSILON
         );
     }
 
