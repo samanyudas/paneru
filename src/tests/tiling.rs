@@ -517,6 +517,41 @@ fn test_window_step_resize_defaults_to_five_points() {
         ]);
 }
 
+#[test]
+fn test_step_grow_then_shrink_keeps_a_fitting_strip_at_the_left_edge() {
+    let options = MainOptions {
+        auto_center: Some(false),
+        continuous_swipe: Some(true),
+        animation_speed: Some(10000.0),
+        ..Default::default()
+    };
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Ratio(0.5));
+    let config: Config = (options, vec![params]).into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .with_focused_window(0)
+        .on_iteration(0, |world, _state| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_size!(world, 0, 512, 748);
+        })
+        .on_iteration(1, |world, _state| {
+            assert_window_size!(world, 0, 563, 748);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_window_size!(world, 0, 512, 748);
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 512, TEST_MENUBAR_HEIGHT);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            step(Operation::ResizeStep, ResizeDirection::Grow),
+            step(Operation::ResizeStep, ResizeDirection::Shrink),
+        ]);
+}
+
 /// In a stack, the height steps by `window_resize_step` of the display, the
 /// neighbour absorbs the difference, and the neighbour keeps its minimum.
 #[test]
