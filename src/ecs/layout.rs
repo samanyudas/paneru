@@ -1285,10 +1285,9 @@ fn reshuffle_layout_strip(
             .and_then(|last| {
                 windows
                     .layout_position(last)
-                    .map(|position| position.0.x)
-                    .zip(windows.moving_frame(last).map(|frame| frame.width()))
-            })
-            .map(|(last_x, last_width)| last_x + last_width);
+                    .zip(windows.moving_frame(last))
+                    .map(|(position, frame)| position.0.x + frame.width())
+            });
 
         // Enforce the edge invariant when auto-center is off: the leftmost
         // window must touch the left edge and the rightmost the right edge
@@ -1317,7 +1316,11 @@ fn reshuffle_layout_strip(
                 .zip(content_end)
                 .and_then(|(first, end)| {
                     fitting_origin_x(
-                        strip_target.x,
+                        if config.continuous_swipe() {
+                            strip_target.x
+                        } else {
+                            strip_position.x
+                        },
                         first.0.x..end,
                         display_bounds.min.x..display_bounds.max.x,
                     )
