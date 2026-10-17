@@ -795,17 +795,85 @@ fn test_animated_native_height_growth_settles_for_both_stack_members() {
 }
 
 #[test]
+fn test_native_height_growth_handles_both_animation_completion_orders() {
+    use crate::ecs::{Position, RepositionMarker, ResizeMarker, VerifyWindowSize};
+    for (window_id, position_finishes_first) in [(1, false), (0, true)] {
+        let mut harness = native_height_harness(30.0);
+        harness.run(vec![Event::Command {
+            command: Command::Window(Operation::Focus(if window_id == 0 {
+                Direction::North
+            } else {
+                Direction::South
+            })),
+        }]);
+        let entity = find_window_entity(window_id, harness.world());
+        let start = harness.mock_state.create_window(window_id).frame();
+        if position_finishes_first {
+            harness.world().get_mut::<Position>(entity).unwrap().0.x += 20;
+            harness
+                .world()
+                .entity_mut(entity)
+                .insert(RepositionMarker(start.min));
+        }
+        harness
+            .world()
+            .write_message(step(Operation::ResizeVerticalStep, ResizeDirection::Grow));
+        harness.advance(Duration::from_millis(40));
+        assert!(harness.world().get::<ResizeMarker>(entity).is_some());
+        assert!(harness.world().get::<RepositionMarker>(entity).is_some());
+        let moving_frame = harness.mock_state.create_window(window_id).frame();
+        assert!(moving_frame.height() > 374 && moving_frame.height() < 449);
+        assert_ne!(moving_frame.min, start.min);
+
+        let mut observed_completion = false;
+        for _ in 0..25 {
+            harness.advance(Duration::from_millis(20));
+            let resizing = harness.world().get::<ResizeMarker>(entity).is_some();
+            let moving = harness.world().get::<RepositionMarker>(entity).is_some();
+            if resizing != moving {
+                assert_eq!(resizing, position_finishes_first);
+                assert!(harness.world().get::<VerifyWindowSize>(entity).is_some());
+                observed_completion = true;
+                break;
+            }
+        }
+        assert!(
+            observed_completion,
+            "animations must finish on different ticks"
+        );
+        harness.advance(Duration::from_secs(3));
+        let frame = harness.mock_state.create_window(window_id).frame();
+        assert_eq!(frame.height(), 449);
+        assert_eq!(frame.min.x, start.min.x);
+        assert_eq!(frame.min.y, if window_id == 0 { 20 } else { 319 });
+        assert!(harness.world().get::<ResizeMarker>(entity).is_none());
+        assert!(harness.world().get::<RepositionMarker>(entity).is_none());
+        assert!(harness.world().get::<VerifyWindowSize>(entity).is_none());
+    }
+}
+
+#[test]
 fn test_interrupted_native_height_resize_uses_the_latest_target() {
-    use crate::ecs::VerifyWindowSize;
+    use crate::ecs::{RepositionMarker, ResizeMarker, VerifyWindowSize};
     let mut harness = native_height_harness(30.0);
     let entity = find_window_entity(1, harness.world());
     harness
         .world()
         .write_message(step(Operation::ResizeVerticalStep, ResizeDirection::Grow));
-    harness.advance(Duration::from_millis(20));
+    harness.advance(Duration::from_millis(40));
+    assert!(harness.world().get::<ResizeMarker>(entity).is_some());
+    assert!(harness.world().get::<RepositionMarker>(entity).is_some());
+    let moving_frame = harness.mock_state.create_window(1).frame();
+    assert!(moving_frame.height() > 374 && moving_frame.height() < 449);
+    assert!(moving_frame.min.y < 394 && moving_frame.min.y > 319);
     harness
         .world()
         .write_message(step(Operation::ResizeVerticalStep, ResizeDirection::Shrink));
+    harness.advance(Duration::from_millis(20));
+    assert_eq!(
+        harness.world().get::<ResizeMarker>(entity).unwrap().0.y,
+        374
+    );
     harness.advance(Duration::from_secs(3));
     let frame = harness.mock_state.create_window(1).frame();
     assert_eq!(
@@ -813,6 +881,8 @@ fn test_interrupted_native_height_resize_uses_the_latest_target() {
         (TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT) / 2
     );
     assert_eq!(frame.max.y, TEST_DISPLAY_HEIGHT);
+    assert!(harness.world().get::<ResizeMarker>(entity).is_none());
+    assert!(harness.world().get::<RepositionMarker>(entity).is_none());
     assert!(harness.world().get::<VerifyWindowSize>(entity).is_none());
 }
 
