@@ -652,6 +652,57 @@ fn test_window_vertical_step_resize_changes_height_by_the_step() {
     harness.run(commands);
 }
 
+#[test]
+fn test_lower_stacked_window_grows_to_its_requested_native_height() {
+    const VIEWPORT_HEIGHT: i32 = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT;
+    let config: Config = (
+        MainOptions {
+            window_resize_step: Some(0.1),
+            animation_speed: Some(10000.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(3, |world, state| {
+            crate::assert_focused!(world, 1);
+            let frame = state.create_window(1).frame();
+            assert_eq!(frame.height(), VIEWPORT_HEIGHT / 2);
+            assert_eq!(frame.max.y, TEST_DISPLAY_HEIGHT);
+            state.update_window(1, |window| {
+                window.resize_bottom_limit = Some(TEST_DISPLAY_HEIGHT);
+            });
+        })
+        .on_iteration(4, |_world, state| {
+            let frame = state.create_window(1).frame();
+            assert_eq!(frame.height(), 449);
+            assert_eq!(frame.max.y, TEST_DISPLAY_HEIGHT);
+        })
+        .on_iteration(5, |_world, state| {
+            let frame = state.create_window(1).frame();
+            assert_eq!(frame.height(), VIEWPORT_HEIGHT / 2);
+            assert_eq!(frame.max.y, TEST_DISPLAY_HEIGHT);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Window(Operation::Focus(Direction::First)),
+            },
+            Event::Command {
+                command: Command::Window(Operation::Focus(Direction::East)),
+            },
+            Event::Command {
+                command: Command::Window(Operation::Stack(Side::West)),
+            },
+            step(Operation::ResizeVerticalStep, ResizeDirection::Grow),
+            step(Operation::ResizeVerticalStep, ResizeDirection::Shrink),
+        ]);
+}
+
 /// Outside a stack a column's lone window always fills the viewport height.
 #[test]
 fn test_window_vertical_step_resize_is_a_noop_outside_a_stack() {

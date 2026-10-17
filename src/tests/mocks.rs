@@ -35,6 +35,7 @@ pub(crate) struct MockWindowData {
     pub(crate) pid: Pid,
     pub(crate) frame: IRect,
     pub(crate) maximum_size: Option<Size>,
+    pub(crate) resize_bottom_limit: Option<i32>,
     pub(crate) frame_read_failures: u8,
     pub(crate) title: String,
     pub(crate) minimized: bool,
@@ -63,6 +64,7 @@ impl Default for MockWindowData {
             pid: 0,
             frame: IRect::default(),
             maximum_size: None,
+            resize_bottom_limit: None,
             frame_read_failures: 0,
             title: String::new(),
             minimized: false,
@@ -559,7 +561,12 @@ impl MockState {
                 .get_mut(&id)
                 .filter(|w| w.ax_generation == ax_generation)
             {
-                let size = w.maximum_size.map_or(size, |maximum| size.min(maximum));
+                let mut size = w.maximum_size.map_or(size, |maximum| size.min(maximum));
+                if let Some(bottom) = w.resize_bottom_limit
+                    && size.y > 0
+                {
+                    size.y = size.y.min((bottom - w.frame.min.y).max(0));
+                }
                 w.frame.max = w.frame.min + size;
             }
         });
