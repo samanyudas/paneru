@@ -1,11 +1,9 @@
-use std::time::Duration;
-
 use bevy::app::PreUpdate;
 use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With, Without};
-use bevy::ecs::system::{Commands, Query, Res, Single};
+use bevy::ecs::system::{Commands, Query, Res, Single, SystemParam};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
 use tracing::{debug, error, info};
@@ -21,8 +19,8 @@ use crate::ecs::layout::{
 };
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
-    FullWidthMarker, ManualStripOffset, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, FullWidthMarker,
+    ManualStripOffset, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
     SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::Event;
@@ -39,9 +37,15 @@ pub use crate::types::commands::{
 type OffscreenStrips<'w, 's> = Query<
     'w,
     's,
-    (&'static mut LayoutStrip, &'static ChildOf),
+    (Entity, &'static mut LayoutStrip, &'static ChildOf),
     (With<SelectedVirtualMarker>, Without<ActiveWorkspaceMarker>),
 >;
+
+#[derive(SystemParam)]
+struct DisplayDestinations<'w, 's> {
+    strips: OffscreenStrips<'w, 's>,
+    docks: Query<'w, 's, &'static DockPosition>,
+}
 
 /// Every strip alongside the two flags that say where it sits: whether it is the
 /// one currently on screen, and whether it is its display's selected virtual
@@ -796,15 +800,26 @@ fn resize_window(
     let new_width = round_px(next_ratio * f64::from(viewport.width()));
     let size = Size::new(new_width, frame.height());
 
-    let origin = clamp_origin_to_viewport(
+    let mut origin = clamp_origin_to_viewport(
         IRect::from_center_size(frame.center(), size).min,
         size,
         viewport,
     );
+    let strip = active_display.active_strip();
+    if !config.auto_center() {
+        if strip.index_of(entity).ok() == Some(0) && frame.min.x == viewport.min.x {
+            origin.x = viewport.min.x;
+        } else if strip
+            .last()
+            .is_ok_and(|column| column.window_iter().any(|window| window == entity))
+            && frame.max.x == viewport.max.x
+        {
+            origin.x = viewport.max.x - new_width;
+        }
+    }
     commands.reposition_entity(entity, origin);
 
     // Resize all windows in the column so stacked siblings share the new width.
-    let strip = active_display.active_strip();
     if let Some(Column::Stack(stack)) = strip
         .index_of(entity)
         .ok()
@@ -1108,7 +1123,6 @@ fn copy_window_rule(
 }
 
 /// Moves the focused window to the next available display.
-/// The window will be repositioned to the center of the new display.
 ///
 /// # Arguments
 ///
@@ -1120,7 +1134,7 @@ fn to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
-    mut other_workspaces: OffscreenStrips,
+    mut destinations: DisplayDestinations,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut commands: Commands,
@@ -1181,11 +1195,26 @@ fn to_next_display(
     let center = other.bounds().center().x;
     let target_display_id = other.id();
 
+    let target_space_id = window_manager.active_display_space(target_display_id).ok();
+    let target_dock = target_space_id
+        .and_then(|id| {
+            destinations
+                .strips
+                .iter()
+                .find(|(_, strip, _)| strip.id() == id)
+        })
+        .and_then(|(_, _, child)| destinations.docks.get(child.parent()).ok());
+    let target_viewport = other.actual_display_bounds(target_dock, &config);
+
     let Some(size) = windows.size(entity) else {
         return;
     };
     let width_ratio =
         (source_viewport_width > 0).then(|| f64::from(size.x) / f64::from(source_viewport_width));
+    let width = width_ratio.map_or(size.x, |ratio| {
+        round_px(ratio * f64::from(target_viewport.width()))
+    });
+    commands.resize_entity(entity, Size::new(width, target_viewport.height()));
     let dest = other.bounds().min.with_x(center - size.x / 2);
     commands.reposition_entity(entity, dest);
 
@@ -1200,7 +1229,7 @@ fn to_next_display(
         .or_else(|| active_display.active_strip().right_neighbour(entity));
     active_display.active_strip().remove(entity);
     if let Some(neighbour) = source_neighbour {
-        commands.reshuffle_around(neighbour);
+        commands.refit_after_removal(neighbour);
     }
 
     if matches!(move_focus, MoveFocus::Stay)
@@ -1210,40 +1239,14 @@ fn to_next_display(
     }
 
     // Insert into the target display's selected strip.
-    if let Ok(target_space_id) = window_manager.active_display_space(target_display_id)
-        && let Some((mut target_strip, child)) = other_workspaces
+    if let Some(target_space_id) = target_space_id
+        && let Some((target_strip_entity, mut target_strip, _)) = destinations
+            .strips
             .iter_mut()
-            .find(|(strip, _)| strip.id() == target_space_id)
+            .find(|(_, strip, _)| strip.id() == target_space_id)
     {
         target_strip.append(entity);
-        commands.reshuffle_around(entity);
-
-        // Add a delayed refresh of the window size - because the other display can have different bounds.
-        let display_entity = child.parent();
-        let moved_window = entity;
-        let refresh_size = move |windows: Query<&Bounds, With<Window>>,
-                                 displays: Query<(&Display, Option<&DockPosition>)>,
-                                 mut commands: Commands,
-                                 config: Res<Config>| {
-            let Ok((display, dock)) = displays.get(display_entity) else {
-                return;
-            };
-            let viewport_bounds = display.actual_display_bounds(dock, &config);
-            if let Ok(Bounds(bounds)) = windows.get(moved_window) {
-                debug!("Refreshing size of window {entity}");
-                // Preserve the window's width ratio relative to the target
-                // display's usable viewport (dock- and padding-adjusted), so a
-                // fixed dock is accounted for consistently with the source.
-                let width = width_ratio.map_or(bounds.x, |ratio| {
-                    round_px(ratio * f64::from(viewport_bounds.width()))
-                });
-                let size = Size::new(width, viewport_bounds.height());
-                commands.resize_entity(moved_window, size);
-                commands.reshuffle_around(moved_window);
-            }
-        };
-        let system_id = commands.register_system(refresh_size);
-        Timeout::callback(Duration::from_millis(150), system_id, &mut commands);
+        commands.place_after_arrival(entity, target_strip_entity);
     }
 }
 

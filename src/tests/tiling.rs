@@ -517,6 +517,88 @@ fn test_window_step_resize_defaults_to_five_points() {
         ]);
 }
 
+#[test]
+fn test_step_grow_then_shrink_keeps_a_fitting_strip_at_viewport_edges() {
+    for focused in [0, 1] {
+        let options = MainOptions {
+            auto_center: Some(false),
+            continuous_swipe: Some(true),
+            animation_speed: Some(10000.0),
+            ..Default::default()
+        };
+        let mut params = WindowParams::new(".*", None);
+        params.width = Some(InitialWindowWidth::Ratio(0.5));
+        let config: Config = (options, vec![params]).into();
+
+        TestHarness::new()
+            .with_config(config)
+            .with_windows(2)
+            .with_focused_window(focused)
+            .on_iteration(0, |world, _state| {
+                assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+                assert_window_size!(world, 0, 512, 748);
+            })
+            .on_iteration(2, move |world, _state| {
+                assert_window_size!(world, focused, 563, 748);
+            })
+            .on_iteration(3, |world, _state| {
+                assert_window_size!(world, 0, 512, 748);
+                assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+                assert_window_at!(world, 1, 512, TEST_MENUBAR_HEIGHT);
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: focused },
+                Event::Command {
+                    command: Command::Window(Operation::Focus(if focused == 0 {
+                        Direction::First
+                    } else {
+                        Direction::Last
+                    })),
+                },
+                step(Operation::ResizeStep, ResizeDirection::Grow),
+                step(Operation::ResizeStep, ResizeDirection::Shrink),
+            ]);
+    }
+}
+
+#[test]
+fn test_rapid_step_resize_keeps_the_right_edge_during_animation() {
+    let options = MainOptions {
+        auto_center: Some(false),
+        continuous_swipe: Some(true),
+        animation_speed: Some(30.0),
+        ..Default::default()
+    };
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Ratio(0.5));
+    let config: Config = (options, vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    for direction in [
+        ResizeDirection::Grow,
+        ResizeDirection::Grow,
+        ResizeDirection::Grow,
+        ResizeDirection::Shrink,
+        ResizeDirection::Shrink,
+        ResizeDirection::Shrink,
+    ] {
+        harness
+            .app
+            .world_mut()
+            .write_message(step(Operation::ResizeStep, direction));
+        harness.advance(Duration::from_millis(20));
+    }
+    harness.advance(Duration::from_secs(3));
+    assert_window_size!(harness.world(), 1, 512, 748);
+    assert_window_at!(harness.world(), 0, 0, TEST_MENUBAR_HEIGHT);
+    assert_window_at!(harness.world(), 1, 512, TEST_MENUBAR_HEIGHT);
+}
+
 /// In a stack, the height steps by `window_resize_step` of the display, the
 /// neighbour absorbs the difference, and the neighbour keeps its minimum.
 #[test]
@@ -568,6 +650,281 @@ fn test_window_vertical_step_resize_changes_height_by_the_step() {
         });
     }
     harness.run(commands);
+}
+
+#[test]
+fn test_lower_stacked_window_grows_to_its_requested_native_height() {
+    const VIEWPORT_HEIGHT: i32 = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT;
+    let config: Config = (
+        MainOptions {
+            window_resize_step: Some(0.1),
+            animation_speed: Some(10000.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    for accepted_growth in [0, 20] {
+        TestHarness::new()
+            .with_config(config.clone())
+            .with_windows(2)
+            .on_iteration(3, move |world, state| {
+                crate::assert_focused!(world, 1);
+                let frame = state.create_window(1).frame();
+                assert_eq!(frame.height(), VIEWPORT_HEIGHT / 2);
+                assert_eq!(frame.max.y, TEST_DISPLAY_HEIGHT);
+                state.update_window(1, |window| {
+                    window.resize_bottom_limit = Some(TEST_DISPLAY_HEIGHT + accepted_growth);
+                });
+            })
+            .on_iteration(4, |_world, state| {
+                let frame = state.create_window(1).frame();
+                assert_eq!(frame.height(), 449);
+                assert_eq!(frame.max.y, TEST_DISPLAY_HEIGHT);
+            })
+            .on_iteration(5, |_world, state| {
+                let frame = state.create_window(1).frame();
+                assert_eq!(frame.height(), VIEWPORT_HEIGHT / 2);
+                assert_eq!(frame.max.y, TEST_DISPLAY_HEIGHT);
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: 0 },
+                Event::Command {
+                    command: Command::Window(Operation::Focus(Direction::First)),
+                },
+                Event::Command {
+                    command: Command::Window(Operation::Focus(Direction::East)),
+                },
+                Event::Command {
+                    command: Command::Window(Operation::Stack(Side::West)),
+                },
+                step(Operation::ResizeVerticalStep, ResizeDirection::Grow),
+                step(Operation::ResizeVerticalStep, ResizeDirection::Shrink),
+            ]);
+    }
+}
+
+fn native_height_harness(animation_speed: f64) -> TestHarness {
+    let config: Config = (
+        MainOptions {
+            window_resize_step: Some(0.1),
+            animation_speed: Some(animation_speed),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(Side::West)),
+        },
+    ]);
+    harness.advance(Duration::from_secs(2));
+    harness.mock_state.update_window(1, |window| {
+        window.resize_bottom_limit = Some(TEST_DISPLAY_HEIGHT);
+    });
+    harness
+}
+
+#[test]
+fn test_native_height_verification_waits_for_layout_after_final_size_tick() {
+    use crate::ecs::{Bounds, RepositionMarker, ResizeMarker, VerifyWindowSize};
+    for accepted_growth in [0, 20] {
+        let mut harness = native_height_harness(10000.0);
+        harness.mock_state.update_window(1, |window| {
+            window.resize_bottom_limit = Some(TEST_DISPLAY_HEIGHT + accepted_growth);
+        });
+        let entity = find_window_entity(1, harness.world());
+        harness
+            .world()
+            .write_message(step(Operation::ResizeVerticalStep, ResizeDirection::Grow));
+        harness.advance(Duration::from_millis(20));
+        assert!(harness.world().get::<ResizeMarker>(entity).is_none());
+        assert!(harness.world().get::<RepositionMarker>(entity).is_none());
+        assert!(harness.world().get::<VerifyWindowSize>(entity).is_some());
+        assert_eq!(harness.world().get::<Bounds>(entity).unwrap().0.y, 449);
+        assert_eq!(
+            harness.mock_state.create_window(1).frame().height(),
+            374 + accepted_growth
+        );
+        harness
+            .world()
+            .write_message(Event::WindowResized { window_id: 1 });
+        harness.advance(Duration::from_secs(2));
+        assert_eq!(harness.mock_state.create_window(1).frame().height(), 449);
+        assert!(harness.world().get::<VerifyWindowSize>(entity).is_none());
+    }
+}
+
+#[test]
+fn test_animated_native_height_growth_settles_for_both_stack_members() {
+    use crate::ecs::{RepositionMarker, ResizeMarker, VerifyWindowSize};
+    for window_id in [0, 1] {
+        let mut harness = native_height_harness(30.0);
+        harness.run(vec![Event::Command {
+            command: Command::Window(Operation::Focus(if window_id == 0 {
+                Direction::North
+            } else {
+                Direction::South
+            })),
+        }]);
+        let entity = find_window_entity(window_id, harness.world());
+        harness
+            .world()
+            .write_message(step(Operation::ResizeVerticalStep, ResizeDirection::Grow));
+        harness.advance(Duration::from_millis(20));
+        assert!(harness.world().get::<ResizeMarker>(entity).is_some());
+        assert!(harness.world().get::<RepositionMarker>(entity).is_none());
+        assert!(harness.world().get::<VerifyWindowSize>(entity).is_some());
+        harness.advance(Duration::from_secs(3));
+        assert_eq!(
+            harness.mock_state.create_window(window_id).frame().height(),
+            449
+        );
+        assert!(harness.world().get::<VerifyWindowSize>(entity).is_none());
+    }
+}
+
+#[test]
+fn test_native_height_growth_handles_both_animation_completion_orders() {
+    use crate::ecs::{Position, RepositionMarker, ResizeMarker, VerifyWindowSize};
+    for (window_id, position_finishes_first) in [(1, false), (0, true)] {
+        let mut harness = native_height_harness(30.0);
+        harness.run(vec![Event::Command {
+            command: Command::Window(Operation::Focus(if window_id == 0 {
+                Direction::North
+            } else {
+                Direction::South
+            })),
+        }]);
+        let entity = find_window_entity(window_id, harness.world());
+        let start = harness.mock_state.create_window(window_id).frame();
+        if position_finishes_first {
+            harness.world().get_mut::<Position>(entity).unwrap().0.x += 20;
+            harness
+                .world()
+                .entity_mut(entity)
+                .insert(RepositionMarker(start.min));
+        }
+        harness
+            .world()
+            .write_message(step(Operation::ResizeVerticalStep, ResizeDirection::Grow));
+        harness.advance(Duration::from_millis(40));
+        assert!(harness.world().get::<ResizeMarker>(entity).is_some());
+        assert!(harness.world().get::<RepositionMarker>(entity).is_some());
+        let moving_frame = harness.mock_state.create_window(window_id).frame();
+        assert!(moving_frame.height() > 374 && moving_frame.height() < 449);
+        assert_ne!(moving_frame.min, start.min);
+
+        let mut observed_completion = false;
+        for _ in 0..25 {
+            harness.advance(Duration::from_millis(20));
+            let resizing = harness.world().get::<ResizeMarker>(entity).is_some();
+            let moving = harness.world().get::<RepositionMarker>(entity).is_some();
+            if resizing != moving {
+                assert_eq!(resizing, position_finishes_first);
+                assert!(harness.world().get::<VerifyWindowSize>(entity).is_some());
+                observed_completion = true;
+                break;
+            }
+        }
+        assert!(
+            observed_completion,
+            "animations must finish on different ticks"
+        );
+        harness.advance(Duration::from_secs(3));
+        let frame = harness.mock_state.create_window(window_id).frame();
+        assert_eq!(frame.height(), 449);
+        assert_eq!(frame.min.x, start.min.x);
+        assert_eq!(frame.min.y, if window_id == 0 { 20 } else { 319 });
+        assert!(harness.world().get::<ResizeMarker>(entity).is_none());
+        assert!(harness.world().get::<RepositionMarker>(entity).is_none());
+        assert!(harness.world().get::<VerifyWindowSize>(entity).is_none());
+    }
+}
+
+#[test]
+fn test_interrupted_native_height_resize_uses_the_latest_target() {
+    use crate::ecs::{RepositionMarker, ResizeMarker, VerifyWindowSize};
+    let mut harness = native_height_harness(30.0);
+    let entity = find_window_entity(1, harness.world());
+    harness
+        .world()
+        .write_message(step(Operation::ResizeVerticalStep, ResizeDirection::Grow));
+    harness.advance(Duration::from_millis(40));
+    assert!(harness.world().get::<ResizeMarker>(entity).is_some());
+    assert!(harness.world().get::<RepositionMarker>(entity).is_some());
+    let moving_frame = harness.mock_state.create_window(1).frame();
+    assert!(moving_frame.height() > 374 && moving_frame.height() < 449);
+    assert!(moving_frame.min.y < 394 && moving_frame.min.y > 319);
+    harness
+        .world()
+        .write_message(step(Operation::ResizeVerticalStep, ResizeDirection::Shrink));
+    harness.advance(Duration::from_millis(20));
+    assert_eq!(
+        harness.world().get::<ResizeMarker>(entity).unwrap().0.y,
+        374
+    );
+    harness.advance(Duration::from_secs(3));
+    let frame = harness.mock_state.create_window(1).frame();
+    assert_eq!(
+        frame.height(),
+        (TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT) / 2
+    );
+    assert_eq!(frame.max.y, TEST_DISPLAY_HEIGHT);
+    assert!(harness.world().get::<ResizeMarker>(entity).is_none());
+    assert!(harness.world().get::<RepositionMarker>(entity).is_none());
+    assert!(harness.world().get::<VerifyWindowSize>(entity).is_none());
+}
+
+#[test]
+fn test_fixed_native_height_settles_without_continuing_writes() {
+    use crate::ecs::{Bounds, VerifyWindowSize};
+    for window_id in [0, 1] {
+        let mut harness = native_height_harness(30.0);
+        harness.run(vec![Event::Command {
+            command: Command::Window(Operation::Focus(if window_id == 0 {
+                Direction::North
+            } else {
+                Direction::South
+            })),
+        }]);
+        let entity = find_window_entity(window_id, harness.world());
+        let height = harness.mock_state.create_window(window_id).frame().height();
+        harness.mock_state.update_window(window_id, |window| {
+            window.maximum_size = Some(IVec2::new(TEST_DISPLAY_WIDTH, height));
+        });
+        harness.run(vec![step(
+            Operation::ResizeVerticalStep,
+            ResizeDirection::Grow,
+        )]);
+        harness.advance(Duration::from_secs(3));
+        assert_eq!(
+            harness.mock_state.create_window(window_id).frame().height(),
+            height
+        );
+        if window_id == 0 {
+            assert_eq!(harness.world().get::<Bounds>(entity).unwrap().0.y, height);
+        }
+        assert!(harness.world().get::<VerifyWindowSize>(entity).is_none());
+        let mut writes = (0, 0);
+        harness.mock_state.update_window(window_id, |window| {
+            writes = (window.resize_writes, window.position_writes);
+        });
+        harness.advance(Duration::from_secs(3));
+        harness.mock_state.update_window(window_id, |window| {
+            assert_eq!((window.resize_writes, window.position_writes), writes);
+        });
+    }
 }
 
 /// Outside a stack a column's lone window always fills the viewport height.

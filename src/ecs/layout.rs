@@ -17,8 +17,8 @@ use crate::ecs::params::Windows;
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, Scrolling,
-    SpawnCommandsExt,
+    ManualStripOffset, PlaceAfterArrival, Position, RefitAfterRemoval, RepositionMarker,
+    ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -57,6 +57,18 @@ type StripPlacements<'w, 's> = Query<
 /// Displays paired with the Dock's current edge, which is what turns a display's
 /// raw bounds into the usable viewport.
 type DisplayViewports<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
+
+type ReshuffleRequests<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        Option<&'static LayoutPosition>,
+        Has<RefitAfterRemoval>,
+        Option<&'static PlaceAfterArrival>,
+    ),
+    With<ReshuffleAroundMarker>,
+>;
 
 /// A strip, its entity, its own scroll position, whether it's mid-swipe, and
 /// its parent display. Used by [`position_layout_windows`] to build each
@@ -122,6 +134,16 @@ pub(crate) fn clamp_origin_to_viewport(origin: Origin, size: Size, viewport: IRe
     let minimum = viewport.min.min(far_edge);
     let maximum = viewport.min.max(far_edge);
     origin.clamp(minimum, maximum)
+}
+
+fn fitting_origin_x(
+    target: i32,
+    content: std::ops::Range<i32>,
+    viewport: std::ops::Range<i32>,
+) -> Option<i32> {
+    let minimum = viewport.start - content.start;
+    let maximum = viewport.end - content.end;
+    (minimum <= maximum).then(|| target.clamp(minimum, maximum))
 }
 
 /// How far a stored width may drift before a [`ManualStripOffset`] counts as
@@ -1203,9 +1225,21 @@ fn layout_strip_changed(
     }
 }
 
+fn strip_content_range(strip: &LayoutStrip, windows: &Windows) -> Option<std::ops::Range<i32>> {
+    let first = strip.first().ok()?.top()?;
+    let last = strip.last().ok()?.top()?;
+    let start = windows.layout_position(first)?.x;
+    let end = windows.layout_position(last)?.x + windows.moving_frame(last)?.width();
+    Some(start..end)
+}
+
+fn overflowing_arrival_x(content: std::ops::Range<i32>, viewport: IRect) -> Option<i32> {
+    (content.end - content.start > viewport.width()).then_some(viewport.max.x - content.end)
+}
+
 #[instrument(level = Level::DEBUG, skip_all)]
 fn reshuffle_layout_strip(
-    markers: Query<(Entity, &LayoutPosition), With<ReshuffleAroundMarker>>,
+    markers: ReshuffleRequests,
     strips: StripPlacements,
     manual_offsets: Query<&ManualStripOffset>,
     displays: DisplayViewports,
@@ -1213,30 +1247,49 @@ fn reshuffle_layout_strip(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    markers.into_iter().for_each(|(entity, layout_position)| {
+    for (entity, slot, refit, arrival) in markers {
         if let Ok(mut cmd) = commands.get_entity(entity) {
-            cmd.try_remove::<ReshuffleAroundMarker>();
+            cmd.try_remove::<(ReshuffleAroundMarker, RefitAfterRemoval, PlaceAfterArrival)>();
         }
+        let Some(slot) = slot else {
+            continue;
+        };
         let Some((strip, strip_entity, active_strip, child, active_marker, strip_reposition)) =
             strips.into_iter().find(|strip| strip.0.contains(entity))
         else {
-            return;
+            continue;
         };
 
         if active_marker.is_some_and(|m| m.is_added()) {
             trace!("reshuffle_layout_strip: skipping newly active workspace {strip_entity}");
-            return;
+            continue;
         }
         let Ok((active_display, dock)) = displays.get(child.parent()) else {
-            return;
+            continue;
         };
         let display_bounds = active_display.actual_display_bounds(dock, &config);
         let Some(mut frame) = windows.moving_frame(entity) else {
-            return;
+            continue;
         };
 
         let size = frame.size();
         let visible_width = display_bounds.intersect(frame).width();
+        let strip_target = strip_reposition.map_or(active_strip.0, |reposition| reposition.0);
+
+        let content = strip_content_range(strip, &windows);
+        if arrival.is_some_and(|arrival| arrival.destination == strip_entity)
+            && !config.auto_center()
+            && matches!(strip.last(), Ok(Column::Single(last)) if last == entity)
+            && let Some(x) = content
+                .clone()
+                .and_then(|range| overflowing_arrival_x(range, display_bounds))
+        {
+            if let Ok(mut cmd) = commands.get_entity(strip_entity) {
+                cmd.try_remove::<ManualStripOffset>();
+            }
+            commands.reposition_entity(strip_entity, Origin::new(x, display_bounds.min.y));
+            continue;
+        }
 
         // A deliberate offset (center, snap) outranks the derived one, but only
         // while the window this reshuffle is about is still fully on screen: a
@@ -1249,13 +1302,12 @@ fn reshuffle_layout_strip(
             // so a strip that has since gained, lost, reordered or resized a
             // column no longer has a placement to keep.
             let current = strip_signature(strip, &windows);
-            let strip_target = strip_reposition.map_or(active_strip.0, |reposition| reposition.0);
-            let projected = layout_position.0 + strip_target;
+            let projected = slot.0 + strip_target;
             if signature_matches(&current, &manual.signature)
                 && clamp_origin_to_viewport(projected, size, display_bounds) == projected
             {
                 trace!("reshuffle_layout_strip: keeping manual offset on {strip_entity}");
-                return;
+                continue;
             }
             trace!("reshuffle_layout_strip: manual offset on {strip_entity} is stale");
             if let Ok(mut cmd) = commands.get_entity(strip_entity) {
@@ -1267,41 +1319,48 @@ fn reshuffle_layout_strip(
         frame.min = clamp_origin_to_viewport(frame.min, size, display_bounds);
         frame.max = frame.min + size;
 
-        let mut strip_position = (frame.min - layout_position.0).with_y(display_bounds.min.y);
+        let mut strip_position = (frame.min - slot.0).with_y(display_bounds.min.y);
 
         // Enforce the edge invariant when auto-center is off: the leftmost
         // window must touch the left edge and the rightmost the right edge
         // if more than 1 windows in workspace.
         if !config.auto_center()
             && !config.continuous_swipe()
-            && let Some(total_strip_width) = strip
-                .last()
-                .ok()
-                .and_then(|column| column.top())
-                .and_then(|last| {
-                    windows
-                        .layout_position(last)
-                        .map(|position| position.0.x)
-                        .zip(windows.moving_frame(last).map(|frame| frame.width()))
-                })
-                .map(|(last_x, last_width)| last_x + last_width)
+            && let Some(total_strip_width) = content.as_ref().map(|range| range.end)
         {
             strip_position.x = if display_bounds.width() < total_strip_width {
-                strip_position.x.clamp(
-                    display_bounds.max.x - total_strip_width,
-                    display_bounds.min.x,
-                )
+                let right_aligned = display_bounds.max.x - total_strip_width;
+                strip_position.x.clamp(right_aligned, display_bounds.min.x)
             } else {
                 // Strip fits entirely: pin the leftmost window to the left edge.
                 display_bounds.min.x
             };
         }
 
+        let refitted_x = if refit && !config.auto_center() {
+            content.and_then(|range| {
+                fitting_origin_x(
+                    if config.continuous_swipe() {
+                        strip_target.x
+                    } else {
+                        strip_position.x
+                    },
+                    range,
+                    display_bounds.min.x..display_bounds.max.x,
+                )
+            })
+        } else {
+            None
+        };
+        if let Some(x) = refitted_x {
+            strip_position = strip_target.with_x(x);
+        }
+
         // Check how much of the window is hidden. Slivers don't count as
         // meaningfully visible, so subtract sliver_width from the visible
         // portion. If the hidden fraction is within the allowed ratio, skip.
         let hidden_ratio = config.window_hidden_ratio();
-        if hidden_ratio > 0.0 {
+        if refitted_x.is_none() && hidden_ratio > 0.0 {
             let meaningful = (visible_width - config.sliver_width()).max(0);
             let visible_fraction = f64::from(meaningful) / f64::from(frame.width().max(1));
             let hidden_fraction = 1.0 - visible_fraction;
@@ -1310,13 +1369,13 @@ fn reshuffle_layout_strip(
             // or if the layout strip movement is shorter than the hidden width.
             let strip_movement = (active_strip.x - strip_position.x).abs();
             if hidden_fraction <= hidden_ratio && frame.width() - visible_width >= strip_movement {
-                return;
+                continue;
             }
         }
 
         trace!("reshuffle_layout_strip: triggered for entity {entity}, offset {strip_position}");
         commands.reposition_entity(strip_entity, strip_position);
-    });
+    }
 }
 
 /// Scrolls the strip the minimum amount needed to keep `EnsureVisibleMarker`
@@ -1374,7 +1433,7 @@ fn ensure_visible_in_strip(
         let Ok((display, dock)) = displays.get(display_entity) else {
             continue;
         };
-        let Some(size) = windows.size(entity) else {
+        let Some(size) = windows.moving_frame(entity).map(|frame| frame.size()) else {
             continue;
         };
         let viewport = display.actual_display_bounds(dock, &config);
@@ -1703,6 +1762,16 @@ fn position_layout_windows(
 mod tests {
     use super::*;
     use bevy::prelude::*;
+
+    #[test]
+    fn fitting_origin_moves_only_to_the_nearest_fitting_edge() {
+        assert_eq!(fitting_origin_x(-500, 0..1906, 4..2044), Some(4));
+        assert_eq!(fitting_origin_x(500, 0..1906, 4..2044), Some(138));
+        assert_eq!(fitting_origin_x(100, 0..1906, 4..2044), Some(100));
+        assert_eq!(fitting_origin_x(-2500, 20..1926, -2044..-4), Some(-2064));
+        assert_eq!(fitting_origin_x(100, 0..2040, 4..2044), Some(4));
+        assert_eq!(fitting_origin_x(100, 0..2041, 4..2044), None);
+    }
 
     #[test]
     fn signature_tolerates_pixel_drift_but_not_a_reshape() {

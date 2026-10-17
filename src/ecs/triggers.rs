@@ -1,7 +1,7 @@
-use bevy::ecs::change_detection::DetectChangesMut;
-use bevy::ecs::entity::{Entity, EntityHashSet};
+use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
+use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
-use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
+use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
@@ -27,8 +27,8 @@ use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
-    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    VerifyWindowPosition, VerifyWindowSize, WidthRatio, WindowProperties,
+    RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
+    SpawnCommandsExt, VerifyWindowPosition, VerifyWindowSize, WidthRatio, WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -51,7 +51,11 @@ type AwaitingWindow = (
     Has<Unmanaged>,
 );
 
-type SizeCheckReady = (Without<ResizeMarker>, Without<AwaitingHandle>);
+type SizeCheckReady = (
+    Without<ResizeMarker>,
+    Without<RepositionMarker>,
+    Without<AwaitingHandle>,
+);
 
 type AddedWindowDefaults<'w, 's> = Populated<
     'w,
@@ -1324,7 +1328,7 @@ pub(super) fn apply_window_defaults(
         }
 
         // Apply configured width AFTER update_frame so it isn't overwritten.
-        // WidthRatio and commit_window_size use the display's raw bounds.
+        // WidthRatio and commit_window_frame use the display's raw bounds.
         // Safe during init: this only resizes, it doesn't reposition, so a
         // window on an inactive display stays put.
         if let Some(width) = properties.width_ratio(focused_ratio) {
@@ -1566,32 +1570,28 @@ pub(super) fn cleanup_timeout_trigger(
 }
 
 pub(super) fn window_resize_verifier(
-    mut removed: RemovedComponents<ResizeMarker>,
     mut requested: Query<(Entity, &mut VerifyWindowSize), SizeCheckReady>,
-    mut windows: Query<(&mut Window, &Position, &mut Bounds)>,
+    mut windows: Query<(&mut Window, Ref<Position>, &mut Bounds)>,
     layout_strips: Query<&LayoutStrip>,
     mut commands: Commands,
 ) {
     use std::cmp::Ordering;
-    let mut pending: EntityHashSet = removed.read().collect();
-    pending.extend(requested.iter().map(|(entity, _)| entity));
-    for entity in pending {
-        let Ok((mut window, _, mut bounds)) = windows.get_mut(entity) else {
+    for (entity, mut verification) in &mut requested {
+        let Ok((mut window, position, mut bounds)) = windows.get_mut(entity) else {
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<VerifyWindowSize>();
             }
             continue;
         };
-        let frame = window.update_frame();
-        if frame.is_err()
-            && requested
-                .get_mut(entity)
-                .is_ok_and(|(_, mut verification)| {
-                    verification.remaining = verification.remaining.saturating_sub(1);
-                    verification.remaining > 0
-                })
-        {
+        if position.is_changed() || bounds.is_changed() {
             continue;
+        }
+        let frame = window.update_frame();
+        if frame.is_err() {
+            verification.remaining = verification.remaining.saturating_sub(1);
+            if verification.remaining > 0 {
+                continue;
+            }
         }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<VerifyWindowSize>();
@@ -1778,11 +1778,11 @@ mod tests {
             .world()
             .entity_mut(entity)
             .insert(crate::ecs::VerifyWindowSize::default());
-        for _ in 0..2 {
-            harness
-                .world()
-                .run_system_once(super::window_resize_verifier)
-                .unwrap();
+        let verifier = harness
+            .world()
+            .register_system(super::window_resize_verifier);
+        for _ in 0..3 {
+            harness.world().run_system(verifier).unwrap();
         }
         assert_eq!(
             harness
@@ -1815,11 +1815,11 @@ mod tests {
             .world()
             .entity_mut(entity)
             .insert(crate::ecs::VerifyWindowSize::default());
-        for _ in 0..3 {
-            harness
-                .world()
-                .run_system_once(super::window_resize_verifier)
-                .unwrap();
+        let verifier = harness
+            .world()
+            .register_system(super::window_resize_verifier);
+        for _ in 0..4 {
+            harness.world().run_system(verifier).unwrap();
         }
         assert!(
             harness

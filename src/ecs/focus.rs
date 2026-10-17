@@ -17,12 +17,12 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, VerifyFocus};
 use crate::config::Config;
-use crate::ecs::layout::{Column, LayoutStrip};
+use crate::ecs::layout::{Column, LayoutStrip, clamp_origin_to_viewport};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, ResizeMarker, Scrolling,
-    SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
+    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, RepositionMarker, ResizeMarker,
+    Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -331,6 +331,7 @@ fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
     restored: Query<&RestoreFocusMarker>,
+    moving_strips: Query<&RepositionMarker, With<LayoutStrip>>,
     global_state: GlobalState,
     active_display: ActiveDisplay,
     mut ctx: WindowCtx,
@@ -359,7 +360,34 @@ fn autocenter_window_on_focus(
         origin.x = center.x - size.x / 2;
         ctx.commands.reposition_entity(entity, origin);
     }
-    ctx.commands.reshuffle_around(entity);
+    if !ctx.config.auto_center()
+        && ctx.config.continuous_swipe()
+        && let Ok(target) = moving_strips.get(active_display.active_strip_entity())
+    {
+        let hidden_ratio = ctx.config.window_hidden_ratio();
+        if hidden_ratio > 0.0
+            && let Some(slot) = ctx.windows.layout_position(entity)
+            && let Some(frame) = ctx.windows.moving_frame(entity)
+        {
+            let projected = slot.0 + target.0;
+            let frame = IRect::from_corners(projected, projected + frame.size());
+            let viewport = active_display.actual_bounds(&ctx.config);
+            let visible_width = viewport.intersect(frame).width();
+            let meaningful = (visible_width - ctx.config.sliver_width()).max(0);
+            let visible_fraction = f64::from(meaningful) / f64::from(frame.width().max(1));
+            let strip_movement =
+                (clamp_origin_to_viewport(projected, frame.size(), viewport).x - projected.x).abs();
+            if visible_width > 0
+                && 1.0 - visible_fraction <= hidden_ratio
+                && frame.width() - visible_width >= strip_movement
+            {
+                return;
+            }
+        }
+        ctx.commands.ensure_visible(entity);
+    } else {
+        ctx.commands.reshuffle_around(entity);
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
