@@ -962,19 +962,20 @@ pub(super) fn recover_window_handles(
         deadline.0.tick(clock.delta());
         let window_id = window.id();
         let ordered_in = window_manager.window_ordered_in(window_id);
-        let recovered = matches!(ordered_in, Ok(true))
+        let handle_recovered = matches!(ordered_in, Ok(true))
             && (window.role().is_ok()
                 || apps
                     .get_mut(child.parent())
-                    .is_ok_and(|mut app| adopt_fresh_handle(&mut window, &mut app, &config)))
-            && (unmanaged || geometry.is_none() || window.update_frame().is_ok());
+                    .is_ok_and(|mut app| adopt_fresh_handle(&mut window, &mut app, &config)));
+        let frame_ready =
+            handle_recovered && (unmanaged || geometry.is_none() || window.update_frame().is_ok());
 
-        if !recovered && !deadline.0.is_finished() && !matches!(ordered_in, Ok(false)) {
+        if !frame_ready && !deadline.0.is_finished() && !matches!(ordered_in, Ok(false)) {
             continue;
         }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<AwaitingHandle>();
-            if recovered
+            if frame_ready
                 && !unmanaged
                 && let Some((position, bounds)) = geometry
             {
@@ -985,7 +986,7 @@ pub(super) fn recover_window_handles(
                     .try_insert_if_new(VerifyWindowPosition::default());
             }
         }
-        if !recovered {
+        if !handle_recovered {
             debug!("Window {window_id} has no new AX element; closing it.");
             commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
                 window_id,
@@ -1680,6 +1681,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::{TestHarness, find_window_entity};
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::math::IVec2;
+    use std::time::Duration;
+
+    #[test]
+    fn test_persistent_frame_refresh_failure_keeps_the_live_window() {
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_millis(2000));
+        let entity = find_window_entity(0, harness.world());
+        harness.mock_state.update_window(0, |window| {
+            window.frame_read_failures = u8::MAX;
+        });
+        harness
+            .world()
+            .entity_mut(entity)
+            .insert(AwaitingHandle(Timer::new(
+                HANDLE_RECOVERY_TIMEOUT,
+                TimerMode::Once,
+            )));
+        harness.advance(Duration::from_millis(1500));
+        assert!(
+            harness.world().get::<Window>(entity).is_some(),
+            "an ordered-in window with a valid handle must not be closed"
+        );
+        assert!(harness.world().get::<AwaitingHandle>(entity).is_none());
+        assert!(
+            !harness
+                .world()
+                .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
+                .unwrap()
+        );
+        crate::assert_focused!(harness.world(), 0);
+    }
 
     #[test]
     fn test_handle_recovery_retries_a_transient_frame_refresh_failure() {
@@ -1716,11 +1752,6 @@ mod tests {
         assert!(harness.world().get::<AwaitingHandle>(entity).is_none());
         assert_eq!(harness.mock_state.create_window(0).frame().width(), 800);
     }
-    use crate::tests::{TestHarness, find_window_entity};
-    use bevy::ecs::system::RunSystemOnce;
-    use bevy::math::IVec2;
-    use std::time::Duration;
-
     #[test]
     fn test_size_verification_retries_a_transient_read_failure() {
         let mut harness = TestHarness::new().with_windows(1);
