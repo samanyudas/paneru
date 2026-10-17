@@ -185,13 +185,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
         (
             (
                 systems::animate_entities,
-                systems::commit_window_position.run_if(not(resource_exists::<Initializing>)),
-                systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
-            )
-                .chain(),
-            (
                 systems::animate_resize_entities,
-                systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
+                systems::commit_window_frame.run_if(not(resource_exists::<Initializing>)),
+                systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
+                triggers::window_resize_verifier,
             )
                 .chain(),
             (
@@ -229,7 +226,6 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::invalidate_window_title,
             triggers::refresh_configuration_trigger,
             triggers::theme_change_trigger,
-            triggers::window_resize_verifier,
         ),
     );
     app.add_observer(triggers::window_unmanaged_trigger)
@@ -471,7 +467,7 @@ pub enum DockPosition {
 }
 
 /// Asks `window_resize_verifier` to read back a window's native size once no
-/// resize animation or handle recovery is pending for it.
+/// geometry animation, layout change, or handle recovery is pending for it.
 /// Transient read failures are retried for at most three attempts.
 #[derive(Component)]
 pub struct VerifyWindowSize {
@@ -592,7 +588,7 @@ impl SpawnCommandsExt for Commands<'_, '_> {
             return;
         }
         if let Ok(mut entity_commands) = self.get_entity(entity) {
-            entity_commands.try_insert(ResizeMarker(size));
+            entity_commands.try_insert((ResizeMarker(size), VerifyWindowSize::default()));
         }
     }
 

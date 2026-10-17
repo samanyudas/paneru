@@ -1,5 +1,5 @@
 use bevy::app::AppExit;
-use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut};
+use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
 use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
@@ -20,7 +20,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     ActiveDisplayMarker, BProcess, ExistingMarker, FreshMarker, RepositionMarker, ResizeMarker,
-    RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition,
+    RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition, VerifyWindowSize,
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
@@ -77,8 +77,21 @@ type ResizableWindows<'w, 's> = Query<
         &'static mut Bounds,
         Option<&'static Unmanaged>,
         Has<ResizeMarker>,
+        Has<VerifyWindowSize>,
     ),
     Without<LayoutStrip>,
+>;
+
+type ChangedWindowFrames<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        Option<Ref<'static, Position>>,
+        Option<Ref<'static, Bounds>>,
+        Option<&'static mut WidthRatio>,
+    ),
+    Or<(Changed<Position>, Changed<Bounds>)>,
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
@@ -793,20 +806,17 @@ pub(super) fn window_resized_update_frame(
             continue;
         };
 
-        let Some((mut window, entity, position, mut bounds, unmanaged, resizing)) = windows
-            .iter_mut()
-            .find(|window| window.0.id() == *window_id)
+        let Some((mut window, entity, position, mut bounds, unmanaged, resizing, verifying)) =
+            windows
+                .iter_mut()
+                .find(|window| window.0.id() == *window_id)
         else {
             continue;
         };
         if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
             continue;
         }
-        // Our own resize, echoed back: `commit_window_size` requested this size
-        // and `animate_resize_entities` is still stepping toward it, so reading
-        // the echo in here would fight the animation producing that difference.
-        // Only a resize we did not initiate is new information.
-        if resizing {
+        if resizing || verifying {
             continue;
         }
         let Ok(new_frame) = window.update_frame() else {
@@ -850,7 +860,7 @@ pub(super) fn window_resized_update_frame(
         let diff = old_frame.min.y - new_frame.min.y;
         if diff.abs() > 0
             && let Some(above_entity) = strip.above(entity)
-            && let Ok((_, _, _, mut above_bounds, _, _)) = windows.get_mut(above_entity)
+            && let Ok((_, _, _, mut above_bounds, _, _, _)) = windows.get_mut(above_entity)
             && above_bounds.0.y - diff > 200
         {
             above_bounds.0.y -= diff;
@@ -1102,15 +1112,31 @@ pub(super) fn update_overlays(
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn commit_window_position(
-    mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
+pub(super) fn commit_window_frame(
+    active_display: Option<ActiveDisplay>,
+    mut windows: ChangedWindowFrames,
 ) {
-    // `par_iter_mut` runs on `ComputeTaskPool` worker threads, which have no
-    // `CFRunLoop` of their own to drain thread-local autorelease pools.
-    moved_windows
+    let display_bounds = active_display.map(|display| display.bounds());
+    windows
         .par_iter_mut()
-        .for_each(|(mut window, position)| {
-            objc2::rc::autoreleasepool(|_| window.reposition(position.0));
+        .for_each(|(mut window, position, bounds, width_ratio)| {
+            let size = match (bounds, width_ratio, display_bounds) {
+                (Some(bounds), Some(mut width_ratio), Some(display_bounds)) => {
+                    if bounds.is_changed() {
+                        width_ratio.0 = f64::from(bounds.0.x) / f64::from(display_bounds.width());
+                    }
+                    Some(bounds.0)
+                }
+                _ => None,
+            };
+            objc2::rc::autoreleasepool(|_| {
+                if let Some(position) = position {
+                    window.reposition(position.0);
+                }
+                if let Some(size) = size {
+                    window.resize(size);
+                }
+            });
         });
 }
 
@@ -1137,20 +1163,6 @@ pub(super) fn verify_window_position(
             entity_commands.try_remove::<VerifyWindowPosition>();
         }
     }
-}
-
-#[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn commit_window_size(
-    active_display: ActiveDisplay,
-    mut resized_windows: Populated<(&mut Window, &Bounds, &mut WidthRatio), Changed<Bounds>>,
-) {
-    let display_bounds = active_display.bounds();
-    resized_windows
-        .par_iter_mut()
-        .for_each(|(mut window, size, mut width_ratio)| {
-            width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
-            objc2::rc::autoreleasepool(|_| window.resize(size.0));
-        });
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any
@@ -1604,6 +1616,43 @@ mod tests {
     use super::gather_initial_processes;
     use crate::config::Config;
     use crate::events::Event;
+
+    #[test]
+    fn frame_commit_preserves_position_only_windows_without_an_active_display() {
+        use crate::ecs::Position;
+        use crate::manager::Origin;
+        use bevy::ecs::system::RunSystemOnce;
+        let mut harness = crate::tests::TestHarness::new().with_windows(1);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        let window = harness.mock_state.create_window(0);
+        let mut world = World::new();
+        world.spawn((window, Position(Origin::new(80, 90))));
+        world.run_system_once(super::commit_window_frame).unwrap();
+        assert_eq!(
+            harness.mock_state.create_window(0).frame().min,
+            Origin::new(80, 90)
+        );
+    }
+
+    #[test]
+    fn frame_commit_preserves_bounds_only_windows_with_size_metadata() {
+        use crate::ecs::{Bounds, Position, WidthRatio};
+        use bevy::ecs::system::RunSystemOnce;
+        let mut harness = crate::tests::TestHarness::new().with_windows(1);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        let entity = crate::tests::find_window_entity(0, harness.world());
+        harness.world().entity_mut(entity).remove::<Position>();
+        harness.world().get_mut::<Bounds>(entity).unwrap().0.x = 700;
+        harness
+            .world()
+            .run_system_once(super::commit_window_frame)
+            .unwrap();
+        assert_eq!(harness.mock_state.create_window(0).frame().width(), 700);
+        assert_eq!(
+            harness.world().get::<WidthRatio>(entity).unwrap().0,
+            700.0 / f64::from(crate::tests::TEST_DISPLAY_WIDTH)
+        );
+    }
 
     /// The input event tap keeps the handle it received on `InitialConfig` and
     /// reads swipe settings off it per event, so the Lua config must land in
