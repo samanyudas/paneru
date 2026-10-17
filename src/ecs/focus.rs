@@ -21,8 +21,8 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, ResizeMarker, Scrolling,
-    SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
+    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, RepositionMarker, ResizeMarker,
+    Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -331,6 +331,7 @@ fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
     restored: Query<&RestoreFocusMarker>,
+    moving_strips: Query<(), (With<LayoutStrip>, With<RepositionMarker>)>,
     global_state: GlobalState,
     active_display: ActiveDisplay,
     mut ctx: WindowCtx,
@@ -359,7 +360,11 @@ fn autocenter_window_on_focus(
         origin.x = center.x - size.x / 2;
         ctx.commands.reposition_entity(entity, origin);
     }
-    ctx.commands.reshuffle_around(entity);
+    if !ctx.config.auto_center() && moving_strips.contains(active_display.active_strip_entity()) {
+        ctx.commands.ensure_visible(entity);
+    } else {
+        ctx.commands.reshuffle_around(entity);
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
