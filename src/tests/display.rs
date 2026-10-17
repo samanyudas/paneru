@@ -1311,8 +1311,6 @@ fn test_move_to_display_waits_for_a_late_ax_element() {
         ]);
 }
 
-/// A window closed while it waits for a fresh AX element is removed as soon
-/// as the window server drops it, not when the wait runs out.
 #[test]
 fn test_close_while_waiting_for_a_late_ax_element_removes_the_window() {
     harness_with_display_above()
@@ -1402,4 +1400,192 @@ fn test_vertical_focus_and_swap_stay_on_the_display_at_a_column_edge() {
             window_command(Operation::Focus(Direction::North)),
             window_command(Operation::Swap(Direction::North)),
         ]);
+}
+
+#[test]
+fn test_late_handle_replays_pending_geometry() {
+    let mut harness = harness_with_display_above();
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+    ]);
+    let entity = find_window_entity(0, harness.world());
+    harness
+        .world()
+        .write_message(window_command(Operation::MoveToDisplay(Direction::North)));
+    harness.advance(Duration::from_millis(60));
+    harness
+        .mock_state
+        .os_transfer_window_late(0, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(600));
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::AwaitingHandle>(entity)
+            .is_some()
+    );
+    let expected = harness.world().get::<crate::ecs::Bounds>(entity).unwrap().0;
+    let expected_origin = harness
+        .world()
+        .get::<crate::ecs::Position>(entity)
+        .unwrap()
+        .0;
+    harness.mock_state.os_list_window(0);
+    harness.advance(Duration::from_millis(2000));
+    assert_eq!(window_entity(harness.world(), 0), Some(entity));
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::AwaitingHandle>(entity)
+            .is_none()
+    );
+    let actual = harness.mock_state.create_window(0).frame();
+    assert_eq!(
+        actual.size(),
+        expected,
+        "native size must catch up after handle recovery"
+    );
+    assert_eq!(
+        actual.min, expected_origin,
+        "native position must catch up after handle recovery"
+    );
+}
+
+#[test]
+fn test_late_handle_reconciles_native_size_constraints() {
+    let mut harness = harness_with_display_above();
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+    ]);
+    let entity = find_window_entity(0, harness.world());
+    harness
+        .world()
+        .write_message(window_command(Operation::MoveToDisplay(Direction::North)));
+    harness.advance(Duration::from_millis(60));
+    harness
+        .mock_state
+        .os_transfer_window_late(0, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(600));
+    harness.mock_state.update_window(0, |window| {
+        window.maximum_size = Some(IVec2::new(600, 2000));
+    });
+    harness.mock_state.os_list_window(0);
+    harness.advance(Duration::from_millis(2000));
+    assert_eq!(window_entity(harness.world(), 0), Some(entity));
+    assert_eq!(harness.mock_state.create_window(0).frame().width(), 600);
+    assert_eq!(
+        harness
+            .world()
+            .get::<crate::ecs::Bounds>(entity)
+            .unwrap()
+            .0
+            .x,
+        600
+    );
+}
+
+#[test]
+fn test_late_handle_keeps_width_ratio_after_active_display_changes() {
+    let mut harness = harness_with_display_above().with_window(1, |_| {});
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+    ]);
+    let entity = find_window_entity(0, harness.world());
+    harness
+        .world()
+        .write_message(window_command(Operation::MoveToDisplay(Direction::North)));
+    harness.advance(Duration::from_millis(60));
+    harness
+        .mock_state
+        .os_transfer_window_late(0, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(600));
+    harness.mock_state.focus_window(1);
+    harness.mock_state.os_activate_display(TEST_DISPLAY_ID);
+    harness.advance(Duration::from_millis(100));
+    let expected = harness
+        .world()
+        .get::<crate::ecs::WidthRatio>(entity)
+        .unwrap()
+        .0;
+    harness.mock_state.os_list_window(0);
+    harness.advance(Duration::from_millis(2000));
+    assert_eq!(window_entity(harness.world(), 0), Some(entity));
+    assert_eq!(
+        harness
+            .world()
+            .get::<crate::ecs::WidthRatio>(entity)
+            .unwrap()
+            .0,
+        expected
+    );
+}
+
+#[test]
+fn test_late_recovery_respects_new_user_focus() {
+    let mut harness = harness_with_display_above();
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::MoveToDisplay(Direction::North)),
+    ]);
+    let entity = find_window_entity(0, harness.world());
+    harness
+        .mock_state
+        .os_transfer_window_late(0, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(200));
+    harness.mock_state.focus_window(100);
+    harness.advance(Duration::from_millis(100));
+    harness.mock_state.os_list_window(0);
+    harness.advance(Duration::from_millis(200));
+    assert_eq!(window_entity(harness.world(), 0), Some(entity));
+    assert_eq!(
+        harness.mock_state.focused_window_id(TEST_PROCESS_ID),
+        Some(100)
+    );
+    assert_focused!(harness.world(), 100);
+}
+
+#[test]
+fn test_current_close_with_warm_membership_is_authoritative() {
+    let mut harness = harness_with_display_above();
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::MoveToDisplay(Direction::North)),
+    ]);
+    harness.mock_state.os_transfer_window(0, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(100));
+    let entity = find_window_entity(0, harness.world());
+    let element = harness.world().get::<Window>(entity).unwrap().element();
+    harness.world().write_message(Event::WindowDestroyed {
+        window_id: 0,
+        source: crate::events::DestroySource::Accessibility { element },
+    });
+    harness.advance(Duration::from_millis(40));
+    assert_eq!(window_entity(harness.world(), 0), None);
+}
+
+#[test]
+fn test_close_new_generation_before_recovery_is_not_a_ghost() {
+    let mut harness = harness_with_display_above();
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::MoveToDisplay(Direction::North)),
+    ]);
+    harness
+        .mock_state
+        .os_transfer_window_late(0, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(200));
+    harness.mock_state.os_close_window(0);
+    harness.advance(Duration::from_millis(100));
+    assert_eq!(window_entity(harness.world(), 0), None);
 }

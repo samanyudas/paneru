@@ -1,5 +1,5 @@
 use bevy::ecs::change_detection::DetectChangesMut;
-use bevy::ecs::entity::Entity;
+use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::message::{MessageReader, MessageWriter};
@@ -28,7 +28,7 @@ use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
     ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    VerifyWindowPosition, WidthRatio, WindowProperties,
+    VerifyWindowPosition, VerifyWindowSize, WidthRatio, WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -41,6 +41,21 @@ use crate::util::{round_px, symlink_target};
 /// give the usable viewport a window has to be fitted into.
 type ActiveDisplayViewport<'w, 's> =
     Single<'w, 's, (&'static Display, Option<&'static DockPosition>), With<ActiveDisplayMarker>>;
+
+type AwaitingWindow = (
+    Entity,
+    &'static mut Window,
+    &'static ChildOf,
+    &'static mut AwaitingHandle,
+    Option<(&'static Position, &'static Bounds)>,
+    Has<Unmanaged>,
+);
+
+type SizeCheckReady = (
+    With<VerifyWindowSize>,
+    Without<ResizeMarker>,
+    Without<AwaitingHandle>,
+);
 
 type AddedWindowDefaults<'w, 's> = Populated<
     'w,
@@ -933,15 +948,21 @@ pub(super) fn claim_replaced_window_handles(
 }
 
 /// Replaces stale AX handles while preserving window entities and layout state.
+///
+/// Geometry committed while the handle was dead never reached the window, and
+/// `Changed<Bounds>`/`Changed<Position>` will not fire again for it, so a
+/// recovered managed window gets its current layout frame written directly.
+/// Writing here instead of marking the components changed keeps
+/// `window_resize_verifier` from reading the stale native size back into `Bounds`.
 pub(super) fn recover_window_handles(
-    awaiting: Populated<(Entity, &mut Window, &ChildOf, &mut AwaitingHandle)>,
+    awaiting: Populated<AwaitingWindow>,
     mut apps: Query<&mut Application>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     clock: Res<Time>,
     mut commands: Commands,
 ) {
-    for (entity, mut window, child, mut deadline) in awaiting {
+    for (entity, mut window, child, mut deadline, geometry, unmanaged) in awaiting {
         deadline.0.tick(clock.delta());
         let window_id = window.id();
         let ordered_in = window_manager.window_ordered_in(window_id);
@@ -956,6 +977,17 @@ pub(super) fn recover_window_handles(
         }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<AwaitingHandle>();
+            if recovered
+                && !unmanaged
+                && let Some((position, bounds)) = geometry
+                && window.update_frame().is_ok()
+            {
+                window.reposition(position.0);
+                window.resize(bounds.0);
+                entity_commands
+                    .try_insert(VerifyWindowSize)
+                    .try_insert_if_new(VerifyWindowPosition::default());
+            }
         }
         if !recovered {
             debug!("Window {window_id} has no new AX element; closing it.");
@@ -994,18 +1026,15 @@ fn adopt_fresh_handle(window: &mut Window, app: &mut Application, config: &Confi
 /// * `active_display` - The active display and its layout strip.
 /// * `apps` - A query for all applications.
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
-/// * `focus_history` - Per-workspace record of what was focused last.
 /// * `windows` - A query for all windows with their parent.
 /// * `awaiting` - Windows waiting for the app to replace their AX element.
 /// * `commands` - Bevy commands to despawn entities and trigger events.
-#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn window_destroyed_trigger(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
     mut apps: Query<&mut Application>,
     mut global_state: GlobalState,
-    mut focus_history: ResMut<FocusHistory>,
     windows: Windows,
     awaiting: Query<(), With<AwaitingHandle>>,
     mut commands: Commands,
@@ -1062,7 +1091,6 @@ pub(super) fn window_destroyed_trigger(
             &mut global_state,
             &mut commands,
         );
-        focus_history.forget(entity);
 
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_despawn();
@@ -1505,8 +1533,10 @@ pub(super) fn refresh_configuration_trigger(
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
     mut workspaces: Query<&mut LayoutStrip>,
+    mut focus_history: ResMut<FocusHistory>,
 ) {
     let entity = trigger.event().entity;
+    focus_history.forget(entity);
 
     if let Some(mut strip) = workspaces.iter_mut().find(|strip| strip.contains(entity)) {
         debug!(
@@ -1540,12 +1570,18 @@ pub(super) fn cleanup_timeout_trigger(
 
 pub(super) fn window_resize_verifier(
     mut removed: RemovedComponents<ResizeMarker>,
+    requested: Query<Entity, SizeCheckReady>,
     mut windows: Query<(&mut Window, &Position, &mut Bounds)>,
     layout_strips: Query<&LayoutStrip>,
     mut commands: Commands,
 ) {
     use std::cmp::Ordering;
-    for entity in removed.read() {
+    let removed: EntityHashSet = removed.read().collect();
+    let pending = requested.iter().filter(|entity| !removed.contains(entity));
+    for entity in removed.iter().copied().chain(pending) {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<VerifyWindowSize>();
+        }
         let Ok((mut window, _, mut bounds)) = windows.get_mut(entity) else {
             continue;
         };

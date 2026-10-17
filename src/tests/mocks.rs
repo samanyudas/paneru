@@ -34,6 +34,7 @@ pub(crate) struct MockWindowData {
     pub(crate) id: WinID,
     pub(crate) pid: Pid,
     pub(crate) frame: IRect,
+    pub(crate) maximum_size: Option<Size>,
     pub(crate) title: String,
     pub(crate) minimized: bool,
     pub(crate) workspace_id: WorkspaceId,
@@ -60,6 +61,7 @@ impl Default for MockWindowData {
             id: 0,
             pid: 0,
             frame: IRect::default(),
+            maximum_size: None,
             title: String::new(),
             minimized: false,
             workspace_id: 0,
@@ -550,7 +552,12 @@ impl MockState {
         let s = self.clone();
         mw.expect_resize().returning(move |size| {
             let mut inner = s.inner.force_write();
-            if let Some(w) = inner.windows.get_mut(&id) {
+            if let Some(w) = inner
+                .windows
+                .get_mut(&id)
+                .filter(|w| w.ax_generation == ax_generation)
+            {
+                let size = w.maximum_size.map_or(size, |maximum| size.min(maximum));
                 w.frame.max = w.frame.min + size;
             }
         });
@@ -558,7 +565,11 @@ impl MockState {
         let s_move = self.clone();
         mw.expect_reposition().returning(move |origin| {
             let mut inner = s_move.inner.force_write();
-            if let Some(w) = inner.windows.get_mut(&id) {
+            if let Some(w) = inner
+                .windows
+                .get_mut(&id)
+                .filter(|w| w.ax_generation == ax_generation)
+            {
                 let size = w.frame.size();
                 w.frame.min = origin;
                 w.frame.max = origin + size;
@@ -598,6 +609,7 @@ impl MockState {
                 .force_read()
                 .windows
                 .get(&id)
+                .filter(|w| w.ax_generation == ax_generation)
                 .map(|w| w.frame)
                 .ok_or(Error::InvalidWindow)
         });

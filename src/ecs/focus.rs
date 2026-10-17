@@ -811,4 +811,45 @@ mod tests {
         assert!(world.get::<Timeout>(first).is_none());
         assert!(world.get::<VerifyFocus>(second).is_some());
     }
+
+    #[test]
+    fn test_application_exit_prunes_managed_recency() {
+        let mut harness = crate::tests::TestHarness::new().with_windows(1);
+        harness.run(vec![crate::events::Event::MenuOpened { window_id: 0 }]);
+        let window = harness
+            .world()
+            .query::<(Entity, &crate::manager::Window)>()
+            .iter(harness.world())
+            .next()
+            .unwrap()
+            .0;
+        harness
+            .world()
+            .resource_mut::<FocusHistory>()
+            .record(2, window, None);
+        let psn = harness
+            .world()
+            .query::<&crate::ecs::BProcess>()
+            .iter(harness.world())
+            .next()
+            .unwrap()
+            .psn();
+        harness
+            .world()
+            .write_message(crate::events::Event::ApplicationTerminated { psn });
+        harness.advance(std::time::Duration::from_millis(100));
+        assert!(harness.world().get_entity(window).is_err());
+        assert!(
+            harness
+                .world()
+                .resource::<FocusHistory>()
+                .managed_recency
+                .is_empty(),
+            "application exit must not retain dead entities in the unbounded recency map"
+        );
+        assert_eq!(
+            harness.world().resource::<FocusHistory>().last_managed(2),
+            None
+        );
+    }
 }

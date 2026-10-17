@@ -17,7 +17,8 @@ use crate::{
     ecs::{
         ActiveWorkspaceMarker, AwaitingHandle, Bounds, DockPosition, FlashMessage, FocusedMarker,
         FullWidthMarker, Initializing, LayoutPosition, NativeFullscreenMarker, Position,
-        RepositionMarker, ResizeMarker, Scrolling, Unmanaged, WidthRatio, layout::LayoutStrip,
+        RepositionMarker, ResizeMarker, Scrolling, Unmanaged, VerifyWindowSize, WidthRatio,
+        layout::LayoutStrip,
     },
     manager::{Application, Display, Origin, Size, Window},
     platform::{ProcessSerialNumber, WinID},
@@ -205,6 +206,7 @@ pub struct FrameActivity<'w, 's> {
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
     awaiting_handles: Query<'w, 's, (), With<AwaitingHandle>>,
+    size_checks: Query<'w, 's, (), With<VerifyWindowSize>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -215,6 +217,7 @@ impl FrameActivity<'_, '_> {
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
             || !self.awaiting_handles.is_empty()
+            || !self.size_checks.is_empty()
     }
 }
 
@@ -399,7 +402,7 @@ mod tests {
     use bevy::prelude::{Timer, TimerMode, World};
 
     use super::FrameActivity;
-    use crate::ecs::AwaitingHandle;
+    use crate::ecs::{AwaitingHandle, VerifyWindowSize};
 
     #[test]
     fn handle_recovery_keeps_frames_active_until_it_finishes() {
@@ -411,6 +414,10 @@ mod tests {
             .id();
         assert!(world.run_system_once(active).unwrap());
         world.entity_mut(window).remove::<AwaitingHandle>();
+        assert!(!world.run_system_once(active).unwrap());
+        world.entity_mut(window).insert(VerifyWindowSize);
+        assert!(world.run_system_once(active).unwrap());
+        world.entity_mut(window).remove::<VerifyWindowSize>();
         assert!(!world.run_system_once(active).unwrap());
     }
 }

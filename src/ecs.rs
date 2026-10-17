@@ -470,6 +470,11 @@ pub enum DockPosition {
     Hidden,
 }
 
+/// Asks `window_resize_verifier` to read back a window's native size once no
+/// resize animation or handle recovery is pending for it.
+#[derive(Component)]
+pub struct VerifyWindowSize;
+
 #[derive(Component)]
 pub struct VerifyWindowPosition {
     remaining: u8,
