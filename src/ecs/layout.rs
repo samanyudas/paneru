@@ -17,8 +17,8 @@ use crate::ecs::params::Windows;
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, Scrolling,
-    SpawnCommandsExt,
+    ManualStripOffset, Position, RefitAfterRemoval, RepositionMarker, ReshuffleAroundMarker,
+    Scrolling, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -122,6 +122,16 @@ pub(crate) fn clamp_origin_to_viewport(origin: Origin, size: Size, viewport: IRe
     let minimum = viewport.min.min(far_edge);
     let maximum = viewport.min.max(far_edge);
     origin.clamp(minimum, maximum)
+}
+
+fn fitting_origin_x(
+    target: i32,
+    content: std::ops::Range<i32>,
+    viewport: std::ops::Range<i32>,
+) -> Option<i32> {
+    let minimum = viewport.start - content.start;
+    let maximum = viewport.end - content.end;
+    (minimum <= maximum).then(|| target.clamp(minimum, maximum))
 }
 
 /// How far a stored width may drift before a [`ManualStripOffset`] counts as
@@ -1205,7 +1215,7 @@ fn layout_strip_changed(
 
 #[instrument(level = Level::DEBUG, skip_all)]
 fn reshuffle_layout_strip(
-    markers: Query<(Entity, &LayoutPosition), With<ReshuffleAroundMarker>>,
+    markers: Query<(Entity, &LayoutPosition, Has<RefitAfterRemoval>), With<ReshuffleAroundMarker>>,
     strips: StripPlacements,
     manual_offsets: Query<&ManualStripOffset>,
     displays: DisplayViewports,
@@ -1213,9 +1223,9 @@ fn reshuffle_layout_strip(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    markers.into_iter().for_each(|(entity, layout_position)| {
+    markers.into_iter().for_each(|(entity, slot, refit)| {
         if let Ok(mut cmd) = commands.get_entity(entity) {
-            cmd.try_remove::<ReshuffleAroundMarker>();
+            cmd.try_remove::<(ReshuffleAroundMarker, RefitAfterRemoval)>();
         }
         let Some((strip, strip_entity, active_strip, child, active_marker, strip_reposition)) =
             strips.into_iter().find(|strip| strip.0.contains(entity))
@@ -1237,6 +1247,7 @@ fn reshuffle_layout_strip(
 
         let size = frame.size();
         let visible_width = display_bounds.intersect(frame).width();
+        let strip_target = strip_reposition.map_or(active_strip.0, |reposition| reposition.0);
 
         // A deliberate offset (center, snap) outranks the derived one, but only
         // while the window this reshuffle is about is still fully on screen: a
@@ -1249,8 +1260,7 @@ fn reshuffle_layout_strip(
             // so a strip that has since gained, lost, reordered or resized a
             // column no longer has a placement to keep.
             let current = strip_signature(strip, &windows);
-            let strip_target = strip_reposition.map_or(active_strip.0, |reposition| reposition.0);
-            let projected = layout_position.0 + strip_target;
+            let projected = slot.0 + strip_target;
             if signature_matches(&current, &manual.signature)
                 && clamp_origin_to_viewport(projected, size, display_bounds) == projected
             {
@@ -1267,24 +1277,25 @@ fn reshuffle_layout_strip(
         frame.min = clamp_origin_to_viewport(frame.min, size, display_bounds);
         frame.max = frame.min + size;
 
-        let mut strip_position = (frame.min - layout_position.0).with_y(display_bounds.min.y);
+        let mut strip_position = (frame.min - slot.0).with_y(display_bounds.min.y);
+        let content_end = strip
+            .last()
+            .ok()
+            .and_then(|column| column.top())
+            .and_then(|last| {
+                windows
+                    .layout_position(last)
+                    .map(|position| position.0.x)
+                    .zip(windows.moving_frame(last).map(|frame| frame.width()))
+            })
+            .map(|(last_x, last_width)| last_x + last_width);
 
         // Enforce the edge invariant when auto-center is off: the leftmost
         // window must touch the left edge and the rightmost the right edge
         // if more than 1 windows in workspace.
         if !config.auto_center()
             && !config.continuous_swipe()
-            && let Some(total_strip_width) = strip
-                .last()
-                .ok()
-                .and_then(|column| column.top())
-                .and_then(|last| {
-                    windows
-                        .layout_position(last)
-                        .map(|position| position.0.x)
-                        .zip(windows.moving_frame(last).map(|frame| frame.width()))
-                })
-                .map(|(last_x, last_width)| last_x + last_width)
+            && let Some(total_strip_width) = content_end
         {
             strip_position.x = if display_bounds.width() < total_strip_width {
                 strip_position.x.clamp(
@@ -1297,11 +1308,32 @@ fn reshuffle_layout_strip(
             };
         }
 
+        let refitted_x = if refit && !config.auto_center() {
+            strip
+                .first()
+                .ok()
+                .and_then(|column| column.top())
+                .and_then(|first| windows.layout_position(first))
+                .zip(content_end)
+                .and_then(|(first, end)| {
+                    fitting_origin_x(
+                        strip_target.x,
+                        first.0.x..end,
+                        display_bounds.min.x..display_bounds.max.x,
+                    )
+                })
+        } else {
+            None
+        };
+        if let Some(x) = refitted_x {
+            strip_position = strip_target.with_x(x);
+        }
+
         // Check how much of the window is hidden. Slivers don't count as
         // meaningfully visible, so subtract sliver_width from the visible
         // portion. If the hidden fraction is within the allowed ratio, skip.
         let hidden_ratio = config.window_hidden_ratio();
-        if hidden_ratio > 0.0 {
+        if refitted_x.is_none() && hidden_ratio > 0.0 {
             let meaningful = (visible_width - config.sliver_width()).max(0);
             let visible_fraction = f64::from(meaningful) / f64::from(frame.width().max(1));
             let hidden_fraction = 1.0 - visible_fraction;
@@ -1703,6 +1735,16 @@ fn position_layout_windows(
 mod tests {
     use super::*;
     use bevy::prelude::*;
+
+    #[test]
+    fn fitting_origin_moves_only_to_the_nearest_fitting_edge() {
+        assert_eq!(fitting_origin_x(-500, 0..1906, 4..2044), Some(4));
+        assert_eq!(fitting_origin_x(500, 0..1906, 4..2044), Some(138));
+        assert_eq!(fitting_origin_x(100, 0..1906, 4..2044), Some(100));
+        assert_eq!(fitting_origin_x(-2500, 20..1926, -2044..-4), Some(-2064));
+        assert_eq!(fitting_origin_x(100, 0..2040, 4..2044), Some(4));
+        assert_eq!(fitting_origin_x(100, 0..2041, 4..2044), None);
+    }
 
     #[test]
     fn signature_tolerates_pixel_drift_but_not_a_reshape() {

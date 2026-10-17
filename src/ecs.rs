@@ -275,6 +275,9 @@ pub struct ResizeMarker(pub Size);
 #[derive(Component)]
 pub struct ReshuffleAroundMarker;
 
+#[derive(Component)]
+pub struct RefitAfterRemoval;
+
 /// Marker component requesting that the strip scroll *minimally* to keep the
 /// entity's NEW layout position inside the viewport. Unlike
 /// [`ReshuffleAroundMarker`], this does not anchor the entity to its old visual
@@ -552,6 +555,8 @@ pub trait SpawnCommandsExt {
 
     fn reshuffle_around(&mut self, entity: Entity);
 
+    fn refit_after_removal(&mut self, entity: Entity);
+
     fn ensure_visible(&mut self, entity: Entity);
 
     /// Like [`SpawnCommandsExt::ensure_visible`], but `snap` controls whether
@@ -596,6 +601,13 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     fn reshuffle_around(&mut self, entity: Entity) {
         if let Ok(mut entity_commands) = self.get_entity(entity) {
             entity_commands.try_insert(ReshuffleAroundMarker);
+        }
+    }
+
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn refit_after_removal(&mut self, entity: Entity) {
+        if let Ok(mut entity_commands) = self.get_entity(entity) {
+            entity_commands.try_insert((ReshuffleAroundMarker, RefitAfterRemoval));
         }
     }
 

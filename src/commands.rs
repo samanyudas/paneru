@@ -1211,7 +1211,7 @@ fn to_next_display(
         .or_else(|| active_display.active_strip().right_neighbour(entity));
     active_display.active_strip().remove(entity);
     if let Some(neighbour) = source_neighbour {
-        commands.reshuffle_around(neighbour);
+        commands.refit_after_removal(neighbour);
     }
 
     if matches!(move_focus, MoveFocus::Stay)
