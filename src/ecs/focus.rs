@@ -17,7 +17,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, VerifyFocus};
 use crate::config::Config;
-use crate::ecs::layout::{Column, LayoutStrip};
+use crate::ecs::layout::{Column, LayoutStrip, clamp_origin_to_viewport};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
@@ -375,7 +375,11 @@ fn autocenter_window_on_focus(
             let visible_width = viewport.intersect(frame).width();
             let meaningful = (visible_width - ctx.config.sliver_width()).max(0);
             let visible_fraction = f64::from(meaningful) / f64::from(frame.width().max(1));
-            if 1.0 - visible_fraction <= hidden_ratio {
+            let strip_movement =
+                (clamp_origin_to_viewport(projected, frame.size(), viewport).x - projected.x).abs();
+            if 1.0 - visible_fraction <= hidden_ratio
+                && frame.width() - visible_width >= strip_movement
+            {
                 return;
             }
         }
