@@ -1190,6 +1190,7 @@ pub(crate) fn cleanup_on_exit(
         }
 
         let display_bounds = displays.iter().map(Display::bounds).collect::<Vec<_>>();
+        let mut targets = Vec::new();
         for (mut window, unmanaged, pre_launch) in &mut all_windows {
             if unmanaged {
                 continue;
@@ -1205,8 +1206,11 @@ pub(crate) fn cleanup_on_exit(
                 target.min,
                 target.size()
             );
-            place(&mut window, padded(target, padding));
+            let target = padded(target, padding);
+            place(&mut window, target);
+            targets.push((window.id(), target));
         }
+        settle_exit_frames(&mut all_windows, targets);
     }
 }
 
@@ -1215,17 +1219,39 @@ pub(crate) fn cleanup_on_exit(
 fn place(window: &mut Window, frame: IRect) {
     window.resize(frame.size());
     window.reposition(frame.min);
-    let Ok(actual) = window.update_frame() else {
-        return;
-    };
-    if actual.size() != frame.size() {
-        window.resize(frame.size());
+    window.resize(frame.size());
+}
+
+/// Some apps, Chromium browsers among them, apply a frame only after the
+/// accessibility call returns, and can drop a size that arrives mid-change. The
+/// engine is exiting, so it rechecks every window a few times and places again
+/// any that has not landed.
+fn settle_exit_frames(
+    all_windows: &mut Query<(&mut Window, Has<Unmanaged>, Option<&PreLaunchFrame>)>,
+    mut pending: Vec<(WinID, IRect)>,
+) {
+    const ROUNDS: usize = 5;
+    const WAIT: Duration = Duration::from_millis(60);
+
+    for _ in 0..ROUNDS {
+        if pending.is_empty() {
+            return;
+        }
+        std::thread::sleep(WAIT);
+        pending.retain(|(id, target)| {
+            let Some((mut window, _, _)) = all_windows.iter_mut().find(|(w, _, _)| w.id() == *id)
+            else {
+                return false;
+            };
+            if window.update_frame().is_ok_and(|actual| actual == *target) {
+                return false;
+            }
+            place(&mut window, *target);
+            true
+        });
     }
-    if window
-        .update_frame()
-        .is_ok_and(|actual| actual.min != frame.min)
-    {
-        window.reposition(frame.min);
+    for (id, target) in pending {
+        warn!("exit cleanup: window {id} did not reach {target:?}");
     }
 }
 

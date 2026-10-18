@@ -3859,6 +3859,24 @@ fn exit_cleanup_sets_the_size_again_after_moving() {
     assert_eq!(exit_frame_of(world, 0), before);
 }
 
+/// An app that applies a size only after the call returns can drop the sizes
+/// that arrive while it is still changing. Exit cleanup checks again and
+/// places the window until it lands.
+#[test]
+fn exit_cleanup_places_again_a_window_that_drops_sizes() {
+    let before = IRect::new(100, 50, 100 + 300, 50 + 600);
+    let mut harness = TestHarness::new().with_window(0, move |window| window.frame = before);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness
+        .mock_state
+        .update_window(0, |window| window.dropped_resizes = 3);
+
+    let world = harness.world();
+    run_exit_cleanup(world);
+
+    assert_eq!(exit_frame_of(world, 0), before);
+}
+
 /// A window that was open at launch but that a slow scan finds only after
 /// startup still gets its frame back. A window that opens during startup is
 /// not one of them.
