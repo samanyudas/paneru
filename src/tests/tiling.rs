@@ -1193,3 +1193,157 @@ fn window_exists(world: &mut World, id: i32) -> bool {
     let mut query = world.query::<&crate::manager::Window>();
     query.iter(world).any(|window| window.id() == id)
 }
+
+/// A last column that ends short of the display edge grows past it at 75% and
+/// is clamped onto it. When the preset cycle wraps to 25%, the column must
+/// return around its original center instead of staying pinned to the edge.
+#[test]
+fn test_preset_cycle_returns_a_clamped_last_column_to_its_center() {
+    let options = MainOptions {
+        auto_center: Some(false),
+        preset_column_widths: vec![0.25, 0.5, 0.75],
+        ..Default::default()
+    };
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Ratio(0.45));
+    let config: Config = (options, vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    harness.advance(Duration::from_secs(1));
+    assert_window_at!(harness.world(), 1, 461, TEST_MENUBAR_HEIGHT);
+    for _ in 0..2 {
+        harness.app.world_mut().write_message(Event::Command {
+            command: Command::Window(Operation::Resize(ResizeDirection::Grow)),
+        });
+        harness.advance(Duration::from_secs(1));
+    }
+    assert_window_size!(harness.world(), 1, 256, 748);
+    assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
+}
+
+fn clamped_last_column_harness(animation_speed: Option<f64>) -> TestHarness {
+    let options = MainOptions {
+        auto_center: Some(false),
+        preset_column_widths: vec![0.25, 0.5, 0.75],
+        animation_speed,
+        ..Default::default()
+    };
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Ratio(0.45));
+    let config: Config = (options, vec![params]).into();
+    TestHarness::new().with_config(config).with_windows(2)
+}
+
+fn grow_width(harness: &mut TestHarness, wait: Duration) {
+    harness.app.world_mut().write_message(Event::Command {
+        command: Command::Window(Operation::Resize(ResizeDirection::Grow)),
+    });
+    harness.advance(wait);
+}
+
+/// Focusing another column and coming back ends the width run, so the next
+/// change anchors where the column now stands: flush on the right edge.
+#[test]
+fn test_a_focus_change_ends_the_width_run() {
+    let mut harness = clamped_last_column_harness(None);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    harness.advance(Duration::from_secs(1));
+    grow_width(&mut harness, Duration::from_secs(1));
+    assert_window_at!(harness.world(), 1, 256, TEST_MENUBAR_HEIGHT);
+    for direction in [Direction::First, Direction::Last] {
+        harness.app.world_mut().write_message(Event::Command {
+            command: Command::Window(Operation::Focus(direction)),
+        });
+        harness.advance(Duration::from_secs(1));
+    }
+    grow_width(&mut harness, Duration::from_secs(1));
+    assert_window_size!(harness.world(), 1, 256, 748);
+    assert_window_at!(harness.world(), 1, 768, TEST_MENUBAR_HEIGHT);
+}
+
+/// Width changes pressed while the previous one still animates keep the run's
+/// center instead of reading an intermediate frame.
+#[test]
+fn test_rapid_animated_width_changes_keep_the_run_center() {
+    let mut harness = clamped_last_column_harness(Some(30.0));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    harness.advance(Duration::from_secs(2));
+    grow_width(&mut harness, Duration::from_millis(20));
+    grow_width(&mut harness, Duration::from_secs(3));
+    assert_window_size!(harness.world(), 1, 256, 748);
+    assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
+}
+
+/// An app that refuses the requested width does not end the run, so cycling
+/// back still returns the column around its original center.
+#[test]
+fn test_a_refused_width_keeps_the_run_center() {
+    let mut harness = clamped_last_column_harness(None);
+    harness.mock_state.update_window(1, |window| {
+        window.maximum_size = Some(crate::manager::Size::new(750, 1312));
+    });
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    harness.advance(Duration::from_secs(1));
+    grow_width(&mut harness, Duration::from_secs(2));
+    grow_width(&mut harness, Duration::from_secs(2));
+    assert_window_size!(harness.world(), 1, 256, 748);
+    assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
+}
+
+/// Moving the pointer with the mouse resize modifier ends the width run, so the
+/// next change anchors where the column now stands.
+#[test]
+fn test_a_mouse_resize_gesture_ends_the_width_run() {
+    let options = MainOptions {
+        auto_center: Some(false),
+        preset_column_widths: vec![0.25, 0.5, 0.75],
+        mouse_resize_modifier: Some(crate::platform::Modifiers::ALT),
+        ..Default::default()
+    };
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Ratio(0.45));
+    let config: Config = (options, vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    harness.advance(Duration::from_secs(1));
+    grow_width(&mut harness, Duration::from_secs(1));
+    assert_window_at!(harness.world(), 1, 256, TEST_MENUBAR_HEIGHT);
+    for x in [5.0, 6.0] {
+        harness
+            .app
+            .world_mut()
+            .write_message(crate::events::InputEvent(Event::MouseMoved {
+                point: objc2_core_foundation::CGPoint::new(x, 5.0),
+                modifiers: crate::platform::Modifiers::LALT,
+            }));
+        harness.advance(Duration::from_millis(20));
+    }
+    grow_width(&mut harness, Duration::from_secs(1));
+    assert_window_size!(harness.world(), 1, 256, 748);
+    assert_window_at!(harness.world(), 1, 768, TEST_MENUBAR_HEIGHT);
+}
