@@ -228,6 +228,10 @@ impl MockState {
             .and_then(|app| app.focused_window_id)
     }
 
+    pub fn set_cursor_position(&self, position: IVec2) {
+        self.inner.force_write().cursor_position = position;
+    }
+
     pub fn focus_window(&self, id: WinID) {
         let mut inner = self.inner.force_write();
         if let Some(win) = inner.windows.get(&id) {
