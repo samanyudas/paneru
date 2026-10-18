@@ -28,9 +28,9 @@ use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LaunchWindows, LayoutPosition,
-    Position, PreLaunchFrame, RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling,
-    SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, VerifyWindowSize, WidthRatio,
-    WindowProperties,
+    MinimumHeight, Position, PreLaunchFrame, RepositionMarker, ResizeMarker, RestoreWindowState,
+    Scrolling, SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, VerifyWindowSize,
+    WidthRatio, WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -1630,6 +1630,11 @@ pub(super) fn window_resize_verifier(
             actual_size,
         );
         bounds.0 = actual_size;
+        if height_ord == Ordering::Less
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_insert(MinimumHeight(actual_size.y));
+        }
 
         // we may hitting minimum width constraint on this window or this window isn't resizable.
         // if this window is a part of a column, other windows in the column might have resized(shrunk) successfully,

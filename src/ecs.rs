@@ -384,6 +384,12 @@ pub struct PreLaunchFrame(pub bevy::math::IRect);
 #[derive(Resource, Clone, Debug, Default)]
 pub struct LaunchWindows(pub std::collections::HashSet<WinID>);
 
+/// The smallest height a window has accepted, learned when it refused a
+/// smaller one. Stack layout never gives it less, so it cannot overlap the
+/// window below it.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct MinimumHeight(pub i32);
+
 /// Marks a window entity that is currently on a native macOS fullscreen space.
 /// The window has been removed from its tiled position in the strip.
 /// `order` gives the sequence in which windows went fullscreen (0, 1, 2, …)

@@ -17,8 +17,8 @@ use crate::ecs::params::Windows;
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, PlaceAfterArrival, Position, RefitAfterRemoval, RepositionMarker,
-    ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
+    ManualStripOffset, MinimumHeight, PlaceAfterArrival, Position, RefitAfterRemoval,
+    RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -883,7 +883,7 @@ impl LayoutStrip {
         self.columns.iter()
     }
 
-    #[instrument(level = Level::TRACE, skip_all, fields(layout_strip_height))]
+    #[cfg(test)]
     pub fn relative_positions<W>(
         &self,
         layout_strip_height: i32,
@@ -891,6 +891,23 @@ impl LayoutStrip {
     ) -> impl Iterator<Item = (Entity, IRect)>
     where
         W: Fn(Entity) -> Option<IRect>,
+    {
+        self.relative_positions_with_minimums(layout_strip_height, get_window_frame, &|_| None)
+            .into_iter()
+    }
+
+    /// [`Self::relative_positions`], with `get_minimum_height` giving the
+    /// height below which a stacked window must not be squeezed.
+    #[instrument(level = Level::TRACE, skip_all, fields(layout_strip_height))]
+    pub fn relative_positions_with_minimums<W, M>(
+        &self,
+        layout_strip_height: i32,
+        get_window_frame: &W,
+        get_minimum_height: &M,
+    ) -> Vec<(Entity, IRect)>
+    where
+        W: Fn(Entity) -> Option<IRect>,
+        M: Fn(Entity) -> Option<i32>,
     {
         self.column_positions(get_window_frame)
             .filter_map(move |(column, position)| {
@@ -922,7 +939,14 @@ impl LayoutStrip {
                         .filter_map(|item| item.top().and_then(get_window_frame))
                         .map(|frame| frame.height())
                         .collect::<Vec<_>>();
-                    binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)?
+                    let mut heights =
+                        binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)?;
+                    let minimums = items
+                        .iter()
+                        .map(|item| item.top().and_then(get_minimum_height).unwrap_or(0))
+                        .collect::<Vec<_>>();
+                    hold_minimum_heights(&mut heights, &minimums, layout_strip_height);
+                    heights
                 };
 
                 // Every window in a column shares the master's (top item's)
@@ -963,6 +987,7 @@ impl LayoutStrip {
                 Some(frames)
             })
             .flatten()
+            .collect()
     }
 
     #[instrument(level = Level::TRACE, skip_all)]
@@ -1162,6 +1187,39 @@ fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Optio
     Some(output)
 }
 
+/// Raises every stacked height below its window's minimum to that minimum,
+/// and takes the extra evenly from the other windows, none going below its own
+/// minimum or `MIN_WINDOW_HEIGHT`. If the minimums alone exceed the column,
+/// the column overflows rather than overlap.
+fn hold_minimum_heights(heights: &mut [i32], minimums: &[i32], total: i32) {
+    for (height, minimum) in heights.iter_mut().zip(minimums) {
+        *height = (*height).max(*minimum);
+    }
+    let mut excess = heights.iter().sum::<i32>() - total;
+    while excess > 0 {
+        let givers = heights
+            .iter()
+            .zip(minimums)
+            .enumerate()
+            .filter(|(_, (height, minimum))| **height > (**minimum).max(MIN_WINDOW_HEIGHT))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let Ok(count) = i32::try_from(givers.len()) else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        let share = (excess + count - 1) / count;
+        for index in givers {
+            let floor = minimums[index].max(MIN_WINDOW_HEIGHT);
+            let taken = share.min(heights[index] - floor).min(excess);
+            heights[index] -= taken;
+            excess -= taken;
+        }
+    }
+}
+
 /// Watches for size changes to windows and if they are changed, signals to the layout strip.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn layout_sizes_changed(changed_sizes: ResizedWindows, workspaces: Query<&mut LayoutStrip>) {
@@ -1207,6 +1265,7 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
 fn layout_strip_changed(
     changed_strips: Populated<(&LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
     mut windows: WindowFrames,
+    minimum_heights: Query<&MinimumHeight>,
     displays: DisplayViewports,
     config: Res<Config>,
 ) {
@@ -1216,6 +1275,7 @@ fn layout_strip_changed(
             .map(|(position, bounds, _)| IRect::from_corners(position.0, position.0 + bounds.0))
             .ok()
     };
+    let get_minimum_height = |entity| minimum_heights.get(entity).ok().map(|m| m.0);
 
     let changed = changed_strips
         .into_iter()
@@ -1224,7 +1284,11 @@ fn layout_strip_changed(
                 .get(child_of.parent())
                 .map(|(display, dock)| {
                     let height = display.actual_display_bounds(dock, &config).height();
-                    layout_strip.relative_positions(height, &get_window_frame)
+                    layout_strip.relative_positions_with_minimums(
+                        height,
+                        &get_window_frame,
+                        &get_minimum_height,
+                    )
                 })
                 .ok()
         })
@@ -2133,6 +2197,23 @@ mod tests {
         assert_eq!(strip.index_of(entities[1]).unwrap(), 0);
         assert_eq!(strip.index_of(entities[0]).unwrap(), 1);
         assert_eq!(strip.index_of(entities[2]).unwrap(), 2);
+    }
+
+    #[test]
+    fn minimum_heights_take_room_evenly_from_the_other_windows() {
+        let mut heights = vec![423, 423, 424];
+        hold_minimum_heights(&mut heights, &[0, 0, 500], 1270);
+        assert_eq!(heights, vec![385, 385, 500]);
+
+        // A window already at the floor gives nothing.
+        let mut heights = vec![200, 500, 570];
+        hold_minimum_heights(&mut heights, &[0, 0, 700], 1270);
+        assert_eq!(heights, vec![200, 370, 700]);
+
+        // Minimums that cannot all fit overflow instead of overlapping.
+        let mut heights = vec![400, 400];
+        hold_minimum_heights(&mut heights, &[600, 600], 800);
+        assert_eq!(heights, vec![600, 600]);
     }
 
     #[test]

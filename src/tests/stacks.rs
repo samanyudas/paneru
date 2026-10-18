@@ -1,0 +1,143 @@
+//! Heights of the windows stacked in one column.
+
+use std::time::Duration;
+
+use bevy::prelude::*;
+
+use crate::commands::{Command, Direction, Operation, Side};
+use crate::events::Event;
+use crate::manager::{Size, Window};
+use crate::platform::WinID;
+
+use super::*;
+
+const SETTLE: Duration = Duration::from_secs(2);
+
+fn command(operation: Operation) -> Event {
+    Event::Command {
+        command: Command::Window(operation),
+    }
+}
+
+fn frame(world: &mut World, id: WinID) -> IRect {
+    world
+        .query::<&Window>()
+        .iter(world)
+        .find(|window| window.id() == id)
+        .expect("window exists")
+        .frame()
+}
+
+/// Stacks windows 1 and 2 under window 0, so one column holds all three.
+fn stack_three(harness: &mut TestHarness) {
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    // The two-window stack settles before the third window joins it.
+    harness.advance(SETTLE);
+    harness.run(vec![
+        command(Operation::Focus(Direction::Last)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    harness.advance(SETTLE);
+}
+
+/// Each window's frame top to bottom, checking they stay in one column and
+/// neither overlap nor leave a gap.
+fn column(world: &mut World, ids: &[WinID]) -> Vec<IRect> {
+    let frames = ids.iter().map(|id| frame(world, *id)).collect::<Vec<_>>();
+    for pair in frames.windows(2) {
+        assert_eq!(pair[0].min.x, pair[1].min.x, "one column: {frames:?}");
+        assert_eq!(
+            pair[0].max.y, pair[1].min.y,
+            "no overlap or gap: {frames:?}"
+        );
+    }
+    frames
+}
+
+/// A display as tall as a 14 inch laptop's, where an uneven split stays above
+/// the minimum window height instead of falling back to an even one.
+const TALL: i32 = 1290;
+const COLUMN: i32 = TALL - TEST_MENUBAR_HEIGHT;
+
+fn tall_harness() -> TestHarness {
+    let harness = TestHarness::new();
+    harness
+        .mock_state
+        .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, TALL));
+    harness.with_windows(3)
+}
+
+fn heights(frames: &[IRect]) -> Vec<i32> {
+    frames.iter().map(IRect::height).collect()
+}
+
+fn assert_even(heights: &[i32], total: i32) {
+    assert_eq!(heights.iter().sum::<i32>(), total, "{heights:?}");
+    assert!(
+        heights.iter().max().unwrap() - heights.iter().min().unwrap() <= 1,
+        "even split: {heights:?}"
+    );
+}
+
+/// A window joining a stack gives every window in it an equal share. Keeping
+/// the existing heights would leave the first window half the column and the
+/// other two a quarter each.
+#[test]
+fn a_window_joining_a_stack_splits_the_column_evenly() {
+    let mut harness = tall_harness();
+    stack_three(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1, 2]);
+    assert_even(&heights(&frames), COLUMN);
+}
+
+/// A window leaving a stack gives the windows that stay an equal share.
+#[test]
+fn a_window_leaving_a_stack_splits_the_rest_evenly() {
+    let mut harness = tall_harness();
+    stack_three(&mut harness);
+    harness.run(vec![command(Operation::Unstack(Side::East))]);
+    harness.advance(SETTLE);
+
+    let frames = column(harness.world(), &[0, 1]);
+    assert_even(&heights(&frames), COLUMN);
+}
+
+/// A window that will not shrink to its share keeps the height it accepts,
+/// and the windows below it move down instead of being covered.
+#[test]
+fn a_window_with_a_minimum_height_does_not_overlap_the_next() {
+    let mut harness = tall_harness();
+    harness.mock_state.update_window(1, |window| {
+        window.minimum_size = Some(Size::new(0, 500));
+    });
+    stack_three(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1, 2]);
+    assert_eq!(frames[1].height(), 500, "{frames:?}");
+    assert_eq!(heights(&frames).iter().sum::<i32>(), COLUMN, "{frames:?}");
+}
+
+/// The last window gets what is left of the column, so when it is the one
+/// with a minimum height, the windows above it must make room.
+#[test]
+fn a_last_window_with_a_minimum_height_stays_on_screen() {
+    let mut harness = tall_harness();
+    harness.mock_state.update_window(2, |window| {
+        window.minimum_size = Some(Size::new(0, 500));
+    });
+    stack_three(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1, 2]);
+    assert_eq!(frames[2].height(), 500, "{frames:?}");
+    assert_eq!(
+        frames[2].max.y, TALL,
+        "it ends at the display bottom: {frames:?}"
+    );
+    assert_even(&heights(&frames[..2]), COLUMN - 500);
+}

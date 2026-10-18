@@ -35,6 +35,8 @@ pub(crate) struct MockWindowData {
     pub(crate) pid: Pid,
     pub(crate) frame: IRect,
     pub(crate) maximum_size: Option<Size>,
+    /// The smallest size the app accepts, like an app with a minimum height.
+    pub(crate) minimum_size: Option<Size>,
     pub(crate) resize_bottom_limit: Option<i32>,
     /// Size writes the app drops before it applies one, like an app that
     /// applies a size only after the call returns.
@@ -71,6 +73,7 @@ impl Default for MockWindowData {
             pid: 0,
             frame: IRect::default(),
             maximum_size: None,
+            minimum_size: None,
             resize_bottom_limit: None,
             dropped_resizes: 0,
             frame_read_delay: std::time::Duration::ZERO,
@@ -582,6 +585,7 @@ impl MockState {
                     return;
                 }
                 let mut size = w.maximum_size.map_or(size, |maximum| size.min(maximum));
+                size = w.minimum_size.map_or(size, |minimum| size.max(minimum));
                 if let Some(bottom) = w.resize_bottom_limit
                     && size.y > 0
                 {
