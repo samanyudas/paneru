@@ -33,6 +33,7 @@ use crate::errors::Result;
 use crate::events::{DestroySource, Event};
 use crate::manager::{Application, Display, Origin, Window, WindowManager};
 use crate::platform::{WinID, WorkspaceId};
+use crate::util::round_px;
 
 pub struct WorkspaceEventsPlugin;
 
@@ -1142,6 +1143,7 @@ fn column_closest_to_center(
         .map(|(candidate, _)| candidate)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(crate) fn show_active_workspace(
     activated: Single<Entity, Added<ActiveWorkspaceMarker>>,
@@ -1149,6 +1151,7 @@ pub(crate) fn show_active_workspace(
     mut workspaces: RestorableStrips,
     displays: Query<(&Display, Option<&DockPosition>)>,
     focus_markers: Query<Ref<FocusedMarker>>,
+    scrollings: Query<&Scrolling>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -1177,9 +1180,12 @@ pub(crate) fn show_active_workspace(
                 debug!("No previous focus, taking centered one {focus:?}.");
             }
 
-            let origin = match &moving {
-                Some(RepositionMarker(destination)) => *destination,
-                None => position.0,
+            // An unfinished settle is where the strip was headed.
+            let settle = scrollings.get(entity).ok().and_then(|scroll| scroll.settle);
+            let origin = match (settle, &moving) {
+                (Some(target), _) => Origin::new(round_px(target), position.0.y),
+                (None, Some(RepositionMarker(destination))) => *destination,
+                (None, None) => position.0,
             };
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_insert(PreviousStripPosition { origin, focus });

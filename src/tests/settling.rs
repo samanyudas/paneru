@@ -318,3 +318,64 @@ fn swipe_settles_instantly_without_animation() {
     assert_focused!(harness.world(), 1);
     assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 700);
 }
+
+/// A strip that stops being active mid-settle, as when focus moves to another
+/// display, lands at once instead of keeping a settle no system drives.
+#[test]
+fn a_strip_that_loses_activation_mid_settle_lands() {
+    let mut harness = harness_with_widths(&[700, 700, 700, 700], Some(14.0));
+    send(&mut harness, swipe(0.05));
+    harness.advance(ONE_FRAME * 6);
+
+    let world = harness.app.world_mut();
+    let (strip, target) = world
+        .query_filtered::<(Entity, &Scrolling), With<crate::ecs::ActiveWorkspaceMarker>>()
+        .iter(world)
+        .find_map(|(entity, scroll)| scroll.settle.map(|target| (entity, target)))
+        .expect("still settling");
+    world
+        .entity_mut(strip)
+        .remove::<crate::ecs::ActiveWorkspaceMarker>();
+    world.flush();
+
+    assert!(
+        world.get::<Scrolling>(strip).is_none(),
+        "no settle is left behind"
+    );
+    assert_eq!(
+        world.get::<crate::ecs::Position>(strip).unwrap().x,
+        crate::util::round_px(target)
+    );
+}
+
+fn swipe_and_maybe_switch_away(switch: bool) -> i32 {
+    let mut harness = harness_with_widths(&[400, 400, 400, 400, 400, 400], Some(14.0));
+    harness.mock_state.set_cursor_position(IVec2::new(1000, 5));
+    send(&mut harness, swipe(0.05));
+    // Late enough that the strip already shows the landed column fully.
+    harness.advance(ONE_FRAME * 10);
+    assert!(is_scrolling(harness.world()), "still settling");
+    if switch {
+        harness.run(vec![
+            Event::Command {
+                command: Command::Window(Operation::VirtualNumber(1)),
+            },
+            Event::Command {
+                command: Command::Window(Operation::VirtualNumber(0)),
+            },
+        ]);
+    }
+    harness.advance(SETTLE);
+    window_x(harness.world(), 0)
+}
+
+/// Switching virtual workspaces mid-settle returns the strip to the landing,
+/// even when the landed column is already fully visible where the settle was
+/// interrupted.
+#[test]
+fn virtual_switch_mid_settle_keeps_a_fully_visible_landing() {
+    assert_eq!(
+        swipe_and_maybe_switch_away(true),
+        swipe_and_maybe_switch_away(false)
+    );
+}

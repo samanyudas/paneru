@@ -1728,6 +1728,9 @@ fn test_virtual_workspace_switch_no_horizontal_slide_no_animations() {
     );
 
     // Remember the settled strip x after scrolling.
+    // Let the swipe settle on its landing before measuring.
+    h.advance(std::time::Duration::from_secs(3));
+
     let strip_x_after_scroll = {
         let world = h.app.world_mut();
         let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
@@ -2568,6 +2571,9 @@ fn test_virtual_workspace_switch_preserves_scroll_with_animations() {
             fingers: 3,
         },
     );
+
+    // Let the swipe settle on its landing before measuring.
+    h.advance(std::time::Duration::from_secs(3));
 
     let strip_x_after_scroll = {
         let world = h.app.world_mut();

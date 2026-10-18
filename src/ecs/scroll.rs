@@ -1,9 +1,11 @@
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
+use bevy::ecs::lifecycle::Remove;
 use bevy::ecs::message::MessageReader;
+use bevy::ecs::observer::On;
 use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Populated, Res, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
 use std::time::{Duration, Instant};
@@ -81,6 +83,7 @@ type SettlingStrip = (
 
 impl Plugin for ScrollEventsPlugin {
     fn build(&self, app: &mut App) {
+        app.add_observer(finish_settle_on_deactivate);
         let mission_control_inactive = |mission_control: Option<Res<MissionControlActive>>| {
             mission_control.is_none_or(|active| !active.0)
         };
@@ -265,6 +268,26 @@ pub(super) fn swiping_timeout(
                 }));
             }
         }
+    }
+}
+
+/// A strip that stops being active mid-settle lands at once. `settle_strip`
+/// only drives the active strip, so otherwise its settle would never finish.
+fn finish_settle_on_deactivate(
+    trigger: On<Remove, ActiveWorkspaceMarker>,
+    mut strips: Query<(&mut Position, &Scrolling), With<LayoutStrip>>,
+    mut commands: Commands,
+) {
+    let entity = trigger.entity;
+    let Ok((mut position, scroll)) = strips.get_mut(entity) else {
+        return;
+    };
+    let Some(target) = scroll.settle else {
+        return;
+    };
+    position.x = round_px(target);
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<Scrolling>();
     }
 }
 
