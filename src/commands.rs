@@ -298,7 +298,7 @@ fn nearest_float_in_direction(
 /// # Returns
 ///
 /// `Some(Entity)` with the entity of the newly focused window, otherwise `None`.
-fn focus_with_verification(
+pub(crate) fn focus_with_verification(
     entity: Entity,
     focused_entity: Option<Entity>,
     commands: &mut Commands,

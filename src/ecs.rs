@@ -327,6 +327,34 @@ pub struct Scrolling {
     pub is_user_swiping: bool,
     /// Last time a physical swipe event was received.
     pub last_event: Duration,
+    /// The kind of input driving the strip, which decides how long a pause
+    /// in it counts as the fingers lifting.
+    pub input: ScrollInput,
+    /// The strip offset when the swipe began. A strip that fits its display
+    /// springs back here.
+    pub anchor: f64,
+    /// The offset the strip settles on once the swipe has ended. Only set
+    /// with `auto_center` off; see `scroll::settle_strip`.
+    pub settle: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollInput {
+    /// A multi-finger trackpad swipe, which reports continuously while the
+    /// fingers are down.
+    Gesture,
+    /// Modifier-scroll, which a mouse wheel reports as separate ticks.
+    Wheel,
+}
+
+impl ScrollInput {
+    /// How long the input may pause before the swipe counts as ended.
+    pub fn idle_threshold(self) -> Duration {
+        match self {
+            Self::Gesture => Duration::from_millis(50),
+            Self::Wheel => Duration::from_millis(150),
+        }
+    }
 }
 
 #[derive(Component, Clone, Debug, Default, Deref, DerefMut)]

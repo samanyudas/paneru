@@ -81,16 +81,20 @@ fn is_scrolling(world: &mut World) -> bool {
 /// meets the viewport edge, and the column takes focus.
 #[test]
 fn swipe_settles_a_partly_hidden_column_flush_with_the_viewport_edge() {
-    let mut harness = harness_with_widths(&[700, 700, 700, 700], None);
-    assert_eq!(window_x(harness.world(), 0), 0);
+    // Miri animates at 14; unset means instant. The focus change the settle
+    // makes must not start a strip animation that fights it either way.
+    for animation_speed in [None, Some(14.0)] {
+        let mut harness = harness_with_widths(&[700, 700, 700, 700], animation_speed);
+        assert_eq!(window_x(harness.world(), 0), 0);
 
-    send(&mut harness, swipe(0.05));
-    harness.advance(SETTLE);
+        send(&mut harness, swipe(0.05));
+        harness.advance(SETTLE);
 
-    assert!(!is_scrolling(harness.world()), "the settle has finished");
-    assert_focused!(harness.world(), 1);
-    assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 700);
-    assert_eq!(window_x(harness.world(), 0), TEST_DISPLAY_WIDTH - 1400);
+        assert!(!is_scrolling(harness.world()), "the settle has finished");
+        assert_focused!(harness.world(), 1);
+        assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 700);
+        assert_eq!(window_x(harness.world(), 0), TEST_DISPLAY_WIDTH - 1400);
+    }
 }
 
 /// A flick toward the end of the strip lands where the strip's own scroll
@@ -175,11 +179,14 @@ fn wheel_scroll_settles_after_a_short_pause() {
     assert!(is_scrolling(harness.world()), "a 100 ms gap is not a pause");
     assert_focused!(harness.world(), 0);
     send(&mut harness, Event::Scroll { delta: 30.0 });
+    harness.advance(ONE_FRAME);
+    let scrolled = window_x(harness.world(), 2);
     harness.advance(SETTLE);
 
     assert!(!is_scrolling(harness.world()), "the settle has finished");
     assert_focused!(harness.world(), 2);
-    assert_eq!(window_x(harness.world(), 2), 147);
+    assert_eq!(scrolled, 146);
+    assert_eq!(window_x(harness.world(), 2), 146, "fully visible: no move");
 }
 
 /// Keyboard focus moves the strip only as far as needed to show the newly
@@ -246,4 +253,51 @@ fn center_command_still_centers() {
     harness.advance(SETTLE);
 
     assert_eq!(window_x(harness.world(), 1), (TEST_DISPLAY_WIDTH - 400) / 2);
+}
+
+/// Switching virtual workspaces mid-settle keeps the landing: the strip
+/// comes back where the settle was headed, not where it was caught.
+#[test]
+fn virtual_switch_mid_settle_restores_the_landing() {
+    let mut harness = harness_with_widths(&[700, 700, 700, 700], None);
+
+    send(&mut harness, swipe(0.05));
+    harness.advance(ONE_FRAME * 6);
+    assert!(is_scrolling(harness.world()), "still settling");
+    harness.run(vec![
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(1)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(0)),
+        },
+    ]);
+    harness.advance(SETTLE);
+
+    assert_focused!(harness.world(), 1);
+    assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 700);
+}
+
+/// Fingers that touch down mid-settle catch the strip where it is, and
+/// lifting them again settles from there.
+#[test]
+fn touch_down_mid_settle_catches_the_strip() {
+    let mut harness = harness_with_widths(&[700, 700, 700, 700], None);
+
+    send(&mut harness, swipe(0.05));
+    harness.advance(ONE_FRAME * 12);
+    send(&mut harness, Event::TouchpadDown);
+    harness.advance(ONE_FRAME);
+    let caught = window_x(harness.world(), 1);
+    harness.advance(ONE_FRAME);
+    assert_eq!(
+        window_x(harness.world(), 1),
+        caught,
+        "the strip holds still"
+    );
+
+    harness.advance(SETTLE);
+    assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_focused!(harness.world(), 1);
+    assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 700);
 }
