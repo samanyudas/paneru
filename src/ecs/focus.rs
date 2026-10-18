@@ -331,7 +331,7 @@ fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
     restored: Query<&RestoreFocusMarker>,
-    moving_strips: Query<&RepositionMarker, With<LayoutStrip>>,
+    strips: Query<(Option<&RepositionMarker>, Option<&Scrolling>), With<LayoutStrip>>,
     global_state: GlobalState,
     active_display: ActiveDisplay,
     mut ctx: WindowCtx,
@@ -351,6 +351,15 @@ fn autocenter_window_on_focus(
     if active_display.active_strip().tabbed(entity) {
         return;
     }
+    // A settling swipe already chose where the strip stops, measured against
+    // where it is going rather than where it is mid-glide.
+    let (moving, scrolling) = strips
+        .get(active_display.active_strip_entity())
+        .unwrap_or_default();
+    if scrolling.is_some_and(|scrolling| scrolling.settle.is_some()) {
+        ctx.commands.ensure_visible(entity);
+        return;
+    }
     if ctx.config.auto_center()
         && let Some((_, _, None)) = ctx.windows.get_managed(entity)
         && let Some(size) = ctx.windows.size(entity)
@@ -362,7 +371,7 @@ fn autocenter_window_on_focus(
     }
     if !ctx.config.auto_center()
         && ctx.config.continuous_swipe()
-        && let Ok(target) = moving_strips.get(active_display.active_strip_entity())
+        && let Some(target) = moving
     {
         let hidden_ratio = ctx.config.window_hidden_ratio();
         if hidden_ratio > 0.0

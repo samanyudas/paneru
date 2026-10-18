@@ -39,7 +39,7 @@ pub struct LayoutEventsPlugin;
 pub(crate) const PARKED_STRIP_SLIVER: i32 = 10;
 
 /// A strip, its entity, origin, display, whether it's the active one, and the
-/// offset it is animating toward if a move is already in flight.
+/// offset it is animating or settling toward if a move is already in flight.
 /// Shared by [`reshuffle_layout_strip`] and [`ensure_visible_in_strip`].
 type StripPlacements<'w, 's> = Query<
     'w,
@@ -51,8 +51,26 @@ type StripPlacements<'w, 's> = Query<
         &'static ChildOf,
         Option<Ref<'static, ActiveWorkspaceMarker>>,
         Option<&'static RepositionMarker>,
+        Option<&'static Scrolling>,
     ),
 >;
+
+/// Where a strip is headed: the target of an animation in flight, else the
+/// offset a swipe is settling on, else where it is now.
+fn strip_destination(
+    position: &Position,
+    reposition: Option<&RepositionMarker>,
+    scrolling: Option<&Scrolling>,
+) -> Origin {
+    reposition.map_or_else(
+        || {
+            scrolling
+                .and_then(|scrolling| scrolling.settle)
+                .map_or(position.0, |x| position.0.with_x(round_px(x)))
+        },
+        |reposition| reposition.0,
+    )
+}
 
 /// Displays paired with the Dock's current edge, which is what turns a display's
 /// raw bounds into the usable viewport.
@@ -1225,7 +1243,10 @@ fn layout_strip_changed(
     }
 }
 
-fn strip_content_range(strip: &LayoutStrip, windows: &Windows) -> Option<std::ops::Range<i32>> {
+pub(crate) fn strip_content_range(
+    strip: &LayoutStrip,
+    windows: &Windows,
+) -> Option<std::ops::Range<i32>> {
     let first = strip.first().ok()?.top()?;
     let last = strip.last().ok()?.top()?;
     let start = windows.layout_position(first)?.x;
@@ -1254,13 +1275,13 @@ fn reshuffle_layout_strip(
         let Some(slot) = slot else {
             continue;
         };
-        let Some((strip, strip_entity, active_strip, child, active_marker, strip_reposition)) =
+        let Some((strip, strip_entity, active_strip, child, marker, moving, settling)) =
             strips.into_iter().find(|strip| strip.0.contains(entity))
         else {
             continue;
         };
 
-        if active_marker.is_some_and(|m| m.is_added()) {
+        if marker.is_some_and(|m| m.is_added()) {
             trace!("reshuffle_layout_strip: skipping newly active workspace {strip_entity}");
             continue;
         }
@@ -1274,7 +1295,7 @@ fn reshuffle_layout_strip(
 
         let size = frame.size();
         let visible_width = display_bounds.intersect(frame).width();
-        let strip_target = strip_reposition.map_or(active_strip.0, |reposition| reposition.0);
+        let strip_target = strip_destination(active_strip, moving, settling);
 
         let content = strip_content_range(strip, &windows);
         if arrival.is_some_and(|arrival| arrival.destination == strip_entity)
@@ -1412,8 +1433,17 @@ fn ensure_visible_in_strip(
             .into_iter()
             .find(|s| s.0.contains(entity))
             .map(
-                |(_, strip_entity, strip_position, child, active_marker, strip_reposition)| {
-                    let target = strip_reposition.map_or(strip_position.0, |r| r.0);
+                |(
+                    _,
+                    strip_entity,
+                    strip_position,
+                    child,
+                    active_marker,
+                    strip_reposition,
+                    strip_scrolling,
+                )| {
+                    let target =
+                        strip_destination(strip_position, strip_reposition, strip_scrolling);
                     (
                         strip_entity,
                         child.parent(),

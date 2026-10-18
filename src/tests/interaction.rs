@@ -541,12 +541,15 @@ fn test_scrolling() {
             assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
             assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
         })
-        // The strip has come to rest mid-scroll: still one contiguous run of
-        // 400px columns, none of them parked at an edge sliver.
+        // The flick's momentum stops with window 1 nearest the center, but
+        // 60px short of the strip end. The settle brings the strip end to the
+        // right edge so no empty space shows. Still one contiguous run of
+        // 400px columns, none parked at an edge sliver.
         .on_iteration(5, move |world, _state| {
-            assert_window_at!(world, 0, -186, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 214, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 614, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 0, -176, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 224, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 624, TEST_MENUBAR_HEIGHT);
+            assert_focused!(world, 1);
         })
         .run(commands);
 }
@@ -1726,6 +1729,9 @@ fn test_virtual_workspace_switch_no_horizontal_slide_no_animations() {
     );
 
     // Remember the settled strip x after scrolling.
+    // Let the swipe settle on its landing before measuring.
+    h.advance(std::time::Duration::from_secs(3));
+
     let strip_x_after_scroll = {
         let world = h.app.world_mut();
         let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
@@ -2567,6 +2573,9 @@ fn test_virtual_workspace_switch_preserves_scroll_with_animations() {
         },
     );
 
+    // Let the swipe settle on its landing before measuring.
+    h.advance(std::time::Duration::from_secs(3));
+
     let strip_x_after_scroll = {
         let world = h.app.world_mut();
         let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
@@ -2673,6 +2682,13 @@ fn test_stack_unstack_brings_focused_window_into_view() {
         );
     }
 
+    // A swipe now settles focus on a column it leaves fully visible, so it
+    // can no longer strand the focused window. Scroll the strip directly.
+    fn scroll_away(world: &mut World, _state: MockState) {
+        let strip = active_strip_entity(world);
+        world.get_mut::<Position>(strip).expect("strip position").x = -1000;
+    }
+
     let config: Config = (
         MainOptions {
             focus_follows_mouse: Some(false),
@@ -2693,22 +2709,14 @@ fn test_stack_unstack_brings_focused_window_into_view() {
         Event::Command {
             command: Command::Window(Operation::Focus(Direction::East)),
         },
-        // Swipe windows 0 and 1 off screen.
-        Event::Swipe {
-            delta: 0.3,
-            fingers: 3,
-        },
-        // Noop to let the scroll settle.
+        // Scroll windows 0 and 1 off screen.
+        Event::MenuOpened { window_id: 0 },
         Event::MenuOpened { window_id: 0 },
         Event::Command {
             command: Command::Window(Operation::Stack(Side::West)),
         },
-        // Now swipe the stacked windows off screen again.
-        Event::Swipe {
-            delta: 0.1,
-            fingers: 3,
-        },
-        // Noop to let the scroll settle.
+        // Now scroll the stacked windows off screen again.
+        Event::MenuOpened { window_id: 0 },
         Event::MenuOpened { window_id: 0 },
         Event::Command {
             command: Command::Window(Operation::Unstack(Side::East)),
@@ -2716,13 +2724,15 @@ fn test_stack_unstack_brings_focused_window_into_view() {
     ];
 
     harness
+        .on_iteration(2, scroll_away)
         .on_iteration(3, check_if_offscreen)
         .on_iteration(4, |world, _state| {
             // Check that both window are stacked and moved into view.
             assert_window_at!(world, 0, 0, 20);
             assert_window_at!(world, 1, 0, 394);
         })
-        .on_iteration(5, check_if_offscreen)
+        .on_iteration(5, scroll_away)
+        .on_iteration(6, check_if_offscreen)
         .on_iteration(7, |world, _state| {
             // Check that both window are stacked and moved into view.
             assert_window_at!(world, 1, 0, 20);

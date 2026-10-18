@@ -1473,7 +1473,8 @@ fn test_arrival_allows_free_panning_after_placement() {
 fn test_arrival_preserves_a_completed_modifier_scroll() {
     let mut harness = pending_display_arrival(MainOptions::default(), 0, 890);
     harness.world().write_message(Event::Scroll { delta: -0.1 });
-    harness.advance(Duration::from_millis(40));
+    // A wheel tick counts as finished after a 150 ms pause.
+    harness.advance(Duration::from_millis(160));
     let before = harness.mock_state.create_window(0).frame().min.x;
     harness.advance(Duration::from_millis(40));
     let world = harness.world();
