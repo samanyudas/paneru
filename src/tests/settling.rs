@@ -259,7 +259,8 @@ fn center_command_still_centers() {
 /// comes back where the settle was headed, not where it was caught.
 #[test]
 fn virtual_switch_mid_settle_restores_the_landing() {
-    let mut harness = harness_with_widths(&[700, 700, 700, 700], None);
+    // Only an animated settle can be caught partway.
+    let mut harness = harness_with_widths(&[700, 700, 700, 700], Some(14.0));
 
     send(&mut harness, swipe(0.05));
     harness.advance(ONE_FRAME * 6);
@@ -282,10 +283,12 @@ fn virtual_switch_mid_settle_restores_the_landing() {
 /// lifting them again settles from there.
 #[test]
 fn touch_down_mid_settle_catches_the_strip() {
-    let mut harness = harness_with_widths(&[700, 700, 700, 700], None);
+    // Only an animated settle can be caught partway.
+    let mut harness = harness_with_widths(&[700, 700, 700, 700], Some(14.0));
 
     send(&mut harness, swipe(0.05));
     harness.advance(ONE_FRAME * 12);
+    assert!(is_scrolling(harness.world()), "still settling");
     send(&mut harness, Event::TouchpadDown);
     harness.advance(ONE_FRAME);
     let caught = window_x(harness.world(), 1);
@@ -298,6 +301,20 @@ fn touch_down_mid_settle_catches_the_strip() {
 
     harness.advance(SETTLE);
     assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_focused!(harness.world(), 1);
+    assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 700);
+}
+
+/// Without an animation speed (Reduce Motion or Miri's disable-animation
+/// setting), the settle is instant: the strip is on its landing as soon as the
+/// swipe ends, not partway along a spring.
+#[test]
+fn swipe_settles_instantly_without_animation() {
+    let mut harness = harness_with_widths(&[700, 700, 700, 700], None);
+    send(&mut harness, swipe(0.05));
+    harness.advance(std::time::Duration::from_millis(100));
+
+    assert!(!is_scrolling(harness.world()), "the settle is instant");
     assert_focused!(harness.world(), 1);
     assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 700);
 }

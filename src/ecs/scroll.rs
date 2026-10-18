@@ -483,6 +483,14 @@ fn settle_strip(
         target
     };
 
+    // An unset animation speed means instant movement, which is how Miri
+    // applies Reduce Motion and its disable-animation setting.
+    if config.options().animation_speed.is_none() {
+        position.x = round_px(target);
+        finish(&mut commands);
+        return;
+    }
+
     let omega = 2.0 * deceleration;
     let dt = time.delta_secs_f64().min(MAX_STEP_SECS);
     let offset = scroll.position - target;
