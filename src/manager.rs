@@ -74,8 +74,8 @@ pub fn size_from(size: CGSize) -> Size {
 }
 
 pub fn irect_from(rect: CGRect) -> IRect {
-    let mid = rect.mid();
-    IRect::from_center_size(origin_from(mid), size_from(rect.size))
+    let min = origin_from(rect.origin);
+    IRect::from_corners(min, min + size_from(rect.size))
 }
 
 /// Defines the interface for a window manager, abstracting OS-specific operations.
@@ -938,5 +938,30 @@ impl notify::EventHandler for ConfigHandler {
                 warn!("error sending config refresh: {err}");
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+
+    use super::irect_from;
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> CGRect {
+        CGRect::new(CGPoint::new(x, y), CGSize::new(width, height))
+    }
+
+    #[test]
+    fn irect_from_keeps_odd_sizes() {
+        let frame = irect_from(rect(8.0, 30.0, 629.0, 401.0));
+        assert_eq!((frame.min.x, frame.min.y), (8, 30));
+        assert_eq!((frame.width(), frame.height()), (629, 401));
+    }
+
+    #[test]
+    fn irect_from_keeps_odd_sizes_at_negative_origins() {
+        let frame = irect_from(rect(-643.0, -1003.0, 629.0, 401.0));
+        assert_eq!((frame.min.x, frame.min.y), (-643, -1003));
+        assert_eq!((frame.width(), frame.height()), (629, 401));
     }
 }
