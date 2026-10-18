@@ -36,6 +36,11 @@ pub(crate) struct MockWindowData {
     pub(crate) frame: IRect,
     pub(crate) maximum_size: Option<Size>,
     pub(crate) resize_bottom_limit: Option<i32>,
+    /// Size writes the app drops before it applies one, like an app that
+    /// applies a size only after the call returns.
+    pub(crate) dropped_resizes: u8,
+    /// How long a frame read takes, like an app slow to answer.
+    pub(crate) frame_read_delay: std::time::Duration,
     pub(crate) resize_writes: usize,
     pub(crate) position_writes: usize,
     pub(crate) frame_read_failures: u8,
@@ -67,6 +72,8 @@ impl Default for MockWindowData {
             frame: IRect::default(),
             maximum_size: None,
             resize_bottom_limit: None,
+            dropped_resizes: 0,
+            frame_read_delay: std::time::Duration::ZERO,
             resize_writes: 0,
             position_writes: 0,
             frame_read_failures: 0,
@@ -570,6 +577,10 @@ impl MockState {
                 .filter(|w| w.ax_generation == ax_generation)
             {
                 w.resize_writes += 1;
+                if w.dropped_resizes > 0 {
+                    w.dropped_resizes -= 1;
+                    return;
+                }
                 let mut size = w.maximum_size.map_or(size, |maximum| size.min(maximum));
                 if let Some(bottom) = w.resize_bottom_limit
                     && size.y > 0
@@ -634,6 +645,7 @@ impl MockState {
                 window.frame_read_failures -= 1;
                 return Err(Error::InvalidWindow);
             }
+            std::thread::sleep(window.frame_read_delay);
             Ok(window.frame)
         });
 
@@ -939,6 +951,10 @@ impl MockState {
                 .collect::<Vec<_>>();
             Some(windows)
         });
+
+        let s = self.clone();
+        wm.expect_all_window_ids()
+            .returning(move || s.inner.force_read().windows.keys().copied().collect());
 
         let s = self.clone();
         wm.expect_warp_mouse()

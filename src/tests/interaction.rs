@@ -18,6 +18,7 @@ use crate::platform::{Modifiers, WinID};
 use crate::{assert_focused, assert_window_at, assert_window_size};
 
 use super::*;
+use crate::ecs::PreLaunchFrame;
 
 #[test]
 fn test_auto_center_keeps_new_focus_centered_during_strip_animation() {
@@ -3654,17 +3655,33 @@ fn test_stack_commands_move_only_the_focused_window() {
         .run(commands);
 }
 
-/// Stop and Quit must leave a floating window exactly where the user put it,
-/// while a tiled window parked off-screen still comes back onto a display.
-///
-/// Driven directly at the system: sending `AppExit` through the full schedule
-/// also runs the state-saving exit systems, which write the real user state
-/// file.
-#[test]
-fn exit_cleanup_restores_tiled_windows_and_leaves_floating_windows_alone() {
+/// Runs the exit cleanup directly. Sending `AppExit` through the full
+/// schedule also runs the state-saving exit systems, which write the real user
+/// state file.
+fn run_exit_cleanup(world: &mut World) {
     use bevy::app::AppExit;
     use bevy::ecs::system::RunSystemOnce as _;
 
+    world.write_message(AppExit::Success);
+    world
+        .run_system_once(crate::ecs::systems::cleanup_on_exit)
+        .expect("running cleanup_on_exit");
+}
+
+fn exit_frame_of(world: &mut World, id: WinID) -> IRect {
+    world
+        .query::<&Window>()
+        .iter(world)
+        .find(|window| window.id() == id)
+        .expect("window exists")
+        .frame()
+}
+
+/// Stop and Quit must leave a floating window exactly where the user put it,
+/// while a tiled window opened during the session and parked off-screen comes
+/// back only as far as the nearest display edge.
+#[test]
+fn exit_cleanup_brings_a_parked_window_to_the_edge_and_leaves_floating_windows_alone() {
     const FLOAT_PID: i32 = TEST_PROCESS_ID + 1;
     const TILED: WinID = 0;
     const FLOATING: WinID = 1;
@@ -3677,12 +3694,15 @@ fn exit_cleanup_restores_tiled_windows_and_leaves_floating_windows_alone() {
         TestHarness::new()
             .with_config(config)
             .with_app(FLOAT_PID, "float.app", "FloatApp", |_| {});
+    // Startup finishes before these windows open, so neither has a frame from
+    // before management began.
+    harness.advance(Duration::from_secs(1));
     let state = harness.mock_state.clone();
     let tiled = state.spawn_window(
         TEST_PROCESS_ID,
         TEST_WORKSPACE_ID,
         TILED,
-        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, 600),
     );
     let floating = state.spawn_window(
         FLOAT_PID,
@@ -3706,34 +3726,337 @@ fn exit_cleanup_restores_tiled_windows_and_leaves_floating_windows_alone() {
     );
 
     // A scrolled strip parks tiled windows past the display edge.
-    state.os_move_window(TILED, Origin::new(TEST_DISPLAY_WIDTH + 500, 100));
+    state.os_move_window(
+        TILED,
+        Origin::new(TEST_DISPLAY_WIDTH + 500, TEST_MENUBAR_HEIGHT),
+    );
+    let size = exit_frame_of(world, TILED).size();
 
-    world.write_message(AppExit::Success);
-    world
-        .run_system_once(crate::ecs::systems::cleanup_on_exit)
-        .expect("running cleanup_on_exit");
-
-    let frame_of = |world: &mut World, id: WinID| {
-        world
-            .query::<&Window>()
-            .iter(world)
-            .find(|window| window.id() == id)
-            .expect("window exists")
-            .frame()
-    };
+    run_exit_cleanup(world);
 
     assert_eq!(
-        frame_of(world, FLOATING),
+        exit_frame_of(world, FLOATING),
         IRect::new(37, 41, 337, 241),
         "exit cleanup must not move or resize a floating window"
     );
-
-    let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
-    let tiled_frame = frame_of(world, TILED);
-    assert!(
-        display.contains(tiled_frame.min) && display.contains(tiled_frame.max),
-        "exit cleanup must bring a tiled window fully onto a display, got {tiled_frame:?}"
+    assert_eq!(
+        exit_frame_of(world, TILED),
+        IRect::from_corners(
+            Origin::new(TEST_DISPLAY_WIDTH - size.x, TEST_MENUBAR_HEIGHT),
+            Origin::new(TEST_DISPLAY_WIDTH, TEST_MENUBAR_HEIGHT + size.y)
+        ),
+        "a parked window comes back only as far as the display edge"
     );
+}
+
+/// A window that was open before management began gets back the position and
+/// size it had then, not a centered frame.
+#[test]
+fn exit_cleanup_restores_the_frame_a_window_had_before_management() {
+    let before = [
+        IRect::new(100, 120, 100 + 300, 120 + 400),
+        IRect::new(500, 150, 500 + 350, 150 + 300),
+    ];
+    let mut harness = TestHarness::new()
+        .with_window(0, move |window| window.frame = before[0])
+        .with_window(1, move |window| window.frame = before[1]);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    let world = harness.world();
+    assert_ne!(
+        exit_frame_of(world, 0),
+        before[0],
+        "tiling has moved the window"
+    );
+
+    run_exit_cleanup(world);
+
+    assert_eq!(exit_frame_of(world, 0), before[0]);
+    assert_eq!(exit_frame_of(world, 1), before[1]);
+}
+
+/// A window opened during the session that is fully on screen stays exactly
+/// where the strip left it.
+#[test]
+fn exit_cleanup_leaves_a_visible_window_opened_during_the_session() {
+    let mut harness = TestHarness::new();
+    harness.advance(Duration::from_secs(1));
+    let state = harness.mock_state.clone();
+    let window = state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        0,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, 600),
+    );
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_secs(1));
+    state.os_move_window(0, Origin::new(200, TEST_MENUBAR_HEIGHT));
+
+    let world = harness.world();
+    let left = exit_frame_of(world, 0);
+    run_exit_cleanup(world);
+
+    assert_eq!(exit_frame_of(world, 0), left);
+    assert_eq!(left.min.x, 200);
+}
+
+/// A frame from before management that is no longer on any display, such as
+/// one on a display that was since disconnected, is not restored.
+#[test]
+fn exit_cleanup_skips_a_frame_from_a_disconnected_display() {
+    let mut harness = TestHarness::new().with_window(0, |window| {
+        window.frame = IRect::new(3000, 100, 3000 + 300, 100 + 400);
+    });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let state = harness.mock_state.clone();
+    state.os_move_window(0, Origin::new(-1000, TEST_MENUBAR_HEIGHT));
+
+    let world = harness.world();
+    run_exit_cleanup(world);
+
+    let frame = exit_frame_of(world, 0);
+    let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+    assert_eq!(
+        frame.min.x, 0,
+        "it comes back to the nearest edge, got {frame:?}"
+    );
+    assert!(
+        display.contains(frame.min) && display.contains(frame.max),
+        "it ends fully on the display, got {frame:?}"
+    );
+}
+
+/// Paneru adds its padding to a window only after it first sees it, so the
+/// recorded frame is the bare macOS frame. Restoring it must put the macOS
+/// window back there, not one padding further in.
+#[test]
+fn exit_cleanup_restores_the_macos_frame_under_padding() {
+    let before = IRect::new(100, 120, 100 + 300, 120 + 400);
+    let mut harness = TestHarness::new().with_window(0, move |window| window.frame = before);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    // The window rules apply their padding once the window is known.
+    harness.mock_state.update_window(0, |window| {
+        window.horizontal_padding = 4;
+        window.vertical_padding = 4;
+    });
+
+    let world = harness.world();
+    run_exit_cleanup(world);
+
+    assert_eq!(
+        exit_frame_of(world, 0),
+        crate::ecs::systems::padded(before, (4, 4)),
+        "the tracked frame includes the padding around the macOS frame"
+    );
+}
+
+/// An app can refuse a height at the old position that it accepts at the
+/// recorded one, so the size is set again after the move.
+#[test]
+fn exit_cleanup_sets_the_size_again_after_moving() {
+    let before = IRect::new(100, 50, 100 + 300, 50 + 600);
+    let mut harness = TestHarness::new().with_window(0, move |window| window.frame = before);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let state = harness.mock_state.clone();
+    state.update_window(0, |window| {
+        window.resize_bottom_limit = Some(TEST_DISPLAY_HEIGHT);
+    });
+    state.os_move_window(0, Origin::new(100, 500));
+
+    let world = harness.world();
+    run_exit_cleanup(world);
+
+    assert_eq!(exit_frame_of(world, 0), before);
+}
+
+/// An app that applies a size only after the call returns can drop the sizes
+/// that arrive while it is still changing. Exit cleanup checks again and
+/// places the window until it lands.
+#[test]
+fn exit_cleanup_places_again_a_window_that_drops_sizes() {
+    let before = IRect::new(100, 50, 100 + 300, 50 + 600);
+    let mut harness = TestHarness::new().with_window(0, move |window| window.frame = before);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness
+        .mock_state
+        .update_window(0, |window| window.dropped_resizes = 3);
+
+    let world = harness.world();
+    run_exit_cleanup(world);
+
+    assert_eq!(exit_frame_of(world, 0), before);
+}
+
+/// Quitting while the strip is still animating must not let the animation
+/// write over the frames exit cleanup restores in the same frame.
+#[test]
+fn exit_mid_animation_keeps_the_restored_frames() {
+    use bevy::app::{AppExit, Last, PostUpdate};
+
+    let before = [
+        IRect::new(100, 120, 100 + 700, 120 + 400),
+        IRect::new(200, 150, 200 + 700, 150 + 300),
+    ];
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(8.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_window(0, move |window| window.frame = before[0])
+        .with_window(1, move |window| window.frame = before[1]);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_secs(3));
+    harness
+        .world()
+        .write_message::<Event>(focus(Direction::East));
+    harness.advance(Duration::from_millis(40));
+
+    let world = harness.world();
+    assert!(
+        world
+            .query_filtered::<(), With<RepositionMarker>>()
+            .iter(world)
+            .next()
+            .is_some(),
+        "the strip is still animating"
+    );
+
+    // The exit frame: its animation and frame writes run, then the runner
+    // stops. The state-saving systems in Update are left out because they
+    // write the real user state file.
+    world.write_message(AppExit::Success);
+    world.run_schedule(PostUpdate);
+    world.run_schedule(Last);
+
+    assert_eq!(exit_frame_of(world, 0), before[0]);
+    assert_eq!(exit_frame_of(world, 1), before[1]);
+}
+
+/// A window whose frame cannot be read is checked once and then left, so an
+/// app that has stopped answering cannot stall Stop or Quit.
+#[test]
+fn exit_cleanup_does_not_retry_an_unreadable_window() {
+    let mut harness = TestHarness::new().with_window(0, |window| {
+        window.frame = IRect::new(100, 50, 400, 650);
+    });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let state = harness.mock_state.clone();
+    state.update_window(0, |window| window.frame_read_failures = u8::MAX);
+
+    let world = harness.world();
+    run_exit_cleanup(world);
+
+    // Every failed read uses up one of the injected failures.
+    let mut failures_left = 0;
+    state.update_window(0, |window| failures_left = window.frame_read_failures);
+    assert_eq!(u8::MAX - failures_left, 1, "read once, never again");
+}
+
+/// A frame read that finishes after the recheck deadline starts no new
+/// placement, so a slow app holds up Stop or Quit by one call at most.
+#[test]
+fn exit_cleanup_places_nothing_after_the_recheck_deadline() {
+    let mut harness = TestHarness::new().with_window(0, |window| {
+        window.frame = IRect::new(100, 50, 400, 650);
+    });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let state = harness.mock_state.clone();
+    let mut writes_before = 0;
+    state.update_window(0, |window| {
+        // Every size is dropped, so the window never lands, and the first
+        // recheck read ends past the one-second deadline.
+        window.dropped_resizes = u8::MAX;
+        window.frame_read_delay = Duration::from_millis(1100);
+        writes_before = window.position_writes;
+    });
+
+    let world = harness.world();
+    run_exit_cleanup(world);
+
+    let mut writes_after = 0;
+    state.update_window(0, |window| writes_after = window.position_writes);
+    assert_eq!(writes_after - writes_before, 1, "only the first placement");
+}
+
+/// A window that was open at launch but that a slow scan finds only after
+/// startup still gets its frame back. A window that opens during startup is
+/// not one of them.
+#[test]
+fn exit_cleanup_records_launch_windows_however_late_they_are_found() {
+    let late = IRect::new(150, 60, 150 + 300, 60 + 400);
+    let mut harness = TestHarness::new();
+    let state = harness.mock_state.clone();
+    let opened = state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        1,
+        IRect::new(0, 0, 300, 400),
+    );
+    harness.world().trigger(SpawnWindowTrigger(vec![opened]));
+    harness.advance(Duration::from_secs(1));
+
+    harness.existed_at_launch([0]);
+    let found = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 0, late);
+    harness.world().trigger(SpawnWindowTrigger(vec![found]));
+    harness.advance(Duration::from_secs(1));
+
+    let world = harness.world();
+    let opened_entity = find_window_entity(1, world);
+    assert!(
+        world
+            .entity(opened_entity)
+            .get::<PreLaunchFrame>()
+            .is_none(),
+        "a window that opened during startup has no frame from before"
+    );
+    assert_ne!(exit_frame_of(world, 0), late, "tiling has moved the window");
+
+    run_exit_cleanup(world);
+
+    assert_eq!(exit_frame_of(world, 0), late);
+}
+
+/// The display choice and the accessibility guarantee, driven at the pure
+/// placement function.
+#[test]
+fn exit_frame_keeps_every_window_reachable_with_the_shortest_move() {
+    use crate::ecs::systems::exit_frame;
+
+    let upper = IRect::new(0, -1000, 1000, 0);
+    let lower = IRect::new(0, 0, 1000, 800);
+    let saved = IRect::new(100, -500, 400, 700);
+
+    // On both displays, the recorded frame is restored as it was.
+    let inside = IRect::new(100, -500, 400, -100);
+    assert_eq!(
+        exit_frame(lower, Some(inside), &[upper, lower]),
+        Some(inside)
+    );
+
+    // The upper display is gone. The center of the recorded frame is on the
+    // lower one, but its title bar is not, so it moves down onto it.
+    assert_eq!(
+        exit_frame(lower, Some(saved), &[lower]),
+        Some(IRect::new(100, 0, 400, 720)),
+        "a recorded frame keeps its size and moves fully onto the display"
+    );
+
+    // With no overlap anywhere, the nearest edge wins: straight down onto the
+    // wide display, not across and down onto the small one beside it.
+    let wide = IRect::new(0, 0, 4000, 2000);
+    let small = IRect::new(4000, 0, 5000, 1000);
+    let above = IRect::new(3800, -400, 4000, -200);
+    assert_eq!(
+        exit_frame(above, None, &[wide, small]),
+        Some(IRect::new(3800, 0, 4000, 200))
+    );
+
+    assert_eq!(exit_frame(above, None, &[]), None);
 }
 
 fn focus(direction: Direction) -> Event {

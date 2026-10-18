@@ -17,8 +17,8 @@ use crate::ecs::scroll::ScrollEventsPlugin;
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::WorkspaceEventsPlugin;
 use crate::ecs::{
-    BProcess, ExistingMarker, FocusFollowsMouse, Initializing, MissionControlActive, SkipReshuffle,
-    SpawnWindowTrigger, register_systems, register_triggers,
+    BProcess, ExistingMarker, FocusFollowsMouse, Initializing, LaunchWindows, MissionControlActive,
+    SkipReshuffle, SpawnWindowTrigger, register_systems, register_triggers,
 };
 use crate::events::Event;
 use crate::manager::{Window, WindowManager};
@@ -98,6 +98,7 @@ impl TestHarness {
                     .spawn_window(pid, TEST_WORKSPACE_ID, win_id, frame)
             })
             .collect::<Vec<_>>();
+        self.existed_at_launch(0..count);
         self.app.world_mut().trigger(SpawnWindowTrigger(windows));
 
         self
@@ -113,10 +114,19 @@ impl TestHarness {
             .mock_state
             .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
         self.mock_state.update_window(id, f);
+        self.existed_at_launch([id]);
         self.app
             .world_mut()
             .trigger(SpawnWindowTrigger(vec![window]));
         self
+    }
+
+    /// Marks windows as already open when the engine started, which is what
+    /// the `with_*window*` builders model.
+    pub(crate) fn existed_at_launch(&mut self, ids: impl IntoIterator<Item = WinID>) {
+        if let Some(mut launch) = self.app.world_mut().get_resource_mut::<LaunchWindows>() {
+            launch.0.extend(ids);
+        }
     }
 
     pub(crate) fn with_workspace_window<F>(
@@ -132,6 +142,7 @@ impl TestHarness {
         let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
         let window = self.mock_state.spawn_window(pid, workspace_id, id, frame);
         self.mock_state.update_window(id, f);
+        self.existed_at_launch([id]);
         self.app
             .world_mut()
             .trigger(SpawnWindowTrigger(vec![window]));
@@ -261,6 +272,7 @@ fn setup_world() -> App {
         .insert_resource(FocusFollowsMouse(None))
         .insert_resource(Config::default())
         .insert_resource(Initializing)
+        .insert_resource(LaunchWindows::default())
         .add_plugins(MouseEventsPlugin)
         .add_plugins(ScrollEventsPlugin)
         .add_plugins(WorkspaceEventsPlugin)

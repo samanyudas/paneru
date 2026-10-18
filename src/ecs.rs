@@ -172,7 +172,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
             )
                 .chain()
                 .run_if(not_swiping),
-            systems::cleanup_on_exit,
             restore::tick_restore_grace,
             state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
             state::cleanup_on_exit,
@@ -205,6 +204,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
             crate::menubar::sync_menu_bar_visibility.run_if(resource_exists_and_changed::<Config>),
         ),
     );
+    // Last, after every system that writes window frames: the runner exits
+    // only once the frame has finished, so an animation still running would
+    // otherwise overwrite the frames cleanup restores.
+    app.add_systems(Last, systems::cleanup_on_exit);
 }
 
 /// Registers all the event triggers for the window manager.
@@ -368,6 +371,18 @@ pub struct Bounds(pub Size);
 
 #[derive(Component, Clone, Debug, Deref, DerefMut)]
 pub struct WidthRatio(pub f64);
+
+/// The macOS frame, without Paneru's padding, that a window had before the
+/// engine managed it. Exit cleanup returns the window there. Only windows in
+/// [`LaunchWindows`] get one, so a window opened later keeps its place.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct PreLaunchFrame(pub bevy::math::IRect);
+
+/// The windows that existed when the engine started. A window in this set is
+/// recorded the first time the engine sees it, which is before any layout can
+/// move it, however late a slow scan discovers it.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct LaunchWindows(pub std::collections::HashSet<WinID>);
 
 /// Marks a window entity that is currently on a native macOS fullscreen space.
 /// The window has been removed from its tiled position in the strip.
@@ -784,6 +799,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         warn!("watching Lua script '{}': {err}", path.display());
     }
 
+    let launch_windows = LaunchWindows(window_manager.all_window_ids().into_iter().collect());
     let mut app = BevyApp::new();
 
     app.add_plugins(MinimalPlugins)
@@ -803,6 +819,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_resource(MissionControlActive(false))
         .insert_resource(FocusFollowsMouse(None))
         .insert_resource(Initializing)
+        .insert_resource(launch_windows)
         .insert_non_send(watcher)
         .add_plugins(mouse::MouseEventsPlugin)
         .add_plugins(scroll::ScrollEventsPlugin)

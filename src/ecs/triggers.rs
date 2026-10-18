@@ -1,3 +1,4 @@
+use super::systems::unpadded;
 use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
@@ -26,9 +27,10 @@ use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
-    RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
-    SpawnCommandsExt, VerifyWindowPosition, VerifyWindowSize, WidthRatio, WindowProperties,
+    ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LaunchWindows, LayoutPosition,
+    Position, PreLaunchFrame, RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling,
+    SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, VerifyWindowSize, WidthRatio,
+    WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -1190,12 +1192,14 @@ fn give_away_focus(
 /// * `active_display` - A query for the active display.
 /// * `main_cid` - The main connection ID resource.
 /// * `commands` - Bevy commands to manage components and trigger events.
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn spawn_window_trigger(
     mut trigger: On<SpawnWindowTrigger>,
     windows: Query<&Window>,
     mut apps: Query<(Entity, &mut Application)>,
     active_display: ActiveDisplay,
+    launch_windows: Option<Res<LaunchWindows>>,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     mut commands: Commands,
@@ -1240,6 +1244,7 @@ pub(super) fn spawn_window_trigger(
         let Ok(frame) = window.update_frame().inspect_err(|err| error!("{err}")) else {
             continue;
         };
+        let window_padding = (window.horizontal_padding(), window.vertical_padding());
         let position = Position(frame.min);
         let bounds = Bounds(frame.size());
         let width_ratio =
@@ -1258,7 +1263,7 @@ pub(super) fn spawn_window_trigger(
 
         // Insert the window into the internal Bevy state.
         // This insertion triggers window attributes observer.
-        commands.spawn((
+        let mut spawned = commands.spawn((
             position,
             bounds,
             width_ratio,
@@ -1266,6 +1271,13 @@ pub(super) fn spawn_window_trigger(
             layout_position,
             ChildOf(app_entity),
         ));
+        if launch_windows
+            .as_ref()
+            .is_some_and(|launch| launch.0.contains(&window_id))
+        {
+            let pre_launch = unpadded(frame, window_padding);
+            spawned.insert(PreLaunchFrame(pre_launch));
+        }
 
         commands.trigger(SendMessageTrigger(Event::WindowSpawned {
             window_id,

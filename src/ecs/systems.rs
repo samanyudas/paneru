@@ -7,7 +7,7 @@ use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
 use bevy::ecs::system::{
     Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
 };
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2};
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
@@ -29,8 +29,9 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    LowPowerMode, MissionControlActive, Position, PreLaunchFrame, ReadDisplayProperties,
+    RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio,
+    WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -1166,19 +1167,21 @@ pub(super) fn verify_window_position(
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any
-/// brightness dim, removes the dim/border overlay window, and centers every
-/// tiled window on the display its frame center falls in, so none is left
-/// parked off-screen. Floating, minimized, and hidden windows stay where they
-/// are.
+/// brightness dim, removes the dim/border overlay window, and puts every tiled
+/// window where [`exit_frame`] says, so none is left parked off-screen.
+/// Floating, minimized, and hidden windows stay where they are.
 pub(crate) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    mut all_windows: Query<(&mut Window, Has<Unmanaged>)>,
+    mut all_windows: Query<(&mut Window, Has<Unmanaged>, Option<&PreLaunchFrame>)>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
 ) {
     for _ in exit_events.read() {
-        let ids = all_windows.iter().map(|(w, _)| w.id()).collect::<Vec<_>>();
+        let ids = all_windows
+            .iter()
+            .map(|(w, _, _)| w.id())
+            .collect::<Vec<_>>();
         info!("exit cleanup: restoring {} window(s)", ids.len());
         window_manager.dim_windows(&ids, 0.0);
 
@@ -1187,50 +1190,136 @@ pub(crate) fn cleanup_on_exit(
         }
 
         let display_bounds = displays.iter().map(Display::bounds).collect::<Vec<_>>();
-        if display_bounds.is_empty() {
-            return;
-        }
-
-        for (mut window, unmanaged) in &mut all_windows {
+        let mut targets = Vec::new();
+        for (mut window, unmanaged, pre_launch) in &mut all_windows {
             if unmanaged {
                 continue;
             }
-            let frame = window.frame();
-            let center = frame.center();
-            let bounds = display_bounds
-                .iter()
-                .find(|b| {
-                    center.x >= b.min.x
-                        && center.x <= b.max.x
-                        && center.y >= b.min.y
-                        && center.y <= b.max.y
-                })
-                .copied()
-                .unwrap_or(display_bounds[0]);
-
-            let mut size = frame.size();
-            if size.x > bounds.width() || size.y > bounds.height() {
-                let new_size = bevy::math::IVec2::new(
-                    size.x.min(bounds.width() * 9 / 10),
-                    size.y.min(bounds.height() * 9 / 10),
-                );
-                window.resize(new_size);
-                size = new_size;
-            }
-
-            let origin = bevy::math::IVec2::new(
-                bounds.min.x + (bounds.width() - size.x) / 2,
-                bounds.min.y + (bounds.height() - size.y) / 2,
-            );
+            let padding = (window.horizontal_padding(), window.vertical_padding());
+            let current = unpadded(window.frame(), padding);
+            let Some(target) = exit_frame(current, pre_launch.map(|f| f.0), &display_bounds) else {
+                return;
+            };
             info!(
                 "exit cleanup: window {} -> origin {:?}, size {:?}",
                 window.id(),
-                origin,
-                size
+                target.min,
+                target.size()
             );
-            window.reposition(origin);
+            let target = padded(target, padding);
+            place(&mut window, target);
+            targets.push((window.id(), target));
         }
+        settle_exit_frames(&mut all_windows, targets);
     }
+}
+
+/// Sets a window's frame the way an app accepts it: an app may limit a size at
+/// the old position, so the size is set again once the window has moved.
+fn place(window: &mut Window, frame: IRect) {
+    window.resize(frame.size());
+    window.reposition(frame.min);
+    window.resize(frame.size());
+}
+
+/// Some apps, Chromium browsers among them, apply a frame only after the
+/// accessibility call returns, and can drop a size that arrives mid-change. The
+/// engine is exiting, so it rechecks every window a few times and places again
+/// any that has not landed. A window whose frame cannot be read is not checked
+/// again, and the whole pass stops at a deadline, so an app that does not
+/// respond cannot hold up Stop or Quit.
+fn settle_exit_frames(
+    all_windows: &mut Query<(&mut Window, Has<Unmanaged>, Option<&PreLaunchFrame>)>,
+    mut pending: Vec<(WinID, IRect)>,
+) {
+    const ROUNDS: usize = 5;
+    const WAIT: Duration = Duration::from_millis(60);
+    const BUDGET: Duration = Duration::from_secs(1);
+
+    let deadline = Instant::now() + BUDGET;
+    for _ in 0..ROUNDS {
+        if pending.is_empty() || Instant::now() + WAIT > deadline {
+            break;
+        }
+        std::thread::sleep(WAIT);
+        pending.retain(|(id, target)| {
+            if Instant::now() > deadline {
+                return true;
+            }
+            let Some((mut window, _, _)) = all_windows.iter_mut().find(|(w, _, _)| w.id() == *id)
+            else {
+                return false;
+            };
+            match window.update_frame() {
+                Ok(actual) if actual == *target => false,
+                // The read itself can outlast the deadline.
+                Ok(_) if Instant::now() > deadline => true,
+                Ok(_) => {
+                    place(&mut window, *target);
+                    true
+                }
+                Err(err) => {
+                    warn!("exit cleanup: window {id} cannot be checked: {err}");
+                    false
+                }
+            }
+        });
+    }
+    for (id, target) in pending {
+        warn!("exit cleanup: window {id} did not reach {target:?}");
+    }
+}
+
+/// A window's macOS frame, from the frame Paneru tracks, which includes the
+/// `(horizontal, vertical)` padding on every side.
+pub(crate) fn unpadded(frame: IRect, (horizontal, vertical): (i32, i32)) -> IRect {
+    let padding = IVec2::new(horizontal, vertical);
+    IRect::from_corners(frame.min + padding, frame.max - padding)
+}
+
+/// The frame Paneru tracks for a window whose macOS frame is `frame`.
+pub(crate) fn padded(frame: IRect, (horizontal, vertical): (i32, i32)) -> IRect {
+    let padding = IVec2::new(horizontal, vertical);
+    IRect::from_corners(frame.min - padding, frame.max + padding)
+}
+
+/// Where a tiled window goes when the engine exits, as a macOS frame. A window
+/// open before the engine started goes back to that frame, and a window opened
+/// later keeps its current one. Either moves only as far as it must to sit
+/// fully on one display, and shrinks to 90% of that display if it is larger. A
+/// recorded frame no display overlaps any more is dropped for the current one.
+/// `None` when no display is connected.
+pub(crate) fn exit_frame(
+    current: IRect,
+    pre_launch: Option<IRect>,
+    displays: &[IRect],
+) -> Option<IRect> {
+    let overlap = |frame: IRect, bounds: &IRect| {
+        let shared = frame.intersect(*bounds).size();
+        i64::from(shared.x.max(0)) * i64::from(shared.y.max(0))
+    };
+    let frame = pre_launch
+        .filter(|saved| displays.iter().any(|bounds| overlap(*saved, bounds) > 0))
+        .unwrap_or(current);
+    displays
+        .iter()
+        .map(|bounds| (overlap(frame, bounds), fit_on_display(frame, *bounds)))
+        .max_by_key(|(shared, fitted)| {
+            let shift = (fitted.min - frame.min).as_i64vec2().length_squared();
+            (*shared, std::cmp::Reverse(shift))
+        })
+        .map(|(_, fitted)| fitted)
+}
+
+/// `frame` moved the least distance that puts it fully inside `bounds`, shrunk
+/// to 90% of `bounds` first if it is larger.
+fn fit_on_display(frame: IRect, bounds: IRect) -> IRect {
+    let mut size = frame.size();
+    if size.x > bounds.width() || size.y > bounds.height() {
+        size = size.min(bounds.size() * 9 / 10);
+    }
+    let origin = frame.min.clamp(bounds.min, bounds.max - size);
+    IRect::from_corners(origin, origin + size)
 }
 
 pub(crate) fn update_flash_messages(
