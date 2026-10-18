@@ -20,6 +20,194 @@ use crate::{assert_focused, assert_window_at, assert_window_size};
 use super::*;
 
 #[test]
+fn test_auto_center_keeps_new_focus_centered_during_strip_animation() {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(true),
+            animation_speed: Some(8.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        focus(Direction::First),
+    ]);
+    harness.world().write_message(focus(Direction::Last));
+    harness.advance(Duration::from_millis(40));
+    harness.world().write_message(focus(Direction::First));
+    harness.advance(Duration::from_secs(3));
+    assert_focused!(harness.world(), 0);
+    assert_window_at!(
+        harness.world(),
+        0,
+        (TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH) / 2,
+        TEST_MENUBAR_HEIGHT
+    );
+}
+
+#[test]
+fn test_fixed_edge_focus_during_center_animation_matches_settled_focus() {
+    for center_duration in [Duration::from_secs(3), Duration::from_millis(60)] {
+        let config: Config = (
+            MainOptions {
+                continuous_swipe: Some(false),
+                animation_speed: Some(8.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(2);
+        harness.run(vec![
+            Event::MenuOpened { window_id: 0 },
+            focus(Direction::First),
+        ]);
+        harness.world().write_message(Event::Command {
+            command: Command::Window(Operation::Center),
+        });
+        harness.advance(center_duration);
+        harness.mock_state.set_focused_window(1);
+        harness
+            .world()
+            .write_message(Event::WindowFocused { window_id: 1 });
+        harness.advance(Duration::from_secs(3));
+        assert_focused!(harness.world(), 1);
+        assert_eq!(
+            window_x(harness.world(), 0),
+            0,
+            "focus timing {center_duration:?}"
+        );
+    }
+}
+
+#[test]
+fn test_hidden_ratio_focus_during_center_animation_matches_settled_focus() {
+    for center_duration in [Duration::from_secs(3), Duration::from_millis(60)] {
+        let config: Config = (
+            MainOptions {
+                continuous_swipe: Some(true),
+                window_hidden_ratio: Some(0.5),
+                animation_speed: Some(8.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(3);
+        harness.run(vec![
+            Event::MenuOpened { window_id: 0 },
+            focus(Direction::East),
+        ]);
+        assert_focused!(harness.world(), 1);
+        harness.world().write_message(Event::Command {
+            command: Command::Window(Operation::Center),
+        });
+        harness.advance(center_duration);
+        harness.mock_state.set_focused_window(0);
+        harness
+            .world()
+            .write_message(Event::WindowFocused { window_id: 0 });
+        harness.advance(Duration::from_secs(3));
+        assert_focused!(harness.world(), 0);
+        assert_eq!(
+            window_x(harness.world(), 0),
+            -88,
+            "focus timing {center_duration:?}"
+        );
+    }
+}
+
+#[test]
+fn test_fully_hidden_focus_during_center_animation_matches_settled_focus() {
+    for center_duration in [Duration::from_secs(3), Duration::from_millis(60)] {
+        let config: Config = (
+            MainOptions {
+                continuous_swipe: Some(true),
+                window_hidden_ratio: Some(1.0),
+                animation_speed: Some(8.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(3);
+        harness.run(vec![
+            Event::MenuOpened { window_id: 0 },
+            focus(Direction::First),
+        ]);
+        harness.world().write_message(Event::Command {
+            command: Command::Window(Operation::Center),
+        });
+        harness.advance(center_duration);
+        harness.mock_state.set_focused_window(2);
+        harness
+            .world()
+            .write_message(Event::WindowFocused { window_id: 2 });
+        harness.advance(Duration::from_secs(3));
+        assert_focused!(harness.world(), 2);
+        let x = window_x(harness.world(), 2);
+        assert!(
+            x >= 0 && x + TEST_WINDOW_WIDTH <= TEST_DISPLAY_WIDTH,
+            "fully hidden window must return into view after focus at {center_duration:?}, got x={x}"
+        );
+    }
+}
+
+#[test]
+fn test_edge_touching_focus_during_center_animation_returns_into_view() {
+    let mut placements = Vec::new();
+    for (centered, focused) in [(0, 2), (2, 0)] {
+        for center_duration in [Duration::from_secs(3), Duration::from_millis(60)] {
+            let config: Config = (
+                MainOptions {
+                    continuous_swipe: Some(true),
+                    window_hidden_ratio: Some(1.0),
+                    animation_speed: Some(8.0),
+                    ..Default::default()
+                },
+                vec![],
+            )
+                .into();
+            let mut harness = TestHarness::new()
+                .with_config(config)
+                .with_window(0, |window| window.frame.max.x = 512)
+                .with_window(1, |window| window.frame.max.x = 256)
+                .with_window(2, |window| window.frame.max.x = 512);
+            harness.run(vec![
+                Event::MenuOpened { window_id: 0 },
+                focus(if centered == 0 {
+                    Direction::First
+                } else {
+                    Direction::Last
+                }),
+            ]);
+            assert_focused!(harness.world(), centered);
+            harness.world().write_message(Event::Command {
+                command: Command::Window(Operation::Center),
+            });
+            harness.advance(center_duration);
+            harness.mock_state.set_focused_window(focused);
+            harness
+                .world()
+                .write_message(Event::WindowFocused { window_id: focused });
+            harness.advance(Duration::from_secs(3));
+            assert_focused!(harness.world(), focused);
+            let x = window_x(harness.world(), focused);
+            placements.push((focused, center_duration, x));
+        }
+    }
+    assert!(
+        placements
+            .iter()
+            .all(|(_, _, x)| *x >= 0 && *x + 512 <= TEST_DISPLAY_WIDTH),
+        "edge-touching windows must return into view after focus, got {placements:?}"
+    );
+}
+
+#[test]
 fn native_fullscreen_transition_removes_window_from_original_strip_without_focus_marker() {
     const FULLSCREEN_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 100;
 
