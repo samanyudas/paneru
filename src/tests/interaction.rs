@@ -3877,6 +3877,56 @@ fn exit_cleanup_places_again_a_window_that_drops_sizes() {
     assert_eq!(exit_frame_of(world, 0), before);
 }
 
+/// Quitting while the strip is still animating must not let the animation
+/// write over the frames exit cleanup restores in the same frame.
+#[test]
+fn exit_mid_animation_keeps_the_restored_frames() {
+    use bevy::app::{AppExit, Last, PostUpdate};
+
+    let before = [
+        IRect::new(100, 120, 100 + 700, 120 + 400),
+        IRect::new(200, 150, 200 + 700, 150 + 300),
+    ];
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(8.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_window(0, move |window| window.frame = before[0])
+        .with_window(1, move |window| window.frame = before[1]);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_secs(3));
+    harness
+        .world()
+        .write_message::<Event>(focus(Direction::East));
+    harness.advance(Duration::from_millis(40));
+
+    let world = harness.world();
+    assert!(
+        world
+            .query_filtered::<(), With<RepositionMarker>>()
+            .iter(world)
+            .next()
+            .is_some(),
+        "the strip is still animating"
+    );
+
+    // The exit frame: its animation and frame writes run, then the runner
+    // stops. The state-saving systems in Update are left out because they
+    // write the real user state file.
+    world.write_message(AppExit::Success);
+    world.run_schedule(PostUpdate);
+    world.run_schedule(Last);
+
+    assert_eq!(exit_frame_of(world, 0), before[0]);
+    assert_eq!(exit_frame_of(world, 1), before[1]);
+}
+
 /// A window that was open at launch but that a slow scan finds only after
 /// startup still gets its frame back. A window that opens during startup is
 /// not one of them.

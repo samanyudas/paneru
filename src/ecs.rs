@@ -172,7 +172,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
             )
                 .chain()
                 .run_if(not_swiping),
-            systems::cleanup_on_exit,
             restore::tick_restore_grace,
             state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
             state::cleanup_on_exit,
@@ -205,6 +204,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
             crate::menubar::sync_menu_bar_visibility.run_if(resource_exists_and_changed::<Config>),
         ),
     );
+    // Last, after every system that writes window frames: the runner exits
+    // only once the frame has finished, so an animation still running would
+    // otherwise overwrite the frames cleanup restores.
+    app.add_systems(Last, systems::cleanup_on_exit);
 }
 
 /// Registers all the event triggers for the window manager.
