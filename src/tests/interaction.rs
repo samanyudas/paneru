@@ -3927,6 +3927,26 @@ fn exit_mid_animation_keeps_the_restored_frames() {
     assert_eq!(exit_frame_of(world, 1), before[1]);
 }
 
+/// A window whose frame cannot be read is checked once and then left, so an
+/// app that has stopped answering cannot stall Stop or Quit.
+#[test]
+fn exit_cleanup_does_not_retry_an_unreadable_window() {
+    let mut harness = TestHarness::new().with_window(0, |window| {
+        window.frame = IRect::new(100, 50, 400, 650);
+    });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let state = harness.mock_state.clone();
+    state.update_window(0, |window| window.frame_read_failures = u8::MAX);
+
+    let world = harness.world();
+    run_exit_cleanup(world);
+
+    // Every failed read uses up one of the injected failures.
+    let mut failures_left = 0;
+    state.update_window(0, |window| failures_left = window.frame_read_failures);
+    assert_eq!(u8::MAX - failures_left, 1, "read once, never again");
+}
+
 /// A window that was open at launch but that a slow scan finds only after
 /// startup still gets its frame back. A window that opens during startup is
 /// not one of them.

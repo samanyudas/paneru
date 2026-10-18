@@ -1225,29 +1225,42 @@ fn place(window: &mut Window, frame: IRect) {
 /// Some apps, Chromium browsers among them, apply a frame only after the
 /// accessibility call returns, and can drop a size that arrives mid-change. The
 /// engine is exiting, so it rechecks every window a few times and places again
-/// any that has not landed.
+/// any that has not landed. A window whose frame cannot be read is not checked
+/// again, and the whole pass stops at a deadline, so an app that does not
+/// respond cannot hold up Stop or Quit.
 fn settle_exit_frames(
     all_windows: &mut Query<(&mut Window, Has<Unmanaged>, Option<&PreLaunchFrame>)>,
     mut pending: Vec<(WinID, IRect)>,
 ) {
     const ROUNDS: usize = 5;
     const WAIT: Duration = Duration::from_millis(60);
+    const BUDGET: Duration = Duration::from_secs(1);
 
+    let deadline = Instant::now() + BUDGET;
     for _ in 0..ROUNDS {
-        if pending.is_empty() {
-            return;
+        if pending.is_empty() || Instant::now() + WAIT > deadline {
+            break;
         }
         std::thread::sleep(WAIT);
         pending.retain(|(id, target)| {
+            if Instant::now() > deadline {
+                return true;
+            }
             let Some((mut window, _, _)) = all_windows.iter_mut().find(|(w, _, _)| w.id() == *id)
             else {
                 return false;
             };
-            if window.update_frame().is_ok_and(|actual| actual == *target) {
-                return false;
+            match window.update_frame() {
+                Ok(actual) if actual == *target => false,
+                Ok(_) => {
+                    place(&mut window, *target);
+                    true
+                }
+                Err(err) => {
+                    warn!("exit cleanup: window {id} cannot be checked: {err}");
+                    false
+                }
             }
-            place(&mut window, *target);
-            true
         });
     }
     for (id, target) in pending {
