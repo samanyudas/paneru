@@ -18,6 +18,7 @@ use crate::platform::{Modifiers, WinID};
 use crate::{assert_focused, assert_window_at, assert_window_size};
 
 use super::*;
+use crate::ecs::PreLaunchFrame;
 
 #[test]
 fn test_auto_center_keeps_new_focus_centered_during_strip_animation() {
@@ -3813,6 +3814,125 @@ fn exit_cleanup_skips_a_frame_from_a_disconnected_display() {
         display.contains(frame.min) && display.contains(frame.max),
         "it ends fully on the display, got {frame:?}"
     );
+}
+
+/// Paneru adds its padding to a window only after it first sees it, so the
+/// recorded frame is the bare macOS frame. Restoring it must put the macOS
+/// window back there, not one padding further in.
+#[test]
+fn exit_cleanup_restores_the_macos_frame_under_padding() {
+    let before = IRect::new(100, 120, 100 + 300, 120 + 400);
+    let mut harness = TestHarness::new().with_window(0, move |window| window.frame = before);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    // The window rules apply their padding once the window is known.
+    harness.mock_state.update_window(0, |window| {
+        window.horizontal_padding = 4;
+        window.vertical_padding = 4;
+    });
+
+    let world = harness.world();
+    run_exit_cleanup(world);
+
+    assert_eq!(
+        exit_frame_of(world, 0),
+        crate::ecs::systems::padded(before, (4, 4)),
+        "the tracked frame includes the padding around the macOS frame"
+    );
+}
+
+/// An app can refuse a height at the old position that it accepts at the
+/// recorded one, so the size is set again after the move.
+#[test]
+fn exit_cleanup_sets_the_size_again_after_moving() {
+    let before = IRect::new(100, 50, 100 + 300, 50 + 600);
+    let mut harness = TestHarness::new().with_window(0, move |window| window.frame = before);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let state = harness.mock_state.clone();
+    state.update_window(0, |window| {
+        window.resize_bottom_limit = Some(TEST_DISPLAY_HEIGHT);
+    });
+    state.os_move_window(0, Origin::new(100, 500));
+
+    let world = harness.world();
+    run_exit_cleanup(world);
+
+    assert_eq!(exit_frame_of(world, 0), before);
+}
+
+/// A window that was open at launch but that a slow scan finds only after
+/// startup still gets its frame back. A window that opens during startup is
+/// not one of them.
+#[test]
+fn exit_cleanup_records_launch_windows_however_late_they_are_found() {
+    let late = IRect::new(150, 60, 150 + 300, 60 + 400);
+    let mut harness = TestHarness::new();
+    let state = harness.mock_state.clone();
+    let opened = state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        1,
+        IRect::new(0, 0, 300, 400),
+    );
+    harness.world().trigger(SpawnWindowTrigger(vec![opened]));
+    harness.advance(Duration::from_secs(1));
+
+    harness.existed_at_launch([0]);
+    let found = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 0, late);
+    harness.world().trigger(SpawnWindowTrigger(vec![found]));
+    harness.advance(Duration::from_secs(1));
+
+    let world = harness.world();
+    let opened_entity = find_window_entity(1, world);
+    assert!(
+        world
+            .entity(opened_entity)
+            .get::<PreLaunchFrame>()
+            .is_none(),
+        "a window that opened during startup has no frame from before"
+    );
+    assert_ne!(exit_frame_of(world, 0), late, "tiling has moved the window");
+
+    run_exit_cleanup(world);
+
+    assert_eq!(exit_frame_of(world, 0), late);
+}
+
+/// The display choice and the accessibility guarantee, driven at the pure
+/// placement function.
+#[test]
+fn exit_frame_keeps_every_window_reachable_with_the_shortest_move() {
+    use crate::ecs::systems::exit_frame;
+
+    let upper = IRect::new(0, -1000, 1000, 0);
+    let lower = IRect::new(0, 0, 1000, 800);
+    let saved = IRect::new(100, -500, 400, 700);
+
+    // On both displays, the recorded frame is restored as it was.
+    let inside = IRect::new(100, -500, 400, -100);
+    assert_eq!(
+        exit_frame(lower, Some(inside), &[upper, lower]),
+        Some(inside)
+    );
+
+    // The upper display is gone. The center of the recorded frame is on the
+    // lower one, but its title bar is not, so it moves down onto it.
+    assert_eq!(
+        exit_frame(lower, Some(saved), &[lower]),
+        Some(IRect::new(100, 0, 400, 720)),
+        "a recorded frame keeps its size and moves fully onto the display"
+    );
+
+    // With no overlap anywhere, the nearest edge wins: straight down onto the
+    // wide display, not across and down onto the small one beside it.
+    let wide = IRect::new(0, 0, 4000, 2000);
+    let small = IRect::new(4000, 0, 5000, 1000);
+    let above = IRect::new(3800, -400, 4000, -200);
+    assert_eq!(
+        exit_frame(above, None, &[wide, small]),
+        Some(IRect::new(3800, 0, 4000, 200))
+    );
+
+    assert_eq!(exit_frame(above, None, &[]), None);
 }
 
 fn focus(direction: Direction) -> Event {

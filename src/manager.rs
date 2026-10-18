@@ -189,6 +189,9 @@ pub trait WindowManagerApi: Send + Sync {
     fn dim_windows(&self, windows: &[WinID], level: f32);
 
     fn windows_on_screen(&self) -> Option<Vec<WinID>>;
+
+    /// Every window that exists right now, on any Space, minimized or not.
+    fn all_window_ids(&self) -> Vec<WinID>;
 }
 
 /// `WindowManager` is a Bevy resource that holds a boxed `WindowManagerApi` trait object.
@@ -581,20 +584,30 @@ impl WindowManagerApi for WindowManagerOS {
     }
 
     fn windows_on_screen(&self) -> Option<Vec<WinID>> {
-        let options =
-            CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
-        let window_list_info = CGWindowListCopyWindowInfo(options, kCGNullWindowID);
-        window_list_info.map(|window_info| {
-            let array = unsafe { window_info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
-            array
-                .iter()
-                .filter_map(|dict| {
-                    dict.get(unsafe { kCGWindowNumber })
-                        .and_then(|id| id.as_i32())
-                })
-                .collect::<Vec<_>>()
-        })
+        window_ids(
+            CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        )
     }
+
+    fn all_window_ids(&self) -> Vec<WinID> {
+        window_ids(CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements)
+            .unwrap_or_default()
+    }
+}
+
+/// The IDs of the windows `CGWindowListCopyWindowInfo` lists for `options`.
+fn window_ids(options: CGWindowListOption) -> Option<Vec<WinID>> {
+    let window_list_info = CGWindowListCopyWindowInfo(options, kCGNullWindowID);
+    window_list_info.map(|window_info| {
+        let array = unsafe { window_info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
+        array
+            .iter()
+            .filter_map(|dict| {
+                dict.get(unsafe { kCGWindowNumber })
+                    .and_then(|id| id.as_i32())
+            })
+            .collect::<Vec<_>>()
+    })
 }
 
 /// Retrieves a list of window IDs for specified spaces and connection, with an option to include minimized windows.

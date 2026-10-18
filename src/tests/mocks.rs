@@ -937,6 +937,10 @@ impl MockState {
         });
 
         let s = self.clone();
+        wm.expect_all_window_ids()
+            .returning(move || s.inner.force_read().windows.keys().copied().collect());
+
+        let s = self.clone();
         wm.expect_warp_mouse()
             .returning(move |origin| s.inner.force_write().cursor_position = origin);
 
