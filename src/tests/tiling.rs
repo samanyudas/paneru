@@ -1193,3 +1193,35 @@ fn window_exists(world: &mut World, id: i32) -> bool {
     let mut query = world.query::<&crate::manager::Window>();
     query.iter(world).any(|window| window.id() == id)
 }
+
+/// A last column that ends short of the display edge grows past it at 75% and
+/// is clamped onto it. When the preset cycle wraps to 25%, the column must
+/// return around its original center instead of staying pinned to the edge.
+#[test]
+fn test_preset_cycle_returns_a_clamped_last_column_to_its_center() {
+    let options = MainOptions {
+        auto_center: Some(false),
+        preset_column_widths: vec![0.25, 0.5, 0.75],
+        ..Default::default()
+    };
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Ratio(0.45));
+    let config: Config = (options, vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    harness.advance(Duration::from_secs(1));
+    assert_window_at!(harness.world(), 1, 461, TEST_MENUBAR_HEIGHT);
+    for _ in 0..2 {
+        harness.app.world_mut().write_message(Event::Command {
+            command: Command::Window(Operation::Resize(ResizeDirection::Grow)),
+        });
+        harness.advance(Duration::from_secs(1));
+    }
+    assert_window_size!(harness.world(), 1, 256, 748);
+    assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
+}
