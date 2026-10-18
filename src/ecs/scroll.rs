@@ -397,13 +397,18 @@ fn resist(stretch: f64, viewport_width: f64) -> f64 {
 /// that shows it fully. The column nearest the viewport center wins; a
 /// partly hidden one ends with its edge on the viewport edge, and a fully
 /// visible one leaves the strip where it rests. This is the projection
-/// `ensure_visible_in_strip` makes for keyboard focus.
+/// `ensure_visible_in_strip` makes for keyboard focus. Continuous swipe lets
+/// the fingers pull an end column to the far edge, so the offset is then
+/// held to the range that leaves no empty space beside the overflowing strip.
 fn landing(
     resting: i32,
     strip: &LayoutStrip,
     windows: &Windows,
     viewport: IRect,
 ) -> Option<(Column, i32)> {
+    let content = strip_content_range(strip, windows)?;
+    let edges = (viewport.max.x - content.end).min(viewport.min.x - content.start)
+        ..=(viewport.min.x - content.start);
     let center = viewport.center().x;
     strip
         .columns()
@@ -423,7 +428,8 @@ fn landing(
             let far_edge = viewport.max.x - width;
             let shown =
                 (resting + slot).clamp(viewport.min.x.min(far_edge), viewport.min.x.max(far_edge));
-            (column.clone(), shown - slot)
+            let offset = (shown - slot).clamp(*edges.start(), *edges.end());
+            (column.clone(), offset)
         })
 }
 

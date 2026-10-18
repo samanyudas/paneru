@@ -97,23 +97,43 @@ fn swipe_settles_a_partly_hidden_column_flush_with_the_viewport_edge() {
     }
 }
 
-/// A flick toward the end of the strip lands where the strip's own scroll
-/// bound stops it, on the last column, which is fully visible and so does not
-/// move again.
+/// A flick past the end of the strip lands on the last column, and the strip
+/// end comes back to the viewport edge. Continuous swipe lets the fingers
+/// pull the last column to the far edge, but no settle leaves empty space
+/// beside an overflowing strip.
 #[test]
-fn swipe_past_the_end_settles_on_the_last_column_where_the_flick_stops() {
-    let mut harness = harness_with_widths(&[400, 400, 400, 400, 400], None);
-    // Above every window, so focus follows mouse never picks a window the
-    // strip slides under the pointer.
-    harness.mock_state.set_cursor_position(IVec2::new(1000, 5));
+fn swipe_past_the_end_settles_with_the_strip_end_on_the_viewport_edge() {
+    for animation_speed in [None, Some(14.0)] {
+        let mut harness = harness_with_widths(&[400, 400, 400, 400, 400], animation_speed);
+        // Above every window, so focus follows mouse never picks a window the
+        // strip slides under the pointer.
+        harness.mock_state.set_cursor_position(IVec2::new(1000, 5));
 
-    assert_focused!(harness.world(), 0);
-    send(&mut harness, swipe(0.3));
+        assert_focused!(harness.world(), 0);
+        send(&mut harness, swipe(0.3));
+        harness.advance(SETTLE);
+
+        assert!(!is_scrolling(harness.world()), "the settle has finished");
+        assert_focused!(harness.world(), 4);
+        assert_eq!(window_x(harness.world(), 4), TEST_DISPLAY_WIDTH - 400);
+    }
+}
+
+/// The mirror case: a flick back past the start lands on the first column
+/// with the strip start on the left viewport edge.
+#[test]
+fn swipe_past_the_start_settles_with_the_strip_start_on_the_viewport_edge() {
+    let mut harness = harness_with_widths(&[400, 400, 400, 400, 400], None);
+    harness.mock_state.set_cursor_position(IVec2::new(1000, 5));
+    harness.run(vec![focus(Direction::Last)]);
+    assert_eq!(window_x(harness.world(), 4), TEST_DISPLAY_WIDTH - 400);
+
+    send(&mut harness, swipe(-0.3));
     harness.advance(SETTLE);
 
     assert!(!is_scrolling(harness.world()), "the settle has finished");
-    assert_focused!(harness.world(), 4);
-    assert_eq!(window_x(harness.world(), 4), 0);
+    assert_focused!(harness.world(), 0);
+    assert_eq!(window_x(harness.world(), 0), 0);
 }
 
 /// Landing on a stack focuses the window in it that had focus last, not the

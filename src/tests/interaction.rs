@@ -541,13 +541,14 @@ fn test_scrolling() {
             assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
             assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
         })
-        // The strip settles where the flick's momentum stops: window 1 is
-        // nearest the center and fully visible there, so it stays. Still one
-        // contiguous run of 400px columns, none parked at an edge sliver.
+        // The flick's momentum stops with window 1 nearest the center, but
+        // 60px short of the strip end. The settle brings the strip end to the
+        // right edge so no empty space shows. Still one contiguous run of
+        // 400px columns, none parked at an edge sliver.
         .on_iteration(5, move |world, _state| {
-            assert_window_at!(world, 0, -236, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 164, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 564, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 0, -176, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 224, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 624, TEST_MENUBAR_HEIGHT);
             assert_focused!(world, 1);
         })
         .run(commands);
