@@ -27,8 +27,9 @@ use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
-    RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
-    SpawnCommandsExt, VerifyWindowPosition, VerifyWindowSize, WidthRatio, WindowProperties,
+    PreLaunchFrame, RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling,
+    SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, VerifyWindowSize, WidthRatio,
+    WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -1258,7 +1259,7 @@ pub(super) fn spawn_window_trigger(
 
         // Insert the window into the internal Bevy state.
         // This insertion triggers window attributes observer.
-        commands.spawn((
+        let mut spawned = commands.spawn((
             position,
             bounds,
             width_ratio,
@@ -1266,6 +1267,9 @@ pub(super) fn spawn_window_trigger(
             layout_position,
             ChildOf(app_entity),
         ));
+        if initializing.is_some() {
+            spawned.insert(PreLaunchFrame(frame));
+        }
 
         commands.trigger(SendMessageTrigger(Event::WindowSpawned {
             window_id,

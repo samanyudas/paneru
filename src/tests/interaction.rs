@@ -3644,17 +3644,33 @@ fn test_stack_commands_move_only_the_focused_window() {
         .run(commands);
 }
 
-/// Stop and Quit must leave a floating window exactly where the user put it,
-/// while a tiled window parked off-screen still comes back onto a display.
-///
-/// Driven directly at the system: sending `AppExit` through the full schedule
-/// also runs the state-saving exit systems, which write the real user state
-/// file.
-#[test]
-fn exit_cleanup_restores_tiled_windows_and_leaves_floating_windows_alone() {
+/// Runs the exit cleanup directly. Sending `AppExit` through the full
+/// schedule also runs the state-saving exit systems, which write the real user
+/// state file.
+fn run_exit_cleanup(world: &mut World) {
     use bevy::app::AppExit;
     use bevy::ecs::system::RunSystemOnce as _;
 
+    world.write_message(AppExit::Success);
+    world
+        .run_system_once(crate::ecs::systems::cleanup_on_exit)
+        .expect("running cleanup_on_exit");
+}
+
+fn exit_frame_of(world: &mut World, id: WinID) -> IRect {
+    world
+        .query::<&Window>()
+        .iter(world)
+        .find(|window| window.id() == id)
+        .expect("window exists")
+        .frame()
+}
+
+/// Stop and Quit must leave a floating window exactly where the user put it,
+/// while a tiled window opened during the session and parked off-screen comes
+/// back only as far as the nearest display edge.
+#[test]
+fn exit_cleanup_brings_a_parked_window_to_the_edge_and_leaves_floating_windows_alone() {
     const FLOAT_PID: i32 = TEST_PROCESS_ID + 1;
     const TILED: WinID = 0;
     const FLOATING: WinID = 1;
@@ -3667,12 +3683,15 @@ fn exit_cleanup_restores_tiled_windows_and_leaves_floating_windows_alone() {
         TestHarness::new()
             .with_config(config)
             .with_app(FLOAT_PID, "float.app", "FloatApp", |_| {});
+    // Startup finishes before these windows open, so neither has a frame from
+    // before management began.
+    harness.advance(Duration::from_secs(1));
     let state = harness.mock_state.clone();
     let tiled = state.spawn_window(
         TEST_PROCESS_ID,
         TEST_WORKSPACE_ID,
         TILED,
-        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, 600),
     );
     let floating = state.spawn_window(
         FLOAT_PID,
@@ -3696,33 +3715,103 @@ fn exit_cleanup_restores_tiled_windows_and_leaves_floating_windows_alone() {
     );
 
     // A scrolled strip parks tiled windows past the display edge.
-    state.os_move_window(TILED, Origin::new(TEST_DISPLAY_WIDTH + 500, 100));
+    state.os_move_window(
+        TILED,
+        Origin::new(TEST_DISPLAY_WIDTH + 500, TEST_MENUBAR_HEIGHT),
+    );
+    let size = exit_frame_of(world, TILED).size();
 
-    world.write_message(AppExit::Success);
-    world
-        .run_system_once(crate::ecs::systems::cleanup_on_exit)
-        .expect("running cleanup_on_exit");
-
-    let frame_of = |world: &mut World, id: WinID| {
-        world
-            .query::<&Window>()
-            .iter(world)
-            .find(|window| window.id() == id)
-            .expect("window exists")
-            .frame()
-    };
+    run_exit_cleanup(world);
 
     assert_eq!(
-        frame_of(world, FLOATING),
+        exit_frame_of(world, FLOATING),
         IRect::new(37, 41, 337, 241),
         "exit cleanup must not move or resize a floating window"
     );
+    assert_eq!(
+        exit_frame_of(world, TILED),
+        IRect::from_corners(
+            Origin::new(TEST_DISPLAY_WIDTH - size.x, TEST_MENUBAR_HEIGHT),
+            Origin::new(TEST_DISPLAY_WIDTH, TEST_MENUBAR_HEIGHT + size.y)
+        ),
+        "a parked window comes back only as far as the display edge"
+    );
+}
 
+/// A window that was open before management began gets back the position and
+/// size it had then, not a centered frame.
+#[test]
+fn exit_cleanup_restores_the_frame_a_window_had_before_management() {
+    let before = [
+        IRect::new(100, 120, 100 + 300, 120 + 400),
+        IRect::new(500, 150, 500 + 350, 150 + 300),
+    ];
+    let mut harness = TestHarness::new()
+        .with_window(0, move |window| window.frame = before[0])
+        .with_window(1, move |window| window.frame = before[1]);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    let world = harness.world();
+    assert_ne!(
+        exit_frame_of(world, 0),
+        before[0],
+        "tiling has moved the window"
+    );
+
+    run_exit_cleanup(world);
+
+    assert_eq!(exit_frame_of(world, 0), before[0]);
+    assert_eq!(exit_frame_of(world, 1), before[1]);
+}
+
+/// A window opened during the session that is fully on screen stays exactly
+/// where the strip left it.
+#[test]
+fn exit_cleanup_leaves_a_visible_window_opened_during_the_session() {
+    let mut harness = TestHarness::new();
+    harness.advance(Duration::from_secs(1));
+    let state = harness.mock_state.clone();
+    let window = state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        0,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, 600),
+    );
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_secs(1));
+    state.os_move_window(0, Origin::new(200, TEST_MENUBAR_HEIGHT));
+
+    let world = harness.world();
+    let left = exit_frame_of(world, 0);
+    run_exit_cleanup(world);
+
+    assert_eq!(exit_frame_of(world, 0), left);
+    assert_eq!(left.min.x, 200);
+}
+
+/// A frame from before management that is no longer on any display, such as
+/// one on a display that was since disconnected, is not restored.
+#[test]
+fn exit_cleanup_skips_a_frame_from_a_disconnected_display() {
+    let mut harness = TestHarness::new().with_window(0, |window| {
+        window.frame = IRect::new(3000, 100, 3000 + 300, 100 + 400);
+    });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let state = harness.mock_state.clone();
+    state.os_move_window(0, Origin::new(-1000, TEST_MENUBAR_HEIGHT));
+
+    let world = harness.world();
+    run_exit_cleanup(world);
+
+    let frame = exit_frame_of(world, 0);
     let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
-    let tiled_frame = frame_of(world, TILED);
+    assert_eq!(
+        frame.min.x, 0,
+        "it comes back to the nearest edge, got {frame:?}"
+    );
     assert!(
-        display.contains(tiled_frame.min) && display.contains(tiled_frame.max),
-        "exit cleanup must bring a tiled window fully onto a display, got {tiled_frame:?}"
+        display.contains(frame.min) && display.contains(frame.max),
+        "it ends fully on the display, got {frame:?}"
     );
 }
 

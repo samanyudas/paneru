@@ -341,6 +341,11 @@ pub struct Bounds(pub Size);
 #[derive(Component, Clone, Debug, Deref, DerefMut)]
 pub struct WidthRatio(pub f64);
 
+/// The frame a window had when the engine started, before any layout moved it.
+/// Exit cleanup returns the window there. Windows that open later have none.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct PreLaunchFrame(pub bevy::math::IRect);
+
 /// Marks a window entity that is currently on a native macOS fullscreen space.
 /// The window has been removed from its tiled position in the strip.
 /// `order` gives the sequence in which windows went fullscreen (0, 1, 2, …)

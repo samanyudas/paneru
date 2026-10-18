@@ -29,8 +29,9 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    LowPowerMode, MissionControlActive, Position, PreLaunchFrame, ReadDisplayProperties,
+    RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio,
+    WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -1166,19 +1167,21 @@ pub(super) fn verify_window_position(
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any
-/// brightness dim, removes the dim/border overlay window, and centers every
-/// tiled window on the display its frame center falls in, so none is left
-/// parked off-screen. Floating, minimized, and hidden windows stay where they
-/// are.
+/// brightness dim, removes the dim/border overlay window, and puts every tiled
+/// window where [`exit_frame`] says, so none is left parked off-screen.
+/// Floating, minimized, and hidden windows stay where they are.
 pub(crate) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    mut all_windows: Query<(&mut Window, Has<Unmanaged>)>,
+    mut all_windows: Query<(&mut Window, Has<Unmanaged>, Option<&PreLaunchFrame>)>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
 ) {
     for _ in exit_events.read() {
-        let ids = all_windows.iter().map(|(w, _)| w.id()).collect::<Vec<_>>();
+        let ids = all_windows
+            .iter()
+            .map(|(w, _, _)| w.id())
+            .collect::<Vec<_>>();
         info!("exit cleanup: restoring {} window(s)", ids.len());
         window_manager.dim_windows(&ids, 0.0);
 
@@ -1187,50 +1190,61 @@ pub(crate) fn cleanup_on_exit(
         }
 
         let display_bounds = displays.iter().map(Display::bounds).collect::<Vec<_>>();
-        if display_bounds.is_empty() {
-            return;
-        }
-
-        for (mut window, unmanaged) in &mut all_windows {
+        for (mut window, unmanaged, pre_launch) in &mut all_windows {
             if unmanaged {
                 continue;
             }
-            let frame = window.frame();
-            let center = frame.center();
-            let bounds = display_bounds
-                .iter()
-                .find(|b| {
-                    center.x >= b.min.x
-                        && center.x <= b.max.x
-                        && center.y >= b.min.y
-                        && center.y <= b.max.y
-                })
-                .copied()
-                .unwrap_or(display_bounds[0]);
-
-            let mut size = frame.size();
-            if size.x > bounds.width() || size.y > bounds.height() {
-                let new_size = bevy::math::IVec2::new(
-                    size.x.min(bounds.width() * 9 / 10),
-                    size.y.min(bounds.height() * 9 / 10),
-                );
-                window.resize(new_size);
-                size = new_size;
-            }
-
-            let origin = bevy::math::IVec2::new(
-                bounds.min.x + (bounds.width() - size.x) / 2,
-                bounds.min.y + (bounds.height() - size.y) / 2,
-            );
+            let current = window.frame();
+            let Some(target) = exit_frame(current, pre_launch.map(|f| f.0), &display_bounds) else {
+                return;
+            };
             info!(
                 "exit cleanup: window {} -> origin {:?}, size {:?}",
                 window.id(),
-                origin,
-                size
+                target.min,
+                target.size()
             );
-            window.reposition(origin);
+            if target.size() != current.size() {
+                window.resize(target.size());
+            }
+            window.reposition(target.min);
         }
     }
+}
+
+/// Where a tiled window goes when the engine exits. A window open before the
+/// engine started returns to that frame while its center is still on a
+/// connected display. Any other window keeps its frame, moved only as far as
+/// needed to sit fully on the display it overlaps most, and shrunk to 90% of
+/// that display if it is larger. `None` when no display is connected.
+pub(crate) fn exit_frame(
+    current: IRect,
+    pre_launch: Option<IRect>,
+    displays: &[IRect],
+) -> Option<IRect> {
+    let on_a_display = |frame: IRect| displays.iter().any(|b| b.contains(frame.center()));
+    if let Some(frame) = pre_launch.filter(|frame| on_a_display(*frame)) {
+        return Some(frame);
+    }
+    let overlap = |b: &IRect| {
+        let shared = current.intersect(*b).size();
+        i64::from(shared.x.max(0)) * i64::from(shared.y.max(0))
+    };
+    let distance = |b: &IRect| (b.center() - current.center()).length_squared();
+    let bounds = *displays.iter().max_by(|a, b| {
+        overlap(a)
+            .cmp(&overlap(b))
+            .then(distance(b).cmp(&distance(a)))
+    })?;
+
+    let mut size = current.size();
+    if size.x > bounds.width() || size.y > bounds.height() {
+        size = size.min(bounds.size() * 9 / 10);
+    }
+    let origin = current
+        .min
+        .clamp(bounds.min, (bounds.max - size).max(bounds.min));
+    Some(IRect::from_corners(origin, origin + size))
 }
 
 pub(crate) fn update_flash_messages(
