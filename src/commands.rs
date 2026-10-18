@@ -748,19 +748,25 @@ fn is_width_change(event: &Event) -> bool {
 }
 
 /// Ends every width run when a command other than a width change arrives, or
-/// when the user scrolls or swipes the strip.
+/// when the user scrolls, swipes, drags, or resizes with the mouse.
 fn end_width_runs(
     mut messages: MessageReader<Event>,
     mut inputs: MessageReader<InputEvent>,
     runs: Query<Entity, With<WidthRun>>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let command = messages
         .read()
         .any(|event| matches!(event, Event::Command { .. }) && !is_width_change(event));
-    let scrolled = inputs
-        .read()
-        .any(|InputEvent(event)| matches!(event, Event::Swipe { .. } | Event::Scroll { .. }));
+    let mouse_resize = config.mouse_resize_modifier();
+    let scrolled = inputs.read().any(|InputEvent(event)| match event {
+        Event::Swipe { .. } | Event::Scroll { .. } | Event::MouseDragged { .. } => true,
+        Event::MouseMoved { modifiers, .. } => {
+            mouse_resize.is_some_and(|modifier| modifier.matches(*modifiers))
+        }
+        _ => false,
+    });
     if !command && !scrolled {
         return;
     }

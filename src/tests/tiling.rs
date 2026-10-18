@@ -1309,3 +1309,41 @@ fn test_a_refused_width_keeps_the_run_center() {
     assert_window_size!(harness.world(), 1, 256, 748);
     assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
 }
+
+/// Moving the pointer with the mouse resize modifier ends the width run, so the
+/// next change anchors where the column now stands.
+#[test]
+fn test_a_mouse_resize_gesture_ends_the_width_run() {
+    let options = MainOptions {
+        auto_center: Some(false),
+        preset_column_widths: vec![0.25, 0.5, 0.75],
+        mouse_resize_modifier: Some(crate::platform::Modifiers::ALT),
+        ..Default::default()
+    };
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Ratio(0.45));
+    let config: Config = (options, vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    harness.advance(Duration::from_secs(1));
+    grow_width(&mut harness, Duration::from_secs(1));
+    assert_window_at!(harness.world(), 1, 256, TEST_MENUBAR_HEIGHT);
+    for x in [5.0, 6.0] {
+        harness
+            .app
+            .world_mut()
+            .write_message(crate::events::InputEvent(Event::MouseMoved {
+                point: objc2_core_foundation::CGPoint::new(x, 5.0),
+                modifiers: crate::platform::Modifiers::LALT,
+            }));
+        harness.advance(Duration::from_millis(20));
+    }
+    grow_width(&mut harness, Duration::from_secs(1));
+    assert_window_size!(harness.world(), 1, 256, 748);
+    assert_window_at!(harness.world(), 1, 768, TEST_MENUBAR_HEIGHT);
+}
