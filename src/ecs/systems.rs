@@ -1252,6 +1252,8 @@ fn settle_exit_frames(
             };
             match window.update_frame() {
                 Ok(actual) if actual == *target => false,
+                // The read itself can outlast the deadline.
+                Ok(_) if Instant::now() > deadline => true,
                 Ok(_) => {
                     place(&mut window, *target);
                     true

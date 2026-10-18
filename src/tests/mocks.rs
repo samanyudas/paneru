@@ -39,6 +39,8 @@ pub(crate) struct MockWindowData {
     /// Size writes the app drops before it applies one, like an app that
     /// applies a size only after the call returns.
     pub(crate) dropped_resizes: u8,
+    /// How long a frame read takes, like an app slow to answer.
+    pub(crate) frame_read_delay: std::time::Duration,
     pub(crate) resize_writes: usize,
     pub(crate) position_writes: usize,
     pub(crate) frame_read_failures: u8,
@@ -71,6 +73,7 @@ impl Default for MockWindowData {
             maximum_size: None,
             resize_bottom_limit: None,
             dropped_resizes: 0,
+            frame_read_delay: std::time::Duration::ZERO,
             resize_writes: 0,
             position_writes: 0,
             frame_read_failures: 0,
@@ -638,6 +641,7 @@ impl MockState {
                 window.frame_read_failures -= 1;
                 return Err(Error::InvalidWindow);
             }
+            std::thread::sleep(window.frame_read_delay);
             Ok(window.frame)
         });
 

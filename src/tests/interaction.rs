@@ -3947,6 +3947,32 @@ fn exit_cleanup_does_not_retry_an_unreadable_window() {
     assert_eq!(u8::MAX - failures_left, 1, "read once, never again");
 }
 
+/// A frame read that finishes after the recheck deadline starts no new
+/// placement, so a slow app holds up Stop or Quit by one call at most.
+#[test]
+fn exit_cleanup_places_nothing_after_the_recheck_deadline() {
+    let mut harness = TestHarness::new().with_window(0, |window| {
+        window.frame = IRect::new(100, 50, 400, 650);
+    });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let state = harness.mock_state.clone();
+    let mut writes_before = 0;
+    state.update_window(0, |window| {
+        // Every size is dropped, so the window never lands, and the first
+        // recheck read ends past the one-second deadline.
+        window.dropped_resizes = u8::MAX;
+        window.frame_read_delay = Duration::from_millis(1100);
+        writes_before = window.position_writes;
+    });
+
+    let world = harness.world();
+    run_exit_cleanup(world);
+
+    let mut writes_after = 0;
+    state.update_window(0, |window| writes_after = window.position_writes);
+    assert_eq!(writes_after - writes_before, 1, "only the first placement");
+}
+
 /// A window that was open at launch but that a slow scan finds only after
 /// startup still gets its frame back. A window that opens during startup is
 /// not one of them.
