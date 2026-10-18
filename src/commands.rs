@@ -715,6 +715,62 @@ fn command_center_window(
     }
 }
 
+/// Where a run of width changes keeps a column: flush against a display edge it
+/// started on, or around the center it started at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WidthAnchor {
+    Left,
+    Right,
+    Center(i32),
+}
+
+/// The anchor of the current run of width changes, with the frame the last
+/// change asked for. Anything else that moves the column ends the run, so the
+/// next change picks a fresh anchor (miri#39).
+#[derive(bevy::ecs::component::Component)]
+struct WidthRun {
+    anchor: WidthAnchor,
+    frame: IRect,
+}
+
+/// The anchor for a width change: the current run's anchor while the column is
+/// still where the run left it, otherwise a fresh one from where it stands.
+fn width_anchor(
+    run: Option<&WidthRun>,
+    current: IRect,
+    frame: IRect,
+    first_at_left: bool,
+    last_at_right: bool,
+    auto_center: bool,
+) -> WidthAnchor {
+    if let Some(run) = run.filter(|run| run.frame == current) {
+        return run.anchor;
+    }
+    if !auto_center && first_at_left {
+        WidthAnchor::Left
+    } else if !auto_center && last_at_right {
+        WidthAnchor::Right
+    } else {
+        WidthAnchor::Center(frame.center().x)
+    }
+}
+
+/// Where a column of `size` goes for `anchor`, kept inside `viewport`.
+fn anchored_origin(anchor: WidthAnchor, frame: IRect, size: Size, viewport: IRect) -> Origin {
+    let center = match anchor {
+        WidthAnchor::Center(x) => Origin::new(x, frame.center().y),
+        WidthAnchor::Left | WidthAnchor::Right => frame.center(),
+    };
+    let mut origin =
+        clamp_origin_to_viewport(IRect::from_center_size(center, size).min, size, viewport);
+    match anchor {
+        WidthAnchor::Left => origin.x = viewport.min.x,
+        WidthAnchor::Right => origin.x = viewport.max.x - size.x,
+        WidthAnchor::Center(_) => {}
+    }
+    origin
+}
+
 /// Resizes the focused window to the next or previous preset column width, or
 /// by one `window_resize_step` of the display width.
 ///
@@ -728,6 +784,7 @@ fn command_center_window(
 fn resize_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
+    runs: Query<&WidthRun>,
     active_display: ActiveDisplay,
     config: Res<Config>,
     mut commands: Commands,
@@ -800,24 +857,26 @@ fn resize_window(
     let new_width = round_px(next_ratio * f64::from(viewport.width()));
     let size = Size::new(new_width, frame.height());
 
-    let mut origin = clamp_origin_to_viewport(
-        IRect::from_center_size(frame.center(), size).min,
-        size,
-        viewport,
-    );
     let strip = active_display.active_strip();
-    if !config.auto_center() {
-        if strip.index_of(entity).ok() == Some(0) && frame.min.x == viewport.min.x {
-            origin.x = viewport.min.x;
-        } else if strip
+    let anchor = width_anchor(
+        runs.get(entity).ok(),
+        windows.moving_frame(entity).unwrap_or(frame),
+        frame,
+        strip.index_of(entity).ok() == Some(0) && frame.min.x == viewport.min.x,
+        strip
             .last()
             .is_ok_and(|column| column.window_iter().any(|window| window == entity))
-            && frame.max.x == viewport.max.x
-        {
-            origin.x = viewport.max.x - new_width;
-        }
-    }
+            && frame.max.x == viewport.max.x,
+        config.auto_center(),
+    );
+    let origin = anchored_origin(anchor, frame, size, viewport);
     commands.reposition_entity(entity, origin);
+    if let Ok(mut cmds) = commands.get_entity(entity) {
+        cmds.try_insert(WidthRun {
+            anchor,
+            frame: IRect::from_corners(origin, origin + size),
+        });
+    }
 
     // Resize all windows in the column so stacked siblings share the new width.
     if let Some(Column::Stack(stack)) = strip
