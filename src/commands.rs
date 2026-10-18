@@ -1,7 +1,9 @@
 use bevy::app::PreUpdate;
 use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::Add;
 use bevy::ecs::message::MessageReader;
+use bevy::ecs::observer::On;
 use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::system::{Commands, Query, Res, Single, SystemParam};
 use bevy::math::IRect;
@@ -23,7 +25,7 @@ use crate::ecs::{
     ManualStripOffset, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
     SpawnCommandsExt, Timeout, Unmanaged,
 };
-use crate::events::Event;
+use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::platform::WorkspaceId;
 use crate::util::round_px;
@@ -110,8 +112,10 @@ pub fn register_commands(app: &mut bevy::app::App) {
             copy_window_rule,
             toggle_tabbed_display_handler,
             focus_display,
+            end_width_runs,
         ),
     );
+    app.add_observer(end_width_runs_on_focus);
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -724,26 +728,72 @@ enum WidthAnchor {
     Center(i32),
 }
 
-/// The anchor of the current run of width changes, with the frame the last
-/// change asked for. Anything else that moves the column ends the run, so the
-/// next change picks a fresh anchor (miri#39).
+/// The anchor of the current run of width changes on a column. A focus change,
+/// any other command, or a swipe or scroll ends the run, so the next change
+/// picks a fresh anchor. App size corrections and animation do not (miri#39).
 #[derive(bevy::ecs::component::Component)]
 struct WidthRun {
     anchor: WidthAnchor,
-    frame: IRect,
 }
 
-/// The anchor for a width change: the current run's anchor while the column is
-/// still where the run left it, otherwise a fresh one from where it stands.
+fn is_width_change(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Command {
+            command: Command::Window(
+                Operation::Resize(_) | Operation::ResizeStep(_) | Operation::SetWidth(_)
+            )
+        }
+    )
+}
+
+/// Ends every width run when a command other than a width change arrives, or
+/// when the user scrolls or swipes the strip.
+fn end_width_runs(
+    mut messages: MessageReader<Event>,
+    mut inputs: MessageReader<InputEvent>,
+    runs: Query<Entity, With<WidthRun>>,
+    mut commands: Commands,
+) {
+    let command = messages
+        .read()
+        .any(|event| matches!(event, Event::Command { .. }) && !is_width_change(event));
+    let scrolled = inputs
+        .read()
+        .any(|InputEvent(event)| matches!(event, Event::Swipe { .. } | Event::Scroll { .. }));
+    if !command && !scrolled {
+        return;
+    }
+    for entity in runs {
+        if let Ok(mut cmds) = commands.get_entity(entity) {
+            cmds.try_remove::<WidthRun>();
+        }
+    }
+}
+
+/// Ends every width run when focus moves to a window.
+fn end_width_runs_on_focus(
+    _trigger: On<Add, FocusedMarker>,
+    runs: Query<Entity, With<WidthRun>>,
+    mut commands: Commands,
+) {
+    for entity in runs {
+        if let Ok(mut cmds) = commands.get_entity(entity) {
+            cmds.try_remove::<WidthRun>();
+        }
+    }
+}
+
+/// The anchor for a width change: the current run's anchor, otherwise a fresh
+/// one from where the column stands.
 fn width_anchor(
     run: Option<&WidthRun>,
-    current: IRect,
     frame: IRect,
     first_at_left: bool,
     last_at_right: bool,
     auto_center: bool,
 ) -> WidthAnchor {
-    if let Some(run) = run.filter(|run| run.frame == current) {
+    if let Some(run) = run {
         return run.anchor;
     }
     if !auto_center && first_at_left {
@@ -812,7 +862,9 @@ fn resize_window(
     }
 
     let viewport = active_display.actual_bounds(&config);
-    let current_ratio = f64::from(frame.width()) / f64::from(viewport.width());
+    // Pending resizes count, so a quick second press moves on to the next preset.
+    let pending = windows.moving_frame(entity).unwrap_or(frame);
+    let current_ratio = f64::from(pending.width()) / f64::from(viewport.width());
     let widths = config.preset_column_widths();
     let fallback = *widths.first().unwrap_or(&0.5);
     let cycle = config.window_resize_cycle();
@@ -842,14 +894,7 @@ fn resize_window(
                 }
             }),
         Operation::ResizeStep(direction) => {
-            // Pending resizes count, so a held key keeps stepping.
-            let width = windows.moving_frame(entity).unwrap_or(frame).width();
-            step_ratio(
-                f64::from(width) / f64::from(viewport.width()),
-                *direction,
-                config.window_resize_step(),
-                1.0,
-            )
+            step_ratio(current_ratio, *direction, config.window_resize_step(), 1.0)
         }
         _ => return,
     };
@@ -860,7 +905,6 @@ fn resize_window(
     let strip = active_display.active_strip();
     let anchor = width_anchor(
         runs.get(entity).ok(),
-        windows.moving_frame(entity).unwrap_or(frame),
         frame,
         strip.index_of(entity).ok() == Some(0) && frame.min.x == viewport.min.x,
         strip
@@ -872,10 +916,7 @@ fn resize_window(
     let origin = anchored_origin(anchor, frame, size, viewport);
     commands.reposition_entity(entity, origin);
     if let Ok(mut cmds) = commands.get_entity(entity) {
-        cmds.try_insert(WidthRun {
-            anchor,
-            frame: IRect::from_corners(origin, origin + size),
-        });
+        cmds.try_insert(WidthRun { anchor });
     }
 
     // Resize all windows in the column so stacked siblings share the new width.
