@@ -1,0 +1,38 @@
+name: CodeRabbit review
+
+# CodeRabbit skips automatic reviews on repositories with fewer than 10 stars.
+# This workflow asks for a review on every pull request instead, so nobody has to type the command.
+# CodeRabbit ignores the command from github-actions[bot], so the request is posted with
+# CODERABBIT_TRIGGER_TOKEN, a fine-grained token of a maintainer with "Pull requests: Read and write".
+# Without that secret the job only prints a warning.
+# Fork pull requests get a read-only token, so they are skipped and need a manual "@coderabbitai review".
+# No job checks out or executes pull request code.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions: {}
+
+concurrency:
+  group: coderabbit-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  request:
+    name: Ask CodeRabbit to review
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Comment the review command
+        env:
+          GH_TOKEN: ${{ secrets.CODERABBIT_TRIGGER_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::warning::CODERABBIT_TRIGGER_TOKEN is not set, so CodeRabbit was not asked to review."
+            exit 0
+          fi
+          gh pr comment "$PR" --body "@coderabbitai review"
