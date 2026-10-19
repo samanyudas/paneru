@@ -1347,3 +1347,46 @@ fn test_a_mouse_resize_gesture_ends_the_width_run() {
     assert_window_size!(harness.world(), 1, 256, 748);
     assert_window_at!(harness.world(), 1, 768, TEST_MENUBAR_HEIGHT);
 }
+
+#[test]
+fn test_refused_width_settles_left_right_and_center() {
+    for (initial_width, focus, grow, accepted, expected_x) in [
+        (0.5, Direction::First, true, 600, 0),
+        (0.5, Direction::First, false, 400, 0),
+        (0.5, Direction::Last, true, 600, 424),
+        (0.5, Direction::Last, false, 400, 624),
+        (0.45, Direction::Last, true, 750, 274),
+        (0.45, Direction::Last, false, 400, 491),
+    ] {
+        let options = MainOptions {
+            auto_center: Some(false),
+            ..Default::default()
+        };
+        let mut params = WindowParams::new(".*", None);
+        params.width = Some(InitialWindowWidth::Ratio(initial_width));
+        let config: Config = (options, vec![params]).into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(2);
+        harness.run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Window(Operation::Focus(focus.clone())),
+            },
+        ]);
+        harness.advance(Duration::from_secs(1));
+        let id = i32::from(focus != Direction::First);
+        harness.mock_state.update_window(id, |window| {
+            if grow {
+                window.maximum_size = Some(crate::manager::Size::new(accepted, 748));
+            } else {
+                window.minimum_size = Some(crate::manager::Size::new(accepted, 0));
+            }
+        });
+        harness.app.world_mut().write_message(Event::Command {
+            command: Command::Window(Operation::SetWidth(if grow { 0.75 } else { 0.25 })),
+        });
+        harness.advance(Duration::from_secs(3));
+        assert_window_size!(harness.world(), id, accepted, 748);
+        assert_window_at!(harness.world(), id, expected_x, TEST_MENUBAR_HEIGHT);
+    }
+}
+
