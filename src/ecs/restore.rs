@@ -580,6 +580,9 @@ fn layout_strip_from_plan(planned: &PlannedStrip) -> LayoutStrip {
 
     let mut strip = LayoutStrip::new(planned.workspace_id, planned.virtual_index);
     apply_planned_columns(&mut strip, &planned.columns);
+    // Rebuilding saved columns is not a stack membership change, so the
+    // windows keep the heights they have.
+    strip.take_even_splits();
     strip
 }
 

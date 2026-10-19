@@ -1254,7 +1254,7 @@ fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Optio
 /// and takes the extra evenly from the other windows, none going below its own
 /// minimum or `MIN_WINDOW_HEIGHT`. If the minimums alone exceed the column,
 /// the column overflows rather than overlap.
-fn hold_minimum_heights(heights: &mut [i32], minimums: &[i32], total: i32) {
+pub(crate) fn hold_minimum_heights(heights: &mut [i32], minimums: &[i32], total: i32) {
     for (height, minimum) in heights.iter_mut().zip(minimums) {
         *height = (*height).max(*minimum);
     }

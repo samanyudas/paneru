@@ -217,13 +217,8 @@ fn minimizing_a_stacked_window_splits_the_rest_evenly() {
     assert_even(&heights(&frames), COLUMN);
 }
 
-/// With animation on, a stack holding a window with a known minimum
-/// settles: the split already leaves that window its minimum, so no resize
-/// keeps fighting the layout.
-#[test]
-fn an_animated_split_with_a_minimum_height_settles() {
+fn animated_tall_harness() -> TestHarness {
     use crate::config::{Config, MainOptions};
-    use crate::ecs::{ResizeMarker, VerifyWindowSize};
 
     let config: Config = (
         MainOptions {
@@ -237,14 +232,11 @@ fn an_animated_split_with_a_minimum_height_settles() {
     harness
         .mock_state
         .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, TALL));
-    let mut harness = harness.with_windows(3);
-    harness.mock_state.update_window(0, |window| {
-        window.minimum_size = Some(Size::new(0, 700));
-    });
-    stack_three(&mut harness);
-    harness.advance(SETTLE);
+    harness.with_windows(3)
+}
 
-    let world = harness.world();
+fn assert_settled(world: &mut World) {
+    use crate::ecs::{ResizeMarker, VerifyWindowSize};
     assert!(
         world
             .query_filtered::<(), Or<(With<ResizeMarker>, With<VerifyWindowSize>)>>()
@@ -253,6 +245,51 @@ fn an_animated_split_with_a_minimum_height_settles() {
             .is_none(),
         "every resize has finished"
     );
+}
+
+/// Shrinking or equalizing never asks a window for less than its known
+/// minimum, so the animation ends instead of fighting the layout.
+#[test]
+fn shrinking_and_equalizing_below_a_minimum_settle() {
+    for operation in [
+        Operation::ResizeVerticalStep(crate::commands::ResizeDirection::Shrink),
+        Operation::Equalize,
+    ] {
+        let mut harness = animated_tall_harness();
+        harness.mock_state.update_window(0, |window| {
+            window.minimum_size = Some(Size::new(0, 700));
+        });
+        stack_three(&mut harness);
+        harness.advance(SETTLE);
+        harness.run(vec![
+            command(Operation::Focus(Direction::North)),
+            command(Operation::Focus(Direction::North)),
+            command(operation),
+        ]);
+        harness.advance(SETTLE);
+
+        let world = harness.world();
+        assert_settled(world);
+        let frames = column(world, &[0, 1, 2]);
+        assert!(frames[0].height() >= 700, "{frames:?}");
+        assert_eq!(heights(&frames).iter().sum::<i32>(), COLUMN, "{frames:?}");
+    }
+}
+
+/// With animation on, a stack holding a window with a known minimum
+/// settles: the split already leaves that window its minimum, so no resize
+/// keeps fighting the layout.
+#[test]
+fn an_animated_split_with_a_minimum_height_settles() {
+    let mut harness = animated_tall_harness();
+    harness.mock_state.update_window(0, |window| {
+        window.minimum_size = Some(Size::new(0, 700));
+    });
+    stack_three(&mut harness);
+    harness.advance(SETTLE);
+
+    let world = harness.world();
+    assert_settled(world);
     let frames = column(world, &[0, 1, 2]);
     assert_eq!(frames[0].height(), 700, "{frames:?}");
     assert_even(&heights(&frames[1..]), COLUMN - 700);
