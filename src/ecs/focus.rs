@@ -908,6 +908,129 @@ mod tests {
         assert!(in_strip(&mut world, target));
     }
 
+    /// Runs the detector and the timer system in their production order, one
+    /// frame after `ms` milliseconds.
+    fn run_frame(world: &mut World, schedule: &mut bevy::ecs::schedule::Schedule, ms: u64) {
+        world
+            .resource_mut::<bevy::time::Time>()
+            .advance_by(Duration::from_millis(ms));
+        schedule.run(world);
+    }
+
+    fn verify_schedule(world: &mut World) -> bevy::ecs::schedule::Schedule {
+        world.insert_resource(bevy::time::Time::<()>::default());
+        world.add_observer(|_: On<FocusWindow>| {});
+        let mut schedule = bevy::ecs::schedule::Schedule::default();
+        schedule.add_systems(
+            (
+                detect_focus_rejection,
+                super::super::systems::timeout_ticker,
+            )
+                .chain(),
+        );
+        schedule
+    }
+
+    fn arm_fresh_verify(world: &mut World, target: Entity) {
+        world.entity_mut(target).insert((
+            VerifyFocus::default(),
+            Timeout::for_component::<VerifyFocus>(VERIFY_FOCUS_TIMEOUT),
+        ));
+    }
+
+    /// With the real timer system, the repeated request keeps the verification
+    /// alive through the retry frame, and a late answer ends it cleanly.
+    #[test]
+    fn a_late_answer_ends_the_verification_with_the_timer_system() {
+        let mut world = World::new();
+        let focused = Arc::new(AtomicI32::new(2));
+        let app = spawn_app_with_focus(&mut world, focused.clone());
+        let (target, _) = two_columns_verifying(&mut world, app);
+        arm_fresh_verify(&mut world, target);
+        let mut schedule = verify_schedule(&mut world);
+
+        run_frame(&mut world, &mut schedule, 350);
+        run_frame(&mut world, &mut schedule, 16);
+        assert!(
+            world
+                .get::<VerifyFocus>(target)
+                .is_some_and(|v| v.asked_again),
+            "the retry frame must not expire the verification"
+        );
+
+        focused.store(1, Ordering::SeqCst);
+        run_frame(&mut world, &mut schedule, 1100);
+        run_frame(&mut world, &mut schedule, 16);
+
+        assert!(
+            world.get_entity(target).is_ok(),
+            "the window entity survives"
+        );
+        assert!(world.get::<VerifyFocus>(target).is_none());
+        assert!(world.get::<Timeout>(target).is_none());
+        assert!(world.get::<Unmanaged>(target).is_none());
+        assert!(in_strip(&mut world, target));
+    }
+
+    /// With the real timer system, an app that keeps refusing gets the window
+    /// floated after the second wait, and the verification is cleared.
+    #[test]
+    fn a_repeated_refusal_floats_the_window_with_the_timer_system() {
+        let mut world = World::new();
+        let app = spawn_app(&mut world, true, 2);
+        let (target, _) = two_columns_verifying(&mut world, app);
+        arm_fresh_verify(&mut world, target);
+        let mut schedule = verify_schedule(&mut world);
+
+        run_frame(&mut world, &mut schedule, 350);
+        run_frame(&mut world, &mut schedule, 16);
+        run_frame(&mut world, &mut schedule, 500);
+        assert!(
+            world.get::<Unmanaged>(target).is_none(),
+            "the second wait has not ended yet"
+        );
+        run_frame(&mut world, &mut schedule, 600);
+        run_frame(&mut world, &mut schedule, 16);
+
+        assert!(matches!(
+            world.get::<Unmanaged>(target),
+            Some(Unmanaged::Floating)
+        ));
+        assert!(!in_strip(&mut world, target));
+        assert!(world.get::<VerifyFocus>(target).is_none());
+        assert!(world.get::<Timeout>(target).is_none());
+    }
+
+    /// A new focus request on the same window replaces the old verification,
+    /// so the retry flag from an earlier request does not carry over.
+    #[test]
+    fn a_new_request_starts_a_fresh_verification() {
+        let mut world = World::new();
+        let app = spawn_app(&mut world, true, 2);
+        let (target, _) = two_columns_verifying(&mut world, app);
+        let system_id = world.register_system(detect_focus_rejection);
+        _ = world.run_system(system_id);
+        assert!(
+            world
+                .get::<VerifyFocus>(target)
+                .is_some_and(|v| v.asked_again)
+        );
+
+        let rearm = world.register_system(move |mut commands: Commands| {
+            crate::commands::focus_with_verification(target, None, &mut commands);
+        });
+        world.add_observer(|_: On<FocusWindow>| {});
+        _ = world.run_system(rearm);
+
+        assert!(
+            world
+                .get::<VerifyFocus>(target)
+                .is_some_and(|v| !v.asked_again)
+        );
+        let timeout = world.get::<Timeout>(target).expect("verifying");
+        assert_eq!(timeout.timer.remaining(), VERIFY_FOCUS_TIMEOUT);
+    }
+
     #[test]
     fn focus_rejection_floats_target_and_clears_verify_focus() {
         let mut world = World::new();
