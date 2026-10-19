@@ -390,6 +390,11 @@ pub struct LaunchWindows(pub std::collections::HashSet<WinID>);
 #[derive(Component, Clone, Copy, Debug)]
 pub struct MinimumHeight(pub i32);
 
+/// A request to give every window in this window's stack an equal share of
+/// the column, made when the stack's members change.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct SplitStackEvenly;
+
 /// Marks a window entity that is currently on a native macOS fullscreen space.
 /// The window has been removed from its tiled position in the strip.
 /// `order` gives the sequence in which windows went fullscreen (0, 1, 2, …)

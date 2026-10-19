@@ -22,8 +22,8 @@ use crate::ecs::layout::{
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, FullWidthMarker,
-    ManualStripOffset, MinimumHeight, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
-    SpawnCommandsExt, Timeout, Unmanaged,
+    ManualStripOffset, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
+    SpawnCommandsExt, SplitStackEvenly, Timeout, Unmanaged,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -113,6 +113,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             toggle_tabbed_display_handler,
             focus_display,
             end_width_runs,
+            split_requested_stacks,
         ),
     );
     app.add_observer(end_width_runs_on_focus);
@@ -1625,7 +1626,6 @@ pub fn stack_windows_handler(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
-    config: Res<Config>,
     mut commands: Commands,
 ) {
     let Some(operation) = filter_window_operations(&mut messages, |op| {
@@ -1646,7 +1646,6 @@ pub fn stack_windows_handler(
         {
             entity_commands.try_remove::<FullWidthMarker>();
         }
-        let column_height = active_display.actual_bounds(&config).height();
         let strip = active_display.active_strip();
         let mate = strip.column_mate(entity);
         let members_before = strip.column_members(entity);
@@ -1661,7 +1660,9 @@ pub fn stack_windows_handler(
         // stacking with no neighbour, keeps the heights the user set.
         if strip.column_members(entity) != members_before {
             for member in std::iter::once(entity).chain(mate) {
-                split_stack_evenly(strip, member, column_height, &windows, &mut commands);
+                if let Ok(mut entity_commands) = commands.get_entity(member) {
+                    entity_commands.try_insert(SplitStackEvenly);
+                }
             }
         }
 
@@ -1671,6 +1672,32 @@ pub fn stack_windows_handler(
         // edge-clamp in reshuffle_layout_strip keeps the strip pinned so the
         // leftmost window touches the left edge and the rightmost the right.
         commands.reshuffle_around(entity);
+    }
+}
+
+/// Carries out [`SplitStackEvenly`] requests, each against the height of the
+/// display its strip is on.
+fn split_requested_stacks(
+    requests: Query<Entity, With<SplitStackEvenly>>,
+    strips: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
+    windows: Windows,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    for member in &requests {
+        if let Ok(mut entity_commands) = commands.get_entity(member) {
+            entity_commands.try_remove::<SplitStackEvenly>();
+        }
+        let Some((strip, child_of)) = strips.iter().find(|(strip, _)| strip.contains(member))
+        else {
+            continue;
+        };
+        let Ok((display, dock)) = displays.get(child_of.parent()) else {
+            continue;
+        };
+        let column_height = display.actual_display_bounds(dock, &config).height();
+        split_stack_evenly(strip, member, column_height, &windows, &mut commands);
     }
 }
 
@@ -1711,11 +1738,6 @@ fn split_stack_evenly(
         for entity in item.window_iter() {
             if let Some(size) = windows.size(entity) {
                 commands.resize_entity(entity, size.with_y(height));
-            }
-            // An even split is where minimums are checked again: the app
-            // may accept less now, and refusing again records it again.
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<MinimumHeight>();
             }
         }
     }

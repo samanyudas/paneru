@@ -29,8 +29,8 @@ use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LaunchWindows, LayoutPosition,
     MinimumHeight, Position, PreLaunchFrame, RepositionMarker, ResizeMarker, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, VerifyWindowSize,
-    WidthRatio, WindowProperties,
+    Scrolling, SendMessageTrigger, SpawnCommandsExt, SplitStackEvenly, VerifyWindowPosition,
+    VerifyWindowSize, WidthRatio, WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -1547,6 +1547,7 @@ pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
     mut workspaces: Query<&mut LayoutStrip>,
     mut focus_history: ResMut<FocusHistory>,
+    mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
     focus_history.forget(entity);
@@ -1556,7 +1557,15 @@ pub(super) fn window_removal_trigger(
             "Removing despawned entity {entity} from strip {}",
             strip.id()
         );
+        // A closed stack member leaves the others an equal share, as leaving
+        // by Unstack does.
+        let mate = strip.column_mate(entity);
         strip.remove(entity);
+        if let Some(mate) = mate
+            && let Ok(mut entity_commands) = commands.get_entity(mate)
+        {
+            entity_commands.try_insert(SplitStackEvenly);
+        }
     }
 }
 

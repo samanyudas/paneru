@@ -142,10 +142,10 @@ fn a_last_window_with_a_minimum_height_stays_on_screen() {
     assert_even(&heights(&frames[..2]), COLUMN - 500);
 }
 
-/// A minimum height is checked again at the next even split, so an app that
-/// now accepts less gets its share again.
+/// A learned minimum is dropped once the window is seen smaller than it, so
+/// an app that now accepts less gets an even share at the next split.
 #[test]
-fn a_minimum_height_is_checked_again_when_the_stack_changes() {
+fn a_minimum_height_is_dropped_when_the_window_is_seen_smaller() {
     let mut harness = tall_harness();
     harness.mock_state.update_window(1, |window| {
         window.minimum_size = Some(Size::new(0, 500));
@@ -156,12 +156,28 @@ fn a_minimum_height_is_checked_again_when_the_stack_changes() {
     harness
         .mock_state
         .update_window(1, |window| window.minimum_size = None);
+    harness
+        .mock_state
+        .os_resize_window(1, Size::new(TEST_WINDOW_WIDTH, 300));
+    harness.advance(SETTLE);
     harness.run(vec![command(Operation::Unstack(Side::East))]);
     harness.advance(SETTLE);
     harness.run(vec![command(Operation::Stack(Side::West))]);
     harness.advance(SETTLE);
 
     let frames = column(harness.world(), &[0, 1, 2]);
+    assert_even(&heights(&frames), COLUMN);
+}
+
+/// Closing a stacked window leaves the others an equal share.
+#[test]
+fn closing_a_stacked_window_splits_the_rest_evenly() {
+    let mut harness = tall_harness();
+    stack_three(&mut harness);
+    harness.mock_state.os_close_window(2);
+    harness.advance(SETTLE);
+
+    let frames = column(harness.world(), &[0, 1]);
     assert_even(&heights(&frames), COLUMN);
 }
 
