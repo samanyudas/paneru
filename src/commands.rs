@@ -312,7 +312,7 @@ pub(crate) fn focus_with_verification(
         && let Ok(mut entity_commands) = commands.get_entity(entity)
     {
         entity_commands.try_insert((
-            crate::ecs::VerifyFocus,
+            crate::ecs::VerifyFocus::default(),
             Timeout::for_component::<crate::ecs::VerifyFocus>(
                 crate::ecs::focus::VERIFY_FOCUS_TIMEOUT,
             ),
