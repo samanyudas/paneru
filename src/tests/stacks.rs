@@ -203,3 +203,57 @@ fn a_stack_command_that_changes_nothing_keeps_set_heights() {
 
     assert_eq!(heights(&column(harness.world(), &[0, 1, 2])), before);
 }
+
+/// Minimizing a stacked window leaves the others an equal share, like
+/// closing it.
+#[test]
+fn minimizing_a_stacked_window_splits_the_rest_evenly() {
+    let mut harness = tall_harness();
+    stack_three(&mut harness);
+    harness.mock_state.os_minimize_window(2, true);
+    harness.advance(SETTLE);
+
+    let frames = column(harness.world(), &[0, 1]);
+    assert_even(&heights(&frames), COLUMN);
+}
+
+/// With animation on, a stack holding a window with a known minimum
+/// settles: the split already leaves that window its minimum, so no resize
+/// keeps fighting the layout.
+#[test]
+fn an_animated_split_with_a_minimum_height_settles() {
+    use crate::config::{Config, MainOptions};
+    use crate::ecs::{ResizeMarker, VerifyWindowSize};
+
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(14.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let harness = TestHarness::new().with_config(config);
+    harness
+        .mock_state
+        .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, TALL));
+    let mut harness = harness.with_windows(3);
+    harness.mock_state.update_window(0, |window| {
+        window.minimum_size = Some(Size::new(0, 700));
+    });
+    stack_three(&mut harness);
+    harness.advance(SETTLE);
+
+    let world = harness.world();
+    assert!(
+        world
+            .query_filtered::<(), Or<(With<ResizeMarker>, With<VerifyWindowSize>)>>()
+            .iter(world)
+            .next()
+            .is_none(),
+        "every resize has finished"
+    );
+    let frames = column(world, &[0, 1, 2]);
+    assert_eq!(frames[0].height(), 700, "{frames:?}");
+    assert_even(&heights(&frames[1..]), COLUMN - 700);
+}

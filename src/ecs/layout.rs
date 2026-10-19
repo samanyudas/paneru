@@ -18,7 +18,7 @@ use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
     ManualStripOffset, MinimumHeight, PlaceAfterArrival, Position, RefitAfterRemoval,
-    RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
+    RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt, VerifyWindowSize,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -443,6 +443,9 @@ pub struct LayoutStrip {
     /// `tabbed`/`tab_group` below) and of `LayoutStrip::tabbed()`, which callers like
     /// `apply_window_positions`/`give_away_focus` already key off for that unrelated feature.
     tabbed_stacks: EntityHashSet,
+    /// Windows whose column splits its height evenly at the next layout,
+    /// because a stack item joined or left that column.
+    even_splits: EntityHashSet,
 }
 
 impl LayoutStrip {
@@ -452,6 +455,7 @@ impl LayoutStrip {
             virtual_index,
             columns: VecDeque::new(),
             tabbed_stacks: EntityHashSet::default(),
+            even_splits: EntityHashSet::default(),
         }
     }
 
@@ -463,6 +467,7 @@ impl LayoutStrip {
             virtual_index: 0,
             columns,
             tabbed_stacks: EntityHashSet::default(),
+            even_splits: EntityHashSet::default(),
         }
     }
 
@@ -626,6 +631,7 @@ impl LayoutStrip {
                 }
                 Column::Stack(mut stack) => {
                     self.tabbed_stacks.remove(&entity);
+                    let items_before = stack.len();
                     for item in &mut stack {
                         match item {
                             StackItem::Single(_) => {}
@@ -638,6 +644,12 @@ impl LayoutStrip {
                         StackItem::Single(id) => *id != entity,
                         StackItem::Tabs(tabs) => !tabs.is_empty(),
                     });
+                    // Only a whole item leaving changes the split: a closed
+                    // native tab leaves its item, and the heights, in place.
+                    if stack.len() < items_before {
+                        self.even_splits
+                            .extend(stack.first().and_then(StackItem::top));
+                    }
                     if let Some(rest) = self.collapse_stack(stack) {
                         self.columns.insert(index, rest);
                     }
@@ -758,9 +770,15 @@ impl LayoutStrip {
         let Some(mut joined) = self.columns.get(target).and_then(Column::stack_items) else {
             return Ok(());
         };
+        let mate = self.column_mate(entity);
         let Some((item, source_kept)) = self.detach_item(source, entity) else {
             return Ok(());
         };
+        // The column the item joined, and the one it left, split evenly.
+        self.even_splits.insert(entity);
+        if source_kept {
+            self.even_splits.extend(mate);
+        }
         let target = if source_kept || target < source {
             target
         } else {
@@ -794,9 +812,13 @@ impl LayoutStrip {
         if !matches!(self.columns.get(index), Some(Column::Stack(_))) {
             return Ok(());
         }
+        let mate = self.column_mate(entity);
         let Some((item, source_kept)) = self.detach_item(index, entity) else {
             return Ok(());
         };
+        if source_kept {
+            self.even_splits.extend(mate);
+        }
         let at = match side {
             Side::West => index,
             Side::East => index + usize::from(source_kept),
@@ -934,10 +956,22 @@ impl LayoutStrip {
                 let heights = if is_tabbed_column {
                     vec![layout_strip_height; items.len()]
                 } else {
+                    // A column a stack item joined or left starts from full
+                    // height for every item, which binpack splits evenly.
+                    let splits_evenly = items
+                        .iter()
+                        .flat_map(StackItem::window_iter)
+                        .any(|entity| self.even_splits.contains(&entity));
                     let current_heights = items
                         .iter()
                         .filter_map(|item| item.top().and_then(get_window_frame))
-                        .map(|frame| frame.height())
+                        .map(|frame| {
+                            if splits_evenly {
+                                layout_strip_height
+                            } else {
+                                frame.height()
+                            }
+                        })
                         .collect::<Vec<_>>();
                     let minimums = items
                         .iter()
@@ -947,7 +981,7 @@ impl LayoutStrip {
                     // share. Taking the extra evenly from the others first
                     // keeps binpack from taking it all from the last window.
                     let mut current_heights = current_heights;
-                    if minimums.iter().any(|minimum| *minimum > 0) {
+                    if !splits_evenly && minimums.iter().any(|minimum| *minimum > 0) {
                         hold_minimum_heights(&mut current_heights, &minimums, layout_strip_height);
                     }
                     let mut heights =
@@ -1094,17 +1128,15 @@ impl LayoutStrip {
         Some(now_tabbed)
     }
 
-    /// Every window in the column holding `entity`, in order.
-    pub fn column_members(&self, entity: Entity) -> Vec<Entity> {
-        self.index_of(entity)
-            .and_then(|index| self.get(index))
-            .map(|column| column.window_iter().collect())
-            .unwrap_or_default()
+    /// Clears the record of columns waiting for an even split, once the
+    /// layout has applied it.
+    pub fn take_even_splits(&mut self) {
+        self.even_splits.clear();
     }
 
     /// A window in the same column as `entity` that is not in `entity`'s own
     /// stack item, so it stays behind when that item moves to another column.
-    pub fn column_mate(&self, entity: Entity) -> Option<Entity> {
+    fn column_mate(&self, entity: Entity) -> Option<Entity> {
         let column = self
             .index_of(entity)
             .and_then(|index| self.get(index))
@@ -1285,11 +1317,12 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
 /// re-calculates the logical positions of all the windows in the layout strip.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn layout_strip_changed(
-    changed_strips: Populated<(&LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
+    mut changed_strips: Populated<(&mut LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
     mut windows: WindowFrames,
     minimum_heights: Query<&MinimumHeight>,
     displays: DisplayViewports,
     config: Res<Config>,
+    mut commands: Commands,
 ) {
     let get_window_frame = |entity| {
         windows
@@ -1299,23 +1332,21 @@ fn layout_strip_changed(
     };
     let get_minimum_height = |entity| minimum_heights.get(entity).ok().map(|m| m.0);
 
-    let changed = changed_strips
-        .into_iter()
-        .filter_map(|(layout_strip, child_of)| {
-            displays
-                .get(child_of.parent())
-                .map(|(display, dock)| {
-                    let height = display.actual_display_bounds(dock, &config).height();
-                    layout_strip.relative_positions_with_minimums(
-                        height,
-                        &get_window_frame,
-                        &get_minimum_height,
-                    )
-                })
-                .ok()
-        })
-        .flatten()
-        .collect::<Vec<_>>();
+    let mut changed = Vec::new();
+    for (mut layout_strip, child_of) in &mut changed_strips {
+        let Ok((display, dock)) = displays.get(child_of.parent()) else {
+            continue;
+        };
+        let height = display.actual_display_bounds(dock, &config).height();
+        changed.extend(layout_strip.relative_positions_with_minimums(
+            height,
+            &get_window_frame,
+            &get_minimum_height,
+        ));
+        // Applied now, so later passes keep the heights it set. Clearing it
+        // is bookkeeping, not a layout change.
+        layout_strip.bypass_change_detection().take_even_splits();
+    }
 
     for (entity, frame) in changed {
         if let Ok((_, mut bounds, mut layout_position)) = windows.get_mut(entity) {
@@ -1323,6 +1354,15 @@ fn layout_strip_changed(
                 layout_position.0 = frame.min;
             }
             if bounds.0 != frame.size() {
+                // A smaller height is checked once the window settles, so an
+                // app that refuses it has its minimum recorded. Growth is not
+                // checked here: a window that cannot grow gets the height it
+                // has, and checking would relayout it forever.
+                if frame.height() < bounds.0.y
+                    && let Ok(mut entity_commands) = commands.get_entity(entity)
+                {
+                    entity_commands.try_insert(VerifyWindowSize::default());
+                }
                 bounds.0 = frame.size();
             }
         }
@@ -2291,7 +2331,8 @@ mod tests {
             .iter()
             .map(|(_, frame)| frame.height())
             .collect::<Vec<_>>();
-        assert_eq!(height, vec![500, 300, 200, 500]);
+        // The window that joined the stack splits the column evenly.
+        assert_eq!(height, vec![500, 250, 250, 500]);
     }
 
     /// Every single-column window must fill the full viewport height.
@@ -2576,6 +2617,33 @@ mod tests {
         assert_eq!(strip.column_mate(e1), Some(e2));
         assert_eq!(strip.column_mate(e4), Some(e2));
         assert_eq!(strip.column_mate(e2), Some(e4));
+    }
+
+    #[test]
+    fn only_a_whole_stack_item_leaving_splits_the_column_evenly() {
+        let mut world = World::new();
+        let e1 = world.spawn_empty().id();
+        let e2 = world.spawn_empty().id();
+        let e3 = world.spawn_empty().id();
+        let e4 = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(e1);
+        strip.append(e2);
+        strip.append(e3);
+        strip.stack(e2, Side::West).unwrap();
+        strip.stack(e3, Side::West).unwrap();
+        strip.convert_to_tabs(e1, e4).unwrap();
+        // [Stack([Tabs([e4, e1]), Single(e2), Single(e3)])]
+        strip.take_even_splits();
+
+        // A closed native tab leaves its item in place.
+        strip.remove(e4);
+        assert!(strip.even_splits.is_empty());
+
+        // A whole item leaving does not.
+        strip.remove(e3);
+        assert!(!strip.even_splits.is_empty());
     }
 
     #[test]

@@ -23,7 +23,7 @@ use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, FullWidthMarker,
     ManualStripOffset, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
-    SpawnCommandsExt, SplitStackEvenly, Timeout, Unmanaged,
+    SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -113,7 +113,6 @@ pub fn register_commands(app: &mut bevy::app::App) {
             toggle_tabbed_display_handler,
             focus_display,
             end_width_runs,
-            split_requested_stacks,
         ),
     );
     app.add_observer(end_width_runs_on_focus);
@@ -1626,6 +1625,7 @@ pub fn stack_windows_handler(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
+    // config: Res<Config>,
     mut commands: Commands,
 ) {
     let Some(operation) = filter_window_operations(&mut messages, |op| {
@@ -1647,24 +1647,11 @@ pub fn stack_windows_handler(
             entity_commands.try_remove::<FullWidthMarker>();
         }
         let strip = active_display.active_strip();
-        let mate = strip.column_mate(entity);
-        let members_before = strip.column_members(entity);
         _ = match operation {
             Operation::Stack(side) => strip.stack(entity, side),
             Operation::Unstack(side) => strip.unstack(entity, side),
             _ => Ok(()),
         };
-        // The column the window joined, and the one it left, each split
-        // evenly: heights carried over from before would leave the first
-        // window most of the column. A command that changed nothing, such as
-        // stacking with no neighbour, keeps the heights the user set.
-        if strip.column_members(entity) != members_before {
-            for member in std::iter::once(entity).chain(mate) {
-                if let Ok(mut entity_commands) = commands.get_entity(member) {
-                    entity_commands.try_insert(SplitStackEvenly);
-                }
-            }
-        }
 
         // Stacking/unstacking moves the focused window to a new column slot
         // (into a neighbouring column, or out to its own column).
@@ -1672,74 +1659,6 @@ pub fn stack_windows_handler(
         // edge-clamp in reshuffle_layout_strip keeps the strip pinned so the
         // leftmost window touches the left edge and the rightmost the right.
         commands.reshuffle_around(entity);
-    }
-}
-
-/// Carries out [`SplitStackEvenly`] requests, each against the height of the
-/// display its strip is on.
-fn split_requested_stacks(
-    requests: Query<Entity, With<SplitStackEvenly>>,
-    strips: Query<(&LayoutStrip, &ChildOf)>,
-    displays: Query<(&Display, Option<&DockPosition>)>,
-    windows: Windows,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
-    for member in &requests {
-        if let Ok(mut entity_commands) = commands.get_entity(member) {
-            entity_commands.try_remove::<SplitStackEvenly>();
-        }
-        let Some((strip, child_of)) = strips.iter().find(|(strip, _)| strip.contains(member))
-        else {
-            continue;
-        };
-        let Ok((display, dock)) = displays.get(child_of.parent()) else {
-            continue;
-        };
-        let column_height = display.actual_display_bounds(dock, &config).height();
-        split_stack_evenly(strip, member, column_height, &windows, &mut commands);
-    }
-}
-
-/// Gives every item in the stack holding `member` an equal share of
-/// `column_height`, the last item taking the rounding remainder. A tabbed
-/// stack shares one full-height frame, so it is left alone.
-fn split_stack_evenly(
-    strip: &LayoutStrip,
-    member: Entity,
-    column_height: i32,
-    windows: &Windows,
-    commands: &mut Commands,
-) {
-    let Some(Column::Stack(items)) = strip
-        .index_of(member)
-        .ok()
-        .and_then(|index| strip.get(index).ok())
-    else {
-        return;
-    };
-    if items
-        .iter()
-        .flat_map(StackItem::window_iter)
-        .any(|entity| strip.is_tabbed_display(entity))
-    {
-        return;
-    }
-    let Ok(count) = i32::try_from(items.len()) else {
-        return;
-    };
-    let share = column_height / count;
-    for (index, item) in (0..count).zip(&items) {
-        let height = if index + 1 == count {
-            column_height - share * (count - 1)
-        } else {
-            share
-        };
-        for entity in item.window_iter() {
-            if let Some(size) = windows.size(entity) {
-                commands.resize_entity(entity, size.with_y(height));
-            }
-        }
     }
 }
 
