@@ -491,11 +491,14 @@ pub struct StrayFocusEvent(pub WinID);
 #[derive(Component)]
 pub struct RetryFrontSwitch(pub Entity);
 
-/// Marker component attached to a window after a keyboard focus request to
-/// verify whether the application accepted or rejected focus once the settle
-/// [`Timeout`] completes.
-#[derive(Component)]
-pub struct VerifyFocus;
+/// Attached to a window after a keyboard focus request to verify whether the
+/// application accepted or rejected focus once the settle [`Timeout`] completes.
+/// `asked_again` is set once the request has been repeated for an application
+/// that had not answered the first one.
+#[derive(Component, Default)]
+pub struct VerifyFocus {
+    pub asked_again: bool,
+}
 
 /// Waits for a replacement AX handle without discarding the window entity.
 /// Uses its own timer because the window's `Timeout` can verify focus.
