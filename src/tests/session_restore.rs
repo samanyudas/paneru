@@ -786,6 +786,44 @@ fn test_startup_restore_keeps_emptied_baseline_row() {
     );
 }
 
+/// Restoring a saved stack rebuilds it without changing who is in it, so the
+/// windows keep the heights they have instead of splitting evenly.
+#[test]
+fn test_startup_restore_keeps_stack_heights() {
+    use crate::ecs::state::SavedStackItem;
+    use crate::manager::Window;
+
+    let state = state_with_strips(vec![SavedStrip {
+        virtual_index: 0,
+        columns: vec![SavedColumn::Stack(vec![
+            SavedStackItem::Single(saved_window(0)),
+            SavedStackItem::Single(saved_window(1)),
+        ])],
+    }]);
+    let top = TEST_MENUBAR_HEIGHT;
+    let mut harness = TestHarness::new()
+        .with_window(0, move |window| {
+            window.frame = IRect::new(0, top, TEST_WINDOW_WIDTH, top + 450);
+        })
+        .with_window(1, move |window| {
+            window.frame = IRect::new(0, top + 450, TEST_WINDOW_WIDTH, TEST_DISPLAY_HEIGHT);
+        })
+        .with_state(state);
+    harness.advance(Duration::from_secs(2));
+
+    let world = harness.world();
+    let heights = [0, 1].map(|id| {
+        world
+            .query::<&Window>()
+            .iter(world)
+            .find(|window| window.id() == id)
+            .expect("window exists")
+            .frame()
+            .height()
+    });
+    assert_eq!(heights, [450, TEST_DISPLAY_HEIGHT - top - 450]);
+}
+
 fn saved_display(display_id: u32, active: bool) -> SavedDisplay {
     SavedDisplay {
         display_id,

@@ -29,9 +29,9 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, PreLaunchFrame, ReadDisplayProperties,
-    RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio,
-    WindowProperties,
+    LowPowerMode, MinimumHeight, MissionControlActive, Position, PreLaunchFrame,
+    ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    Unmanaged, WidthRatio, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -801,6 +801,8 @@ pub(super) fn window_resized_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: ResizableWindows,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
+    minimum_heights: Query<&MinimumHeight>,
+    mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::WindowResized { window_id } = event else {
@@ -830,6 +832,15 @@ pub(super) fn window_resized_update_frame(
             .as_ref()
             .is_some_and(|strip| strip.0.tabbed(entity));
 
+        // The window now has less height than its recorded minimum, so the
+        // app accepts less than it once refused.
+        if minimum_heights
+            .get(entity)
+            .is_ok_and(|minimum| new_frame.height() < minimum.0)
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<MinimumHeight>();
+        }
         let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
         if old_frame.size() != new_frame.size() {
             if tabbed {

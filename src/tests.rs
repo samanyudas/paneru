@@ -5,6 +5,7 @@ mod interaction;
 mod mocks;
 mod session_restore;
 mod settling;
+mod stacks;
 mod state;
 mod tabbed_display;
 mod tabs;
