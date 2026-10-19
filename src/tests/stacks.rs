@@ -120,7 +120,7 @@ fn a_window_with_a_minimum_height_does_not_overlap_the_next() {
 
     let frames = column(harness.world(), &[0, 1, 2]);
     assert_eq!(frames[1].height(), 500, "{frames:?}");
-    assert_eq!(heights(&frames).iter().sum::<i32>(), COLUMN, "{frames:?}");
+    assert_even(&[frames[0].height(), frames[2].height()], COLUMN - 500);
 }
 
 /// The last window gets what is left of the column, so when it is the one
@@ -140,4 +140,50 @@ fn a_last_window_with_a_minimum_height_stays_on_screen() {
         "it ends at the display bottom: {frames:?}"
     );
     assert_even(&heights(&frames[..2]), COLUMN - 500);
+}
+
+/// A minimum height is checked again at the next even split, so an app that
+/// now accepts less gets its share again.
+#[test]
+fn a_minimum_height_is_checked_again_when_the_stack_changes() {
+    let mut harness = tall_harness();
+    harness.mock_state.update_window(1, |window| {
+        window.minimum_size = Some(Size::new(0, 500));
+    });
+    stack_three(&mut harness);
+    assert_eq!(frame(harness.world(), 1).height(), 500);
+
+    harness
+        .mock_state
+        .update_window(1, |window| window.minimum_size = None);
+    harness.run(vec![command(Operation::Unstack(Side::East))]);
+    harness.advance(SETTLE);
+    harness.run(vec![command(Operation::Stack(Side::West))]);
+    harness.advance(SETTLE);
+
+    let frames = column(harness.world(), &[0, 1, 2]);
+    assert_even(&heights(&frames), COLUMN);
+}
+
+/// Stacking with no column to join changes nothing, so heights the user set
+/// stay.
+#[test]
+fn a_stack_command_that_changes_nothing_keeps_set_heights() {
+    let mut harness = tall_harness();
+    stack_three(&mut harness);
+    harness.run(vec![
+        command(Operation::Focus(Direction::North)),
+        command(Operation::Focus(Direction::North)),
+        command(Operation::ResizeVerticalStep(
+            crate::commands::ResizeDirection::Grow,
+        )),
+    ]);
+    harness.advance(SETTLE);
+    let before = heights(&column(harness.world(), &[0, 1, 2]));
+    assert!(before[0] > before[1], "the resize took effect: {before:?}");
+
+    harness.run(vec![command(Operation::Stack(Side::West))]);
+    harness.advance(SETTLE);
+
+    assert_eq!(heights(&column(harness.world(), &[0, 1, 2])), before);
 }

@@ -939,12 +939,19 @@ impl LayoutStrip {
                         .filter_map(|item| item.top().and_then(get_window_frame))
                         .map(|frame| frame.height())
                         .collect::<Vec<_>>();
-                    let mut heights =
-                        binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)?;
                     let minimums = items
                         .iter()
                         .map(|item| item.top().and_then(get_minimum_height).unwrap_or(0))
                         .collect::<Vec<_>>();
+                    // A refused height arrives as a current height above its
+                    // share. Taking the extra evenly from the others first
+                    // keeps binpack from taking it all from the last window.
+                    let mut current_heights = current_heights;
+                    if minimums.iter().any(|minimum| *minimum > 0) {
+                        hold_minimum_heights(&mut current_heights, &minimums, layout_strip_height);
+                    }
+                    let mut heights =
+                        binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)?;
                     hold_minimum_heights(&mut heights, &minimums, layout_strip_height);
                     heights
                 };
@@ -1087,6 +1094,30 @@ impl LayoutStrip {
         Some(now_tabbed)
     }
 
+    /// Every window in the column holding `entity`, in order.
+    pub fn column_members(&self, entity: Entity) -> Vec<Entity> {
+        self.index_of(entity)
+            .and_then(|index| self.get(index))
+            .map(|column| column.window_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// A window in the same column as `entity` that is not in `entity`'s own
+    /// stack item, so it stays behind when that item moves to another column.
+    pub fn column_mate(&self, entity: Entity) -> Option<Entity> {
+        let column = self
+            .index_of(entity)
+            .and_then(|index| self.get(index))
+            .ok()?;
+        let Column::Stack(items) = column else {
+            return None;
+        };
+        items
+            .iter()
+            .find(|item| !item.contains(entity))
+            .and_then(StackItem::top)
+    }
+
     /// Whether `entity` belongs to a `Column::Stack` currently displayed as
     /// tabs. Independent of `tabbed()` (native-OS-tab detection).
     pub fn is_tabbed_display(&self, entity: Entity) -> bool {
@@ -1195,28 +1226,19 @@ fn hold_minimum_heights(heights: &mut [i32], minimums: &[i32], total: i32) {
     for (height, minimum) in heights.iter_mut().zip(minimums) {
         *height = (*height).max(*minimum);
     }
+    let floor = |index: usize| minimums[index].max(MIN_WINDOW_HEIGHT);
     let mut excess = heights.iter().sum::<i32>() - total;
+    // One pixel at a time from whichever window has the most room above its
+    // floor, which levels the givers instead of leaving rounding steps.
     while excess > 0 {
-        let givers = heights
-            .iter()
-            .zip(minimums)
-            .enumerate()
-            .filter(|(_, (height, minimum))| **height > (**minimum).max(MIN_WINDOW_HEIGHT))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let Ok(count) = i32::try_from(givers.len()) else {
+        let Some(tallest) = (0..heights.len())
+            .filter(|index| heights[*index] > floor(*index))
+            .max_by_key(|index| (heights[*index] - floor(*index), std::cmp::Reverse(*index)))
+        else {
             return;
         };
-        if count == 0 {
-            return;
-        }
-        let share = (excess + count - 1) / count;
-        for index in givers {
-            let floor = minimums[index].max(MIN_WINDOW_HEIGHT);
-            let taken = share.min(heights[index] - floor).min(excess);
-            heights[index] -= taken;
-            excess -= taken;
-        }
+        heights[tallest] -= 1;
+        excess -= 1;
     }
 }
 
@@ -2535,6 +2557,25 @@ mod tests {
         );
         let index = strip.index_of(entities[0]).unwrap();
         assert!(matches!(strip.get(index).unwrap(), Column::Single(_)));
+    }
+
+    #[test]
+    fn a_column_mate_is_outside_the_native_tab_group() {
+        let mut world = World::new();
+        let e1 = world.spawn_empty().id();
+        let e2 = world.spawn_empty().id();
+        let e4 = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(e1);
+        strip.append(e2);
+        strip.stack(e2, Side::West).unwrap();
+        strip.convert_to_tabs(e1, e4).unwrap();
+        // [Stack([Tabs([e4, e1]), Single(e2)])]
+
+        assert_eq!(strip.column_mate(e1), Some(e2));
+        assert_eq!(strip.column_mate(e4), Some(e2));
+        assert_eq!(strip.column_mate(e2), Some(e4));
     }
 
     #[test]

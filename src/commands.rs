@@ -22,7 +22,7 @@ use crate::ecs::layout::{
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, FullWidthMarker,
-    ManualStripOffset, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
+    ManualStripOffset, MinimumHeight, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
     SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::{Event, InputEvent};
@@ -1648,11 +1648,8 @@ pub fn stack_windows_handler(
         }
         let column_height = active_display.actual_bounds(&config).height();
         let strip = active_display.active_strip();
-        let mate = strip
-            .index_of(entity)
-            .ok()
-            .and_then(|index| strip.get(index).ok())
-            .and_then(|column| column.window_iter().find(|other| *other != entity));
+        let mate = strip.column_mate(entity);
+        let members_before = strip.column_members(entity);
         _ = match operation {
             Operation::Stack(side) => strip.stack(entity, side),
             Operation::Unstack(side) => strip.unstack(entity, side),
@@ -1660,9 +1657,12 @@ pub fn stack_windows_handler(
         };
         // The column the window joined, and the one it left, each split
         // evenly: heights carried over from before would leave the first
-        // window most of the column.
-        for member in std::iter::once(entity).chain(mate) {
-            split_stack_evenly(strip, member, column_height, &windows, &mut commands);
+        // window most of the column. A command that changed nothing, such as
+        // stacking with no neighbour, keeps the heights the user set.
+        if strip.column_members(entity) != members_before {
+            for member in std::iter::once(entity).chain(mate) {
+                split_stack_evenly(strip, member, column_height, &windows, &mut commands);
+            }
         }
 
         // Stacking/unstacking moves the focused window to a new column slot
@@ -1711,6 +1711,11 @@ fn split_stack_evenly(
         for entity in item.window_iter() {
             if let Some(size) = windows.size(entity) {
                 commands.resize_entity(entity, size.with_y(height));
+            }
+            // An even split is where minimums are checked again: the app
+            // may accept less now, and refusing again records it again.
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<MinimumHeight>();
             }
         }
     }
