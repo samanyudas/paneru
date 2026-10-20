@@ -43,6 +43,7 @@ use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
 pub mod display;
+pub mod drag;
 pub mod focus;
 pub mod layout;
 #[cfg(feature = "lua")]
@@ -363,6 +364,13 @@ impl ScrollInput {
 
 #[derive(Component, Clone, Debug, Default, Deref, DerefMut)]
 pub struct LayoutPosition(pub Origin);
+
+/// Where the layout last placed a tiled window on screen: its slot plus the
+/// strip offset, after an offscreen window is parked as an edge sliver.
+/// Unlike [`Position`], a move the user makes does not change it, so with
+/// [`Bounds`] it still says where the window was when a drag began.
+#[derive(Component, Clone, Copy, Debug, Deref, DerefMut)]
+pub struct PresentedOrigin(pub Origin);
 
 #[derive(Component, Clone, Debug, Deref, DerefMut)]
 pub struct Position(pub Origin);
@@ -900,6 +908,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_resource(launch_windows)
         .insert_non_send(watcher)
         .add_plugins(mouse::MouseEventsPlugin)
+        .add_plugins(drag::DragEventsPlugin)
         .add_plugins(scroll::ScrollEventsPlugin)
         .add_plugins(workspace::WorkspaceEventsPlugin)
         .add_plugins(layout::LayoutEventsPlugin)

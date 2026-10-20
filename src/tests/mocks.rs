@@ -7,7 +7,7 @@ use objc2_core_graphics::CGDirectDisplayID;
 use stdext::prelude::RwLockExt;
 
 use crate::errors::Error;
-use crate::events::{DestroySource, Event};
+use crate::events::{DestroySource, Event, MouseButton};
 use crate::manager::app::MockApplicationApi;
 use crate::manager::{
     Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
@@ -123,6 +123,12 @@ struct MockStateInner {
     fullscreen_spaces: HashSet<WorkspaceId>,
     active_display_id: u32,
     cursor_position: Origin,
+    /// Whether the window server sees the left mouse button down.
+    left_button_down: bool,
+    /// Windows raised above the rest, bottom to top. Windows not in it sit
+    /// below, the lowest ID on top, so overlapping windows resolve the same
+    /// way on every run.
+    raised: Vec<WinID>,
     event_queue: VecDeque<Event>,
     /// Windows that are gone but which the app's AX window list still reports,
     /// modelling the lag real apps show right after a window closes.
@@ -131,13 +137,24 @@ struct MockStateInner {
     /// Windows the app keeps out of its accessibility window list while the
     /// window server still reports them on screen: a background native tab.
     background_tabs: HashSet<WinID>,
-    /// Windows in the order they were last raised, frontmost last.
-    raised: Vec<WinID>,
     /// How many times any window was raised.
     raise_count: usize,
     /// Whether raising a window also makes it its app's focused window, as
     /// `AXRaise` does for a window of the frontmost app.
     raise_takes_focus: bool,
+}
+
+/// The window on top at `point`: raised windows first, then the lowest ID.
+fn top_window_at(inner: &MockStateInner, point: Origin) -> Option<WinID> {
+    inner
+        .windows
+        .iter()
+        .filter(|(_, window)| window.frame.contains(point))
+        .map(|(id, _)| *id)
+        .max_by_key(|id| {
+            let raised = inner.raised.iter().position(|raised| raised == id);
+            (raised, std::cmp::Reverse(*id))
+        })
 }
 
 #[derive(Clone)]
@@ -155,11 +172,12 @@ impl MockState {
                 fullscreen_spaces: HashSet::new(),
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
+                left_button_down: false,
+                raised: Vec::new(),
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
                 background_tabs: HashSet::new(),
-                raised: Vec::new(),
                 raise_count: 0,
                 raise_takes_focus: false,
             })),
@@ -559,17 +577,27 @@ impl MockState {
 
     // --- Interaction Helpers ---
 
+    /// The window on top at `point`, as the window server would name it in
+    /// a press event.
+    pub fn window_at(&self, point: Origin) -> Option<WinID> {
+        top_window_at(&self.inner.force_read(), point)
+    }
+
     #[allow(unused)]
     pub fn simulate_click(&self, point: Origin) {
         let mut inner = self.inner.force_write();
         let point = CGPoint::new(point.x.into(), point.y.into());
+        let window_id = top_window_at(&inner, origin_from(point));
         inner.event_queue.push_back(Event::MouseDown {
             point,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+            window_id,
         });
         inner.event_queue.push_back(Event::MouseUp {
             point,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
         });
     }
 
@@ -588,18 +616,29 @@ impl MockState {
         let mut inner = self.inner.force_write();
         let start_p = CGPoint::new(start.x.into(), start.y.into());
         let end_p = CGPoint::new(end.x.into(), end.y.into());
+        let window_id = top_window_at(&inner, start);
         inner.event_queue.push_back(Event::MouseDown {
             point: start_p,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+            window_id,
         });
         inner.event_queue.push_back(Event::MouseDragged {
             point: end_p,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
         });
         inner.event_queue.push_back(Event::MouseUp {
             point: end_p,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
         });
+    }
+
+    /// Sets whether the window server sees the left mouse button down. Only
+    /// the button state changes: no mouse event is sent.
+    pub fn set_left_button_down(&self, down: bool) {
+        self.inner.force_write().left_button_down = down;
     }
 
     pub fn cursor_position(&self) -> IVec2 {
@@ -1054,18 +1093,17 @@ impl MockState {
         wm.expect_cursor_position()
             .returning(move || Some(origin_to(s.inner.force_read().cursor_position)));
 
+        let s = self.clone();
+        wm.expect_left_button_down()
+            .returning(move || s.inner.force_read().left_button_down);
+
         wm.expect_get_associated_windows().return_const(vec![]);
 
         let s = self.clone();
         wm.expect_find_window_at_point().returning(move |at_point| {
             let point = origin_from(*at_point);
-            s.inner
-                .force_read()
-                .windows
-                .iter()
-                .find_map(|(id, window)| window.frame.contains(point).then_some(id))
+            top_window_at(&s.inner.force_read(), point)
                 .ok_or(Error::NotFound(format!("no window found at point {point}")))
-                .copied()
         });
 
         wm

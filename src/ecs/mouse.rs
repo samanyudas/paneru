@@ -10,6 +10,7 @@ use tracing::{debug, trace, warn};
 
 use super::{MouseHeldMarker, Timeout};
 use crate::config::Config;
+use crate::ecs::drag::DragState;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{GlobalState, Windows};
 use crate::ecs::{
@@ -214,15 +215,24 @@ fn mouse_down_trigger(
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
-        let Event::MouseDown { point, .. } = event else {
+        let Event::MouseDown {
+            point, window_id, ..
+        } = event
+        else {
             continue;
         };
         trace!("{point:?}");
 
-        let Some((_, entity)) = window_manager
-            .find_window_at_point(point)
-            .ok()
+        // The window the tap saw under the press, because by now the pressed
+        // window may have moved off the point.
+        let Some((_, entity)) = window_id
             .and_then(|window_id| windows.find(window_id))
+            .or_else(|| {
+                window_manager
+                    .find_window_at_point(point)
+                    .ok()
+                    .and_then(|window_id| windows.find(window_id))
+            })
         else {
             continue;
         };
@@ -255,10 +265,12 @@ fn mouse_down_trigger(
 }
 
 /// Handles mouse-up events. Triggers the deferred reshuffle so the clicked
-/// window slides into view after the user releases the button.
-fn mouse_up_trigger(
+/// window slides into view after the user releases the button. A title-bar
+/// drop that awaits confirmation or just finished owns its placement.
+pub(super) fn mouse_up_trigger(
     mut messages: MessageReader<InputEvent>,
     mouse_held: Query<(Entity, &MouseHeldMarker)>,
+    drag: Option<Res<DragState>>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -266,8 +278,14 @@ fn mouse_up_trigger(
             continue;
         }
 
+        let dropped = drag.as_ref().and_then(|drag| match &**drag {
+            DragState::Released { press, .. } => Some(press.window),
+            _ => drag.settling_window(),
+        });
         for (held_entity, marker) in &mouse_held {
-            commands.reshuffle_around(marker.0);
+            if dropped != Some(marker.0) {
+                commands.reshuffle_around(marker.0);
+            }
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
             }

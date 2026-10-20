@@ -19,6 +19,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, VerifyFocus};
 use crate::config::Config;
+use crate::ecs::drag::DragState;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::RestoreFocusMarker;
@@ -224,7 +225,7 @@ fn shares_a_tab_group(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(focused))]
-fn fix_window_size_on_focus(
+pub(super) fn fix_window_size_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mut windows: Query<(&mut Window, &mut Bounds, Has<ResizeMarker>)>,
 ) {
@@ -350,10 +351,12 @@ fn detect_focus_rejection(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
+    drag: Option<Res<DragState>>,
     restored: Query<&RestoreFocusMarker>,
     strips: Query<(Option<&RepositionMarker>, Option<&Scrolling>), With<LayoutStrip>>,
     global_state: GlobalState,
@@ -370,6 +373,10 @@ fn autocenter_window_on_focus(
     }
 
     if global_state.skip_reshuffle() || global_state.initializing() || !mouse_held.is_empty() {
+        return;
+    }
+    // Preserve the held window's position and the settling drop's chosen position.
+    if drag.is_some_and(|drag| drag.holds_window() || drag.settling_window() == Some(entity)) {
         return;
     }
     if active_display.active_strip().tabbed(entity) {
