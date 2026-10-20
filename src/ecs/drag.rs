@@ -38,7 +38,7 @@ use crate::config::Config;
 use crate::ecs::layout::{Column, LayoutStrip, effective_stack_limit};
 use crate::ecs::{
     Bounds, DockPosition, FocusedMarker, FullWidthMarker, Initializing, LayoutPosition, Position,
-    SpawnCommandsExt, Unmanaged,
+    PresentedOrigin, SpawnCommandsExt, Unmanaged,
 };
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Window, WindowManager, origin_from};
@@ -67,15 +67,11 @@ const SETTLE_WINDOW: Duration = Duration::from_millis(600);
 /// The most pointer samples a press keeps to match a late window move.
 const MAX_SAMPLES: usize = 32;
 
-/// How long the window server must report the left button up, with no
-/// pointer input since, before a press or drag counts as released. The tap
-/// can deliver the release a little after the button state changes, so a
-/// shorter wait would cancel drops still in flight.
+/// How long the window server must keep reporting the left button up before
+/// a press or drag counts as released. The tap can deliver the release a
+/// little after the button state changes, so a shorter wait would cancel
+/// drops still in flight.
 pub(crate) const RELEASE_GRACE: Duration = Duration::from_millis(250);
-
-/// How long a press or drag may go with no pointer input before it ends,
-/// even while the button reads as down.
-pub(crate) const HOLD_LIMIT: Duration = Duration::from_secs(10);
 
 pub(crate) type DisplayId = CGDirectDisplayID;
 
@@ -318,8 +314,8 @@ pub(crate) struct Press {
     pub moved_at: Option<Duration>,
     /// How far the window had moved from `frame` at its latest move.
     pub window_moved: Option<IVec2>,
-    /// When the latest pointer input arrived.
-    pub last_input: Duration,
+    /// When the button first read as up, if it reads up now.
+    pub button_up_since: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -328,8 +324,8 @@ pub(crate) struct Drag {
     pub pointer: IVec2,
     /// What a release here would do.
     pub target: DropTarget,
-    /// When the latest pointer input arrived.
-    pub last_input: Duration,
+    /// When the button first read as up, if it reads up now.
+    pub button_up_since: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -411,7 +407,7 @@ pub(crate) fn step(
             }],
             _ => vec![],
         };
-        return (press(point, button, window, now), effects);
+        return (press(point, button, window), effects);
     }
 
     match (state, input) {
@@ -419,29 +415,31 @@ pub(crate) fn step(
         (state, DragInput::WindowGone { window }) if state.window() == Some(window) => {
             (DragState::Idle, vec![])
         }
-        (DragState::Pressed(press), DragInput::Tick { button_down }) => {
-            if let_go(press.last_input, button_down, now) {
+        (DragState::Pressed(mut press), DragInput::Tick { button_down }) => {
+            if let_go(&mut press.button_up_since, button_down, now) {
                 (DragState::Idle, vec![])
             } else {
                 (DragState::Pressed(press), vec![])
             }
         }
-        (DragState::Dragging(drag), DragInput::Tick { button_down })
-            if let_go(drag.last_input, button_down, now) =>
-        {
-            (
-                DragState::Idle,
-                vec![DragEffect::Drop {
-                    window: drag.window,
-                    target: DropTarget::Home,
-                }],
-            )
+        (DragState::Dragging(mut drag), DragInput::Tick { button_down }) => {
+            if let_go(&mut drag.button_up_since, button_down, now) {
+                (
+                    DragState::Idle,
+                    vec![DragEffect::Drop {
+                        window: drag.window,
+                        target: DropTarget::Home,
+                    }],
+                )
+            } else {
+                (DragState::Dragging(drag), vec![])
+            }
         }
         (DragState::Pressed(press), input) => (pressed(press, input, now, hit), vec![]),
         (DragState::Dragging(mut drag), DragInput::Dragged { point }) => {
             drag.pointer = point;
             drag.target = hit(drag.window, point);
-            drag.last_input = now;
+            drag.button_up_since = None;
             (DragState::Dragging(drag), vec![])
         }
         (DragState::Dragging(drag), DragInput::Up { point }) => (
@@ -469,12 +467,7 @@ pub(crate) fn step(
 
 /// The state a press leaves: [`DragState::Pressed`] for the left button in
 /// the top bar of a tiled window, otherwise idle.
-fn press(
-    point: IVec2,
-    button: MouseButton,
-    window: Option<PressedWindow>,
-    now: Duration,
-) -> DragState {
+fn press(point: IVec2, button: MouseButton, window: Option<PressedWindow>) -> DragState {
     let Some(window) = window else {
         return DragState::Idle;
     };
@@ -491,7 +484,7 @@ fn press(
         samples: Vec::new(),
         moved_at: None,
         window_moved: None,
-        last_input: now,
+        button_up_since: None,
     })
 }
 
@@ -514,7 +507,8 @@ fn pressed(
                 press.samples.remove(0);
             }
             press.samples.push(point);
-            press.last_input = now;
+            // A drag event means the button is down.
+            press.button_up_since = None;
             if press.moved_at.is_none() && past_threshold(point - press.point) {
                 press.moved_at = Some(now);
             }
@@ -557,18 +551,23 @@ fn pressed(
             window: press.window,
             pointer: *pointer,
             target: hit(press.window, *pointer),
-            last_input: press.last_input,
+            button_up_since: press.button_up_since,
         }),
         _ => DragState::Pressed(press),
     }
 }
 
-/// Whether a press or drag whose latest pointer input arrived at
-/// `last_input` has been let go: the button reads as up past the grace, or
-/// nothing has come for the hold limit.
-fn let_go(last_input: Duration, button_down: bool, now: Duration) -> bool {
-    let quiet = now.saturating_sub(last_input);
-    quiet > HOLD_LIMIT || (!button_down && quiet > RELEASE_GRACE)
+/// Records a read of the button in `up_since`, and returns whether the
+/// press or drag has been let go: the button has read as up for the whole
+/// grace. A read of the button down starts the grace over. A held button
+/// never ends a drag, however long the pointer stays still.
+fn let_go(up_since: &mut Option<Duration>, button_down: bool, now: Duration) -> bool {
+    if button_down {
+        *up_since = None;
+        return false;
+    }
+    let since = *up_since.get_or_insert(now);
+    now.saturating_sub(since) > RELEASE_GRACE
 }
 
 /// Whether a move of `delta` is more than [`DRAG_THRESHOLD`] long.
@@ -606,6 +605,7 @@ type WindowInfo<'w, 's> = Query<
         Has<FocusedMarker>,
     ),
 >;
+type Presented<'w, 's> = Query<'w, 's, &'static PresentedOrigin>;
 type Placements<'w, 's> =
     Query<'w, 's, (&'static mut LayoutPosition, &'static mut Bounds), With<Window>>;
 type Strips<'w, 's> = Query<
@@ -629,6 +629,7 @@ fn drag_events(
     window_manager: Res<WindowManager>,
     windows: WindowInfo,
     mut placements: Placements,
+    presented: Presented,
     mut strips: Strips,
     displays: Displays,
     config: Res<Config>,
@@ -642,6 +643,7 @@ fn drag_events(
             &window_manager,
             &windows,
             &strips,
+            &presented,
             &placements,
         ) else {
             continue;
@@ -685,6 +687,7 @@ fn drag_input(
     window_manager: &WindowManager,
     windows: &WindowInfo,
     strips: &Strips,
+    presented: &Presented,
     placements: &Placements,
 ) -> Option<DragInput> {
     let find = |window_id| {
@@ -716,7 +719,7 @@ fn drag_input(
             DragInput::Down {
                 point: origin_from(*point),
                 button: *button,
-                window: pressed_window(origin_from(*point), on_top, strips, placements),
+                window: pressed_window(origin_from(*point), on_top, strips, presented, placements),
             }
         }
         Event::MouseDragged {
@@ -757,23 +760,27 @@ fn drag_input(
 /// The window a press at `point` landed on, given the window the window
 /// server reports on top there now.
 ///
-/// A tiled window is found by its layout slot, not its live frame. The tap
-/// can hand over a whole gesture in one update, and by then the window has
-/// already followed the pointer away from the press. The slot also gives the
-/// frame the window had when it was pressed.
+/// A tiled window is found where the layout last presented it, not by its
+/// live frame. The tap can hand over a whole gesture in one update, and by
+/// then the window has already followed the pointer away from the press.
+/// The presented origin also gives the frame the window had when it was
+/// pressed, including the offsets of a window parked as an edge sliver.
 fn pressed_window(
     point: IVec2,
     on_top: Option<(Entity, &Window, Option<&Unmanaged>, bool)>,
     strips: &Strips,
+    presented: &Presented,
     placements: &Placements,
 ) -> Option<PressedWindow> {
     let slots = strips
         .iter()
-        .flat_map(|(strip, position, _)| {
-            strip.all_windows().into_iter().filter_map(move |entity| {
-                let (layout_position, bounds) = placements.get(entity).ok()?;
-                let min = layout_position.0 + position.0;
-                let frame = IRect::from_corners(min, min + bounds.0);
+        .flat_map(|(strip, _, _)| {
+            strip.all_windows().into_iter().filter_map(|entity| {
+                let origin = presented.get(entity).ok()?.0;
+                // An app can resize its window after the layout placed it,
+                // so the size comes from the current bounds.
+                let (_, bounds) = placements.get(entity).ok()?;
+                let frame = IRect::from_corners(origin, origin + bounds.0);
                 frame.contains(point).then_some((entity, frame))
             })
         })

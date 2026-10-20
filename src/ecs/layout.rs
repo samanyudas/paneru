@@ -17,8 +17,9 @@ use crate::ecs::params::Windows;
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, MinimumHeight, PlaceAfterArrival, Position, RefitAfterRemoval,
-    RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt, VerifyWindowSize,
+    ManualStripOffset, MinimumHeight, PlaceAfterArrival, Position, PresentedOrigin,
+    RefitAfterRemoval, RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
+    VerifyWindowSize,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -1996,6 +1997,9 @@ fn position_layout_windows(
 
         if bounds.0 != frame.size() {
             bounds.0 = frame.size();
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(PresentedOrigin(frame.min));
         }
 
         if position.0 != frame.min {

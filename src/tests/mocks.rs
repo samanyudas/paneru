@@ -115,6 +115,10 @@ struct MockStateInner {
     cursor_position: Origin,
     /// Whether the window server sees the left mouse button down.
     left_button_down: bool,
+    /// Windows raised above the rest, bottom to top. Windows not in it sit
+    /// below, the lowest ID on top, so overlapping windows resolve the same
+    /// way on every run.
+    raised: Vec<WinID>,
     event_queue: VecDeque<Event>,
     /// Windows that are gone but which the app's AX window list still reports,
     /// modelling the lag real apps show right after a window closes.
@@ -141,6 +145,7 @@ impl MockState {
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
                 left_button_down: false,
+                raised: Vec::new(),
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
@@ -545,6 +550,13 @@ impl MockState {
     /// the button state changes: no mouse event is sent.
     pub fn set_left_button_down(&self, down: bool) {
         self.inner.force_write().left_button_down = down;
+    }
+
+    /// Raises window `id` above every other window, without any event.
+    pub fn raise_window(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        inner.raised.retain(|raised| *raised != id);
+        inner.raised.push(id);
     }
 
     pub fn cursor_position(&self) -> IVec2 {
@@ -991,13 +1003,17 @@ impl MockState {
         let s = self.clone();
         wm.expect_find_window_at_point().returning(move |at_point| {
             let point = origin_from(*at_point);
-            s.inner
-                .force_read()
+            let inner = s.inner.force_read();
+            inner
                 .windows
                 .iter()
-                .find_map(|(id, window)| window.frame.contains(point).then_some(id))
+                .filter(|(_, window)| window.frame.contains(point))
+                .map(|(id, _)| *id)
+                .max_by_key(|id| {
+                    let raised = inner.raised.iter().position(|raised| raised == id);
+                    (raised, std::cmp::Reverse(*id))
+                })
                 .ok_or(Error::NotFound(format!("no window found at point {point}")))
-                .copied()
         });
 
         wm

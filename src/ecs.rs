@@ -364,6 +364,13 @@ impl ScrollInput {
 #[derive(Component, Clone, Debug, Default, Deref, DerefMut)]
 pub struct LayoutPosition(pub Origin);
 
+/// Where the layout last placed a tiled window on screen: its slot plus the
+/// strip offset, after an offscreen window is parked as an edge sliver.
+/// Unlike [`Position`], a move the user makes does not change it, so with
+/// [`Bounds`] it still says where the window was when a drag began.
+#[derive(Component, Clone, Copy, Debug, Deref, DerefMut)]
+pub struct PresentedOrigin(pub Origin);
+
 #[derive(Component, Clone, Debug, Deref, DerefMut)]
 pub struct Position(pub Origin);
 

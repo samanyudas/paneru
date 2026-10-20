@@ -10,8 +10,7 @@ use objc2_core_foundation::CGPoint;
 use crate::commands::{Command, Direction, Operation, Side};
 use crate::ecs::drag::{
     Band, ColumnKind, ColumnSnap, DisplaySnap, DragEffect, DragInput, DragState, DropTarget,
-    HOLD_LIMIT, LayoutSnapshot, PressedWindow, RELEASE_GRACE, Refusal, TOP_BAR_BAND, hit_test,
-    step,
+    LayoutSnapshot, PressedWindow, RELEASE_GRACE, Refusal, TOP_BAR_BAND, hit_test, step,
 };
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{ActiveWorkspaceMarker, SpawnWindowTrigger};
@@ -339,20 +338,19 @@ fn a_window_that_follows_only_after_the_confirm_window_is_not_a_drag() {
 }
 
 #[test]
-fn a_button_seen_up_ends_a_held_press_or_drag_after_the_grace() {
+fn a_button_read_up_for_the_grace_ends_a_held_press_or_drag() {
     let w = entities(1)[0];
     let up = DragInput::Tick { button_down: false };
     let (pressed, _) = run(&[down(w, PRESS)]);
 
     let (state, _) = run_from(pressed.clone(), &[up], ms(100));
-    assert!(is_pressed(&state), "inside the grace: {state:?}");
-    let (state, effects) = run_from(pressed, &[up], RELEASE_GRACE + ms(1));
+    assert!(is_pressed(&state), "the button just read up: {state:?}");
+    let (state, effects) = run_from(state, &[up], ms(100) + RELEASE_GRACE + ms(1));
     assert_eq!(state, DragState::Idle);
     assert!(effects.is_empty());
 
-    // The drag's latest pointer input arrived at 20ms.
-    let after_the_grace = ms(20) + RELEASE_GRACE + ms(1);
-    let (state, effects) = run_from(dragging(w), &[up], after_the_grace);
+    let (state, _) = run_from(dragging(w), &[up], ms(100));
+    let (state, effects) = run_from(state, &[up], ms(100) + RELEASE_GRACE + ms(1));
     assert_eq!(state, DragState::Idle);
     assert_eq!(
         effects,
@@ -361,34 +359,50 @@ fn a_button_seen_up_ends_a_held_press_or_drag_after_the_grace() {
             target: DropTarget::Home,
         }]
     );
-    let (state, _) = run_from(
-        dragging(w),
-        &[DragInput::Tick { button_down: true }],
-        after_the_grace,
+}
+
+#[test]
+fn the_release_grace_runs_from_when_the_button_first_reads_up() {
+    let w = entities(1)[0];
+    let up = DragInput::Tick { button_down: false };
+    let held = DragInput::Tick { button_down: true };
+
+    // The pointer pauses over a target well past the grace, then the button
+    // reads up before the tap delivers the release.
+    let (state, effects) = run_from(dragging(w), &[up], ms(600));
+    assert!(matches!(state, DragState::Dragging(_)), "{state:?}");
+    assert!(effects.is_empty());
+    let release = IVec2::new(300, 200);
+    let (state, effects) = run_from(state, &[DragInput::Up { point: release }], ms(700));
+    assert_eq!(state.settling_window(), Some(w));
+    assert_eq!(
+        effects,
+        vec![DragEffect::Drop {
+            window: w,
+            target: hit_at(w, release),
+        }]
     );
+
+    // A read of the button down starts the grace over.
+    let (state, _) = run_from(dragging(w), &[up], ms(600));
+    let (state, _) = run_from(state, &[held], ms(700));
+    let (state, _) = run_from(state, &[up], ms(800));
+    let (state, _) = run_from(state, &[up], ms(799) + RELEASE_GRACE);
     assert!(matches!(state, DragState::Dragging(_)), "{state:?}");
 }
 
 #[test]
-fn a_hold_with_no_pointer_input_ends_at_the_limit() {
+fn a_still_hold_with_the_button_down_never_ends() {
     let w = entities(1)[0];
     let held = DragInput::Tick { button_down: true };
     let (pressed, _) = run(&[down(w, PRESS)]);
+    let much_later = Duration::from_secs(60);
 
-    let (state, _) = run_from(pressed.clone(), &[held], HOLD_LIMIT.saturating_sub(ms(1)));
+    let (state, _) = run_from(pressed, &[held], much_later);
     assert!(is_pressed(&state), "{state:?}");
-    let (state, _) = run_from(pressed, &[held], HOLD_LIMIT + ms(1));
-    assert_eq!(state, DragState::Idle);
-
-    let (state, effects) = run_from(dragging(w), &[held], ms(20) + HOLD_LIMIT + ms(1));
-    assert_eq!(state, DragState::Idle);
-    assert_eq!(
-        effects,
-        vec![DragEffect::Drop {
-            window: w,
-            target: DropTarget::Home,
-        }]
-    );
+    let (state, effects) = run_from(dragging(w), &[held], much_later);
+    assert!(matches!(state, DragState::Dragging(_)), "{state:?}");
+    assert!(effects.is_empty());
 }
 
 #[test]
@@ -1136,4 +1150,74 @@ fn a_held_window_closing_ends_the_drag() {
 
     assert_eq!(drag_state(harness.world()), DragState::Idle);
     assert_eq!(layout(harness.world()), vec![vec![0], vec![1]]);
+}
+
+/// A window scrolled past the edge sits as a sliver, inset from its slot.
+/// Its visible title bar still starts a drag.
+#[test]
+fn a_parked_window_is_dragged_by_its_visible_title_bar() {
+    let mut harness = harness_with("[options]\nsliver_height = 0.5\n", TEST_DISPLAY_HEIGHT, 4);
+    let parked = frame(harness.world(), 3);
+    assert!(
+        parked.min.x >= TEST_DISPLAY_WIDTH - 10 && parked.min.y > TEST_MENUBAR_HEIGHT,
+        "window 3 is a sliver at the right edge: {parked:?}"
+    );
+
+    // The sliver sits over the right edge of window 2, and is on top.
+    harness.mock_state.raise_window(3);
+    let start = parked.min + IVec2::new(2, 10);
+    let to = middle_of(harness.world(), 0, 600);
+    press_at(&mut harness, start);
+    harness.advance(FRAME);
+    for at in 1..=6 {
+        let point = start + (to - start) * at / 6;
+        harness.world().write_message(mouse_dragged(point));
+        harness
+            .mock_state
+            .os_move_window(3, parked.min + (point - start));
+        harness.advance(FRAME);
+    }
+    assert!(
+        matches!(drag_state(harness.world()), DragState::Dragging(_)),
+        "{:?}",
+        drag_state(harness.world())
+    );
+    release(&mut harness, to);
+    harness.advance(SETTLE);
+
+    assert_eq!(layout(harness.world())[0], vec![0, 3]);
+}
+
+#[test]
+fn a_release_after_a_pause_still_drops() {
+    let mut harness = three_columns();
+    let into_the_column = middle_of(harness.world(), 0, 600);
+    press_and_drag(&mut harness, 2, into_the_column);
+    harness.advance(Duration::from_millis(500));
+
+    // The window server sees the button up a frame before the tap delivers
+    // the release.
+    harness.mock_state.set_left_button_down(false);
+    harness.advance(FRAME);
+    release(&mut harness, into_the_column);
+    harness.advance(SETTLE);
+
+    assert_eq!(layout(harness.world()), vec![vec![0, 2], vec![1]]);
+}
+
+#[test]
+fn a_drag_held_still_with_the_button_down_still_drops() {
+    let mut harness = three_columns();
+    let into_the_column = middle_of(harness.world(), 0, 600);
+    press_and_drag(&mut harness, 2, into_the_column);
+    harness.advance(Duration::from_secs(12));
+    assert!(matches!(
+        drag_state(harness.world()),
+        DragState::Dragging(_)
+    ));
+
+    release(&mut harness, into_the_column);
+    harness.advance(SETTLE);
+
+    assert_eq!(layout(harness.world()), vec![vec![0, 2], vec![1]]);
 }
