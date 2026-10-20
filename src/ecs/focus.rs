@@ -373,8 +373,8 @@ fn autocenter_window_on_focus(
     if global_state.skip_reshuffle() || global_state.initializing() || !mouse_held.is_empty() {
         return;
     }
-    // A title-bar press or drag holds the window under the pointer.
-    if drag.is_some_and(|drag| drag.holds_window()) {
+    // Preserve the held window's position and the settling drop's chosen position.
+    if drag.is_some_and(|drag| drag.holds_window() || drag.settling_window() == Some(entity)) {
         return;
     }
     if active_display.active_strip().tabbed(entity) {

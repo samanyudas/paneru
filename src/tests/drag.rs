@@ -97,7 +97,7 @@ fn a_press_in_the_top_bar_of_a_tiled_window_may_start_a_drag() {
     let w = entities(1)[0];
     let (state, effects) = run(&[down(w, PRESS)]);
     assert!(is_pressed(&state), "{state:?}");
-    assert!(effects.is_empty());
+    assert_eq!(effects, Vec::<DragEffect>::new());
 
     let last_row = IVec2::new(100, FRAME_RECT.min.y + TOP_BAR_BAND - 1);
     assert!(is_pressed(&run(&[down(w, last_row)]).0));
@@ -150,7 +150,7 @@ fn a_window_following_the_pointer_starts_a_drag() {
     };
     assert_eq!(drag.window, w);
     assert_eq!(drag.target, hit_at(w, PRESS + IVec2::new(50, 5)));
-    assert!(effects.is_empty());
+    assert_eq!(effects, Vec::<DragEffect>::new());
 }
 
 #[test]
@@ -184,7 +184,7 @@ fn a_small_jitter_is_not_a_drag() {
         moved_by(w, jitter),
     ]);
     assert!(is_pressed(&state), "{state:?}");
-    assert!(effects.is_empty());
+    assert_eq!(effects, Vec::<DragEffect>::new());
 
     let (state, effects) = run_from(
         state,
@@ -194,7 +194,7 @@ fn a_small_jitter_is_not_a_drag() {
         ms(60),
     );
     assert_eq!(state, DragState::Idle);
-    assert!(effects.is_empty());
+    assert_eq!(effects, Vec::<DragEffect>::new());
 }
 
 #[test]
@@ -347,7 +347,7 @@ fn a_button_read_up_for_the_grace_ends_a_held_press_or_drag() {
     assert!(is_pressed(&state), "the button just read up: {state:?}");
     let (state, effects) = run_from(state, &[up], ms(100) + RELEASE_GRACE + ms(1));
     assert_eq!(state, DragState::Idle);
-    assert!(effects.is_empty());
+    assert_eq!(effects, Vec::<DragEffect>::new());
 
     let (state, _) = run_from(dragging(w), &[up], ms(100));
     let (state, effects) = run_from(state, &[up], ms(100) + RELEASE_GRACE + ms(1));
@@ -371,7 +371,7 @@ fn the_release_grace_runs_from_when_the_button_first_reads_up() {
     // reads up before the tap delivers the release.
     let (state, effects) = run_from(dragging(w), &[up], ms(600));
     assert!(matches!(state, DragState::Dragging(_)), "{state:?}");
-    assert!(effects.is_empty());
+    assert_eq!(effects, Vec::<DragEffect>::new());
     let release = IVec2::new(300, 200);
     let (state, effects) = run_from(state, &[DragInput::Up { point: release }], ms(700));
     assert_eq!(state.settling_window(), Some(w));
@@ -402,7 +402,7 @@ fn a_still_hold_with_the_button_down_never_ends() {
     assert!(is_pressed(&state), "{state:?}");
     let (state, effects) = run_from(dragging(w), &[held], much_later);
     assert!(matches!(state, DragState::Dragging(_)), "{state:?}");
-    assert!(effects.is_empty());
+    assert_eq!(effects, Vec::<DragEffect>::new());
 }
 
 #[test]
@@ -457,7 +457,7 @@ fn a_drag_follows_the_pointer_and_drops_on_release() {
         panic!("{state:?}");
     };
     assert_eq!(drag.target, hit_at(w, pointer));
-    assert!(effects.is_empty());
+    assert_eq!(effects, Vec::<DragEffect>::new());
 
     let release = IVec2::new(320, 200);
     let (state, effects) = run_from(state, &[DragInput::Up { point: release }], ms(200));
@@ -887,6 +887,38 @@ fn a_window_dropped_on_a_column_joins_it_where_it_lands() {
     assert_eq!(layout(harness.world()), vec![vec![0, 2], vec![1]]);
     assert_one_column(harness.world(), &[0, 2]);
     crate::assert_focused!(harness.world(), 2);
+}
+
+#[test]
+fn a_drop_restoring_focus_scrolls_only_as_far_as_needed_with_auto_center() {
+    let mut harness = harness_with("[options]\nauto_center = true\n", TEST_DISPLAY_HEIGHT, 3);
+    crate::assert_focused!(harness.world(), 0);
+    let parked = frame(harness.world(), 2);
+    assert!(parked.min.x >= TEST_DISPLAY_WIDTH - 10, "{parked:?}");
+    harness.mock_state.raise_window(2);
+    let start = parked.min + IVec2::new(2, 10);
+    let to = middle_of(harness.world(), 1, 600);
+
+    press_at(&mut harness, start);
+    harness.advance(FRAME);
+    for at in 1..=6 {
+        let point = start + (to - start) * at / 6;
+        harness.world().write_message(mouse_dragged(point));
+        harness
+            .mock_state
+            .os_move_window(2, parked.min + (point - start));
+        harness.advance(FRAME);
+    }
+    release(&mut harness, to);
+    harness.advance(SETTLE);
+
+    assert_eq!(layout(harness.world()), vec![vec![0], vec![1, 2]]);
+    crate::assert_focused!(harness.world(), 2);
+    assert_eq!(
+        frame(harness.world(), 2).max.x,
+        TEST_DISPLAY_WIDTH,
+        "the drop only scrolls enough to expose the destination column"
+    );
 }
 
 #[test]
