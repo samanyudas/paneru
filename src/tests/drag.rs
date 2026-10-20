@@ -308,6 +308,25 @@ fn another_window_moving_changes_nothing() {
 }
 
 #[test]
+fn a_right_press_leaves_a_held_left_gesture_unchanged() {
+    let w = entities(1)[0];
+    let (pressed, _) = run(&[down(w, PRESS)]);
+    let right = DragInput::Down {
+        button: MouseButton::Right,
+        point: PRESS,
+        window: None,
+    };
+    for state in [pressed, dragging(w)] {
+        let (next, effects) = step(state.clone(), right, ms(100), &hit_at);
+        assert_eq!(
+            next, state,
+            "a right press must not replace the left gesture"
+        );
+        assert!(effects.is_empty(), "a right press must not drop the window");
+    }
+}
+
+#[test]
 fn a_window_move_with_the_pointer_below_the_threshold_is_not_a_drag() {
     let w = entities(1)[0];
     let nudge = PRESS + IVec2::new(1, 0);
@@ -321,6 +340,63 @@ fn a_window_move_with_the_pointer_below_the_threshold_is_not_a_drag() {
     let (state, effects) = run_from(state, &[DragInput::Up { point: nudge }], ms(60));
     assert_eq!(state, DragState::Idle);
     assert!(effects.is_empty(), "no drop: {effects:?}");
+}
+
+#[test]
+fn a_delayed_move_uses_the_release_point_despite_later_pointer_input() {
+    let w = entities(1)[0];
+    let sample = PRESS + IVec2::new(50, 0);
+    let release = sample + IVec2::new(5, 0);
+    let (state, effects) = run(&[
+        down(w, PRESS),
+        DragInput::Dragged { point: sample },
+        DragInput::Up { point: release },
+        DragInput::Down {
+            button: MouseButton::Right,
+            point: PRESS,
+            window: None,
+        },
+        DragInput::Moved { point: PRESS },
+        moved_by(w, sample - PRESS),
+    ]);
+    assert!(matches!(state, DragState::Settling(_)), "{state:?}");
+    assert_eq!(
+        effects,
+        vec![DragEffect::Drop {
+            window: w,
+            target: hit_at(w, release)
+        }]
+    );
+}
+
+#[test]
+fn a_released_unconfirmed_drag_can_expire_or_be_cancelled() {
+    let w = entities(1)[0];
+    let sample = PRESS + IVec2::new(50, 0);
+    let (released, _) = run(&[
+        down(w, PRESS),
+        DragInput::Dragged { point: sample },
+        DragInput::Up { point: sample },
+    ]);
+    for input in [
+        DragInput::WindowResized { window: w },
+        DragInput::WindowGone { window: w },
+    ] {
+        let (state, effects) = step(released.clone(), input, ms(60), &hit_at);
+        assert_eq!(state, DragState::Idle);
+        assert_eq!(effects, Vec::<DragEffect>::new());
+    }
+    let (state, effects) = step(released.clone(), down(w, PRESS), ms(60), &hit_at);
+    assert!(is_pressed(&state));
+    assert_eq!(effects, Vec::<DragEffect>::new());
+    let (state, effects) = step(
+        released,
+        DragInput::Tick { button_down: false },
+        ms(271),
+        &hit_at,
+    );
+    assert_eq!(state, DragState::Idle);
+    assert_eq!(effects, Vec::<DragEffect>::new());
 }
 
 #[test]
@@ -921,6 +997,58 @@ fn a_window_dropped_on_a_column_joins_it_where_it_lands() {
     assert_eq!(layout(harness.world()), vec![vec![0, 2], vec![1]]);
     assert_one_column(harness.world(), &[0, 2]);
     crate::assert_focused!(harness.world(), 2);
+}
+
+#[test]
+fn a_quick_drop_waits_for_its_delayed_move_notification() {
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 2);
+    let press = start.min + IVec2::new(100, 10);
+    let to = middle_of(harness.world(), 0, 600);
+    press_at(&mut harness, press);
+    harness.advance(FRAME);
+    harness.world().write_message(mouse_dragged(to));
+    harness.mock_state.update_window(2, |window| {
+        window.frame = IRect::from_corners(start.min + to - press, start.max + to - press);
+    });
+    release(&mut harness, to);
+    assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
+
+    harness
+        .world()
+        .write_message(Event::WindowMoved { window_id: 2 });
+    harness.advance(FRAME);
+    harness.advance(SETTLE);
+    assert_eq!(layout(harness.world()), vec![vec![0, 2], vec![1]]);
+    crate::assert_focused!(harness.world(), 2);
+}
+
+#[test]
+fn a_quick_drop_waits_for_a_move_after_release_within_the_original_deadline() {
+    for delay in [FRAME, Duration::from_millis(300)] {
+        let mut harness = three_columns();
+        let start = frame(harness.world(), 2);
+        let press = start.min + IVec2::new(100, 10);
+        let to = middle_of(harness.world(), 0, 600);
+        press_at(&mut harness, press);
+        harness.advance(FRAME);
+        harness.world().write_message(mouse_dragged(to));
+        release(&mut harness, to);
+        harness.advance(delay);
+        harness.mock_state.os_move_window(2, start.min + to - press);
+        harness.advance(FRAME);
+        harness.advance(FRAME);
+
+        let expected = if delay == FRAME {
+            vec![vec![0, 2], vec![1]]
+        } else {
+            vec![vec![0], vec![1], vec![2]]
+        };
+        assert_eq!(layout(harness.world()), expected, "move delay {delay:?}");
+        harness.advance(SETTLE);
+        assert_eq!(layout(harness.world()), expected);
+        assert_eq!(drag_state(harness.world()), DragState::Idle);
+    }
 }
 
 #[test]

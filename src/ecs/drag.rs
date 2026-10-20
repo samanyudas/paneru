@@ -335,6 +335,8 @@ pub(crate) enum DragState {
     Idle,
     /// The left button went down in a tiled window's top bar.
     Pressed(Press),
+    /// The button was released before its window move was confirmed.
+    Released { press: Press, point: IVec2 },
     /// The window follows the pointer.
     Dragging(Drag),
     /// A drop just happened.
@@ -345,14 +347,17 @@ impl DragState {
     /// Whether a press or drag holds a window, so nothing else should move
     /// it.
     pub(crate) fn holds_window(&self) -> bool {
-        matches!(self, Self::Pressed(_) | Self::Dragging(_))
+        matches!(
+            self,
+            Self::Pressed(_) | Self::Released { .. } | Self::Dragging(_)
+        )
     }
 
     /// The window a press, drag, or settling drop is about.
     pub(crate) fn window(&self) -> Option<Entity> {
         match self {
             Self::Idle => None,
-            Self::Pressed(press) => Some(press.window),
+            Self::Pressed(press) | Self::Released { press, .. } => Some(press.window),
             Self::Dragging(drag) => Some(drag.window),
             Self::Settling(settle) => Some(settle.window),
         }
@@ -391,6 +396,7 @@ pub(crate) fn step(
         button,
         window,
     } = input
+        && button == MouseButton::Left
     {
         // A press always starts afresh. One that arrives mid-drag means the
         // release was lost, so the dragged window goes home first.
@@ -408,6 +414,35 @@ pub(crate) fn step(
         // Nothing is left to place, so nothing is dropped.
         (state, DragInput::WindowGone { window }) if state.window() == Some(window) => {
             (DragState::Idle, vec![])
+        }
+        (DragState::Pressed(press), DragInput::Up { point })
+            if press
+                .moved_at
+                .is_some_and(|at| now.saturating_sub(at) <= CONFIRM_WINDOW) =>
+        {
+            (DragState::Released { press, point }, vec![])
+        }
+        (DragState::Released { press, point }, input) => {
+            if press
+                .moved_at
+                .is_none_or(|at| now.saturating_sub(at) > CONFIRM_WINDOW)
+            {
+                return (DragState::Idle, vec![]);
+            }
+            // The release point stays fixed while native movement catches up.
+            if !matches!(
+                input,
+                DragInput::WindowMoved { .. } | DragInput::WindowResized { .. }
+            ) {
+                return (DragState::Released { press, point }, vec![]);
+            }
+            match pressed(press, input, now, hit) {
+                DragState::Dragging(drag) => {
+                    step(DragState::Dragging(drag), DragInput::Up { point }, now, hit)
+                }
+                DragState::Pressed(press) => (DragState::Released { press, point }, vec![]),
+                next => (next, vec![]),
+            }
         }
         (DragState::Pressed(mut press), DragInput::Tick { button_down }) => {
             if let_go(&mut press.button_up_since, button_down, now) {
@@ -697,7 +732,7 @@ fn drag_input(
     // macOS may report either tab of a native tab group as the one that
     // moved, so a move of any tab counts as a move of the pressed one.
     let pressed_tab = |entity: Entity| match state {
-        DragState::Pressed(press)
+        DragState::Pressed(press) | DragState::Released { press, .. }
             if press.window != entity
                 && strips.iter().any(|(strip, _, _)| {
                     strip
