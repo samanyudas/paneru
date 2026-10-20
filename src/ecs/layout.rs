@@ -1488,6 +1488,9 @@ fn refresh_top_bars(
             // No overlapping stack has needed this top bar yet.
             continue;
         }
+        if retry.as_ref().is_some_and(|retry| !retry.0.is_finished()) {
+            continue;
+        }
         let Ok(mut entity_commands) = commands.get_entity(entity) else {
             continue;
         };

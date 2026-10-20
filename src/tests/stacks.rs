@@ -569,6 +569,34 @@ fn a_top_bar_that_cannot_be_read_yet_is_measured_again_later() {
     assert_eq!(rows(harness.world(), &[0, 1, 2]), SIXTY_POINT_ROWS);
 }
 
+#[test]
+fn resizing_a_busy_window_waits_for_its_top_bar_retry() {
+    let mut harness = overflowing_harness();
+    stack_three(&mut harness);
+    harness.mock_state.update_window(0, |window| {
+        window.top_bar_unreadable = true;
+    });
+    let size = frame(harness.world(), 0).size();
+    let before = top_bar_reads(&harness, 0);
+
+    for _ in 0..10 {
+        harness.mock_state.os_resize_window(0, size);
+        harness.advance(Duration::from_millis(40));
+    }
+    assert_eq!(
+        top_bar_reads(&harness, 0) - before,
+        1,
+        "resizing waits for the retry after the first failed read"
+    );
+
+    harness.advance(Duration::from_secs(1));
+    assert_eq!(
+        top_bar_reads(&harness, 0) - before,
+        2,
+        "the scheduled retry still reads the top bar"
+    );
+}
+
 /// A top bar that cannot be read when it is measured again keeps its last
 /// measurement until a retry reads it, rather than falling back to 52 points.
 #[test]
