@@ -625,7 +625,7 @@ fn install_script_state(
 #[allow(clippy::too_many_lines)]
 fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     use crate::config::{
-        MainOptions, RestoreOptions, format_modifiers,
+        MainOptions, RestoreOptions, StackLimit, format_modifiers,
         padding::PaddingOptions,
         swipe::{GestureOptions, ScrollOptions, SwipeOptions},
     };
@@ -669,6 +669,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         window_hidden_ratio: _,
         window_resize_cycle: _,
         window_resize_step: _,
+        stack_limit: _,
         reap_empty_workspaces: _,
         disable_native_tabs: _,
         virtual_workspace_animations: _,
@@ -697,6 +698,11 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     options.set("window_hidden_ratio", config.window_hidden_ratio())?;
     options.set("window_resize_cycle", config.window_resize_cycle())?;
     options.set("window_resize_step", config.window_resize_step())?;
+    let stack_limit = match config.stack_limit() {
+        StackLimit::Count(count) => count.get().into_lua(lua)?,
+        StackLimit::Fit => "fit".into_lua(lua)?,
+    };
+    options.set("stack_limit", stack_limit)?;
     options.set("reap_empty_workspaces", config.reap_empty_workspaces())?;
     options.set("disable_native_tabs", !config.native_tabs_enabled())?;
     options.set(
@@ -912,6 +918,8 @@ mod tests {
                  Did you add a new option to MainOptions and forget to set it in config_to_lua_table?"
             );
         }
+
+        assert_eq!(options_table.get::<i64>("stack_limit").unwrap(), 5);
 
         let padding_table: Table = root.get("padding").unwrap();
         for field in struct_field_names::<PaddingOptions>() {

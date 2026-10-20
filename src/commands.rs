@@ -18,7 +18,7 @@ use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport,
-    hold_minimum_heights, strip_signature,
+    effective_stack_limit, hold_minimum_heights, strip_signature,
 };
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
@@ -1651,7 +1651,7 @@ pub fn stack_windows_handler(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
-    // config: Res<Config>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let Some(operation) = filter_window_operations(&mut messages, |op| {
@@ -1672,9 +1672,10 @@ pub fn stack_windows_handler(
         {
             entity_commands.try_remove::<FullWidthMarker>();
         }
+        let limit = effective_stack_limit(&config, active_display.actual_bounds(&config).height());
         let strip = active_display.active_strip();
         _ = match operation {
-            Operation::Stack(side) => strip.stack(entity, side),
+            Operation::Stack(side) => strip.stack_within_limit(entity, side, limit),
             Operation::Unstack(side) => strip.unstack(entity, side),
             _ => Ok(()),
         };

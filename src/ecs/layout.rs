@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use stdext::function_name;
 use tracing::{Level, instrument, trace};
 
-use crate::config::Config;
+use crate::config::{Config, StackLimit};
 use crate::ecs::params::Windows;
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
@@ -29,6 +29,19 @@ use crate::util::round_px;
 /// The floor every window in a column is packed against. Heights that would
 /// starve a sibling below it make [`binpack_heights`] fall back to averaging.
 pub(crate) const MIN_WINDOW_HEIGHT: i32 = 200;
+
+/// How many windows a stack may hold in a column `column_height` tall: the
+/// configured limit, capped at how many fit at [`MIN_WINDOW_HEIGHT`], and
+/// never below one.
+pub(crate) fn effective_stack_limit(config: &Config, column_height: i32) -> usize {
+    let fit = usize::try_from(column_height / MIN_WINDOW_HEIGHT)
+        .unwrap_or(0)
+        .max(1);
+    match config.stack_limit() {
+        StackLimit::Count(count) => count.get().min(fit),
+        StackLimit::Fit => fit,
+    }
+}
 
 pub struct LayoutEventsPlugin;
 
@@ -799,6 +812,28 @@ impl LayoutStrip {
             *column = Column::Stack(joined);
         }
         Ok(())
+    }
+
+    /// [`Self::stack`], unless the neighbouring column on `side` already
+    /// holds `limit` stack items. Then the item leaves its own stack for a
+    /// new column between the two instead, and a window that is already its
+    /// own column stays put.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Error)` if the window is not in the strip.
+    pub fn stack_within_limit(&mut self, entity: Entity, side: Side, limit: usize) -> Result<()> {
+        let source = self.index_of(entity)?;
+        let target_len = self
+            .neighbour_index(source, side)
+            .and_then(|target| self.columns.get(target))
+            .and_then(Column::stack_items)
+            .map(|items| items.len());
+        if target_len.is_some_and(|len| len >= limit) {
+            self.unstack(entity, side)
+        } else {
+            self.stack(entity, side)
+        }
     }
 
     /// Moves the stack item holding `entity` out of its stack into a new
