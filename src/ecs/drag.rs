@@ -19,7 +19,7 @@ use std::cell::OnceCell;
 use std::ops::Range;
 use std::time::Duration;
 
-use bevy::app::{App, Plugin, Update};
+use bevy::app::{App, Plugin, PostUpdate, Update};
 use bevy::ecs::change_detection::DetectChangesMut as _;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
@@ -27,8 +27,8 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::schedule::common_conditions::{not, on_message, resource_exists};
-use bevy::ecs::system::{Commands, Query, Res, ResMut};
+use bevy::ecs::schedule::common_conditions::{not, on_message, resource_changed, resource_exists};
+use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 use objc2_core_graphics::CGDirectDisplayID;
@@ -42,6 +42,7 @@ use crate::ecs::{
 };
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Window, WindowManager, origin_from};
+use crate::overlay::DragOverlay;
 
 /// How far the pointer must move from the press before a drag can start.
 const DRAG_THRESHOLD: i32 = 4;
@@ -246,6 +247,98 @@ fn gap_at(columns: &[ColumnSnap], x: i32) -> usize {
         )
 }
 
+/// How thick an insertion line is, in points.
+pub(crate) const INSERTION_LINE: i32 = 3;
+
+/// The size of the refusal symbol, in points.
+pub(crate) const REFUSAL_SYMBOL: i32 = 22;
+
+/// Where the refusal symbol sits from the pointer, down and to the right,
+/// like the badge of a cursor.
+pub(crate) const REFUSAL_OFFSET: IVec2 = IVec2::new(14, 14);
+
+/// What the drag overlay draws, in screen points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayShape {
+    /// An insertion line where a release would put the window.
+    Line(IRect),
+    /// The `nosign` symbol in this square, beside the pointer, for a drop
+    /// that would be refused.
+    Refusal(IRect),
+}
+
+/// What the overlay shows for `state`: where a release would land, the
+/// refusal symbol, or nothing.
+pub(crate) fn overlay_shape(state: &DragState, snapshot: &LayoutSnapshot) -> Option<OverlayShape> {
+    let DragState::Dragging(drag) = state else {
+        return None;
+    };
+    let display_of = |id: DisplayId| snapshot.displays.iter().find(|display| display.id == id);
+    match drag.target {
+        DropTarget::IntoColumn {
+            display,
+            column,
+            slot,
+        } => {
+            let display = display_of(display)?;
+            let column = display.columns.iter().find(|snap| snap.index == column)?;
+            let mut others = column
+                .bands
+                .iter()
+                .filter(|band| !band.windows.contains(&drag.window));
+            // The gap above the `slot`-th other item, or below the last.
+            let y = match others.nth(slot) {
+                Some(band) => band.y.start,
+                None => column.bands.last()?.y.end,
+            };
+            // Only the part of the column on screen.
+            let x = column.x.start.max(display.viewport.min.x)
+                ..column.x.end.min(display.viewport.max.x);
+            if x.is_empty() {
+                return None;
+            }
+            let y = line_across(y, display.viewport.min.y..display.viewport.max.y);
+            Some(OverlayShape::Line(IRect::new(
+                x.start, y.start, x.end, y.end,
+            )))
+        }
+        DropTarget::NewColumn { display, index } => {
+            let display = display_of(display)?;
+            let at = |index| display.columns.iter().find(|snap| snap.index == index);
+            let before = index.checked_sub(1).and_then(at).map(|snap| snap.x.end);
+            let after = at(index).map(|snap| snap.x.start);
+            let x = match (before, after) {
+                (Some(before), Some(after)) => i32::midpoint(before, after),
+                (Some(edge), None) | (None, Some(edge)) => edge,
+                (None, None) => return None,
+            };
+            let x = line_across(x, display.viewport.min.x..display.viewport.max.x);
+            let viewport = display.viewport;
+            Some(OverlayShape::Line(IRect::new(
+                x.start,
+                viewport.min.y,
+                x.end,
+                viewport.max.y,
+            )))
+        }
+        DropTarget::Refused { .. } => {
+            let corner = drag.pointer + REFUSAL_OFFSET;
+            Some(OverlayShape::Refusal(IRect::from_corners(
+                corner,
+                corner + IVec2::splat(REFUSAL_SYMBOL),
+            )))
+        }
+        DropTarget::Home => None,
+    }
+}
+
+/// The span of an insertion line centered on `at`, moved inside `within` so a
+/// line at a screen edge stays whole and on screen.
+fn line_across(at: i32, within: Range<i32>) -> Range<i32> {
+    let start = (at - INSERTION_LINE / 2).clamp(within.start, within.end - INSERTION_LINE);
+    start..start + INSERTION_LINE
+}
+
 /// The window a press landed on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PressedWindow {
@@ -371,6 +464,10 @@ impl DragState {
         }
     }
 }
+
+/// The shape the drag overlay shows now, if any.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Resource)]
+pub(crate) struct DragFeedback(pub Option<OverlayShape>);
 
 /// What the ECS side has to do after a step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -609,23 +706,32 @@ pub struct DragEventsPlugin;
 impl Plugin for DragEventsPlugin {
     fn build(&self, app: &mut App) {
         let in_progress = |state: Res<DragState>| *state != DragState::Idle;
-        app.init_resource::<DragState>().add_systems(
-            Update,
-            (
-                drag_events
-                    .after(super::systems::window_resized_update_frame)
-                    .after(super::systems::window_moved_update_frame)
-                    .before(super::mouse::mouse_up_trigger)
-                    // A drop focuses the window after giving it its new
-                    // column's width. Run the other way round, the focus
-                    // check would read the old size back from the window
-                    // before the new one is committed.
-                    .after(super::focus::fix_window_size_on_focus)
-                    .run_if(on_message::<Event>),
-                drag_watchdog.after(drag_events).run_if(in_progress),
+        app.init_resource::<DragState>()
+            .init_resource::<DragFeedback>()
+            .add_systems(
+                Update,
+                (
+                    drag_events
+                        .after(super::systems::window_resized_update_frame)
+                        .after(super::systems::window_moved_update_frame)
+                        .before(super::mouse::mouse_up_trigger)
+                        // A drop focuses the window after giving it its new
+                        // column's width. Run the other way round, the focus
+                        // check would read the old size back from the window
+                        // before the new one is committed.
+                        .after(super::focus::fix_window_size_on_focus)
+                        .run_if(on_message::<Event>),
+                    drag_watchdog.after(drag_events).run_if(in_progress),
+                    drag_feedback
+                        .after(drag_watchdog)
+                        .run_if(resource_changed::<DragState>),
+                )
+                    .run_if(not(resource_exists::<Initializing>)),
             )
-                .run_if(not(resource_exists::<Initializing>)),
-        );
+            .add_systems(
+                PostUpdate,
+                show_drag_feedback.run_if(resource_changed::<DragFeedback>),
+            );
     }
 }
 
@@ -689,8 +795,20 @@ fn drag_events(
         let (next, effects) = {
             let snapshot = OnceCell::new();
             let hit = |dragged, pointer| {
-                let snapshot = snapshot
-                    .get_or_init(|| snapshot_of(dragged, &strips, &placements, &displays, &config));
+                let snapshot = snapshot.get_or_init(|| {
+                    snapshot_of(
+                        dragged,
+                        strips.iter(),
+                        |entity| {
+                            placements
+                                .get(entity)
+                                .ok()
+                                .map(|(position, bounds)| (position.0, bounds.0))
+                        },
+                        &displays,
+                        &config,
+                    )
+                });
                 hit_test(snapshot, dragged, pointer, |id| {
                     stack_limit(snapshot, id, &config)
                 })
@@ -901,6 +1019,53 @@ fn drag_watchdog(
     }
 }
 
+/// Keeps [`DragFeedback`] on what the overlay should show for the drag
+/// state, which hides it whenever no drag would move a window.
+fn drag_feedback(
+    state: Res<DragState>,
+    mut feedback: ResMut<DragFeedback>,
+    strips: Query<(&LayoutStrip, &Position, &ChildOf)>,
+    placements: Query<(&LayoutPosition, &Bounds), With<Window>>,
+    displays: Displays,
+    config: Res<Config>,
+) {
+    let shape = match &*state {
+        DragState::Dragging(drag) => {
+            let snapshot = snapshot_of(
+                drag.window,
+                strips.iter(),
+                |entity| {
+                    placements
+                        .get(entity)
+                        .ok()
+                        .map(|(position, bounds)| (position.0, bounds.0))
+                },
+                &displays,
+                &config,
+            );
+            overlay_shape(&state, &snapshot)
+        }
+        _ => None,
+    };
+    feedback.set_if_neq(DragFeedback(shape));
+}
+
+/// Draws [`DragFeedback`]. The line takes the focus border's color.
+fn show_drag_feedback(
+    feedback: Res<DragFeedback>,
+    overlay: Option<NonSendMut<DragOverlay>>,
+    config: Res<Config>,
+) {
+    let Some(mut overlay) = overlay else {
+        return;
+    };
+    match feedback.0 {
+        Some(OverlayShape::Line(line)) => overlay.show_line(line, config.border_color()),
+        Some(OverlayShape::Refusal(square)) => overlay.show_refusal(square),
+        None => overlay.hide(),
+    }
+}
+
 /// The stack limit of display `id`, from the height its layout uses.
 fn stack_limit(snapshot: &LayoutSnapshot, id: DisplayId, config: &Config) -> usize {
     snapshot
@@ -914,15 +1079,17 @@ fn stack_limit(snapshot: &LayoutSnapshot, id: DisplayId, config: &Config) -> usi
 
 /// The snapshot of the strip holding `dragged`, on the display that strip is
 /// on.
-fn snapshot_of(
+///
+/// `placement` gives a window's position in its strip and its size.
+fn snapshot_of<'a>(
     dragged: Entity,
-    strips: &Strips,
-    placements: &Placements,
+    mut strips: impl Iterator<Item = (&'a LayoutStrip, &'a Position, &'a ChildOf)>,
+    placement: impl Fn(Entity) -> Option<(IVec2, IVec2)>,
     displays: &Displays,
     config: &Config,
 ) -> LayoutSnapshot {
     let Some((strip, strip_position, child_of)) =
-        strips.iter().find(|(strip, _, _)| strip.contains(dragged))
+        strips.find(|(strip, _, _)| strip.contains(dragged))
     else {
         return LayoutSnapshot::default();
     };
@@ -931,12 +1098,7 @@ fn snapshot_of(
     };
     let viewport = display.actual_display_bounds(dock, config);
     let origin = strip_position.0;
-    let slot = |entity: Entity| {
-        placements
-            .get(entity)
-            .ok()
-            .map(|(layout_position, bounds)| (layout_position.0 + origin, bounds.0))
-    };
+    let slot = |entity: Entity| placement(entity).map(|(position, size)| (position + origin, size));
 
     let columns = strip
         .columns()
