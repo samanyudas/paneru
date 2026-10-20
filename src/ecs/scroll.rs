@@ -108,7 +108,11 @@ impl Plugin for ScrollEventsPlugin {
                     apply_scrolling_constraints,
                     swiping_timeout,
                 )
-                    .chain(),
+                    .chain()
+                    // The strip moves in the frame its input arrives. Without
+                    // this order, the executor could place the windows first
+                    // and show the move a frame late.
+                    .before(super::layout::position_layout_strips),
             ),
         );
     }
