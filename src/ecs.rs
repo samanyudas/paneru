@@ -385,10 +385,15 @@ pub struct PreLaunchFrame(pub bevy::math::IRect);
 pub struct LaunchWindows(pub std::collections::HashSet<WinID>);
 
 /// The smallest height a window has accepted, learned when it refused a
-/// smaller one. Stack layout never gives it less, so it cannot overlap the
-/// window below it.
+/// smaller one. Stack layout never gives it less.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct MinimumHeight(pub i32);
+
+/// How far a window's top bar (title bar, toolbar, or navigation bar) reaches
+/// below its top edge. Measured once, the first time an overlapping stack needs
+/// it, because a top bar rarely changes.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct TopBarHeight(pub i32);
 
 /// Marks a window entity that is currently on a native macOS fullscreen space.
 /// The window has been removed from its tiled position in the strip.

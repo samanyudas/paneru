@@ -294,3 +294,147 @@ fn an_animated_split_with_a_minimum_height_settles() {
     assert_eq!(frames[0].height(), 700, "{frames:?}");
     assert_even(&heights(&frames[1..]), COLUMN - 700);
 }
+
+/// Stacks windows 1 to `count - 1` under window 0, one Stack command each.
+fn stack_all(harness: &mut TestHarness, count: WinID) {
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    for _ in 1..count {
+        harness.run(vec![
+            command(Operation::Focus(Direction::East)),
+            command(Operation::Stack(Side::West)),
+        ]);
+        harness.advance(SETTLE);
+    }
+}
+
+/// Each window's top and height.
+fn rows(world: &mut World, ids: &[WinID]) -> Vec<(i32, i32)> {
+    let frames = ids.iter().map(|id| frame(world, *id)).collect::<Vec<_>>();
+    assert!(
+        frames.windows(2).all(|pair| pair[0].min.x == pair[1].min.x),
+        "one column: {frames:?}"
+    );
+    frames
+        .iter()
+        .map(|frame| (frame.min.y, frame.height()))
+        .collect()
+}
+
+fn set_minimum_height(harness: &TestHarness, id: WinID, height: i32) {
+    harness.mock_state.update_window(id, |window| {
+        window.minimum_size = Some(Size::new(0, height));
+    });
+}
+
+fn set_top_bar(harness: &TestHarness, id: WinID, height: i32) {
+    harness.mock_state.update_window(id, |window| {
+        window.top_bar_height = Some(height);
+    });
+}
+
+/// More windows than fit at the minimum window height used to drop the whole
+/// column from the layout, leaving every window where it was. They overlap
+/// instead: the last window ends at the display bottom, and each window above
+/// shows its top bar and an even share of the rest.
+#[test]
+fn a_stack_too_tall_for_the_minimum_window_height_overlaps() {
+    let mut harness = TestHarness::new().with_windows(5);
+    stack_all(&mut harness, 5);
+
+    // A 748 point column: 548 above the last window, 208 of it the four
+    // fallback top bars and 340 shared, 85 each.
+    assert_eq!(
+        rows(harness.world(), &[0, 1, 2, 3, 4]),
+        vec![(20, 748), (157, 611), (294, 474), (431, 337), (568, 200)]
+    );
+}
+
+/// Windows whose minimum heights exceed the column overlap, each covering
+/// the window above only below that window's measured top bar. No window
+/// extends past the display bottom while the top bars fit.
+#[test]
+fn an_overflowing_stack_overlaps_only_below_each_top_bar() {
+    let mut harness = tall_harness();
+    set_minimum_height(&harness, 1, 900);
+    for (id, top_bar) in [(0, 60), (1, 40), (2, 52)] {
+        set_top_bar(&harness, id, top_bar);
+    }
+    stack_three(&mut harness);
+
+    // Window 1 starts high enough to fit its 900 points above the bottom.
+    assert_eq!(
+        rows(harness.world(), &[0, 1, 2]),
+        vec![(20, COLUMN), (390, 900), (1090, 200)]
+    );
+    for id in 0..3 {
+        let mut reads = 0;
+        harness
+            .mock_state
+            .update_window(id, |window| reads = window.top_bar_reads);
+        assert_eq!(reads, 1, "window {id}'s top bar is measured once");
+    }
+}
+
+/// A top bar Accessibility cannot measure keeps 52 points visible. Here the
+/// three 52 point top bars and the last window's minimum do not fit, so only
+/// that window extends past the display bottom.
+#[test]
+fn an_unmeasured_top_bar_keeps_52_points() {
+    let mut harness = tall_harness();
+    for id in 0..3 {
+        set_minimum_height(&harness, id, 1200);
+    }
+    stack_three(&mut harness);
+
+    assert_eq!(
+        rows(harness.world(), &[0, 1, 2]),
+        vec![(20, COLUMN), (72, 1218), (124, 1200)]
+    );
+    assert_eq!(frame(harness.world(), 2).max.y, TALL + 34);
+}
+
+/// The same windows with 30 point top bars fit above the display bottom, so
+/// the stack does not extend past it: every window ends at the bottom.
+#[test]
+fn a_stack_extends_past_the_bottom_only_when_its_top_bars_do_not_fit() {
+    let mut harness = tall_harness();
+    for id in 0..3 {
+        set_minimum_height(&harness, id, 1200);
+        set_top_bar(&harness, id, 30);
+    }
+    stack_three(&mut harness);
+
+    // 10 points are left above the last window, 5 for each strip.
+    assert_eq!(
+        rows(harness.world(), &[0, 1, 2]),
+        vec![(20, COLUMN), (55, 1235), (90, 1200)]
+    );
+}
+
+/// In an overlapping stack each lower window is in front of the window above
+/// it, so every top bar shows. The focused window comes to the front, and
+/// returns to its place when focus leaves it.
+#[test]
+fn focus_brings_an_overlapped_window_to_the_front_until_it_leaves() {
+    let mut harness = TestHarness::new().with_windows(4);
+    set_minimum_height(&harness, 1, 500);
+    stack_all(&mut harness, 3);
+    let stack = [0, 1, 2];
+    assert!(
+        frame(harness.world(), 2).min.y < frame(harness.world(), 1).max.y,
+        "the stack overlaps"
+    );
+    assert_eq!(harness.mock_state.window_order(&stack), vec![0, 1, 2]);
+
+    harness.run(vec![command(Operation::Focus(Direction::North))]);
+    assert_eq!(harness.mock_state.window_order(&stack), vec![0, 2, 1]);
+
+    harness.run(vec![command(Operation::Focus(Direction::North))]);
+    assert_eq!(harness.mock_state.window_order(&stack), vec![1, 2, 0]);
+
+    harness.run(vec![command(Operation::Focus(Direction::East))]);
+    assert_eq!(harness.mock_state.window_order(&stack), vec![0, 1, 2]);
+}

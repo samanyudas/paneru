@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy::app::{App, Plugin, PostUpdate, Update};
+use bevy::ecs::change_detection::{DetectChanges, Ref};
 use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::lifecycle::{Add, Remove};
+use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With};
 use bevy::ecs::resource::Resource;
@@ -18,12 +19,12 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, VerifyFocus};
 use crate::config::Config;
-use crate::ecs::layout::{Column, LayoutStrip, clamp_origin_to_viewport};
+use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, RepositionMarker, ResizeMarker,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
+    ActiveWorkspaceMarker, Bounds, LayoutPosition, Position, RaiseWindow, RepositionMarker,
+    ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -132,6 +133,7 @@ impl Plugin for FocusEventsPlugin {
                 recover_lost_focus.run_if(on_timer(Duration::from_millis(
                     REFRESH_WINDOW_CHECK_FREQ_MS,
                 ))),
+                order_overlapping_stacks,
             ),
         );
         app.add_observer(dim_remove_window_trigger)
@@ -602,6 +604,87 @@ fn raise_window_trigger(
 
     // Raise the focused window last, because raised windows get OS focus events.
     window.raise_without_focus();
+}
+
+/// Keeps every top bar of an overlapping stack visible. Each lower window goes
+/// in front of the window above it, and the focused window goes in front of
+/// everything, so it shows its full content. Runs when focus enters or leaves
+/// a stacked window and when a strip's layout changes, so a window that loses
+/// focus returns to its place in the stack.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn order_overlapping_stacks(
+    gained: Query<Entity, Added<FocusedMarker>>,
+    mut lost: RemovedComponents<FocusedMarker>,
+    strips: Query<Ref<LayoutStrip>, With<ActiveWorkspaceMarker>>,
+    windows: Query<(&Window, &LayoutPosition, &Bounds)>,
+    focused: Query<Entity, With<FocusedMarker>>,
+    window_manager: Res<WindowManager>,
+) {
+    let touched = gained.iter().chain(lost.read()).collect::<Vec<_>>();
+    let frame = |entity| {
+        windows
+            .get(entity)
+            .ok()
+            .map(|(_, position, bounds)| IRect::from_corners(position.0, position.0 + bounds.0))
+    };
+    // A native tab group shows one tab, and raising a background tab would
+    // switch to it.
+    let shown = |item: &StackItem| match item {
+        StackItem::Single(entity) => Some(*entity),
+        StackItem::Tabs(tabs) => tabs.iter().copied().find(|entity| {
+            windows.get(*entity).is_ok_and(|(window, _, _)| {
+                matches!(window_manager.window_ordered_in(window.id()), Ok(true))
+            })
+        }),
+    };
+
+    let mut back_to_front = vec![];
+    for strip in &strips {
+        for column in strip.columns() {
+            let Column::Stack(items) = column else {
+                continue;
+            };
+            let affected = strip.is_changed()
+                || touched
+                    .iter()
+                    .any(|entity| items.iter().any(|item| item.contains(*entity)));
+            let tops = items.iter().filter_map(StackItem::top).collect::<Vec<_>>();
+            let tabbed_display = tops.iter().any(|top| strip.is_tabbed_display(*top));
+            if affected && !tabbed_display && stack_overlaps(&tops, &frame) {
+                back_to_front.extend(items.iter().filter_map(shown));
+            }
+        }
+    }
+    if back_to_front.is_empty() {
+        return;
+    }
+
+    let focus = focused.iter().next();
+    for entity in back_to_front
+        .into_iter()
+        .filter(|entity| Some(*entity) != focus)
+    {
+        if let Ok((window, _, _)) = windows.get(entity) {
+            window.raise_without_focus();
+        }
+    }
+    // Last, because a raised window can take its app's focus.
+    if let Some((window, _, _)) = focus.and_then(|focus| windows.get(focus).ok()) {
+        window.raise_without_focus();
+    }
+}
+
+/// Whether any window of a stack, given top to bottom, starts above the
+/// bottom of the window over it.
+fn stack_overlaps<F>(tops: &[Entity], frame: &F) -> bool
+where
+    F: Fn(Entity) -> Option<IRect>,
+{
+    tops.windows(2).any(|pair| {
+        frame(pair[0])
+            .zip(frame(pair[1]))
+            .is_some_and(|(upper, lower)| lower.min.y < upper.max.y)
+    })
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
