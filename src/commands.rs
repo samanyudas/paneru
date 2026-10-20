@@ -1,12 +1,14 @@
 use bevy::app::PreUpdate;
 use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::lifecycle::Add;
+use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Has, With, Without};
-use bevy::ecs::system::{Commands, Query, Res, Single, SystemParam};
+use bevy::ecs::schedule::IntoScheduleConfigs as _;
+use bevy::ecs::system::{Commands, Query, Res, ResMut, Single, SystemParam};
 use bevy::math::IRect;
+use bevy::time::Time;
 use tracing::{Level, instrument};
 use tracing::{debug, error, info};
 
@@ -17,14 +19,14 @@ use crate::config::snippet::{RuleSubject, SnippetDialect, window_rule_snippet};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{
-    Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport,
+    Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, anchored_origin, clamp_origin_to_viewport,
     effective_stack_limit, hold_minimum_heights, strip_signature,
 };
-use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
+use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowCtx, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, FullWidthMarker,
-    ManualStripOffset, MinimumHeight, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
-    SpawnCommandsExt, Timeout, Unmanaged,
+    ManualStripOffset, MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, RaiseWindow,
+    SelectedVirtualMarker, SpawnCommandsExt, Timeout, Unmanaged, WidthAnchor, WidthRun,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -113,10 +115,14 @@ pub fn register_commands(app: &mut bevy::app::App) {
             copy_window_rule,
             toggle_tabbed_display_handler,
             focus_display,
-            end_width_runs,
+            end_width_runs
+                .after(crate::ecs::systems::demux_input_events)
+                .before(resize_window),
         ),
     );
+    app.init_resource::<WidthBatchInterrupted>();
     app.add_observer(end_width_runs_on_focus);
+    app.add_observer(cancel_width_settlement);
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -720,54 +726,52 @@ fn command_center_window(
     }
 }
 
-/// Where a run of width changes keeps a column: flush against a display edge it
-/// started on, or around the center it started at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WidthAnchor {
-    Left,
-    Right,
-    Center(i32),
+#[derive(bevy::ecs::resource::Resource, Default)]
+struct WidthBatchInterrupted(bool);
+
+fn interrupts_width_run(event: &Event) -> bool {
+    let Event::Command { command } = event else {
+        return false;
+    };
+    match command {
+        Command::Window(
+            Operation::Resize(_) | Operation::ResizeStep(_) | Operation::SetWidth(_),
+        )
+        | Command::PrintState
+        | Command::Lua(_) => false,
+        Command::Layout(ops) => ops
+            .iter()
+            .any(|op| !matches!(op, crate::types::windowset::LayoutOp::SetWidth { .. })),
+        _ => true,
+    }
 }
 
-/// The anchor of the current run of width changes on a column. A focus change,
-/// any other command, or a swipe or scroll ends the run, so the next change
-/// picks a fresh anchor. App size corrections and animation do not (miri#39).
-#[derive(bevy::ecs::component::Component)]
-struct WidthRun {
-    anchor: WidthAnchor,
-}
-
-fn is_width_change(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::Command {
-            command: Command::Window(
-                Operation::Resize(_) | Operation::ResizeStep(_) | Operation::SetWidth(_)
-            )
-        }
-    )
-}
-
-/// Ends every width run when a command other than a width change arrives, or
+/// Ends every width run when an interrupting command arrives, or
 /// when the user scrolls, swipes, drags, or resizes with the mouse.
 fn end_width_runs(
     mut messages: MessageReader<Event>,
     mut inputs: MessageReader<InputEvent>,
     runs: Query<Entity, With<WidthRun>>,
+    mut interrupted: ResMut<WidthBatchInterrupted>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let command = messages
-        .read()
-        .any(|event| matches!(event, Event::Command { .. }) && !is_width_change(event));
+    let mut command = false;
+    for event in messages.read() {
+        command |= interrupts_width_run(event);
+    }
     let mouse_resize = config.mouse_resize_modifier();
-    let scrolled = inputs.read().any(|InputEvent(event)| match event {
-        Event::Swipe { .. } | Event::Scroll { .. } | Event::MouseDragged { .. } => true,
-        Event::MouseMoved { modifiers, .. } => {
-            mouse_resize.is_some_and(|modifier| modifier.matches(*modifiers))
-        }
-        _ => false,
-    });
+    let mut scrolled = false;
+    for InputEvent(event) in inputs.read() {
+        scrolled |= match event {
+            Event::Swipe { .. } | Event::Scroll { .. } | Event::MouseDragged { .. } => true,
+            Event::MouseMoved { modifiers, .. } => {
+                mouse_resize.is_some_and(|modifier| modifier.matches(*modifiers))
+            }
+            _ => false,
+        };
+    }
+    interrupted.0 = command || scrolled;
     if !command && !scrolled {
         return;
     }
@@ -775,6 +779,12 @@ fn end_width_runs(
         if let Ok(mut cmds) = commands.get_entity(entity) {
             cmds.try_remove::<WidthRun>();
         }
+    }
+}
+
+fn cancel_width_settlement(trigger: On<Remove, WidthRun>, mut commands: Commands) {
+    if let Ok(mut entity) = commands.get_entity(trigger.entity) {
+        entity.try_remove::<PendingWidthSettlement>();
     }
 }
 
@@ -812,22 +822,6 @@ fn width_anchor(
     }
 }
 
-/// Where a column of `size` goes for `anchor`, kept inside `viewport`.
-fn anchored_origin(anchor: WidthAnchor, frame: IRect, size: Size, viewport: IRect) -> Origin {
-    let center = match anchor {
-        WidthAnchor::Center(x) => Origin::new(x, frame.center().y),
-        WidthAnchor::Left | WidthAnchor::Right => frame.center(),
-    };
-    let mut origin =
-        clamp_origin_to_viewport(IRect::from_center_size(center, size).min, size, viewport);
-    match anchor {
-        WidthAnchor::Left => origin.x = viewport.min.x,
-        WidthAnchor::Right => origin.x = viewport.max.x - size.x,
-        WidthAnchor::Center(_) => {}
-    }
-    origin
-}
-
 /// Resizes the focused window to the next or previous preset column width, or
 /// by one `window_resize_step` of the display width.
 ///
@@ -840,12 +834,17 @@ fn anchored_origin(anchor: WidthAnchor, frame: IRect, size: Size, viewport: IRec
 /// * `config` - The `Config` resource.
 fn resize_window(
     mut messages: MessageReader<Event>,
-    windows: Windows,
+    ctx: WindowCtx,
     runs: Query<&WidthRun>,
+    interrupted: Res<WidthBatchInterrupted>,
+    time: Res<Time>,
     active_display: ActiveDisplay,
-    config: Res<Config>,
-    mut commands: Commands,
 ) {
+    let WindowCtx {
+        windows,
+        config,
+        mut commands,
+    } = ctx;
     let Some(operation) = filter_window_operations(&mut messages, |op| {
         matches!(
             op,
@@ -910,6 +909,7 @@ fn resize_window(
     let size = Size::new(new_width, frame.height());
 
     let strip = active_display.active_strip();
+    let strip_entity = active_display.active_strip_entity();
     let anchor = width_anchor(
         runs.get(entity).ok(),
         frame,
@@ -922,8 +922,13 @@ fn resize_window(
     );
     let origin = anchored_origin(anchor, frame, size, viewport);
     commands.reposition_entity(entity, origin);
-    if let Ok(mut cmds) = commands.get_entity(entity) {
-        cmds.try_insert(WidthRun { anchor });
+    if !interrupted.0
+        && let Ok(mut cmds) = commands.get_entity(entity)
+    {
+        cmds.try_insert((
+            WidthRun { anchor },
+            PendingWidthSettlement::new(new_width, strip_entity, viewport, time.elapsed()),
+        ));
     }
 
     // Resize all windows in the column so stacked siblings share the new width.
@@ -934,9 +939,9 @@ fn resize_window(
     {
         for sibling in stack.iter().flat_map(StackItem::window_iter) {
             if sibling != entity
-                && let Some(size) = windows.size(sibling)
+                && let Some(frame) = windows.moving_frame(sibling)
             {
-                commands.resize_entity(sibling, size.with_x(new_width));
+                commands.resize_entity(sibling, frame.size().with_x(new_width));
             }
         }
     }
