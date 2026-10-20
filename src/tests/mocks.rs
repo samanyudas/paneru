@@ -113,6 +113,8 @@ struct MockStateInner {
     fullscreen_spaces: HashSet<WorkspaceId>,
     active_display_id: u32,
     cursor_position: Origin,
+    /// Whether the window server sees the left mouse button down.
+    left_button_down: bool,
     event_queue: VecDeque<Event>,
     /// Windows that are gone but which the app's AX window list still reports,
     /// modelling the lag real apps show right after a window closes.
@@ -138,6 +140,7 @@ impl MockState {
                 fullscreen_spaces: HashSet::new(),
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
+                left_button_down: false,
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
@@ -536,6 +539,12 @@ impl MockState {
             modifiers: Modifiers::empty(),
             button: MouseButton::Left,
         });
+    }
+
+    /// Sets whether the window server sees the left mouse button down. Only
+    /// the button state changes: no mouse event is sent.
+    pub fn set_left_button_down(&self, down: bool) {
+        self.inner.force_write().left_button_down = down;
     }
 
     pub fn cursor_position(&self) -> IVec2 {
@@ -972,6 +981,10 @@ impl MockState {
         let s = self.clone();
         wm.expect_cursor_position()
             .returning(move || Some(origin_to(s.inner.force_read().cursor_position)));
+
+        let s = self.clone();
+        wm.expect_left_button_down()
+            .returning(move || s.inner.force_read().left_button_down);
 
         wm.expect_get_associated_windows().return_const(vec![]);
 
