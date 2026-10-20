@@ -717,9 +717,14 @@ fn drag_input(
             window_id,
             ..
         } => {
-            let on_top = window_id
-                .or_else(|| window_manager.find_window_at_point(point).ok())
-                .and_then(find);
+            // The window the tap saw under the press, because by now the
+            // pressed window may have moved off the point.
+            let on_top = window_id.and_then(find).or_else(|| {
+                window_manager
+                    .find_window_at_point(point)
+                    .ok()
+                    .and_then(find)
+            });
             DragInput::Down {
                 point: origin_from(*point),
                 button: *button,

@@ -13,7 +13,7 @@ use crate::ecs::drag::{
     LayoutSnapshot, PressedWindow, RELEASE_GRACE, Refusal, TOP_BAR_BAND, hit_test, step,
 };
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::{ActiveWorkspaceMarker, SpawnWindowTrigger};
+use crate::ecs::{ActiveWorkspaceMarker, MouseHeldMarker, SpawnWindowTrigger};
 use crate::events::{Event, MouseButton};
 use crate::manager::{Origin, Size, Window};
 use crate::platform::{Modifiers, WinID};
@@ -1217,6 +1217,46 @@ fn a_batched_drag_of_a_parked_window_moves_that_window() {
     harness.advance(SETTLE);
 
     assert_eq!(layout(harness.world())[0], vec![0, 3]);
+}
+
+/// The same batched press, with the release in a later update. The click
+/// bookkeeping must hold the sliver too. If it held the neighbor the sliver
+/// sat over, the release would scroll the strip to show that neighbor.
+#[test]
+fn a_batched_press_of_a_parked_window_holds_that_window() {
+    let mut harness = harness_with("[options]\nsliver_height = 0.5\n", TEST_DISPLAY_HEIGHT, 5);
+    let parked = frame(harness.world(), 4);
+    harness.mock_state.raise_window(4);
+    let start = parked.min + IVec2::new(2, 10);
+    let to = middle_of(harness.world(), 0, 600);
+
+    press_at(&mut harness, start);
+    for at in 1..=6 {
+        let point = start + (to - start) * at / 6;
+        harness.world().write_message(mouse_dragged(point));
+        harness
+            .mock_state
+            .os_move_window(4, parked.min + (point - start));
+        for event in harness.mock_state.drain_events() {
+            harness.world().write_message(event);
+        }
+    }
+    harness.advance(FRAME);
+    let world = harness.world();
+    let held = world
+        .query::<&MouseHeldMarker>()
+        .iter(world)
+        .map(|marker| marker.0)
+        .collect::<Vec<_>>();
+    let held = held
+        .into_iter()
+        .filter_map(|entity| world.get::<Window>(entity).map(|window| window.id()))
+        .collect::<Vec<_>>();
+    assert_eq!(held, vec![4]);
+
+    release(&mut harness, to);
+    harness.advance(SETTLE);
+    assert_eq!(layout(harness.world())[0], vec![0, 4]);
 }
 
 #[test]

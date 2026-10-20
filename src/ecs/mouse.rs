@@ -215,15 +215,24 @@ fn mouse_down_trigger(
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
-        let Event::MouseDown { point, .. } = event else {
+        let Event::MouseDown {
+            point, window_id, ..
+        } = event
+        else {
             continue;
         };
         trace!("{point:?}");
 
-        let Some((_, entity)) = window_manager
-            .find_window_at_point(point)
-            .ok()
+        // The window the tap saw under the press, because by now the pressed
+        // window may have moved off the point.
+        let Some((_, entity)) = window_id
             .and_then(|window_id| windows.find(window_id))
+            .or_else(|| {
+                window_manager
+                    .find_window_at_point(point)
+                    .ok()
+                    .and_then(|window_id| windows.find(window_id))
+            })
         else {
             continue;
         };
