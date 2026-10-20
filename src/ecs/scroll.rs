@@ -109,9 +109,9 @@ impl Plugin for ScrollEventsPlugin {
                     swiping_timeout,
                 )
                     .chain()
-                    // A scroll moves the strip, and the layout moves its
-                    // windows to match in the same frame. Unordered, the
-                    // windows could follow a frame late.
+                    // The strip moves in the frame its input arrives. Without
+                    // this order, the executor could place the windows first
+                    // and show the move a frame late.
                     .before(super::layout::position_layout_strips),
             ),
         );

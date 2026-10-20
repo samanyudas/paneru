@@ -351,10 +351,14 @@ pub(super) fn window_focused_trigger(
                 active_workspace_id = Some(strip.id());
             }
             if owner.is_none() && strip.contains(entity) {
+                // Only a real reorder counts as a layout change. A repeat
+                // focus notification, such as one raising a stacked window
+                // emits, would otherwise order the stack again, forever.
                 if let Ok(index) = strip.index_of(entity)
-                    && let Some(column) = strip.get_column_mut(index)
+                    && let Some(column) = strip.bypass_change_detection().get_column_mut(index)
+                    && column.move_to_front(entity)
                 {
-                    column.move_to_front(entity);
+                    strip.set_changed();
                 }
                 owning_workspace_id = Some(strip.id());
                 owner = Some((strip_entity, active));

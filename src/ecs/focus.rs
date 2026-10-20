@@ -2,14 +2,15 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy::app::{App, Plugin, PostUpdate, Update};
+use bevy::ecs::change_detection::{DetectChanges, Ref};
 use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::lifecycle::{Add, Remove};
+use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Added, Has, With};
+use bevy::ecs::query::{Added, Changed, Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Populated, Query, Res, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
@@ -19,12 +20,12 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, VerifyFocus};
 use crate::config::Config;
 use crate::ecs::drag::DragState;
-use crate::ecs::layout::{Column, LayoutStrip, clamp_origin_to_viewport};
+use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, RepositionMarker, ResizeMarker,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
+    ActiveWorkspaceMarker, Bounds, LayoutPosition, Position, RaiseWindow, RepositionMarker,
+    ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -133,6 +134,7 @@ impl Plugin for FocusEventsPlugin {
                 recover_lost_focus.run_if(on_timer(Duration::from_millis(
                     REFRESH_WINDOW_CHECK_FREQ_MS,
                 ))),
+                order_overlapping_stacks.run_if(overlapping_stacks_need_ordering),
             ),
         );
         app.add_observer(dim_remove_window_trigger)
@@ -611,6 +613,124 @@ fn raise_window_trigger(
     window.raise_without_focus();
 }
 
+fn overlapping_stacks_need_ordering(
+    gained: Query<Entity, Added<FocusedMarker>>,
+    mut lost: RemovedComponents<FocusedMarker>,
+    strips: Query<(), (Changed<LayoutStrip>, With<ActiveWorkspaceMarker>)>,
+) -> bool {
+    let lost_focus = lost.read().count() > 0;
+    !gained.is_empty() || lost_focus || !strips.is_empty()
+}
+
+/// Keeps every top bar of an overlapping stack visible. Each lower window goes
+/// in front of the window above it, and the focused window goes in front of
+/// everything, so it shows its full content. Runs when focus enters or leaves
+/// a stacked window and when a strip's layout changes, so a window that loses
+/// focus returns to its place in the stack.
+///
+/// `applied` holds the order last given to each overlapping stack, back to
+/// front. A stack already in the order it needs is not raised again. Raising
+/// can move an app's focus and emit focus notifications, so raising an
+/// ordered stack again on each of them would never settle.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn order_overlapping_stacks(
+    gained: Query<Entity, Added<FocusedMarker>>,
+    mut lost: RemovedComponents<FocusedMarker>,
+    strips: Query<Ref<LayoutStrip>, With<ActiveWorkspaceMarker>>,
+    windows: Query<(&Window, &LayoutPosition, &Bounds)>,
+    focused: Query<Entity, With<FocusedMarker>>,
+    window_manager: Res<WindowManager>,
+    mut applied: Local<Vec<Vec<Entity>>>,
+) {
+    let touched = gained.iter().chain(lost.read()).collect::<Vec<_>>();
+    let frame = |entity| {
+        windows
+            .get(entity)
+            .ok()
+            .map(|(_, position, bounds)| IRect::from_corners(position.0, position.0 + bounds.0))
+    };
+    // A native tab group shows one tab, and raising a background tab would
+    // switch to it.
+    let shown = |item: &StackItem| match item {
+        StackItem::Single(entity) => Some(*entity),
+        StackItem::Tabs(tabs) => tabs.iter().copied().find(|entity| {
+            windows.get(*entity).is_ok_and(|(window, _, _)| {
+                matches!(window_manager.window_ordered_in(window.id()), Ok(true))
+            })
+        }),
+    };
+    let focus = focused.iter().next();
+
+    let mut back_to_front = vec![];
+    for strip in &strips {
+        for column in strip.columns() {
+            let Column::Stack(items) = column else {
+                continue;
+            };
+            let affected = strip.is_changed()
+                || touched
+                    .iter()
+                    .any(|entity| items.iter().any(|item| item.contains(*entity)));
+            if !affected {
+                continue;
+            }
+            let tops = items.iter().filter_map(StackItem::top).collect::<Vec<_>>();
+            let tabbed_display = tops.iter().any(|top| strip.is_tabbed_display(*top));
+            let order = (!tabbed_display && stack_overlaps(&tops, &frame)).then(|| {
+                let mut order = items.iter().filter_map(shown).collect::<Vec<_>>();
+                if let Some(index) = order.iter().position(|entity| Some(*entity) == focus) {
+                    let focused = order.remove(index);
+                    order.push(focused);
+                }
+                order
+            });
+            if order.as_ref().is_some_and(|order| applied.contains(order)) {
+                continue;
+            }
+            applied.retain(|order| {
+                !order
+                    .iter()
+                    .any(|entity| items.iter().any(|item| item.contains(*entity)))
+            });
+            if let Some(order) = order {
+                back_to_front.extend(order.iter().copied());
+                applied.push(order);
+            }
+        }
+    }
+    // Forget windows that are gone.
+    applied.retain(|order| order.iter().all(|entity| windows.contains(*entity)));
+    if back_to_front.is_empty() {
+        return;
+    }
+
+    for entity in back_to_front
+        .into_iter()
+        .filter(|entity| Some(*entity) != focus)
+    {
+        if let Ok((window, _, _)) = windows.get(entity) {
+            window.raise_without_focus();
+        }
+    }
+    // Last, because a raised window can take its app's focus.
+    if let Some((window, _, _)) = focus.and_then(|focus| windows.get(focus).ok()) {
+        window.raise_without_focus();
+    }
+}
+
+/// Whether any window of a stack, given top to bottom, starts above the
+/// bottom of the window over it.
+fn stack_overlaps<F>(tops: &[Entity], frame: &F) -> bool
+where
+    F: Fn(Entity) -> Option<IRect>,
+{
+    tops.windows(2).any(|pair| {
+        frame(pair[0])
+            .zip(frame(pair[1]))
+            .is_some_and(|(upper, lower)| lower.min.y < upper.max.y)
+    })
+}
+
 #[instrument(level = Level::DEBUG, skip_all)]
 fn recover_lost_focus(
     windows: Windows,
@@ -659,9 +779,33 @@ mod tests {
     use crate::manager::MockWindowApi;
     use crate::manager::app::MockApplicationApi;
     use crate::platform::WinID;
+    use bevy::ecs::system::IntoSystem as _;
     use bevy::ecs::world::World;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI32, Ordering};
+
+    #[test]
+    fn overlapping_order_stays_idle_without_changes() {
+        let mut harness = crate::tests::TestHarness::new().with_windows(1);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_secs(2));
+        let system_type = order_overlapping_stacks.system_type_id();
+        let last_run = |world: &World| {
+            world
+                .resource::<bevy::ecs::schedule::Schedules>()
+                .get(PostUpdate)
+                .unwrap()
+                .systems()
+                .unwrap()
+                .find(|(_, system)| system.system_type() == system_type)
+                .unwrap()
+                .1
+                .get_last_run()
+        };
+        let before = last_run(harness.world());
+        harness.advance(Duration::from_millis(200));
+        assert_eq!(last_run(harness.world()), before);
+    }
 
     fn spawn_app(world: &mut World, frontmost: bool, focused_id: WinID) -> Entity {
         let mut api = MockApplicationApi::new();

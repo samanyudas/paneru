@@ -3,25 +3,31 @@ use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::RemovedComponents;
+use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Changed, Has, Or, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, ParamSet, Populated, Query, Res};
 use bevy::math::IRect;
+use bevy::time::{Time, Timer, TimerMode};
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::time::Duration;
 use stdext::function_name;
-use tracing::{Level, instrument, trace};
+use tracing::{Level, debug, instrument, trace};
 
 use crate::config::{Config, StackLimit};
 use crate::ecs::params::Windows;
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, MinimumHeight, PlaceAfterArrival, Position, PresentedOrigin,
+    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
+    LayoutPosition, ManualStripOffset, MinimumHeight, PlaceAfterArrival, Position, PresentedOrigin,
     RefitAfterRemoval, RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
-    VerifyWindowSize, WidthAnchor,
+    TopBarHeight, TopBarRetry, VerifyWindowSize, WidthAnchor,
 };
 use crate::errors::{Error, Result};
+use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WorkspaceId;
 use crate::types::commands::Side;
@@ -30,6 +36,16 @@ use crate::util::round_px;
 /// The floor every window in a column is packed against. Heights that would
 /// starve a sibling below it make [`binpack_heights`] fall back to averaging.
 pub(crate) const MIN_WINDOW_HEIGHT: i32 = 200;
+
+/// The top bar kept visible for a window whose top bar Accessibility cannot
+/// measure, in points.
+pub(crate) const FALLBACK_TOP_BAR_HEIGHT: i32 = 52;
+
+/// How long to wait before reading a top bar again after Accessibility first
+/// failed to read it. Each further failure doubles the wait, up to
+/// [`TOP_BAR_RETRY_LIMIT`].
+const TOP_BAR_RETRY_FIRST: Duration = Duration::from_secs(1);
+const TOP_BAR_RETRY_LIMIT: Duration = Duration::from_secs(30);
 
 /// How many windows a stack may hold in a column `column_height` tall: the
 /// configured limit, capped at how many fit at [`MIN_WINDOW_HEIGHT`], and
@@ -231,6 +247,7 @@ impl Plugin for LayoutEventsPlugin {
                 // Wait for finish_setup before tiling: until then every window
                 // sits in the active strip regardless of its real display.
                 (
+                    refresh_top_bars.run_if(top_bars_need_refresh),
                     layout_sizes_changed,
                     layout_strip_changed,
                     reshuffle_layout_strip,
@@ -397,22 +414,23 @@ impl Column {
 
     /// Moves the specified entity to the front of stack-local ordering.
     /// Native tab ordering is stable; the focused tab is tracked by `FocusedMarker`.
-    pub fn move_to_front(&mut self, entity: Entity) {
-        match self {
-            Column::Single(_) | Column::Fullscren(_) => {}
-            Column::Stack(stack) => {
-                if let Some(StackItem::Tabs(tabs)) =
-                    stack.iter_mut().find(|item| item.contains(entity))
-                    && let Some(pos) = tabs.iter().position(|&e| e == entity)
-                {
-                    tabs.swap(0, pos);
-                }
+    /// Returns whether the column changed, so a caller can leave change
+    /// detection alone when `entity` was already in front.
+    pub fn move_to_front(&mut self, entity: Entity) -> bool {
+        let tabs = match self {
+            Column::Single(_) | Column::Fullscren(_) => return false,
+            Column::Stack(stack) => match stack.iter_mut().find(|item| item.contains(entity)) {
+                Some(StackItem::Tabs(tabs)) => tabs,
+                _ => return false,
+            },
+            Column::Tabs(tabs) => tabs,
+        };
+        match tabs.iter().position(|&e| e == entity) {
+            Some(pos) if pos > 0 => {
+                tabs.swap(0, pos);
+                true
             }
-            Column::Tabs(tabs) => {
-                if let Some(pos) = tabs.iter().position(|&e| e == entity) {
-                    tabs.swap(0, pos);
-                }
-            }
+            _ => false,
         }
     }
 }
@@ -1039,22 +1057,31 @@ impl LayoutStrip {
     where
         W: Fn(Entity) -> Option<IRect>,
     {
-        self.relative_positions_with_minimums(layout_strip_height, get_window_frame, &|_| None)
-            .into_iter()
+        self.relative_positions_with_minimums(
+            layout_strip_height,
+            get_window_frame,
+            &|_| None,
+            &|_| FALLBACK_TOP_BAR_HEIGHT,
+        )
+        .into_iter()
     }
 
     /// [`Self::relative_positions`], with `get_minimum_height` giving the
-    /// height below which a stacked window must not be squeezed.
+    /// height below which a stacked window must not be squeezed, and
+    /// `get_top_bar_height` the top bar a stack too tall for its column keeps
+    /// visible. See [`overlapping_rows`].
     #[instrument(level = Level::TRACE, skip_all, fields(layout_strip_height))]
-    pub fn relative_positions_with_minimums<W, M>(
+    pub fn relative_positions_with_minimums<W, M, T>(
         &self,
         layout_strip_height: i32,
         get_window_frame: &W,
         get_minimum_height: &M,
+        get_top_bar_height: &T,
     ) -> Vec<(Entity, IRect)>
     where
         W: Fn(Entity) -> Option<IRect>,
         M: Fn(Entity) -> Option<i32>,
+        T: Fn(Entity) -> i32,
     {
         self.column_positions(get_window_frame)
             .filter_map(move |(column, position)| {
@@ -1078,8 +1105,32 @@ impl LayoutStrip {
                         .flat_map(StackItem::window_iter)
                         .any(|e| self.tabbed_stacks.contains(&e));
 
-                let heights = if is_tabbed_column {
-                    vec![layout_strip_height; items.len()]
+                let minimums = items
+                    .iter()
+                    .map(|item| item.top().and_then(get_minimum_height).unwrap_or(0))
+                    .collect::<Vec<_>>();
+                let floors = minimums
+                    .iter()
+                    .map(|minimum| (*minimum).max(MIN_WINDOW_HEIGHT))
+                    .collect::<Vec<_>>();
+
+                let rows = if is_tabbed_column {
+                    vec![
+                        Row {
+                            y: 0,
+                            height: layout_strip_height
+                        };
+                        items.len()
+                    ]
+                } else if floors.iter().sum::<i32>() > layout_strip_height {
+                    let top_bars = items
+                        .iter()
+                        .map(|item| {
+                            item.top()
+                                .map_or(FALLBACK_TOP_BAR_HEIGHT, get_top_bar_height)
+                        })
+                        .collect::<Vec<_>>();
+                    overlapping_rows(layout_strip_height, &floors, &top_bars)
                 } else {
                     // A column a stack item joined or left starts from full
                     // height for every item, which binpack splits evenly.
@@ -1098,10 +1149,6 @@ impl LayoutStrip {
                             }
                         })
                         .collect::<Vec<_>>();
-                    let minimums = items
-                        .iter()
-                        .map(|item| item.top().and_then(get_minimum_height).unwrap_or(0))
-                        .collect::<Vec<_>>();
                     // A refused height arrives as a current height above its
                     // share. Taking the extra evenly from the others first
                     // keeps binpack from taking it all from the last window.
@@ -1109,10 +1156,15 @@ impl LayoutStrip {
                     if !splits_evenly && minimums.iter().any(|minimum| *minimum > 0) {
                         hold_minimum_heights(&mut current_heights, &minimums, layout_strip_height);
                     }
+                    // Binpack gives up when the heights it keeps leave too
+                    // little for the rest, though every floor fits an even split.
                     let mut heights =
-                        binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)?;
+                        binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)
+                            .unwrap_or_else(|| {
+                                even_heights(current_heights.len(), layout_strip_height)
+                            });
                     hold_minimum_heights(&mut heights, &minimums, layout_strip_height);
-                    heights
+                    stacked_rows(&heights)
                 };
 
                 // Every window in a column shares the master's (top item's)
@@ -1126,22 +1178,17 @@ impl LayoutStrip {
                     .and_then(get_window_frame)
                     .map(|frame| frame.width())?;
 
-                let mut next_y = 0;
                 let frames = items
                     .into_iter()
-                    .zip(heights)
-                    .filter_map(|(item, height)| {
+                    .zip(rows)
+                    .filter_map(|(item, row)| {
                         let entity = item.top()?;
                         let mut frame = get_window_frame(entity)?;
                         frame.min.x = position;
                         frame.max.x = frame.min.x + column_width;
 
-                        frame.min.y = next_y;
-                        frame.max.y = frame.min.y + height;
-
-                        if !is_tabbed_column {
-                            next_y = frame.max.y;
-                        }
+                        frame.min.y = row.y;
+                        frame.max.y = row.y + row.height;
 
                         // Return ALL windows in the item with the same frame
                         let results = item.window_iter().map(|e| (e, frame)).collect::<Vec<_>>();
@@ -1375,10 +1422,88 @@ fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Optio
     Some(output)
 }
 
+/// Where one window of a column sits: its distance from the column's top and
+/// its height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Row {
+    pub y: i32,
+    pub height: i32,
+}
+
+/// Rows for windows that fit, each starting where the one above ends.
+fn stacked_rows(heights: &[i32]) -> Vec<Row> {
+    let mut y = 0;
+    heights
+        .iter()
+        .map(|height| {
+            let row = Row { y, height: *height };
+            y += height;
+            row
+        })
+        .collect()
+}
+
+/// `total` split into `count` heights, the last taking the rounding.
+fn even_heights(count: usize, total: i32) -> Vec<i32> {
+    let Some(rest) = count.checked_sub(1) else {
+        return vec![];
+    };
+    let share = total / i32::try_from(count).unwrap_or(i32::MAX);
+    let mut heights = vec![share; rest];
+    heights.push(total - share * i32::try_from(rest).unwrap_or(0));
+    heights
+}
+
+/// Rows for a stack whose `floors` (each window's minimum height, at least
+/// `MIN_WINDOW_HEIGHT`) exceed `column_height`.
+///
+/// Each lower window overlaps the window above it, but only below that
+/// window's top bar, given by `top_bars`. The last window ends at the column
+/// bottom, and the space it leaves above is shared evenly between the upper
+/// windows' visible strips. A window starts no lower than lets it fit above the
+/// column bottom at its floor. A window extends past the bottom only when the
+/// top bars above it and its own floor exceed the column.
+///
+/// Every window reaches down to the column bottom, so the focused window,
+/// raised in front of the stack, shows as much of itself as the column holds.
+/// The rows do not depend on focus: focus changes only the window order.
+pub(crate) fn overlapping_rows(column_height: i32, floors: &[i32], top_bars: &[i32]) -> Vec<Row> {
+    let Some(last) = floors.len().checked_sub(1) else {
+        return vec![];
+    };
+    let upper_bars = top_bars[..last].iter().sum::<i32>();
+    let leftover = (column_height - floors[last] - upper_bars).max(0);
+    let upper_count = i32::try_from(last).unwrap_or(i32::MAX).max(1);
+    let (share, remainder) = (leftover / upper_count, leftover % upper_count);
+    let mut latest = floors
+        .iter()
+        .map(|floor| column_height - floor)
+        .collect::<Vec<_>>();
+    for index in (0..last).rev() {
+        latest[index] = latest[index].min(latest[index + 1] - top_bars[index]);
+    }
+
+    let mut rows = Vec::with_capacity(floors.len());
+    // Where the even share would put the next window, and where the top bar of
+    // the window above lets it start at the earliest.
+    let (mut target, mut earliest) = (0, 0);
+    for (index, floor) in floors.iter().enumerate() {
+        let y = earliest.max(target.min(latest[index]));
+        rows.push(Row {
+            y,
+            height: (*floor).max(column_height - y),
+        });
+        let extra = share + i32::from(i32::try_from(index).unwrap_or(i32::MAX) < remainder);
+        target += top_bars[index] + extra;
+        earliest = y + top_bars[index];
+    }
+    rows
+}
+
 /// Raises every stacked height below its window's minimum to that minimum,
 /// and takes the extra evenly from the other windows, none going below its own
-/// minimum or `MIN_WINDOW_HEIGHT`. If the minimums alone exceed the column,
-/// the column overflows rather than overlap.
+/// minimum or `MIN_WINDOW_HEIGHT`. Minimums that cannot all fit are left for
+/// [`overlapping_rows`], which the layout uses instead.
 pub(crate) fn hold_minimum_heights(heights: &mut [i32], minimums: &[i32], total: i32) {
     for (height, minimum) in heights.iter_mut().zip(minimums) {
         *height = (*height).max(*minimum);
@@ -1438,6 +1563,123 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
     }
 }
 
+fn top_bars_need_refresh(
+    mut messages: MessageReader<Event>,
+    mut lost: RemovedComponents<FocusedMarker>,
+    retries: Query<Entity, With<TopBarRetry>>,
+) -> bool {
+    let resized = messages
+        .read()
+        .filter(|event| matches!(event, Event::WindowResized { .. }))
+        .count()
+        > 0;
+    let lost_focus = lost.read().count() > 0;
+    resized || lost_focus || !retries.is_empty()
+}
+
+/// Measures a top bar again when it may have changed, and relays out the
+/// strip that holds the window when it did. Only windows an overlapping stack
+/// has measured before, or failed to, are measured.
+///
+/// - A window that loses focus goes back behind the window below it, so its
+///   top bar is measured then. Its app can change the top bar only while it
+///   is focused or as it resizes, such as when a browser shows its bookmarks
+///   bar, so this finds such a change before the top bar is covered.
+/// - A window that resizes may lay out its top bar again.
+/// - A top bar Accessibility could not read is read again when its
+///   [`TopBarRetry`] timer finishes.
+///
+/// A failed read keeps the last measurement and schedules a retry, waiting
+/// twice as long after each failure, so a busy app is not asked every frame.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn refresh_top_bars(
+    mut messages: MessageReader<Event>,
+    mut lost: RemovedComponents<FocusedMarker>,
+    retries: Query<Entity, With<TopBarRetry>>,
+    mut windows: Query<(
+        Entity,
+        &Window,
+        Option<&mut TopBarHeight>,
+        Option<&mut TopBarRetry>,
+    )>,
+    mut strips: Query<&mut LayoutStrip>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    let mut stale = lost.read().collect::<EntityHashSet>();
+    let resized = messages
+        .read()
+        .filter_map(|event| match event {
+            Event::WindowResized { window_id } => Some(*window_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !resized.is_empty() {
+        for (entity, window, _, _) in &windows {
+            if resized.contains(&window.id()) {
+                stale.insert(entity);
+            }
+        }
+    }
+    for entity in &retries {
+        if let Ok((_, _, _, Some(mut retry))) = windows.get_mut(entity)
+            && retry.0.tick(time.delta()).is_finished()
+        {
+            stale.insert(entity);
+        }
+    }
+
+    for entity in stale {
+        let Ok((_, window, top_bar, retry)) = windows.get_mut(entity) else {
+            continue;
+        };
+        if top_bar.is_none() && retry.is_none() {
+            // No overlapping stack has needed this top bar yet.
+            continue;
+        }
+        if retry.as_ref().is_some_and(|retry| !retry.0.is_finished()) {
+            continue;
+        }
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            continue;
+        };
+        let height = match window.top_bar_height() {
+            Ok(height) => height.unwrap_or(FALLBACK_TOP_BAR_HEIGHT),
+            Err(err) => {
+                debug!("top bar of window {} unreadable: {err}", window.id());
+                match retry {
+                    Some(mut retry) => {
+                        let wait = (retry.0.duration() * 2).min(TOP_BAR_RETRY_LIMIT);
+                        retry.0 = Timer::new(wait, TimerMode::Once);
+                    }
+                    None => {
+                        entity_commands.try_insert(TopBarRetry(Timer::new(
+                            TOP_BAR_RETRY_FIRST,
+                            TimerMode::Once,
+                        )));
+                    }
+                }
+                continue;
+            }
+        };
+        if retry.is_some() {
+            entity_commands.try_remove::<TopBarRetry>();
+        }
+        match top_bar {
+            Some(top_bar) if top_bar.0 == height => continue,
+            Some(mut top_bar) => top_bar.0 = height,
+            None => {
+                entity_commands.try_insert(TopBarHeight(height));
+            }
+        }
+        for mut strip in &mut strips {
+            if strip.contains(entity) {
+                strip.set_changed();
+            }
+        }
+    }
+}
+
 /// Watches for changes to `LayoutStrip` (i.e. a window added or window order changed) and
 /// re-calculates the logical positions of all the windows in the layout strip.
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -1445,6 +1687,7 @@ fn layout_strip_changed(
     mut changed_strips: Populated<(&mut LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
     mut windows: WindowFrames,
     minimum_heights: Query<&MinimumHeight>,
+    top_bars: Query<(&Window, Option<&TopBarHeight>, Has<TopBarRetry>)>,
     displays: DisplayViewports,
     config: Res<Config>,
     mut commands: Commands,
@@ -1456,6 +1699,20 @@ fn layout_strip_changed(
             .ok()
     };
     let get_minimum_height = |entity| minimum_heights.get(entity).ok().map(|m| m.0);
+    let measured = RefCell::new(Vec::new());
+    // A window waiting to retry an unreadable top bar keeps the fallback until
+    // `refresh_top_bars` reads it.
+    let get_top_bar_height = |entity| match top_bars.get(entity) {
+        Ok((_, Some(top_bar), _)) => top_bar.0,
+        Ok((window, None, false)) => {
+            let height = window.top_bar_height();
+            measured
+                .borrow_mut()
+                .push((entity, height.as_ref().ok().copied()));
+            height.ok().flatten().unwrap_or(FALLBACK_TOP_BAR_HEIGHT)
+        }
+        Ok((_, None, true)) | Err(_) => FALLBACK_TOP_BAR_HEIGHT,
+    };
 
     let mut changed = Vec::new();
     for (mut layout_strip, child_of) in &mut changed_strips {
@@ -1467,10 +1724,24 @@ fn layout_strip_changed(
             height,
             &get_window_frame,
             &get_minimum_height,
+            &get_top_bar_height,
         ));
         // Applied now, so later passes keep the heights it set. Clearing it
         // is bookkeeping, not a layout change.
         layout_strip.bypass_change_detection().take_even_splits();
+    }
+
+    for (entity, height) in measured.into_inner() {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            match height {
+                Some(height) => entity_commands
+                    .try_insert(TopBarHeight(height.unwrap_or(FALLBACK_TOP_BAR_HEIGHT))),
+                None => entity_commands.try_insert(TopBarRetry(Timer::new(
+                    TOP_BAR_RETRY_FIRST,
+                    TimerMode::Once,
+                ))),
+            };
+        }
     }
 
     for (entity, frame) in changed {
@@ -2069,6 +2340,29 @@ mod tests {
     use bevy::prelude::*;
 
     #[test]
+    fn top_bar_refresh_stays_idle_without_changes() {
+        let mut harness = crate::tests::TestHarness::new().with_windows(1);
+        harness.run(vec![crate::events::Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_secs(2));
+        let system_type = refresh_top_bars.system_type_id();
+        let last_run = |world: &World| {
+            world
+                .resource::<bevy::ecs::schedule::Schedules>()
+                .get(Update)
+                .unwrap()
+                .systems()
+                .unwrap()
+                .find(|(_, system)| system.system_type() == system_type)
+                .unwrap()
+                .1
+                .get_last_run()
+        };
+        let before = last_run(harness.world());
+        harness.advance(Duration::from_millis(200));
+        assert_eq!(last_run(harness.world()), before);
+    }
+
+    #[test]
     fn fitting_origin_moves_only_to_the_nearest_fitting_edge() {
         assert_eq!(fitting_origin_x(-500, 0..1906, 4..2044), Some(4));
         assert_eq!(fitting_origin_x(500, 0..1906, 4..2044), Some(138));
@@ -2558,6 +2852,131 @@ mod tests {
         let mut heights = vec![400, 400];
         hold_minimum_heights(&mut heights, &[600, 600], 800);
         assert_eq!(heights, vec![600, 600]);
+    }
+
+    fn rows(rows: &[(i32, i32)]) -> Vec<Row> {
+        rows.iter().map(|&(y, height)| Row { y, height }).collect()
+    }
+
+    /// The last window ends at the column bottom, and the upper windows share
+    /// what it leaves above evenly, each strip at least its top bar. Every
+    /// window reaches the column bottom.
+    #[test]
+    fn overlapping_rows_share_the_space_above_the_last_window() {
+        // 548 above the last window: 260 of top bars and 288 shared, 57 each
+        // with the 3 left over going to the first windows.
+        assert_eq!(
+            overlapping_rows(748, &[200; 6], &[52; 6]),
+            rows(&[
+                (0, 748),
+                (110, 638),
+                (220, 528),
+                (330, 418),
+                (439, 309),
+                (548, 200),
+            ])
+        );
+    }
+
+    /// A window starts high enough to fit above the column bottom at its
+    /// floor, which leaves the window above it a smaller strip.
+    #[test]
+    fn overlapping_rows_fit_a_tall_window_above_the_bottom() {
+        assert_eq!(
+            overlapping_rows(1270, &[200, 900, 200], &[60, 40, 52]),
+            rows(&[(0, 1270), (370, 900), (1070, 200)])
+        );
+    }
+
+    /// Top bars that leave no room to share sit back to back.
+    #[test]
+    fn overlapping_rows_stack_top_bars_when_nothing_is_left() {
+        assert_eq!(
+            overlapping_rows(1270, &[1200; 3], &[52; 3]),
+            rows(&[(0, 1270), (52, 1218), (104, 1200)])
+        );
+    }
+
+    /// The stack runs past the column bottom only from the window whose top
+    /// bars above it and floor no longer fit.
+    #[test]
+    fn overlapping_rows_spill_only_when_top_bars_do_not_fit() {
+        let spilled = overlapping_rows(500, &[200; 8], &[52; 8]);
+        assert_eq!(
+            spilled.iter().map(|row| row.y).collect::<Vec<_>>(),
+            vec![0, 52, 104, 156, 208, 260, 312, 364]
+        );
+        let bottoms = spilled
+            .iter()
+            .map(|row| row.y + row.height)
+            .collect::<Vec<_>>();
+        assert_eq!(bottoms, vec![500, 500, 500, 500, 500, 500, 512, 564]);
+    }
+
+    #[test]
+    fn overlapping_rows_give_a_lone_window_its_floor() {
+        assert_eq!(overlapping_rows(700, &[900], &[52]), rows(&[(0, 900)]));
+        assert_eq!(overlapping_rows(700, &[], &[]), vec![]);
+    }
+
+    /// Binpack gives up on these heights, though an even split fits every
+    /// floor. The column is still laid out instead of being left out.
+    #[test]
+    fn a_stack_binpack_gives_up_on_is_split_evenly() {
+        assert_eq!(
+            binpack_heights(&[900, 50, 50], MIN_WINDOW_HEIGHT, 1000),
+            None
+        );
+
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::default();
+        for &entity in &entities {
+            strip.append(entity);
+        }
+        strip.stack(entities[1], Side::West).unwrap();
+        strip.stack(entities[2], Side::West).unwrap();
+        strip.take_even_splits();
+        let heights = [900, 50, 50];
+        let frame = |entity: Entity| {
+            let index = entities.iter().position(|e| *e == entity)?;
+            Some(IRect::new(0, 0, 300, heights[index]))
+        };
+
+        let out = strip.relative_positions(1000, &frame).collect::<Vec<_>>();
+        assert_eq!(
+            out.iter()
+                .map(|(_, frame)| (frame.min.y, frame.height()))
+                .collect::<Vec<_>>(),
+            vec![(0, 333), (333, 333), (666, 334)]
+        );
+    }
+
+    /// Windows too many for the minimum window height overlap instead of
+    /// leaving the layout.
+    #[test]
+    fn a_stack_too_tall_for_the_minimum_window_height_is_laid_out() {
+        let mut world = World::new();
+        let entities = world
+            .spawn_batch(vec![(), (), (), ()])
+            .collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::default();
+        for &entity in &entities {
+            strip.append(entity);
+        }
+        for &entity in &entities[1..] {
+            strip.stack(entity, Side::West).unwrap();
+        }
+        let frame = |_| Some(IRect::new(0, 0, 300, 300));
+
+        let out = strip.relative_positions(700, &frame).collect::<Vec<_>>();
+        // 500 above the last window: 156 of top bars, 344 shared.
+        assert_eq!(
+            out.iter()
+                .map(|(_, frame)| (frame.min.y, frame.height()))
+                .collect::<Vec<_>>(),
+            vec![(0, 700), (167, 533), (334, 366), (500, 200)]
+        );
     }
 
     #[test]

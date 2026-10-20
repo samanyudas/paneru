@@ -10,9 +10,9 @@ use objc2_core_foundation::CGPoint;
 use crate::commands::{Command, Direction, Operation, Side};
 use crate::ecs::drag::{
     Band, ColumnKind, ColumnSnap, DisplaySnap, DragEffect, DragInput, DragState, DropTarget,
-    LayoutSnapshot, PressedWindow, RELEASE_GRACE, Refusal, TOP_BAR_BAND, hit_test, step,
+    LayoutSnapshot, PressedWindow, RELEASE_GRACE, Refusal, hit_test, step,
 };
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{FALLBACK_TOP_BAR_HEIGHT, LayoutStrip};
 use crate::ecs::{ActiveWorkspaceMarker, MouseHeldMarker, SpawnWindowTrigger};
 use crate::events::{Event, MouseButton};
 use crate::manager::{Origin, Size, Window};
@@ -55,6 +55,7 @@ fn down(window: Entity, point: IVec2) -> DragInput {
         window: Some(PressedWindow {
             entity: window,
             frame: FRAME_RECT,
+            top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: true,
         }),
     }
@@ -99,20 +100,21 @@ fn a_press_in_the_top_bar_of_a_tiled_window_may_start_a_drag() {
     assert!(is_pressed(&state), "{state:?}");
     assert_eq!(effects, Vec::<DragEffect>::new());
 
-    let last_row = IVec2::new(100, FRAME_RECT.min.y + TOP_BAR_BAND - 1);
+    let last_row = IVec2::new(100, FRAME_RECT.min.y + FALLBACK_TOP_BAR_HEIGHT - 1);
     assert!(is_pressed(&run(&[down(w, last_row)]).0));
 }
 
 #[test]
 fn other_presses_never_start_a_drag() {
     let w = entities(1)[0];
-    let below_the_bar = IVec2::new(100, FRAME_RECT.min.y + TOP_BAR_BAND);
+    let below_the_bar = IVec2::new(100, FRAME_RECT.min.y + FALLBACK_TOP_BAR_HEIGHT);
     let floating = DragInput::Down {
         point: PRESS,
         button: MouseButton::Left,
         window: Some(PressedWindow {
             entity: w,
             frame: FRAME_RECT,
+            top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: false,
         }),
     };
@@ -122,6 +124,7 @@ fn other_presses_never_start_a_drag() {
         window: Some(PressedWindow {
             entity: w,
             frame: FRAME_RECT,
+            top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: true,
         }),
     };
@@ -845,6 +848,37 @@ fn harness_with(config: &str, display_height: i32, windows: i32) -> TestHarness 
 
 fn three_columns() -> TestHarness {
     harness_with("", TEST_DISPLAY_HEIGHT, 3)
+}
+
+#[test]
+fn a_title_bar_press_uses_its_cached_height() {
+    for (height, offset, expected) in [(96, 60, true), (32, 40, false)] {
+        let mut harness = harness_with("", TEST_DISPLAY_HEIGHT, 1);
+        let entity = harness
+            .world()
+            .query::<(Entity, &Window)>()
+            .iter(harness.world())
+            .find_map(|(entity, window)| (window.id() == 0).then_some(entity))
+            .expect("window exists");
+        harness
+            .world()
+            .entity_mut(entity)
+            .insert(crate::ecs::TopBarHeight(height));
+        harness
+            .mock_state
+            .update_window(0, |window| window.top_bar_height = Some(height));
+        let start = frame(harness.world(), 0).min + IVec2::new(100, offset);
+
+        press_at(&mut harness, start);
+        harness.advance(FRAME);
+
+        let state = drag_state(harness.world());
+        assert_eq!(
+            is_pressed(&state),
+            expected,
+            "height {height}, press offset {offset}: {state:?}"
+        );
+    }
 }
 
 fn command(operation: Operation) -> Event {

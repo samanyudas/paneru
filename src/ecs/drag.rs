@@ -35,20 +35,13 @@ use objc2_core_graphics::CGDirectDisplayID;
 use tracing::debug;
 
 use crate::config::Config;
-use crate::ecs::layout::{Column, LayoutStrip, effective_stack_limit};
+use crate::ecs::layout::{Column, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, effective_stack_limit};
 use crate::ecs::{
     Bounds, DockPosition, FocusedMarker, FullWidthMarker, Initializing, LayoutPosition, Position,
-    PresentedOrigin, SpawnCommandsExt, Unmanaged,
+    PresentedOrigin, SpawnCommandsExt, TopBarHeight, Unmanaged,
 };
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Window, WindowManager, origin_from};
-
-/// The height of the band at the top of a window where a press can start a
-/// title-bar drag.
-///
-/// A fixed fallback for now. Once samanyudas/miri#42 lands, this should read
-/// the cached `TopBarHeight` measurement instead.
-pub(crate) const TOP_BAR_BAND: i32 = 52;
 
 /// How far the pointer must move from the press before a drag can start.
 const DRAG_THRESHOLD: i32 = 4;
@@ -258,6 +251,7 @@ fn gap_at(columns: &[ColumnSnap], x: i32) -> usize {
 pub(crate) struct PressedWindow {
     pub entity: Entity,
     pub frame: IRect,
+    pub top_bar_height: i32,
     /// Whether the window is in a strip, rather than floating.
     pub tiled: bool,
 }
@@ -473,7 +467,7 @@ fn press(point: IVec2, button: MouseButton, window: Option<PressedWindow>) -> Dr
     };
     let frame = window.frame;
     let in_top_bar = (frame.min.x..frame.max.x).contains(&point.x)
-        && (frame.min.y..frame.min.y + TOP_BAR_BAND).contains(&point.y);
+        && (frame.min.y..frame.min.y + window.top_bar_height).contains(&point.y);
     if button != MouseButton::Left || !window.tiled || !in_top_bar {
         return DragState::Idle;
     }
@@ -610,7 +604,7 @@ type WindowInfo<'w, 's> = Query<
         Has<FocusedMarker>,
     ),
 >;
-type Presented<'w, 's> = Query<'w, 's, &'static PresentedOrigin>;
+type Presented<'w, 's> = Query<'w, 's, (&'static PresentedOrigin, Option<&'static TopBarHeight>)>;
 type Placements<'w, 's> =
     Query<'w, 's, (&'static mut LayoutPosition, &'static mut Bounds), With<Window>>;
 type Strips<'w, 's> = Query<
@@ -790,25 +784,27 @@ fn pressed_window(
         .iter()
         .flat_map(|(strip, _, _)| {
             strip.all_windows().into_iter().filter_map(|entity| {
-                let origin = presented.get(entity).ok()?.0;
+                let (origin, top_bar) = presented.get(entity).ok()?;
                 // An app can resize its window after the layout placed it,
                 // so the size comes from the current bounds.
                 let (_, bounds) = placements.get(entity).ok()?;
-                let frame = IRect::from_corners(origin, origin + bounds.0);
-                frame.contains(point).then_some((entity, frame))
+                let frame = IRect::from_corners(origin.0, origin.0 + bounds.0);
+                let height = top_bar.map_or(FALLBACK_TOP_BAR_HEIGHT, |height| height.0);
+                frame.contains(point).then_some((entity, frame, height))
             })
         })
         .collect::<Vec<_>>();
-    let tiled = |(entity, frame): (Entity, IRect)| PressedWindow {
+    let tiled = |(entity, frame, top_bar_height): (Entity, IRect, i32)| PressedWindow {
         entity,
         frame,
+        top_bar_height,
         tiled: true,
     };
 
     if let Some((entity, window, unmanaged, _)) = on_top {
         // Of the tiled windows whose slot holds the press, such as the tabs
         // of a group, the one on top is the one pressed.
-        if let Some(slot) = slots.iter().find(|(slotted, _)| *slotted == entity) {
+        if let Some(slot) = slots.iter().find(|(slotted, _, _)| *slotted == entity) {
             return Some(tiled(*slot));
         }
         let floating =
@@ -817,6 +813,7 @@ fn pressed_window(
             return Some(PressedWindow {
                 entity,
                 frame: window.frame(),
+                top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
                 tiled: false,
             });
         }
