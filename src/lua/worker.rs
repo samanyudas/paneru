@@ -634,6 +634,8 @@ mod tests {
                     bundle_id: "com.example.app".to_string(),
                     app_name: "Test App".to_string(),
                     title: "window".to_string(),
+                    role: Some("AXWindow".to_string()),
+                    subrole: Some("AXStandardWindow".to_string()),
                     focused: true,
                     floating: false,
                     display_id: Some(1),
@@ -850,6 +852,8 @@ mod tests {
                                     app_name: (*app).to_string(),
                                     bundle_id: format!("com.example.{app}"),
                                     title: format!("{app} window"),
+                                    role: Some("AXWindow".to_string()),
+                                    subrole: Some("AXStandardWindow".to_string()),
                                     frame: None,
                                     floating: false,
                                     managed: true,
@@ -913,6 +917,8 @@ mod tests {
             app_name: "Test App".to_string(),
             bundle_id: "com.example.app".to_string(),
             title: "window".to_string(),
+            role: Some("AXWindow".to_string()),
+            subrole: Some("AXStandardWindow".to_string()),
             frame: None,
             floating: false,
             managed: true,
@@ -1605,6 +1611,8 @@ mod tests {
             app_name: "Ghostty".into(),
             bundle_id: "com.mitchellh.ghostty".into(),
             title: "Terminal".into(),
+            role: None,
+            subrole: None,
             frame: crate::types::state::Frame {
                 x: 0,
                 y: 0,
@@ -1636,6 +1644,8 @@ mod tests {
             app_name: "Ghostty".into(),
             bundle_id: "com.mitchellh.ghostty".into(),
             title: "Terminal".into(),
+            role: None,
+            subrole: None,
             frame: crate::types::state::Frame {
                 x: 0,
                 y: 0,
@@ -1651,6 +1661,8 @@ mod tests {
             app_name: "LibreOffice".into(),
             bundle_id: "org.libreoffice.script".into(),
             title: "Document".into(),
+            role: None,
+            subrole: None,
             frame: crate::types::state::Frame {
                 x: 0,
                 y: 0,
@@ -1670,6 +1682,29 @@ mod tests {
         assert_eq!(
             next_flash(&worker, "libreoffice match"),
             "matched:LibreOffice"
+        );
+    }
+
+    #[test]
+    fn window_set_records_expose_role_and_subrole_and_match_on_them() {
+        let worker = worker(
+            r#"
+            local is_standard = paneru.match{ role = "AXWindow", subrole = "AXStandardWindow" }
+            local is_dialog = paneru.match{ subrole = "AXDialog" }
+            paneru.bind("alt - r", function(ws)
+                local win = ws:find(is_standard)
+                if win and not ws:find(is_dialog) then
+                    paneru.flash(win.role .. "/" .. win.subrole)
+                end
+            end)
+            "#,
+        );
+
+        worker.send_binds(vec![1]);
+        serve(&worker, test_window_set_on(1));
+        assert_eq!(
+            next_flash(&worker, "window_set role/subrole"),
+            "AXWindow/AXStandardWindow"
         );
     }
 }

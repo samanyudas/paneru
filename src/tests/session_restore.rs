@@ -3,7 +3,7 @@ use std::time::Duration;
 use bevy::ecs::query::Has;
 use bevy::prelude::*;
 
-use crate::commands::Command;
+use crate::commands::{Command, Operation};
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::state::{
@@ -510,6 +510,11 @@ fn test_startup_restore_uses_first_restored_row_when_active_metadata_is_missing(
 
     assert_eq!(active_strips.len(), 1);
     assert_eq!(active_strips[0].virtual_index, 2);
+    let mut messages = world.query::<&crate::ecs::FlashMessage>();
+    assert!(
+        messages.iter(world).next().is_none(),
+        "startup session restoration should not show a workspace switch popup"
+    );
 }
 
 #[test]
@@ -582,6 +587,12 @@ fn test_late_startup_window_restores_during_grace_period() {
         Event::Command {
             command: Command::PrintState,
         },
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(0)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(1)),
+        },
     ];
 
     harness
@@ -615,6 +626,19 @@ fn test_late_startup_window_restores_during_grace_period() {
                 restored.is_some(),
                 "late startup window should restore into saved row"
             );
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).next().is_none(),
+                "late startup restoration should not show a workspace switch popup"
+            );
+        })
+        .on_iteration(3, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(messages.iter(world).any(|message| message.0 == "1"));
+        })
+        .on_iteration(4, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(messages.iter(world).any(|message| message.0 == "2"));
         })
         .run(commands);
 }
@@ -822,6 +846,146 @@ fn test_startup_restore_keeps_stack_heights() {
             .height()
     });
     assert_eq!(heights, [450, TEST_DISPLAY_HEIGHT - top - 450]);
+}
+
+/// When session restore keeps an emptied baseline row 0 on a workspace whose
+/// active virtual row is > 0, row 0 must be parked off-screen with a
+/// `PreviousStripPosition` (and without `SelectedVirtualMarker`), so that
+/// moving windows to row 0 positions them properly on or off screen.
+#[test]
+fn test_emptied_baseline_row_is_parked_and_repositions_moved_windows() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(10000.0),
+            auto_center: Some(false),
+            continuous_swipe: Some(true),
+            virtual_workspace_animations: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Center),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMove(
+                crate::commands::Direction::South,
+                crate::commands::MoveFocus::Follow,
+            )),
+        },
+    ];
+
+    let mut display = saved_display(TEST_DISPLAY_ID, true);
+    display.workspace_ids = vec![TEST_WORKSPACE_ID, 200];
+
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_display(
+            TEST_DISPLAY_ID,
+            bevy::math::IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, 200],
+        )
+        .with_workspace_window(0, TEST_WORKSPACE_ID, |_| {})
+        .with_workspace_window(1, TEST_WORKSPACE_ID, |_| {})
+        .with_workspace_window(2, 200, |_| {});
+    harness.world().insert_resource(PaneruState {
+        version: 2,
+        timestamp: 123_456_789,
+        active_display_id: Some(TEST_DISPLAY_ID),
+        displays: vec![display],
+        workspaces: vec![
+            SavedWorkspace {
+                workspace_id: TEST_WORKSPACE_ID,
+                display_id: Some(TEST_DISPLAY_ID),
+                active_virtual_index: Some(0),
+                strips: vec![SavedStrip {
+                    virtual_index: 0,
+                    columns: vec![
+                        SavedColumn::Single(saved_window(0)),
+                        SavedColumn::Single(saved_window(1)),
+                    ],
+                }],
+            },
+            SavedWorkspace {
+                workspace_id: 200,
+                display_id: Some(TEST_DISPLAY_ID),
+                active_virtual_index: Some(1),
+                strips: vec![SavedStrip {
+                    virtual_index: 1,
+                    columns: vec![SavedColumn::Single(saved_window(2))],
+                }],
+            },
+        ],
+    });
+
+    let parked_origin = bevy::math::IVec2::new(
+        TEST_DISPLAY_WIDTH - crate::ecs::layout::PARKED_STRIP_SLIVER,
+        TEST_DISPLAY_HEIGHT - crate::ecs::layout::PARKED_STRIP_SLIVER,
+    );
+    let visible_origin = bevy::math::IVec2::new(0, TEST_MENUBAR_HEIGHT);
+
+    harness
+        .on_iteration(0, move |world, _state| {
+            assert_eq!(
+                workspace_rows_state(world, 200),
+                vec![
+                    (0, parked_origin, false, false, Some(visible_origin)),
+                    (1, parked_origin, false, true, Some(visible_origin)),
+                ],
+                "emptied baseline row 0 must be parked with PreviousStripPosition and not selected"
+            );
+        })
+        .on_iteration(1, |world, _state| {
+            let win0 = find_window_entity(0, world);
+            assert!(world.get::<crate::ecs::Position>(win0).unwrap().0.x > 0);
+        })
+        .on_iteration(2, move |world, _state| {
+            let win0 = find_window_entity(0, world);
+            assert_eq!(
+                world.get::<crate::ecs::Position>(win0).unwrap().0,
+                visible_origin,
+                "moving window 0 to a new virtual row must reposition it even when relative LayoutPosition stays (0, 0)"
+            );
+        })
+        .run(commands);
+}
+
+fn workspace_rows_state(
+    world: &mut World,
+    workspace_id: WorkspaceId,
+) -> Vec<(
+    u32,
+    bevy::math::IVec2,
+    bool,
+    bool,
+    Option<bevy::math::IVec2>,
+)> {
+    let mut query = world.query::<(
+        &LayoutStrip,
+        &crate::ecs::Position,
+        Has<crate::ecs::ActiveWorkspaceMarker>,
+        Has<crate::ecs::SelectedVirtualMarker>,
+        Option<&PreviousStripPosition>,
+    )>();
+    let mut rows = query
+        .iter(world)
+        .filter(|(strip, _, _, _, _)| strip.id() == workspace_id)
+        .map(|(strip, pos, active, selected, prev)| {
+            (
+                strip.virtual_index,
+                pos.0,
+                active,
+                selected,
+                prev.map(|p| p.origin),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(idx, ..)| *idx);
+    rows
 }
 
 fn saved_display(display_id: u32, active: bool) -> SavedDisplay {

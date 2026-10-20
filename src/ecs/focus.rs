@@ -3,11 +3,12 @@ use std::time::Duration;
 
 use bevy::app::{App, Plugin, PostUpdate, Update};
 use bevy::ecs::change_detection::{DetectChanges, Ref};
+use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Added, Changed, Has, With};
+use bevy::ecs::query::{Added, Changed, Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
@@ -24,8 +25,9 @@ use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewpor
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, LayoutPosition, Position, RaiseWindow, RepositionMarker,
-    ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
+    ActiveWorkspaceMarker, Bounds, LayoutPosition, Position, RaiseWindow, RefreshWindowSizeOnFocus,
+    RepositionMarker, ReshuffleAroundMarker, ResizeMarker, Scrolling, SendMessageTrigger,
+    SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -35,6 +37,19 @@ const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
 pub(crate) const VERIFY_FOCUS_TIMEOUT: Duration = Duration::from_millis(300);
 /// How long a busy application gets to answer the repeated focus request.
 const VERIFY_FOCUS_AGAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+type MouseFocusStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static LayoutStrip,
+        &'static ChildOf,
+        Option<&'static Scrolling>,
+        Has<ActiveWorkspaceMarker>,
+        &'static Position,
+        Option<&'static RepositionMarker>,
+    ),
+>;
 
 #[derive(Default)]
 pub struct TierMemory {
@@ -122,19 +137,27 @@ impl Plugin for FocusEventsPlugin {
         app.add_systems(
             Update,
             (
-                detect_focus_rejection.before(super::systems::timeout_ticker),
-                fix_window_size_on_focus,
+                detect_focus_rejection.in_set(super::UpdateSet::Events),
+                fix_window_size_on_focus.in_set(super::UpdateSet::Focus),
+                autocenter_window_on_focus
+                    .in_set(super::UpdateSet::Layout)
+                    .after(super::layout::layout_strip_changed)
+                    .before(super::layout::reshuffle_layout_strip),
             ),
         );
         app.add_systems(
             PostUpdate,
             (
-                autocenter_window_on_focus.after(super::systems::animate_resize_entities),
-                mouse_follows_focus.after(super::systems::animate_resize_entities),
-                recover_lost_focus.run_if(on_timer(Duration::from_millis(
-                    REFRESH_WINDOW_CHECK_FREQ_MS,
-                ))),
-                order_overlapping_stacks.run_if(overlapping_stacks_need_ordering),
+                order_overlapping_stacks
+                    .in_set(super::PostUpdateSet::Ui)
+                    .run_if(overlapping_stacks_need_ordering),
+                clear_pending_focus_layout.in_set(super::PostUpdateSet::Bookkeeping),
+                mouse_follows_focus.in_set(super::PostUpdateSet::Ui),
+                recover_lost_focus
+                    .in_set(super::PostUpdateSet::Bookkeeping)
+                    .run_if(on_timer(Duration::from_millis(
+                        REFRESH_WINDOW_CHECK_FREQ_MS,
+                    ))),
             ),
         );
         app.add_observer(dim_remove_window_trigger)
@@ -152,6 +175,19 @@ impl Plugin for FocusEventsPlugin {
 pub(super) struct FocusWindow {
     pub entity: Entity,
     pub raise: bool,
+}
+
+/// Protects command focus until its pending layout has queued movement targets.
+#[derive(Component)]
+pub(super) struct PendingFocusLayout;
+
+fn clear_pending_focus_layout(
+    pending: Populated<Entity, (With<PendingFocusLayout>, Without<ReshuffleAroundMarker>)>,
+    mut commands: Commands,
+) {
+    for entity in pending {
+        commands.entity(entity).try_remove::<PendingFocusLayout>();
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
@@ -177,6 +213,9 @@ fn maintain_focus_singleton(
     // Skip reshuffle if caused by mouse - because then it won't center.
     if config.ffm_flag().is_none() {
         config.set_skip_reshuffle(false);
+        commands
+            .entity(focused_entity)
+            .try_insert(PendingFocusLayout);
     }
     config.set_ffm_flag(None);
 }
@@ -226,10 +265,18 @@ fn shares_a_tab_group(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(focused))]
 pub(super) fn fix_window_size_on_focus(
-    focused: Single<Entity, Added<FocusedMarker>>,
+    focused: Single<(Entity, Has<RefreshWindowSizeOnFocus>), Added<FocusedMarker>>,
     mut windows: Query<(&mut Window, &mut Bounds, Has<ResizeMarker>)>,
+    mut commands: Commands,
 ) {
-    if let Ok((mut window, mut bounds, resizing)) = windows.get_mut(*focused)
+    let (entity, verify_size) = *focused;
+    if !verify_size {
+        return;
+    }
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<RefreshWindowSizeOnFocus>();
+    }
+    if let Ok((mut window, mut bounds, resizing)) = windows.get_mut(entity)
         && !resizing
         && let Ok(frame) = window.update_frame()
         && frame.size() != bounds.0
@@ -431,6 +478,7 @@ fn autocenter_window_on_focus(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
+#[allow(clippy::too_many_arguments)]
 fn mouse_follows_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     windows: Windows,
@@ -438,12 +486,8 @@ fn mouse_follows_focus(
     config: Res<Config>,
     window_manager: Res<WindowManager>,
     displays: Query<&Display>,
-    workspaces: Query<(
-        &LayoutStrip,
-        &ChildOf,
-        Option<&Scrolling>,
-        Has<ActiveWorkspaceMarker>,
-    )>,
+    workspaces: MouseFocusStrips,
+    restored: Query<&RestoreFocusMarker>,
 ) {
     let entity = *focused;
     let Some(window) = windows.get(entity) else {
@@ -451,7 +495,7 @@ fn mouse_follows_focus(
     };
     if workspaces
         .iter()
-        .find_map(|(_, _, scrolling, active)| if active { scrolling } else { None })
+        .find_map(|(_, _, scrolling, active, _, _)| if active { scrolling } else { None })
         .is_some_and(|scrolling| scrolling.is_user_swiping)
     {
         debug!("Suppressing center mouse due to a swipe");
@@ -468,15 +512,25 @@ fn mouse_follows_focus(
         && !global_state.skip_reshuffle()
         && global_state.ffm_flag().is_none_or(|id| id != window.id())
         && let Some(frame) = windows.moving_frame(entity)
-        && let Some(display_bounds) = workspaces
+        && let Some((_, child, _, _, position, reposition)) = workspaces
             .into_iter()
-            .find_map(|(strip, child, _, _)| strip.contains(entity).then_some(child))
-            .and_then(|child| displays.get(child.parent()).ok())
-            .map(Display::bounds)
+            .find(|(strip, _, _, _, _, _)| strip.contains(entity))
+        && let Ok(display) = displays.get(child.parent())
     {
-        let visible = display_bounds.intersect(frame);
-        // If the overlap is smaller than 50x50, the window is probably hidden
-        // off screen, so do not move the mouse.
+        // Project the window's slot onto the strip destination when the window
+        // does not carry its own auto-center target (workspace restore or
+        // auto-center disabled), since the strip moves before its members are
+        // laid out on a following tick.
+        let frame = if (restored.iter().any(|marker| marker.entity == entity)
+            || !config.auto_center())
+            && let Some(layout) = windows.layout_position(entity)
+        {
+            let origin = layout.0 + reposition.map_or(position.0, |target| target.0);
+            IRect::from_corners(origin, origin + frame.size())
+        } else {
+            frame
+        };
+        let visible = display.bounds().intersect(frame);
         if visible.size().length_squared() > 5000 {
             let origin = visible.center();
             debug!("centering on {} {origin}", window.id());

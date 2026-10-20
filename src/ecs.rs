@@ -4,15 +4,13 @@ use std::time::Duration;
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
 use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
+use bevy::ecs::change_detection::DetectChanges;
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
-use bevy::ecs::schedule::common_conditions::{
-    not, on_message, resource_exists, resource_exists_and_changed,
-};
-use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor};
+use bevy::ecs::schedule::common_conditions::{not, on_message, resource_changed, resource_exists};
+use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor, SystemSet};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
 use bevy::tasks::Task;
@@ -38,7 +36,6 @@ use crate::lua;
 use crate::manager::{
     Application, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi, WindowManagerOS,
 };
-use crate::menubar::MenuBarManager;
 use crate::overlay::{DragOverlay, FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
@@ -63,6 +60,62 @@ pub mod workspace;
 #[cfg(feature = "lua")]
 pub(crate) use triggers::apply_config_side_effects;
 
+/// Deterministic execution phases for the [`PreUpdate`] schedule.
+///
+/// Bevy's topological sort breaks ties between unconstrained systems using its
+/// internal node-insertion order, and `DagGroups::flatten` uses `swap_remove`
+/// whenever a system tuple carries a `.run_if(...)` condition (creating an
+/// anonymous set). Codifying explicit phase sets guarantees that adding or
+/// modifying a `.run_if(...)` anywhere in the schedule can never permute
+/// unrelated systems.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PreUpdateSet {
+    /// Answer pending Lua queries from the previous frame and pump OS events.
+    Pump,
+    /// Split high-rate pointer/gesture events out of `Messages<Event>` before
+    /// command and trigger readers iterate the main queue.
+    Demux,
+    /// Process commands, display changes, and window creation events pumped this
+    /// frame.
+    Dispatch,
+}
+
+/// Deterministic execution phases for the [`Update`] schedule.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UpdateSet {
+    /// Pointer and touchpad gesture handling (`MouseEventsPlugin`,
+    /// `ScrollEventsPlugin`).
+    Input,
+    /// OS event triggers, external window move/resize frame sync, and workspace
+    /// switching / cleanup handlers.
+    Events,
+    /// Startup and runtime process/application/window spawning, default sizing,
+    /// floating-rule classification, and initial workspace strip population.
+    Spawn,
+    /// Focus event handling and focus-driven window size verification.
+    Focus,
+    /// Workspace visibility restoration (`show_active_workspace`). Runs after
+    /// `Events`, `Spawn`, and `Focus` have flushed any `ActiveWorkspaceMarker`
+    /// additions, and before `Layout` so newly unparked strips have their
+    /// on-screen `Position` before window layout positions are computed.
+    Workspace,
+    /// Tiling layout calculation (`LayoutEventsPlugin`).
+    Layout,
+    /// Timers, marker cleanup, state persistence, and Lua event forwarding.
+    Housekeeping,
+}
+
+/// Deterministic execution phases for the [`PostUpdate`] schedule.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PostUpdateSet {
+    /// Interpolate and commit window positions and sizes to the OS.
+    Animate,
+    /// Update dim overlays, flash messages, mouse-follows-focus, and menu bar.
+    Ui,
+    /// Clean up destroyed workspaces, save preferences, and broadcast state.
+    Bookkeeping,
+}
+
 /// Registers the Bevy systems for the `WindowManager`.
 /// This function adds various systems to the `Update` schedule, including event dispatchers,
 /// process/application/window lifecycle management, animation, and periodic watchers.
@@ -82,34 +135,59 @@ pub fn register_systems(app: &mut bevy::app::App) {
             .next()
             .is_none_or(|marker| !marker.is_user_swiping)
     };
-    let dimming_enabled = |config: Option<Res<Config>>| {
-        config
-            .is_some_and(|config| config.has_dim_inactive_color() || config.border_active_window())
-    };
-    // The overlay must refresh not just when the active strip's layout changes,
-    // but also whenever focus moves — including focus *loss* (e.g. switching to
-    // an empty virtual workspace), which otherwise leaves a stale outline.
-    // Position changes on the focused window also dirty the overlay so that
-    // dragging a floating window moves the highlight with it.
-    let vw_indicator_dirty =
-        |strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
+    let overlays_dirty =
+        |config: Option<Res<Config>>,
+         theme: Option<Res<SystemTheme>>,
+         strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
          focus_gained: Query<(), Added<FocusedMarker>>,
          workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
          focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>| {
-            !strip_changed.is_empty()
-                || !focus_gained.is_empty()
-                || !workspace_changed.is_empty()
-                || !focused_moved.is_empty()
-        };
-    // The menu bar additionally shows how many virtual workspaces exist, so it
-    // has to redraw when one is created or reaped, neither of which touches the
-    // active strip.
-    let strip_count_changed =
-        |added: Query<(), Added<LayoutStrip>>, mut removed: RemovedComponents<LayoutStrip>| {
-            !added.is_empty() || removed.read().next().is_some()
+            let Some(config) = config else {
+                return false;
+            };
+            let enabled = config.has_dim_inactive_color() || config.border_active_window();
+            config.is_changed()
+                || (enabled
+                    && (theme.is_some_and(|theme| theme.is_changed())
+                        || !strip_changed.is_empty()
+                        || !focus_gained.is_empty()
+                        || !workspace_changed.is_empty()
+                        || !focused_moved.is_empty()))
         };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
+
+    app.configure_sets(
+        PreUpdate,
+        (
+            PreUpdateSet::Pump,
+            PreUpdateSet::Demux,
+            PreUpdateSet::Dispatch,
+        )
+            .chain(),
+    );
+    app.configure_sets(
+        Update,
+        (
+            UpdateSet::Input,
+            UpdateSet::Events,
+            UpdateSet::Spawn,
+            UpdateSet::Focus,
+            UpdateSet::Workspace,
+            UpdateSet::Layout,
+            UpdateSet::Housekeeping,
+        )
+            .chain(),
+    );
+    app.configure_sets(
+        PostUpdate,
+        (
+            PostUpdateSet::Animate,
+            PostUpdateSet::Ui,
+            PostUpdateSet::Bookkeeping,
+        )
+            .chain(),
+    );
 
     app.add_systems(
         Startup,
@@ -126,35 +204,23 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_systems(
         PreUpdate,
         (
-            systems::pump_events,
+            systems::pump_events.in_set(PreUpdateSet::Pump),
+            systems::demux_input_events.in_set(PreUpdateSet::Demux),
             // Read creation notifications in the same frame that pumps them.
             // Otherwise an idle pump can wait up to its next timeout before
             // the first resize of a newly visible window.
-            systems::window_creation_event.after(systems::pump_events),
-            systems::demux_input_events.after(systems::pump_events),
+            systems::window_creation_event.in_set(PreUpdateSet::Dispatch),
         ),
     );
     app.add_systems(
         Update,
         (
             (
-                triggers::apply_window_defaults,
-                systems::detect_tabbed_windows.run_if(native_tabs_enabled),
-                triggers::apply_window_positions,
+                systems::window_resized_update_frame,
+                systems::window_moved_update_frame,
             )
                 .chain()
-                .after(systems::finish_setup),
-            (
-                systems::add_existing_process,
-                systems::add_existing_application,
-                systems::finish_setup,
-            )
-                .chain()
-                .run_if(resource_exists::<Initializing>),
-            systems::add_launched_process.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
-            systems::add_launched_application.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
-            systems::fresh_marker_cleanup,
-            systems::timeout_ticker,
+                .run_if(not_swiping),
             workspace::cleanup_unordered_windows
                 .run_if(not(resource_exists::<Initializing>))
                 .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
@@ -164,47 +230,79 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
             systems::auto_discover_unmanaged_focused_windows,
             systems::retry_front_switch,
+        )
+            .in_set(UpdateSet::Events),
+    );
+    app.add_systems(
+        Update,
+        (
+            systems::add_launched_process.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
+            systems::add_launched_application.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
+            (
+                systems::add_existing_process,
+                systems::add_existing_application,
+            )
+                .chain()
+                .run_if(resource_exists::<Initializing>),
+            (
+                triggers::apply_window_defaults,
+                systems::detect_tabbed_windows.run_if(native_tabs_enabled),
+                triggers::apply_window_positions,
+            )
+                .chain()
+                .after(systems::add_launched_application)
+                .after(systems::add_existing_application),
+            systems::finish_setup
+                .after(triggers::apply_window_positions)
+                .run_if(resource_exists::<Initializing>),
+        )
+            .in_set(UpdateSet::Spawn),
+    );
+    app.add_systems(
+        Update,
+        (
+            systems::fresh_marker_cleanup,
+            systems::timeout_ticker,
             systems::update_low_power_state
                 .run_if(resource_exists::<LowPowerMode>)
                 .run_if(on_timer(LOW_POWER_MODE_CHECK)),
-            (
-                systems::window_resized_update_frame,
-                systems::window_moved_update_frame,
-            )
-                .chain()
-                .run_if(not_swiping),
             restore::tick_restore_grace,
             state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
             state::cleanup_on_exit,
             script_state::periodic_script_state_save.run_if(on_timer(Duration::from_mins(5))),
             script_state::script_state_cleanup_on_exit,
-        ),
+        )
+            .in_set(UpdateSet::Housekeeping),
+    );
+    app.add_systems(
+        PostUpdate,
+        ((
+            systems::animate_entities,
+            systems::animate_resize_entities,
+            systems::commit_window_frame.run_if(not(resource_exists::<Initializing>)),
+            systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
+            triggers::window_resize_verifier,
+            triggers::settle_width_requests,
+        )
+            .chain(),)
+            .in_set(PostUpdateSet::Animate),
     );
     app.add_systems(
         PostUpdate,
         (
             (
-                systems::animate_entities,
-                systems::animate_resize_entities,
-                systems::commit_window_frame.run_if(not(resource_exists::<Initializing>)),
-                systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
-                triggers::window_resize_verifier,
-                triggers::settle_width_requests,
-            )
-                .chain(),
-            (
-                systems::update_overlays
-                    .after(systems::animate_entities)
-                    .after(systems::animate_resize_entities)
-                    .run_if(dimming_enabled)
-                    .run_if(vw_indicator_dirty),
+                systems::update_overlays.run_if(overlays_dirty),
                 systems::update_flash_messages,
             )
                 .chain(),
-            crate::menubar::update_menu_bar
-                .run_if(vw_indicator_dirty.or_eager(strip_count_changed)),
-            crate::menubar::sync_menu_bar_visibility.run_if(resource_exists_and_changed::<Config>),
-        ),
+            crate::menubar::update_menu_bar.run_if(
+                crate::menubar::menu_bar_dirty
+                    .or_eager(crate::menubar::menu_viewport_dirty)
+                    .or_eager(resource_changed::<Config>)
+                    .or_eager(resource_changed::<crate::menubar::MenuBarVisibility>),
+            ),
+        )
+            .in_set(PostUpdateSet::Ui),
     );
     // Last, after every system that writes window frames: the runner exits
     // only once the frame has finished, so an animation still running would
@@ -218,7 +316,6 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         Update,
         (
             triggers::front_switched_trigger,
-            triggers::window_focused_trigger,
             triggers::mission_control_trigger,
             triggers::application_event_trigger,
             triggers::dispatch_application_messages,
@@ -231,7 +328,14 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::invalidate_window_title,
             triggers::refresh_configuration_trigger,
             triggers::theme_change_trigger,
-        ),
+        )
+            .in_set(UpdateSet::Events),
+    );
+    app.add_systems(
+        Update,
+        triggers::window_focused_trigger
+            .in_set(UpdateSet::Focus)
+            .before(focus::fix_window_size_on_focus),
     );
     app.add_observer(triggers::window_unmanaged_trigger)
         .add_observer(triggers::window_managed_trigger)
@@ -625,6 +729,11 @@ impl VerifyWindowPosition {
     }
 }
 
+/// Marker attached to windows after a display change so [`focus::fix_window_size_on_focus`]
+/// re-reads their OS frame once when focused instead of polling AX on every focus change.
+#[derive(Component)]
+pub struct RefreshWindowSizeOnFocus;
+
 #[derive(Deref, DerefMut, Resource)]
 pub struct LowPowerMode(pub bool);
 
@@ -938,18 +1047,17 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
 
     app.set_runner(autorelease_runner);
 
+    crate::menubar::load_menu_bar_preference(&mut app);
     let menu_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
-    platform_callbacks.setup_handlers()?;
+    let initial_config = platform_callbacks.setup_handlers()?;
     let mtm = platform_callbacks.main_thread_marker;
     let overlay_manager = OverlayManager::new(mtm);
     let flash_message_manager = FlashMessageManager::new(mtm);
-    let menu_bar_manager = MenuBarManager::new(mtm, menu_events);
     app.insert_non_send(platform_callbacks)
         .insert_non_send(overlay_manager)
         .insert_non_send(flash_message_manager)
         .insert_non_send(DragOverlay::new(mtm))
-        .insert_non_send(menu_bar_manager)
         .insert_non_send(receiver);
 
     // `CONFIGURATION_FILE` is `None` exactly when an `init.lua` took the TOML
@@ -1004,6 +1112,8 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         app.add_plugins(lua::LuaPlugin {});
     }
 
+    crate::menubar::setup_menu_bar(&mut app, mtm, menu_events, &initial_config);
+
     Ok(app)
 }
 
@@ -1015,7 +1125,13 @@ impl WindowProperties {
     pub fn new(app: &Application, window: &Window, config: &Config) -> Self {
         let bundle_id = app.bundle_id().unwrap_or_default();
         let title = window.title().unwrap_or_default();
-        let params = config.find_window_properties(&title, &bundle_id);
+        // ponytail: a transient AX failure here yields None, so rules keyed on
+        // role/subrole silently miss this window and are never re-matched.
+        // Retry the match once the role becomes readable if this bites.
+        let role = window.role().ok();
+        let subrole = window.subrole().ok();
+        let params =
+            config.find_window_properties(&title, &bundle_id, role.as_deref(), subrole.as_deref());
         Self { params }
     }
 
@@ -1078,5 +1194,84 @@ impl WindowProperties {
             .iter()
             .find_map(|props| props.horizontal_padding)
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::SystemTheme;
+    use crate::{config::Config, tests::TestHarness};
+    use bevy::prelude::*;
+
+    fn overlays_last_run(harness: &TestHarness) -> bevy::ecs::change_detection::Tick {
+        let target = IntoSystem::into_system(crate::ecs::systems::update_overlays).system_type();
+        let schedules = harness.app.world().resource::<Schedules>();
+        let mut systems = schedules.get(PostUpdate).unwrap().systems().unwrap();
+        systems
+            .find(|(_, system)| system.system_type() == target)
+            .map(|(_, system)| system.get_last_run())
+            .unwrap()
+    }
+
+    fn border_config(enabled: bool) -> Config {
+        Config::try_from(&*format!(
+            "[options]\n[bindings]\n[decorations.active.border]\nenabled = {enabled}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn overlays_rerun_on_theme_and_config_changes_only() {
+        let mut harness = TestHarness::new()
+            .with_config(border_config(true))
+            .with_windows(1);
+        harness
+            .world()
+            .insert_resource(SystemTheme { is_dark: false });
+        harness.advance(Duration::from_secs(1));
+
+        let overlay_runs_after = |harness: &mut TestHarness, change: &dyn Fn(&mut World)| {
+            let before = overlays_last_run(harness);
+            change(harness.world());
+            harness.app.update();
+            overlays_last_run(harness) != before
+        };
+
+        assert!(!overlay_runs_after(&mut harness, &|_| {}), "idle frame");
+        assert!(overlay_runs_after(&mut harness, &|world| {
+            world.resource_mut::<SystemTheme>().is_dark = true;
+        }));
+        assert!(
+            !overlay_runs_after(&mut harness, &|_| {}),
+            "idle frame after theme change"
+        );
+        assert!(overlay_runs_after(&mut harness, &|world| {
+            world.insert_resource(border_config(true));
+        }));
+        assert!(overlay_runs_after(&mut harness, &|world| {
+            world.insert_resource(border_config(false));
+        }));
+        assert!(
+            !overlay_runs_after(&mut harness, &|world| {
+                world.resource_mut::<SystemTheme>().is_dark = false;
+            }),
+            "theme change while disabled"
+        );
+    }
+
+    #[test]
+    fn overlays_run_without_system_theme() {
+        let mut harness = TestHarness::new()
+            .with_config(border_config(true))
+            .with_windows(1);
+        harness.advance(Duration::from_secs(1));
+        assert!(harness.world().get_resource::<SystemTheme>().is_none());
+
+        let before = overlays_last_run(&harness);
+        harness.world().insert_resource(border_config(true));
+        harness.app.update();
+        assert_ne!(overlays_last_run(&harness), before);
     }
 }

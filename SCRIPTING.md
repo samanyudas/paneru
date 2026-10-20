@@ -146,7 +146,7 @@ end)
 
 | Event Name | Description | Event Payload Fields |
 | --- | --- | --- |
-| `window_spawned` | A window was fully spawned and initialized in Paneru | `type`, `window_id`, `pid`, `app_name`, `bundle_id`, `title`, `frame` (`{x, y, width, height}`), `floating`, `managed` |
+| `window_spawned` | A window was fully spawned and initialized in Paneru | `type`, `window_id`, `pid`, `app_name`, `bundle_id`, `title`, `role`, `subrole`, `frame` (`{x, y, width, height}`), `floating`, `managed` |
 | `window_focused` | A window gained focus | `type`, `window_id` |
 | `window_destroyed` | A window was closed / destroyed | `type`, `window_id` |
 | `window_moved` | A window was moved | `type`, `window_id` |
@@ -269,9 +269,9 @@ A handler that raises partway through changes nothing either, because it never r
 | `ws:east(id)` / `ws:west(id)` | The window one column over |
 | `ws:next(id)` / `ws:prev(id)` | The next/previous window, wrapping |
 
-A window record contains `id`, `app_name`, `bundle_id`, `title`, `frame`, `floating`, `managed`, `visible` and `focused`.
+A window record contains `id`, `app_name`, `bundle_id`, `title`, `role`, `subrole`, `frame`, `floating`, `managed`, `visible` and `focused`.
 
-`paneru.match{ app = …, bundle = …, title = …, floating = …, managed = … }` builds a compiled predicate; `app`, `bundle` and `title` are regular expressions.
+`paneru.match{ app = …, bundle = …, title = …, role = …, subrole = …, floating = …, managed = … }` builds a compiled predicate; `app`, `bundle` and `title` are regular expressions, while `role` and `subrole` match exact strings.
 
 ### Transforming Layout State
 
