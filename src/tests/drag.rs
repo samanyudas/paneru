@@ -9,8 +9,9 @@ use objc2_core_foundation::CGPoint;
 
 use crate::commands::{Command, Direction, Operation, Side};
 use crate::ecs::drag::{
-    Band, ColumnKind, ColumnSnap, DisplaySnap, DragEffect, DragInput, DragState, DropTarget,
-    LayoutSnapshot, PressedWindow, RELEASE_GRACE, Refusal, hit_test, step,
+    Band, ColumnKind, ColumnSnap, DisplaySnap, Drag, DragEffect, DragFeedback, DragInput,
+    DragState, DropTarget, LayoutSnapshot, OverlayShape, PressedWindow, RELEASE_GRACE, Refusal,
+    hit_test, overlay_shape, step,
 };
 use crate::ecs::layout::{FALLBACK_TOP_BAR_HEIGHT, LayoutStrip};
 use crate::ecs::{ActiveWorkspaceMarker, MouseHeldMarker, SpawnWindowTrigger};
@@ -795,6 +796,171 @@ fn a_pointer_off_every_display_goes_home() {
     assert_eq!(hit(&snap, e[4], 200, 900, 5), DropTarget::Home);
 }
 
+// --- The drag overlay ---
+
+/// A drag of `window` with the pointer at `pointer`, whose release would
+/// land at `target`.
+fn dragging_to(window: Entity, pointer: IVec2, target: DropTarget) -> DragState {
+    DragState::Dragging(Drag {
+        window,
+        pointer,
+        target,
+        button_up_since: None,
+    })
+}
+
+fn shape(e: &[Entity], dragged: usize, target: DropTarget) -> Option<OverlayShape> {
+    let state = dragging_to(e[dragged], IVec2::new(600, 300), target);
+    overlay_shape(&state, &four_columns(e))
+}
+
+fn line(x: std::ops::Range<i32>, y: std::ops::Range<i32>) -> OverlayShape {
+    OverlayShape::Line(IRect::new(x.start, y.start, x.end, y.end))
+}
+
+#[test]
+fn a_drop_into_a_column_shows_a_line_across_it_at_the_gap() {
+    let e = entities(5);
+
+    assert_eq!(
+        shape(&e, 4, into(1, 1)),
+        Some(line(400..800, 393..396)),
+        "between B and C"
+    );
+}
+
+#[test]
+fn a_drop_at_the_top_or_bottom_of_a_column_shows_a_line_inside_the_screen() {
+    let e = entities(5);
+
+    assert_eq!(
+        shape(&e, 4, into(1, 0)),
+        Some(line(400..800, 20..23)),
+        "top"
+    );
+    assert_eq!(
+        shape(&e, 4, into(1, 2)),
+        Some(line(400..800, 765..768)),
+        "bottom"
+    );
+    assert_eq!(
+        shape(&e, 4, into(0, 1)),
+        Some(line(0..400, 765..768)),
+        "below a lone window"
+    );
+}
+
+#[test]
+fn a_reorder_shows_the_line_between_the_other_windows_of_its_stack() {
+    let e = entities(5);
+
+    assert_eq!(
+        shape(&e, 1, into(1, 1)),
+        Some(line(400..800, 765..768)),
+        "B under C"
+    );
+    assert_eq!(
+        shape(&e, 2, into(1, 0)),
+        Some(line(400..800, 20..23)),
+        "C over B"
+    );
+}
+
+#[test]
+fn a_new_column_shows_a_line_down_the_full_height_of_its_gap() {
+    let e = entities(5);
+
+    assert_eq!(
+        shape(&e, 4, new_column(1)),
+        Some(line(399..402, 20..768)),
+        "between A and B"
+    );
+    assert_eq!(
+        shape(&e, 4, new_column(0)),
+        Some(line(0..3, 20..768)),
+        "before the first column"
+    );
+}
+
+#[test]
+fn a_new_column_in_a_padded_gap_shows_its_line_in_the_middle() {
+    let e = entities(3);
+    let snap = snapshot(vec![
+        column(0, 200..500, vec![band(&[e[0]], 20..768)]),
+        column(1, 510..800, vec![band(&[e[1]], 20..768)]),
+    ]);
+    let at = |index| {
+        overlay_shape(
+            &dragging_to(e[2], IVec2::new(900, 300), new_column(index)),
+            &snap,
+        )
+    };
+
+    assert_eq!(at(1), Some(line(504..507, 20..768)), "between the columns");
+    assert_eq!(
+        at(2),
+        Some(line(799..802, 20..768)),
+        "after the last column"
+    );
+}
+
+#[test]
+fn a_refused_drop_shows_the_refusal_symbol_beside_the_pointer_and_no_line() {
+    let e = entities(5);
+    let pointer = IVec2::new(600, 300);
+    for reason in [Refusal::StackFull, Refusal::Fullscreen] {
+        let state = dragging_to(
+            e[0],
+            pointer,
+            DropTarget::Refused {
+                reason,
+                display: DISPLAY,
+            },
+        );
+
+        assert_eq!(
+            overlay_shape(&state, &four_columns(&e)),
+            Some(OverlayShape::Refusal(IRect::new(614, 314, 636, 336))),
+            "{reason:?}"
+        );
+    }
+}
+
+#[test]
+fn the_overlay_hides_unless_a_drag_would_move_the_window() {
+    let e = entities(5);
+    let snap = four_columns(&e);
+    let w = e[4];
+    let settling = run_from(
+        dragging(w),
+        &[DragInput::Up {
+            point: IVec2::new(300, 200),
+        }],
+        ms(100),
+    )
+    .0;
+
+    for state in [
+        DragState::Idle,
+        run(&[down(w, PRESS)]).0,
+        dragging_to(w, IVec2::new(600, 300), DropTarget::Home),
+        settling,
+    ] {
+        assert_eq!(overlay_shape(&state, &snap), None, "{state:?}");
+    }
+}
+
+#[test]
+fn a_target_on_a_display_the_snapshot_lacks_shows_nothing() {
+    let e = entities(5);
+    let elsewhere = DropTarget::NewColumn {
+        display: DISPLAY + 1,
+        index: 1,
+    };
+
+    assert_eq!(shape(&e, 4, elsewhere), None);
+}
+
 // --- Drops in the running engine ---
 
 /// One harness frame, as `TestHarness::advance` paces them.
@@ -1485,4 +1651,118 @@ fn a_drag_held_still_with_the_button_down_still_drops() {
     harness.advance(SETTLE);
 
     assert_eq!(layout(harness.world()), vec![vec![0, 2], vec![1]]);
+}
+
+// --- The drag overlay in the running engine ---
+
+fn feedback(world: &mut World) -> Option<OverlayShape> {
+    world.resource::<DragFeedback>().shape
+}
+
+#[test]
+fn a_drag_over_a_column_shows_a_line_until_the_drop() {
+    let mut harness = three_columns();
+    let target = frame(harness.world(), 0);
+
+    let above_the_top = middle_of(harness.world(), 0, 30);
+    press_and_drag(&mut harness, 2, above_the_top);
+
+    assert_eq!(
+        feedback(harness.world()),
+        Some(OverlayShape::Line(IRect::new(
+            target.min.x,
+            target.min.y,
+            target.max.x,
+            target.min.y + 3,
+        )))
+    );
+
+    release(&mut harness, above_the_top);
+    assert_eq!(feedback(harness.world()), None, "hidden on drop");
+}
+
+#[test]
+fn a_drag_over_an_outer_quarter_shows_a_vertical_line() {
+    let mut harness = three_columns();
+    let column = frame(harness.world(), 1);
+
+    let east_quarter = Origin::new(column.max.x - 10, 300);
+    press_and_drag(&mut harness, 0, east_quarter);
+
+    let Some(OverlayShape::Line(line)) = feedback(harness.world()) else {
+        panic!("{:?}", feedback(harness.world()));
+    };
+    assert_eq!(line.width(), 3, "{line:?}");
+    assert_eq!(line.min.x, column.max.x - 1, "{line:?}");
+    assert_eq!(line.min.y, column.min.y, "full height: {line:?}");
+
+    release(&mut harness, east_quarter);
+    assert_eq!(feedback(harness.world()), None);
+}
+
+#[test]
+fn a_drag_over_a_full_column_shows_the_refusal_symbol_until_the_return() {
+    let mut harness = harness_with("[options]\nstack_limit = 2\n", TEST_DISPLAY_HEIGHT, 3);
+    harness.run(vec![
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    harness.advance(SETTLE);
+
+    let into_the_stack = middle_of(harness.world(), 0, 600);
+    press_and_drag(&mut harness, 2, into_the_stack);
+
+    let corner = into_the_stack + IVec2::new(14, 14);
+    assert_eq!(
+        feedback(harness.world()),
+        Some(OverlayShape::Refusal(IRect::from_corners(
+            corner,
+            corner + IVec2::splat(22),
+        )))
+    );
+
+    release(&mut harness, into_the_stack);
+    assert_eq!(feedback(harness.world()), None, "hidden on the return");
+}
+
+#[test]
+fn a_lost_release_hides_the_overlay() {
+    let mut harness = three_columns();
+    let into_the_column = middle_of(harness.world(), 0, 600);
+    press_and_drag(&mut harness, 2, into_the_column);
+    assert!(feedback(harness.world()).is_some());
+
+    harness.world().write_message(Event::MouseMoved {
+        point: cg(into_the_column),
+        modifiers: Modifiers::empty(),
+    });
+    harness.advance(FRAME);
+
+    assert_eq!(feedback(harness.world()), None);
+}
+
+#[test]
+fn a_release_the_tap_never_reports_hides_the_overlay() {
+    let mut harness = three_columns();
+    let into_the_column = middle_of(harness.world(), 0, 600);
+    press_and_drag(&mut harness, 2, into_the_column);
+    assert!(feedback(harness.world()).is_some());
+
+    harness.mock_state.set_left_button_down(false);
+    harness.advance(SETTLE);
+
+    assert_eq!(drag_state(harness.world()), DragState::Idle);
+    assert_eq!(feedback(harness.world()), None);
+}
+
+#[test]
+fn a_press_that_never_becomes_a_drag_shows_nothing() {
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 1);
+    press_at(&mut harness, start.min + IVec2::new(100, 10));
+    harness.advance(FRAME);
+
+    assert!(matches!(drag_state(harness.world()), DragState::Pressed(_)));
+    assert_eq!(feedback(harness.world()), None);
 }
