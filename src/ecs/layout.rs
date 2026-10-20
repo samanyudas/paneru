@@ -17,7 +17,7 @@ use std::time::Duration;
 use stdext::function_name;
 use tracing::{Level, debug, instrument, trace};
 
-use crate::config::Config;
+use crate::config::{Config, StackLimit};
 use crate::ecs::params::Windows;
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
@@ -46,6 +46,19 @@ pub(crate) const FALLBACK_TOP_BAR_HEIGHT: i32 = 52;
 /// [`TOP_BAR_RETRY_LIMIT`].
 const TOP_BAR_RETRY_FIRST: Duration = Duration::from_secs(1);
 const TOP_BAR_RETRY_LIMIT: Duration = Duration::from_secs(30);
+
+/// How many windows a stack may hold in a column `column_height` tall: the
+/// configured limit, capped at how many fit at [`MIN_WINDOW_HEIGHT`], and
+/// never below one.
+pub(crate) fn effective_stack_limit(config: &Config, column_height: i32) -> usize {
+    let fit = usize::try_from(column_height / MIN_WINDOW_HEIGHT)
+        .unwrap_or(0)
+        .max(1);
+    match config.stack_limit() {
+        StackLimit::Count(count) => count.get().min(fit),
+        StackLimit::Fit => fit,
+    }
+}
 
 pub struct LayoutEventsPlugin;
 
@@ -234,7 +247,7 @@ impl Plugin for LayoutEventsPlugin {
                 // Wait for finish_setup before tiling: until then every window
                 // sits in the active strip regardless of its real display.
                 (
-                    refresh_top_bars,
+                    refresh_top_bars.run_if(top_bars_need_refresh),
                     layout_sizes_changed,
                     layout_strip_changed,
                     reshuffle_layout_strip,
@@ -820,6 +833,28 @@ impl LayoutStrip {
         Ok(())
     }
 
+    /// [`Self::stack`], unless the neighbouring column on `side` already
+    /// holds `limit` stack items. Then the item leaves its own stack for a
+    /// new column between the two instead, and a window that is already its
+    /// own column stays put.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Error)` if the window is not in the strip.
+    pub fn stack_within_limit(&mut self, entity: Entity, side: Side, limit: usize) -> Result<()> {
+        let source = self.index_of(entity)?;
+        let target_len = self
+            .neighbour_index(source, side)
+            .and_then(|target| self.columns.get(target))
+            .and_then(Column::stack_items)
+            .map(|items| items.len());
+        if target_len.is_some_and(|len| len >= limit) {
+            self.unstack(entity, side)
+        } else {
+            self.stack(entity, side)
+        }
+    }
+
     /// Moves the stack item holding `entity` out of its stack into a new
     /// column on `side` of the stack. A no-op if the window is not stacked.
     ///
@@ -1351,14 +1386,20 @@ pub(crate) fn overlapping_rows(column_height: i32, floors: &[i32], top_bars: &[i
     let leftover = (column_height - floors[last] - upper_bars).max(0);
     let upper_count = i32::try_from(last).unwrap_or(i32::MAX).max(1);
     let (share, remainder) = (leftover / upper_count, leftover % upper_count);
+    let mut latest = floors
+        .iter()
+        .map(|floor| column_height - floor)
+        .collect::<Vec<_>>();
+    for index in (0..last).rev() {
+        latest[index] = latest[index].min(latest[index + 1] - top_bars[index]);
+    }
 
     let mut rows = Vec::with_capacity(floors.len());
     // Where the even share would put the next window, and where the top bar of
     // the window above lets it start at the earliest.
     let (mut target, mut earliest) = (0, 0);
     for (index, floor) in floors.iter().enumerate() {
-        let latest = column_height - floor;
-        let y = earliest.max(target.min(latest));
+        let y = earliest.max(target.min(latest[index]));
         rows.push(Row {
             y,
             height: (*floor).max(column_height - y),
@@ -1433,6 +1474,20 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
     }
 }
 
+fn top_bars_need_refresh(
+    mut messages: MessageReader<Event>,
+    mut lost: RemovedComponents<FocusedMarker>,
+    retries: Query<Entity, With<TopBarRetry>>,
+) -> bool {
+    let resized = messages
+        .read()
+        .filter(|event| matches!(event, Event::WindowResized { .. }))
+        .count()
+        > 0;
+    let lost_focus = lost.read().count() > 0;
+    resized || lost_focus || !retries.is_empty()
+}
+
 /// Measures a top bar again when it may have changed, and relays out the
 /// strip that holds the window when it did. Only windows an overlapping stack
 /// has measured before, or failed to, are measured.
@@ -1451,6 +1506,7 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
 fn refresh_top_bars(
     mut messages: MessageReader<Event>,
     mut lost: RemovedComponents<FocusedMarker>,
+    retries: Query<Entity, With<TopBarRetry>>,
     mut windows: Query<(
         Entity,
         &Window,
@@ -1469,11 +1525,15 @@ fn refresh_top_bars(
             _ => None,
         })
         .collect::<Vec<_>>();
-    for (entity, window, _, retry) in &mut windows {
-        if resized.contains(&window.id()) {
-            stale.insert(entity);
+    if !resized.is_empty() {
+        for (entity, window, _, _) in &windows {
+            if resized.contains(&window.id()) {
+                stale.insert(entity);
+            }
         }
-        if let Some(mut retry) = retry
+    }
+    for entity in &retries {
+        if let Ok((_, _, _, Some(mut retry))) = windows.get_mut(entity)
             && retry.0.tick(time.delta()).is_finished()
         {
             stale.insert(entity);
@@ -2186,6 +2246,29 @@ pub(crate) fn anchored_origin(
 mod tests {
     use super::*;
     use bevy::prelude::*;
+
+    #[test]
+    fn top_bar_refresh_stays_idle_without_changes() {
+        let mut harness = crate::tests::TestHarness::new().with_windows(1);
+        harness.run(vec![crate::events::Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_secs(2));
+        let system_type = refresh_top_bars.system_type_id();
+        let last_run = |world: &World| {
+            world
+                .resource::<bevy::ecs::schedule::Schedules>()
+                .get(Update)
+                .unwrap()
+                .systems()
+                .unwrap()
+                .find(|(_, system)| system.system_type() == system_type)
+                .unwrap()
+                .1
+                .get_last_run()
+        };
+        let before = last_run(harness.world());
+        harness.advance(Duration::from_millis(200));
+        assert_eq!(last_run(harness.world()), before);
+    }
 
     #[test]
     fn fitting_origin_moves_only_to_the_nearest_fitting_edge() {

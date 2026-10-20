@@ -7,7 +7,7 @@ use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Added, Has, With};
+use bevy::ecs::query::{Added, Changed, Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
@@ -133,7 +133,7 @@ impl Plugin for FocusEventsPlugin {
                 recover_lost_focus.run_if(on_timer(Duration::from_millis(
                     REFRESH_WINDOW_CHECK_FREQ_MS,
                 ))),
-                order_overlapping_stacks,
+                order_overlapping_stacks.run_if(overlapping_stacks_need_ordering),
             ),
         );
         app.add_observer(dim_remove_window_trigger)
@@ -606,6 +606,15 @@ fn raise_window_trigger(
     window.raise_without_focus();
 }
 
+fn overlapping_stacks_need_ordering(
+    gained: Query<Entity, Added<FocusedMarker>>,
+    mut lost: RemovedComponents<FocusedMarker>,
+    strips: Query<(), (Changed<LayoutStrip>, With<ActiveWorkspaceMarker>)>,
+) -> bool {
+    let lost_focus = lost.read().count() > 0;
+    !gained.is_empty() || lost_focus || !strips.is_empty()
+}
+
 /// Keeps every top bar of an overlapping stack visible. Each lower window goes
 /// in front of the window above it, and the focused window goes in front of
 /// everything, so it shows its full content. Runs when focus enters or leaves
@@ -763,9 +772,33 @@ mod tests {
     use crate::manager::MockWindowApi;
     use crate::manager::app::MockApplicationApi;
     use crate::platform::WinID;
+    use bevy::ecs::system::IntoSystem as _;
     use bevy::ecs::world::World;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI32, Ordering};
+
+    #[test]
+    fn overlapping_order_stays_idle_without_changes() {
+        let mut harness = crate::tests::TestHarness::new().with_windows(1);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_secs(2));
+        let system_type = order_overlapping_stacks.system_type_id();
+        let last_run = |world: &World| {
+            world
+                .resource::<bevy::ecs::schedule::Schedules>()
+                .get(PostUpdate)
+                .unwrap()
+                .systems()
+                .unwrap()
+                .find(|(_, system)| system.system_type() == system_type)
+                .unwrap()
+                .1
+                .get_last_run()
+        };
+        let before = last_run(harness.world());
+        harness.advance(Duration::from_millis(200));
+        assert_eq!(last_run(harness.world()), before);
+    }
 
     fn spawn_app(world: &mut World, frontmost: bool, focused_id: WinID) -> Entity {
         let mut api = MockApplicationApi::new();

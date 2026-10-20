@@ -9,6 +9,7 @@ use std::{
     ffi::c_void,
     fs::{OpenOptions, create_dir_all, read_to_string},
     io::{ErrorKind, Write},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     ptr::NonNull,
     sync::{Arc, LazyLock},
@@ -820,6 +821,12 @@ impl Config {
             .unwrap_or(0.05)
     }
 
+    /// How many windows one stack holds, before capping at what fits on a
+    /// display (see `effective_stack_limit`).
+    pub fn stack_limit(&self) -> StackLimit {
+        self.options().stack_limit.unwrap_or_default()
+    }
+
     pub fn auto_center(&self) -> bool {
         self.options().auto_center.is_some_and(|center| center)
     }
@@ -1314,6 +1321,11 @@ pub struct MainOptions {
     /// resize commands add or remove. Default: 0.05.
     pub window_resize_step: Option<f64>,
 
+    /// How many windows one stack holds: a whole number from 1, or `"fit"`
+    /// for as many as fit in the column at the minimum window height. A
+    /// number is capped at that same count. Default: 5.
+    pub stack_limit: Option<StackLimit>,
+
     /// If enabled, an empty virtual workspace will be removed.
     /// Default: true.
     pub reap_empty_workspaces: Option<bool>,
@@ -1394,6 +1406,76 @@ impl<'de> Deserialize<'de> for Keybinding {
             modifiers,
             command: Command::Quit,
         })
+    }
+}
+
+/// How many windows one stack holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackLimit {
+    Count(NonZeroUsize),
+    /// As many as fit in the column at the minimum window height.
+    Fit,
+}
+
+impl Default for StackLimit {
+    fn default() -> Self {
+        Self::Count(NonZeroUsize::new(5).expect("5 is not zero"))
+    }
+}
+
+impl<'de> Deserialize<'de> for StackLimit {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StackLimitVisitor;
+
+        impl de::Visitor<'_> for StackLimitVisitor {
+            type Value = StackLimit;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(r#"a whole number from 1 or "fit""#)
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<StackLimit, E> {
+                usize::try_from(value)
+                    .ok()
+                    .and_then(NonZeroUsize::new)
+                    .map(StackLimit::Count)
+                    .ok_or_else(|| E::invalid_value(de::Unexpected::Signed(value), &self))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<StackLimit, E> {
+                usize::try_from(value)
+                    .ok()
+                    .and_then(NonZeroUsize::new)
+                    .map(StackLimit::Count)
+                    .ok_or_else(|| E::invalid_value(de::Unexpected::Unsigned(value), &self))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<StackLimit, E> {
+                if value == "fit" {
+                    Ok(StackLimit::Fit)
+                } else {
+                    Err(E::invalid_value(de::Unexpected::Str(value), &self))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(StackLimitVisitor)
+    }
+}
+
+#[cfg(test)]
+impl serde::Serialize for StackLimit {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Count(count) => serializer.serialize_u64(count.get() as u64),
+            Self::Fit => serializer.serialize_str("fit"),
+        }
     }
 }
 
@@ -2704,6 +2786,25 @@ mod lua_setup_tests {
             !rules[0].passthrough_keys().is_empty(),
             "passthrough chords should resolve to keycodes"
         );
+    }
+
+    #[test]
+    fn setup_table_sets_the_stack_limit() {
+        let limit = |value: &str| {
+            config_from_source(&format!(
+                "return {{ options = {{ stack_limit = {value} }} }}"
+            ))
+            .stack_limit()
+        };
+        assert_eq!(limit("3"), StackLimit::Count(NonZeroUsize::new(3).unwrap()));
+        assert_eq!(limit("\"fit\""), StackLimit::Fit);
+
+        let lua = Lua::new();
+        let zero = lua
+            .load("return { options = { stack_limit = 0 } }")
+            .eval()
+            .expect("lua chunk should evaluate");
+        assert!(config_from_lua(&lua, zero).is_err());
     }
 
     #[test]
