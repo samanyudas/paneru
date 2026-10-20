@@ -19,7 +19,7 @@ use crate::ecs::layout::{Column, LayoutStrip, strip_content_range};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, ManualStripOffset, MissionControlActive, Position, RepositionMarker,
-    ScrollInput, Scrolling, SendMessageTrigger,
+    ScrollInput, Scrolling, SendMessageTrigger, UpdateSet,
 };
 use crate::errors::Result;
 use bevy::ecs::schedule::common_conditions::on_message;
@@ -108,12 +108,9 @@ impl Plugin for ScrollEventsPlugin {
                     apply_scrolling_constraints,
                     swiping_timeout,
                 )
-                    .chain()
-                    // The strip moves in the frame its input arrives. Without
-                    // this order, the executor could place the windows first
-                    // and show the move a frame late.
-                    .before(super::layout::position_layout_strips),
-            ),
+                    .chain(),
+            )
+                .in_set(UpdateSet::Input),
         );
     }
 }
@@ -645,7 +642,9 @@ where
     };
 
     let left_snap = strip_position(layout_strip.last());
-    let right_snap = strip_position(layout_strip.first());
+    // NOTE: this snaps to the second window on purpose.
+    // For a single colum workspace this will return None
+    let right_snap = strip_position(layout_strip.get(1));
 
     Some(
         if continuous_swipe && let Some((left_snap, right_snap)) = left_snap.zip(right_snap) {

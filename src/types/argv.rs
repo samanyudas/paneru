@@ -48,6 +48,8 @@ pub fn parse_command(argv: &[&str]) -> Result<Command> {
         "mouse" => Command::Mouse(parse_mouse_move(&argv[1..])?),
         "quit" => Command::Quit,
         "restart" => Command::Restart,
+        "showmenu" if argv.len() == 1 => Command::MenuBar(true),
+        "hidemenu" if argv.len() == 1 => Command::MenuBar(false),
         _ => return Err(ParseError::new(format!("unhandled command '{argv:?}'"))),
     })
 }
@@ -186,6 +188,9 @@ impl Command {
             Command::Quit => vec!["quit".to_string()],
             Command::Restart => vec!["restart".to_string()],
             Command::PrintState => vec!["printstate".to_string()],
+            Command::MenuBar(enabled) => {
+                vec![if *enabled { "showmenu" } else { "hidemenu" }.to_string()]
+            }
             Command::Lua(_) | Command::Layout(_) => return None,
         };
         Some(argv)
@@ -355,6 +360,8 @@ mod tests {
             Command::Quit,
             Command::Restart,
             Command::PrintState,
+            Command::MenuBar(true),
+            Command::MenuBar(false),
             Command::Mouse(MouseMove::ToNextDisplay),
         ] {
             assert_eq!(
@@ -398,5 +405,7 @@ mod tests {
         assert!(parse_command(&["window", "swap", "3"]).is_err());
         assert!(parse_command(&["window", "stack", "north"]).is_err());
         assert!(parse_command(&["window", "unstack", "first"]).is_err());
+        assert!(parse_command(&["showmenu", "extra"]).is_err());
+        assert!(parse_command(&["hidemenu", "extra"]).is_err());
     }
 }

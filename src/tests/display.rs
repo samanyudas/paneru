@@ -488,7 +488,7 @@ fn test_display_configuration_reapplies_layout_after_geometry_change() {
     let display = world.query::<&Display>().single(world).unwrap();
     assert_eq!(display.bounds().min.x, 0, "wait for the display to settle");
 
-    harness.advance(Duration::from_millis(1000));
+    harness.advance(Duration::from_secs(1));
     let updated = harness
         .world()
         .get::<Window>(window_entity)
@@ -602,7 +602,7 @@ fn test_unplug_rehomes_workspace_and_window_on_surviving_display() {
         .write_message::<Event>(Event::DisplayRemoved {
             display_id: EXT_DISPLAY_ID,
         });
-    harness.advance(Duration::from_millis(1000));
+    harness.advance(Duration::from_secs(1));
 
     let world = harness.world();
     let main = world.query::<(&Display, Entity)>().single(world).unwrap().1;
@@ -690,7 +690,7 @@ fn test_wake_reapplies_window_frame_without_geometry_change() {
     harness
         .world()
         .write_message::<Event>(Event::SystemWoke { msg: String::new() });
-    harness.advance(Duration::from_millis(1000));
+    harness.advance(Duration::from_secs(1));
 
     let restored = harness
         .world()
@@ -829,8 +829,8 @@ fn test_hidden_stack_stays_off_the_display_below() {
             assert_on_workspace!(world, 1, TEST_WORKSPACE_ID);
             assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
             assert_not_on_workspace!(world, 1, EXT_WORKSPACE_ID);
-            assert_window_at!(world, 0, 400, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 400, 394);
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 0, 394);
         })
         .run(commands);
 }
@@ -906,6 +906,146 @@ fn test_center_survives_display_round_trip() {
             );
         })
         .run(commands);
+}
+
+#[test]
+fn focusing_another_display_without_switching_its_workspace_does_not_flash() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+            window.workspace_id = EXT_WORKSPACE_ID;
+        });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    // The focus event can arrive before the active-display notification.
+    harness.mock_state.focus_window(100);
+    harness.advance(Duration::from_millis(60));
+    let world = harness.world();
+    let mut active =
+        world.query_filtered::<&LayoutStrip, With<crate::ecs::ActiveWorkspaceMarker>>();
+    assert_eq!(active.single(world).unwrap().id(), EXT_WORKSPACE_ID);
+    let mut messages = world.query::<&crate::ecs::FlashMessage>();
+    assert!(
+        messages.iter(world).next().is_none(),
+        "focus on another display must not flash on the original display"
+    );
+
+    harness.mock_state.activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(60));
+    let world = harness.world();
+    let mut messages = world.query::<&crate::ecs::FlashMessage>();
+    assert!(
+        messages.iter(world).next().is_none(),
+        "recognizing the new display must not turn focus into a workspace popup"
+    );
+
+    harness.mock_state.focus_window(0);
+    harness.advance(Duration::from_millis(60));
+    let world = harness.world();
+    let mut messages = world.query::<&crate::ecs::FlashMessage>();
+    assert!(
+        messages.iter(world).next().is_none(),
+        "returning to an unchanged strip must also stay quiet"
+    );
+
+    harness.mock_state.activate_display(TEST_DISPLAY_ID);
+    harness.advance(Duration::from_millis(60));
+    let world = harness.world();
+    let mut messages = world.query::<&crate::ecs::FlashMessage>();
+    assert!(messages.iter(world).next().is_none());
+}
+
+#[test]
+fn focus_display_south_does_not_flash() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(
+                0,
+                TEST_DISPLAY_HEIGHT,
+                EXT_DISPLAY_WIDTH,
+                TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
+            ),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+            window.workspace_id = EXT_WORKSPACE_ID;
+        });
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::FocusDisplay(Direction::South)),
+        },
+    ]);
+
+    let world = harness.world();
+    let mut active =
+        world.query_filtered::<&LayoutStrip, With<crate::ecs::ActiveWorkspaceMarker>>();
+    assert_eq!(active.single(world).unwrap().id(), EXT_WORKSPACE_ID);
+    let mut messages = world.query::<&crate::ecs::FlashMessage>();
+    assert!(
+        messages.iter(world).next().is_none(),
+        "focus_display south must not create a workspace popup"
+    );
+}
+
+#[test]
+fn popup_waits_until_the_destination_display_is_active() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+            window.workspace_id = EXT_WORKSPACE_ID;
+        });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    let target = {
+        let world = harness.world();
+        let display = world
+            .query::<(Entity, &Display)>()
+            .iter(world)
+            .find_map(|(entity, display)| (display.id() == EXT_DISPLAY_ID).then_some(entity))
+            .expect("external display");
+        world
+            .spawn((
+                LayoutStrip::new(EXT_WORKSPACE_ID, 1),
+                crate::ecs::Position(Origin::new(0, -EXT_DISPLAY_HEIGHT)),
+                ChildOf(display),
+            ))
+            .id()
+    };
+
+    // Workspace activation arrives while the original display is still marked active.
+    harness
+        .world()
+        .entity_mut(target)
+        .insert(crate::ecs::ActiveWorkspaceMarker);
+    harness.advance(Duration::from_millis(20));
+    let world = harness.world();
+    let mut messages = world.query::<&crate::ecs::FlashMessage>();
+    assert!(
+        messages.iter(world).next().is_none(),
+        "the popup must not render on the old display"
+    );
+
+    harness.mock_state.activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(60));
+    let world = harness.world();
+    let mut messages = world.query::<&crate::ecs::FlashMessage>();
+    assert!(
+        messages.iter(world).any(|message| message.0 == "2"),
+        "the pending workspace change should flash after display recognition"
+    );
 }
 
 /// An empty row 0 must survive its display going away. Despawning it left the
@@ -2265,4 +2405,435 @@ fn test_close_new_generation_before_recovery_is_not_a_ghost() {
     harness.mock_state.os_close_window(0);
     harness.advance(Duration::from_millis(100));
     assert_eq!(window_entity(harness.world(), 0), None);
+}
+
+#[test]
+fn test_fix_window_size_on_focus_only_after_display_change() {
+    use crate::ecs::{Bounds, RefreshWindowSizeOnFocus};
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::DisplayChanged,
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::West)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(0, |_world, state| {
+            // Silently change window 1's OS width without emitting WindowResized.
+            state.update_window(1, |window| {
+                window.frame.max.x = window.frame.min.x + 600;
+            });
+        })
+        .on_iteration(1, |world, _state| {
+            let win1 = find_window_entity(1, world);
+            assert_eq!(
+                world.get::<Bounds>(win1).expect("win1 bounds").0.x,
+                TEST_WINDOW_WIDTH,
+                "ordinary focus changes must not poll AX to re-read window size"
+            );
+            assert!(world.get::<RefreshWindowSizeOnFocus>(win1).is_none());
+        })
+        .on_iteration(2, |world, _state| {
+            let win0 = find_window_entity(0, world);
+            let win1 = find_window_entity(1, world);
+            assert!(
+                world.get::<RefreshWindowSizeOnFocus>(win0).is_some()
+                    && world.get::<RefreshWindowSizeOnFocus>(win1).is_some(),
+                "DisplayChanged only attaches RefreshWindowSizeOnFocus without immediately polling AX"
+            );
+            assert_eq!(
+                world.get::<Bounds>(win1).expect("win1 bounds").0.x,
+                TEST_WINDOW_WIDTH,
+                "already-focused window is not re-read until it next gains focus"
+            );
+        })
+        .on_iteration(3, |world, _state| {
+            let win0 = find_window_entity(0, world);
+            let win1 = find_window_entity(1, world);
+            assert!(
+                world.get::<RefreshWindowSizeOnFocus>(win0).is_none(),
+                "focusing window 0 consumes its RefreshWindowSizeOnFocus marker"
+            );
+            assert!(
+                world.get::<RefreshWindowSizeOnFocus>(win1).is_some(),
+                "window 1 keeps RefreshWindowSizeOnFocus until it gains focus"
+            );
+        })
+        .on_iteration(4, |world, _state| {
+            let win1 = find_window_entity(1, world);
+            assert_eq!(
+                world.get::<Bounds>(win1).expect("win1 bounds").0.x,
+                600,
+                "focusing window 1 with RefreshWindowSizeOnFocus refreshes its Bounds from AX"
+            );
+            assert!(
+                world.get::<RefreshWindowSizeOnFocus>(win1).is_none(),
+                "window 1's RefreshWindowSizeOnFocus marker is removed after checking"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_attach_display_moves_virtual_workspace_together() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        Event::DisplayAdded {
+            display_id: EXT_DISPLAY_ID,
+        },
+    ];
+
+    let mut harness = TestHarness::new().with_windows(4);
+    harness
+        .app
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            500,
+        )));
+
+    harness
+        .on_iteration(5, |world, mut state| {
+            // Before attaching EXT_DISPLAY_ID: [0, 1] on v0, [2, 3] on v1.
+            let win0 = find_window_entity(0, world);
+            let win1 = find_window_entity(1, world);
+            let win2 = find_window_entity(2, world);
+            let win3 = find_window_entity(3, world);
+
+            let v0 = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .find(|s| s.id() == TEST_WORKSPACE_ID && s.virtual_index == 0)
+                .expect("v0 on TEST_WORKSPACE_ID");
+            assert_eq!(v0.all_windows(), vec![win0, win1]);
+
+            let v1 = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .find(|s| s.id() == TEST_WORKSPACE_ID && s.virtual_index == 1)
+                .expect("v1 on TEST_WORKSPACE_ID");
+            assert_eq!(v1.all_windows(), vec![win2, win3]);
+
+            // Attach EXT_DISPLAY_ID and report both windows 2 and 3 on EXT_WORKSPACE_ID.
+            state.add_display(
+                EXT_DISPLAY_ID,
+                IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+                vec![EXT_WORKSPACE_ID],
+            );
+            state.update_window(2, |w| w.workspace_id = EXT_WORKSPACE_ID);
+            state.update_window(3, |w| w.workspace_id = EXT_WORKSPACE_ID);
+        })
+        .on_iteration(6, |world, _state| {
+            let win0 = find_window_entity(0, world);
+            let win1 = find_window_entity(1, world);
+            let win2 = find_window_entity(2, world);
+            let win3 = find_window_entity(3, world);
+
+            let main_strips: Vec<(u32, Vec<Entity>)> = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|s| s.id() == TEST_WORKSPACE_ID)
+                .map(|s| (s.virtual_index, s.all_windows()))
+                .collect();
+            assert_eq!(
+                main_strips,
+                vec![(0, vec![win0, win1])],
+                "source display should only have v0 with [0, 1] after v1 moved away"
+            );
+
+            let ext_strips: Vec<(u32, Vec<Entity>)> = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|s| s.id() == EXT_WORKSPACE_ID)
+                .map(|s| (s.virtual_index, s.all_windows()))
+                .collect();
+            assert_eq!(
+                ext_strips,
+                vec![(0, vec![win2, win3])],
+                "new display should receive [2, 3] together in its first virtual workspace v0"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_attach_display_only_moves_windows_reported_by_os() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        Event::DisplayAdded {
+            display_id: EXT_DISPLAY_ID,
+        },
+    ];
+
+    let mut harness = TestHarness::new().with_windows(4);
+    harness
+        .app
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            500,
+        )));
+
+    harness
+        .on_iteration(5, |_world, mut state| {
+            // Attach EXT_DISPLAY_ID, but macOS only reports window 2 (not 3) on EXT_WORKSPACE_ID.
+            state.add_display(
+                EXT_DISPLAY_ID,
+                IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+                vec![EXT_WORKSPACE_ID],
+            );
+            state.update_window(2, |w| w.workspace_id = EXT_WORKSPACE_ID);
+        })
+        .on_iteration(6, |world, _state| {
+            let win0 = find_window_entity(0, world);
+            let win1 = find_window_entity(1, world);
+            let win2 = find_window_entity(2, world);
+            let win3 = find_window_entity(3, world);
+
+            let mut main_strips: Vec<(u32, Vec<Entity>)> = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|s| s.id() == TEST_WORKSPACE_ID)
+                .map(|s| (s.virtual_index, s.all_windows()))
+                .collect();
+            main_strips.sort_by_key(|(idx, _)| *idx);
+            assert_eq!(
+                main_strips,
+                vec![(0, vec![win0, win1]), (1, vec![win3])],
+                "window 3 was not reported on the new display and must stay on v1 of main display"
+            );
+
+            let ext_strips: Vec<(u32, Vec<Entity>)> = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|s| s.id() == EXT_WORKSPACE_ID)
+                .map(|s| (s.virtual_index, s.all_windows()))
+                .collect();
+            assert_eq!(
+                ext_strips,
+                vec![(0, vec![win2])],
+                "only window 2 should move to the new display"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_attach_display_compacts_emptied_first_virtual_workspace() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        Event::DisplayAdded {
+            display_id: EXT_DISPLAY_ID,
+        },
+    ];
+
+    let mut harness = TestHarness::new().with_windows(4);
+    harness
+        .app
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            500,
+        )));
+
+    harness
+        .on_iteration(5, |_world, mut state| {
+            // Attach EXT_DISPLAY_ID and move [0, 1] from v0 of TEST_WORKSPACE_ID to EXT_WORKSPACE_ID.
+            state.add_display(
+                EXT_DISPLAY_ID,
+                IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+                vec![EXT_WORKSPACE_ID],
+            );
+            state.update_window(0, |w| w.workspace_id = EXT_WORKSPACE_ID);
+            state.update_window(1, |w| w.workspace_id = EXT_WORKSPACE_ID);
+        })
+        .on_iteration(6, |world, _state| {
+            let win0 = find_window_entity(0, world);
+            let win1 = find_window_entity(1, world);
+            let win2 = find_window_entity(2, world);
+            let win3 = find_window_entity(3, world);
+
+            let main_strips: Vec<(u32, Vec<Entity>)> = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|s| s.id() == TEST_WORKSPACE_ID)
+                .map(|s| (s.virtual_index, s.all_windows()))
+                .collect();
+            assert_eq!(
+                main_strips,
+                vec![(0, vec![win2, win3])],
+                "emptied v0 on source display must be removed and v1 compacted to v0"
+            );
+
+            let ext_strips: Vec<(u32, Vec<Entity>)> = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|s| s.id() == EXT_WORKSPACE_ID)
+                .map(|s| (s.virtual_index, s.all_windows()))
+                .collect();
+            assert_eq!(ext_strips, vec![(0, vec![win0, win1])]);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_remove_display_appends_strip_as_next_virtual_workspace() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(2)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {})
+        .with_workspace_window(101, EXT_WORKSPACE_ID, |_| {});
+
+    harness
+        .app
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            500,
+        )));
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::DisplayRemoved {
+            display_id: EXT_DISPLAY_ID,
+        },
+    ];
+
+    harness
+        .on_iteration(0, |_world, state| {
+            // Unplug EXT_DISPLAY_ID; macOS moves windows 100 and 101 to TEST_WORKSPACE_ID.
+            state.remove_display(EXT_DISPLAY_ID);
+            state.update_window(100, |w| w.workspace_id = TEST_WORKSPACE_ID);
+            state.update_window(101, |w| w.workspace_id = TEST_WORKSPACE_ID);
+        })
+        .on_iteration(1, |world, _state| {
+            let win0 = find_window_entity(0, world);
+            let win1 = find_window_entity(1, world);
+            let win100 = find_window_entity(100, world);
+            let win101 = find_window_entity(101, world);
+
+            let mut main_strips: Vec<(u32, Vec<Entity>)> = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|s| s.id() == TEST_WORKSPACE_ID)
+                .map(|s| (s.virtual_index, s.all_windows()))
+                .collect();
+            main_strips.sort_by_key(|(idx, _)| *idx);
+            assert_eq!(
+                main_strips,
+                vec![(0, vec![win0, win1]), (1, vec![win100, win101])],
+                "windows from removed display must become the next virtual workspace (v1) on surviving display, not merged into v0"
+            );
+
+            let leftover_ext = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|s| s.id() == EXT_WORKSPACE_ID)
+                .count();
+            assert_eq!(
+                leftover_ext, 0,
+                "emptied orphan strip from removed display should be despawned"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_remove_display_populates_empty_first_workspace_on_surviving_display() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {})
+        .with_workspace_window(101, EXT_WORKSPACE_ID, |_| {});
+
+    harness
+        .app
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            500,
+        )));
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        Event::DisplayRemoved {
+            display_id: EXT_DISPLAY_ID,
+        },
+    ];
+
+    harness
+        .on_iteration(0, |_world, state| {
+            // TEST_WORKSPACE_ID has no windows (empty v0); EXT_DISPLAY_ID has [100, 101].
+            state.remove_display(EXT_DISPLAY_ID);
+            state.update_window(100, |w| w.workspace_id = TEST_WORKSPACE_ID);
+            state.update_window(101, |w| w.workspace_id = TEST_WORKSPACE_ID);
+        })
+        .on_iteration(1, |world, _state| {
+            let win100 = find_window_entity(100, world);
+            let win101 = find_window_entity(101, world);
+
+            let main_strips: Vec<(u32, Vec<Entity>)> = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|s| s.id() == TEST_WORKSPACE_ID)
+                .map(|s| (s.virtual_index, s.all_windows()))
+                .collect();
+            assert_eq!(
+                main_strips,
+                vec![(0, vec![win100, win101])],
+                "surviving display with empty v0 must have no empty first workspace after receiving strip from removed display"
+            );
+        })
+        .run(commands);
 }

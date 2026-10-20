@@ -596,6 +596,8 @@ impl QueryStateParams<'_, '_> {
             app_name: app.name().to_string(),
             bundle_id: app.bundle_id().unwrap_or_default().clone(),
             title: window.title().unwrap_or_default(),
+            role: window.role().ok(),
+            subrole: window.subrole().ok(),
             frame: frame.map(|frame| Frame {
                 x: frame.min.x,
                 y: frame.min.y,
@@ -712,6 +714,8 @@ impl QueryState for PaneruQueryState {
                         bundle_id,
                         app_name,
                         title,
+                        role: window.role().ok(),
+                        subrole: window.subrole().ok(),
                         focused: focused_entity == Some(entity),
                         floating: matches!(unmanaged, Some(Unmanaged::Floating)),
                         display_id: visibility.map(|(display_id, _)| display_id),

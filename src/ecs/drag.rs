@@ -729,11 +729,14 @@ impl Plugin for DragEventsPlugin {
                         .after(drag_watchdog)
                         .run_if(resource_changed::<DragState>),
                 )
+                    .in_set(super::UpdateSet::Focus)
                     .run_if(not(resource_exists::<Initializing>)),
             )
             .add_systems(
                 PostUpdate,
-                show_drag_feedback.run_if(resource_changed::<DragFeedback>),
+                show_drag_feedback
+                    .in_set(super::PostUpdateSet::Ui)
+                    .run_if(resource_changed::<DragFeedback>),
             );
     }
 }
@@ -765,7 +768,7 @@ type Displays<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPos
 /// Feeds mouse and window events to [`step`] and applies the drops it asks
 /// for.
 #[allow(clippy::too_many_arguments)]
-fn drag_events(
+pub(super) fn drag_events(
     mut messages: MessageReader<Event>,
     mut state: ResMut<DragState>,
     time: Res<Time>,
@@ -1031,6 +1034,7 @@ fn drag_feedback(
     placements: Query<(&LayoutPosition, &Bounds), With<Window>>,
     displays: Displays,
     config: Res<Config>,
+    theme: Option<Res<super::SystemTheme>>,
 ) {
     let shape = match &*state {
         DragState::Dragging(drag) => {
@@ -1051,7 +1055,9 @@ fn drag_feedback(
         _ => None,
     };
     let line_color = match shape {
-        Some(OverlayShape::Line(_)) => config.border_color(),
+        Some(OverlayShape::Line(_)) => {
+            config.border_color(theme.is_some_and(|theme| theme.is_dark))
+        }
         _ => feedback.line_color,
     };
     feedback.set_if_neq(DragFeedback { shape, line_color });

@@ -6,7 +6,7 @@ use crate::config::{
 };
 use crate::ecs::SpawnWindowTrigger;
 use crate::ecs::layout::LayoutStrip;
-use crate::events::Event;
+use crate::events::{DestroySource, Event};
 use crate::{assert_window_at, assert_window_size};
 use bevy::math::IRect;
 use bevy::prelude::*;
@@ -284,6 +284,7 @@ fn test_window_resize_grow_and_shrink_cycle() {
     let config: Config = (
         MainOptions {
             preset_column_widths: vec![0.25, 0.5, 0.75],
+            continuous_swipe: Some(false),
             ..Default::default()
         },
         vec![],
@@ -1178,6 +1179,70 @@ fn test_closing_window_of_live_app_closes_the_gap() {
         .run(commands);
 }
 
+/// A space notification for a window whose AX element is gone is a real close,
+/// not a space change. It must be recognised on its own, without waiting for
+/// the periodic unordered-window sweep, even though `role()` is cached.
+#[test]
+fn test_space_notification_for_dead_window_removes_it() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.advance(Duration::from_millis(100));
+
+    harness.mock_state.os_vanish_window(1);
+    harness
+        .app
+        .world_mut()
+        .write_message::<Event>(Event::WindowDestroyed {
+            window_id: 1,
+            source: DestroySource::SpaceNotification,
+        });
+    // Well short of the 1-second CLOSED_WINDOW_CHECK_FREQ sweep, so only the
+    // destroy event can remove the window.
+    harness.advance(Duration::from_millis(60));
+
+    assert!(
+        !window_exists(harness.app.world_mut(), 1),
+        "a space notification for a dead window must remove it"
+    );
+}
+
+/// Closing a floating window despawns it, which removes its `Unmanaged` marker.
+/// That removal must not put the dying window back into the layout strip.
+#[test]
+fn test_closing_floating_window_does_not_reinsert_it_into_the_strip() {
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    let mut params = WindowParams::new("^Window 1$", None);
+    params.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.os_close_window(1))
+        .on_iteration(1, |world, _state| {
+            assert!(!window_exists(world, 1), "closed window must be despawned");
+            let mut strips = world.query::<&LayoutStrip>();
+            let entities = strips
+                .iter(world)
+                .flat_map(LayoutStrip::all_windows)
+                .collect::<Vec<_>>();
+            for entity in entities {
+                assert!(
+                    world.get::<crate::manager::Window>(entity).is_some(),
+                    "strip holds {entity}, which is no longer a window"
+                );
+            }
+        })
+        .run(commands);
+}
+
 fn window_x(world: &mut World, id: i32) -> i32 {
     let mut query = world.query::<&crate::manager::Window>();
     query
@@ -1603,4 +1668,281 @@ fn test_width_settlement_lua_width_batches_preserve_the_run() {
         assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
         assert_width_settlement_idle(&mut harness);
     }
+}
+
+/// A `subrole` window rule applies its effects only to windows reporting that
+/// subrole: an app's dialog floats while its standard window stays tiled.
+#[test]
+fn test_subrole_window_rule_floats_only_matching_windows() {
+    let config = Config::try_from(
+        r#"
+[options]
+
+[bindings]
+
+[windows.dialogs]
+title = ".*"
+subrole = "AXDialog"
+floating = true
+"#,
+    )
+    .expect("config should parse");
+
+    let commands = vec![Event::Command {
+        command: Command::PrintState,
+    }];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_window(1, |window| window.subrole = "AXDialog".to_string())
+        // Iterations are 0-indexed: this is the only command's iteration.
+        .on_iteration(0, |world, _state| {
+            let is_floating = |world: &mut World, id| {
+                let entity = find_window_entity(id, world);
+                matches!(
+                    world.entity(entity).get::<crate::ecs::Unmanaged>(),
+                    Some(crate::ecs::Unmanaged::Floating)
+                )
+            };
+            assert!(!is_floating(world, 0), "standard window must stay tiled");
+            assert!(is_floating(world, 1), "dialog must float");
+        })
+        .run(commands);
+}
+
+/// Regression test: during startup (`Initializing`), `apply_window_defaults` and
+/// `apply_window_positions` must classify floating windows as `Unmanaged::Floating`
+/// *before* `finish_setup` populates the workspace strip and selects the initial
+/// focused window. Otherwise, a floating window that appears first in the
+/// workspace window list is treated as managed by `finish_setup` and steals
+/// `FocusedMarker` from the first tiled window, or `finish_setup` removes
+/// `Initializing` before `apply_window_positions` runs and causes startup
+/// windows to be treated as runtime spawns.
+#[test]
+fn test_startup_floating_window_does_not_steal_initial_focus_or_enter_strip() {
+    let mut params = WindowParams::new("^Window 0$", None);
+    params.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    let commands = vec![Event::Command {
+        command: Command::PrintState,
+    }];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(0, |world, _state| {
+            let win0 = find_window_entity(0, world);
+            let win1 = find_window_entity(1, world);
+            let win2 = find_window_entity(2, world);
+
+            assert!(
+                matches!(
+                    world.entity(win0).get::<crate::ecs::Unmanaged>(),
+                    Some(crate::ecs::Unmanaged::Floating)
+                ),
+                "window 0 must be marked Unmanaged::Floating during startup"
+            );
+            assert!(
+                world
+                    .entity(win0)
+                    .get::<crate::ecs::FocusedMarker>()
+                    .is_none(),
+                "floating window 0 must not receive initial FocusedMarker"
+            );
+            assert!(
+                world
+                    .entity(win1)
+                    .get::<crate::ecs::FocusedMarker>()
+                    .is_some(),
+                "first tiled window (1) must receive initial FocusedMarker"
+            );
+
+            let mut strips = world.query::<&LayoutStrip>();
+            let strip = strips.single(world).expect("single active strip");
+            assert_eq!(
+                strip.all_windows(),
+                vec![win1, win2],
+                "strip must contain only tiled windows in workspace order without holes"
+            );
+            assert_window_at!(world, 1, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+/// Regression test: stacking an already-focused window (`Operation::Stack(Side::West)`)
+/// when `auto_center = false` and `continuous_swipe = false` must compute the
+/// strip offset from the window's new layout slot (`layout_position.0 + strip_target`)
+/// and clamp the strip to `display_bounds.min.x` (`0`) when the stacked strip fits
+/// inside the viewport, rather than anchoring the strip to the window's pre-stack
+/// `moving_frame` X coordinate (`400`).
+#[test]
+fn test_stacking_focused_window_pins_strip_to_left_edge_when_strip_fits_viewport() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(Side::West)),
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(2, |world, _state| {
+            let mut query = world
+                .query_filtered::<&crate::ecs::Position, With<crate::ecs::ActiveWorkspaceMarker>>();
+            let strip_pos = query.single(world).expect("active strip").0;
+            assert_eq!(
+                strip_pos.x, 0,
+                "single-column stacked strip that fits the display must stay pinned at x = 0"
+            );
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 0, 394);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_window_resize_moves_subsequent_windows_in_strip() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Resize(ResizeDirection::Grow)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Resize(ResizeDirection::Shrink)),
+        },
+    ];
+
+    let config: Config = (
+        MainOptions {
+            preset_column_widths: vec![0.25, 0.5, 0.75],
+            continuous_swipe: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(0, |world, _state| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(1, |world, _state| {
+            // Window 0 grows from 400 -> 512; windows 1 and 2 must shift right.
+            assert_window_size!(world, 0, 512, 748);
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 512, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 912, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(2, |world, _state| {
+            // Window 0 shrinks from 512 -> 256; windows 1 and 2 must shift left.
+            assert_window_size!(world, 0, 256, 748);
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 256, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 656, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_window_resize_middle_column_centers_around_window_and_shifts_strip() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Resize(ResizeDirection::Shrink)),
+        },
+    ];
+
+    let config: Config = (
+        MainOptions {
+            preset_column_widths: vec![0.25, 0.5, 0.75],
+            continuous_swipe: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(2, |world, _state| {
+            // Window 1 shrinks from 400 -> 256 around its center (600):
+            // its new screen x is 600 - 128 = 472, so the strip shifts right
+            // by +72: window 0 moves to 72, window 1 to 472, and window 2 to 728.
+            assert_window_size!(world, 1, 256, 748);
+            assert_window_at!(world, 0, 72, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 472, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 728, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_full_width_centers_and_fills_viewport_when_window_was_partially_offscreen() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Center),
+        },
+        Event::Command {
+            command: Command::Window(Operation::FullWidth),
+        },
+        Event::Command {
+            command: Command::Window(Operation::FullWidth),
+        },
+    ];
+
+    let config: Config = (
+        MainOptions {
+            window_hidden_ratio: Some(0.5),
+            continuous_swipe: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            // Window 0 (width 400) is centered at x = 312.
+            assert_window_at!(world, 0, 312, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(2, |world, _state| {
+            // Even when `window_hidden_ratio` is set (312 / 1024 = 0.30 < 0.5)
+            // and window 0 was off-origin, `FullWidth` must bring it fully on
+            // screen (`x = 0`, `width = 1024`).
+            assert_window_size!(world, 0, 1024, 748);
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(3, |world, _state| {
+            // Toggling `FullWidth` off restores the original width (400) and
+            // centers it in place (`512 - 200 = 312`).
+            assert_window_size!(world, 0, 400, 748);
+            assert_window_at!(world, 0, 312, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
 }

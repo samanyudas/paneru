@@ -38,6 +38,7 @@ use crate::ecs::{
 use crate::events::{DestroySource, Event};
 use crate::manager::{
     Application, Display, Origin, Process, Size, Window, WindowManager, WindowPadding,
+    forget_enhanced_ui_state,
 };
 use crate::platform::WinID;
 use crate::util::{round_px, symlink_target};
@@ -352,8 +353,7 @@ pub(super) fn window_focused_trigger(
             }
             if owner.is_none() && strip.contains(entity) {
                 // Only a real reorder counts as a layout change. A repeat
-                // focus notification, such as one raising a stacked window
-                // emits, would otherwise order the stack again, forever.
+                // focus notification must not order the stack again.
                 if let Ok(index) = strip.index_of(entity)
                     && let Some(column) = strip.bypass_change_detection().get_column_mut(index)
                     && column.move_to_front(entity)
@@ -535,10 +535,11 @@ pub(super) fn application_event_trigger(
             }
 
             Event::ApplicationTerminated { psn } => {
-                if let Some((_, entity)) = find_process(*psn)
-                    && let Ok(mut entity_commands) = commands.get_entity(entity)
-                {
-                    entity_commands.try_despawn();
+                if let Some((BProcess(process), entity)) = find_process(*psn) {
+                    forget_enhanced_ui_state(process.pid());
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_despawn();
+                    }
                 }
             }
             _ => (),
@@ -821,7 +822,7 @@ pub(super) fn window_managed_trigger(
     if ctx
         .windows
         .get(entity)
-        .is_some_and(|window| window.role().is_err())
+        .is_some_and(|window| !window.is_alive())
     {
         // The marker was removed because the windows was destroyed.
         return;
@@ -943,7 +944,7 @@ pub(super) fn claim_replaced_window_handles(
         let Some((window, entity)) = windows.find(*window_id) else {
             continue;
         };
-        if window.role().is_err()
+        if !window.is_alive()
             && matches!(window_manager.window_ordered_in(*window_id), Ok(true))
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
@@ -976,7 +977,7 @@ pub(super) fn recover_window_handles(
         let window_id = window.id();
         let ordered_in = window_manager.window_ordered_in(window_id);
         let handle_recovered = matches!(ordered_in, Ok(true))
-            && (window.role().is_ok()
+            && (window.is_alive()
                 || apps
                     .get_mut(child.parent())
                     .is_ok_and(|mut app| adopt_fresh_handle(&mut window, &mut app, &config)));
@@ -1014,7 +1015,7 @@ fn adopt_fresh_handle(window: &mut Window, app: &mut Application, config: &Confi
     let Some(old) = app
         .window_list(config)
         .into_iter()
-        .filter(|fresh| fresh.id() == window_id && fresh.role().is_ok())
+        .filter(|fresh| fresh.id() == window_id && fresh.is_alive())
         .find_map(|fresh| window.replace_handle(fresh).ok())
     else {
         return false;
@@ -1063,14 +1064,12 @@ pub(super) fn window_destroyed_trigger(
         // space, so it needs confirming. A `kAXUIElementDestroyedNotification` means the AX element
         // itself has been torn down and is taken at face value: confirming it against the app is
         // not just unnecessary but actively wrong, because both signals below lag the teardown.
-        // `role()` keeps succeeding on the dead element for apps that outlive their windows, and
+        // `is_alive()` keeps succeeding on the dead element for apps that outlive their windows, and
         // the app's AX window list is still warm for a moment after the close. Re-checking them
         // raced the window back to life, leaving the entity in the strip and a permanent gap where
         // the window had been.
         match source {
-            DestroySource::SpaceNotification
-                if awaiting.contains(entity) || window.role().is_ok() =>
-            {
+            DestroySource::SpaceNotification if awaiting.contains(entity) || window.is_alive() => {
                 debug!(
                     "Window {} still present, this was SLS workspace change.",
                     window.id()
@@ -1259,6 +1258,8 @@ pub(super) fn spawn_window_trigger(
         let layout_position = LayoutPosition::default();
 
         let title = window.title().unwrap_or_default();
+        let role = window.role().ok();
+        let subrole = window.subrole().ok();
         let app_name = app.name().to_string();
         let bundle_id = app.bundle_id().unwrap_or_default().clone();
         let window_frame = crate::types::state::Frame {
@@ -1292,6 +1293,8 @@ pub(super) fn spawn_window_trigger(
             app_name,
             bundle_id,
             title,
+            role,
+            subrole,
             frame: window_frame,
             floating: false,
             managed: true,
