@@ -465,9 +465,12 @@ impl DragState {
     }
 }
 
-/// The shape the drag overlay shows now, if any.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Resource)]
-pub(crate) struct DragFeedback(pub Option<OverlayShape>);
+/// The shape the drag overlay shows now and its most recent line color.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Resource)]
+pub(crate) struct DragFeedback {
+    pub shape: Option<OverlayShape>,
+    line_color: (f64, f64, f64),
+}
 
 /// What the ECS side has to do after a step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1047,20 +1050,20 @@ fn drag_feedback(
         }
         _ => None,
     };
-    feedback.set_if_neq(DragFeedback(shape));
+    let line_color = match shape {
+        Some(OverlayShape::Line(_)) => config.border_color(),
+        _ => feedback.line_color,
+    };
+    feedback.set_if_neq(DragFeedback { shape, line_color });
 }
 
 /// Draws [`DragFeedback`]. The line takes the focus border's color.
-fn show_drag_feedback(
-    feedback: Res<DragFeedback>,
-    overlay: Option<NonSendMut<DragOverlay>>,
-    config: Res<Config>,
-) {
+fn show_drag_feedback(feedback: Res<DragFeedback>, overlay: Option<NonSendMut<DragOverlay>>) {
     let Some(mut overlay) = overlay else {
         return;
     };
-    match feedback.0 {
-        Some(OverlayShape::Line(line)) => overlay.show_line(line, config.border_color()),
+    match feedback.shape {
+        Some(OverlayShape::Line(line)) => overlay.show_line(line, feedback.line_color),
         Some(OverlayShape::Refusal(square)) => overlay.show_refusal(square),
         None => overlay.hide(),
     }

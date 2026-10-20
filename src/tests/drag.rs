@@ -1656,7 +1656,7 @@ fn a_drag_held_still_with_the_button_down_still_drops() {
 // --- The drag overlay in the running engine ---
 
 fn feedback(world: &mut World) -> Option<OverlayShape> {
-    world.resource::<DragFeedback>().0
+    world.resource::<DragFeedback>().shape
 }
 
 #[test]
