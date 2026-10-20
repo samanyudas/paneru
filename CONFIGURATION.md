@@ -31,6 +31,7 @@ General behavior settings for the window manager.
 | `horizontal_mouse_warp_offset` | Integer (px) | `0` | Vertical pixel offset applied to the `horizontal_mouse_warp` landing position, signed by warp direction. Positive values shift the cursor lower when warping to a display *below* (in macOS arrangement) and higher when warping to one *above*. Use to compensate for physical desk arrangement differing from the macOS arrangement (e.g. portrait monitor sitting physically higher or lower than the laptop). |
 | `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0]` | Ratios of the screen width used by the `window_resize` command and the menu bar width picker. Values above `1.0` create a horizontally scrollable oversized window. |
 | `preset_stack_heights` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75]` | Ratios of the viewport height used by the `window_vertical_resize` command. Only applies to windows inside a stack; every window in the column is kept at least 200px tall, so a ratio that would starve a neighbour is clamped. |
+| `stack_limit` | Integer (1 or more) or `"fit"` | `5` | How many windows one stack holds. `"fit"` allows as many as fit in the column at the 200px minimum window height on that display, and a number is capped at that same count. A `window_stack_*` command into a full stack moves the window to a new column beside it instead. Lowering the limit leaves existing stacks as they are. |
 | `animation_speed` | Float | *None* | Speed of window animations. Comfortable range is from 8 to 20. Unset or set to a very high value to effectively disable animations. |
 | `auto_center` | Boolean | `false` | Automatically center the focused window on the screen when switching focus. |
 | `sliver_height` | Float (0.1–1.0) | `1.0` | Vertical ratio of off-screen windows kept visible to prevent macOS from relocating them. |
@@ -210,7 +211,7 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_fullwidth` | Toggle full-width mode. |
 | `window_manage` | Toggle between tiled and floating state. |
 | `window_stack` | Alias for `window_stack_west`. |
-| `window_stack_west` / `_east` | Move the current window to the bottom of the column on the left/right. The rest of its old stack stays in place. No-op at the edge of the strip. |
+| `window_stack_west` / `_east` | Move the current window to the bottom of the column on the left/right. The rest of its old stack stays in place. No-op at the edge of the strip. When that column already holds `stack_limit` windows, the window leaves its stack for a new column between the two instead. |
 | `window_unstack` | Alias for `window_unstack_east`. |
 | `window_unstack_east` / `_west` | Pull the current window out of its stack into a new column right/left of the stack. No-op outside a stack. |
 | `window_tabbeddisplay` | Toggle the focused stack between a normal split display and a tabbed display (one window visible at a time, sharing the full column). Cycle tabs with `window_focus_north`/`window_focus_south`. |
