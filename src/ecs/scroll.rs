@@ -108,7 +108,11 @@ impl Plugin for ScrollEventsPlugin {
                     apply_scrolling_constraints,
                     swiping_timeout,
                 )
-                    .chain(),
+                    .chain()
+                    // A scroll moves the strip, and the layout moves its
+                    // windows to match in the same frame. Unordered, the
+                    // windows could follow a frame late.
+                    .before(super::layout::position_layout_strips),
             ),
         );
     }

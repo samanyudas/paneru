@@ -1760,7 +1760,7 @@ fn ensure_visible_in_strip(
 /// Reacts to changes in the position of the `LayoutStrip` to Display, and if changed,
 /// marks all the windows in the strip as requiring re-positioning.
 #[instrument(level = Level::DEBUG, skip_all)]
-fn position_layout_strips(
+pub(super) fn position_layout_strips(
     moved_strips: Populated<&LayoutStrip, Changed<Position>>,
     mut windows: Query<&mut LayoutPosition, (With<Window>, Without<LayoutStrip>)>,
 ) {

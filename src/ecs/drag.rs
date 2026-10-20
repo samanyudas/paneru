@@ -587,6 +587,11 @@ impl Plugin for DragEventsPlugin {
                     .after(super::systems::window_resized_update_frame)
                     .after(super::systems::window_moved_update_frame)
                     .before(super::mouse::mouse_up_trigger)
+                    // A drop focuses the window after giving it its new
+                    // column's width. Run the other way round, the focus
+                    // check would read the old size back from the window
+                    // before the new one is committed.
+                    .after(super::focus::fix_window_size_on_focus)
                     .run_if(on_message::<Event>),
                 drag_watchdog.after(drag_events).run_if(in_progress),
             )

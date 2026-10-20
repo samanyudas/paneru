@@ -223,7 +223,7 @@ fn shares_a_tab_group(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(focused))]
-fn fix_window_size_on_focus(
+pub(super) fn fix_window_size_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mut windows: Query<(&mut Window, &mut Bounds, Has<ResizeMarker>)>,
 ) {
