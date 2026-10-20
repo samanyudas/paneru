@@ -1,8 +1,9 @@
 use accessibility_sys::{
     AXUIElementCreateApplication, AXUIElementRef, AXValueCreate, AXValueGetValue,
-    kAXChildrenAttribute, kAXCloseButtonAttribute, kAXFloatingWindowSubrole, kAXPositionAttribute,
-    kAXRaiseAction, kAXSizeAttribute, kAXStandardWindowSubrole, kAXToolbarRole, kAXUnknownSubrole,
-    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
+    kAXChildrenAttribute, kAXCloseButtonAttribute, kAXErrorAttributeUnsupported, kAXErrorNoValue,
+    kAXErrorNotImplemented, kAXErrorSuccess, kAXFloatingWindowSubrole, kAXPositionAttribute,
+    kAXRaiseAction, kAXRoleAttribute, kAXSizeAttribute, kAXStandardWindowSubrole, kAXToolbarRole,
+    kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
 };
 use bevy::ecs::component::Component;
 use bevy::math::IRect;
@@ -10,7 +11,7 @@ use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
+    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize, Type,
     kCFBooleanFalse, kCFBooleanTrue,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -112,9 +113,10 @@ pub trait WindowApi: Send + Sync {
     fn border_radius(&self) -> Option<f64>;
     /// How far the window's top bar (title bar, toolbar, or navigation bar)
     /// reaches below its top edge, read through Accessibility. `Ok(None)`
-    /// when the window exposes neither a close button nor a toolbar, and an
-    /// error when Accessibility cannot read the window at all, such as while
-    /// its app is busy, so the caller can try again later.
+    /// when the window exposes neither a close button nor a toolbar. An error
+    /// when any read fails, such as while its app is busy, even after part of
+    /// the top bar was read, so the caller tries again later rather than
+    /// keeping a top bar that is missing a toolbar.
     fn top_bar_height(&self) -> Result<Option<i32>>;
 }
 
@@ -246,6 +248,95 @@ const TOP_BAR_LEAF_ROLES: [&str; 12] = [
     "AXWebArea",
 ];
 
+/// The Accessibility reads a top bar measurement makes. `Ok(None)` means the
+/// element does not have the attribute. An error means the read failed, such
+/// as while the app is busy, and may succeed later.
+trait TopBarTree {
+    type Node;
+    fn frame(&self, node: &Self::Node) -> Result<Option<IRect>>;
+    fn close_button(&self, node: &Self::Node) -> Result<Option<Self::Node>>;
+    fn children(&self, node: &Self::Node) -> Result<Vec<Self::Node>>;
+    fn role(&self, node: &Self::Node) -> Result<Option<String>>;
+}
+
+/// The live Accessibility tree of a window.
+struct AxTopBarTree;
+
+impl AxTopBarTree {
+    /// Reads an attribute, telling an element that lacks it apart from a
+    /// read that failed.
+    fn read<T: Type>(
+        element: &CFRetained<AXUIWrapper>,
+        attribute: &'static str,
+    ) -> Result<Option<CFRetained<T>>> {
+        let mut value: *mut CFType = null_mut();
+        let code = unsafe {
+            AXUIElementCopyAttributeValue(
+                element.as_ptr(),
+                CFString::from_static_str(attribute).as_ref(),
+                &mut value,
+            )
+        };
+        if code == kAXErrorSuccess {
+            Ok(NonNull::new(value).map(|value| unsafe { CFRetained::from_raw(value.cast::<T>()) }))
+        } else if [
+            kAXErrorAttributeUnsupported,
+            kAXErrorNoValue,
+            kAXErrorNotImplemented,
+        ]
+        .contains(&code)
+        {
+            Ok(None)
+        } else {
+            Err(Error::Generic(format!(
+                "reading {attribute}: Accessibility error {code}"
+            )))
+        }
+    }
+}
+
+impl TopBarTree for AxTopBarTree {
+    type Node = CFRetained<AXUIWrapper>;
+
+    fn frame(&self, node: &Self::Node) -> Result<Option<IRect>> {
+        let position = Self::read::<AXUIWrapper>(node, kAXPositionAttribute)?;
+        let size = Self::read::<AXUIWrapper>(node, kAXSizeAttribute)?;
+        let Some((position, size)) = position.zip(size) else {
+            return Ok(None);
+        };
+        let mut frame = CGRect::default();
+        unsafe {
+            AXValueGetValue(
+                position.as_ptr(),
+                kAXValueTypeCGPoint,
+                NonNull::from(&mut frame.origin).as_ptr().cast(),
+            );
+            AXValueGetValue(
+                size.as_ptr(),
+                kAXValueTypeCGSize,
+                NonNull::from(&mut frame.size).as_ptr().cast(),
+            );
+        }
+        Ok(Some(irect_from(frame)))
+    }
+
+    fn close_button(&self, node: &Self::Node) -> Result<Option<Self::Node>> {
+        Self::read::<AXUIWrapper>(node, kAXCloseButtonAttribute)
+    }
+
+    fn children(&self, node: &Self::Node) -> Result<Vec<Self::Node>> {
+        Ok(
+            Self::read::<CFArray<AXUIWrapper>>(node, kAXChildrenAttribute)?
+                .map(|children| children.to_vec())
+                .unwrap_or_default(),
+        )
+    }
+
+    fn role(&self, node: &Self::Node) -> Result<Option<String>> {
+        Ok(Self::read::<CFString>(node, kAXRoleAttribute)?.map(|role| role.to_string()))
+    }
+}
+
 /// Measures how far a window's top bar reaches below its top edge.
 ///
 /// The title bar is twice the distance from the window top to the middle of
@@ -253,43 +344,46 @@ const TOP_BAR_LEAF_ROLES: [&str; 12] = [
 /// holds them, whether that is a plain title bar or a unified toolbar. Each
 /// `AXToolbar` near the top that starts where the bar found so far ends, such
 /// as a browser's address bar and bookmarks bar under its tab strip, extends it.
-fn measure_top_bar(window: &CFRetained<AXUIWrapper>) -> Result<Option<i32>> {
-    let frame = ax_frame(window)?;
+///
+/// Any failed read fails the measurement, so the caller tries again later
+/// instead of keeping a top bar that is missing the part it could not read.
+fn measure_top_bar<T: TopBarTree>(tree: &T, window: &T::Node) -> Result<Option<i32>>
+where
+    T::Node: Clone,
+{
+    let frame = tree
+        .frame(window)?
+        .ok_or_else(|| Error::Generic("window has no frame".to_string()))?;
     let top = frame.min.y;
-    let title_bar = window
-        .get_attribute::<AXUIWrapper>(&CFString::from_static_str(kAXCloseButtonAttribute))
-        .and_then(|button| ax_frame(&button))
-        .ok()
-        .map(|button| button.min.y + button.max.y - 2 * top);
+    let title_bar = match tree.close_button(window)? {
+        Some(button) => tree
+            .frame(&button)?
+            .map(|button| button.min.y + button.max.y - 2 * top),
+        None => None,
+    };
 
-    let children = CFString::from_static_str(kAXChildrenAttribute);
     let toolbars = search_toolbars(
         window.clone(),
-        |element| {
-            element
-                .get_attribute::<CFArray<AXUIWrapper>>(&children)
-                .map(|elements| elements.to_vec())
-                .unwrap_or_default()
-        },
+        |element| tree.children(element),
         |child| {
-            let Ok(role) = child.role() else {
-                return TopBarElement::Other;
+            let Some(role) = tree.role(child)? else {
+                return Ok(TopBarElement::Other);
             };
             if TOP_BAR_LEAF_ROLES.contains(&role.as_str()) {
-                return TopBarElement::Other;
+                return Ok(TopBarElement::Other);
             }
-            let Ok(child_frame) = ax_frame(child) else {
-                return TopBarElement::Other;
+            let Some(child_frame) = tree.frame(child)? else {
+                return Ok(TopBarElement::Other);
             };
-            if child_frame.min.y - top > TOP_BAR_SEARCH_REACH {
+            Ok(if child_frame.min.y - top > TOP_BAR_SEARCH_REACH {
                 TopBarElement::Other
             } else if role == kAXToolbarRole {
                 TopBarElement::Toolbar(child_frame.min.y - top..child_frame.max.y - top)
             } else {
                 TopBarElement::Container
-            }
+            })
         },
-    );
+    )?;
     Ok(top_bar_extent(title_bar, toolbars).filter(|height| *height < frame.height()))
 }
 
@@ -308,21 +402,22 @@ enum TopBarElement {
 /// [`TOP_BAR_SEARCH_DEPTH`] levels deep, and returns every toolbar found.
 /// `inspect` classifies an element, and every call counts against one
 /// [`TOP_BAR_SEARCH_BUDGET`], so a wide tree costs no more than a deep one.
+/// A failed read from either closure ends the search with that error.
 fn search_toolbars<N>(
     root: N,
-    mut children: impl FnMut(&N) -> Vec<N>,
-    mut inspect: impl FnMut(&N) -> TopBarElement,
-) -> Vec<Range<i32>> {
+    mut children: impl FnMut(&N) -> Result<Vec<N>>,
+    mut inspect: impl FnMut(&N) -> Result<TopBarElement>,
+) -> Result<Vec<Range<i32>>> {
     let mut toolbars = vec![];
     let mut budget = TOP_BAR_SEARCH_BUDGET;
     let mut queue = VecDeque::from([(root, 0)]);
     while let Some((element, depth)) = queue.pop_front() {
-        for child in children(&element) {
+        for child in children(&element)? {
             if budget == 0 {
-                return toolbars;
+                return Ok(toolbars);
             }
             budget -= 1;
-            match inspect(&child) {
+            match inspect(&child)? {
                 TopBarElement::Toolbar(range) => toolbars.push(range),
                 TopBarElement::Container if depth + 1 < TOP_BAR_SEARCH_DEPTH => {
                     queue.push_back((child, depth + 1));
@@ -331,7 +426,7 @@ fn search_toolbars<N>(
             }
         }
     }
-    toolbars
+    Ok(toolbars)
 }
 
 /// The top bar's reach below the window top: the title bar, extended by each
@@ -978,7 +1073,7 @@ impl WindowApi for WindowOS {
     }
 
     fn top_bar_height(&self) -> Result<Option<i32>> {
-        measure_top_bar(&self.ax_element)
+        measure_top_bar(&AxTopBarTree, &self.ax_element)
     }
 }
 
@@ -1014,13 +1109,13 @@ mod tests {
         let mut inspected = 0;
         let toolbars = search_toolbars(
             0_usize,
-            |depth| vec![depth + 1; 1000],
+            |depth| Ok(vec![depth + 1; 1000]),
             |_| {
                 inspected += 1;
-                TopBarElement::Container
+                Ok(TopBarElement::Container)
             },
         );
-        assert!(toolbars.is_empty());
+        assert!(toolbars.is_ok_and(|toolbars| toolbars.is_empty()));
         assert_eq!(inspected, TOP_BAR_SEARCH_BUDGET);
     }
 
@@ -1031,18 +1126,173 @@ mod tests {
         let toolbar_at = |depth: usize| {
             search_toolbars(
                 0_usize,
-                |level| if *level < 10 { vec![level + 1] } else { vec![] },
+                |level| Ok(if *level < 10 { vec![level + 1] } else { vec![] }),
                 |level| {
-                    if *level == depth {
+                    Ok(if *level == depth {
                         TopBarElement::Toolbar(31..65)
                     } else {
                         TopBarElement::Container
-                    }
+                    })
                 },
             )
+            .expect("no read fails")
         };
         assert_eq!(toolbar_at(TOP_BAR_SEARCH_DEPTH), vec![31..65]);
         assert_eq!(toolbar_at(TOP_BAR_SEARCH_DEPTH + 1), vec![]);
+    }
+
+    /// An Accessibility read in a [`FakeTree`].
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Read {
+        Frame,
+        CloseButton,
+        Children,
+        Role,
+    }
+
+    #[derive(Default)]
+    struct FakeNode {
+        frame: Option<IRect>,
+        close_button: Option<usize>,
+        children: Vec<usize>,
+        role: Option<&'static str>,
+    }
+
+    /// A window's Accessibility tree, where one read can fail.
+    #[derive(Default)]
+    struct FakeTree {
+        nodes: HashMap<usize, FakeNode>,
+        failing: Option<(usize, Read)>,
+    }
+
+    impl FakeTree {
+        fn check(&self, node: usize, read: Read) -> Result<&FakeNode> {
+            if self.failing == Some((node, read)) {
+                return Err(Error::Generic(format!("{read:?} of {node} timed out")));
+            }
+            Ok(&self.nodes[&node])
+        }
+    }
+
+    impl TopBarTree for FakeTree {
+        type Node = usize;
+
+        fn frame(&self, node: &usize) -> Result<Option<IRect>> {
+            Ok(self.check(*node, Read::Frame)?.frame)
+        }
+
+        fn close_button(&self, node: &usize) -> Result<Option<usize>> {
+            Ok(self.check(*node, Read::CloseButton)?.close_button)
+        }
+
+        fn children(&self, node: &usize) -> Result<Vec<usize>> {
+            Ok(self.check(*node, Read::Children)?.children.clone())
+        }
+
+        fn role(&self, node: &usize) -> Result<Option<String>> {
+            Ok(self.check(*node, Read::Role)?.role.map(str::to_string))
+        }
+    }
+
+    /// A browser window 100 points down the screen, shaped like Helium's: the
+    /// close button centers in a 34 point tab strip, and the address bar and
+    /// bookmarks bar toolbars follow it at different depths, next to a web
+    /// area with no role or frame.
+    fn browser_tree() -> FakeTree {
+        let rect = |top, bottom| Some(IRect::new(0, top, 800, bottom));
+        let nodes = [
+            (
+                0,
+                FakeNode {
+                    frame: rect(100, 900),
+                    close_button: Some(1),
+                    children: vec![2, 3],
+                    role: Some("AXWindow"),
+                },
+            ),
+            (
+                1,
+                FakeNode {
+                    frame: Some(IRect::new(8, 110, 22, 124)),
+                    role: Some("AXButton"),
+                    ..FakeNode::default()
+                },
+            ),
+            (
+                2,
+                FakeNode {
+                    frame: rect(100, 300),
+                    children: vec![4, 5],
+                    role: Some("AXGroup"),
+                    ..FakeNode::default()
+                },
+            ),
+            (3, FakeNode::default()),
+            (
+                4,
+                FakeNode {
+                    frame: rect(131, 165),
+                    role: Some(kAXToolbarRole),
+                    ..FakeNode::default()
+                },
+            ),
+            (
+                5,
+                FakeNode {
+                    frame: rect(165, 200),
+                    children: vec![6],
+                    role: Some("AXGroup"),
+                    ..FakeNode::default()
+                },
+            ),
+            (
+                6,
+                FakeNode {
+                    frame: rect(165, 196),
+                    role: Some(kAXToolbarRole),
+                    ..FakeNode::default()
+                },
+            ),
+        ];
+        FakeTree {
+            nodes: nodes.into_iter().collect(),
+            failing: None,
+        }
+    }
+
+    /// Attributes an element does not have leave it out of the top bar, but
+    /// do not fail the measurement.
+    #[test]
+    fn a_browser_top_bar_reaches_through_its_toolbars() {
+        assert_eq!(measure_top_bar(&browser_tree(), &0).ok(), Some(Some(96)));
+    }
+
+    /// A read that fails partway, such as a busy browser timing out on its
+    /// toolbars, fails the whole measurement so the engine tries again. It
+    /// must not measure the title bar alone and keep 34 points.
+    #[test]
+    fn a_read_that_fails_partway_fails_the_top_bar_measurement() {
+        for failing in [
+            (0, Read::Frame),
+            (0, Read::CloseButton),
+            (1, Read::Frame),
+            (0, Read::Children),
+            (2, Read::Role),
+            (2, Read::Frame),
+            (5, Read::Children),
+            (6, Read::Role),
+            (6, Read::Frame),
+        ] {
+            let tree = FakeTree {
+                failing: Some(failing),
+                ..browser_tree()
+            };
+            let measured = measure_top_bar(&tree, &0);
+            assert!(
+                measured.is_err(),
+                "failing {failing:?} measured {measured:?}"
+            );
+        }
     }
 
     #[test]

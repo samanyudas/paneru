@@ -568,3 +568,42 @@ fn a_top_bar_that_cannot_be_read_yet_is_measured_again_later() {
     harness.advance(Duration::from_secs(30));
     assert_eq!(rows(harness.world(), &[0, 1, 2]), SIXTY_POINT_ROWS);
 }
+
+/// A top bar that cannot be read when it is measured again keeps its last
+/// measurement until a retry reads it, rather than falling back to 52 points.
+#[test]
+fn a_failed_refresh_keeps_the_last_top_bar_until_a_retry_reads_it() {
+    let mut harness = overflowing_harness();
+    set_top_bar(&harness, 0, 96);
+    stack_three(&mut harness);
+    let ninety_six_point_rows = vec![(20, COLUMN), (123, 1167), (190, 1100)];
+    assert_eq!(rows(harness.world(), &[0, 1, 2]), ninety_six_point_rows);
+
+    // Window 0 resizes while its app is busy.
+    harness.mock_state.update_window(0, |window| {
+        window.top_bar_unreadable = true;
+        window.top_bar_height = Some(60);
+    });
+    let reads = top_bar_reads(&harness, 0);
+    let size = frame(harness.world(), 0).size();
+    harness.mock_state.os_resize_window(0, size);
+    harness.advance(Duration::from_secs(5));
+    assert!(
+        top_bar_reads(&harness, 0) > reads + 1,
+        "the read is retried"
+    );
+    // A layout pass while the retry waits still uses the last measurement.
+    let world = harness.world();
+    let mut strips = world.query::<&mut crate::ecs::layout::LayoutStrip>();
+    for mut strip in strips.iter_mut(world) {
+        strip.set_changed();
+    }
+    harness.advance(SETTLE);
+    assert_eq!(rows(harness.world(), &[0, 1, 2]), ninety_six_point_rows);
+
+    harness.mock_state.update_window(0, |window| {
+        window.top_bar_unreadable = false;
+    });
+    harness.advance(Duration::from_secs(30));
+    assert_eq!(rows(harness.world(), &[0, 1, 2]), SIXTY_POINT_ROWS);
+}
