@@ -390,10 +390,20 @@ pub struct LaunchWindows(pub std::collections::HashSet<WinID>);
 pub struct MinimumHeight(pub i32);
 
 /// How far a window's top bar (title bar, toolbar, or navigation bar) reaches
-/// below its top edge. Measured once, the first time an overlapping stack needs
-/// it, because a top bar rarely changes.
-#[derive(Component, Clone, Copy, Debug)]
+/// below its top edge, as last measured. Measured the first time an
+/// overlapping stack needs it, and again when the window loses focus or
+/// resizes, because a top bar can change then, such as when a browser shows
+/// its bookmarks bar. A window with no measurable top bar keeps
+/// [`layout::FALLBACK_TOP_BAR_HEIGHT`].
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TopBarHeight(pub i32);
+
+/// A top bar Accessibility could not read, such as while its app was busy.
+/// The window keeps its last [`TopBarHeight`], or the fallback height if it
+/// has none, until the timer finishes and the top bar is read again. Each
+/// failure doubles the wait, up to a limit.
+#[derive(Component, Debug)]
+pub struct TopBarRetry(pub bevy::time::Timer);
 
 /// Marks a window entity that is currently on a native macOS fullscreen space.
 /// The window has been removed from its tiled position in the strip.

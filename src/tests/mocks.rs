@@ -58,6 +58,9 @@ pub(crate) struct MockWindowData {
     /// What Accessibility reports as the window's top bar height. `None`
     /// models a window whose top bar cannot be measured.
     pub(crate) top_bar_height: Option<i32>,
+    /// Models Accessibility failing to read the window, such as while its
+    /// app is busy.
+    pub(crate) top_bar_unreadable: bool,
     pub(crate) top_bar_reads: usize,
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
@@ -94,6 +97,7 @@ impl Default for MockWindowData {
             is_full_screen: false,
             border_radius: None,
             top_bar_height: None,
+            top_bar_unreadable: false,
             top_bar_reads: 0,
             horizontal_padding: 0,
             vertical_padding: 0,
@@ -129,6 +133,11 @@ struct MockStateInner {
     background_tabs: HashSet<WinID>,
     /// Windows in the order they were last raised, frontmost last.
     raised: Vec<WinID>,
+    /// How many times any window was raised.
+    raise_count: usize,
+    /// Whether raising a window also makes it its app's focused window, as
+    /// `AXRaise` does for a window of the frontmost app.
+    raise_takes_focus: bool,
 }
 
 #[derive(Clone)]
@@ -151,6 +160,8 @@ impl MockState {
                 unordered_windows: HashSet::new(),
                 background_tabs: HashSet::new(),
                 raised: Vec::new(),
+                raise_count: 0,
+                raise_takes_focus: false,
             })),
         }
     }
@@ -256,6 +267,37 @@ impl MockState {
         let mut inner = self.inner.force_write();
         inner.raised.retain(|raised| *raised != id);
         inner.raised.push(id);
+        inner.raise_count += 1;
+    }
+
+    /// How many times any window was raised.
+    pub fn raise_count(&self) -> usize {
+        self.inner.force_read().raise_count
+    }
+
+    /// Makes a raised window take its app's focus and report it, as `AXRaise`
+    /// does for a window of the frontmost app.
+    pub fn set_raise_takes_focus(&self, takes_focus: bool) {
+        self.inner.force_write().raise_takes_focus = takes_focus;
+    }
+
+    /// Raises a window without asking for focus, which can still move its
+    /// app's focus to it. See [`Self::set_raise_takes_focus`].
+    fn raise_without_focus(&self, id: WinID) {
+        self.raise_window(id);
+        let mut inner = self.inner.force_write();
+        if !inner.raise_takes_focus {
+            return;
+        }
+        let Some(pid) = inner.windows.get(&id).map(|window| window.pid) else {
+            return;
+        };
+        if let Some(app) = inner.apps.get_mut(&pid) {
+            app.focused_window_id = Some(id);
+            inner
+                .event_queue
+                .push_back(Event::WindowFocused { window_id: id });
+        }
     }
 
     /// `ids` back to front, as last raised. A window never raised is left out.
@@ -764,14 +806,20 @@ impl MockState {
             .return_const(Some(mock_element(id, ax_generation)));
         let s = self.clone();
         mw.expect_raise_without_focus()
-            .returning(move || s.raise_window(id));
+            .returning(move || s.raise_without_focus(id));
 
         let s = self.clone();
         mw.expect_top_bar_height().returning(move || {
             let mut inner = s.inner.force_write();
-            let window = inner.windows.get_mut(&id)?;
+            let window = inner
+                .windows
+                .get_mut(&id)
+                .ok_or_else(|| Error::NotFound(format!("window {id} is gone")))?;
             window.top_bar_reads += 1;
-            window.top_bar_height
+            if window.top_bar_unreadable {
+                return Err(Error::Generic(format!("window {id} is unreadable")));
+            }
+            Ok(window.top_bar_height)
         });
 
         // Focusing without raising still moves the OS focus, it just leaves the

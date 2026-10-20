@@ -10,7 +10,7 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Populated, Query, Res, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
@@ -611,6 +611,11 @@ fn raise_window_trigger(
 /// everything, so it shows its full content. Runs when focus enters or leaves
 /// a stacked window and when a strip's layout changes, so a window that loses
 /// focus returns to its place in the stack.
+///
+/// `applied` holds the order last given to each overlapping stack, back to
+/// front. A stack already in the order it needs is not raised again. Raising
+/// can move an app's focus and emit focus notifications, so raising an
+/// ordered stack again on each of them would never settle.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn order_overlapping_stacks(
     gained: Query<Entity, Added<FocusedMarker>>,
@@ -619,6 +624,7 @@ fn order_overlapping_stacks(
     windows: Query<(&Window, &LayoutPosition, &Bounds)>,
     focused: Query<Entity, With<FocusedMarker>>,
     window_manager: Res<WindowManager>,
+    mut applied: Local<Vec<Vec<Entity>>>,
 ) {
     let touched = gained.iter().chain(lost.read()).collect::<Vec<_>>();
     let frame = |entity| {
@@ -637,6 +643,7 @@ fn order_overlapping_stacks(
             })
         }),
     };
+    let focus = focused.iter().next();
 
     let mut back_to_front = vec![];
     for strip in &strips {
@@ -648,18 +655,39 @@ fn order_overlapping_stacks(
                 || touched
                     .iter()
                     .any(|entity| items.iter().any(|item| item.contains(*entity)));
+            if !affected {
+                continue;
+            }
             let tops = items.iter().filter_map(StackItem::top).collect::<Vec<_>>();
             let tabbed_display = tops.iter().any(|top| strip.is_tabbed_display(*top));
-            if affected && !tabbed_display && stack_overlaps(&tops, &frame) {
-                back_to_front.extend(items.iter().filter_map(shown));
+            let order = (!tabbed_display && stack_overlaps(&tops, &frame)).then(|| {
+                let mut order = items.iter().filter_map(shown).collect::<Vec<_>>();
+                if let Some(index) = order.iter().position(|entity| Some(*entity) == focus) {
+                    let focused = order.remove(index);
+                    order.push(focused);
+                }
+                order
+            });
+            if order.as_ref().is_some_and(|order| applied.contains(order)) {
+                continue;
+            }
+            applied.retain(|order| {
+                !order
+                    .iter()
+                    .any(|entity| items.iter().any(|item| item.contains(*entity)))
+            });
+            if let Some(order) = order {
+                back_to_front.extend(order.iter().copied());
+                applied.push(order);
             }
         }
     }
+    // Forget windows that are gone.
+    applied.retain(|order| order.iter().all(|entity| windows.contains(*entity)));
     if back_to_front.is_empty() {
         return;
     }
 
-    let focus = focused.iter().next();
     for entity in back_to_front
         .into_iter()
         .filter(|entity| Some(*entity) != focus)

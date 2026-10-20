@@ -3,26 +3,31 @@ use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::RemovedComponents;
+use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Changed, Has, Or, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, ParamSet, Populated, Query, Res};
 use bevy::math::IRect;
+use bevy::time::{Time, Timer, TimerMode};
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::time::Duration;
 use stdext::function_name;
-use tracing::{Level, instrument, trace};
+use tracing::{Level, debug, instrument, trace};
 
 use crate::config::Config;
 use crate::ecs::params::Windows;
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, MinimumHeight, PlaceAfterArrival, Position, RefitAfterRemoval,
-    RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt, TopBarHeight,
-    VerifyWindowSize,
+    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
+    LayoutPosition, ManualStripOffset, MinimumHeight, PlaceAfterArrival, Position,
+    RefitAfterRemoval, RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
+    TopBarHeight, TopBarRetry, VerifyWindowSize,
 };
 use crate::errors::{Error, Result};
+use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WorkspaceId;
 use crate::types::commands::Side;
@@ -35,6 +40,12 @@ pub(crate) const MIN_WINDOW_HEIGHT: i32 = 200;
 /// The top bar kept visible for a window whose top bar Accessibility cannot
 /// measure, in points.
 pub(crate) const FALLBACK_TOP_BAR_HEIGHT: i32 = 52;
+
+/// How long to wait before reading a top bar again after Accessibility first
+/// failed to read it. Each further failure doubles the wait, up to
+/// [`TOP_BAR_RETRY_LIMIT`].
+const TOP_BAR_RETRY_FIRST: Duration = Duration::from_secs(1);
+const TOP_BAR_RETRY_LIMIT: Duration = Duration::from_secs(30);
 
 pub struct LayoutEventsPlugin;
 
@@ -223,6 +234,7 @@ impl Plugin for LayoutEventsPlugin {
                 // Wait for finish_setup before tiling: until then every window
                 // sits in the active strip regardless of its real display.
                 (
+                    refresh_top_bars,
                     layout_sizes_changed,
                     layout_strip_changed,
                     reshuffle_layout_strip,
@@ -389,22 +401,23 @@ impl Column {
 
     /// Moves the specified entity to the front of stack-local ordering.
     /// Native tab ordering is stable; the focused tab is tracked by `FocusedMarker`.
-    pub fn move_to_front(&mut self, entity: Entity) {
-        match self {
-            Column::Single(_) | Column::Fullscren(_) => {}
-            Column::Stack(stack) => {
-                if let Some(StackItem::Tabs(tabs)) =
-                    stack.iter_mut().find(|item| item.contains(entity))
-                    && let Some(pos) = tabs.iter().position(|&e| e == entity)
-                {
-                    tabs.swap(0, pos);
-                }
+    /// Returns whether the column changed, so a caller can leave change
+    /// detection alone when `entity` was already in front.
+    pub fn move_to_front(&mut self, entity: Entity) -> bool {
+        let tabs = match self {
+            Column::Single(_) | Column::Fullscren(_) => return false,
+            Column::Stack(stack) => match stack.iter_mut().find(|item| item.contains(entity)) {
+                Some(StackItem::Tabs(tabs)) => tabs,
+                _ => return false,
+            },
+            Column::Tabs(tabs) => tabs,
+        };
+        match tabs.iter().position(|&e| e == entity) {
+            Some(pos) if pos > 0 => {
+                tabs.swap(0, pos);
+                true
             }
-            Column::Tabs(tabs) => {
-                if let Some(pos) = tabs.iter().position(|&e| e == entity) {
-                    tabs.swap(0, pos);
-                }
-            }
+            _ => false,
         }
     }
 }
@@ -1420,6 +1433,101 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
     }
 }
 
+/// Measures a top bar again when it may have changed, and relays out the
+/// strip that holds the window when it did. Only windows an overlapping stack
+/// has measured before, or failed to, are measured.
+///
+/// - A window that loses focus goes back behind the window below it, so its
+///   top bar is measured then. Its app can change the top bar only while it
+///   is focused or as it resizes, such as when a browser shows its bookmarks
+///   bar, so this finds such a change before the top bar is covered.
+/// - A window that resizes may lay out its top bar again.
+/// - A top bar Accessibility could not read is read again when its
+///   [`TopBarRetry`] timer finishes.
+///
+/// A failed read keeps the last measurement and schedules a retry, waiting
+/// twice as long after each failure, so a busy app is not asked every frame.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn refresh_top_bars(
+    mut messages: MessageReader<Event>,
+    mut lost: RemovedComponents<FocusedMarker>,
+    mut windows: Query<(
+        Entity,
+        &Window,
+        Option<&mut TopBarHeight>,
+        Option<&mut TopBarRetry>,
+    )>,
+    mut strips: Query<&mut LayoutStrip>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    let mut stale = lost.read().collect::<EntityHashSet>();
+    let resized = messages
+        .read()
+        .filter_map(|event| match event {
+            Event::WindowResized { window_id } => Some(*window_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (entity, window, _, retry) in &mut windows {
+        if resized.contains(&window.id()) {
+            stale.insert(entity);
+        }
+        if let Some(mut retry) = retry
+            && retry.0.tick(time.delta()).is_finished()
+        {
+            stale.insert(entity);
+        }
+    }
+
+    for entity in stale {
+        let Ok((_, window, top_bar, retry)) = windows.get_mut(entity) else {
+            continue;
+        };
+        if top_bar.is_none() && retry.is_none() {
+            // No overlapping stack has needed this top bar yet.
+            continue;
+        }
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            continue;
+        };
+        let height = match window.top_bar_height() {
+            Ok(height) => height.unwrap_or(FALLBACK_TOP_BAR_HEIGHT),
+            Err(err) => {
+                debug!("top bar of window {} unreadable: {err}", window.id());
+                match retry {
+                    Some(mut retry) => {
+                        let wait = (retry.0.duration() * 2).min(TOP_BAR_RETRY_LIMIT);
+                        retry.0 = Timer::new(wait, TimerMode::Once);
+                    }
+                    None => {
+                        entity_commands.try_insert(TopBarRetry(Timer::new(
+                            TOP_BAR_RETRY_FIRST,
+                            TimerMode::Once,
+                        )));
+                    }
+                }
+                continue;
+            }
+        };
+        if retry.is_some() {
+            entity_commands.try_remove::<TopBarRetry>();
+        }
+        match top_bar {
+            Some(top_bar) if top_bar.0 == height => continue,
+            Some(mut top_bar) => top_bar.0 = height,
+            None => {
+                entity_commands.try_insert(TopBarHeight(height));
+            }
+        }
+        for mut strip in &mut strips {
+            if strip.contains(entity) {
+                strip.set_changed();
+            }
+        }
+    }
+}
+
 /// Watches for changes to `LayoutStrip` (i.e. a window added or window order changed) and
 /// re-calculates the logical positions of all the windows in the layout strip.
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -1427,7 +1535,7 @@ fn layout_strip_changed(
     mut changed_strips: Populated<(&mut LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
     mut windows: WindowFrames,
     minimum_heights: Query<&MinimumHeight>,
-    top_bars: Query<(&Window, Option<&TopBarHeight>)>,
+    top_bars: Query<(&Window, Option<&TopBarHeight>, Has<TopBarRetry>)>,
     displays: DisplayViewports,
     config: Res<Config>,
     mut commands: Commands,
@@ -1440,14 +1548,18 @@ fn layout_strip_changed(
     };
     let get_minimum_height = |entity| minimum_heights.get(entity).ok().map(|m| m.0);
     let measured = RefCell::new(Vec::new());
+    // A window waiting to retry an unreadable top bar keeps the fallback until
+    // `refresh_top_bars` reads it.
     let get_top_bar_height = |entity| match top_bars.get(entity) {
-        Ok((_, Some(top_bar))) => top_bar.0,
-        Ok((window, None)) => {
-            let height = window.top_bar_height().unwrap_or(FALLBACK_TOP_BAR_HEIGHT);
-            measured.borrow_mut().push((entity, height));
-            height
+        Ok((_, Some(top_bar), _)) => top_bar.0,
+        Ok((window, None, false)) => {
+            let height = window.top_bar_height();
+            measured
+                .borrow_mut()
+                .push((entity, height.as_ref().ok().copied()));
+            height.ok().flatten().unwrap_or(FALLBACK_TOP_BAR_HEIGHT)
         }
-        Err(_) => FALLBACK_TOP_BAR_HEIGHT,
+        Ok((_, None, true)) | Err(_) => FALLBACK_TOP_BAR_HEIGHT,
     };
 
     let mut changed = Vec::new();
@@ -1469,7 +1581,14 @@ fn layout_strip_changed(
 
     for (entity, height) in measured.into_inner() {
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_insert(TopBarHeight(height));
+            match height {
+                Some(height) => entity_commands
+                    .try_insert(TopBarHeight(height.unwrap_or(FALLBACK_TOP_BAR_HEIGHT))),
+                None => entity_commands.try_insert(TopBarRetry(Timer::new(
+                    TOP_BAR_RETRY_FIRST,
+                    TimerMode::Once,
+                ))),
+            };
         }
     }
 
