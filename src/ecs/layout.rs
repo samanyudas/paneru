@@ -862,6 +862,95 @@ impl LayoutStrip {
         Ok(())
     }
 
+    /// Moves the stack item holding `entity` into the column at `column`, so
+    /// it sits `slot` items from the top among that column's other items.
+    /// `column` counts the columns as they are before the move. A drop into
+    /// the item's own stack reorders it. A no-op for a fullscreen column on
+    /// either end, or a `column` past the end.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Error)` if the window is not in the strip.
+    pub fn insert_into_column(&mut self, entity: Entity, column: usize, slot: usize) -> Result<()> {
+        let source = self.index_of(entity)?;
+        if self
+            .columns
+            .get(column)
+            .and_then(Column::stack_items)
+            .is_none()
+        {
+            return Ok(());
+        }
+        let mate = self.column_mate(entity);
+        // A reorder keeps a tabbed stack tabbed, even one of two windows,
+        // whose lone survivor loses the membership while the item is out.
+        let tabbed_reorder = column == source && self.is_tabbed_display(entity);
+        let Some((item, source_kept)) = self.detach_item(source, entity) else {
+            return Ok(());
+        };
+        // The column the item joined, and the one it left, split evenly.
+        self.even_splits.insert(entity);
+        if source_kept {
+            self.even_splits.extend(mate);
+        }
+        if !source_kept && column == source {
+            // Its own lone column: nothing else to join, so it goes back.
+            self.columns.insert(source, item.into_column());
+            return Ok(());
+        }
+        let target = if source_kept || column < source {
+            column
+        } else {
+            column - 1
+        };
+        let Some(mut joined) = self.columns.get(target).and_then(Column::stack_items) else {
+            return Ok(());
+        };
+        // Joining a tabbed stack makes the newcomer tabbed too, so the stack
+        // never mixes tabbed and split members (see `tabbed_stacks`).
+        if tabbed_reorder
+            || joined
+                .iter()
+                .flat_map(StackItem::window_iter)
+                .any(|e| self.tabbed_stacks.contains(&e))
+        {
+            self.tabbed_stacks.extend(item.window_iter());
+            self.tabbed_stacks
+                .extend(joined.iter().flat_map(StackItem::window_iter));
+        }
+        joined.insert(slot.min(joined.len()), item);
+        if let Some(column) = self.columns.get_mut(target) {
+            *column = Column::Stack(joined);
+        }
+        Ok(())
+    }
+
+    /// Moves the stack item holding `entity` into a new column of its own at
+    /// gap `index`, where gap 0 is before the first column. `index` counts
+    /// the columns as they are before the move. A no-op for a fullscreen
+    /// source column.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Error)` if the window is not in the strip.
+    pub fn insert_as_column(&mut self, entity: Entity, index: usize) -> Result<()> {
+        let source = self.index_of(entity)?;
+        let mate = self.column_mate(entity);
+        let Some((item, source_kept)) = self.detach_item(source, entity) else {
+            return Ok(());
+        };
+        if source_kept {
+            self.even_splits.extend(mate);
+        }
+        let at = if source_kept || index <= source {
+            index
+        } else {
+            index - 1
+        };
+        self.columns.insert(at.min(self.len()), item.into_column());
+        Ok(())
+    }
+
     /// Takes the stack item holding `entity` out of column `index`, and
     /// returns it with whether any of the column remains. Leaves the strip
     /// untouched and returns `None` for a fullscreen column.
@@ -2178,6 +2267,139 @@ mod tests {
 
         strip.unstack(e[2], Side::West).unwrap();
         assert_eq!(render(&strip, &e), "B | A | C | D");
+    }
+
+    #[test]
+    fn a_drop_into_a_column_lands_at_the_slot() {
+        let (_world, mut strip, e) = strip_of(4);
+
+        strip.insert_into_column(e[3], 0, 0).unwrap();
+        assert_eq!(render(&strip, &e), "[D, A] | B | C");
+        strip.insert_into_column(e[2], 0, 1).unwrap();
+        assert_eq!(render(&strip, &e), "[D, C, A] | B");
+        strip.insert_into_column(e[1], 0, 3).unwrap();
+        assert_eq!(render(&strip, &e), "[D, C, A, B]");
+    }
+
+    #[test]
+    fn a_drop_into_a_column_right_of_a_vanishing_column_finds_it() {
+        let (_world, mut strip, e) = strip_of(3);
+
+        strip.insert_into_column(e[0], 2, 0).unwrap();
+        assert_eq!(render(&strip, &e), "B | [A, C]");
+    }
+
+    #[test]
+    fn a_slot_past_the_bottom_makes_the_bottom_window() {
+        let (_world, mut strip, e) = strip_of(3);
+
+        strip.insert_into_column(e[2], 0, 9).unwrap();
+        assert_eq!(render(&strip, &e), "[A, C] | B");
+    }
+
+    #[test]
+    fn a_drop_into_its_own_stack_reorders_it() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[1], Side::West).unwrap();
+        strip.stack(e[2], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B, C] | D");
+
+        strip.insert_into_column(e[0], 0, 2).unwrap();
+        assert_eq!(render(&strip, &e), "[B, C, A] | D");
+        strip.insert_into_column(e[0], 0, 0).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B, C] | D");
+        strip.insert_into_column(e[2], 0, 1).unwrap();
+        assert_eq!(render(&strip, &e), "[A, C, B] | D");
+    }
+
+    #[test]
+    fn a_drop_out_of_a_stack_leaves_the_rest_in_place() {
+        let (_world, mut strip, e) = strip_of(3);
+        strip.stack(e[1], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B] | C");
+
+        strip.insert_into_column(e[1], 1, 0).unwrap();
+        assert_eq!(render(&strip, &e), "A | [B, C]");
+        assert!(strip.even_splits.contains(&e[0]), "the column it left");
+        assert!(strip.even_splits.contains(&e[1]), "the column it joined");
+    }
+
+    #[test]
+    fn a_dropped_native_tab_moves_its_whole_tab_group() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[2], Side::West).unwrap();
+        strip.convert_to_tabs(e[2], e[3]).unwrap();
+        assert_eq!(render(&strip, &e), "A | [B, {D C}]");
+
+        strip.insert_into_column(e[2], 0, 0).unwrap();
+        assert_eq!(render(&strip, &e), "[{D C}, A] | B");
+    }
+
+    #[test]
+    fn a_fullscreen_column_takes_no_drop() {
+        let (_world, mut strip, e) = strip_of(3);
+        *strip.get_column_mut(1).unwrap() = Column::Fullscren(e[1]);
+
+        strip.insert_into_column(e[0], 1, 0).unwrap();
+        assert_eq!(render(&strip, &e), "A | !B | C");
+        strip.insert_into_column(e[1], 0, 0).unwrap();
+        assert_eq!(render(&strip, &e), "A | !B | C");
+        strip.insert_as_column(e[1], 0).unwrap();
+        assert_eq!(render(&strip, &e), "A | !B | C");
+    }
+
+    #[test]
+    fn a_drop_into_a_tabbed_stack_joins_its_tabs() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[2], Side::West).unwrap();
+        assert_eq!(strip.toggle_tabbed_display(e[1]), Some(true));
+
+        strip.insert_into_column(e[3], 1, 1).unwrap();
+        assert_eq!(render(&strip, &e), "A | [B, D, C]");
+        assert!(strip.is_tabbed_display(e[3]));
+    }
+
+    #[test]
+    fn reordering_a_tabbed_stack_of_two_keeps_it_tabbed() {
+        let (_world, mut strip, e) = strip_of(2);
+        strip.stack(e[1], Side::West).unwrap();
+        assert_eq!(strip.toggle_tabbed_display(e[0]), Some(true));
+
+        strip.insert_into_column(e[1], 0, 0).unwrap();
+        assert_eq!(render(&strip, &e), "[B, A]");
+        assert!(strip.is_tabbed_display(e[0]));
+        assert!(strip.is_tabbed_display(e[1]));
+    }
+
+    #[test]
+    fn a_drop_between_columns_opens_a_column_there() {
+        let (_world, mut strip, e) = strip_of(3);
+
+        strip.insert_as_column(e[0], 3).unwrap();
+        assert_eq!(render(&strip, &e), "B | C | A");
+        strip.insert_as_column(e[0], 0).unwrap();
+        assert_eq!(render(&strip, &e), "A | B | C");
+        strip.insert_as_column(e[0], 2).unwrap();
+        assert_eq!(render(&strip, &e), "B | A | C");
+    }
+
+    #[test]
+    fn a_drop_between_columns_takes_a_window_out_of_its_stack() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[1], Side::West).unwrap();
+        strip.convert_to_tabs(e[2], e[3]).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B] | {D C}");
+
+        strip.insert_as_column(e[1], 0).unwrap();
+        assert_eq!(render(&strip, &e), "B | A | {D C}");
+        assert!(strip.even_splits.contains(&e[0]), "the column it left");
+
+        strip.stack(e[0], Side::West).unwrap();
+        strip.insert_as_column(e[0], 2).unwrap();
+        assert_eq!(render(&strip, &e), "B | {D C} | A");
+
+        strip.insert_as_column(e[2], 0).unwrap();
+        assert_eq!(render(&strip, &e), "{D C} | B | A");
     }
 
     #[test]

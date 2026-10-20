@@ -7,7 +7,7 @@ use objc2_core_graphics::CGDirectDisplayID;
 use stdext::prelude::RwLockExt;
 
 use crate::errors::Error;
-use crate::events::{DestroySource, Event};
+use crate::events::{DestroySource, Event, MouseButton};
 use crate::manager::app::MockApplicationApi;
 use crate::manager::{
     Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
@@ -497,10 +497,12 @@ impl MockState {
         inner.event_queue.push_back(Event::MouseDown {
             point,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
         });
         inner.event_queue.push_back(Event::MouseUp {
             point,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
         });
     }
 
@@ -522,14 +524,17 @@ impl MockState {
         inner.event_queue.push_back(Event::MouseDown {
             point: start_p,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
         });
         inner.event_queue.push_back(Event::MouseDragged {
             point: end_p,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
         });
         inner.event_queue.push_back(Event::MouseUp {
             point: end_p,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
         });
     }
 

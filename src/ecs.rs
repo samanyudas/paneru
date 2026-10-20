@@ -43,6 +43,7 @@ use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
 pub mod display;
+pub mod drag;
 pub mod focus;
 pub mod layout;
 #[cfg(feature = "lua")]
@@ -831,6 +832,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_resource(launch_windows)
         .insert_non_send(watcher)
         .add_plugins(mouse::MouseEventsPlugin)
+        .add_plugins(drag::DragEventsPlugin)
         .add_plugins(scroll::ScrollEventsPlugin)
         .add_plugins(workspace::WorkspaceEventsPlugin)
         .add_plugins(layout::LayoutEventsPlugin)

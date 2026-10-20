@@ -10,6 +10,7 @@ use tracing::{debug, trace, warn};
 
 use super::{MouseHeldMarker, Timeout};
 use crate::config::Config;
+use crate::ecs::drag::DragState;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{GlobalState, Windows};
 use crate::ecs::{
@@ -255,10 +256,13 @@ fn mouse_down_trigger(
 }
 
 /// Handles mouse-up events. Triggers the deferred reshuffle so the clicked
-/// window slides into view after the user releases the button.
-fn mouse_up_trigger(
+/// window slides into view after the user releases the button. A window
+/// just dropped by a title-bar drag is left to the drop, which already
+/// placed it.
+pub(super) fn mouse_up_trigger(
     mut messages: MessageReader<InputEvent>,
     mouse_held: Query<(Entity, &MouseHeldMarker)>,
+    drag: Option<Res<DragState>>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -266,8 +270,11 @@ fn mouse_up_trigger(
             continue;
         }
 
+        let dropped = drag.as_ref().and_then(|drag| drag.settling_window());
         for (held_entity, marker) in &mouse_held {
-            commands.reshuffle_around(marker.0);
+            if dropped != Some(marker.0) {
+                commands.reshuffle_around(marker.0);
+            }
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
             }
