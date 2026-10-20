@@ -24,7 +24,7 @@ use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
     LayoutPosition, ManualStripOffset, MinimumHeight, PlaceAfterArrival, Position,
     RefitAfterRemoval, RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
-    TopBarHeight, TopBarRetry, VerifyWindowSize,
+    TopBarHeight, TopBarRetry, VerifyWindowSize, WidthAnchor,
 };
 use crate::errors::{Error, Result};
 use crate::events::Event;
@@ -2156,6 +2156,27 @@ fn position_layout_windows(
             }
         }
     }
+}
+
+/// Where a column of `size` goes for `anchor`, kept inside `viewport`.
+pub(crate) fn anchored_origin(
+    anchor: WidthAnchor,
+    frame: IRect,
+    size: Size,
+    viewport: IRect,
+) -> Origin {
+    let center = match anchor {
+        WidthAnchor::Center(x) => Origin::new(x, frame.center().y),
+        WidthAnchor::Left | WidthAnchor::Right => frame.center(),
+    };
+    let mut origin =
+        clamp_origin_to_viewport(IRect::from_center_size(center, size).min, size, viewport);
+    match anchor {
+        WidthAnchor::Left => origin.x = viewport.min.x,
+        WidthAnchor::Right => origin.x = viewport.max.x - size.x,
+        WidthAnchor::Center(_) => {}
+    }
+    origin
 }
 
 #[cfg(test)]

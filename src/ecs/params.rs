@@ -16,9 +16,9 @@ use crate::{
     config::Config,
     ecs::{
         ActiveWorkspaceMarker, AwaitingHandle, Bounds, DockPosition, FlashMessage, FocusedMarker,
-        FullWidthMarker, Initializing, LayoutPosition, NativeFullscreenMarker, Position,
-        RepositionMarker, ResizeMarker, Scrolling, Unmanaged, VerifyWindowSize, WidthRatio,
-        layout::LayoutStrip,
+        FullWidthMarker, Initializing, LayoutPosition, NativeFullscreenMarker,
+        PendingWidthSettlement, Position, RepositionMarker, ResizeMarker, Scrolling, Unmanaged,
+        VerifyWindowSize, WidthRatio, layout::LayoutStrip,
     },
     manager::{Application, Display, Origin, Size, Window},
     platform::{ProcessSerialNumber, WinID},
@@ -207,6 +207,7 @@ pub struct FrameActivity<'w, 's> {
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
     awaiting_handles: Query<'w, 's, (), With<AwaitingHandle>>,
     size_checks: Query<'w, 's, (), With<VerifyWindowSize>>,
+    width_settlements: Query<'w, 's, (), With<PendingWidthSettlement>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -218,6 +219,7 @@ impl FrameActivity<'_, '_> {
             || !self.flash_messages.is_empty()
             || !self.awaiting_handles.is_empty()
             || !self.size_checks.is_empty()
+            || !self.width_settlements.is_empty()
     }
 }
 
