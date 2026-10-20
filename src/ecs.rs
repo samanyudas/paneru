@@ -189,6 +189,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::commit_window_frame.run_if(not(resource_exists::<Initializing>)),
                 systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
                 triggers::window_resize_verifier,
+                triggers::settle_width_requests,
             )
                 .chain(),
             (
@@ -522,6 +523,59 @@ pub enum DockPosition {
     Left(i32),
     Right(i32),
     Hidden,
+}
+
+/// Where a run of width changes keeps a column: flush against a display edge it
+/// started on, or around the center it started at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WidthAnchor {
+    Left,
+    Right,
+    Center(i32),
+}
+
+/// The anchor of the current run of width changes on a column. Focus changes,
+/// non-width placement commands, and swipe or scroll gestures end the run.
+/// App size corrections and animation do not (miri#39).
+#[derive(Component)]
+pub(crate) struct WidthRun {
+    pub(crate) anchor: WidthAnchor,
+}
+
+/// A width command's finite request for native readback and anchored placement.
+#[derive(Component)]
+pub(crate) struct PendingWidthSettlement {
+    requested_width: i32,
+    strip: Entity,
+    viewport: bevy::math::IRect,
+    expires: Duration,
+    phase: WidthSettlementPhase,
+}
+
+enum WidthSettlementPhase {
+    InitialReadback,
+    Grace {
+        deadline: Duration,
+        reads_remaining: u8,
+    },
+    Reconciled,
+}
+
+impl PendingWidthSettlement {
+    pub(crate) fn new(
+        requested_width: i32,
+        strip: Entity,
+        viewport: bevy::math::IRect,
+        now: Duration,
+    ) -> Self {
+        Self {
+            requested_width,
+            strip,
+            viewport,
+            expires: now + Duration::from_secs(10),
+            phase: WidthSettlementPhase::InitialReadback,
+        }
+    }
 }
 
 /// Asks `window_resize_verifier` to read back a window's native size once no

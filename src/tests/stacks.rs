@@ -542,3 +542,33 @@ fn the_effective_limit_never_exceeds_what_fits() {
     assert_eq!(effective("[options]\nstack_limit = \"fit\"\n", 1400), 7);
     assert_eq!(effective("[options]\nstack_limit = \"fit\"\n", 150), 1);
 }
+
+#[test]
+fn test_width_settlement_unfocused_sibling_refusal_preserves_unequal_heights() {
+    let mut harness = tall_harness();
+    stack_three(&mut harness);
+    harness.run(vec![
+        command(Operation::Focus(Direction::North)),
+        command(Operation::Focus(Direction::North)),
+        command(Operation::ResizeVerticalStep(
+            crate::commands::ResizeDirection::Grow,
+        )),
+        command(Operation::Center),
+    ]);
+    harness.advance(SETTLE);
+    let before = column(harness.world(), &[0, 1, 2]);
+    let before_heights = heights(&before);
+    assert!(before_heights[0] > before_heights[1]);
+    crate::assert_focused!(harness.world(), 0);
+    harness
+        .mock_state
+        .update_window(2, |window| window.minimum_size = Some(Size::new(400, 0)));
+    harness.run(vec![command(Operation::SetWidth(0.25))]);
+    harness.advance(Duration::from_secs(3));
+    let after = column(harness.world(), &[0, 1, 2]);
+    assert_eq!(heights(&after), before_heights);
+    for frame in after {
+        assert_eq!(frame.width(), 400);
+        assert_eq!(frame.min.x, 312);
+    }
+}

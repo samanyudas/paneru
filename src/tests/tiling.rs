@@ -1347,3 +1347,260 @@ fn test_a_mouse_resize_gesture_ends_the_width_run() {
     assert_window_size!(harness.world(), 1, 256, 748);
     assert_window_at!(harness.world(), 1, 768, TEST_MENUBAR_HEIGHT);
 }
+
+#[test]
+fn test_refused_width_settles_left_right_and_center() {
+    for (initial_width, focus, grow, accepted, expected_x) in [
+        (0.5, Direction::First, true, 600, 0),
+        (0.5, Direction::First, false, 400, 0),
+        (0.5, Direction::Last, true, 600, 424),
+        (0.5, Direction::Last, false, 400, 624),
+        (0.45, Direction::Last, true, 750, 274),
+        (0.45, Direction::Last, false, 400, 491),
+    ] {
+        let options = MainOptions {
+            auto_center: Some(false),
+            ..Default::default()
+        };
+        let mut params = WindowParams::new(".*", None);
+        params.width = Some(InitialWindowWidth::Ratio(initial_width));
+        let config: Config = (options, vec![params]).into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(2);
+        harness.run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Window(Operation::Focus(focus.clone())),
+            },
+        ]);
+        harness.advance(Duration::from_secs(1));
+        let id = i32::from(focus != Direction::First);
+        harness.mock_state.update_window(id, |window| {
+            if grow {
+                window.maximum_size = Some(crate::manager::Size::new(accepted, 748));
+            } else {
+                window.minimum_size = Some(crate::manager::Size::new(accepted, 0));
+            }
+        });
+        harness.app.world_mut().write_message(Event::Command {
+            command: Command::Window(Operation::SetWidth(if grow { 0.75 } else { 0.25 })),
+        });
+        harness.advance(Duration::from_secs(3));
+        assert_window_size!(harness.world(), id, accepted, 748);
+        assert_window_at!(harness.world(), id, expected_x, TEST_MENUBAR_HEIGHT);
+    }
+}
+
+fn refused_center_harness(animation_speed: Option<f64>) -> TestHarness {
+    let mut harness = clamped_last_column_harness(animation_speed);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    harness.advance(Duration::from_secs(3));
+    harness.mock_state.update_window(1, |window| {
+        window.maximum_size = Some(crate::manager::Size::new(750, 748));
+    });
+    harness
+}
+
+fn set_width(harness: &mut TestHarness, ratio: f64) {
+    harness.app.world_mut().write_message(Event::Command {
+        command: Command::Window(Operation::SetWidth(ratio)),
+    });
+}
+
+fn assert_width_settlement_idle(harness: &mut TestHarness) {
+    use bevy::ecs::system::RunSystemOnce;
+    assert!(
+        harness
+            .world()
+            .query::<&crate::ecs::PendingWidthSettlement>()
+            .iter(harness.world())
+            .next()
+            .is_none()
+    );
+    assert!(
+        !harness
+            .world()
+            .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
+            .unwrap()
+    );
+}
+
+#[test]
+fn test_width_settlement_repeated_refusal_and_idle() {
+    let mut harness = refused_center_harness(None);
+    set_width(&mut harness, 0.75);
+    harness.advance(Duration::from_millis(400));
+    set_width(&mut harness, 0.75);
+    harness.advance(Duration::from_secs(3));
+    assert_window_at!(harness.world(), 1, 274, TEST_MENUBAR_HEIGHT);
+    assert_width_settlement_idle(&mut harness);
+    set_width(&mut harness, 0.75);
+    harness.advance(Duration::from_secs(3));
+    assert_window_at!(harness.world(), 1, 274, TEST_MENUBAR_HEIGHT);
+    assert_width_settlement_idle(&mut harness);
+}
+
+#[test]
+fn test_width_settlement_honors_400ms_late_apply_with_and_without_notification() {
+    for notify in [false, true] {
+        for accepted in [768, 650] {
+            let mut harness = refused_center_harness(None);
+            set_width(&mut harness, 0.75);
+            harness.advance(Duration::from_millis(400));
+            harness.mock_state.update_window(1, |window| {
+                window.maximum_size = None;
+                window.frame.max.x = window.frame.min.x + accepted;
+            });
+            if notify {
+                harness
+                    .app
+                    .world_mut()
+                    .write_message(Event::WindowResized { window_id: 1 });
+            }
+            harness.advance(Duration::from_secs(3));
+            let expected_x = if accepted == 768 { 256 } else { 366 };
+            assert_window_size!(harness.world(), 1, accepted, 748);
+            assert_window_at!(harness.world(), 1, expected_x, TEST_MENUBAR_HEIGHT);
+            assert_width_settlement_idle(&mut harness);
+        }
+    }
+}
+
+#[test]
+fn test_width_settlement_center_cancels_during_animation_and_grace() {
+    for (speed, wait) in [(Some(8.0), 100), (None, 400)] {
+        let mut harness = refused_center_harness(speed);
+        set_width(&mut harness, 0.75);
+        harness.advance(Duration::from_millis(wait));
+        let owner = find_window_entity(1, harness.world());
+        let center_destination = 512
+            - harness
+                .world()
+                .get::<crate::ecs::Bounds>(owner)
+                .unwrap()
+                .0
+                .x
+                / 2;
+        harness.app.world_mut().write_message(Event::Command {
+            command: Command::Window(Operation::Center),
+        });
+        harness.advance(Duration::from_secs(4));
+        let after_center = window_x(harness.world(), 1);
+        assert_eq!(after_center, center_destination);
+        harness.advance(Duration::from_secs(2));
+        assert_eq!(window_x(harness.world(), 1), after_center);
+        assert_ne!(after_center, 274, "Center must replace the old anchor");
+        assert_width_settlement_idle(&mut harness);
+    }
+}
+
+#[test]
+fn test_width_settlement_mixed_batches_give_interruption_precedence() {
+    for width_first in [false, true] {
+        let mut harness = refused_center_harness(None);
+        let center = Event::Command {
+            command: Command::Window(Operation::Center),
+        };
+        if width_first {
+            set_width(&mut harness, 0.75);
+            harness.app.world_mut().write_message(center);
+        } else {
+            harness.app.world_mut().write_message(center);
+            set_width(&mut harness, 0.75);
+        }
+        harness.advance(Duration::from_secs(3));
+        assert_width_settlement_idle(&mut harness);
+        let owner = find_window_entity(1, harness.world());
+        assert!(harness.world().get::<crate::ecs::WidthRun>(owner).is_none());
+        set_width(&mut harness, 0.5);
+        harness.advance(Duration::from_secs(3));
+        assert!(harness.world().get::<crate::ecs::WidthRun>(owner).is_some());
+        assert_width_settlement_idle(&mut harness);
+    }
+}
+
+#[test]
+fn test_width_settlement_final_read_failures_end_without_correction() {
+    let mut harness = refused_center_harness(None);
+    set_width(&mut harness, 0.75);
+    harness.advance(Duration::from_millis(400));
+    harness
+        .mock_state
+        .update_window(1, |window| window.frame_read_failures = u8::MAX);
+    harness.advance(Duration::from_secs(3));
+    assert_window_at!(harness.world(), 1, 256, TEST_MENUBAR_HEIGHT);
+    let mut failures = 0;
+    harness
+        .mock_state
+        .update_window(1, |window| failures = window.frame_read_failures);
+    assert_eq!(failures, u8::MAX - 3);
+    assert_width_settlement_idle(&mut harness);
+}
+
+#[test]
+fn test_width_settlement_perpetual_geometry_changes_expire() {
+    let mut harness = refused_center_harness(None);
+    let stop_changing = harness.world().resource::<Time>().elapsed() + Duration::from_secs(11);
+    harness.app.add_systems(
+        Update,
+        move |time: Res<Time>,
+              mut bounds: Query<&mut crate::ecs::Bounds, With<crate::ecs::FocusedMarker>>| {
+            if time.elapsed() < stop_changing {
+                for mut bounds in &mut bounds {
+                    bounds.set_changed();
+                }
+            }
+        },
+    );
+    set_width(&mut harness, 0.75);
+    harness.advance(Duration::from_millis(10_100));
+    assert!(
+        harness
+            .world()
+            .query::<&crate::ecs::PendingWidthSettlement>()
+            .iter(harness.world())
+            .next()
+            .is_none()
+    );
+    harness.advance(Duration::from_secs(4));
+    assert_width_settlement_idle(&mut harness);
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn test_width_settlement_lua_width_batches_preserve_the_run() {
+    use crate::types::windowset::LayoutOp;
+    for script_first in [false, true] {
+        let mut harness = refused_center_harness(None);
+        if script_first {
+            harness.app.world_mut().write_message(Event::Command {
+                command: Command::Layout(vec![LayoutOp::SetWidth {
+                    window: 1,
+                    ratio: 0.75,
+                }]),
+            });
+        } else {
+            set_width(&mut harness, 0.75);
+        }
+        harness.advance(Duration::from_millis(500));
+        harness.app.world_mut().write_message(Event::Command {
+            command: Command::PrintState,
+        });
+        harness.app.world_mut().write_message(Event::Command {
+            command: Command::Lua(0),
+        });
+        harness.app.world_mut().write_message(Event::Command {
+            command: Command::Layout(vec![LayoutOp::SetWidth {
+                window: 1,
+                ratio: 0.25,
+            }]),
+        });
+        harness.advance(Duration::from_secs(3));
+        assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
+        assert_width_settlement_idle(&mut harness);
+    }
+}

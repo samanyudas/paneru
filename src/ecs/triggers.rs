@@ -6,7 +6,9 @@ use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
-use bevy::ecs::system::{Commands, NonSendMut, ParamSet, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{
+    Commands, NonSendMut, ParamSet, Populated, Query, Res, ResMut, Single, SystemParam,
+};
 use bevy::math::IRect;
 use bevy::time::{Time, Timer, TimerMode};
 use notify::event::{DataChange, MetadataKind, ModifyKind};
@@ -22,15 +24,16 @@ use super::{
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{LayoutStrip, anchored_origin};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LaunchWindows, LayoutPosition,
-    MinimumHeight, Position, PreLaunchFrame, RepositionMarker, ResizeMarker, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, VerifyWindowSize,
-    WidthRatio, WindowProperties,
+    MinimumHeight, PendingWidthSettlement, Position, PreLaunchFrame, RepositionMarker,
+    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    VerifyWindowPosition, VerifyWindowSize, WidthRatio, WidthRun, WidthSettlementPhase,
+    WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -1581,15 +1584,30 @@ pub(super) fn cleanup_timeout_trigger(
     }
 }
 
+type NativeSizeWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        Ref<'static, Position>,
+        &'static mut Bounds,
+    ),
+>;
+
+#[derive(SystemParam)]
+pub(super) struct SizeVerification<'w, 's> {
+    windows: NativeSizeWindows<'w, 's>,
+    layout_strips: Query<'w, 's, &'static LayoutStrip>,
+    resizes: Query<'w, 's, &'static ResizeMarker>,
+}
+
 pub(super) fn window_resize_verifier(
     mut requested: Query<(Entity, &mut VerifyWindowSize), SizeCheckReady>,
-    mut windows: Query<(&mut Window, Ref<Position>, &mut Bounds)>,
-    layout_strips: Query<&LayoutStrip>,
+    mut verification: SizeVerification,
     mut commands: Commands,
 ) {
-    use std::cmp::Ordering;
-    for (entity, mut verification) in &mut requested {
-        let Ok((mut window, position, mut bounds)) = windows.get_mut(entity) else {
+    for (entity, mut request) in &mut requested {
+        let Ok((mut window, position, bounds)) = verification.windows.get_mut(entity) else {
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<VerifyWindowSize>();
             }
@@ -1600,34 +1618,44 @@ pub(super) fn window_resize_verifier(
         }
         let frame = window.update_frame();
         if frame.is_err() {
-            verification.remaining = verification.remaining.saturating_sub(1);
-            if verification.remaining > 0 {
+            request.remaining = request.remaining.saturating_sub(1);
+            if request.remaining > 0 {
                 continue;
             }
         }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<VerifyWindowSize>();
         }
-        let Ok(frame) = frame else {
-            continue;
+        if let Ok(frame) = frame {
+            verification.reconcile(entity, frame.size(), &mut commands);
+        }
+    }
+}
+
+impl SizeVerification<'_, '_> {
+    fn frame(&self, entity: Entity) -> Option<IRect> {
+        self.windows
+            .get(entity)
+            .ok()
+            .map(|(_, position, bounds)| IRect::from_corners(position.0, position.0 + bounds.0))
+    }
+
+    fn reconcile(&mut self, entity: Entity, actual_size: Size, commands: &mut Commands) {
+        let Ok((window, _, mut bounds)) = self.windows.get_mut(entity) else {
+            return;
         };
-
-        let actual_size = frame.size();
         let expected_size = bounds.0;
-
-        // note: macOS loves to make window sizes to even numbers, so we treat actual+1 as equal.
         let width_ord = fuzzy_equal(actual_size.x, expected_size.x);
         let height_ord = fuzzy_equal(actual_size.y, expected_size.y);
-
         if width_ord == Ordering::Equal && height_ord == Ordering::Equal {
-            continue;
+            return;
         }
         debug!(
-            "window '{}'({}) did not fully resized to {}, was {} instead",
+            "window '{}'({}) did not fully resize to {}, was {} instead",
             window.title().unwrap_or_default(),
             window.id(),
             expected_size,
-            actual_size,
+            actual_size
         );
         bounds.0 = actual_size;
         if height_ord == Ordering::Less
@@ -1635,47 +1663,177 @@ pub(super) fn window_resize_verifier(
         {
             entity_commands.try_insert(MinimumHeight(actual_size.y));
         }
+        if width_ord != Ordering::Less {
+            return;
+        }
+        let Some(column) = self.layout_strips.iter().find_map(|strip| {
+            strip
+                .index_of(entity)
+                .ok()
+                .and_then(|idx| strip.get(idx).ok())
+        }) else {
+            return;
+        };
+        let get_window_frame = |entity| self.frame(entity);
+        let Some(column_width) = column.width(&get_window_frame) else {
+            return;
+        };
+        for sibling in column.window_iter().filter(|sibling| *sibling != entity) {
+            if let Some(frame) = get_window_frame(sibling)
+                && frame.width() < column_width
+            {
+                let height = self
+                    .resizes
+                    .get(sibling)
+                    .map_or(frame.height(), |resize| resize.0.y);
+                commands.resize_entity(sibling, Size::new(column_width, height));
+            }
+        }
+    }
 
-        // we may hitting minimum width constraint on this window or this window isn't resizable.
-        // if this window is a part of a column, other windows in the column might have resized(shrunk) successfully,
-        // which leaves an empty space next to those windows.
-        // try to expand those windows to fill the empty space. (it's free real estate after all)
-        //
-        // note that those windows might have max window constraints or isn't resiable.
-        // so we need to ignore cases where windows are failing to expand to the target.
-        if width_ord == Ordering::Less {
-            let Some(column) = layout_strips.iter().find_map(|strip| {
-                strip
-                    .index_of(entity)
-                    .ok()
-                    .and_then(|idx| strip.get(idx).ok())
-            }) else {
-                continue;
-            };
+    fn read_column(&mut self, members: &[Entity], commands: &mut Commands) -> bool {
+        let mut frames = Vec::with_capacity(members.len());
+        for member in members {
+            if let Ok((mut window, _, _)) = self.windows.get_mut(*member)
+                && let Ok(frame) = window.update_frame()
+            {
+                frames.push((*member, frame));
+            }
+        }
+        if frames.len() != members.len() {
+            return false;
+        }
+        for (member, frame) in frames {
+            self.reconcile(member, frame.size(), commands);
+        }
+        true
+    }
+}
 
-            let get_window_frame = |entity| {
-                windows
-                    .get(entity)
-                    .map(|(_, position, bounds)| {
-                        IRect::from_corners(position.0, position.0 + bounds.0)
-                    })
-                    .ok()
-            };
+type WidthSettlementRequests<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut PendingWidthSettlement,
+        Option<&'static WidthRun>,
+        Has<FocusedMarker>,
+        Has<Unmanaged>,
+    ),
+>;
 
-            let Some(column_width) = column.width(&get_window_frame) else {
-                continue;
-            };
+type SettledSize = (
+    Without<ResizeMarker>,
+    Without<RepositionMarker>,
+    Without<AwaitingHandle>,
+    Without<VerifyWindowSize>,
+);
 
-            column
-                .window_iter()
-                .filter(|e| *e != entity)
-                .for_each(|entity| {
-                    if let Some(width) = get_window_frame(entity).as_ref().map(IRect::width)
-                        && width < column_width
-                    {
-                        commands.resize_entity(entity, Size::new(column_width, actual_size.y));
+pub(super) fn settle_width_requests(
+    mut requests: WidthSettlementRequests,
+    mut verification: SizeVerification,
+    ready: Query<(), SettledSize>,
+    active_display: ActiveDisplay,
+    config: Res<Config>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    for (entity, mut request, run, focused, unmanaged) in &mut requests {
+        let strip = active_display.active_strip();
+        let column = strip
+            .index_of(entity)
+            .ok()
+            .and_then(|idx| strip.get(idx).ok());
+        let (Some(run), Some(column)) = (run, column) else {
+            commands
+                .entity(entity)
+                .try_remove::<PendingWidthSettlement>();
+            continue;
+        };
+        let members: Vec<_> = column.window_iter().collect();
+        if time.elapsed() >= request.expires
+            || !focused
+            || unmanaged
+            || request.strip != active_display.active_strip_entity()
+            || request.viewport != active_display.actual_bounds(&config)
+            || members
+                .iter()
+                .any(|member| !verification.windows.contains(*member))
+        {
+            commands
+                .entity(entity)
+                .try_remove::<PendingWidthSettlement>();
+            continue;
+        }
+        if !ready.contains(request.strip)
+            || members.iter().any(|member| {
+                !ready.contains(*member)
+                    || verification
+                        .windows
+                        .get_mut(*member)
+                        .is_ok_and(|(_, position, bounds)| {
+                            position.is_changed() || bounds.is_changed()
+                        })
+            })
+        {
+            continue;
+        }
+        let Some(width) = column.width(&|member| verification.frame(member)) else {
+            commands
+                .entity(entity)
+                .try_remove::<PendingWidthSettlement>();
+            continue;
+        };
+        match &mut request.phase {
+            WidthSettlementPhase::InitialReadback => {
+                if fuzzy_equal(width, request.requested_width) == Ordering::Equal {
+                    commands
+                        .entity(entity)
+                        .try_remove::<PendingWidthSettlement>();
+                } else {
+                    request.phase = WidthSettlementPhase::Grace {
+                        deadline: time.elapsed() + Duration::from_secs(1),
+                        reads_remaining: 3,
+                    };
+                }
+            }
+            WidthSettlementPhase::Grace {
+                deadline,
+                reads_remaining,
+            } => {
+                if time.elapsed() < *deadline {
+                    continue;
+                }
+                if !verification.read_column(&members, &mut commands) {
+                    *reads_remaining -= 1;
+                    if *reads_remaining == 0 {
+                        commands
+                            .entity(entity)
+                            .try_remove::<PendingWidthSettlement>();
                     }
-                });
+                    continue;
+                }
+                request.phase = WidthSettlementPhase::Reconciled;
+            }
+            WidthSettlementPhase::Reconciled => {
+                commands
+                    .entity(entity)
+                    .try_remove::<PendingWidthSettlement>();
+                if fuzzy_equal(width, request.requested_width) == Ordering::Equal {
+                    continue;
+                }
+                let Some(frame) = verification.frame(entity) else {
+                    continue;
+                };
+                let origin = anchored_origin(
+                    run.anchor,
+                    frame,
+                    frame.size().with_x(width),
+                    request.viewport,
+                );
+                commands.reposition_entity(entity, origin);
+                commands.reshuffle_around(entity);
+            }
         }
     }
 }
