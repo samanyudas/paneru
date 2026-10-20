@@ -544,6 +544,7 @@ mod tests {
                 point: objc2_core_foundation::CGPoint { x: 10.0, y: 20.0 },
                 modifiers: Modifiers::ALT,
                 button: crate::events::MouseButton::Left,
+                window_id: None,
             },
         )
         .expect("mouse_down should marshal");

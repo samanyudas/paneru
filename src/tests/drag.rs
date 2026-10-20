@@ -726,11 +726,12 @@ fn cg(point: Origin) -> CGPoint {
     CGPoint::new(point.x.into(), point.y.into())
 }
 
-fn mouse_down(point: Origin) -> Event {
+fn mouse_down(point: Origin, window_id: Option<WinID>) -> Event {
     Event::MouseDown {
         point: cg(point),
         modifiers: Modifiers::empty(),
         button: MouseButton::Left,
+        window_id,
     }
 }
 
@@ -804,7 +805,8 @@ fn press_and_drag(harness: &mut TestHarness, id: WinID, to: Origin) -> IRect {
 /// the tap reports the press.
 fn press_at(harness: &mut TestHarness, point: Origin) {
     harness.mock_state.set_left_button_down(true);
-    harness.world().write_message(mouse_down(point));
+    let window_id = harness.mock_state.window_at(point);
+    harness.world().write_message(mouse_down(point, window_id));
 }
 
 fn release(harness: &mut TestHarness, at: Origin) {
@@ -1183,6 +1185,35 @@ fn a_parked_window_is_dragged_by_its_visible_title_bar() {
         drag_state(harness.world())
     );
     release(&mut harness, to);
+    harness.advance(SETTLE);
+
+    assert_eq!(layout(harness.world())[0], vec![0, 3]);
+}
+
+/// The tap hands over a parked window's whole gesture in one update. By
+/// then the sliver has moved off the press, and the window under the press
+/// is its neighbor, so the press must keep the window the tap saw.
+#[test]
+fn a_batched_drag_of_a_parked_window_moves_that_window() {
+    let mut harness = harness_with("[options]\nsliver_height = 0.5\n", TEST_DISPLAY_HEIGHT, 4);
+    let parked = frame(harness.world(), 3);
+    harness.mock_state.raise_window(3);
+    let start = parked.min + IVec2::new(2, 10);
+    let to = middle_of(harness.world(), 0, 600);
+
+    press_at(&mut harness, start);
+    for at in 1..=6 {
+        let point = start + (to - start) * at / 6;
+        harness.world().write_message(mouse_dragged(point));
+        harness
+            .mock_state
+            .os_move_window(3, parked.min + (point - start));
+        for event in harness.mock_state.drain_events() {
+            harness.world().write_message(event);
+        }
+    }
+    harness.mock_state.set_left_button_down(false);
+    harness.world().write_message(mouse_up(to));
     harness.advance(SETTLE);
 
     assert_eq!(layout(harness.world())[0], vec![0, 3]);

@@ -27,7 +27,7 @@ use crate::config::Config;
 use crate::config::swipe::SwipeGestureDirection;
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender, MouseButton};
-use crate::platform::Modifiers;
+use crate::platform::{Modifiers, WinID};
 
 const NX_DEVICEFNKEYMASK: u64 = 0x0080_0100;
 
@@ -359,10 +359,15 @@ impl InputHandler {
             CGEventType::LeftMouseDown | CGEventType::RightMouseDown => {
                 let point = CGEvent::location(Some(event));
                 let button = mouse_button(event_type);
+                let window_id = CGEvent::integer_value_field(
+                    Some(event),
+                    CGEventField::MouseEventWindowUnderMousePointer,
+                );
                 events.send(Event::MouseDown {
                     point,
                     modifiers,
                     button,
+                    window_id: WinID::try_from(window_id).ok().filter(|id| *id != 0),
                 })
             }
             CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {

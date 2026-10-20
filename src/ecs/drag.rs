@@ -711,10 +711,14 @@ fn drag_input(
         _ => entity,
     };
     let input = match event {
-        Event::MouseDown { point, button, .. } => {
-            let on_top = window_manager
-                .find_window_at_point(point)
-                .ok()
+        Event::MouseDown {
+            point,
+            button,
+            window_id,
+            ..
+        } => {
+            let on_top = window_id
+                .or_else(|| window_manager.find_window_at_point(point).ok())
                 .and_then(find);
             DragInput::Down {
                 point: origin_from(*point),

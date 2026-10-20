@@ -131,6 +131,10 @@ pub enum Event {
         point: CGPoint,
         modifiers: Modifiers,
         button: MouseButton,
+        /// The window under the pointer when the window server sent the
+        /// press, if it named one. A lookup when the press is handled can
+        /// find another window, because the pressed one may have moved.
+        window_id: Option<WinID>,
     },
     /// A mouse up event has occurred.
     MouseUp {

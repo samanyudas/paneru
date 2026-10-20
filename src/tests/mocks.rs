@@ -129,6 +129,19 @@ struct MockStateInner {
     background_tabs: HashSet<WinID>,
 }
 
+/// The window on top at `point`: raised windows first, then the lowest ID.
+fn top_window_at(inner: &MockStateInner, point: Origin) -> Option<WinID> {
+    inner
+        .windows
+        .iter()
+        .filter(|(_, window)| window.frame.contains(point))
+        .map(|(id, _)| *id)
+        .max_by_key(|id| {
+            let raised = inner.raised.iter().position(|raised| raised == id);
+            (raised, std::cmp::Reverse(*id))
+        })
+}
+
 #[derive(Clone)]
 pub struct MockState {
     inner: Arc<RwLock<MockStateInner>>,
@@ -498,14 +511,22 @@ impl MockState {
 
     // --- Interaction Helpers ---
 
+    /// The window on top at `point`, as the window server would name it in
+    /// a press event.
+    pub fn window_at(&self, point: Origin) -> Option<WinID> {
+        top_window_at(&self.inner.force_read(), point)
+    }
+
     #[allow(unused)]
     pub fn simulate_click(&self, point: Origin) {
         let mut inner = self.inner.force_write();
         let point = CGPoint::new(point.x.into(), point.y.into());
+        let window_id = top_window_at(&inner, origin_from(point));
         inner.event_queue.push_back(Event::MouseDown {
             point,
             modifiers: Modifiers::empty(),
             button: MouseButton::Left,
+            window_id,
         });
         inner.event_queue.push_back(Event::MouseUp {
             point,
@@ -529,10 +550,12 @@ impl MockState {
         let mut inner = self.inner.force_write();
         let start_p = CGPoint::new(start.x.into(), start.y.into());
         let end_p = CGPoint::new(end.x.into(), end.y.into());
+        let window_id = top_window_at(&inner, start);
         inner.event_queue.push_back(Event::MouseDown {
             point: start_p,
             modifiers: Modifiers::empty(),
             button: MouseButton::Left,
+            window_id,
         });
         inner.event_queue.push_back(Event::MouseDragged {
             point: end_p,
@@ -1003,16 +1026,7 @@ impl MockState {
         let s = self.clone();
         wm.expect_find_window_at_point().returning(move |at_point| {
             let point = origin_from(*at_point);
-            let inner = s.inner.force_read();
-            inner
-                .windows
-                .iter()
-                .filter(|(_, window)| window.frame.contains(point))
-                .map(|(id, _)| *id)
-                .max_by_key(|id| {
-                    let raised = inner.raised.iter().position(|raised| raised == id);
-                    (raised, std::cmp::Reverse(*id))
-                })
+            top_window_at(&s.inner.force_read(), point)
                 .ok_or(Error::NotFound(format!("no window found at point {point}")))
         });
 
