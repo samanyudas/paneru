@@ -6,12 +6,14 @@
 //! is not on a display other than the one that shows S. One rule decides
 //! which display a window is on:
 //!
-//! 1. A window whose frame the engine set is on the display of the strip that
-//!    holds it, wherever that frame is. That is a window at the frame the
-//!    engine placed it at, or one the engine is still moving or about to move
-//!    there, such as in a scroll animation. The engine parks off-screen columns as slivers
-//!    that hang past the display's edge, onto a neighboring display or onto no
-//!    display at all, and an animation passes through such frames.
+//! 1. A window at a frame the engine wrote is on the display of the strip
+//!    that holds it, wherever that frame is. That is the frame the engine
+//!    placed it at, or, while an animation moves the window there, the last
+//!    frame the animation wrote. Any other frame, even while the engine is
+//!    moving the window, is a native move and falls to rule 3. The engine
+//!    parks off-screen columns as slivers that hang past the display's edge,
+//!    onto a neighboring display or onto no display at all, and an animation
+//!    passes through such frames.
 //! 2. A window of a parked virtual workspace is the exception. The engine
 //!    tucks the whole strip into a corner, so its frame is no evidence.
 //! 3. Any other frame is on the display that holds its center. A center on
@@ -513,23 +515,30 @@ fn on_another_display(world: &mut World, members: &[Entity], display: Entity) ->
 /// evidence either way.
 fn window_display(world: &mut World, member: Entity) -> Option<Entity> {
     let frame = world.get_mut::<Window>(member)?.update_frame().ok()?;
-    let placed = world
-        .query_filtered::<(), Moving>()
-        .get(world, member)
-        .is_ok()
-        || world
-            .get::<PresentedOrigin>(member)
-            .zip(world.get::<Bounds>(member))
-            .is_some_and(|(origin, bounds)| {
-                (frame.min - origin.0).abs().max_element() <= FRAME_TOLERANCE
-                    && (frame.size() - bounds.0).abs().max_element() <= FRAME_TOLERANCE
-            });
+    let near = |a: IVec2, b: IVec2| (a - b).abs().max_element() <= FRAME_TOLERANCE;
+    // `PresentedOrigin` is where the engine is taking the window. While a
+    // `RepositionMarker` animates it, `Position` is the last frame the engine
+    // wrote. Otherwise `Position` can hold a native move the engine adopted.
+    let animated = world.get::<RepositionMarker>(member).is_some();
+    let written = world.get::<Bounds>(member).is_some_and(|bounds| {
+        near(frame.size(), bounds.0)
+            && [
+                world.get::<PresentedOrigin>(member).map(|origin| origin.0),
+                world
+                    .get::<Position>(member)
+                    .filter(|_| animated)
+                    .map(|position| position.0),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|origin| near(frame.min, origin))
+    });
     let strip = world
         .query::<(&LayoutStrip, &ChildOf, Has<PreviousStripPosition>)>()
         .iter(world)
         .find(|(strip, _, _)| strip.contains(member))
         .map(|(_, child, parked)| (child.parent(), parked));
-    if placed && let Some((display, parked)) = strip {
+    if written && let Some((display, parked)) = strip {
         return (!parked).then_some(display);
     }
     world

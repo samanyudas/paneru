@@ -1820,3 +1820,49 @@ fn an_edge_resize_of_a_native_tab_keeps_the_users_size_for_every_tab() {
     assert_eq!(frame(harness.world(), 3), tile);
     assert_eq!(frame(harness.world(), 0), padded_tile);
 }
+
+#[test]
+fn a_real_native_move_during_an_engine_animation_applies() {
+    let config = crate::config::Config::try_from("[options]\nanimation_speed = 12.0\n").unwrap();
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
+        .with_windows(4)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+            window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
+        });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(SETTLE);
+
+    harness.world().write_message(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+    harness.advance(FRAME);
+    let entity = window_entity(&mut harness, 0);
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::RepositionMarker>(entity)
+            .is_some(),
+        "the scroll is animating window 0"
+    );
+    // macOS moves window 0 onto the external display and into its space, and
+    // its move and the display change arrive together.
+    macos_moves_to_ext(&mut harness, 0);
+    harness
+        .world()
+        .write_message(Event::WindowMoved { window_id: 0 });
+    for event in harness.mock_state.drain_events() {
+        harness.world().write_message(event);
+    }
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100], vec![0]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![1], vec![2], vec![3]]
+    );
+}
