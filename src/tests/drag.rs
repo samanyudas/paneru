@@ -1902,3 +1902,45 @@ fn a_still_drag_leaves_the_drag_state_unchanged() {
     ));
     assert_eq!(changed(harness.world()), before);
 }
+
+#[test]
+fn a_still_drag_line_follows_its_stack_boundary_when_the_layout_moves_it() {
+    let mut harness = three_columns();
+    harness.run(vec![
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    harness.advance(SETTLE);
+    assert_eq!(layout(harness.world()), vec![vec![0, 1], vec![2]]);
+    let boundary = |world: &mut World| frame(world, 1).min.y;
+
+    // Just above the boundary between windows 0 and 1, so a drop lands
+    // between them.
+    let top = boundary(harness.world());
+    let between = middle_of(harness.world(), 0, top - 14);
+    press_and_drag(&mut harness, 2, between);
+    let line_at = |world: &mut World| {
+        let column = frame(world, 0);
+        let y = boundary(world);
+        Some(OverlayShape::Line(IRect::new(
+            column.min.x,
+            y - 1,
+            column.max.x,
+            y + 2,
+        )))
+    };
+    assert_eq!(feedback(harness.world()), line_at(harness.world()));
+
+    // The app shrinks the top window while the pointer stays still, and the
+    // layout moves the boundary up. No display or drag input changes.
+    harness.mock_state.os_resize_window(0, Size::new(400, 200));
+    harness.advance(SETTLE);
+
+    assert!(matches!(
+        drag_state(harness.world()),
+        DragState::Dragging(_)
+    ));
+    assert_ne!(boundary(harness.world()), top, "the boundary moved");
+    assert_eq!(feedback(harness.world()), line_at(harness.world()));
+}

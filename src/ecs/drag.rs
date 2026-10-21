@@ -25,7 +25,7 @@ use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Changed, Has, With};
+use bevy::ecs::query::{Changed, Has, Or, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::common_conditions::{not, on_message, resource_changed, resource_exists};
 use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
@@ -746,14 +746,23 @@ impl Plugin for DragEventsPlugin {
                         .after(super::focus::fix_window_size_on_focus)
                         .run_if(on_message::<Event>),
                     drag_watchdog.after(drag_events).run_if(in_progress),
-                    // A display change can move the layout the shape is
-                    // drawn from.
-                    drag_feedback
-                        .after(drag_watchdog)
-                        .run_if(resource_changed::<DragState>.or_eager(displays_changed)),
                 )
                     .in_set(super::UpdateSet::Focus)
                     .run_if(not(resource_exists::<Initializing>)),
+            )
+            .add_systems(
+                Update,
+                // After the layout, so the shape is drawn from where the
+                // layout put the windows this frame. A display or layout
+                // change can move the shape with the pointer still.
+                drag_feedback
+                    .in_set(super::UpdateSet::Housekeeping)
+                    .run_if(not(resource_exists::<Initializing>))
+                    .run_if(
+                        resource_changed::<DragState>
+                            .or_eager(displays_changed)
+                            .or_eager(layout_changed),
+                    ),
             )
             .add_systems(
                 PostUpdate,
@@ -1051,6 +1060,21 @@ fn drag_watchdog(
 /// Whether any display was added or changed since the last check.
 fn displays_changed(displays: Query<(), Changed<Display>>) -> bool {
     !displays.is_empty()
+}
+
+/// Whether the layout moved a strip or any window's slot or size since the
+/// last check.
+fn layout_changed(
+    strips: Query<
+        (),
+        (
+            With<LayoutStrip>,
+            Or<(Changed<LayoutStrip>, Changed<Position>)>,
+        ),
+    >,
+    windows: Query<(), (With<Window>, Or<(Changed<LayoutPosition>, Changed<Bounds>)>)>,
+) -> bool {
+    !strips.is_empty() || !windows.is_empty()
 }
 
 /// Keeps [`DragFeedback`] on what the overlay should show for the drag
