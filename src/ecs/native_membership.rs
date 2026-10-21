@@ -25,8 +25,8 @@ use super::drag::DragState;
 use super::layout::LayoutStrip;
 use super::{
     ActiveWorkspaceMarker, AwaitingHandle, Bounds, Initializing, NativeFullscreenMarker, Position,
-    RepositionMarker, ResizeMarker, SelectedVirtualMarker, SpawnWindowTrigger, Unmanaged,
-    VerifyWindowPosition, VerifyWindowSize,
+    PresentedOrigin, RepositionMarker, ResizeMarker, SelectedVirtualMarker, SpawnWindowTrigger,
+    Unmanaged, VerifyWindowPosition, VerifyWindowSize,
 };
 use crate::config::Config;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -34,6 +34,9 @@ use crate::platform::{WinID, WorkspaceId};
 use crate::util::AXUIWrapper;
 
 const QUERY_ATTEMPTS: u8 = 4;
+/// Rounding allowed between a window's AX frame and the frame the engine
+/// placed it at.
+const FRAME_TOLERANCE: i32 = 2;
 /// How long a window ID stays ignored after it closed or could not be
 /// resolved. After that, a native list that still reports it is checked
 /// again.
@@ -463,24 +466,40 @@ fn stripless(world: &mut World, member: Entity) -> bool {
             .any(|strip| strip.contains(member))
 }
 
-/// Whether a window of `members` is on a display other than `display`, by its
-/// frame center. A frame that cannot be read, or a center on no display, is no
-/// evidence either way.
+/// Whether a window of `members` is on a display other than `display`.
 fn on_another_display(world: &mut World, members: &[Entity], display: Entity) -> bool {
-    members.iter().any(|member| {
-        let Some(center) = world
-            .get_mut::<Window>(*member)
-            .and_then(|mut window| window.update_frame().ok())
-            .map(|frame| frame.center())
-        else {
-            return false;
-        };
-        world
-            .query::<(Entity, &Display)>()
-            .iter(world)
-            .find(|(_, shown)| shown.bounds().contains(center))
-            .is_some_and(|(shown, _)| shown != display)
-    })
+    members
+        .iter()
+        .any(|member| window_display(world, *member).is_some_and(|shown| shown != display))
+}
+
+/// The display that holds the center of `member`'s frame. A window the engine
+/// still holds at the frame it placed it at counts as on its strip's display
+/// instead, because a center elsewhere is a parked column overhanging the next
+/// display, not a native move. `None`, which is no evidence either way, when
+/// the frame cannot be read or its center is on no display.
+fn window_display(world: &mut World, member: Entity) -> Option<Entity> {
+    let frame = world.get_mut::<Window>(member)?.update_frame().ok()?;
+    let shown = world
+        .query::<(Entity, &Display)>()
+        .iter(world)
+        .find(|(_, display)| display.bounds().contains(frame.center()))
+        .map(|(shown, _)| shown)?;
+    let placed = world
+        .get::<PresentedOrigin>(member)
+        .zip(world.get::<Bounds>(member))
+        .is_some_and(|(origin, bounds)| {
+            (frame.min - origin.0).abs().max_element() <= FRAME_TOLERANCE
+                && (frame.size() - bounds.0).abs().max_element() <= FRAME_TOLERANCE
+        });
+    if !placed {
+        return Some(shown);
+    }
+    world
+        .query::<(&LayoutStrip, &ChildOf)>()
+        .iter(world)
+        .find(|(strip, _)| strip.contains(member))
+        .map_or(Some(shown), |(_, child)| Some(child.parent()))
 }
 
 /// Moves the managed windows `ids` lists for `space` into its strips. Returns

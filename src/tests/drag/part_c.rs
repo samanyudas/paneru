@@ -1652,3 +1652,34 @@ fn an_ignored_native_window_is_checked_again_after_a_while() {
     harness.advance(SETTLE);
     assert!(has_window(&mut harness, 7));
 }
+
+#[test]
+fn a_stale_report_for_the_display_a_parked_column_overhangs_changes_nothing() {
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    let mut harness = TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
+        .with_windows(4)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+            window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
+        });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(SETTLE);
+    let parked = frame(harness.world(), 3);
+    assert!(
+        parked.min.x < TEST_DISPLAY_WIDTH && ext.contains(parked.center()),
+        "window 3 parks as a sliver at the edge toward the external display: {parked:?}"
+    );
+    let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
+    assert!(source.iter().flatten().any(|id| *id == 3));
+
+    harness
+        .mock_state
+        .update_window(3, |window| window.workspace_id = EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(SETTLE);
+    assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID), source);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+}
