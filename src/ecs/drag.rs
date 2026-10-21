@@ -1009,6 +1009,9 @@ pub(super) fn drag_events(
             };
             step(state.clone(), input, now, &hit)
         };
+        if effects.is_empty() {
+            restore_ended_hold(&state, &next, &moves, &mut placements);
+        }
         // Written only when it differs, so a drag held still does not
         // count as a change and rebuild the feedback.
         state.set_if_neq(next);
@@ -1211,6 +1214,9 @@ pub(super) fn drag_watchdog(
     // Neither input asks where the pointer is.
     let home = |_, _| DropTarget::Home;
     let (next, effects) = step(state.clone(), input, time.elapsed(), &home);
+    if effects.is_empty() {
+        restore_ended_hold(&state, &next, &moves, &mut placements);
+    }
     state.set_if_neq(next);
     for DragEffect::Drop { window, target } in effects {
         let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
@@ -1558,6 +1564,25 @@ fn apply_drop(
     commands.ensure_visible(window);
     if !focused {
         commands.focus_entity(window, false);
+    }
+}
+
+fn restore_ended_hold(
+    previous: &DragState,
+    next: &DragState,
+    moves: &DisplayMoves,
+    placements: &mut Placements,
+) {
+    if previous.holds_window()
+        && !next.holds_window()
+        && let Some(window) = previous.window()
+    {
+        let members = moves
+            .strips
+            .iter()
+            .find_map(|(_, strip, _, _, _)| strip.tab_group(window))
+            .unwrap_or_else(|| vec![window]);
+        restore_drop_members(&members, placements);
     }
 }
 

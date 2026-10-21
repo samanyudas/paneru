@@ -1,5 +1,79 @@
 use super::*;
 
+#[test]
+fn ending_a_press_replays_layout_changes_for_every_native_tab() {
+    let mut control = three_columns();
+    add_native_tab(&mut control, 1, 3);
+    control.mock_state.os_close_window(0);
+    control.advance(SETTLE);
+    let expected = frame(control.world(), 3);
+
+    let mut failures = Vec::new();
+    for ending in [
+        "mouse-up",
+        "watchdog",
+        "mouse-move",
+        "resize",
+        "confirmation",
+    ] {
+        let mut harness = three_columns();
+        add_native_tab(&mut harness, 1, 3);
+        let start = frame(harness.world(), 3);
+        let point = start.min + IVec2::new(100, 10);
+        press_at(&mut harness, point);
+        harness.advance(FRAME);
+        assert!(is_pressed(&drag_state(harness.world())));
+        harness.mock_state.os_close_window(0);
+        harness.advance(SETTLE);
+        assert_ne!(start, expected, "closing the neighbor reflows the strip");
+        assert_eq!(
+            frame(harness.world(), 3),
+            start,
+            "the press holds the window"
+        );
+
+        match ending {
+            "watchdog" => harness.mock_state.set_left_button_down(false),
+            "mouse-move" => {
+                harness.mock_state.set_left_button_down(false);
+                harness.world().write_message(Event::MouseMoved {
+                    point: cg(point),
+                    modifiers: Modifiers::empty(),
+                });
+            }
+            "resize" => {
+                harness
+                    .world()
+                    .write_message(Event::WindowResized { window_id: 3 });
+            }
+            "confirmation" => {
+                let moved = point + IVec2::new(20, 0);
+                harness.world().write_message(mouse_dragged(moved));
+                harness.advance(FRAME);
+                release(&mut harness, moved);
+                assert!(matches!(
+                    drag_state(harness.world()),
+                    DragState::Released { .. }
+                ));
+            }
+            _ => release(&mut harness, point),
+        }
+        harness.advance(SETTLE);
+
+        assert_eq!(drag_state(harness.world()), DragState::Idle);
+        for id in [1, 3] {
+            let actual = frame(harness.world(), id);
+            if actual != expected {
+                failures.push((ending, id, actual));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "expected {expected:?}, got {failures:?}"
+    );
+}
+
 fn ext_bounds(height: i32) -> IRect {
     IRect::new(
         TEST_DISPLAY_WIDTH,
