@@ -8,7 +8,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Has, With};
 use bevy::ecs::schedule::IntoScheduleConfigs;
-use bevy::ecs::system::{Commands, NonSend, Query, Res};
+use bevy::ecs::system::{Commands, NonSend, Query, Res, SystemParam};
 use bevy::ecs::world::World;
 use bevy::math::IRect;
 use bevy::platform::collections::HashSet;
@@ -21,21 +21,210 @@ use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
 use crate::config::Config;
-use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
+use crate::ecs::layout::{Column, LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, EnsureVisibleMarker, FocusedMarker, LayoutPosition,
-    ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, EnsureVisibleMarker, FocusedMarker,
+    LayoutPosition, ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties,
     RefreshWindowSizeOnFocus, RepositionMarker, SelectedVirtualMarker, SendMessageTrigger,
     SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::Event;
-use crate::manager::{Display, Window, WindowManager, irect_from};
+use crate::manager::{Display, Size, Window, WindowManager, irect_from};
 use crate::platform::{PlatformCallbacks, WinID, WorkspaceId};
 use crate::util::{read_screen_property, round_px};
 use bevy::ecs::entity::EntityHashSet;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::ResMut;
+
+/// Where a window moved to another display goes in the strip shown there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// A new column after the last one.
+    Append,
+    /// A new column at gap `index`, where gap 0 is before the first column.
+    Column(usize),
+    /// Into column `column`, `slot` items from the top, as `Into(column, slot)`.
+    Into(usize, usize),
+}
+
+/// What [`DisplayMoves::move_to_display`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DisplayMove {
+    /// The strip the window joined. `None` when the display shows no strip,
+    /// which only an [`Placement::Append`] move allows.
+    pub strip: Option<Entity>,
+    /// The bounds of the display the window moved to.
+    pub display_bounds: IRect,
+    /// A window beside it in the strip it left, if one is left there.
+    pub left_behind: Option<Entity>,
+}
+
+type MovableStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        &'static Position,
+        &'static ChildOf,
+        Has<SelectedVirtualMarker>,
+    ),
+>;
+
+type DisplaysWithDocks<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Display,
+        Option<&'static DockPosition>,
+        Has<ActiveDisplayMarker>,
+    ),
+>;
+
+/// The strips and displays a window moves between when it changes display,
+/// by keyboard or by drag.
+#[derive(SystemParam)]
+pub(crate) struct DisplayMoves<'w, 's> {
+    pub strips: MovableStrips<'w, 's>,
+    pub displays: DisplaysWithDocks<'w, 's>,
+    window_manager: Res<'w, WindowManager>,
+    config: Res<'w, Config>,
+}
+
+impl DisplayMoves<'_, '_> {
+    /// The display marked active.
+    pub(crate) fn active_display(&self) -> Option<&Display> {
+        self.displays
+            .iter()
+            .find_map(|(_, display, _, active)| active.then_some(display))
+    }
+
+    /// The displays other than the active one.
+    pub(crate) fn other_displays(&self) -> impl Iterator<Item = &Display> {
+        self.displays
+            .iter()
+            .filter_map(|(_, display, _, active)| (!active).then_some(display))
+    }
+
+    /// The strip shown on display `id`: the selected strip of the space macOS
+    /// shows there.
+    pub(crate) fn shown_strip(&self, id: CGDirectDisplayID) -> Option<Entity> {
+        let space = self.window_manager.active_display_space(id).ok()?;
+        self.strips
+            .iter()
+            .find(|(_, strip, _, _, selected)| *selected && strip.id() == space)
+            .map(|(entity, _, _, _, _)| entity)
+    }
+
+    /// The part of the display `display_entity` the layout uses.
+    fn viewport(&self, display_entity: Entity) -> Option<IRect> {
+        let (_, display, dock, _) = self.displays.get(display_entity).ok()?;
+        Some(display.actual_display_bounds(dock, &self.config))
+    }
+
+    /// Moves `entity`, with the native tabs grouped with it, from its strip
+    /// to the strip shown on display `target`, at `placement`.
+    ///
+    /// The window is sized for the destination: the width of the column it
+    /// joins, or for a new column the width it had relative to its old
+    /// display, and the height of the destination. `size` is its size now,
+    /// and `frame_of` gives the frame of any window, for a column's width.
+    /// The window it leaves behind refits its strip.
+    ///
+    /// Returns `None`, changing nothing, when `entity` is in no strip, there
+    /// is no display `target`, the target strip is its own, or `placement`
+    /// names a column the target strip cannot fill.
+    pub(crate) fn move_to_display(
+        &mut self,
+        entity: Entity,
+        target: CGDirectDisplayID,
+        placement: Placement,
+        size: Size,
+        frame_of: impl Fn(Entity) -> Option<IRect>,
+        commands: &mut Commands,
+    ) -> Option<DisplayMove> {
+        let (source, source_display) = self
+            .strips
+            .iter()
+            .find(|(_, strip, _, _, _)| strip.contains(entity))
+            .map(|(strip_entity, _, _, child, _)| (strip_entity, child.parent()))?;
+        let (target_display_entity, display_bounds) = self
+            .displays
+            .iter()
+            .find(|(_, display, _, _)| display.id() == target)
+            .map(|(display_entity, display, _, _)| (display_entity, display.bounds()))?;
+        let strip = self.shown_strip(target);
+        if strip == Some(source) {
+            return None;
+        }
+        // The width relative to the usable viewport on each side, dock and
+        // padding included, as `resize_window` measures it.
+        let source_viewport = self.viewport(source_display)?;
+        let target_viewport = self.viewport(target_display_entity)?;
+
+        let joined_width = match placement {
+            Placement::Into(column, _) => {
+                let target_strip = self.strips.get(strip?).ok()?.1;
+                match target_strip.get(column).ok()? {
+                    Column::Fullscren(_) => return None,
+                    column => column.width(&frame_of),
+                }
+            }
+            Placement::Append | Placement::Column(_) => None,
+        };
+        if strip.is_none() && placement != Placement::Append {
+            return None;
+        }
+        let width = joined_width.unwrap_or_else(|| {
+            let ratio = (source_viewport.width() > 0)
+                .then(|| f64::from(size.x) / f64::from(source_viewport.width()));
+            ratio.map_or(size.x, |ratio| {
+                round_px(ratio * f64::from(target_viewport.width()))
+            })
+        });
+        let (_, mut source_strip, _, _, _) = self.strips.get_mut(source).ok()?;
+        let members = source_strip
+            .tab_group(entity)
+            .unwrap_or_else(|| vec![entity]);
+        let left_behind = source_strip
+            .left_neighbour(entity)
+            .or_else(|| source_strip.right_neighbour(entity))
+            .filter(|neighbour| !members.contains(neighbour));
+        for member in &members {
+            commands.resize_entity(*member, Size::new(width, target_viewport.height()));
+            if matches!(placement, Placement::Into(..)) {
+                commands
+                    .entity(*member)
+                    .remove::<crate::ecs::FullWidthMarker>();
+            }
+            source_strip.remove(*member);
+        }
+        if let Some(neighbour) = left_behind {
+            commands.refit_after_removal(neighbour);
+        }
+
+        if let Some((_, mut target_strip, _, _, _)) =
+            strip.and_then(|strip| self.strips.get_mut(strip).ok())
+        {
+            match (placement, members.as_slice()) {
+                (Placement::Append, [_]) => target_strip.append(entity),
+                (Placement::Append, group) => target_strip.append_tab_group(group),
+                (Placement::Column(index), group) => target_strip.insert_tab_group_at(index, group),
+                (Placement::Into(column, slot), group) => {
+                    // Checked above: the column takes a window.
+                    _ = target_strip.join_column(group, column, slot);
+                }
+            }
+        }
+        Some(DisplayMove {
+            strip,
+            display_bounds,
+            left_behind,
+        })
+    }
+}
 
 const ORPHANED_SPACES_TIMEOUT_SEC: u64 = 30;
 const DISPLAY_SETTLE_DELAY: Duration = Duration::from_millis(350);

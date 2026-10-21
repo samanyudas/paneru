@@ -122,10 +122,6 @@ impl Display {
         bounds
     }
 
-    pub fn width(&self) -> i32 {
-        self.bounds().width()
-    }
-
     pub fn menubar_height(&self) -> i32 {
         self.menubar_height_override
             .unwrap_or(self.menubar_height)
@@ -140,23 +136,27 @@ impl Display {
         self.notch_height = height;
     }
 
+    /// The macOS work area, without the engine's configured edge padding.
+    pub fn visible_bounds(&self, dock: Option<&DockPosition>) -> IRect {
+        let mut visible = self.bounds();
+        match dock {
+            Some(DockPosition::Bottom(size)) => visible.max.y -= size,
+            Some(DockPosition::Left(size)) => visible.min.x += size,
+            Some(DockPosition::Right(size)) => visible.max.x -= size,
+            _ => {}
+        }
+        visible
+    }
+
     #[instrument(level = Level::TRACE, skip_all, ret)]
     pub fn actual_display_bounds(&self, dock: Option<&DockPosition>, config: &Config) -> IRect {
         let (pad_top, pad_right, pad_bottom, pad_left) = config.edge_padding();
-        let mut viewport = self.bounds();
+        let mut viewport = self.visible_bounds(dock);
         viewport.min.x += pad_left;
         viewport.min.y += pad_top;
         viewport.max.x -= pad_right;
         viewport.max.y -= pad_bottom;
 
-        match dock {
-            Some(DockPosition::Bottom(size)) => viewport.max.y -= size,
-            Some(DockPosition::Left(size)) => {
-                viewport.min.x += size;
-            }
-            Some(DockPosition::Right(size)) => viewport.max.x -= size,
-            _ => (),
-        }
         viewport
     }
 }

@@ -1,5 +1,5 @@
 //! Dragging a tiled window by its title bar into a column, or out to a new
-//! column, on the display it is on.
+//! column, on its own display or another display.
 //!
 //! The pieces are kept apart so each one can be tested on its own:
 //!
@@ -10,10 +10,10 @@
 //! - [`drag_events`] feeds platform events to [`step`] and applies its
 //!   effects to the [`LayoutStrip`].
 //!
-//! Seams left for later parts of samanyudas/miri#43: an overlay can read the
-//! live target from [`DragState::Dragging`], a cross-display drop can add more
-//! displays to the snapshot, and [`DragState::Settling`] is where a macOS
-//! tiling resize after a drop will be caught.
+mod tiling;
+pub(crate) use tiling::TilingRestore;
+#[cfg(test)]
+pub(crate) use tiling::is_macos_tile;
 
 use std::cell::OnceCell;
 use std::ops::Range;
@@ -21,11 +21,11 @@ use std::time::Duration;
 
 use bevy::app::{App, Plugin, PostUpdate, Update};
 use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _};
+use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
-use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Changed, Has, Or, With};
+use bevy::ecs::query::{Changed, Has, Or, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::common_conditions::{
     not, on_message, resource_changed, resource_exists, resource_exists_and_changed,
@@ -37,11 +37,14 @@ use bevy::time::Time;
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::debug;
 
+use crate::commands::{Direction, display_in_direction};
 use crate::config::Config;
+use crate::ecs::display::{DisplayMoves, Placement};
 use crate::ecs::layout::{Column, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, effective_stack_limit};
 use crate::ecs::{
-    Bounds, DockPosition, FocusedMarker, FullWidthMarker, Initializing, LayoutPosition, Position,
-    PresentedOrigin, SpawnCommandsExt, TopBarHeight, Unmanaged,
+    Bounds, FocusedMarker, FullWidthMarker, Initializing, LayoutPosition, ManualStripOffset,
+    Position, PresentedOrigin, RepositionMarker, Scrolling, SpawnCommandsExt, TopBarHeight,
+    Unmanaged,
 };
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Window, WindowManager, origin_from};
@@ -727,6 +730,134 @@ fn past_threshold(delta: IVec2) -> bool {
     delta.length_squared() > DRAG_THRESHOLD * DRAG_THRESHOLD
 }
 
+const EDGE_BAND: i32 = 6;
+const EDGE_DELAY: Duration = Duration::from_millis(500);
+const EDGE_REPEAT: Duration = Duration::from_millis(350);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeSide {
+    Left,
+    Right,
+}
+
+/// One continuous hold at an outer display edge.
+#[derive(Component)]
+pub(crate) struct EdgeHold {
+    display: DisplayId,
+    side: EdgeSide,
+    next_scroll: Duration,
+}
+
+fn held_edge(snapshot: &LayoutSnapshot, pointer: IVec2) -> Option<(DisplayId, EdgeSide)> {
+    let display = snapshot
+        .displays
+        .iter()
+        .find(|display| display.bounds.contains(pointer))?;
+    let (side, direction) = if pointer.x < display.bounds.min.x + EDGE_BAND {
+        (EdgeSide::Left, Direction::West)
+    } else if pointer.x >= display.bounds.max.x - EDGE_BAND {
+        (EdgeSide::Right, Direction::East)
+    } else {
+        return None;
+    };
+    display_in_direction(
+        &direction,
+        display.bounds,
+        snapshot
+            .displays
+            .iter()
+            .filter(|other| other.id != display.id)
+            .map(|other| (other.id, other.bounds)),
+    )
+    .is_none()
+    .then_some((display.id, side))
+}
+
+type EdgeStrips<'w, 's> =
+    Query<'w, 's, &'static mut Position, (With<LayoutStrip>, Without<Window>)>;
+
+/// Scrolls one more column into view after the initial hold, then at the
+/// repeat interval. Deadlines survive delayed frames without burst repeats.
+fn drag_edge_scroll(
+    state: Res<DragState>,
+    time: Res<Time>,
+    mut holds: Query<(Entity, &mut EdgeHold)>,
+    mut parameters: bevy::ecs::system::ParamSet<(DisplayMoves, EdgeStrips)>,
+    placements: Query<(&LayoutPosition, &Bounds), With<Window>>,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    let DragState::Dragging(drag) = &*state else {
+        for (entity, _) in &holds {
+            commands.entity(entity).despawn();
+        }
+        return;
+    };
+    let snapshot = snapshot_of(
+        drag.window,
+        &parameters.p0(),
+        |entity| {
+            placements
+                .get(entity)
+                .ok()
+                .map(|(position, bounds)| (position.0, bounds.0))
+        },
+        &config,
+    );
+    let edge = held_edge(&snapshot, drag.pointer);
+    let mut current = None;
+    for (entity, hold) in &mut holds {
+        if edge == Some((hold.display, hold.side)) {
+            current = Some((entity, hold));
+        } else {
+            commands.entity(entity).despawn();
+        }
+    }
+    let Some((display, side)) = edge else {
+        return;
+    };
+    let Some((_, mut hold)) = current else {
+        commands.spawn(EdgeHold {
+            display,
+            side,
+            next_scroll: time.elapsed() + EDGE_DELAY,
+        });
+        return;
+    };
+    if time.elapsed() < hold.next_scroll {
+        return;
+    }
+    hold.next_scroll = time.elapsed() + EDGE_REPEAT;
+    let Some(view) = snapshot.displays.iter().find(|view| view.id == display) else {
+        return;
+    };
+    let shift = match side {
+        EdgeSide::Left => view
+            .columns
+            .iter()
+            .rev()
+            .find(|column| column.x.start < view.viewport.min.x)
+            .map(|column| view.viewport.min.x - column.x.start),
+        EdgeSide::Right => view
+            .columns
+            .iter()
+            .find(|column| column.x.end > view.viewport.max.x)
+            .map(|column| view.viewport.max.x - column.x.end),
+    };
+    let Some(shift) = shift else {
+        return;
+    };
+    let Some(strip) = parameters.p0().shown_strip(display) else {
+        return;
+    };
+    if let Ok(mut position) = parameters.p1().get_mut(strip) {
+        position.0.x += shift;
+        commands
+            .entity(strip)
+            .remove::<(RepositionMarker, ManualStripOffset, Scrolling)>();
+    }
+}
+
 pub struct DragEventsPlugin;
 
 impl Plugin for DragEventsPlugin {
@@ -734,6 +865,14 @@ impl Plugin for DragEventsPlugin {
         let in_progress = |state: Res<DragState>| *state != DragState::Idle;
         app.init_resource::<DragState>()
             .init_resource::<DragFeedback>()
+            .init_resource::<tiling::PointerResize>()
+            .add_systems(
+                Update,
+                tiling::track_resize_gesture
+                    .before(super::systems::window_resized_update_frame)
+                    .in_set(super::UpdateSet::Events)
+                    .run_if(on_message::<Event>),
+            )
             .add_systems(
                 Update,
                 (
@@ -748,6 +887,9 @@ impl Plugin for DragEventsPlugin {
                         .after(super::focus::fix_window_size_on_focus)
                         .run_if(on_message::<Event>),
                     drag_watchdog.after(drag_events).run_if(in_progress),
+                    drag_edge_scroll
+                        .after(drag_watchdog)
+                        .run_if(in_progress.or_eager(resource_changed::<DragState>)),
                 )
                     .in_set(super::UpdateSet::Focus)
                     .run_if(not(resource_exists::<Initializing>)),
@@ -793,16 +935,6 @@ type WindowInfo<'w, 's> = Query<
 type Presented<'w, 's> = Query<'w, 's, (&'static PresentedOrigin, Option<&'static TopBarHeight>)>;
 type Placements<'w, 's> =
     Query<'w, 's, (&'static mut LayoutPosition, &'static mut Bounds), With<Window>>;
-type Strips<'w, 's> = Query<
-    'w,
-    's,
-    (
-        &'static mut LayoutStrip,
-        &'static Position,
-        &'static ChildOf,
-    ),
->;
-type Displays<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
 
 /// Feeds mouse and window events to [`step`] and applies the drops it asks
 /// for.
@@ -815,8 +947,7 @@ pub(super) fn drag_events(
     windows: WindowInfo,
     mut placements: Placements,
     presented: Presented,
-    mut strips: Strips,
-    displays: Displays,
+    mut moves: DisplayMoves,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -827,7 +958,7 @@ pub(super) fn drag_events(
             &state,
             &window_manager,
             &windows,
-            &strips,
+            &moves,
             &presented,
             &placements,
         ) else {
@@ -843,14 +974,13 @@ pub(super) fn drag_events(
                 let snapshot = snapshot.get_or_init(|| {
                     snapshot_of(
                         dragged,
-                        strips.iter(),
+                        &moves,
                         |entity| {
                             placements
                                 .get(entity)
                                 .ok()
                                 .map(|(position, bounds)| (position.0, bounds.0))
                         },
-                        &displays,
                         &config,
                     )
                 });
@@ -871,7 +1001,7 @@ pub(super) fn drag_events(
                 window,
                 target,
                 focused,
-                &mut strips,
+                &mut moves,
                 &mut placements,
                 &mut commands,
             );
@@ -885,7 +1015,7 @@ fn drag_input(
     state: &DragState,
     window_manager: &WindowManager,
     windows: &WindowInfo,
-    strips: &Strips,
+    moves: &DisplayMoves,
     presented: &Presented,
     placements: &Placements,
 ) -> Option<DragInput> {
@@ -899,7 +1029,7 @@ fn drag_input(
     let pressed_tab = |entity: Entity| match state {
         DragState::Pressed(press) | DragState::Released { press, .. }
             if press.window != entity
-                && strips.iter().any(|(strip, _, _)| {
+                && moves.strips.iter().any(|(_, strip, _, _, _)| {
                     strip
                         .tab_group(press.window)
                         .is_some_and(|group| group.contains(&entity))
@@ -927,7 +1057,7 @@ fn drag_input(
             DragInput::Down {
                 point: origin_from(*point),
                 button: *button,
-                window: pressed_window(origin_from(*point), on_top, strips, presented, placements),
+                window: pressed_window(origin_from(*point), on_top, moves, presented, placements),
             }
         }
         Event::MouseDragged {
@@ -976,13 +1106,14 @@ fn drag_input(
 fn pressed_window(
     point: IVec2,
     on_top: Option<(Entity, &Window, Option<&Unmanaged>, bool)>,
-    strips: &Strips,
+    moves: &DisplayMoves,
     presented: &Presented,
     placements: &Placements,
 ) -> Option<PressedWindow> {
-    let slots = strips
+    let slots = moves
+        .strips
         .iter()
-        .flat_map(|(strip, _, _)| {
+        .flat_map(|(_, strip, _, _, _)| {
             strip.all_windows().into_iter().filter_map(|entity| {
                 let (origin, top_bar) = presented.get(entity).ok()?;
                 // An app can resize its window after the layout placed it,
@@ -1007,8 +1138,11 @@ fn pressed_window(
         if let Some(slot) = slots.iter().find(|(slotted, _, _)| *slotted == entity) {
             return Some(tiled(*slot));
         }
-        let floating =
-            unmanaged.is_some() || !strips.iter().any(|(strip, _, _)| strip.contains(entity));
+        let floating = unmanaged.is_some()
+            || !moves
+                .strips
+                .iter()
+                .any(|(_, strip, _, _, _)| strip.contains(entity));
         if floating {
             return Some(PressedWindow {
                 entity,
@@ -1031,7 +1165,7 @@ fn drag_watchdog(
     window_manager: Res<WindowManager>,
     windows: WindowInfo,
     mut placements: Placements,
-    mut strips: Strips,
+    mut moves: DisplayMoves,
     mut commands: Commands,
 ) {
     let Some(window) = state.window() else {
@@ -1041,7 +1175,10 @@ fn drag_watchdog(
         .get(window)
         .ok()
         .is_none_or(|(_, _, unmanaged, _)| unmanaged.is_some())
-        || !strips.iter().any(|(strip, _, _)| strip.contains(window));
+        || !moves
+            .strips
+            .iter()
+            .any(|(_, strip, _, _, _)| strip.contains(window));
     let input = if gone {
         DragInput::WindowGone { window }
     } else {
@@ -1059,7 +1196,7 @@ fn drag_watchdog(
             window,
             target,
             focused,
-            &mut strips,
+            &mut moves,
             &mut placements,
             &mut commands,
         );
@@ -1092,11 +1229,10 @@ fn layout_changed(strips: MovedStrips, windows: MovedWindows) -> bool {
 /// Keeps [`DragFeedback`] on what the overlay should show for the drag
 /// state, which hides it whenever no drag would move a window.
 fn drag_feedback(
-    state: Res<DragState>,
+    mut state: ResMut<DragState>,
     mut feedback: ResMut<DragFeedback>,
-    strips: Query<(&LayoutStrip, &Position, &ChildOf)>,
+    moves: DisplayMoves,
     placements: Query<(&LayoutPosition, &Bounds), With<Window>>,
-    displays: Displays,
     config: Res<Config>,
     theme: Option<Res<super::SystemTheme>>,
 ) {
@@ -1104,16 +1240,21 @@ fn drag_feedback(
         DragState::Dragging(drag) => {
             let snapshot = snapshot_of(
                 drag.window,
-                strips.iter(),
+                &moves,
                 |entity| {
                     placements
                         .get(entity)
                         .ok()
                         .map(|(position, bounds)| (position.0, bounds.0))
                 },
-                &displays,
                 &config,
             );
+            let target = hit_test(&snapshot, drag.window, drag.pointer, |id| {
+                stack_limit(&snapshot, id, &config)
+            });
+            let mut next = drag.clone();
+            next.target = target;
+            state.set_if_neq(DragState::Dragging(next));
             overlay_shape(&state, &snapshot)
         }
         _ => None,
@@ -1197,88 +1338,96 @@ fn stack_limit(snapshot: &LayoutSnapshot, id: DisplayId, config: &Config) -> usi
         })
 }
 
-/// The snapshot of the strip holding `dragged`, on the display that strip is
-/// on.
-///
-/// `placement` gives a window's position in its strip and its size.
-fn snapshot_of<'a>(
+/// The selected strip on every visible display, using layout slots rather
+/// than the dragged window's live frame.
+fn snapshot_of(
     dragged: Entity,
-    mut strips: impl Iterator<Item = (&'a LayoutStrip, &'a Position, &'a ChildOf)>,
+    moves: &DisplayMoves,
     placement: impl Fn(Entity) -> Option<(IVec2, IVec2)>,
-    displays: &Displays,
     config: &Config,
 ) -> LayoutSnapshot {
-    let Some((strip, strip_position, child_of)) =
-        strips.find(|(strip, _, _)| strip.contains(dragged))
-    else {
+    if !moves
+        .strips
+        .iter()
+        .any(|(_, strip, _, _, _)| strip.contains(dragged))
+    {
         return LayoutSnapshot::default();
-    };
-    let Ok((display, dock)) = displays.get(child_of.parent()) else {
-        return LayoutSnapshot::default();
-    };
-    let viewport = display.actual_display_bounds(dock, config);
-    let origin = strip_position.0;
-    let slot = |entity: Entity| placement(entity).map(|(position, size)| (position + origin, size));
-
-    let columns = strip
-        .columns()
-        .enumerate()
-        .filter_map(|(index, column)| {
-            let (items, kind) = match column {
-                Column::Single(entity) => (vec![vec![*entity]], ColumnKind::Tiled),
-                Column::Fullscren(entity) => (vec![vec![*entity]], ColumnKind::Fullscreen),
-                Column::Tabs(tabs) => (vec![tabs.clone()], ColumnKind::Tiled),
-                Column::Stack(items) => (
-                    items
-                        .iter()
-                        .map(|item| item.window_iter().collect())
-                        .collect(),
-                    ColumnKind::Tiled,
-                ),
-            };
-            let width = column
-                .window_iter()
-                .filter_map(slot)
-                .map(|(_, size)| size.x)
-                .max()?;
-            let tops = items
-                .iter()
-                .map(|windows: &Vec<Entity>| {
-                    windows
-                        .first()
-                        .and_then(|entity| slot(*entity))
-                        .map(|(origin, _)| origin)
-                })
-                .collect::<Option<Vec<_>>>()?;
-            let left = tops.first()?.x;
-            let bands = items
-                .into_iter()
-                .enumerate()
-                .map(|(at, windows)| {
-                    let top = tops[at].y;
-                    let bottom = tops.get(at + 1).map_or(viewport.max.y, |next| next.y);
-                    Band {
-                        windows,
-                        y: top..bottom.max(top),
-                    }
-                })
-                .collect();
-            Some(ColumnSnap {
-                index,
-                x: left..left + width,
-                bands,
-                kind,
-            })
-        })
-        .collect();
-
+    }
     LayoutSnapshot {
-        displays: vec![DisplaySnap {
-            id: display.id(),
-            bounds: display.bounds(),
-            viewport,
-            columns,
-        }],
+        displays: moves
+            .displays
+            .iter()
+            .filter_map(|(_, display, dock, _)| {
+                let strip_entity = moves.shown_strip(display.id())?;
+                let (_, strip, strip_position, _, _) = moves.strips.get(strip_entity).ok()?;
+                let viewport = display.actual_display_bounds(dock, config);
+                let origin = strip_position.0;
+                let slot = |entity: Entity| {
+                    placement(entity).map(|(position, size)| (position + origin, size))
+                };
+
+                let columns = strip
+                    .columns()
+                    .enumerate()
+                    .filter_map(|(index, column)| {
+                        let (items, kind) = match column {
+                            Column::Single(entity) => (vec![vec![*entity]], ColumnKind::Tiled),
+                            Column::Fullscren(entity) => {
+                                (vec![vec![*entity]], ColumnKind::Fullscreen)
+                            }
+                            Column::Tabs(tabs) => (vec![tabs.clone()], ColumnKind::Tiled),
+                            Column::Stack(items) => (
+                                items
+                                    .iter()
+                                    .map(|item| item.window_iter().collect())
+                                    .collect(),
+                                ColumnKind::Tiled,
+                            ),
+                        };
+                        let width = column
+                            .window_iter()
+                            .filter_map(slot)
+                            .map(|(_, size)| size.x)
+                            .max()?;
+                        let tops = items
+                            .iter()
+                            .map(|windows: &Vec<Entity>| {
+                                windows
+                                    .first()
+                                    .and_then(|entity| slot(*entity))
+                                    .map(|(origin, _)| origin)
+                            })
+                            .collect::<Option<Vec<_>>>()?;
+                        let left = tops.first()?.x;
+                        let bands = items
+                            .into_iter()
+                            .enumerate()
+                            .map(|(at, windows)| {
+                                let top = tops[at].y;
+                                let bottom = tops.get(at + 1).map_or(viewport.max.y, |next| next.y);
+                                Band {
+                                    windows,
+                                    y: top..bottom.max(top),
+                                }
+                            })
+                            .collect();
+                        Some(ColumnSnap {
+                            index,
+                            x: left..left + width,
+                            bands,
+                            kind,
+                        })
+                    })
+                    .collect();
+
+                Some(DisplaySnap {
+                    id: display.id(),
+                    bounds: display.bounds(),
+                    viewport,
+                    columns,
+                })
+            })
+            .collect(),
     }
 }
 
@@ -1288,14 +1437,64 @@ fn apply_drop(
     window: Entity,
     target: DropTarget,
     focused: bool,
-    strips: &mut Strips,
+    moves: &mut DisplayMoves,
     placements: &mut Placements,
     commands: &mut Commands,
 ) {
-    let Some((mut strip, _, _)) = strips
-        .iter_mut()
-        .find(|(strip, _, _)| strip.contains(window))
+    let Some((source, _, _, source_display, _)) = moves
+        .strips
+        .iter()
+        .find(|(_, strip, _, _, _)| strip.contains(window))
     else {
+        return;
+    };
+    let source_display = source_display.parent();
+    let destination = match target {
+        DropTarget::IntoColumn {
+            display,
+            column,
+            slot,
+        } => Some((display, Placement::Into(column, slot))),
+        DropTarget::NewColumn { display, index } => Some((display, Placement::Column(index))),
+        DropTarget::Home | DropTarget::Refused { .. } => None,
+    };
+    if let Some((display, placement)) = destination
+        && moves
+            .displays
+            .get(source_display)
+            .is_ok_and(|(_, source, _, _)| source.id() != display)
+    {
+        let size = placements.get(window).ok().map(|(_, bounds)| bounds.0);
+        if let Some(size) = size {
+            moves.move_to_display(
+                window,
+                display,
+                placement,
+                size,
+                |entity| {
+                    placements.get(entity).ok().map(|(position, bounds)| {
+                        IRect::from_corners(position.0, position.0 + bounds.0)
+                    })
+                },
+                commands,
+            );
+        }
+        if let Some((_, strip, _, _, _)) = moves
+            .strips
+            .iter()
+            .find(|(_, strip, _, _, _)| strip.contains(window))
+        {
+            for member in strip.tab_group(window).unwrap_or_else(|| vec![window]) {
+                if let Ok((mut position, _)) = placements.get_mut(member) {
+                    position.set_changed();
+                }
+            }
+        }
+        commands.ensure_visible(window);
+        commands.focus_entity(window, false);
+        return;
+    }
+    let Ok((_, mut strip, _, _, _)) = moves.strips.get_mut(source) else {
         return;
     };
     // A native tab group moves as one, so every tab goes where it goes.

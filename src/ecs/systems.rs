@@ -25,7 +25,7 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::drag::DragOverlayHandle;
+use crate::ecs::drag::{DragOverlayHandle, TilingRestore};
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
@@ -810,6 +810,7 @@ pub(super) fn window_resized_update_frame(
     mut windows: ResizableWindows,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
     minimum_heights: Query<&MinimumHeight>,
+    tiling: TilingRestore,
     mut commands: Commands,
 ) {
     for event in messages.read() {
@@ -827,15 +828,27 @@ pub(super) fn window_resized_update_frame(
         if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
             continue;
         }
-        if resizing || verifying {
-            continue;
-        }
         let Ok(new_frame) = window.update_frame() else {
             continue;
         };
         let active_strip = workspaces
             .iter_mut()
             .find(|(strip, _)| strip.contains(entity));
+        if unmanaged.is_none()
+            && active_strip.as_ref().is_some_and(|(strip, _)| {
+                strip
+                    .index_of(entity)
+                    .ok()
+                    .and_then(|index| strip.get(index).ok())
+                    .is_some_and(|column| !matches!(column, Column::Fullscren(_)))
+            })
+            && tiling.restore(entity, new_frame, bounds.0, &mut commands)
+        {
+            continue;
+        }
+        if resizing || verifying {
+            continue;
+        }
         let tabbed = active_strip
             .as_ref()
             .is_some_and(|strip| strip.0.tabbed(entity));
