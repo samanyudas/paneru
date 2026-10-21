@@ -321,6 +321,7 @@ pub(crate) fn overlay_shape(state: &DragState, snapshot: &LayoutSnapshot) -> Opt
             let x = match (before, after) {
                 (Some(before), Some(after)) => i32::midpoint(before, after),
                 (Some(edge), None) | (None, Some(edge)) => edge,
+                (None, None) if display.columns.is_empty() => display.viewport.min.x,
                 (None, None) => return None,
             };
             let x = line_across(x, display.viewport.min.x..display.viewport.max.x)?;
