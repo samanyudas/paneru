@@ -10,8 +10,8 @@ use objc2_core_foundation::CGPoint;
 use crate::commands::{Command, Direction, Operation, Side};
 use crate::ecs::drag::{
     Band, ColumnKind, ColumnSnap, DisplaySnap, Drag, DragEffect, DragFeedback, DragInput,
-    DragState, DropTarget, LayoutSnapshot, OverlayShape, PressedWindow, RELEASE_GRACE, Refusal,
-    hit_test, overlay_shape, step,
+    DragOverlayApi, DragOverlayHandle, DragState, DropTarget, LayoutSnapshot, OverlayShape,
+    PressedWindow, RELEASE_GRACE, Refusal, hit_test, overlay_shape, step,
 };
 use crate::ecs::layout::{FALLBACK_TOP_BAR_HEIGHT, LayoutStrip};
 use crate::ecs::{ActiveWorkspaceMarker, MouseHeldMarker, SpawnWindowTrigger};
@@ -1783,4 +1783,74 @@ fn a_press_that_never_becomes_a_drag_shows_nothing() {
 
     assert!(matches!(drag_state(harness.world()), DragState::Pressed(_)));
     assert_eq!(feedback(harness.world()), None);
+}
+
+/// One call the engine made to the drag overlay.
+#[derive(Clone, Debug, PartialEq)]
+enum OverlayCall {
+    Line(IRect),
+    Refusal(IRect),
+    Hide,
+    Remove,
+}
+
+type OverlayLog = std::rc::Rc<std::cell::RefCell<Vec<OverlayCall>>>;
+
+struct RecordingOverlay(OverlayLog);
+
+impl DragOverlayApi for RecordingOverlay {
+    fn show_line(&mut self, line: IRect, _color: (f64, f64, f64)) {
+        self.0.borrow_mut().push(OverlayCall::Line(line));
+    }
+
+    fn show_refusal(&mut self, square: IRect) {
+        self.0.borrow_mut().push(OverlayCall::Refusal(square));
+    }
+
+    fn hide(&mut self) {
+        self.0.borrow_mut().push(OverlayCall::Hide);
+    }
+
+    fn remove(&mut self) {
+        self.0.borrow_mut().push(OverlayCall::Remove);
+    }
+}
+
+/// Gives the engine a drag overlay that records each call, as the app's
+/// `DragOverlay` would receive them.
+fn record_overlay(harness: &mut TestHarness) -> OverlayLog {
+    let log = OverlayLog::default();
+    harness
+        .world()
+        .insert_non_send(DragOverlayHandle(Box::new(RecordingOverlay(log.clone()))));
+    log
+}
+
+#[test]
+fn a_screen_change_rebuilds_the_overlay_even_for_an_unchanged_shape() {
+    let mut harness = three_columns();
+    let log = record_overlay(&mut harness);
+    let above_the_top = middle_of(harness.world(), 0, 30);
+    press_and_drag(&mut harness, 2, above_the_top);
+    let Some(OverlayShape::Line(line)) = feedback(harness.world()) else {
+        panic!("{:?}", feedback(harness.world()));
+    };
+    assert_eq!(log.borrow().last(), Some(&OverlayCall::Line(line)));
+    log.borrow_mut().clear();
+
+    harness.world().write_message(Event::DisplayResized {
+        display_id: TEST_DISPLAY_ID,
+    });
+    harness.advance(FRAME);
+
+    assert_eq!(
+        feedback(harness.world()),
+        Some(OverlayShape::Line(line)),
+        "the shape is unchanged"
+    );
+    assert_eq!(
+        *log.borrow(),
+        vec![OverlayCall::Remove, OverlayCall::Line(line)],
+        "the windows are built again for the new screens"
+    );
 }
