@@ -1788,19 +1788,22 @@ fn a_press_that_never_becomes_a_drag_shows_nothing() {
 /// One call the engine made to the drag overlay.
 #[derive(Clone, Debug, PartialEq)]
 enum OverlayCall {
-    Line(IRect),
+    Line(IRect, (f64, f64, f64)),
     Refusal(IRect),
     Hide,
     Remove,
 }
+
+/// The line color with no border color configured.
+const WHITE: (f64, f64, f64) = (1.0, 1.0, 1.0);
 
 type OverlayLog = std::rc::Rc<std::cell::RefCell<Vec<OverlayCall>>>;
 
 struct RecordingOverlay(OverlayLog);
 
 impl DragOverlayApi for RecordingOverlay {
-    fn show_line(&mut self, line: IRect, _color: (f64, f64, f64)) {
-        self.0.borrow_mut().push(OverlayCall::Line(line));
+    fn show_line(&mut self, line: IRect, color: (f64, f64, f64)) {
+        self.0.borrow_mut().push(OverlayCall::Line(line, color));
     }
 
     fn show_refusal(&mut self, square: IRect) {
@@ -1835,7 +1838,7 @@ fn a_screen_change_rebuilds_the_overlay_even_for_an_unchanged_shape() {
     let Some(OverlayShape::Line(line)) = feedback(harness.world()) else {
         panic!("{:?}", feedback(harness.world()));
     };
-    assert_eq!(log.borrow().last(), Some(&OverlayCall::Line(line)));
+    assert_eq!(log.borrow().last(), Some(&OverlayCall::Line(line, WHITE)));
     log.borrow_mut().clear();
 
     harness.world().write_message(Event::DisplayResized {
@@ -1850,7 +1853,7 @@ fn a_screen_change_rebuilds_the_overlay_even_for_an_unchanged_shape() {
     );
     assert_eq!(
         *log.borrow(),
-        vec![OverlayCall::Remove, OverlayCall::Line(line)],
+        vec![OverlayCall::Remove, OverlayCall::Line(line, WHITE)],
         "the windows are built again for the new screens"
     );
 }
@@ -1864,7 +1867,7 @@ fn exiting_during_a_drag_removes_the_overlay() {
     let log = record_overlay(&mut harness);
     let into_the_column = middle_of(harness.world(), 0, 600);
     press_and_drag(&mut harness, 2, into_the_column);
-    assert!(matches!(log.borrow().last(), Some(OverlayCall::Line(_))));
+    assert!(matches!(log.borrow().last(), Some(OverlayCall::Line(..))));
     log.borrow_mut().clear();
 
     // Only the cleanup runs. The full exit schedule also saves state to the
@@ -1943,4 +1946,34 @@ fn a_still_drag_line_follows_its_stack_boundary_when_the_layout_moves_it() {
     ));
     assert_ne!(boundary(harness.world()), top, "the boundary moved");
     assert_eq!(feedback(harness.world()), line_at(harness.world()));
+}
+
+#[test]
+fn a_still_drag_line_takes_the_new_color_when_the_appearance_changes() {
+    const RED: (f64, f64, f64) = (1.0, 0.0, 0.0);
+    const GREEN: (f64, f64, f64) = (0.0, 1.0, 0.0);
+    let mut harness = harness_with(
+        "[decorations.active.border]\ncolor = '#FF0000'\ncolor_night = '#00FF00'\n",
+        TEST_DISPLAY_HEIGHT,
+        3,
+    );
+    harness
+        .world()
+        .insert_resource(crate::ecs::SystemTheme { is_dark: false });
+    let log = record_overlay(&mut harness);
+    let above_the_top = middle_of(harness.world(), 0, 30);
+    press_and_drag(&mut harness, 2, above_the_top);
+    let Some(OverlayShape::Line(line)) = feedback(harness.world()) else {
+        panic!("{:?}", feedback(harness.world()));
+    };
+    assert_eq!(log.borrow().last(), Some(&OverlayCall::Line(line, RED)));
+
+    // macOS switches to dark mode while the pointer stays still.
+    harness
+        .world()
+        .resource_mut::<crate::ecs::SystemTheme>()
+        .is_dark = true;
+    harness.advance(FRAME);
+
+    assert_eq!(log.borrow().last(), Some(&OverlayCall::Line(line, GREEN)));
 }

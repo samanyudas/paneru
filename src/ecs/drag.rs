@@ -27,7 +27,9 @@ use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Changed, Has, Or, With};
 use bevy::ecs::resource::Resource;
-use bevy::ecs::schedule::common_conditions::{not, on_message, resource_changed, resource_exists};
+use bevy::ecs::schedule::common_conditions::{
+    not, on_message, resource_changed, resource_exists, resource_exists_and_changed,
+};
 use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
 use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
 use bevy::math::{IRect, IVec2};
@@ -755,14 +757,21 @@ impl Plugin for DragEventsPlugin {
                 // After the layout, so the shape is drawn from where the
                 // layout put the windows this frame. A display or layout
                 // change can move the shape with the pointer still.
-                drag_feedback
-                    .in_set(super::UpdateSet::Housekeeping)
-                    .run_if(not(resource_exists::<Initializing>))
-                    .run_if(
+                (
+                    drag_feedback.run_if(
                         resource_changed::<DragState>
                             .or_eager(displays_changed)
                             .or_eager(layout_changed),
                     ),
+                    // An appearance switch or a config reload recolors a
+                    // line even with the pointer still.
+                    drag_line_color.after(drag_feedback).run_if(
+                        resource_exists_and_changed::<super::SystemTheme>
+                            .or_eager(resource_changed::<Config>),
+                    ),
+                )
+                    .in_set(super::UpdateSet::Housekeeping)
+                    .run_if(not(resource_exists::<Initializing>)),
             )
             .add_systems(
                 PostUpdate,
@@ -1112,6 +1121,21 @@ fn drag_feedback(
         }
         _ => feedback.line_color,
     };
+    feedback.set_if_neq(DragFeedback { shape, line_color });
+}
+
+/// Samples the line color again for a line already shown, without
+/// rebuilding the layout snapshot.
+fn drag_line_color(
+    mut feedback: ResMut<DragFeedback>,
+    config: Res<Config>,
+    theme: Option<Res<super::SystemTheme>>,
+) {
+    if !matches!(feedback.shape, Some(OverlayShape::Line(_))) {
+        return;
+    }
+    let line_color = config.border_color(theme.is_some_and(|theme| theme.is_dark));
+    let shape = feedback.shape;
     feedback.set_if_neq(DragFeedback { shape, line_color });
 }
 
