@@ -1449,3 +1449,45 @@ fn an_external_resize_before_space_notification_invalidates_the_old_receipt() {
         vec![vec![100], vec![2]]
     );
 }
+
+#[test]
+fn a_closed_window_stays_removed_until_a_fresh_creation_reuses_its_id() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    let removed = window_entity(&mut harness, 2);
+    let old_frame = frame(harness.world(), 2);
+    let element = harness.world().get::<Window>(removed).unwrap().element();
+    harness
+        .mock_state
+        .fail_membership_reads(TEST_WORKSPACE_ID, 1);
+    harness.world().write_message(Event::WindowDestroyed {
+        window_id: 2,
+        source: crate::events::DestroySource::Accessibility { element },
+    });
+    harness.advance(SETTLE);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.advance(SETTLE);
+    assert!(
+        harness
+            .world()
+            .query::<&Window>()
+            .iter(harness.world())
+            .all(|window| window.id() != 2),
+        "warm native and AX lists cannot recreate an authoritative close"
+    );
+
+    let replacement =
+        harness
+            .mock_state
+            .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 2, old_frame);
+    harness
+        .world()
+        .trigger(crate::ecs::SpawnWindowTrigger(vec![replacement]));
+    harness.advance(SETTLE);
+    assert_ne!(window_entity(&mut harness, 2), removed);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100], vec![2]]
+    );
+}

@@ -205,6 +205,8 @@ fn overlaps(a: &[Entity], b: &[Entity]) -> bool {
 
 pub(super) fn register(app: &mut App) {
     app.init_resource::<NativeMembership>()
+        .add_observer(forget_removed_window)
+        .add_observer(accept_created_window)
         .add_systems(
             Update,
             (
@@ -236,6 +238,28 @@ pub(super) fn register(app: &mut App) {
                     !native.pending.is_empty() || !native.receipts.is_empty()
                 }),
         );
+}
+
+fn forget_removed_window(
+    removed: On<Remove, Window>,
+    windows: Query<&Window>,
+    mut native: ResMut<NativeMembership>,
+) {
+    if let Ok(window) = windows.get(removed.entity) {
+        // Native and AX window lists can retain an authoritatively closed ID.
+        // Membership replay must wait for the window lifecycle to recreate it.
+        native.ignored_windows.insert(window.id());
+    }
+}
+
+fn accept_created_window(
+    created: On<Insert, Window>,
+    windows: Query<&Window>,
+    mut native: ResMut<NativeMembership>,
+) {
+    if let Ok(window) = windows.get(created.entity) {
+        native.ignored_windows.remove(&window.id());
+    }
 }
 
 fn membership_work(native: Res<NativeMembership>, drag: Res<DragState>, time: Res<Time>) -> bool {
