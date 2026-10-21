@@ -624,7 +624,7 @@ fn column(index: usize, x: std::ops::Range<i32>, bands: Vec<Band>) -> ColumnSnap
 
 fn snapshot(columns: Vec<ColumnSnap>) -> LayoutSnapshot {
     LayoutSnapshot {
-        displays: vec![DisplaySnap {
+        managed_strip_displays: vec![DisplaySnap {
             id: DISPLAY,
             bounds: BOUNDS,
             viewport: VIEWPORT,
@@ -761,7 +761,7 @@ fn a_fullscreen_column_refuses_a_drop() {
         column(0, 0..400, vec![band(&[e[0]], 20..768)]),
         column(1, 400..800, vec![band(&[e[1]], 20..768)]),
     ]);
-    snap.displays[0].columns[1].kind = ColumnKind::Fullscreen;
+    snap.managed_strip_displays[0].columns[1].kind = ColumnKind::Fullscreen;
 
     assert_eq!(
         hit(&snap, e[0], 600, 300, 5),
@@ -960,11 +960,11 @@ fn a_viewport_too_small_for_a_line_shows_nothing() {
             column(0, 0..400, vec![band(&[e[0]], 20..20 + span)]),
             column(1, 400..800, vec![band(&[e[1]], 20..20 + span)]),
         ]);
-        snap.displays[0].viewport = IRect::new(0, 20, 1024, 20 + span);
+        snap.managed_strip_displays[0].viewport = IRect::new(0, 20, 1024, 20 + span);
         let into_column = dragging_to(e[2], IVec2::new(600, 20), into(1, 0));
         assert_eq!(overlay_shape(&into_column, &snap), None, "{span} pt high");
 
-        snap.displays[0].viewport = IRect::new(400, 20, 400 + span, 768);
+        snap.managed_strip_displays[0].viewport = IRect::new(400, 20, 400 + span, 768);
         let new_column = dragging_to(e[2], IVec2::new(400, 300), new_column(1));
         assert_eq!(overlay_shape(&new_column, &snap), None, "{span} pt wide");
     }

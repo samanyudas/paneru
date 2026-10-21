@@ -80,10 +80,7 @@ pub(crate) type DisplayId = CGDirectDisplayID;
 /// not hide its own slot.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct LayoutSnapshot {
-    /// The displays that show a managed strip a drop can join. A display in
-    /// a native fullscreen space, or with no strip, is left out, so this is
-    /// not the list of physical displays.
-    pub displays: Vec<DisplaySnap>,
+    pub managed_strip_displays: Vec<DisplaySnap>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -162,7 +159,7 @@ pub(crate) fn hit_test(
     limit: impl Fn(DisplayId) -> usize,
 ) -> DropTarget {
     let Some(display) = snapshot
-        .displays
+        .managed_strip_displays
         .iter()
         .find(|display| display.bounds.contains(pointer))
     else {
@@ -282,7 +279,12 @@ pub(crate) fn overlay_shape(state: &DragState, snapshot: &LayoutSnapshot) -> Opt
     let DragState::Dragging(drag) = state else {
         return None;
     };
-    let display_of = |id: DisplayId| snapshot.displays.iter().find(|display| display.id == id);
+    let display_of = |id: DisplayId| {
+        snapshot
+            .managed_strip_displays
+            .iter()
+            .find(|display| display.id == id)
+    };
     match drag.target {
         DropTarget::IntoColumn {
             display,
@@ -751,17 +753,13 @@ pub(crate) struct EdgeHold {
     next_scroll: Duration,
 }
 
-/// The display side whose edge band holds `pointer`, when that side has no
-/// neighboring display. `snapshot` names the displays whose strip can scroll.
-/// `physical` lists every display, because a neighbor that shows no managed
-/// strip, such as one in a native fullscreen space, is still a neighbor.
 fn held_edge(
     snapshot: &LayoutSnapshot,
-    physical: &[(DisplayId, IRect)],
+    physical_displays: &[(DisplayId, IRect)],
     pointer: IVec2,
 ) -> Option<(DisplayId, EdgeSide)> {
     let display = snapshot
-        .displays
+        .managed_strip_displays
         .iter()
         .find(|display| display.bounds.contains(pointer))?;
     let (side, direction) = if pointer.x < display.bounds.min.x + EDGE_BAND {
@@ -774,7 +772,10 @@ fn held_edge(
     display_in_direction(
         &direction,
         display.bounds,
-        physical.iter().copied().filter(|(id, _)| *id != display.id),
+        physical_displays
+            .iter()
+            .copied()
+            .filter(|(id, _)| *id != display.id),
     )
     .is_none()
     .then_some((display.id, side))
@@ -809,13 +810,13 @@ fn drag_edge_scroll(
         },
         &config,
     );
-    let physical: Vec<_> = parameters
+    let physical_displays: Vec<_> = parameters
         .p0()
         .displays
         .iter()
         .map(|(_, display, _, _)| (display.id(), display.bounds()))
         .collect();
-    let edge = held_edge(&snapshot, &physical, drag.pointer);
+    let edge = held_edge(&snapshot, &physical_displays, drag.pointer);
     let mut current = None;
     for (entity, hold) in &mut holds {
         if edge == Some((hold.display, hold.side)) {
@@ -839,7 +840,11 @@ fn drag_edge_scroll(
         return;
     }
     hold.next_scroll = time.elapsed() + EDGE_REPEAT;
-    let Some(view) = snapshot.displays.iter().find(|view| view.id == display) else {
+    let Some(view) = snapshot
+        .managed_strip_displays
+        .iter()
+        .find(|view| view.id == display)
+    else {
         return;
     };
     let shift = match side {
@@ -1348,7 +1353,7 @@ fn show_drag_feedback(
 /// The stack limit of display `id`, from the height its layout uses.
 fn stack_limit(snapshot: &LayoutSnapshot, id: DisplayId, config: &Config) -> usize {
     snapshot
-        .displays
+        .managed_strip_displays
         .iter()
         .find(|display| display.id == id)
         .map_or(1, |display| {
@@ -1370,7 +1375,7 @@ fn snapshot_of(
         return LayoutSnapshot::default();
     }
     LayoutSnapshot {
-        displays: moves
+        managed_strip_displays: moves
             .displays
             .iter()
             .filter_map(|(_, display, dock, _)| {
