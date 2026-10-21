@@ -16,15 +16,37 @@ const EDGE_TOLERANCE: i32 = 6;
 const TILE_TOLERANCE: i32 = 2;
 const RESIZE_RELEASE_GRACE: Duration = Duration::from_millis(600);
 
+/// The windows a left press may be resizing by an edge: every tiled window
+/// whose edge band holds the press point. Two neighboring columns share a
+/// boundary, so a press there can resize either one.
 #[derive(Default, Resource)]
 pub(crate) enum PointerResize {
     #[default]
     Idle,
-    Held(Entity),
+    Held(Vec<Entity>),
     Released {
-        window: Entity,
+        windows: Vec<Entity>,
         until: Duration,
     },
+}
+
+impl PointerResize {
+    fn resizes(&self, entity: Entity, now: Duration) -> bool {
+        match self {
+            Self::Held(windows) => windows.contains(&entity),
+            Self::Released { windows, until } => now <= *until && windows.contains(&entity),
+            Self::Idle => false,
+        }
+    }
+
+    fn release(&mut self, now: Duration) {
+        if let Self::Held(windows) = self {
+            *self = Self::Released {
+                windows: std::mem::take(windows),
+                until: now + RESIZE_RELEASE_GRACE,
+            };
+        }
+    }
 }
 
 /// A resize remains a user resize when its last AX notification arrives
@@ -39,27 +61,17 @@ pub(super) fn track_resize_gesture(
     window_manager: Res<WindowManager>,
     time: Res<Time>,
 ) {
+    let now = time.elapsed();
     for event in events.read() {
         match event {
             Event::MouseDown {
                 point,
                 button: MouseButton::Left,
-                window_id,
                 ..
             } => {
                 let point = origin_from(*point);
-                *gesture = windows
+                let edges: Vec<_> = windows
                     .iter()
-                    .find(|(_, window, presented, bounds)| {
-                        let frame = unpadded(
-                            IRect::from_corners(presented.0, presented.0 + bounds.0),
-                            (window.horizontal_padding(), window.vertical_padding()),
-                        );
-                        window_id.map_or_else(
-                            || frame.inflate(EDGE_TOLERANCE).contains(point),
-                            |id| window.id() == id,
-                        )
-                    })
                     .filter(|(_, window, presented, bounds)| {
                         let frame = unpadded(
                             IRect::from_corners(presented.0, presented.0 + bounds.0),
@@ -68,43 +80,41 @@ pub(super) fn track_resize_gesture(
                         frame.inflate(EDGE_TOLERANCE).contains(point)
                             && !frame.inflate(-EDGE_TOLERANCE).contains(point)
                     })
-                    .map_or(PointerResize::Idle, |(entity, _, _, _)| {
-                        PointerResize::Held(entity)
-                    });
+                    .map(|(entity, _, _, _)| entity)
+                    .collect();
+                *gesture = if edges.is_empty() {
+                    PointerResize::Idle
+                } else {
+                    PointerResize::Held(edges)
+                };
             }
             Event::MouseUp {
                 button: MouseButton::Left,
                 ..
             }
-            | Event::MouseMoved { .. } => {
-                if let PointerResize::Held(window) = *gesture {
-                    *gesture = PointerResize::Released {
-                        window,
-                        until: time.elapsed() + RESIZE_RELEASE_GRACE,
-                    };
-                }
-            }
+            | Event::MouseMoved { .. } => gesture.release(now),
             _ => {}
         }
     }
-    let tracked = match *gesture {
-        PointerResize::Held(window) | PointerResize::Released { window, .. } => Some(window),
-        PointerResize::Idle => None,
-    };
-    if tracked.is_some_and(|window| windows.get(window).is_err()) {
-        *gesture = PointerResize::Idle;
+    match &mut *gesture {
+        PointerResize::Held(tracked)
+        | PointerResize::Released {
+            windows: tracked, ..
+        } => {
+            tracked.retain(|window| windows.contains(*window));
+        }
+        PointerResize::Idle => {}
     }
-    match *gesture {
-        PointerResize::Held(window) if !window_manager.left_button_down() => {
-            *gesture = PointerResize::Released {
-                window,
-                until: time.elapsed() + RESIZE_RELEASE_GRACE,
-            };
-        }
-        PointerResize::Released { until, .. } if time.elapsed() > until => {
-            *gesture = PointerResize::Idle;
-        }
-        _ => {}
+    if matches!(*gesture, PointerResize::Held(_)) && !window_manager.left_button_down() {
+        gesture.release(now);
+    }
+    let expired = match &*gesture {
+        PointerResize::Held(tracked) => tracked.is_empty(),
+        PointerResize::Released { windows, until } => windows.is_empty() || now > *until,
+        PointerResize::Idle => false,
+    };
+    if expired {
+        *gesture = PointerResize::Idle;
     }
 }
 
@@ -148,14 +158,7 @@ impl TilingRestore<'_, '_> {
         padding: (i32, i32),
         commands: &mut Commands,
     ) -> bool {
-        let edge_resize = match *self.gesture {
-            PointerResize::Held(window) => window == entity,
-            PointerResize::Released { window, until } => {
-                window == entity && self.time.elapsed() <= until
-            }
-            PointerResize::Idle => false,
-        };
-        if edge_resize
+        if self.gesture.resizes(entity, self.time.elapsed())
             || !self.displays.iter().any(|(display, dock)| {
                 is_macos_tile(unpadded(frame, padding), display.visible_bounds(dock))
             })

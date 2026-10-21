@@ -1553,6 +1553,38 @@ fn clicks_read_no_native_membership_and_leave_other_windows_in_place() {
 }
 
 #[test]
+fn an_edge_resize_from_a_shared_column_boundary_keeps_the_users_size() {
+    // A press just inside the right column, named by the window server, and
+    // a press on the boundary that names no window, as in a padded gap.
+    for named in [true, false] {
+        let mut harness = three_columns();
+        let left = frame(harness.world(), 0);
+        let right = frame(harness.world(), 1);
+        let press = if named {
+            Origin::new(right.min.x + 2, left.center().y)
+        } else {
+            Origin::new(left.max.x, left.center().y)
+        };
+        harness.mock_state.set_left_button_down(true);
+        let window_id = named.then_some(1);
+        if named {
+            assert_eq!(harness.mock_state.window_at(press), window_id);
+        }
+        harness.world().write_message(Event::MouseDown {
+            point: cg(press),
+            modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+            window_id,
+        });
+        harness.advance(FRAME);
+        let tile = IRect::new(0, 20, 512, 768);
+        macos_tile(&mut harness, 0, tile);
+        harness.advance(ms(200));
+        assert_eq!(frame(harness.world(), 0), tile, "named={named}");
+    }
+}
+
+#[test]
 fn layout_changes_after_a_returned_drop_read_no_native_membership() {
     let mut harness = refused_return_with_native_echo();
     let reads = membership_reads(&harness);
