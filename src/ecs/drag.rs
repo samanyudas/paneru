@@ -840,9 +840,11 @@ pub(super) fn drag_events(
                     stack_limit(snapshot, id, &config)
                 })
             };
-            step(std::mem::take(&mut *state), input, now, &hit)
+            step(state.clone(), input, now, &hit)
         };
-        *state = next;
+        // Written only when it differs, so a drag held still does not
+        // count as a change and rebuild the feedback.
+        state.set_if_neq(next);
 
         for DragEffect::Drop { window, target } in effects {
             debug!("dropping {window} at {target:?}");
@@ -1031,8 +1033,8 @@ fn drag_watchdog(
     };
     // Neither input asks where the pointer is.
     let home = |_, _| DropTarget::Home;
-    let (next, effects) = step(std::mem::take(&mut *state), input, time.elapsed(), &home);
-    *state = next;
+    let (next, effects) = step(state.clone(), input, time.elapsed(), &home);
+    state.set_if_neq(next);
     for DragEffect::Drop { window, target } in effects {
         let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
         apply_drop(

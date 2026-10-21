@@ -1877,3 +1877,28 @@ fn exiting_during_a_drag_removes_the_overlay() {
 
     assert_eq!(*log.borrow(), vec![OverlayCall::Remove]);
 }
+
+#[test]
+fn a_still_drag_leaves_the_drag_state_unchanged() {
+    let mut harness = three_columns();
+    let into_the_column = middle_of(harness.world(), 0, 600);
+    press_and_drag(&mut harness, 2, into_the_column);
+    let changed = |world: &mut World| {
+        world
+            .get_resource_change_ticks::<DragState>()
+            .expect("drag state exists")
+            .changed
+    };
+    let before = changed(harness.world());
+
+    // The watchdog checks the held button on every one of these frames.
+    for _ in 0..5 {
+        harness.advance(FRAME);
+    }
+
+    assert!(matches!(
+        drag_state(harness.world()),
+        DragState::Dragging(_)
+    ));
+    assert_eq!(changed(harness.world()), before);
+}
