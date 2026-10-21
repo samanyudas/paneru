@@ -80,6 +80,9 @@ pub(crate) type DisplayId = CGDirectDisplayID;
 /// not hide its own slot.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct LayoutSnapshot {
+    /// The displays that show a managed strip a drop can join. A display in
+    /// a native fullscreen space, or with no strip, is left out, so this is
+    /// not the list of physical displays.
     pub displays: Vec<DisplaySnap>,
 }
 
@@ -748,7 +751,15 @@ pub(crate) struct EdgeHold {
     next_scroll: Duration,
 }
 
-fn held_edge(snapshot: &LayoutSnapshot, pointer: IVec2) -> Option<(DisplayId, EdgeSide)> {
+/// The display side whose edge band holds `pointer`, when that side has no
+/// neighboring display. `snapshot` names the displays whose strip can scroll.
+/// `physical` lists every display, because a neighbor that shows no managed
+/// strip, such as one in a native fullscreen space, is still a neighbor.
+fn held_edge(
+    snapshot: &LayoutSnapshot,
+    physical: &[(DisplayId, IRect)],
+    pointer: IVec2,
+) -> Option<(DisplayId, EdgeSide)> {
     let display = snapshot
         .displays
         .iter()
@@ -763,11 +774,7 @@ fn held_edge(snapshot: &LayoutSnapshot, pointer: IVec2) -> Option<(DisplayId, Ed
     display_in_direction(
         &direction,
         display.bounds,
-        snapshot
-            .displays
-            .iter()
-            .filter(|other| other.id != display.id)
-            .map(|other| (other.id, other.bounds)),
+        physical.iter().copied().filter(|(id, _)| *id != display.id),
     )
     .is_none()
     .then_some((display.id, side))
@@ -802,7 +809,13 @@ fn drag_edge_scroll(
         },
         &config,
     );
-    let edge = held_edge(&snapshot, drag.pointer);
+    let physical: Vec<_> = parameters
+        .p0()
+        .displays
+        .iter()
+        .map(|(_, display, _, _)| (display.id(), display.bounds()))
+        .collect();
+    let edge = held_edge(&snapshot, &physical, drag.pointer);
     let mut current = None;
     for (entity, hold) in &mut holds {
         if edge == Some((hold.display, hold.side)) {

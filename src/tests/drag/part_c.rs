@@ -1866,3 +1866,18 @@ fn a_real_native_move_during_an_engine_animation_applies() {
         vec![vec![1], vec![2], vec![3]]
     );
 }
+
+#[test]
+fn a_neighbor_display_showing_a_fullscreen_space_still_stops_the_edge_scroll() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    // The external display shows a native fullscreen space, which has no
+    // managed strip, so the drag snapshot leaves that display out.
+    harness
+        .mock_state
+        .activate_workspace(EXT_DISPLAY_ID, EXT_WORKSPACE_ID + 1, true);
+    let edge = Origin::new(TEST_DISPLAY_WIDTH - 2, 500);
+    press_and_drag(&mut harness, 0, edge);
+    let before = strip_x(harness.world(), TEST_WORKSPACE_ID);
+    harness.advance(ms(1200));
+    assert_eq!(strip_x(harness.world(), TEST_WORKSPACE_ID), before);
+}
