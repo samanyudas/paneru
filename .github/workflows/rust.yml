@@ -15,18 +15,16 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: "Use the Command Line Tools toolchain"
+      run: sudo xcode-select -s /Library/Developer/CommandLineTools
+
     - name: Select macOS SDK
       if: runner.os == 'macOS'
       shell: bash
       run: |
-        # Keep the SDK paired with the active Xcode toolchain. The system's
-        # Command Line Tools SDK can be newer than that linker understands.
         sdkroot="$(xcrun --sdk macosx --show-sdk-path)"
         echo "SDKROOT=$sdkroot" >> "$GITHUB_ENV"
         echo "Using macOS SDK: $sdkroot"
-
-    - name: "Use the Command Line Tools toolchain"
-      run: sudo xcode-select -s /Library/Developer/CommandLineTools
 
     - run: rustup update
     - run: cargo build --release --verbose
