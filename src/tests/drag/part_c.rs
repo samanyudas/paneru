@@ -1,9 +1,5 @@
 use super::*;
 
-// --- Drops across displays ---
-
-/// Where the external display sits: to the right of the main one, sharing its
-/// top edge.
 fn ext_bounds(height: i32) -> IRect {
     IRect::new(
         TEST_DISPLAY_WIDTH,
@@ -13,8 +9,6 @@ fn ext_bounds(height: i32) -> IRect {
     )
 }
 
-/// The main display with three columns, and an external display of
-/// `ext_height` to its right with window 100 alone on it.
 fn two_displays(config: &str, ext_height: i32) -> TestHarness {
     let config = crate::config::Config::try_from(config).expect("config parses");
     let ext = ext_bounds(ext_height);
@@ -30,8 +24,6 @@ fn two_displays(config: &str, ext_height: i32) -> TestHarness {
     harness
 }
 
-/// The window IDs of each column of the strip shown for `workspace`, left to
-/// right, each column top to bottom.
 fn layout_on(world: &mut World, workspace: crate::platform::WorkspaceId) -> Vec<Vec<WinID>> {
     let ids = world
         .query::<(Entity, &Window)>()
@@ -48,8 +40,6 @@ fn layout_on(world: &mut World, workspace: crate::platform::WorkspaceId) -> Vec<
         .collect()
 }
 
-/// macOS puts a window released over another display on that display's
-/// space, and that display becomes the active one.
 fn macos_moves_to_ext(harness: &mut TestHarness, id: WinID) {
     harness
         .mock_state
@@ -57,8 +47,6 @@ fn macos_moves_to_ext(harness: &mut TestHarness, id: WinID) {
     harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
 }
 
-/// Drags window `id` by its title bar onto the external display, drops it at
-/// `to`, lets macOS move it there, and lets the layout settle.
 fn title_drag_to_ext(harness: &mut TestHarness, id: WinID, to: Origin) -> IRect {
     let start = press_and_drag(harness, id, to);
     release(harness, to);
@@ -176,8 +164,6 @@ fn a_full_stack_on_another_display_refuses_the_drop_and_the_window_returns() {
 
 #[test]
 fn a_smaller_display_refuses_a_stack_it_cannot_fit_under_fit_display() {
-    // At the minimum window height the main display fits three windows in a
-    // column, and the short external display fits one.
     let mut harness = two_displays("[options]\nstack_limit = \"fit\"\n", 300);
 
     let into_the_column = middle_of(harness.world(), 100, 200);
@@ -193,7 +179,6 @@ fn a_smaller_display_refuses_a_stack_it_cannot_fit_under_fit_display() {
     );
     assert_back_right_of(harness.world(), 1, 2, start);
 
-    // The same drop on the main display's own column fits.
     let into_a_main_column = middle_of(harness.world(), 0, 600);
     title_drag(&mut harness, 2, into_a_main_column);
     assert_eq!(
@@ -656,5 +641,261 @@ fn a_drop_rechecks_a_display_that_disappears_before_release() {
     assert!(
         IRect::new(0, 20, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT)
             .contains(frame(harness.world(), 2).center())
+    );
+}
+
+#[test]
+fn a_held_drop_is_refused_when_a_display_resize_reduces_the_fit_limit() {
+    let mut harness = still_drag_over_a_stack_boundary();
+    let DragState::Dragging(drag) = drag_state(harness.world()) else {
+        panic!("drag in progress");
+    };
+    harness
+        .mock_state
+        .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, 500));
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: TEST_DISPLAY_ID,
+    });
+    harness.advance(ms(500));
+    assert!(matches!(
+        feedback(harness.world()),
+        Some(OverlayShape::Refusal(_))
+    ));
+    release(&mut harness, drag.pointer);
+    harness.advance(SETTLE);
+    assert_eq!(layout(harness.world()), vec![vec![0, 1], vec![2]]);
+}
+
+#[test]
+fn a_cross_display_drop_survives_macos_activating_the_destination_before_release() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    let point = middle_of(harness.world(), 100, 900);
+    press_and_drag(&mut harness, 2, point);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.advance(ms(100));
+    release(&mut harness, point);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100, 2]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1]]
+    );
+}
+
+#[test]
+fn tiling_restore_matches_the_native_frame_of_a_padded_window() {
+    for resizing in [false, true] {
+        let mut harness = three_columns();
+        let padding = (14, 12);
+        harness.mock_state.update_window(0, |window| {
+            window.horizontal_padding = padding.0;
+            window.vertical_padding = padding.1;
+        });
+        let before = frame(harness.world(), 0);
+        if resizing {
+            let edge = Origin::new(before.max.x - padding.0 - 1, before.center().y);
+            press_at(&mut harness, edge);
+            harness.advance(FRAME);
+        }
+        let tile = crate::ecs::systems::padded(IRect::new(0, 20, 512, 768), padding);
+        macos_tile(&mut harness, 0, tile);
+        harness.advance(SETTLE);
+        if resizing {
+            assert_eq!(frame(harness.world(), 0).width(), tile.width());
+        } else {
+            assert_eq!(frame(harness.world(), 0), before);
+        }
+    }
+}
+
+#[test]
+fn a_lost_mouse_up_keeps_grace_for_a_delayed_manual_edge_resize() {
+    for pointer_moved in [false, true] {
+        let mut harness = three_columns();
+        let start = frame(harness.world(), 0);
+        let edge = Origin::new(start.max.x - 1, start.center().y);
+        press_at(&mut harness, edge);
+        harness.advance(FRAME);
+        harness.mock_state.set_left_button_down(false);
+        if pointer_moved {
+            harness.world().write_message(Event::MouseMoved {
+                point: cg(edge + IVec2::new(60, 0)),
+                modifiers: Modifiers::empty(),
+            });
+            harness.advance(ms(150));
+        }
+        let tile = IRect::new(0, 20, 512, 768);
+        macos_tile(&mut harness, 0, tile);
+        harness.advance(SETTLE);
+        assert_eq!(frame(harness.world(), 0), tile);
+        macos_tile(&mut harness, 0, IRect::new(0, 20, 512, 394));
+        harness.advance(SETTLE);
+        assert_eq!(
+            frame(harness.world(), 0),
+            tile,
+            "release grace must expire for subsequent macOS tiling"
+        );
+    }
+}
+
+#[test]
+fn early_display_activation_keeps_a_refused_drag_in_its_source() {
+    for native_tabs in [false, true] {
+        let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
+        let grabbed = if native_tabs {
+            add_native_tab(&mut harness, 2, 3);
+            3
+        } else {
+            2
+        };
+        let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
+        let members = source[2].clone();
+        let point = middle_of(harness.world(), 100, 900);
+        press_and_drag(&mut harness, grabbed, point);
+        harness.mock_state.set_left_button_down(false);
+        for member in members {
+            macos_moves_to_ext(&mut harness, member);
+        }
+        harness.advance(ms(100));
+        assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID), source);
+        release(&mut harness, point);
+        harness.advance(SETTLE);
+        assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID), source);
+        assert_eq!(
+            layout_on(harness.world(), EXT_WORKSPACE_ID),
+            vec![vec![100]]
+        );
+    }
+}
+
+#[test]
+fn a_late_accessibility_element_keeps_a_cross_display_drop() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    let point = middle_of(harness.world(), 100, 900);
+    press_and_drag(&mut harness, 2, point);
+    release(&mut harness, point);
+    harness
+        .mock_state
+        .os_transfer_window_late(2, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(ms(400));
+    harness.mock_state.os_list_window(2);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100, 2]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1]]
+    );
+}
+
+#[test]
+fn a_batched_gesture_and_display_activation_keep_a_refused_drag_in_its_source() {
+    let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
+    let start = frame(harness.world(), 2);
+    let press = start.min + IVec2::new(100, 10);
+    let point = middle_of(harness.world(), 100, 900);
+    press_at(&mut harness, press);
+    for at in 1..=6 {
+        let sample = press + (point - press) * at / 6;
+        harness.world().write_message(mouse_dragged(sample));
+        harness
+            .mock_state
+            .os_move_window(2, start.min + (sample - press));
+        for event in harness.mock_state.drain_events() {
+            harness.world().write_message(event);
+        }
+    }
+    harness.mock_state.set_left_button_down(false);
+    macos_moves_to_ext(&mut harness, 2);
+    for event in harness.mock_state.drain_events() {
+        harness.world().write_message(event);
+    }
+    harness.world().write_message(mouse_up(point));
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+}
+
+#[test]
+fn early_display_activation_preserves_the_width_ratio_of_a_new_column_and_its_native_tabs() {
+    for native_tabs in [false, true] {
+        let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
+        let grabbed = if native_tabs {
+            add_native_tab(&mut harness, 2, 3);
+            3
+        } else {
+            2
+        };
+        let members = layout_on(harness.world(), TEST_WORKSPACE_ID)[2].clone();
+        let start = frame(harness.world(), grabbed);
+        let target = frame(harness.world(), 100);
+        let point = Origin::new(target.max.x - 20, 600);
+        press_and_drag(&mut harness, grabbed, point);
+        harness.mock_state.set_left_button_down(false);
+        for &member in &members {
+            macos_moves_to_ext(&mut harness, member);
+        }
+        harness.advance(ms(100));
+        assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID)[2], members);
+        release(&mut harness, point);
+        harness.advance(SETTLE);
+        assert_eq!(
+            layout_on(harness.world(), EXT_WORKSPACE_ID),
+            vec![vec![100], members.clone()]
+        );
+        let expected = crate::util::round_px(
+            f64::from(start.width()) / f64::from(TEST_DISPLAY_WIDTH) * f64::from(EXT_DISPLAY_WIDTH),
+        );
+        for member in members {
+            assert_eq!(frame(harness.world(), member).width(), expected);
+        }
+    }
+}
+
+#[test]
+fn native_batch_migration_of_other_windows_keeps_the_held_window_in_its_source() {
+    let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
+    let point = middle_of(harness.world(), 100, 900);
+    press_and_drag(&mut harness, 2, point);
+    harness.mock_state.set_left_button_down(false);
+    for id in [0, 1, 2] {
+        macos_moves_to_ext(&mut harness, id);
+    }
+    harness.advance(ms(100));
+    assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID), vec![vec![2]]);
+    let moved = harness
+        .world()
+        .query::<&LayoutStrip>()
+        .iter(harness.world())
+        .filter(|strip| strip.id() == EXT_WORKSPACE_ID)
+        .map(|strip| strip.all_windows().len())
+        .sum::<usize>();
+    assert_eq!(
+        moved, 3,
+        "the native batch still moves windows 0 and 1 beside external 100"
+    );
+    release(&mut harness, point);
+    harness.advance(SETTLE);
+    let count = harness
+        .world()
+        .query::<&LayoutStrip>()
+        .iter(harness.world())
+        .map(|strip| strip.all_windows().len())
+        .sum::<usize>();
+    assert_eq!(
+        count, 4,
+        "the drop keeps every managed window in the layout"
     );
 }

@@ -1010,8 +1010,6 @@ impl LayoutStrip {
         Ok(())
     }
 
-    /// Makes column `target`, whose items are `joined`, a stack with `item`
-    /// inserted `slot` items from the top.
     fn join_items(
         &mut self,
         target: usize,

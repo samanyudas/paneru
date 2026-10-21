@@ -1250,9 +1250,6 @@ fn copy_window_rule(
     }
 }
 
-/// Moves the focused window to the end of the strip on the next display, or
-/// on the display in the commanded direction, through
-/// [`DisplayMoves::move_to_display`].
 fn to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,

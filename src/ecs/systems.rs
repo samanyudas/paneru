@@ -842,7 +842,13 @@ pub(super) fn window_resized_update_frame(
                     .and_then(|index| strip.get(index).ok())
                     .is_some_and(|column| !matches!(column, Column::Fullscren(_)))
             })
-            && tiling.restore(entity, new_frame, bounds.0, &mut commands)
+            && tiling.restore(
+                entity,
+                new_frame,
+                bounds.0,
+                (window.horizontal_padding(), window.vertical_padding()),
+                &mut commands,
+            )
         {
             continue;
         }

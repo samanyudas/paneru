@@ -31,7 +31,7 @@ use bevy::ecs::schedule::common_conditions::{
     not, on_message, resource_changed, resource_exists, resource_exists_and_changed,
 };
 use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
-use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
+use bevy::ecs::system::{Commands, NonSendMut, Populated, Query, Res, ResMut, SystemParam};
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 use objc2_core_graphics::CGDirectDisplayID;
@@ -740,7 +740,6 @@ enum EdgeSide {
     Right,
 }
 
-/// One continuous hold at an outer display edge.
 #[derive(Component)]
 pub(crate) struct EdgeHold {
     display: DisplayId,
@@ -776,8 +775,6 @@ fn held_edge(snapshot: &LayoutSnapshot, pointer: IVec2) -> Option<(DisplayId, Ed
 type EdgeStrips<'w, 's> =
     Query<'w, 's, &'static mut Position, (With<LayoutStrip>, Without<Window>)>;
 
-/// Scrolls one more column into view after the initial hold, then at the
-/// repeat interval. Deadlines survive delayed frames without burst repeats.
 fn drag_edge_scroll(
     state: Res<DragState>,
     time: Res<Time>,
@@ -858,6 +855,70 @@ fn drag_edge_scroll(
     }
 }
 
+#[derive(Component)]
+pub(crate) struct DropPlacementGuard {
+    pub until: Duration,
+}
+
+#[derive(SystemParam)]
+pub(crate) struct DragPlacementProtection<'w, 's> {
+    state: Option<Res<'w, DragState>>,
+    guards: Query<
+        'w,
+        's,
+        (
+            &'static DropPlacementGuard,
+            Has<RepositionMarker>,
+            Has<super::ResizeMarker>,
+        ),
+    >,
+    time: Res<'w, Time>,
+}
+
+impl DragPlacementProtection<'_, '_> {
+    pub(crate) fn protects<'a>(
+        &self,
+        entity: Entity,
+        mut strips: impl Iterator<Item = &'a LayoutStrip>,
+    ) -> bool {
+        if self
+            .guards
+            .get(entity)
+            .is_ok_and(|(guard, moving, resizing)| {
+                self.time.elapsed() < guard.until || moving || resizing
+            })
+        {
+            return true;
+        }
+        let Some(held) = self.state.as_ref().and_then(|state| state.window()) else {
+            return false;
+        };
+        entity == held
+            || strips.any(|strip| {
+                strip
+                    .tab_group(held)
+                    .is_some_and(|group| group.contains(&entity))
+            })
+    }
+}
+
+fn cleanup_drop_guards(
+    guards: Populated<(
+        Entity,
+        &DropPlacementGuard,
+        Has<RepositionMarker>,
+        Has<super::ResizeMarker>,
+    )>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    for (entity, guard, moving, resizing) in guards {
+        if time.elapsed() >= guard.until && !moving && !resizing {
+            commands.entity(entity).remove::<DropPlacementGuard>();
+        }
+    }
+}
+
 pub struct DragEventsPlugin;
 
 impl Plugin for DragEventsPlugin {
@@ -900,6 +961,7 @@ impl Plugin for DragEventsPlugin {
                 // layout put the windows this frame. A display or layout
                 // change can move the shape with the pointer still.
                 (
+                    cleanup_drop_guards,
                     drag_feedback.run_if(
                         resource_changed::<DragState>
                             .or_eager(displays_changed)
@@ -1004,6 +1066,7 @@ pub(super) fn drag_events(
                 &mut moves,
                 &mut placements,
                 &mut commands,
+                now,
             );
         }
     }
@@ -1199,6 +1262,7 @@ fn drag_watchdog(
             &mut moves,
             &mut placements,
             &mut commands,
+            time.elapsed(),
         );
     }
 }
@@ -1338,12 +1402,10 @@ fn stack_limit(snapshot: &LayoutSnapshot, id: DisplayId, config: &Config) -> usi
         })
 }
 
-/// The selected strip on every visible display, using layout slots rather
-/// than the dragged window's live frame.
 fn snapshot_of(
     dragged: Entity,
     moves: &DisplayMoves,
-    placement: impl Fn(Entity) -> Option<(IVec2, IVec2)>,
+    layout_slot: impl Fn(Entity) -> Option<(IVec2, IVec2)>,
     config: &Config,
 ) -> LayoutSnapshot {
     if !moves
@@ -1363,7 +1425,7 @@ fn snapshot_of(
                 let viewport = display.actual_display_bounds(dock, config);
                 let origin = strip_position.0;
                 let slot = |entity: Entity| {
-                    placement(entity).map(|(position, size)| (position + origin, size))
+                    layout_slot(entity).map(|(position, size)| (position + origin, size))
                 };
 
                 let columns = strip
@@ -1440,6 +1502,7 @@ fn apply_drop(
     moves: &mut DisplayMoves,
     placements: &mut Placements,
     commands: &mut Commands,
+    now: Duration,
 ) {
     let Some((source, _, _, source_display, _)) = moves
         .strips
@@ -1484,11 +1547,12 @@ fn apply_drop(
             .iter()
             .find(|(_, strip, _, _, _)| strip.contains(window))
         {
-            for member in strip.tab_group(window).unwrap_or_else(|| vec![window]) {
-                if let Ok((mut position, _)) = placements.get_mut(member) {
-                    position.set_changed();
-                }
-            }
+            restore_drop_members(
+                &strip.tab_group(window).unwrap_or_else(|| vec![window]),
+                placements,
+                commands,
+                now,
+            );
         }
         commands.ensure_visible(window);
         commands.focus_entity(window, false);
@@ -1533,13 +1597,25 @@ fn apply_drop(
 
     // The user's drag left the window where it was released. Marking its
     // slot changed sends it there, even when the slot did not move.
-    for member in members {
-        if let Ok((mut layout_position, _)) = placements.get_mut(member) {
-            layout_position.set_changed();
-        }
-    }
+    restore_drop_members(&members, placements, commands, now);
     commands.ensure_visible(window);
     if !focused {
         commands.focus_entity(window, false);
+    }
+}
+
+fn restore_drop_members(
+    members: &[Entity],
+    placements: &mut Placements,
+    commands: &mut Commands,
+    now: Duration,
+) {
+    for &member in members {
+        if let Ok((mut position, _)) = placements.get_mut(member) {
+            position.set_changed();
+            commands.entity(member).insert(DropPlacementGuard {
+                until: now + SETTLE_WINDOW,
+            });
+        }
     }
 }

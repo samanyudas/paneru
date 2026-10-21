@@ -37,7 +37,6 @@ use bevy::ecs::entity::EntityHashSet;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::ResMut;
 
-/// Where a window moved to another display goes in the strip shown there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Placement {
     /// A new column after the last one.
@@ -48,15 +47,12 @@ pub(crate) enum Placement {
     Into(usize, usize),
 }
 
-/// What [`DisplayMoves::move_to_display`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DisplayMove {
     /// The strip the window joined. `None` when the display shows no strip,
     /// which only an [`Placement::Append`] move allows.
     pub strip: Option<Entity>,
-    /// The bounds of the display the window moved to.
     pub display_bounds: IRect,
-    /// A window beside it in the strip it left, if one is left there.
     pub left_behind: Option<Entity>,
 }
 
@@ -83,8 +79,6 @@ type DisplaysWithDocks<'w, 's> = Query<
     ),
 >;
 
-/// The strips and displays a window moves between when it changes display,
-/// by keyboard or by drag.
 #[derive(SystemParam)]
 pub(crate) struct DisplayMoves<'w, 's> {
     pub strips: MovableStrips<'w, 's>,
@@ -94,14 +88,12 @@ pub(crate) struct DisplayMoves<'w, 's> {
 }
 
 impl DisplayMoves<'_, '_> {
-    /// The display marked active.
     pub(crate) fn active_display(&self) -> Option<&Display> {
         self.displays
             .iter()
             .find_map(|(_, display, _, active)| active.then_some(display))
     }
 
-    /// The displays other than the active one.
     pub(crate) fn other_displays(&self) -> impl Iterator<Item = &Display> {
         self.displays
             .iter()
@@ -118,7 +110,6 @@ impl DisplayMoves<'_, '_> {
             .map(|(entity, _, _, _, _)| entity)
     }
 
-    /// The part of the display `display_entity` the layout uses.
     fn viewport(&self, display_entity: Entity) -> Option<IRect> {
         let (_, display, dock, _) = self.displays.get(display_entity).ok()?;
         Some(display.actual_display_bounds(dock, &self.config))
@@ -159,8 +150,6 @@ impl DisplayMoves<'_, '_> {
         if strip == Some(source) {
             return None;
         }
-        // The width relative to the usable viewport on each side, dock and
-        // padding included, as `resize_window` measures it.
         let source_viewport = self.viewport(source_display)?;
         let target_viewport = self.viewport(target_display_entity)?;
 
@@ -213,7 +202,6 @@ impl DisplayMoves<'_, '_> {
                 (Placement::Append, group) => target_strip.append_tab_group(group),
                 (Placement::Column(index), group) => target_strip.insert_tab_group_at(index, group),
                 (Placement::Into(column, slot), group) => {
-                    // Checked above: the column takes a window.
                     _ = target_strip.join_column(group, column, slot);
                 }
             }
@@ -474,6 +462,7 @@ pub(crate) fn migrate_moved_windows_across_displays(world: &mut World) {
             display_entity,
             target_space_id,
             &mut affected_source_spaces,
+            None,
         );
     }
 
@@ -486,6 +475,7 @@ pub(crate) fn migrate_moved_windows_for_space(
     world: &mut World,
     display_entity: Entity,
     target_space_id: WorkspaceId,
+    approved: &EntityHashSet,
 ) {
     let mut affected_source_spaces = HashSet::new();
     migrate_moved_windows_to_space(
@@ -493,6 +483,7 @@ pub(crate) fn migrate_moved_windows_for_space(
         display_entity,
         target_space_id,
         &mut affected_source_spaces,
+        Some(approved),
     );
     for source_space_id in affected_source_spaces {
         compact_workspace_strips(world, source_space_id);
@@ -504,6 +495,7 @@ fn migrate_moved_windows_to_space(
     display_entity: Entity,
     target_space_id: WorkspaceId,
     affected_source_spaces: &mut HashSet<WorkspaceId>,
+    approved: Option<&EntityHashSet>,
 ) {
     let Some(display_bounds) = world.get::<Display>(display_entity).map(Display::bounds) else {
         return;
@@ -539,7 +531,8 @@ fn migrate_moved_windows_to_space(
             .into_iter()
             .filter_map(|id| managed_windows.get(&id).copied())
             .filter(|&entity| {
-                !strips_in_space.iter().any(|strip| strip.contains(entity))
+                approved.is_none_or(|approved| approved.contains(&entity))
+                    && !strips_in_space.iter().any(|strip| strip.contains(entity))
                     && !fullscreen_strips.iter().any(|strip| strip.contains(entity))
             })
             .collect()

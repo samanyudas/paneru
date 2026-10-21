@@ -1983,7 +1983,7 @@ fn a_still_drag_line_takes_the_new_color_when_the_appearance_changes() {
 /// The stack `[0, 1] | [2]` with window 2 held still just above the boundary
 /// between windows 0 and 1, so a drop lands between them.
 fn still_drag_over_a_stack_boundary() -> TestHarness {
-    let mut harness = three_columns();
+    let mut harness = harness_with("", 900, 3);
     harness.run(vec![
         command(Operation::Focus(Direction::First)),
         command(Operation::Focus(Direction::East)),
@@ -2027,7 +2027,7 @@ fn a_still_drag_line_follows_its_stack_boundary_on_the_first_frame_of_a_display_
     // Short enough that the layout must move the boundary up.
     harness
         .mock_state
-        .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, 500));
+        .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, 650));
     harness.world().write_message(Event::DisplayConfigured {
         display_id: TEST_DISPLAY_ID,
     });

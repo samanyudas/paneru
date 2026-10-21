@@ -21,6 +21,7 @@ use crate::commands::{
     Direction, MoveFocus, Operation, filter_window_operations, get_window_in_direction,
 };
 use crate::config::Config;
+use crate::ecs::drag::DragPlacementProtection;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, origin_exposing};
 use crate::ecs::params::{ActiveDisplay, WindowCtx, Windows};
@@ -132,9 +133,15 @@ impl Plugin for WorkspaceEventsPlugin {
                 workspace_change_handler,
                 workspace_created_handler,
                 handle_virtual_window_moves,
-                detect_moved_windows.run_if(not(resource_exists::<Initializing>)),
             )
                 .in_set(super::UpdateSet::Events),
+        );
+        app.add_systems(
+            Update,
+            detect_moved_windows
+                .in_set(super::UpdateSet::Focus)
+                .after(crate::ecs::drag::drag_events)
+                .run_if(not(resource_exists::<Initializing>)),
         );
         app.add_systems(
             Update,
@@ -338,6 +345,7 @@ fn workspace_change_handler(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn detect_moved_windows(
     activated_workspace: Single<Entity, Added<ActiveWorkspaceMarker>>,
@@ -351,6 +359,7 @@ fn detect_moved_windows(
     window_manager: Res<WindowManager>,
     reconcile_state: Option<Res<crate::ecs::display::DisplayReconcileState>>,
     mut ignored_windows: Local<HashSet<WinID>>,
+    protection: DragPlacementProtection,
     mut ctx: WindowCtx,
 ) {
     let Ok((workspace_id, target_display)) = workspaces
@@ -399,9 +408,7 @@ fn detect_moved_windows(
             })
             .collect::<Vec<_>>();
         if retry_windows.is_empty() {
-            for id in unresolved_ids {
-                ignored_windows.insert(id);
-            }
+            ignored_windows.extend(unresolved_ids);
         } else {
             debug!(
                 "retrying unresolved windows: {}",
@@ -423,9 +430,10 @@ fn detect_moved_windows(
         .iter()
         .copied()
         .filter(|&entity| {
-            !workspaces
-                .iter()
-                .any(|(strip, _, fullscreen, _)| fullscreen && strip.contains(entity))
+            !protection.protects(entity, workspaces.iter().map(|(strip, _, _, _)| strip))
+                && !workspaces
+                    .iter()
+                    .any(|(strip, _, fullscreen, _)| fullscreen && strip.contains(entity))
         })
         .collect();
     if moved_set.is_empty() {
@@ -440,6 +448,7 @@ fn detect_moved_windows(
                 world,
                 display_entity,
                 workspace_id,
+                &moved_set,
             );
         });
         return;
