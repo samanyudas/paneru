@@ -14,6 +14,18 @@ jobs:
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@v4
+
+    - name: "Use the Command Line Tools toolchain"
+      run: sudo xcode-select -s /Library/Developer/CommandLineTools
+
+    - name: Select macOS SDK
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        sdkroot="$(xcrun --sdk macosx --show-sdk-path)"
+        echo "SDKROOT=$sdkroot" >> "$GITHUB_ENV"
+        echo "Using macOS SDK: $sdkroot"
+
     - run: rustup update
     - run: cargo build --release --verbose
     - uses: actions/upload-artifact@v4
