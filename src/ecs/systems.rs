@@ -25,6 +25,7 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
+use crate::ecs::drag::DragOverlayHandle;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
@@ -1184,8 +1185,9 @@ pub(super) fn verify_window_position(
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any
-/// brightness dim, removes the dim/border overlay window, and puts every tiled
-/// window where [`exit_frame`] says, so none is left parked off-screen.
+/// brightness dim, removes the drag overlay and the dim/border overlay window,
+/// and puts every tiled window where [`exit_frame`] says, so none is left
+/// parked off-screen.
 /// Floating, minimized, and hidden windows stay where they are.
 pub(crate) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
@@ -1193,8 +1195,15 @@ pub(crate) fn cleanup_on_exit(
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
+    mut drag_overlay: Option<NonSendMut<DragOverlayHandle>>,
 ) {
     for _ in exit_events.read() {
+        // First, because restoring windows below goes through slow
+        // accessibility calls, and a drag line or symbol must not stay on
+        // screen meanwhile.
+        if let Some(ref mut drag_overlay) = drag_overlay {
+            drag_overlay.0.remove();
+        }
         let ids = all_windows
             .iter()
             .map(|(w, _, _)| w.id())

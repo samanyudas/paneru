@@ -20,14 +20,17 @@ use std::ops::Range;
 use std::time::Duration;
 
 use bevy::app::{App, Plugin, PostUpdate, Update};
-use bevy::ecs::change_detection::DetectChangesMut as _;
+use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Has, With};
+use bevy::ecs::query::{Changed, Has, Or, With};
 use bevy::ecs::resource::Resource;
-use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::schedule::common_conditions::{not, on_message, resource_changed, resource_exists};
+use bevy::ecs::schedule::common_conditions::{
+    not, on_message, resource_changed, resource_exists, resource_exists_and_changed,
+};
+use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
 use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
@@ -42,7 +45,6 @@ use crate::ecs::{
 };
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Window, WindowManager, origin_from};
-use crate::overlay::DragOverlay;
 
 /// How far the pointer must move from the press before a drag can start.
 const DRAG_THRESHOLD: i32 = 4;
@@ -297,7 +299,7 @@ pub(crate) fn overlay_shape(state: &DragState, snapshot: &LayoutSnapshot) -> Opt
             if x.is_empty() {
                 return None;
             }
-            let y = line_across(y, display.viewport.min.y..display.viewport.max.y);
+            let y = line_across(y, display.viewport.min.y..display.viewport.max.y)?;
             Some(OverlayShape::Line(IRect::new(
                 x.start, y.start, x.end, y.end,
             )))
@@ -312,7 +314,7 @@ pub(crate) fn overlay_shape(state: &DragState, snapshot: &LayoutSnapshot) -> Opt
                 (Some(edge), None) | (None, Some(edge)) => edge,
                 (None, None) => return None,
             };
-            let x = line_across(x, display.viewport.min.x..display.viewport.max.x);
+            let x = line_across(x, display.viewport.min.x..display.viewport.max.x)?;
             let viewport = display.viewport;
             Some(OverlayShape::Line(IRect::new(
                 x.start,
@@ -333,10 +335,14 @@ pub(crate) fn overlay_shape(state: &DragState, snapshot: &LayoutSnapshot) -> Opt
 }
 
 /// The span of an insertion line centered on `at`, moved inside `within` so a
-/// line at a screen edge stays whole and on screen.
-fn line_across(at: i32, within: Range<i32>) -> Range<i32> {
+/// line at a screen edge stays whole and on screen. `None` when `within` is
+/// too short to hold a whole line.
+fn line_across(at: i32, within: Range<i32>) -> Option<Range<i32>> {
+    if within.end - within.start < INSERTION_LINE {
+        return None;
+    }
     let start = (at - INSERTION_LINE / 2).clamp(within.start, within.end - INSERTION_LINE);
-    start..start + INSERTION_LINE
+    Some(start..start + INSERTION_LINE)
 }
 
 /// The window a press landed on.
@@ -464,6 +470,23 @@ impl DragState {
         }
     }
 }
+
+/// Draws the drag feedback on screen. The app uses
+/// [`DragOverlay`](crate::overlay::DragOverlay), and tests record the calls.
+pub(crate) trait DragOverlayApi {
+    /// Shows an insertion line in `line`, in absolute screen points, drawn in
+    /// `color`.
+    fn show_line(&mut self, line: IRect, color: (f64, f64, f64));
+    /// Shows the refusal symbol in `square`, in absolute screen points.
+    fn show_refusal(&mut self, square: IRect);
+    fn hide(&mut self);
+    /// Closes every overlay window at once, so the next show builds them
+    /// again for the screens as they are then.
+    fn remove(&mut self);
+}
+
+/// The drag overlay the engine draws with, as a non-send resource.
+pub(crate) struct DragOverlayHandle(pub Box<dyn DragOverlayApi>);
 
 /// The shape the drag overlay shows now and its most recent line color.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Resource)]
@@ -725,18 +748,34 @@ impl Plugin for DragEventsPlugin {
                         .after(super::focus::fix_window_size_on_focus)
                         .run_if(on_message::<Event>),
                     drag_watchdog.after(drag_events).run_if(in_progress),
-                    drag_feedback
-                        .after(drag_watchdog)
-                        .run_if(resource_changed::<DragState>),
                 )
                     .in_set(super::UpdateSet::Focus)
                     .run_if(not(resource_exists::<Initializing>)),
             )
             .add_systems(
+                Update,
+                // After the layout, so the shape is drawn from where the
+                // layout put the windows this frame. A display or layout
+                // change can move the shape with the pointer still.
+                (
+                    drag_feedback.run_if(
+                        resource_changed::<DragState>
+                            .or_eager(displays_changed)
+                            .or_eager(layout_changed),
+                    ),
+                    // An appearance switch or a config reload recolors a
+                    // line even with the pointer still.
+                    drag_line_color.after(drag_feedback).run_if(
+                        resource_exists_and_changed::<super::SystemTheme>
+                            .or_eager(resource_changed::<Config>),
+                    ),
+                )
+                    .in_set(super::UpdateSet::Housekeeping)
+                    .run_if(not(resource_exists::<Initializing>)),
+            )
+            .add_systems(
                 PostUpdate,
-                show_drag_feedback
-                    .in_set(super::PostUpdateSet::Ui)
-                    .run_if(resource_changed::<DragFeedback>),
+                show_drag_feedback.in_set(super::PostUpdateSet::Ui),
             );
     }
 }
@@ -819,9 +858,11 @@ pub(super) fn drag_events(
                     stack_limit(snapshot, id, &config)
                 })
             };
-            step(std::mem::take(&mut *state), input, now, &hit)
+            step(state.clone(), input, now, &hit)
         };
-        *state = next;
+        // Written only when it differs, so a drag held still does not
+        // count as a change and rebuild the feedback.
+        state.set_if_neq(next);
 
         for DragEffect::Drop { window, target } in effects {
             debug!("dropping {window} at {target:?}");
@@ -1010,8 +1051,8 @@ fn drag_watchdog(
     };
     // Neither input asks where the pointer is.
     let home = |_, _| DropTarget::Home;
-    let (next, effects) = step(std::mem::take(&mut *state), input, time.elapsed(), &home);
-    *state = next;
+    let (next, effects) = step(state.clone(), input, time.elapsed(), &home);
+    state.set_if_neq(next);
     for DragEffect::Drop { window, target } in effects {
         let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
         apply_drop(
@@ -1023,6 +1064,29 @@ fn drag_watchdog(
             &mut commands,
         );
     }
+}
+
+/// Whether any display was added or changed since the last check.
+fn displays_changed(displays: Query<(), Changed<Display>>) -> bool {
+    !displays.is_empty()
+}
+
+type MovedStrips<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    (
+        With<LayoutStrip>,
+        Or<(Changed<LayoutStrip>, Changed<Position>)>,
+    ),
+>;
+type MovedWindows<'w, 's> =
+    Query<'w, 's, (), (With<Window>, Or<(Changed<LayoutPosition>, Changed<Bounds>)>)>;
+
+/// Whether the layout moved a strip or any window's slot or size since the
+/// last check.
+fn layout_changed(strips: MovedStrips, windows: MovedWindows) -> bool {
+    !strips.is_empty() || !windows.is_empty()
 }
 
 /// Keeps [`DragFeedback`] on what the overlay should show for the drag
@@ -1063,11 +1127,58 @@ fn drag_feedback(
     feedback.set_if_neq(DragFeedback { shape, line_color });
 }
 
-/// Draws [`DragFeedback`]. The line takes the focus border's color.
-fn show_drag_feedback(feedback: Res<DragFeedback>, overlay: Option<NonSendMut<DragOverlay>>) {
+/// Samples the line color again for a line already shown, without
+/// rebuilding the layout snapshot.
+fn drag_line_color(
+    mut feedback: ResMut<DragFeedback>,
+    config: Res<Config>,
+    theme: Option<Res<super::SystemTheme>>,
+) {
+    if !matches!(feedback.shape, Some(OverlayShape::Line(_))) {
+        return;
+    }
+    let line_color = config.border_color(theme.is_some_and(|theme| theme.is_dark));
+    let shape = feedback.shape;
+    feedback.set_if_neq(DragFeedback { shape, line_color });
+}
+
+/// Draws [`DragFeedback`] when it changes. The line takes the focus border's
+/// color.
+///
+/// A display change closes the overlay windows and draws again, even when
+/// the shape is the same. The windows and the conversion from screen points
+/// both follow the screens, and a resolution change can leave a shape's
+/// screen points as they were.
+fn show_drag_feedback(
+    feedback: Res<DragFeedback>,
+    mut messages: MessageReader<Event>,
+    changed_displays: Query<(), Changed<Display>>,
+    mut removed_displays: RemovedComponents<Display>,
+    overlay: Option<NonSendMut<DragOverlayHandle>>,
+) {
+    let display_event = messages.read().fold(false, |seen, event| {
+        seen | matches!(
+            event,
+            Event::DisplayAdded { .. }
+                | Event::DisplayRemoved { .. }
+                | Event::DisplayMoved { .. }
+                | Event::DisplayResized { .. }
+                | Event::DisplayConfigured { .. }
+                | Event::DisplayChanged
+        )
+    });
+    let screens_changed =
+        display_event | !changed_displays.is_empty() | (removed_displays.read().count() > 0);
+    if !screens_changed && !feedback.is_changed() {
+        return;
+    }
     let Some(mut overlay) = overlay else {
         return;
     };
+    let overlay = &mut overlay.0;
+    if screens_changed {
+        overlay.remove();
+    }
     match feedback.shape {
         Some(OverlayShape::Line(line)) => overlay.show_line(line, feedback.line_color),
         Some(OverlayShape::Refusal(square)) => overlay.show_refusal(square),

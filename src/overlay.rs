@@ -11,6 +11,8 @@ use objc2_app_kit::{
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGFloat;
+
+use crate::ecs::drag::DragOverlayApi;
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableCopying, NSPoint, NSRect, NSSize, NSString,
 };
@@ -448,19 +450,6 @@ impl DragOverlay {
         }
     }
 
-    /// Shows an insertion line in `line` (absolute CG coordinates) drawn
-    /// in `color`.
-    pub fn show_line(&mut self, line: IRect, color: (f64, f64, f64)) {
-        self.show(line, |rect| DragMark::Line { rect, color });
-        self.refusing = false;
-    }
-
-    /// Shows the refusal symbol in `square` (absolute CG coordinates).
-    pub fn show_refusal(&mut self, square: IRect) {
-        self.show(square, DragMark::Refusal);
-        self.refusing = true;
-    }
-
     fn show(&mut self, shape: IRect, mark: impl Fn(NSRect) -> DragMark) {
         let screens = NSScreen::screens(self.mtm);
         if self.overlays.len() != screens.len() {
@@ -507,10 +496,22 @@ impl DragOverlay {
             window.orderFront(None::<&AnyObject>);
         }
     }
+}
 
-    /// Hides the overlay. The refusal symbol fades out while the window
-    /// returns; a line goes at once.
-    pub fn hide(&mut self) {
+impl DragOverlayApi for DragOverlay {
+    fn show_line(&mut self, line: IRect, color: (f64, f64, f64)) {
+        self.show(line, |rect| DragMark::Line { rect, color });
+        self.refusing = false;
+    }
+
+    fn show_refusal(&mut self, square: IRect) {
+        self.show(square, DragMark::Refusal);
+        self.refusing = true;
+    }
+
+    /// The refusal symbol fades out while the window returns; a line goes
+    /// at once.
+    fn hide(&mut self) {
         for (window, view) in &self.overlays {
             if self.refusing && window.isVisible() {
                 fade(window, REFUSAL_FADE, 0.0);
@@ -518,6 +519,13 @@ impl DragOverlay {
                 view.ivars().mark.set(None);
                 window.orderOut(None::<&AnyObject>);
             }
+        }
+        self.refusing = false;
+    }
+
+    fn remove(&mut self) {
+        for (window, _) in self.overlays.drain(..) {
+            window.orderOut(None::<&AnyObject>);
         }
         self.refusing = false;
     }
