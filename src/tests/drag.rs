@@ -1977,3 +1977,111 @@ fn a_still_drag_line_takes_the_new_color_when_the_appearance_changes() {
 
     assert_eq!(log.borrow().last(), Some(&OverlayCall::Line(line, GREEN)));
 }
+
+/// The stack `[0, 1] | [2]` with window 2 held still just above the boundary
+/// between windows 0 and 1, so a drop lands between them.
+fn still_drag_over_a_stack_boundary() -> TestHarness {
+    let mut harness = three_columns();
+    harness.run(vec![
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    harness.advance(SETTLE);
+    assert_eq!(layout(harness.world()), vec![vec![0, 1], vec![2]]);
+    let top = frame(harness.world(), 1).min.y;
+    let between = middle_of(harness.world(), 0, top - 14);
+    press_and_drag(&mut harness, 2, between);
+    harness
+}
+
+/// The insertion line at the top of window 1, across its column.
+fn line_above_window_1(world: &mut World) -> Option<OverlayShape> {
+    let column = frame(world, 0);
+    let y = frame(world, 1).min.y;
+    Some(OverlayShape::Line(IRect::new(
+        column.min.x,
+        y - 1,
+        column.max.x,
+        y + 2,
+    )))
+}
+
+#[test]
+fn a_still_drag_line_follows_its_stack_boundary_on_the_first_frame_of_a_display_resize() {
+    let mut harness = still_drag_over_a_stack_boundary();
+    assert_eq!(
+        feedback(harness.world()),
+        line_above_window_1(harness.world())
+    );
+    let top = frame(harness.world(), 1).min.y;
+    let display_bottom = |world: &mut World| {
+        world
+            .query::<&crate::manager::Display>()
+            .single(world)
+            .expect("one display")
+            .bounds()
+            .max
+            .y
+    };
+    let before = display_bottom(harness.world());
+
+    // Short enough that the layout must move the boundary up.
+    harness
+        .mock_state
+        .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, 500));
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: TEST_DISPLAY_ID,
+    });
+    // Stops on the frame the engine reconciles the display. A later frame
+    // changes the display again, which would redraw stale feedback anyway.
+    let mut frames = 0;
+    while display_bottom(harness.world()) == before {
+        harness.advance(FRAME);
+        frames += 1;
+        assert!(frames < 100, "the display never reconciled");
+    }
+
+    assert!(matches!(
+        drag_state(harness.world()),
+        DragState::Dragging(_)
+    ));
+    assert_ne!(frame(harness.world(), 1).min.y, top, "the boundary moved");
+    assert_eq!(
+        feedback(harness.world()),
+        line_above_window_1(harness.world())
+    );
+}
+
+#[test]
+fn a_still_drag_line_takes_the_new_color_when_the_config_reloads() {
+    const RED: (f64, f64, f64) = (1.0, 0.0, 0.0);
+    const BLUE: (f64, f64, f64) = (0.0, 0.0, 1.0);
+    let mut harness = harness_with(
+        "[decorations.active.border]\ncolor = '#FF0000'\n",
+        TEST_DISPLAY_HEIGHT,
+        3,
+    );
+    let log = record_overlay(&mut harness);
+    let above_the_top = middle_of(harness.world(), 0, 30);
+    press_and_drag(&mut harness, 2, above_the_top);
+    let Some(OverlayShape::Line(line)) = feedback(harness.world()) else {
+        panic!("{:?}", feedback(harness.world()));
+    };
+    assert_eq!(log.borrow().last(), Some(&OverlayCall::Line(line, RED)));
+
+    // The user saves a new border color while the pointer stays still. The
+    // engine reloads it the way `refresh_configuration_trigger` does.
+    let path = std::env::temp_dir().join(format!("paneru-drag-reload-{}.toml", std::process::id()));
+    std::fs::write(&path, "[decorations.active.border]\ncolor = '#0000FF'\n")
+        .expect("writing the new config");
+    let reloaded = harness
+        .world()
+        .resource_mut::<crate::config::Config>()
+        .reload_config(&path);
+    std::fs::remove_file(&path).expect("removing the new config");
+    reloaded.expect("reloading the config");
+    harness.advance(FRAME);
+
+    assert_eq!(log.borrow().last(), Some(&OverlayCall::Line(line, BLUE)));
+}
