@@ -2874,12 +2874,22 @@ fn removed_display_fixture(
         )
         .with_windows(2)
         .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {});
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let commands = vec![Event::MenuOpened { window_id: 0 }];
+    harness = harness.on_iteration(0, |world, _state| {
+        assert_focused!(world, 0);
+    });
+    harness.run(commands);
     if destination_virtual_index == 1 {
-        harness.run(vec![window_command(Operation::VirtualMoveNumber(
+        let commands = vec![window_command(Operation::VirtualMoveNumber(
             1,
             MoveFocus::Follow,
-        ))]);
+        ))];
+        harness = harness.on_iteration(0, |world, _state| {
+            assert_focused!(world, 0);
+            let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+            assert_eq!(strips.single(world).unwrap().virtual_index, 1);
+        });
+        harness.run(commands);
     }
     let destination_selected = harness
         .world()
@@ -2902,8 +2912,11 @@ fn removed_display_fixture(
     if removed_display_focused {
         harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
         harness.mock_state.focus_window(100);
-        harness.advance(Duration::from_millis(500));
-        assert_focused!(harness.world(), 100);
+        let commands = vec![Event::WindowFocused { window_id: 100 }];
+        harness = harness.on_iteration(0, |world, _state| {
+            assert_focused!(world, 100);
+        });
+        harness.run(commands);
     }
 
     harness.mock_state.remove_display(EXT_DISPLAY_ID);
@@ -3011,41 +3024,36 @@ fn assert_removed_display_follows_focus(
             harness.mock_state.create_window(100).frame().min,
             destination_origin
         );
-        harness.run(vec![window_command(Operation::VirtualNumber(
+        let commands = vec![window_command(Operation::VirtualNumber(
             destination_virtual_index,
-        ))]);
-        let world = harness.world();
-        let focused = world
-            .query_filtered::<Entity, With<FocusedMarker>>()
-            .single(world)
-            .unwrap();
-        assert!(
-            world
-                .get::<LayoutStrip>(destination_selected)
-                .unwrap()
-                .contains(focused),
-            "switching back must focus a window in the destination's restored row"
-        );
-        assert_eq!(
-            harness.mock_state.create_window(0).frame(),
-            destination_frame
-        );
-        assert_eq!(
-            harness.mock_state.create_window(100).frame().min,
-            parked_origin
-        );
-        let world = harness.world();
-        assert!(
-            world
-                .get::<SelectedVirtualMarker>(destination_selected)
-                .is_some()
-        );
-        assert!(
-            world
-                .get::<ActiveWorkspaceMarker>(destination_selected)
-                .is_some()
-        );
-        assert!(world.get::<PreviousStripPosition>(migrated_strip).is_some());
+        ))];
+        harness = harness.on_iteration(0, move |world, state| {
+            let focused = world
+                .query_filtered::<Entity, With<FocusedMarker>>()
+                .single(world)
+                .unwrap();
+            assert!(
+                world
+                    .get::<LayoutStrip>(destination_selected)
+                    .unwrap()
+                    .contains(focused),
+                "switching back must focus a window in the destination's restored row"
+            );
+            assert_eq!(state.create_window(0).frame(), destination_frame);
+            assert_eq!(state.create_window(100).frame().min, parked_origin);
+            assert!(
+                world
+                    .get::<SelectedVirtualMarker>(destination_selected)
+                    .is_some()
+            );
+            assert!(
+                world
+                    .get::<ActiveWorkspaceMarker>(destination_selected)
+                    .is_some()
+            );
+            assert!(world.get::<PreviousStripPosition>(migrated_strip).is_some());
+        });
+        harness.run(commands);
     } else {
         assert_eq!(previous.focus, Some(migrated_window));
         assert_eq!(
