@@ -648,8 +648,7 @@ impl MockState {
         });
     }
 
-    /// Sets whether the window server sees the left mouse button down. Only
-    /// the button state changes: no mouse event is sent.
+    /// Makes the next `failures` native membership reads of `space` fail.
     pub fn fail_membership_reads(&self, space: WorkspaceId, failures: u16) {
         self.inner
             .force_write()
@@ -657,6 +656,7 @@ impl MockState {
             .insert(space, failures);
     }
 
+    /// How many native membership reads of `space` the engine made.
     pub fn membership_reads(&self, space: WorkspaceId) -> usize {
         self.inner
             .force_read()
@@ -666,6 +666,8 @@ impl MockState {
             .unwrap_or(0)
     }
 
+    /// Sets whether the window server sees the left mouse button down. Only
+    /// the button state changes: no mouse event is sent.
     pub fn set_left_button_down(&self, down: bool) {
         self.inner.force_write().left_button_down = down;
     }
