@@ -885,6 +885,39 @@ fn a_new_column_shows_a_line_down_the_full_height_of_its_gap() {
 }
 
 #[test]
+fn a_new_column_on_an_empty_display_shows_a_full_line_inside_its_viewport() {
+    let e = entities(5);
+    let mut snap = four_columns(&e);
+    snap.managed_strip_displays.push(DisplaySnap {
+        id: DISPLAY + 1,
+        bounds: IRect::new(182, 1486, 2230, 2772),
+        viewport: IRect::new(182, 1486, 2230, 2772),
+        columns: vec![],
+    });
+    let pointer = IVec2::new(1206, 1560);
+    let target = hit_test(&snap, e[4], pointer, |_| 5);
+    assert_eq!(
+        target,
+        DropTarget::NewColumn {
+            display: DISPLAY + 1,
+            index: 0,
+        }
+    );
+
+    assert_eq!(
+        overlay_shape(&dragging_to(e[4], pointer, target), &snap),
+        Some(line(182..185, 1486..2772))
+    );
+}
+
+#[test]
+fn a_new_column_without_neighbors_on_a_nonempty_display_shows_nothing() {
+    let e = entities(5);
+
+    assert_eq!(shape(&e, 4, new_column(5)), None);
+}
+
+#[test]
 fn a_new_column_in_a_padded_gap_shows_its_line_in_the_middle() {
     let e = entities(3);
     let snap = snapshot(vec![
