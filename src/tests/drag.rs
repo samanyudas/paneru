@@ -951,6 +951,24 @@ fn the_overlay_hides_unless_a_drag_would_move_the_window() {
 }
 
 #[test]
+fn a_viewport_too_small_for_a_line_shows_nothing() {
+    let e = entities(3);
+    for span in 0..3 {
+        let mut snap = snapshot(vec![
+            column(0, 0..400, vec![band(&[e[0]], 20..20 + span)]),
+            column(1, 400..800, vec![band(&[e[1]], 20..20 + span)]),
+        ]);
+        snap.displays[0].viewport = IRect::new(0, 20, 1024, 20 + span);
+        let into_column = dragging_to(e[2], IVec2::new(600, 20), into(1, 0));
+        assert_eq!(overlay_shape(&into_column, &snap), None, "{span} pt high");
+
+        snap.displays[0].viewport = IRect::new(400, 20, 400 + span, 768);
+        let new_column = dragging_to(e[2], IVec2::new(400, 300), new_column(1));
+        assert_eq!(overlay_shape(&new_column, &snap), None, "{span} pt wide");
+    }
+}
+
+#[test]
 fn a_target_on_a_display_the_snapshot_lacks_shows_nothing() {
     let e = entities(5);
     let elsewhere = DropTarget::NewColumn {

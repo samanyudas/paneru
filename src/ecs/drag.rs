@@ -297,7 +297,7 @@ pub(crate) fn overlay_shape(state: &DragState, snapshot: &LayoutSnapshot) -> Opt
             if x.is_empty() {
                 return None;
             }
-            let y = line_across(y, display.viewport.min.y..display.viewport.max.y);
+            let y = line_across(y, display.viewport.min.y..display.viewport.max.y)?;
             Some(OverlayShape::Line(IRect::new(
                 x.start, y.start, x.end, y.end,
             )))
@@ -312,7 +312,7 @@ pub(crate) fn overlay_shape(state: &DragState, snapshot: &LayoutSnapshot) -> Opt
                 (Some(edge), None) | (None, Some(edge)) => edge,
                 (None, None) => return None,
             };
-            let x = line_across(x, display.viewport.min.x..display.viewport.max.x);
+            let x = line_across(x, display.viewport.min.x..display.viewport.max.x)?;
             let viewport = display.viewport;
             Some(OverlayShape::Line(IRect::new(
                 x.start,
@@ -333,10 +333,14 @@ pub(crate) fn overlay_shape(state: &DragState, snapshot: &LayoutSnapshot) -> Opt
 }
 
 /// The span of an insertion line centered on `at`, moved inside `within` so a
-/// line at a screen edge stays whole and on screen.
-fn line_across(at: i32, within: Range<i32>) -> Range<i32> {
+/// line at a screen edge stays whole and on screen. `None` when `within` is
+/// too short to hold a whole line.
+fn line_across(at: i32, within: Range<i32>) -> Option<Range<i32>> {
+    if within.end - within.start < INSERTION_LINE {
+        return None;
+    }
     let start = (at - INSERTION_LINE / 2).clamp(within.start, within.end - INSERTION_LINE);
-    start..start + INSERTION_LINE
+    Some(start..start + INSERTION_LINE)
 }
 
 /// The window a press landed on.
