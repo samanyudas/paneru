@@ -33,7 +33,6 @@ pub(crate) enum NativeScope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlacementDestination {
     Strip(Entity),
-    // Append is allowed before the destination display has any strip.
     EmptyDisplay(Entity),
 }
 
@@ -116,6 +115,11 @@ impl QueryRetry {
     }
 }
 
+struct HeldDragGroup {
+    window: Entity,
+    members: Vec<Entity>,
+}
+
 #[derive(Default, Resource)]
 pub(crate) struct NativeMembership {
     dirty: HashMap<WorkspaceId, DirtySpace>,
@@ -125,8 +129,7 @@ pub(crate) struct NativeMembership {
     interactions: EntityHashMap<u64>,
     next_interaction: u64,
     committed_pass: u64,
-    // This source snapshot survives group edits until the gesture releases it.
-    held: Option<(Entity, Entity, Vec<Entity>)>,
+    held: Option<HeldDragGroup>,
     ignored_windows: HashSet<WinID>,
 }
 
@@ -191,7 +194,7 @@ impl NativeMembership {
     fn owned(&self, member: Entity) -> bool {
         self.held
             .as_ref()
-            .is_some_and(|(_, _, members)| members.contains(&member))
+            .is_some_and(|held| held.members.contains(&member))
             || self
                 .pending
                 .iter()
@@ -270,7 +273,7 @@ fn membership_work(native: Res<NativeMembership>, drag: Res<DragState>, time: Re
                 .dirty
                 .values()
                 .any(|dirty| dirty.retry.due(time.elapsed()))
-        || native.held.as_ref().map(|(member, _, _)| *member)
+        || native.held.as_ref().map(|held| held.window)
             != drag.holds_window().then(|| drag.window()).flatten()
 }
 
@@ -398,19 +401,16 @@ fn reconcile(world: &mut World) {
     world.resource_scope(|world, mut native: Mut<NativeMembership>| {
         let held = world.resource::<DragState>();
         let held = held.holds_window().then(|| held.window()).flatten();
-        if native.held.as_ref().map(|(member, _, _)| *member) != held {
+        if native.held.as_ref().map(|held| held.window) != held {
             native.all_spaces.get_or_insert(ScanKind::Activation);
             native.held = held.and_then(|member| {
                 world
-                    .query::<(Entity, &LayoutStrip)>()
+                    .query::<&LayoutStrip>()
                     .iter(world)
-                    .find(|(_, strip)| strip.contains(member))
-                    .map(|(strip_entity, strip)| {
-                        (
-                            member,
-                            strip_entity,
-                            strip.tab_group(member).unwrap_or_else(|| vec![member]),
-                        )
+                    .find(|strip| strip.contains(member))
+                    .map(|strip| HeldDragGroup {
+                        window: member,
+                        members: strip.tab_group(member).unwrap_or_else(|| vec![member]),
                     })
             });
         }
@@ -774,8 +774,6 @@ fn reconcile_space(
             .collect();
         actual.len() == expected.len() && actual.iter().all(|member| expected.contains(member))
     });
-    // Admission and extraction share this exclusive operation. Neither queued
-    // commands nor native-tab expansion can add an owned member after admission.
     if !admitted.is_empty() {
         apply_native_move(world, space, display, &admitted, topology);
     }
@@ -811,8 +809,6 @@ fn apply_native_move(
             });
     if batch {
         apply_batch(world, space, display, &admitted);
-        // An Append can reach an empty display before its strip exists.
-        // Its remembered native group still needs admission as one item.
         for members in groups {
             if !world
                 .query::<&LayoutStrip>()

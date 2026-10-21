@@ -1417,7 +1417,6 @@ fn append_to_a_display_without_a_strip_finishes_its_pending_placement() {
             space_id: EXT_WORKSPACE_ID,
         });
         harness.advance(FRAME * 3);
-        // Strip discovery does not itself make the old source observation current.
         harness.mock_state.os_activate_display(TEST_DISPLAY_ID);
         harness.advance(FRAME * 3);
         assert!(
