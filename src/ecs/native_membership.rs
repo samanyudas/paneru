@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::prelude::*;
+use objc2_core_foundation::CFRetained;
 use tracing::{debug, warn};
 
 use super::display::migrate_windows_to_space;
@@ -30,8 +31,13 @@ use super::{
 use crate::config::Config;
 use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{WinID, WorkspaceId};
+use crate::util::AXUIWrapper;
 
 const QUERY_ATTEMPTS: u8 = 4;
+/// How long a window ID stays ignored after it closed or could not be
+/// resolved. After that, a native list that still reports it is checked
+/// again.
+const IGNORE_FOR: Duration = Duration::from_secs(30);
 
 pub(crate) enum NativeScope {
     ActivatedSpace(WorkspaceId),
@@ -110,6 +116,14 @@ struct Placing {
     targets: Vec<(Entity, IRect)>,
 }
 
+struct IgnoredWindow {
+    /// The AX element a closed window had. Native and AX lists can replay it
+    /// for a moment after the close, and only a different element is a live
+    /// window again. `None` for a window no app could resolve.
+    closed: Option<CFRetained<AXUIWrapper>>,
+    until: Duration,
+}
+
 #[derive(Default, Resource)]
 pub(crate) struct NativeMembership {
     dirty: HashMap<WorkspaceId, DirtySpace>,
@@ -119,7 +133,7 @@ pub(crate) struct NativeMembership {
     /// Groups a placement left in no strip, because the destination display
     /// showed none. A later native report adds each as one item.
     stripless: Vec<Vec<Entity>>,
-    ignored_windows: HashSet<WinID>,
+    ignored: HashMap<WinID, IgnoredWindow>,
 }
 
 impl NativeMembership {
@@ -223,12 +237,17 @@ pub(super) fn register(app: &mut App) {
 fn forget_removed_window(
     removed: On<Remove, Window>,
     windows: Query<&Window>,
+    time: Res<Time>,
     mut native: ResMut<NativeMembership>,
 ) {
     if let Ok(window) = windows.get(removed.entity) {
-        // Native and AX window lists can retain an authoritatively closed ID.
-        // Membership replay must wait for the window lifecycle to recreate it.
-        native.ignored_windows.insert(window.id());
+        native.ignored.insert(
+            window.id(),
+            IgnoredWindow {
+                closed: window.element(),
+                until: time.elapsed() + IGNORE_FOR,
+            },
+        );
     }
 }
 
@@ -238,7 +257,7 @@ fn accept_created_window(
     mut native: ResMut<NativeMembership>,
 ) {
     if let Ok(window) = windows.get(created.entity) {
-        native.ignored_windows.remove(&window.id());
+        native.ignored.remove(&window.id());
     }
 }
 
@@ -331,6 +350,7 @@ fn reconcile(world: &mut World) {
             return;
         }
         let now = world.resource::<Time>().elapsed();
+        native.ignored.retain(|_, ignored| ignored.until > now);
         for (space, display) in spaces {
             let Some(mut dirty) = native.dirty.remove(&space) else {
                 continue;
@@ -344,7 +364,7 @@ fn reconcile(world: &mut World) {
                 .windows_in_workspace(space)
             {
                 Ok(ids) => {
-                    let unresolved = discover_unresolved(world, &ids, &mut native.ignored_windows);
+                    let unresolved = discover_unresolved(world, &ids, &mut native.ignored, now);
                     let held = reconcile_space(
                         world,
                         &native,
@@ -374,7 +394,12 @@ fn reconcile(world: &mut World) {
 /// Asks the apps for the listed windows the engine does not know, and spawns
 /// the ones they resolve. Returns whether any spawned, so the space is read
 /// again once they exist.
-fn discover_unresolved(world: &mut World, ids: &[WinID], ignored: &mut HashSet<WinID>) -> bool {
+fn discover_unresolved(
+    world: &mut World,
+    ids: &[WinID],
+    ignored: &mut HashMap<WinID, IgnoredWindow>,
+    now: Duration,
+) -> bool {
     let known: HashSet<_> = world
         .query::<&Window>()
         .iter(world)
@@ -383,25 +408,51 @@ fn discover_unresolved(world: &mut World, ids: &[WinID], ignored: &mut HashSet<W
     let unresolved: HashSet<_> = ids
         .iter()
         .copied()
-        .filter(|id| !known.contains(id) && !ignored.contains(id))
+        .filter(|id| {
+            !known.contains(id)
+                && ignored
+                    .get(id)
+                    .is_none_or(|ignored| ignored.closed.is_some())
+        })
         .collect();
     if unresolved.is_empty() {
         return false;
     }
     let config = world.resource::<Config>().clone();
-    let retry: Vec<_> = world
+    let listed: Vec<_> = world
         .query::<&Application>()
         .iter(world)
         .flat_map(|app| app.window_list(&config))
         .filter(|window| unresolved.contains(&window.id()))
         .collect();
-    if retry.is_empty() {
-        ignored.extend(unresolved);
-        false
-    } else {
-        world.trigger(SpawnWindowTrigger(retry));
-        true
+    for id in &unresolved {
+        if !listed.iter().any(|window| window.id() == *id) {
+            ignored.insert(
+                *id,
+                IgnoredWindow {
+                    closed: None,
+                    until: now + IGNORE_FOR,
+                },
+            );
+        }
     }
+    let fresh: Vec<_> = listed
+        .into_iter()
+        .filter(|window| {
+            ignored
+                .get(&window.id())
+                .and_then(|ignored| ignored.closed.as_ref())
+                .is_none_or(|closed| !window.is_current_element(closed))
+        })
+        .collect();
+    if fresh.is_empty() {
+        return false;
+    }
+    for window in &fresh {
+        ignored.remove(&window.id());
+    }
+    world.trigger(SpawnWindowTrigger(fresh));
+    true
 }
 
 fn stripless(world: &mut World, member: Entity) -> bool {

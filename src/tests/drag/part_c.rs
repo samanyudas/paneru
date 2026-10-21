@@ -1569,3 +1569,54 @@ fn layout_changes_after_a_returned_drop_read_no_native_membership() {
     }
     assert_eq!(membership_reads(&harness), reads);
 }
+
+fn has_window(harness: &mut TestHarness, id: WinID) -> bool {
+    harness
+        .world()
+        .query::<&Window>()
+        .iter(harness.world())
+        .any(|window| window.id() == id)
+}
+
+#[test]
+fn a_window_closed_while_its_handle_was_late_returns_once_the_app_lists_it() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    harness
+        .mock_state
+        .os_transfer_window_late(2, TEST_WORKSPACE_ID);
+    harness.advance(SETTLE);
+    assert!(
+        !has_window(&mut harness, 2),
+        "the handle recovery gave up and closed the window"
+    );
+    harness.mock_state.os_list_window(2);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.advance(SETTLE);
+    assert!(has_window(&mut harness, 2));
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+}
+
+#[test]
+fn an_ignored_native_window_is_checked_again_after_a_while() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        7,
+        IRect::new(100, 20, 500, 768),
+    );
+    harness
+        .mock_state
+        .update_window(7, |window| window.ax_unlisted = true);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.advance(SETTLE);
+    assert!(!has_window(&mut harness, 7));
+    harness.mock_state.os_list_window(7);
+    harness.advance(ms(60_000));
+    harness.world().write_message(Event::SpaceChanged);
+    harness.advance(SETTLE);
+    assert!(has_window(&mut harness, 7));
+}
