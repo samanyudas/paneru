@@ -16,6 +16,7 @@ use objc2_core_graphics::{
     CGEventSourceStateID, CGGetActiveDisplayList, CGMouseButton, CGWarpMouseCursorPosition,
     CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowNumber,
 };
+use objc2_foundation::NSBundle;
 use std::path::Path;
 use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
@@ -945,20 +946,31 @@ pub fn request_ax_privilege() -> bool {
     }
 }
 
-/// Resets the TCC Accessibility entry for Paneru (`com.github.karinushka.paneru`).
+fn accessibility_reset_command(bundle_id: Option<&str>) -> Option<std::process::Command> {
+    let bundle_id = bundle_id.filter(|bundle_id| !bundle_id.is_empty())?;
+    let mut command = std::process::Command::new("/usr/bin/tccutil");
+    command.args(["reset", "Accessibility", bundle_id]);
+    Some(command)
+}
+
+/// Resets the TCC Accessibility entry for the running application's bundle identity.
 ///
 /// Rebuilding the binary or switching between Homebrew and Cargo changes the
 /// ad-hoc code-signing hash (`cdhash`), leaving a stale TCC entry that
 /// prevents macOS from honoring the existing toggle or re-displaying the
 /// system prompt until the entry is cleared.
 pub fn reset_ax_privilege() -> bool {
-    match std::process::Command::new("/usr/bin/tccutil")
-        .args(["reset", "Accessibility", crate::platform::service::ID])
-        .output()
-    {
+    let bundle_id = NSBundle::mainBundle()
+        .bundleIdentifier()
+        .map(|bundle_id| bundle_id.to_string());
+    let Some(mut command) = accessibility_reset_command(bundle_id.as_deref()) else {
+        warn!("unable to reset Accessibility entry without a bundle identity");
+        return false;
+    };
+    match command.output() {
         Ok(output) if output.status.success() => {
             info!(
-                bundle_id = crate::platform::service::ID,
+                bundle_id = bundle_id.as_deref(),
                 "reset TCC Accessibility entry"
             );
             true
@@ -1014,8 +1026,45 @@ impl notify::EventHandler for ConfigHandler {
 #[cfg(test)]
 mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+    use objc2_foundation::NSBundle;
 
-    use super::irect_from;
+    use super::{accessibility_reset_command, irect_from};
+
+    #[test]
+    fn accessibility_reset_targets_embedded_bundle_identity() {
+        let bundle_id = NSBundle::mainBundle()
+            .bundleIdentifier()
+            .expect("the engine test binary embeds its bundle identity")
+            .to_string();
+        #[cfg(not(feature = "miri-developer"))]
+        let embedded_plist = include_str!("../assets/Info.plist");
+        #[cfg(feature = "miri-developer")]
+        let embedded_plist = include_str!("../assets/Info.developer.plist");
+        assert!(embedded_plist.contains(&format!("<string>{bundle_id}</string>")));
+
+        #[cfg(not(feature = "miri-developer"))]
+        assert_eq!(bundle_id, "io.github.samanyudas.miri.engine");
+        #[cfg(feature = "miri-developer")]
+        assert_eq!(bundle_id, "io.github.samanyudas.miri.dev.engine");
+
+        let command = accessibility_reset_command(Some(&bundle_id))
+            .expect("the runtime bundle identity permits a scoped reset");
+        assert_eq!(command.get_program(), "/usr/bin/tccutil");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["reset", "Accessibility", bundle_id.as_str()]
+        );
+    }
+
+    #[test]
+    fn accessibility_reset_rejects_missing_bundle_identity() {
+        assert!(accessibility_reset_command(None).is_none());
+    }
+
+    #[test]
+    fn accessibility_reset_rejects_empty_bundle_identity() {
+        assert!(accessibility_reset_command(Some("")).is_none());
+    }
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(width, height))
