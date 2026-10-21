@@ -1996,23 +1996,19 @@ fn still_drag_over_a_stack_boundary() -> TestHarness {
 }
 
 /// The insertion line at the top of window 1, across its column.
-fn line_above_window_1(world: &mut World) -> Option<OverlayShape> {
+fn line_above_window_1(world: &mut World) -> IRect {
     let column = frame(world, 0);
     let y = frame(world, 1).min.y;
-    Some(OverlayShape::Line(IRect::new(
-        column.min.x,
-        y - 1,
-        column.max.x,
-        y + 2,
-    )))
+    IRect::new(column.min.x, y - 1, column.max.x, y + 2)
 }
 
 #[test]
 fn a_still_drag_line_follows_its_stack_boundary_on_the_first_frame_of_a_display_resize() {
     let mut harness = still_drag_over_a_stack_boundary();
+    let log = record_overlay(&mut harness);
     assert_eq!(
         feedback(harness.world()),
-        line_above_window_1(harness.world())
+        Some(OverlayShape::Line(line_above_window_1(harness.world())))
     );
     let top = frame(harness.world(), 1).min.y;
     let display_bottom = |world: &mut World| {
@@ -2047,10 +2043,9 @@ fn a_still_drag_line_follows_its_stack_boundary_on_the_first_frame_of_a_display_
         DragState::Dragging(_)
     ));
     assert_ne!(frame(harness.world(), 1).min.y, top, "the boundary moved");
-    assert_eq!(
-        feedback(harness.world()),
-        line_above_window_1(harness.world())
-    );
+    let line = line_above_window_1(harness.world());
+    assert_eq!(feedback(harness.world()), Some(OverlayShape::Line(line)));
+    assert_eq!(log.borrow().last(), Some(&OverlayCall::Line(line, WHITE)));
 }
 
 #[test]
