@@ -1683,3 +1683,48 @@ fn a_stale_report_for_the_display_a_parked_column_overhangs_changes_nothing() {
         vec![vec![100]]
     );
 }
+
+#[test]
+fn a_returned_window_parked_past_the_outer_edge_ignores_a_stale_report() {
+    let config = crate::config::Config::try_from("[options]\nstack_limit = 1\n").unwrap();
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
+        .with_windows(5)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+            window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
+        });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(SETTLE);
+    let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
+    assert_eq!(source.len(), 5);
+
+    let point = middle_of(harness.world(), 100, 900);
+    press_and_drag(&mut harness, 0, point);
+    macos_moves_to_ext(&mut harness, 0);
+    harness.advance(FRAME * 3);
+    release(&mut harness, point);
+    harness.advance(SETTLE);
+    assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID), source);
+
+    harness.mock_state.os_activate_display(TEST_DISPLAY_ID);
+    harness.advance(FRAME * 3);
+    harness.world().write_message(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+    harness.advance(SETTLE);
+    let parked = frame(harness.world(), 0);
+    assert!(
+        parked.center().x < 0,
+        "window 0 parks past the outer edge: {parked:?}"
+    );
+
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(SETTLE);
+    assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID), source);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+}

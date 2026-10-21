@@ -2485,6 +2485,36 @@ fn test_fix_window_size_on_focus_only_after_display_change() {
 
 #[test]
 fn test_attach_display_moves_virtual_workspace_together() {
+    attach_moves_virtual_workspace_together(IRect::new(
+        0,
+        -EXT_DISPLAY_HEIGHT,
+        EXT_DISPLAY_WIDTH,
+        0,
+    ));
+}
+
+#[test]
+fn test_attach_display_moves_virtual_workspace_together_below() {
+    attach_moves_virtual_workspace_together(IRect::new(
+        0,
+        TEST_DISPLAY_HEIGHT,
+        EXT_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
+    ));
+}
+
+#[test]
+fn test_attach_display_moves_virtual_workspace_together_to_the_right() {
+    attach_moves_virtual_workspace_together(IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        EXT_DISPLAY_HEIGHT,
+    ));
+}
+
+/// Attaches the external display at `ext`.
+fn attach_moves_virtual_workspace_together(ext: IRect) {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -2515,7 +2545,7 @@ fn test_attach_display_moves_virtual_workspace_together() {
         )));
 
     harness
-        .on_iteration(5, |world, mut state| {
+        .on_iteration(5, move |world, mut state| {
             // Before attaching EXT_DISPLAY_ID: [0, 1] on v0, [2, 3] on v1.
             let win0 = find_window_entity(0, world);
             let win1 = find_window_entity(1, world);
@@ -2537,11 +2567,7 @@ fn test_attach_display_moves_virtual_workspace_together() {
             assert_eq!(v1.all_windows(), vec![win2, win3]);
 
             // Attach EXT_DISPLAY_ID and report both windows 2 and 3 on EXT_WORKSPACE_ID.
-            state.add_display(
-                EXT_DISPLAY_ID,
-                IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
-                vec![EXT_WORKSPACE_ID],
-            );
+            state.add_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID]);
             state.update_window(2, |w| w.workspace_id = EXT_WORKSPACE_ID);
             state.update_window(3, |w| w.workspace_id = EXT_WORKSPACE_ID);
         })
@@ -2580,6 +2606,31 @@ fn test_attach_display_moves_virtual_workspace_together() {
 
 #[test]
 fn test_attach_display_only_moves_windows_reported_by_os() {
+    attach_moves_only_reported_windows(IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0));
+}
+
+#[test]
+fn test_attach_display_only_moves_windows_reported_by_os_below() {
+    attach_moves_only_reported_windows(IRect::new(
+        0,
+        TEST_DISPLAY_HEIGHT,
+        EXT_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
+    ));
+}
+
+#[test]
+fn test_attach_display_only_moves_windows_reported_by_os_to_the_right() {
+    attach_moves_only_reported_windows(IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        EXT_DISPLAY_HEIGHT,
+    ));
+}
+
+/// Attaches the external display at `ext`.
+fn attach_moves_only_reported_windows(ext: IRect) {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -2610,13 +2661,9 @@ fn test_attach_display_only_moves_windows_reported_by_os() {
         )));
 
     harness
-        .on_iteration(5, |_world, mut state| {
+        .on_iteration(5, move |_world, mut state| {
             // Attach EXT_DISPLAY_ID, but macOS only reports window 2 (not 3) on EXT_WORKSPACE_ID.
-            state.add_display(
-                EXT_DISPLAY_ID,
-                IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
-                vec![EXT_WORKSPACE_ID],
-            );
+            state.add_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID]);
             state.update_window(2, |w| w.workspace_id = EXT_WORKSPACE_ID);
         })
         .on_iteration(6, |world, _state| {

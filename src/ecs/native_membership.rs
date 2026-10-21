@@ -2,10 +2,31 @@
 //! module replays those reports and owns every strip change inferred from
 //! them.
 //!
-//! A report that a window is in space S moves the window only when its frame
-//! does not put it on a display other than the one that shows S. A stale
-//! report for another display, such as after a refused drop returned the
-//! window, therefore changes nothing, however long macOS keeps it.
+//! A report that a window is in space S moves the window only when the window
+//! is not on a display other than the one that shows S. One rule decides
+//! which display a window is on:
+//!
+//! 1. A window still at the frame the engine placed it at is on the display
+//!    of the strip that holds it, wherever that frame is. The engine parks
+//!    off-screen columns as slivers that hang past the display's edge, onto a
+//!    neighboring display or onto no display at all.
+//! 2. A window of a parked virtual workspace is the exception. The engine
+//!    tucks the whole strip into a corner, so its frame is no evidence.
+//! 3. Any other frame is on the display that holds its center. A center on
+//!    no display is no evidence.
+//!
+//! A report with no evidence against it moves the window. A stale report for
+//! another display, such as after a refused drop returned the window,
+//! therefore changes nothing, however long macOS keeps it, while macOS's
+//! own moves change the frame and pass.
+//!
+//! Two trades follow from the rule:
+//!
+//! - A failed AX frame read is no evidence, so a stale report wins for a
+//!   window whose app stops responding.
+//! - If macOS moves a window into another display's space without changing
+//!   its frame, the report is refused. A Mission Control drag of a parked
+//!   sliver into the neighboring display's space is such a move.
 //!
 //! The engine's own placements win while they are in progress: a held drag
 //! group, and an explicit placement until the engine has finished moving its
@@ -23,6 +44,7 @@ use tracing::{debug, warn};
 use super::display::migrate_windows_to_space;
 use super::drag::DragState;
 use super::layout::LayoutStrip;
+use super::workspace::PreviousStripPosition;
 use super::{
     ActiveWorkspaceMarker, AwaitingHandle, Bounds, Initializing, NativeFullscreenMarker, Position,
     PresentedOrigin, RepositionMarker, ResizeMarker, SelectedVirtualMarker, SpawnWindowTrigger,
@@ -473,18 +495,10 @@ fn on_another_display(world: &mut World, members: &[Entity], display: Entity) ->
         .any(|member| window_display(world, *member).is_some_and(|shown| shown != display))
 }
 
-/// The display that holds the center of `member`'s frame. A window the engine
-/// still holds at the frame it placed it at counts as on its strip's display
-/// instead, because a center elsewhere is a parked column overhanging the next
-/// display, not a native move. `None`, which is no evidence either way, when
-/// the frame cannot be read or its center is on no display.
+/// The display `member` is on, by the rule in the module docs. `None` is no
+/// evidence either way.
 fn window_display(world: &mut World, member: Entity) -> Option<Entity> {
     let frame = world.get_mut::<Window>(member)?.update_frame().ok()?;
-    let shown = world
-        .query::<(Entity, &Display)>()
-        .iter(world)
-        .find(|(_, display)| display.bounds().contains(frame.center()))
-        .map(|(shown, _)| shown)?;
     let placed = world
         .get::<PresentedOrigin>(member)
         .zip(world.get::<Bounds>(member))
@@ -492,14 +506,19 @@ fn window_display(world: &mut World, member: Entity) -> Option<Entity> {
             (frame.min - origin.0).abs().max_element() <= FRAME_TOLERANCE
                 && (frame.size() - bounds.0).abs().max_element() <= FRAME_TOLERANCE
         });
-    if !placed {
-        return Some(shown);
+    let strip = world
+        .query::<(&LayoutStrip, &ChildOf, Has<PreviousStripPosition>)>()
+        .iter(world)
+        .find(|(strip, _, _)| strip.contains(member))
+        .map(|(_, child, parked)| (child.parent(), parked));
+    if placed && let Some((display, parked)) = strip {
+        return (!parked).then_some(display);
     }
     world
-        .query::<(&LayoutStrip, &ChildOf)>()
+        .query::<(Entity, &Display)>()
         .iter(world)
-        .find(|(strip, _)| strip.contains(member))
-        .map_or(Some(shown), |(_, child)| Some(child.parent()))
+        .find(|(_, display)| display.bounds().contains(frame.center()))
+        .map(|(shown, _)| shown)
 }
 
 /// Moves the managed windows `ids` lists for `space` into its strips. Returns
