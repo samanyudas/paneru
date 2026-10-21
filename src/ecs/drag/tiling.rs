@@ -7,6 +7,7 @@ use bevy::ecs::system::{Commands, Query, Res, ResMut, SystemParam};
 use bevy::math::IRect;
 use bevy::time::Time;
 
+use crate::ecs::layout::LayoutStrip;
 use crate::ecs::systems::unpadded;
 use crate::ecs::{Bounds, DockPosition, PresentedOrigin, ResizeMarker, SpawnCommandsExt};
 use crate::events::{Event, MouseButton};
@@ -17,8 +18,9 @@ const TILE_TOLERANCE: i32 = 2;
 const RESIZE_RELEASE_GRACE: Duration = Duration::from_millis(600);
 
 /// The windows a left press may be resizing by an edge: every tiled window
-/// whose edge band holds the press point. Two neighboring columns share a
-/// boundary, so a press there can resize either one.
+/// whose edge band holds the press point, with the native tabs grouped with
+/// it. Two neighboring columns share a boundary, so a press there can resize
+/// either one. A tab group resizes as one, so every tab reports the resize.
 #[derive(Default, Resource)]
 pub(crate) enum PointerResize {
     #[default]
@@ -58,6 +60,7 @@ pub(super) fn track_resize_gesture(
         (Entity, &Window, &PresentedOrigin, &Bounds),
         bevy::ecs::query::Without<crate::ecs::Unmanaged>,
     >,
+    strips: Query<&LayoutStrip>,
     window_manager: Res<WindowManager>,
     time: Res<Time>,
 ) {
@@ -70,7 +73,7 @@ pub(super) fn track_resize_gesture(
                 ..
             } => {
                 let point = origin_from(*point);
-                let edges: Vec<_> = windows
+                let mut edges: Vec<_> = windows
                     .iter()
                     .filter(|(_, window, presented, bounds)| {
                         let frame = unpadded(
@@ -80,8 +83,15 @@ pub(super) fn track_resize_gesture(
                         frame.inflate(EDGE_TOLERANCE).contains(point)
                             && !frame.inflate(-EDGE_TOLERANCE).contains(point)
                     })
-                    .map(|(entity, _, _, _)| entity)
+                    .flat_map(|(entity, _, _, _)| {
+                        strips
+                            .iter()
+                            .find_map(|strip| strip.tab_group(entity))
+                            .unwrap_or_else(|| vec![entity])
+                    })
                     .collect();
+                edges.sort_unstable();
+                edges.dedup();
                 *gesture = if edges.is_empty() {
                     PointerResize::Idle
                 } else {

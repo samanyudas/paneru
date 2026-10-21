@@ -1794,3 +1794,29 @@ fn a_stale_report_during_an_engine_animation_changes_nothing() {
         vec![vec![100]]
     );
 }
+
+#[test]
+fn an_edge_resize_of_a_native_tab_keeps_the_users_size_for_every_tab() {
+    let mut harness = three_columns();
+    add_native_tab(&mut harness, 0, 3);
+    assert_eq!(layout(harness.world())[0].len(), 2, "one tab group");
+    // The background tab reports wider frame insets, so its own edge band
+    // misses a press on the visible tab's edge.
+    let padding = (14, 0);
+    harness
+        .mock_state
+        .update_window(0, |window| window.horizontal_padding = padding.0);
+    let start = frame(harness.world(), 3);
+    let edge = Origin::new(start.max.x - 1, start.center().y);
+    press_at(&mut harness, edge);
+    harness.advance(FRAME);
+    let tile = IRect::new(0, 20, 512, 768);
+    let padded_tile = crate::ecs::systems::padded(tile, padding);
+    // The user resizes the visible tab, and the app reports the shared
+    // resize for the background tab too.
+    macos_tile(&mut harness, 3, tile);
+    macos_tile(&mut harness, 0, padded_tile);
+    harness.advance(ms(200));
+    assert_eq!(frame(harness.world(), 3), tile);
+    assert_eq!(frame(harness.world(), 0), padded_tile);
+}
