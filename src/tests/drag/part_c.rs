@@ -1728,3 +1728,26 @@ fn a_returned_window_parked_past_the_outer_edge_ignores_a_stale_report() {
         vec![vec![100]]
     );
 }
+
+#[test]
+fn a_warm_listed_closed_window_asks_only_its_own_app() {
+    const OTHER_APP: i32 = TEST_PROCESS_ID + 1;
+    let mut harness =
+        two_displays("", EXT_DISPLAY_HEIGHT).with_app(OTHER_APP, "other", "Other", |_| {});
+    harness.advance(SETTLE);
+    let removed = window_entity(&mut harness, 2);
+    let element = harness.world().get::<Window>(removed).unwrap().element();
+    harness.world().write_message(Event::WindowDestroyed {
+        window_id: 2,
+        source: crate::events::DestroySource::Accessibility { element },
+    });
+    harness.advance(SETTLE);
+    assert!(!has_window(&mut harness, 2));
+    let reads = harness.mock_state.window_list_reads(OTHER_APP);
+    for _ in 0..3 {
+        harness.world().write_message(Event::SpaceChanged);
+        harness.advance(ms(500));
+    }
+    assert!(!has_window(&mut harness, 2));
+    assert_eq!(harness.mock_state.window_list_reads(OTHER_APP), reads);
+}

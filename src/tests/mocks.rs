@@ -128,6 +128,7 @@ struct MockStateInner {
     fullscreen_spaces: HashSet<WorkspaceId>,
     membership_failures: HashMap<WorkspaceId, u16>,
     membership_reads: HashMap<WorkspaceId, usize>,
+    window_list_reads: HashMap<Pid, usize>,
     active_display_id: u32,
     cursor_position: Origin,
     /// Whether the window server sees the left mouse button down.
@@ -179,6 +180,7 @@ impl MockState {
                 fullscreen_spaces: HashSet::new(),
                 membership_failures: HashMap::new(),
                 membership_reads: HashMap::new(),
+                window_list_reads: HashMap::new(),
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
                 left_button_down: false,
@@ -669,6 +671,16 @@ impl MockState {
             .unwrap_or(0)
     }
 
+    /// How many times the engine asked app `pid` for its AX window list.
+    pub fn window_list_reads(&self, pid: Pid) -> usize {
+        self.inner
+            .force_read()
+            .window_list_reads
+            .get(&pid)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Sets whether the window server sees the left mouse button down. Only
     /// the button state changes: no mouse event is sent.
     pub fn set_left_button_down(&self, down: bool) {
@@ -1039,8 +1051,14 @@ impl MockState {
         };
 
         let (s, ids) = (self.clone(), window_ids.clone());
-        ma.expect_window_list()
-            .returning(move |_| ids().into_iter().map(|id| s.create_window(id)).collect());
+        ma.expect_window_list().returning(move |_| {
+            *s.inner
+                .force_write()
+                .window_list_reads
+                .entry(pid)
+                .or_default() += 1;
+            ids().into_iter().map(|id| s.create_window(id)).collect()
+        });
 
         let (s, ids) = (self.clone(), window_ids.clone());
         ma.expect_ax_window_ids().returning(move || {

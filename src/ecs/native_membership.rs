@@ -69,18 +69,11 @@ pub(crate) enum NativeScope {
     DisplayTopology,
 }
 
-/// A topology scan moves windows grouped by their source strip, as the
-/// display reconciliation always has.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum ScanKind {
-    #[default]
-    Activation,
-    Topology,
-}
-
 #[derive(Default)]
 struct DirtySpace {
-    kind: ScanKind,
+    /// The read follows a display topology change, so it moves windows
+    /// grouped by their source strip, as display reconciliation always has.
+    topology: bool,
     retry: QueryRetry,
 }
 
@@ -142,17 +135,27 @@ struct Placing {
 }
 
 struct IgnoredWindow {
-    /// The AX element a closed window had. Native and AX lists can replay it
-    /// for a moment after the close, and only a different element is a live
-    /// window again. `None` for a window no app could resolve.
-    closed: Option<CFRetained<AXUIWrapper>>,
+    /// What the window had when it closed. `None` for a window no app could
+    /// resolve, or a closed window without an element or an app.
+    closed: Option<ClosedWindow>,
     until: Duration,
+}
+
+/// Native and AX lists can replay a closed window's element for a moment
+/// after the close. Only its own app can list a different element for it,
+/// which is a live window again.
+struct ClosedWindow {
+    app: Entity,
+    element: CFRetained<AXUIWrapper>,
 }
 
 #[derive(Default, Resource)]
 pub(crate) struct NativeMembership {
     dirty: HashMap<WorkspaceId, DirtySpace>,
-    all_spaces: Option<ScanKind>,
+    /// Every live space is to be read.
+    all_spaces: bool,
+    /// The next read of every space follows a display topology change.
+    topology: bool,
     held: Option<HeldDragGroup>,
     placing: Vec<Placing>,
     /// Groups a placement left in no strip, because the destination display
@@ -168,7 +171,8 @@ impl NativeMembership {
                 self.dirty.entry(space).or_default().retry = QueryRetry::Ready;
             }
             NativeScope::DisplayTopology => {
-                self.all_spaces = Some(ScanKind::Topology);
+                self.all_spaces = true;
+                self.topology = true;
             }
         }
     }
@@ -191,7 +195,7 @@ impl NativeMembership {
 
     pub(crate) fn needs_frame(&self, now: Duration) -> bool {
         !self.placing.is_empty()
-            || self.all_spaces.is_some()
+            || self.all_spaces
             || self.dirty.values().any(|dirty| dirty.retry.due(now))
     }
 
@@ -205,15 +209,17 @@ impl NativeMembership {
                 .any(|placing| placing.members.contains(&member))
     }
 
-    /// Reads every space again when a report waited for a placement to end,
-    /// because the window may have moved to another space since.
+    /// Reads every live space again when some report waited for a placement
+    /// to end. Reading only the spaces that waited would miss a window that
+    /// macOS moved on to a third space during the hold. A hold that no report
+    /// waited for reads nothing.
     fn release(&mut self) {
         if self
             .dirty
             .values()
             .any(|dirty| matches!(dirty.retry, QueryRetry::Held))
         {
-            self.all_spaces.get_or_insert_default();
+            self.all_spaces = true;
         }
     }
 
@@ -261,15 +267,21 @@ pub(super) fn register(app: &mut App) {
 
 fn forget_removed_window(
     removed: On<Remove, Window>,
-    windows: Query<&Window>,
+    windows: Query<(&Window, Option<&ChildOf>)>,
     time: Res<Time>,
     mut native: ResMut<NativeMembership>,
 ) {
-    if let Ok(window) = windows.get(removed.entity) {
+    if let Ok((window, app)) = windows.get(removed.entity) {
+        let closed = app
+            .zip(window.element())
+            .map(|(app, element)| ClosedWindow {
+                app: app.parent(),
+                element,
+            });
         native.ignored.insert(
             window.id(),
             IgnoredWindow {
-                closed: window.element(),
+                closed,
                 until: time.elapsed() + IGNORE_FOR,
             },
         );
@@ -295,7 +307,7 @@ fn held_window(drag: &DragState) -> Option<Entity> {
 }
 
 fn membership_work(native: Res<NativeMembership>, drag: Res<DragState>, time: Res<Time>) -> bool {
-    native.all_spaces.is_some()
+    native.all_spaces
         || native
             .dirty
             .values()
@@ -356,14 +368,14 @@ fn reconcile(world: &mut World) {
         let spaces = live_spaces(world);
         let live = |space: &WorkspaceId| spaces.iter().any(|(live, _)| live == space);
         if native.dirty.keys().any(|space| !live(space)) {
-            native.all_spaces = Some(ScanKind::Topology);
+            native.all_spaces = true;
+            native.topology = true;
         }
-        if let Some(kind) = native.all_spaces.take() {
+        if std::mem::take(&mut native.all_spaces) {
+            let topology = std::mem::take(&mut native.topology);
             for (space, _) in &spaces {
                 let dirty = native.dirty.entry(*space).or_default();
-                if kind == ScanKind::Topology {
-                    dirty.kind = kind;
-                }
+                dirty.topology |= topology;
                 dirty.retry = QueryRetry::Ready;
             }
         }
@@ -390,14 +402,8 @@ fn reconcile(world: &mut World) {
             {
                 Ok(ids) => {
                     let unresolved = discover_unresolved(world, &ids, &mut native.ignored, now);
-                    let held = reconcile_space(
-                        world,
-                        &native,
-                        space,
-                        display,
-                        &ids,
-                        dirty.kind == ScanKind::Topology,
-                    );
+                    let held =
+                        reconcile_space(world, &native, space, display, &ids, dirty.topology);
                     if unresolved {
                         dirty.retry.failed(now, space);
                     } else if held {
@@ -417,8 +423,9 @@ fn reconcile(world: &mut World) {
 }
 
 /// Asks the apps for the listed windows the engine does not know, and spawns
-/// the ones they resolve. Returns whether any spawned, so the space is read
-/// again once they exist.
+/// the ones they resolve. A closed window can come back only through its own
+/// app, so when every unknown window closed, only their apps are asked.
+/// Returns whether any spawned, so the space is read again once they exist.
 fn discover_unresolved(
     world: &mut World,
     ids: &[WinID],
@@ -443,11 +450,16 @@ fn discover_unresolved(
     if unresolved.is_empty() {
         return false;
     }
+    let closed_apps: Option<HashSet<Entity>> = unresolved
+        .iter()
+        .map(|id| ignored.get(id)?.closed.as_ref().map(|closed| closed.app))
+        .collect();
     let config = world.resource::<Config>().clone();
     let listed: Vec<_> = world
-        .query::<&Application>()
+        .query::<(Entity, &Application)>()
         .iter(world)
-        .flat_map(|app| app.window_list(&config))
+        .filter(|(app, _)| closed_apps.as_ref().is_none_or(|apps| apps.contains(app)))
+        .flat_map(|(_, app)| app.window_list(&config))
         .filter(|window| unresolved.contains(&window.id()))
         .collect();
     for id in &unresolved {
@@ -467,7 +479,7 @@ fn discover_unresolved(
             ignored
                 .get(&window.id())
                 .and_then(|ignored| ignored.closed.as_ref())
-                .is_none_or(|closed| !window.is_current_element(closed))
+                .is_none_or(|closed| !window.is_current_element(&closed.element))
         })
         .collect();
     if fresh.is_empty() {
