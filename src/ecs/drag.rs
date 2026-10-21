@@ -41,9 +41,7 @@ use crate::commands::{Direction, display_in_direction};
 use crate::config::Config;
 use crate::ecs::display::{DisplayMoves, Placement};
 use crate::ecs::layout::{Column, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, effective_stack_limit};
-use crate::ecs::native_membership::{
-    AppliedPlacement, NativeMembership, NativeScope, PlacementDestination,
-};
+use crate::ecs::native_membership::NativeMembership;
 use crate::ecs::{
     Bounds, FocusedMarker, FullWidthMarker, Initializing, LayoutPosition, ManualStripOffset,
     Position, PresentedOrigin, RepositionMarker, Scrolling, SpawnCommandsExt, TopBarHeight,
@@ -956,23 +954,6 @@ pub(super) fn drag_events(
 ) {
     let now = time.elapsed();
     for event in messages.read() {
-        if let Event::MouseDown {
-            point,
-            window_id,
-            button: MouseButton::Left,
-            ..
-        } = event
-        {
-            let id = window_id.or_else(|| window_manager.find_window_at_point(point).ok());
-            if let Some(entity) = id.and_then(|id| {
-                windows
-                    .iter()
-                    .find_map(|(entity, window, _, _)| (window.id() == id).then_some(entity))
-            }) {
-                native.request(NativeScope::TargetedPress(entity));
-            }
-        }
-
         let Some(input) = drag_input(
             event,
             &state,
@@ -1464,14 +1445,13 @@ fn apply_drop(
     commands: &mut Commands,
     native: &mut NativeMembership,
 ) {
-    let Some((source, source_strip, _, source_display, _)) = moves
+    let Some((source, _, _, source_display, _)) = moves
         .strips
         .iter()
         .find(|(_, strip, _, _, _)| strip.contains(window))
     else {
         return;
     };
-    let previous_space = source_strip.id();
     let source_display = source_display.parent();
     let destination = match target {
         DropTarget::IntoColumn {
@@ -1503,18 +1483,14 @@ fn apply_drop(
                 commands,
             );
         }
-        if let Some((strip_entity, strip, _, _, _)) = moves
+        if let Some((_, strip, _, _, _)) = moves
             .strips
             .iter()
             .find(|(_, strip, _, _, _)| strip.contains(window))
         {
             let members = strip.tab_group(window).unwrap_or_else(|| vec![window]);
             restore_drop_members(&members, placements);
-            native.placed(AppliedPlacement {
-                members,
-                destination: PlacementDestination::Strip(strip_entity),
-                previous_space,
-            });
+            native.placed(members);
         }
         commands.ensure_visible(window);
         commands.focus_entity(window, false);
@@ -1560,11 +1536,7 @@ fn apply_drop(
     // The user's drag left the window where it was released. Marking its
     // slot changed sends it there, even when the slot did not move.
     restore_drop_members(&members, placements);
-    native.placed(AppliedPlacement {
-        members,
-        destination: PlacementDestination::Strip(source),
-        previous_space,
-    });
+    native.placed(members);
     commands.ensure_visible(window);
     if !focused {
         commands.focus_entity(window, false);

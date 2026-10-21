@@ -2692,8 +2692,14 @@ fn test_attach_display_compacts_emptied_first_virtual_workspace() {
                 IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
                 vec![EXT_WORKSPACE_ID],
             );
-            state.update_window(0, |w| w.workspace_id = EXT_WORKSPACE_ID);
-            state.update_window(1, |w| w.workspace_id = EXT_WORKSPACE_ID);
+            // macOS moves the windows onto the display whose space they join.
+            for id in [0, 1] {
+                state.update_window(id, |w| {
+                    w.workspace_id = EXT_WORKSPACE_ID;
+                    w.frame.min.y -= EXT_DISPLAY_HEIGHT;
+                    w.frame.max.y -= EXT_DISPLAY_HEIGHT;
+                });
+            }
         })
         .on_iteration(6, |world, _state| {
             let win0 = find_window_entity(0, world);

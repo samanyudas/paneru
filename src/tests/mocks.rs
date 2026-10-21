@@ -50,6 +50,8 @@ pub(crate) struct MockWindowData {
     pub(crate) title: String,
     pub(crate) minimized: bool,
     pub(crate) workspace_id: WorkspaceId,
+    /// Listed in every space, like a window assigned to all desktops.
+    pub(crate) on_all_spaces: bool,
     pub(crate) visible: bool,
     pub(crate) role: String,
     pub(crate) subrole: String,
@@ -92,6 +94,7 @@ impl Default for MockWindowData {
             title: String::new(),
             minimized: false,
             workspace_id: 0,
+            on_all_spaces: false,
             visible: true,
             role: "AXWindow".to_string(),
             subrole: "AXStandardWindow".to_string(),
@@ -1136,7 +1139,9 @@ impl MockState {
                 let mut windows = inner
                     .windows
                     .values()
-                    .filter_map(|w| (w.workspace_id == workspace_id).then_some(w.id))
+                    .filter_map(|w| {
+                        (w.on_all_spaces || w.workspace_id == workspace_id).then_some(w.id)
+                    })
                     .collect::<Vec<_>>();
                 // Sort the windows to keep the tests consistent
                 windows.sort_unstable();

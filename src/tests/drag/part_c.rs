@@ -40,10 +40,17 @@ fn layout_on(world: &mut World, workspace: crate::platform::WorkspaceId) -> Vec<
         .collect()
 }
 
+/// macOS moves window `id` into the external display's space. The window
+/// lands on that display, unless a drag already put it there.
 fn macos_moves_to_ext(harness: &mut TestHarness, id: WinID) {
-    harness
-        .mock_state
-        .update_window(id, |window| window.workspace_id = EXT_WORKSPACE_ID);
+    harness.mock_state.update_window(id, |window| {
+        window.workspace_id = EXT_WORKSPACE_ID;
+        let shift = TEST_DISPLAY_WIDTH + 100 - window.frame.min.x;
+        if window.frame.center().x < TEST_DISPLAY_WIDTH {
+            window.frame.min.x += shift;
+            window.frame.max.x += shift;
+        }
+    });
     harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
 }
 
@@ -1325,7 +1332,7 @@ fn a_new_resize_press_after_idle_grace_keeps_manual_resize_classification() {
 }
 
 #[test]
-fn native_membership_convergence_retires_the_old_receipt() {
+fn a_later_native_move_of_a_returned_window_applies() {
     let mut harness = refused_return_with_native_echo();
     harness
         .mock_state
@@ -1434,7 +1441,7 @@ fn append_to_a_display_without_a_strip_finishes_its_pending_placement() {
 }
 
 #[test]
-fn an_external_resize_before_space_notification_invalidates_the_old_receipt() {
+fn an_external_resize_keeps_a_returned_window_on_its_display() {
     let mut harness = refused_return_with_native_echo();
     let old = frame(harness.world(), 2);
     harness
@@ -1444,8 +1451,12 @@ fn an_external_resize_before_space_notification_invalidates_the_old_receipt() {
     harness.world().write_message(Event::SpaceChanged);
     harness.advance(SETTLE);
     assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    assert_eq!(
         layout_on(harness.world(), EXT_WORKSPACE_ID),
-        vec![vec![100], vec![2]]
+        vec![vec![100]]
     );
 }
 
@@ -1489,4 +1500,72 @@ fn a_closed_window_stays_removed_until_a_fresh_creation_reuses_its_id() {
         layout_on(harness.world(), EXT_WORKSPACE_ID),
         vec![vec![100], vec![2]]
     );
+}
+
+fn click(harness: &mut TestHarness, at: Origin) {
+    press_at(harness, at);
+    harness.advance(FRAME);
+    release(harness, at);
+}
+
+fn membership_reads(harness: &TestHarness) -> usize {
+    harness.mock_state.membership_reads(TEST_WORKSPACE_ID)
+        + harness.mock_state.membership_reads(EXT_WORKSPACE_ID)
+}
+
+#[test]
+fn a_click_on_a_returned_window_keeps_it_on_its_display() {
+    let mut harness = refused_return_with_native_echo();
+    let body = frame(harness.world(), 2).center();
+    click(&mut harness, body);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+}
+
+#[test]
+fn clicks_read_no_native_membership_and_leave_other_windows_in_place() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    harness
+        .mock_state
+        .update_window(1, |window| window.on_all_spaces = true);
+    let reads = membership_reads(&harness);
+    for _ in 0..5 {
+        let body = frame(harness.world(), 0).center();
+        click(&mut harness, body);
+        harness.advance(ms(200));
+    }
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+    assert_eq!(membership_reads(&harness), reads);
+}
+
+#[test]
+fn layout_changes_after_a_returned_drop_read_no_native_membership() {
+    let mut harness = refused_return_with_native_echo();
+    let reads = membership_reads(&harness);
+    for swap in 0..10 {
+        let direction = if swap % 2 == 0 {
+            Direction::West
+        } else {
+            Direction::East
+        };
+        harness.world().write_message(Event::Command {
+            command: Command::Window(Operation::Swap(direction)),
+        });
+        harness.advance(ms(100));
+    }
+    assert_eq!(membership_reads(&harness), reads);
 }

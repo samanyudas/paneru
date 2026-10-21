@@ -33,6 +33,7 @@ use crate::events::Event;
 use crate::manager::{Display, Size, Window, WindowManager, irect_from};
 use crate::platform::{PlatformCallbacks, WorkspaceId};
 use crate::util::{read_screen_property, round_px};
+use bevy::ecs::entity::EntityHashSet;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::ResMut;
 
@@ -52,7 +53,8 @@ pub(crate) struct DisplayMove {
     pub strip: Option<Entity>,
     pub display_bounds: IRect,
     pub left_behind: Option<Entity>,
-    pub placement: super::native_membership::AppliedPlacement,
+    /// The moved window and the native tabs grouped with it.
+    pub members: Vec<Entity>,
 }
 
 type MovableStrips<'w, 's> = Query<
@@ -173,7 +175,6 @@ impl DisplayMoves<'_, '_> {
             })
         });
         let (_, mut source_strip, _, _, _) = self.strips.get_mut(source).ok()?;
-        let previous_space = source_strip.id();
         let members = source_strip
             .tab_group(entity)
             .unwrap_or_else(|| vec![entity]);
@@ -210,16 +211,7 @@ impl DisplayMoves<'_, '_> {
             strip,
             display_bounds,
             left_behind,
-            placement: super::native_membership::AppliedPlacement {
-                members,
-                previous_space,
-                destination: strip.map_or(
-                    super::native_membership::PlacementDestination::EmptyDisplay(
-                        target_display_entity,
-                    ),
-                    super::native_membership::PlacementDestination::Strip,
-                ),
-            },
+            members,
         })
     }
 }
@@ -447,6 +439,133 @@ pub(crate) fn reconcile_displays(
         // requiring a second notification from Core Graphics.
         state.verify_again = false;
         state.pending = Some(Timer::new(DISPLAY_VERIFY_DELAY, TimerMode::Once));
+    }
+}
+
+/// Moves the `admitted` windows, which macOS reports in `space` on `display`,
+/// out of their strips on other spaces. Each source strip's windows stay
+/// together: they fill the space's empty first strip, or open a new virtual
+/// strip after the existing ones.
+pub(crate) fn migrate_windows_to_space(
+    world: &mut World,
+    display: Entity,
+    space: WorkspaceId,
+    admitted: &EntityHashSet,
+) {
+    let Some(bounds) = world.get::<Display>(display).map(Display::bounds) else {
+        return;
+    };
+    let mut sources: Vec<_> = world
+        .query::<(Entity, &LayoutStrip, Has<NativeFullscreenMarker>)>()
+        .iter(world)
+        .filter_map(|(entity, strip, fullscreen)| {
+            if fullscreen || strip.id() == space {
+                return None;
+            }
+            let members: EntityHashSet = strip
+                .all_windows()
+                .into_iter()
+                .filter(|member| admitted.contains(member))
+                .collect();
+            (!members.is_empty()).then_some((entity, strip.id(), strip.virtual_index, members))
+        })
+        .collect();
+    sources.sort_by_key(|(_, id, index, _)| (*id, *index));
+    if !sources.is_empty() {
+        compact_workspace_strips(world, space);
+    }
+    let mut affected = HashSet::new();
+    for (source, source_space, _, members) in sources {
+        let mut extracted = LayoutStrip::new(space, 0);
+        if let Some(mut strip) = world.get_mut::<LayoutStrip>(source) {
+            strip.extract_windows_into(&members, &mut extracted);
+        }
+        if extracted.len() > 0 {
+            place_extracted_strip(world, display, bounds, space, extracted);
+        }
+        affected.insert(source_space);
+    }
+    for source in affected {
+        compact_workspace_strips(world, source);
+    }
+}
+
+fn place_extracted_strip(
+    world: &mut World,
+    display_entity: Entity,
+    display_bounds: IRect,
+    target_space_id: WorkspaceId,
+    mut extracted: LayoutStrip,
+) {
+    let retains_focus = extracted
+        .all_windows()
+        .into_iter()
+        .any(|entity| world.get::<FocusedMarker>(entity).is_some());
+    let empty_row_0 = world
+        .query::<(Entity, &LayoutStrip, Has<NativeFullscreenMarker>)>()
+        .iter(world)
+        .find_map(|(entity, strip, fullscreen)| {
+            (!fullscreen
+                && strip.id() == target_space_id
+                && strip.virtual_index == 0
+                && strip.len() == 0)
+                .then_some(entity)
+        });
+
+    if let Some(dst_entity) = empty_row_0 {
+        if let Some(mut dst_strip) = world.get_mut::<LayoutStrip>(dst_entity) {
+            dst_strip.append_strip(&mut extracted);
+        }
+        let any_selected = world
+            .query::<(&LayoutStrip, Has<SelectedVirtualMarker>)>()
+            .iter(world)
+            .any(|(strip, selected)| strip.id() == target_space_id && selected);
+        if !any_selected {
+            world
+                .entity_mut(dst_entity)
+                .remove::<PreviousStripPosition>()
+                .insert((Position(display_bounds.min), SelectedVirtualMarker));
+        }
+        if retains_focus {
+            world.entity_mut(dst_entity).insert(ActiveWorkspaceMarker);
+        }
+        return;
+    }
+
+    let next_virtual_index = world
+        .query::<(&LayoutStrip, Has<NativeFullscreenMarker>)>()
+        .iter(world)
+        .filter(|(strip, fullscreen)| !fullscreen && strip.id() == target_space_id)
+        .map(|(strip, _)| strip.virtual_index)
+        .max()
+        .map_or(0, |max_idx| max_idx + 1);
+
+    extracted.virtual_index = next_virtual_index;
+    let focus = extracted.first().ok().and_then(|col| col.top());
+    let strip_entity = if next_virtual_index == 0 {
+        world
+            .spawn((
+                Position(display_bounds.min),
+                extracted,
+                ChildOf(display_entity),
+                SelectedVirtualMarker,
+            ))
+            .id()
+    } else {
+        world
+            .spawn((
+                Position(display_bounds.max - PARKED_STRIP_SLIVER),
+                PreviousStripPosition {
+                    origin: display_bounds.min,
+                    focus,
+                },
+                extracted,
+                ChildOf(display_entity),
+            ))
+            .id()
+    };
+    if retains_focus {
+        world.entity_mut(strip_entity).insert(ActiveWorkspaceMarker);
     }
 }
 

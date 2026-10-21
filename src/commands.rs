@@ -1319,13 +1319,13 @@ fn to_next_display(
     let bounds = arrival.display_bounds;
     let origin = bounds.min.with_x(bounds.center().x - size.x / 2);
     if arrival.strip.is_none() {
-        for member in &arrival.placement.members {
+        for member in &arrival.members {
             commands.reposition_entity(*member, origin);
         }
     } else {
         commands.reposition_entity(entity, origin);
     }
-    native.placed(arrival.placement);
+    native.placed(arrival.members);
     if matches!(move_focus, MoveFocus::Follow) {
         window_manager.warp_mouse(bounds.center());
     }
