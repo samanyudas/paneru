@@ -899,3 +899,553 @@ fn native_batch_migration_of_other_windows_keeps_the_held_window_in_its_source()
         "the drop keeps every managed window in the layout"
     );
 }
+
+#[test]
+fn review_lost_resize_release_expires_without_followup_events() {
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 0);
+    press_at(&mut harness, Origin::new(start.max.x - 1, start.center().y));
+    harness.advance(FRAME);
+    harness.mock_state.set_left_button_down(false);
+    harness.advance(ms(2000));
+    macos_tile(&mut harness, 0, IRect::new(0, 20, 512, 768));
+    harness.advance(SETTLE);
+    assert_eq!(
+        frame(harness.world(), 0),
+        start,
+        "a later native tile must restore after the lost-release grace expires"
+    );
+}
+
+#[test]
+fn fresh_native_migration_after_a_drop_applies_without_a_deadline() {
+    for before_expiry in [false, true] {
+        let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+        let point = middle_of(harness.world(), 0, 600);
+        press_and_drag(&mut harness, 2, point);
+        release(&mut harness, point);
+        harness.advance(if before_expiry { ms(100) } else { SETTLE });
+        let body = frame(harness.world(), 2).center();
+        press_at(&mut harness, body);
+        harness.advance(FRAME);
+        release(&mut harness, body);
+        assert_eq!(drag_state(harness.world()), DragState::Idle);
+        let entity = harness
+            .world()
+            .query::<(Entity, &Window)>()
+            .iter(harness.world())
+            .find_map(|(entity, window)| (window.id() == 2).then_some(entity))
+            .unwrap();
+        assert!(
+            harness
+                .world()
+                .get::<crate::ecs::RepositionMarker>(entity)
+                .is_none()
+        );
+        assert!(
+            harness
+                .world()
+                .get::<crate::ecs::ResizeMarker>(entity)
+                .is_none()
+        );
+        macos_moves_to_ext(&mut harness, 2);
+        harness.advance(ms(2000));
+        assert_eq!(
+            layout_on(harness.world(), EXT_WORKSPACE_ID),
+            vec![vec![100], vec![2]],
+            "before_expiry={before_expiry}"
+        );
+        assert_eq!(
+            layout_on(harness.world(), TEST_WORKSPACE_ID),
+            vec![vec![0], vec![1]],
+            "before_expiry={before_expiry}"
+        );
+    }
+}
+
+#[test]
+fn review_display_reconciliation_preserves_refused_drag_source() {
+    let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
+    let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
+    let point = middle_of(harness.world(), 100, 900);
+    press_and_drag(&mut harness, 2, point);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: EXT_DISPLAY_ID,
+    });
+    harness.advance(ms(450));
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        source,
+        "display reconciliation must not migrate the held window before a refused drop"
+    );
+    release(&mut harness, point);
+    harness.advance(SETTLE);
+    assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID), source);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+}
+
+fn window_entity(harness: &mut TestHarness, id: WinID) -> Entity {
+    harness
+        .world()
+        .query::<(Entity, &Window)>()
+        .iter(harness.world())
+        .find_map(|(entity, window)| (window.id() == id).then_some(entity))
+        .unwrap()
+}
+
+fn refused_return_with_native_echo() -> TestHarness {
+    let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
+    let point = middle_of(harness.world(), 100, 900);
+    press_and_drag(&mut harness, 2, point);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.advance(FRAME * 3);
+    release(&mut harness, point);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    harness
+}
+
+#[test]
+fn deferred_activation_requeries_after_a_press_is_cancelled_without_another_activation() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    let start = frame(harness.world(), 2);
+    press_at(&mut harness, start.min + IVec2::new(100, 10));
+    harness.advance(FRAME);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.advance(FRAME * 3);
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    let reads = harness.mock_state.membership_reads(EXT_WORKSPACE_ID);
+    harness
+        .world()
+        .write_message(Event::WindowResized { window_id: 2 });
+    harness.advance(FRAME * 3);
+    assert!(harness.mock_state.membership_reads(EXT_WORKSPACE_ID) > reads);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100], vec![2]]
+    );
+}
+
+#[test]
+fn deferred_activation_uses_the_latest_native_destination() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    let start = frame(harness.world(), 2);
+    press_at(&mut harness, start.min + IVec2::new(100, 10));
+    harness.advance(FRAME);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.advance(FRAME * 3);
+    harness
+        .mock_state
+        .update_window(2, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    harness
+        .world()
+        .write_message(Event::WindowResized { window_id: 2 });
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+}
+
+#[test]
+fn verified_return_suppresses_duplicate_old_membership_without_a_deadline() {
+    let mut harness = refused_return_with_native_echo();
+    for _ in 0..3 {
+        harness.world().write_message(Event::SpaceChanged);
+        harness.advance(ms(1000));
+    }
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+}
+
+#[test]
+fn verified_return_allows_a_changed_native_frame_without_new_pointer_input() {
+    let mut harness = refused_return_with_native_echo();
+    harness.mock_state.update_window(2, |window| {
+        window.frame.min.x += 300;
+        window.frame.max.x += 300;
+    });
+    harness.world().write_message(Event::SpaceChanged);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100], vec![2]]
+    );
+}
+
+#[test]
+fn verified_return_survives_later_engine_scroll_and_resize() {
+    let mut harness = refused_return_with_native_echo();
+    let entity = window_entity(&mut harness, 2);
+    let strip = harness
+        .world()
+        .query::<(Entity, &LayoutStrip)>()
+        .iter(harness.world())
+        .find_map(|(entity, strip)| (strip.id() == TEST_WORKSPACE_ID).then_some(entity))
+        .unwrap();
+    harness
+        .world()
+        .get_mut::<crate::ecs::Position>(strip)
+        .unwrap()
+        .0
+        .x -= 100;
+    harness.advance(SETTLE);
+    let size = harness.world().get::<crate::ecs::Bounds>(entity).unwrap().0;
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(crate::ecs::ResizeMarker(size.with_x(size.x + 50)));
+    harness.advance(SETTLE);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+}
+
+#[test]
+fn a_press_during_late_handle_recovery_supersedes_the_old_placement() {
+    let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
+    let point = middle_of(harness.world(), 100, 900);
+    press_and_drag(&mut harness, 2, point);
+    release(&mut harness, point);
+    harness
+        .mock_state
+        .os_transfer_window_late(2, EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(ms(100));
+    let entity = window_entity(&mut harness, 2);
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::AwaitingHandle>(entity)
+            .is_some()
+    );
+    let body = frame(harness.world(), 2).center();
+    harness.world().write_message(Event::MouseDown {
+        point: crate::manager::origin_to(body),
+        button: MouseButton::Left,
+        window_id: Some(2),
+        modifiers: Modifiers::empty(),
+    });
+    harness.advance(FRAME);
+    release(&mut harness, body);
+    harness.mock_state.os_list_window(2);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100], vec![2]]
+    );
+}
+
+#[test]
+fn a_failed_return_releases_membership_after_native_verification_fails() {
+    let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
+    let point = middle_of(harness.world(), 100, 900);
+    press_and_drag(&mut harness, 2, point);
+    macos_moves_to_ext(&mut harness, 2);
+    harness
+        .mock_state
+        .update_window(2, |window| window.dropped_positions = 1000);
+    release(&mut harness, point);
+    harness.advance(ms(2000));
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100], vec![2]]
+    );
+}
+
+#[test]
+fn native_query_failure_backs_off_suspends_and_wakes_on_a_fresh_signal() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    harness
+        .mock_state
+        .fail_membership_reads(EXT_WORKSPACE_ID, 1000);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.advance(ms(3000));
+    let reads = harness.mock_state.membership_reads(EXT_WORKSPACE_ID);
+    harness.advance(ms(3000));
+    assert_eq!(harness.mock_state.membership_reads(EXT_WORKSPACE_ID), reads);
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    harness
+        .mock_state
+        .fail_membership_reads(EXT_WORKSPACE_ID, 0);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100], vec![2]]
+    );
+}
+
+#[test]
+fn fresh_activation_migrates_unrelated_windows_while_another_group_remains_held() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    let point = middle_of(harness.world(), 100, 900);
+    press_and_drag(&mut harness, 2, point);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.advance(FRAME * 3);
+    macos_moves_to_ext(&mut harness, 0);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.advance(FRAME * 3);
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![1], vec![2]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100], vec![0]]
+    );
+}
+
+#[test]
+fn one_native_tab_report_cannot_extract_another_held_tab() {
+    let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
+    add_native_tab(&mut harness, 2, 3);
+    let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
+    let point = middle_of(harness.world(), 100, 900);
+    press_and_drag(&mut harness, 3, point);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: EXT_DISPLAY_ID,
+    });
+    harness.advance(ms(450));
+    assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID), source);
+    release(&mut harness, point);
+    harness.advance(SETTLE);
+    assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID), source);
+}
+
+#[test]
+fn removing_a_group_member_during_placement_does_not_keep_other_windows_owned() {
+    let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
+    add_native_tab(&mut harness, 2, 3);
+    let point = middle_of(harness.world(), 100, 900);
+    press_and_drag(&mut harness, 3, point);
+    release(&mut harness, point);
+    harness
+        .mock_state
+        .os_transfer_window_late(3, EXT_WORKSPACE_ID);
+    harness.advance(ms(100));
+    harness.mock_state.os_close_window(3);
+    let entity = window_entity(&mut harness, 3);
+    harness.world().despawn(entity);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100], vec![2]]
+    );
+}
+
+#[test]
+fn a_deferred_activation_follows_a_different_live_space_on_replay() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    let third_space = EXT_WORKSPACE_ID + 1;
+    let display = harness
+        .world()
+        .query::<(Entity, &crate::manager::Display)>()
+        .iter(harness.world())
+        .find_map(|(entity, display)| (display.id() == EXT_DISPLAY_ID).then_some(entity))
+        .unwrap();
+    harness.world().spawn((
+        LayoutStrip::new(third_space, 0),
+        ChildOf(display),
+        crate::ecs::Position(Origin::new(TEST_DISPLAY_WIDTH, 0)),
+        crate::ecs::SelectedVirtualMarker,
+    ));
+    let start = frame(harness.world(), 2);
+    press_at(&mut harness, start.min + IVec2::new(100, 10));
+    harness.advance(FRAME);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.advance(FRAME * 3);
+    harness
+        .mock_state
+        .update_window(2, |window| window.workspace_id = third_space);
+    harness
+        .world()
+        .write_message(Event::WindowResized { window_id: 2 });
+    harness.advance(SETTLE);
+    let entity = window_entity(&mut harness, 2);
+    assert!(
+        harness
+            .world()
+            .query::<&LayoutStrip>()
+            .iter(harness.world())
+            .any(|strip| strip.id() == third_space && strip.contains(entity))
+    );
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+}
+
+#[test]
+fn a_new_resize_press_after_idle_grace_keeps_manual_resize_classification() {
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 0);
+    press_at(&mut harness, Origin::new(start.max.x - 1, start.center().y));
+    harness.advance(FRAME);
+    harness.mock_state.set_left_button_down(false);
+    harness.advance(ms(2000));
+    press_at(&mut harness, Origin::new(start.max.x - 1, start.center().y));
+    harness.advance(FRAME);
+    macos_tile(&mut harness, 0, IRect::new(0, 20, 512, 768));
+    release(&mut harness, Origin::new(511, start.center().y));
+    harness.advance(ms(100));
+    assert_eq!(frame(harness.world(), 0).width(), 512);
+}
+
+#[test]
+fn native_membership_convergence_retires_the_old_receipt() {
+    let mut harness = refused_return_with_native_echo();
+    harness
+        .mock_state
+        .update_window(2, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.advance(FRAME * 3);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100], vec![2]]
+    );
+}
+
+#[test]
+fn failed_native_frame_readback_cannot_acknowledge_a_return() {
+    let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
+    let point = middle_of(harness.world(), 100, 900);
+    press_and_drag(&mut harness, 2, point);
+    macos_moves_to_ext(&mut harness, 2);
+    release(&mut harness, point);
+    harness
+        .mock_state
+        .update_window(2, |window| window.frame_read_failures = 255);
+    harness.advance(ms(1500));
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100], vec![2]]
+    );
+}
+
+#[test]
+fn append_to_a_display_without_a_strip_finishes_its_pending_placement() {
+    use bevy::ecs::system::RunSystemOnce;
+    for native_tabs in [false, true] {
+        let mut harness = TestHarness::new()
+            .with_display(
+                EXT_DISPLAY_ID,
+                ext_bounds(EXT_DISPLAY_HEIGHT),
+                vec![EXT_WORKSPACE_ID],
+            )
+            .with_windows(3);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.advance(SETTLE);
+        if native_tabs {
+            add_native_tab(&mut harness, 0, 3);
+        }
+        let expected = layout_on(harness.world(), TEST_WORKSPACE_ID)[0].clone();
+        let strips: Vec<_> = harness
+            .world()
+            .query::<(Entity, &LayoutStrip)>()
+            .iter(harness.world())
+            .filter_map(|(entity, strip)| (strip.id() == EXT_WORKSPACE_ID).then_some(entity))
+            .collect();
+        for strip in strips {
+            harness.world().despawn(strip);
+        }
+        harness.world().write_message(Event::Command {
+            command: Command::Window(Operation::ToNextDisplay(crate::commands::MoveFocus::Follow)),
+        });
+        harness.advance(SETTLE);
+        assert!(
+            !layout_on(harness.world(), TEST_WORKSPACE_ID)
+                .iter()
+                .flatten()
+                .any(|id| *id == 0)
+        );
+        assert!(ext_bounds(EXT_DISPLAY_HEIGHT).contains(frame(harness.world(), 0).center()));
+        let active = harness
+            .world()
+            .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
+            .unwrap();
+        assert!(
+            !active,
+            "the empty-display append must finish without a target strip"
+        );
+        harness.world().write_message(Event::SpaceChanged);
+        harness.advance(ms(2000));
+        assert!(
+            !layout_on(harness.world(), TEST_WORKSPACE_ID)
+                .iter()
+                .flatten()
+                .any(|id| expected.contains(id))
+        );
+        harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+        harness.advance(FRAME * 3);
+        harness.world().write_message(Event::SpaceCreated {
+            space_id: EXT_WORKSPACE_ID,
+        });
+        harness.advance(FRAME * 3);
+        // Strip discovery does not itself make the old source observation current.
+        harness.mock_state.os_activate_display(TEST_DISPLAY_ID);
+        harness.advance(FRAME * 3);
+        assert!(
+            !layout_on(harness.world(), TEST_WORKSPACE_ID)
+                .iter()
+                .flatten()
+                .any(|id| expected.contains(id))
+        );
+        for member in &expected {
+            macos_moves_to_ext(&mut harness, *member);
+        }
+        harness.advance(SETTLE);
+        assert_eq!(layout_on(harness.world(), EXT_WORKSPACE_ID), vec![expected]);
+    }
+}
+
+#[test]
+fn an_external_resize_before_space_notification_invalidates_the_old_receipt() {
+    let mut harness = refused_return_with_native_echo();
+    let old = frame(harness.world(), 2);
+    harness
+        .mock_state
+        .os_resize_window(2, old.size().with_x(old.width() + 73));
+    harness.advance(FRAME * 3);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100], vec![2]]
+    );
+}

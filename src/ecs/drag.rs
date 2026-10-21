@@ -11,9 +11,9 @@
 //!   effects to the [`LayoutStrip`].
 //!
 mod tiling;
-pub(crate) use tiling::TilingRestore;
 #[cfg(test)]
 pub(crate) use tiling::is_macos_tile;
+pub(crate) use tiling::{PointerResize, TilingRestore};
 
 use std::cell::OnceCell;
 use std::ops::Range;
@@ -31,7 +31,7 @@ use bevy::ecs::schedule::common_conditions::{
     not, on_message, resource_changed, resource_exists, resource_exists_and_changed,
 };
 use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
-use bevy::ecs::system::{Commands, NonSendMut, Populated, Query, Res, ResMut, SystemParam};
+use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 use objc2_core_graphics::CGDirectDisplayID;
@@ -41,6 +41,9 @@ use crate::commands::{Direction, display_in_direction};
 use crate::config::Config;
 use crate::ecs::display::{DisplayMoves, Placement};
 use crate::ecs::layout::{Column, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, effective_stack_limit};
+use crate::ecs::native_membership::{
+    AppliedPlacement, NativeMembership, NativeScope, PlacementDestination,
+};
 use crate::ecs::{
     Bounds, FocusedMarker, FullWidthMarker, Initializing, LayoutPosition, ManualStripOffset,
     Position, PresentedOrigin, RepositionMarker, Scrolling, SpawnCommandsExt, TopBarHeight,
@@ -855,70 +858,6 @@ fn drag_edge_scroll(
     }
 }
 
-#[derive(Component)]
-pub(crate) struct DropPlacementGuard {
-    pub until: Duration,
-}
-
-#[derive(SystemParam)]
-pub(crate) struct DragPlacementProtection<'w, 's> {
-    state: Option<Res<'w, DragState>>,
-    guards: Query<
-        'w,
-        's,
-        (
-            &'static DropPlacementGuard,
-            Has<RepositionMarker>,
-            Has<super::ResizeMarker>,
-        ),
-    >,
-    time: Res<'w, Time>,
-}
-
-impl DragPlacementProtection<'_, '_> {
-    pub(crate) fn protects<'a>(
-        &self,
-        entity: Entity,
-        mut strips: impl Iterator<Item = &'a LayoutStrip>,
-    ) -> bool {
-        if self
-            .guards
-            .get(entity)
-            .is_ok_and(|(guard, moving, resizing)| {
-                self.time.elapsed() < guard.until || moving || resizing
-            })
-        {
-            return true;
-        }
-        let Some(held) = self.state.as_ref().and_then(|state| state.window()) else {
-            return false;
-        };
-        entity == held
-            || strips.any(|strip| {
-                strip
-                    .tab_group(held)
-                    .is_some_and(|group| group.contains(&entity))
-            })
-    }
-}
-
-fn cleanup_drop_guards(
-    guards: Populated<(
-        Entity,
-        &DropPlacementGuard,
-        Has<RepositionMarker>,
-        Has<super::ResizeMarker>,
-    )>,
-    time: Res<Time>,
-    mut commands: Commands,
-) {
-    for (entity, guard, moving, resizing) in guards {
-        if time.elapsed() >= guard.until && !moving && !resizing {
-            commands.entity(entity).remove::<DropPlacementGuard>();
-        }
-    }
-}
-
 pub struct DragEventsPlugin;
 
 impl Plugin for DragEventsPlugin {
@@ -932,7 +871,9 @@ impl Plugin for DragEventsPlugin {
                 tiling::track_resize_gesture
                     .before(super::systems::window_resized_update_frame)
                     .in_set(super::UpdateSet::Events)
-                    .run_if(on_message::<Event>),
+                    .run_if(on_message::<Event>.or_eager(|resize: Res<PointerResize>| {
+                        !matches!(*resize, PointerResize::Idle)
+                    })),
             )
             .add_systems(
                 Update,
@@ -961,7 +902,6 @@ impl Plugin for DragEventsPlugin {
                 // layout put the windows this frame. A display or layout
                 // change can move the shape with the pointer still.
                 (
-                    cleanup_drop_guards,
                     drag_feedback.run_if(
                         resource_changed::<DragState>
                             .or_eager(displays_changed)
@@ -1011,10 +951,28 @@ pub(super) fn drag_events(
     presented: Presented,
     mut moves: DisplayMoves,
     config: Res<Config>,
+    mut native: ResMut<NativeMembership>,
     mut commands: Commands,
 ) {
     let now = time.elapsed();
     for event in messages.read() {
+        if let Event::MouseDown {
+            point,
+            window_id,
+            button: MouseButton::Left,
+            ..
+        } = event
+        {
+            let id = window_id.or_else(|| window_manager.find_window_at_point(point).ok());
+            if let Some(entity) = id.and_then(|id| {
+                windows
+                    .iter()
+                    .find_map(|(entity, window, _, _)| (window.id() == id).then_some(entity))
+            }) {
+                native.request(NativeScope::TargetedPress(entity));
+            }
+        }
+
         let Some(input) = drag_input(
             event,
             &state,
@@ -1066,7 +1024,7 @@ pub(super) fn drag_events(
                 &mut moves,
                 &mut placements,
                 &mut commands,
-                now,
+                &mut native,
             );
         }
     }
@@ -1222,13 +1180,15 @@ fn pressed_window(
 /// nothing has come for a long time, or the window it holds is gone. A
 /// lost release would otherwise keep [`DragState::holds_window`] true and
 /// stop every later focus from centering its window.
-fn drag_watchdog(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drag_watchdog(
     mut state: ResMut<DragState>,
     time: Res<Time>,
     window_manager: Res<WindowManager>,
     windows: WindowInfo,
     mut placements: Placements,
     mut moves: DisplayMoves,
+    mut native: ResMut<NativeMembership>,
     mut commands: Commands,
 ) {
     let Some(window) = state.window() else {
@@ -1262,7 +1222,7 @@ fn drag_watchdog(
             &mut moves,
             &mut placements,
             &mut commands,
-            time.elapsed(),
+            &mut native,
         );
     }
 }
@@ -1502,15 +1462,16 @@ fn apply_drop(
     moves: &mut DisplayMoves,
     placements: &mut Placements,
     commands: &mut Commands,
-    now: Duration,
+    native: &mut NativeMembership,
 ) {
-    let Some((source, _, _, source_display, _)) = moves
+    let Some((source, source_strip, _, source_display, _)) = moves
         .strips
         .iter()
         .find(|(_, strip, _, _, _)| strip.contains(window))
     else {
         return;
     };
+    let previous_space = source_strip.id();
     let source_display = source_display.parent();
     let destination = match target {
         DropTarget::IntoColumn {
@@ -1542,17 +1503,18 @@ fn apply_drop(
                 commands,
             );
         }
-        if let Some((_, strip, _, _, _)) = moves
+        if let Some((strip_entity, strip, _, _, _)) = moves
             .strips
             .iter()
             .find(|(_, strip, _, _, _)| strip.contains(window))
         {
-            restore_drop_members(
-                &strip.tab_group(window).unwrap_or_else(|| vec![window]),
-                placements,
-                commands,
-                now,
-            );
+            let members = strip.tab_group(window).unwrap_or_else(|| vec![window]);
+            restore_drop_members(&members, placements);
+            native.placed(AppliedPlacement {
+                members,
+                destination: PlacementDestination::Strip(strip_entity),
+                previous_space,
+            });
         }
         commands.ensure_visible(window);
         commands.focus_entity(window, false);
@@ -1597,25 +1559,22 @@ fn apply_drop(
 
     // The user's drag left the window where it was released. Marking its
     // slot changed sends it there, even when the slot did not move.
-    restore_drop_members(&members, placements, commands, now);
+    restore_drop_members(&members, placements);
+    native.placed(AppliedPlacement {
+        members,
+        destination: PlacementDestination::Strip(source),
+        previous_space,
+    });
     commands.ensure_visible(window);
     if !focused {
         commands.focus_entity(window, false);
     }
 }
 
-fn restore_drop_members(
-    members: &[Entity],
-    placements: &mut Placements,
-    commands: &mut Commands,
-    now: Duration,
-) {
+fn restore_drop_members(members: &[Entity], placements: &mut Placements) {
     for &member in members {
         if let Ok((mut position, _)) = placements.get_mut(member) {
             position.set_changed();
-            commands.entity(member).insert(DropPlacementGuard {
-                until: now + SETTLE_WINDOW,
-            });
         }
     }
 }

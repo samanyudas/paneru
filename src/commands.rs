@@ -1255,6 +1255,7 @@ fn to_next_display(
     windows: Windows,
     mut moves: DisplayMoves,
     window_manager: Res<WindowManager>,
+    mut native: ResMut<crate::ecs::native_membership::NativeMembership>,
     mut commands: Commands,
 ) {
     let Some((move_focus, direction)) = filter_window_operations(&mut messages, |op| {
@@ -1316,7 +1317,15 @@ fn to_next_display(
     debug!("moved window (id {window_id}, {entity}) to display {target_id}.");
 
     let bounds = arrival.display_bounds;
-    commands.reposition_entity(entity, bounds.min.with_x(bounds.center().x - size.x / 2));
+    let origin = bounds.min.with_x(bounds.center().x - size.x / 2);
+    if arrival.strip.is_none() {
+        for member in &arrival.placement.members {
+            commands.reposition_entity(*member, origin);
+        }
+    } else {
+        commands.reposition_entity(entity, origin);
+    }
+    native.placed(arrival.placement);
     if matches!(move_focus, MoveFocus::Follow) {
         window_manager.warp_mouse(bounds.center());
     }

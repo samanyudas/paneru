@@ -17,7 +17,7 @@ const TILE_TOLERANCE: i32 = 2;
 const RESIZE_RELEASE_GRACE: Duration = Duration::from_millis(600);
 
 #[derive(Default, Resource)]
-pub(super) enum PointerResize {
+pub(crate) enum PointerResize {
     #[default]
     Idle,
     Held(Entity),
@@ -32,19 +32,14 @@ pub(super) enum PointerResize {
 pub(super) fn track_resize_gesture(
     mut events: MessageReader<Event>,
     mut gesture: ResMut<PointerResize>,
-    windows: Query<(Entity, &Window, &PresentedOrigin, &Bounds)>,
+    windows: Query<
+        (Entity, &Window, &PresentedOrigin, &Bounds),
+        bevy::ecs::query::Without<crate::ecs::Unmanaged>,
+    >,
     window_manager: Res<WindowManager>,
     time: Res<Time>,
 ) {
     for event in events.read() {
-        if let PointerResize::Held(window) = *gesture
-            && !window_manager.left_button_down()
-        {
-            *gesture = PointerResize::Released {
-                window,
-                until: time.elapsed() + RESIZE_RELEASE_GRACE,
-            };
-        }
         match event {
             Event::MouseDown {
                 point,
@@ -91,6 +86,25 @@ pub(super) fn track_resize_gesture(
             }
             _ => {}
         }
+    }
+    let tracked = match *gesture {
+        PointerResize::Held(window) | PointerResize::Released { window, .. } => Some(window),
+        PointerResize::Idle => None,
+    };
+    if tracked.is_some_and(|window| windows.get(window).is_err()) {
+        *gesture = PointerResize::Idle;
+    }
+    match *gesture {
+        PointerResize::Held(window) if !window_manager.left_button_down() => {
+            *gesture = PointerResize::Released {
+                window,
+                until: time.elapsed() + RESIZE_RELEASE_GRACE,
+            };
+        }
+        PointerResize::Released { until, .. } if time.elapsed() > until => {
+            *gesture = PointerResize::Idle;
+        }
+        _ => {}
     }
 }
 

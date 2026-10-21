@@ -8,7 +8,6 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::ecs::world::World;
 use bevy::time::common_conditions::on_timer;
@@ -16,24 +15,23 @@ use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
-use super::{ActiveDisplayMarker, SpawnWindowTrigger};
+use super::ActiveDisplayMarker;
 use crate::commands::{
     Direction, MoveFocus, Operation, filter_window_operations, get_window_in_direction,
 };
 use crate::config::Config;
-use crate::ecs::drag::DragPlacementProtection;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, origin_exposing};
-use crate::ecs::params::{ActiveDisplay, WindowCtx, Windows};
+use crate::ecs::native_membership::{NativeMembership, NativeScope};
+use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, DockPosition, FocusedMarker, Initializing, ManualStripOffset,
-    NativeFullscreenMarker, Position, RaiseWindow, RepositionMarker, Scrolling,
-    SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
+    ActiveWorkspaceMarker, DockPosition, FocusedMarker, ManualStripOffset, NativeFullscreenMarker,
+    Position, RaiseWindow, RepositionMarker, Scrolling, SelectedVirtualMarker, SendMessageTrigger,
+    SpawnCommandsExt, Timeout, Unmanaged,
 };
-use crate::errors::Result;
 use crate::events::{DestroySource, Event};
-use crate::manager::{Application, Display, Origin, Window, WindowManager};
-use crate::platform::{WinID, WorkspaceId};
+use crate::manager::{Display, Origin, Window, WindowManager};
+use crate::platform::WorkspaceId;
 use crate::util::round_px;
 
 pub struct WorkspaceEventsPlugin;
@@ -135,13 +133,6 @@ impl Plugin for WorkspaceEventsPlugin {
                 handle_virtual_window_moves,
             )
                 .in_set(super::UpdateSet::Events),
-        );
-        app.add_systems(
-            Update,
-            detect_moved_windows
-                .in_set(super::UpdateSet::Focus)
-                .after(crate::ecs::drag::drag_events)
-                .run_if(not(resource_exists::<Initializing>)),
         );
         app.add_systems(
             Update,
@@ -268,6 +259,7 @@ fn workspace_change_handler(
     )>,
     active_display: Single<(&Display, Entity), With<ActiveDisplayMarker>>,
     window_manager: Res<WindowManager>,
+    mut native: ResMut<NativeMembership>,
     mut commands: Commands,
 ) {
     if !messages
@@ -282,6 +274,8 @@ fn workspace_change_handler(
         error!("Unable to get active workspace id!");
         return;
     };
+
+    native.request(NativeScope::ActivatedSpace(workspace_id));
 
     let mut remove_from = None;
     let mut insert_into = None;
@@ -343,169 +337,6 @@ fn workspace_change_handler(
     {
         entity_commands.try_insert(ActiveWorkspaceMarker);
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-fn detect_moved_windows(
-    activated_workspace: Single<Entity, Added<ActiveWorkspaceMarker>>,
-    mut workspaces: Query<(
-        &mut LayoutStrip,
-        Entity,
-        Has<NativeFullscreenMarker>,
-        Option<&ChildOf>,
-    )>,
-    apps: Query<&mut Application>,
-    window_manager: Res<WindowManager>,
-    reconcile_state: Option<Res<crate::ecs::display::DisplayReconcileState>>,
-    mut ignored_windows: Local<HashSet<WinID>>,
-    protection: DragPlacementProtection,
-    mut ctx: WindowCtx,
-) {
-    let Ok((workspace_id, target_display)) = workspaces
-        .get(*activated_workspace)
-        .map(|(strip, _, _, child)| (strip.id(), child.map(ChildOf::parent)))
-    else {
-        return;
-    };
-    debug!("workspace {workspace_id}");
-
-    let strips = workspaces
-        .iter()
-        .filter_map(|strip| (strip.0.id() == workspace_id).then_some(strip.0))
-        .collect::<Vec<_>>();
-    let find_window = |window_id| {
-        ctx.windows
-            .find_managed(window_id)
-            .map(|(_, entity)| entity)
-    };
-    let Ok((moved_windows, mut unresolved)) =
-        windows_not_in_strips(workspace_id, find_window, &strips, &window_manager).inspect_err(
-            |err| {
-                warn!("unable to get windows in the current workspace: {err}");
-            },
-        )
-    else {
-        return;
-    };
-    // Skip known, but unmanaged windows.
-    unresolved.retain(|window_id| {
-        !ignored_windows.contains(window_id) && ctx.windows.find(*window_id).is_none()
-    });
-
-    if !unresolved.is_empty() {
-        let unresolved_ids = unresolved.iter().copied().collect::<HashSet<_>>();
-        // Retry unresolved window IDs: during startup bruteforce, windows on
-        // inactive workspaces may have stale AX attributes (e.g. AXGroup instead
-        // of AXWindow).  Now that this workspace is active, re-query each app's
-        // window list — the AX data should be correct.
-        let retry_windows = apps
-            .into_iter()
-            .flat_map(|app| {
-                app.window_list(&ctx.config)
-                    .into_iter()
-                    .filter(|window| unresolved_ids.contains(&window.id()))
-            })
-            .collect::<Vec<_>>();
-        if retry_windows.is_empty() {
-            ignored_windows.extend(unresolved_ids);
-        } else {
-            debug!(
-                "retrying unresolved windows: {}",
-                retry_windows
-                    .iter()
-                    .map(|window| format!("{}", window.id()))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-            ctx.commands.trigger(SpawnWindowTrigger(retry_windows));
-        }
-    }
-
-    if reconcile_state.is_some_and(|state| state.is_settling()) {
-        return;
-    }
-
-    let moved_set: bevy::ecs::entity::EntityHashSet = moved_windows
-        .iter()
-        .copied()
-        .filter(|&entity| {
-            !protection.protects(entity, workspaces.iter().map(|(strip, _, _, _)| strip))
-                && !workspaces
-                    .iter()
-                    .any(|(strip, _, fullscreen, _)| fullscreen && strip.contains(entity))
-        })
-        .collect();
-    if moved_set.is_empty() {
-        return;
-    }
-
-    if is_batch_workspace_move(workspace_id, &moved_set, &workspaces)
-        && let Some(display_entity) = target_display
-    {
-        ctx.commands.queue(move |world: &mut World| {
-            crate::ecs::display::migrate_moved_windows_for_space(
-                world,
-                display_entity,
-                workspace_id,
-                &moved_set,
-            );
-        });
-        return;
-    }
-
-    for entity in moved_windows {
-        if !moved_set.contains(&entity) {
-            continue;
-        }
-
-        debug!("Window {entity} moved to workspace {workspace_id}.");
-        let moving_entities = workspaces
-            .iter()
-            .find_map(|(strip, _, _, _)| strip.tab_group(entity))
-            .unwrap_or_else(|| vec![entity]);
-        for (mut strip, strip_entity, _, _) in &mut workspaces {
-            if strip_entity == *activated_workspace {
-                strip.append_tab_group(&moving_entities);
-            } else {
-                for moving_entity in &moving_entities {
-                    strip.remove(*moving_entity);
-                }
-            }
-        }
-    }
-}
-
-fn is_batch_workspace_move(
-    workspace_id: WorkspaceId,
-    moved_set: &bevy::ecs::entity::EntityHashSet,
-    workspaces: &Query<(
-        &mut LayoutStrip,
-        Entity,
-        Has<NativeFullscreenMarker>,
-        Option<&ChildOf>,
-    )>,
-) -> bool {
-    workspaces.iter().any(|(strip, _, fullscreen, child)| {
-        if fullscreen || strip.id() == workspace_id {
-            return false;
-        }
-        let matching: Vec<Entity> = strip
-            .all_windows()
-            .into_iter()
-            .filter(|entity| moved_set.contains(entity))
-            .collect();
-        if matching.is_empty() {
-            return false;
-        }
-        if child.is_none() {
-            return true;
-        }
-        let first_group = strip
-            .tab_group(matching[0])
-            .unwrap_or_else(|| vec![matching[0]]);
-        matching.iter().any(|entity| !first_group.contains(entity))
-    })
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
@@ -587,32 +418,6 @@ fn workspace_created_handler(
         let origin = active_display.bounds().min;
         commands.spawn_layout_strip(strip, origin, display_entity, false);
     }
-}
-
-fn windows_not_in_strips<F: Fn(WinID) -> Option<Entity>>(
-    workspace_id: WorkspaceId,
-    find_window: F,
-    strips: &[&LayoutStrip],
-    window_manager: &WindowManager,
-) -> Result<(Vec<Entity>, Vec<WinID>)> {
-    window_manager
-        .windows_in_workspace(workspace_id)
-        .map(|ids| {
-            let mut moved = Vec::new();
-            let mut unresolved = Vec::new();
-            for id in ids {
-                if let Some(entity) = find_window(id) {
-                    // If window exists in any of the active workspace rows.
-                    if strips.iter().any(|strip| strip.contains(entity)) {
-                        continue;
-                    }
-                    moved.push(entity);
-                } else {
-                    unresolved.push(id);
-                }
-            }
-            (moved, unresolved)
-        })
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]

@@ -195,6 +195,9 @@ pub struct FrameActivity<'w, 's> {
     awaiting_handles: Query<'w, 's, (), With<AwaitingHandle>>,
     size_checks: Query<'w, 's, (), With<VerifyWindowSize>>,
     width_settlements: Query<'w, 's, (), With<PendingWidthSettlement>>,
+    native: Option<Res<'w, crate::ecs::native_membership::NativeMembership>>,
+    time: Option<Res<'w, bevy::time::Time>>,
+    pointer_resize: Option<Res<'w, crate::ecs::drag::PointerResize>>,
     drag_edges: Query<'w, 's, (), With<crate::ecs::drag::EdgeHold>>,
 }
 
@@ -209,6 +212,15 @@ impl FrameActivity<'_, '_> {
             || !self.size_checks.is_empty()
             || !self.width_settlements.is_empty()
             || !self.drag_edges.is_empty()
+            || self
+                .native
+                .as_ref()
+                .zip(self.time.as_ref())
+                .is_some_and(|(native, time)| native.needs_frame(time.elapsed()))
+            || self
+                .pointer_resize
+                .as_ref()
+                .is_some_and(|resize| !matches!(**resize, crate::ecs::drag::PointerResize::Idle))
     }
 }
 
