@@ -1071,18 +1071,21 @@ fn displays_changed(displays: Query<(), Changed<Display>>) -> bool {
     !displays.is_empty()
 }
 
+type MovedStrips<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    (
+        With<LayoutStrip>,
+        Or<(Changed<LayoutStrip>, Changed<Position>)>,
+    ),
+>;
+type MovedWindows<'w, 's> =
+    Query<'w, 's, (), (With<Window>, Or<(Changed<LayoutPosition>, Changed<Bounds>)>)>;
+
 /// Whether the layout moved a strip or any window's slot or size since the
 /// last check.
-fn layout_changed(
-    strips: Query<
-        (),
-        (
-            With<LayoutStrip>,
-            Or<(Changed<LayoutStrip>, Changed<Position>)>,
-        ),
-    >,
-    windows: Query<(), (With<Window>, Or<(Changed<LayoutPosition>, Changed<Bounds>)>)>,
-) -> bool {
+fn layout_changed(strips: MovedStrips, windows: MovedWindows) -> bool {
     !strips.is_empty() || !windows.is_empty()
 }
 
