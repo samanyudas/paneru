@@ -1854,3 +1854,26 @@ fn a_screen_change_rebuilds_the_overlay_even_for_an_unchanged_shape() {
         "the windows are built again for the new screens"
     );
 }
+
+#[test]
+fn exiting_during_a_drag_removes_the_overlay() {
+    use bevy::app::AppExit;
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    let mut harness = three_columns();
+    let log = record_overlay(&mut harness);
+    let into_the_column = middle_of(harness.world(), 0, 600);
+    press_and_drag(&mut harness, 2, into_the_column);
+    assert!(matches!(log.borrow().last(), Some(OverlayCall::Line(_))));
+    log.borrow_mut().clear();
+
+    // Only the cleanup runs. The full exit schedule also saves state to the
+    // real user state file.
+    let world = harness.world();
+    world.write_message(AppExit::Success);
+    world
+        .run_system_once(crate::ecs::systems::cleanup_on_exit)
+        .expect("running cleanup_on_exit");
+
+    assert_eq!(*log.borrow(), vec![OverlayCall::Remove]);
+}
