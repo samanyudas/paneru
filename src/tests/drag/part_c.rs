@@ -1751,3 +1751,46 @@ fn a_warm_listed_closed_window_asks_only_its_own_app() {
     assert!(!has_window(&mut harness, 2));
     assert_eq!(harness.mock_state.window_list_reads(OTHER_APP), reads);
 }
+
+#[test]
+fn a_stale_report_during_an_engine_animation_changes_nothing() {
+    let config = crate::config::Config::try_from("[options]\nanimation_speed = 12.0\n").unwrap();
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
+        .with_windows(4)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+            window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
+        });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(SETTLE);
+    let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
+    assert!(ext.contains(frame(harness.world(), 3).center()));
+
+    // macOS lists window 3 in the external space without moving it, and the
+    // report arrives while a scroll animates the window back onto its display.
+    harness
+        .mock_state
+        .update_window(3, |window| window.workspace_id = EXT_WORKSPACE_ID);
+    harness.world().write_message(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(FRAME);
+    let entity = window_entity(&mut harness, 3);
+    let presented = harness
+        .world()
+        .get::<crate::ecs::PresentedOrigin>(entity)
+        .unwrap()
+        .0;
+    let moving = frame(harness.world(), 3);
+    assert_ne!(moving.min, presented, "window 3 is still animating");
+    assert!(ext.contains(moving.center()), "{moving:?}");
+    harness.advance(SETTLE);
+    assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID), source);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+}
