@@ -114,7 +114,7 @@ pub fn menu_bar_command_handler(
         if let Event::Command {
             command: Command::MenuBar(enabled),
         } = event
-            && visibility.enabled != Some(*enabled)
+            && (visibility.enabled != Some(*enabled) || visibility.dirty)
         {
             visibility.enabled = Some(*enabled);
             visibility.dirty = true;
@@ -1121,6 +1121,54 @@ mod tests {
         harness.app.update();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), shown);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn repeated_menu_bar_choice_retries_failed_save_and_survives_restart() {
+        use crate::tests::TestHarness;
+
+        for enabled in [false, true] {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let parent = std::env::temp_dir().join(format!(
+                "paneru-menu-retry-{}-{stamp}-{enabled}",
+                std::process::id()
+            ));
+            std::fs::write(&parent, "blocks the preference directory").unwrap();
+            let path = parent.join("menu-bar.json");
+            let config =
+                Config::try_from(format!("[decorations.menu]\nenabled = {}\n", !enabled).as_str())
+                    .unwrap();
+            let mut harness = TestHarness::new().with_config(config);
+            harness
+                .app
+                .insert_resource(MenuBarPreferenceFile(path.clone()));
+            harness.world().write_message(Event::Command {
+                command: Command::MenuBar(enabled),
+            });
+            harness.app.update();
+            assert!(!path.exists());
+
+            std::fs::remove_file(&parent).unwrap();
+            std::fs::create_dir(&parent).unwrap();
+            harness.app.update();
+            harness.app.update();
+            assert!(!path.exists());
+
+            harness.world().write_message(Event::Command {
+                command: Command::MenuBar(enabled),
+            });
+            harness.app.update();
+            let restored =
+                MenuBarVisibility::load(&path).enabled(harness.world().resource::<Config>());
+            std::fs::remove_dir_all(&parent).unwrap();
+            assert_eq!(
+                restored, enabled,
+                "the repeated choice must survive restart"
+            );
+        }
     }
 
     #[test]
