@@ -2824,41 +2824,54 @@ fn tile_lifecycle_immediate_relative_width_uses_the_unsettled_native_frame() {
 
 #[test]
 fn tile_lifecycle_repeated_tile_refusal_has_an_absolute_deadline() {
-    let mut harness = harness_with("[options]\nauto_center = false\n", TEST_DISPLAY_HEIGHT, 1);
-    let tile = IRect::new(0, 20, 512, 768);
-    assert_eq!(frame(harness.world(), 0), IRect::new(0, 20, 400, 768));
-    harness.mock_state.update_window(0, |window| {
-        window.minimum_size = Some(tile.size());
-    });
-    for _ in 0..6 {
-        macos_tile(&mut harness, 0, tile);
-        harness.advance(ms(280));
-    }
-    let mut before = 0;
-    harness
-        .mock_state
-        .update_window(0, |window| before = window.resize_writes);
-    for _ in 0..4 {
-        macos_tile(&mut harness, 0, tile);
-        harness.advance(ms(280));
-    }
-    let active = harness
-        .world()
-        .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
-        .unwrap();
-    let mut actual = (tile, 0);
-    harness.mock_state.update_window(0, |window| {
-        actual = (window.frame, window.resize_writes);
-    });
-    assert_eq!(
+    let mut failures = Vec::new();
+    for (tile, minimum, maximum) in [
+        (IRect::new(0, 20, 512, 768), Size::new(512, 748), None),
         (
-            actual.0,
-            bounds_of(&mut harness, 0),
-            actual.1 - before,
-            active
+            IRect::new(0, 20, 512, 394),
+            Size::new(512, 0),
+            Some(Size::new(512, 374)),
         ),
-        (tile, tile.size(), 0, false),
-        "persistent refusal must be adopted without renewed restoration or active frames"
+    ] {
+        let mut harness = harness_with("[options]\nauto_center = false\n", TEST_DISPLAY_HEIGHT, 1);
+        assert_eq!(frame(harness.world(), 0), IRect::new(0, 20, 400, 768));
+        harness.mock_state.update_window(0, |window| {
+            window.minimum_size = Some(minimum);
+            window.maximum_size = maximum;
+        });
+        for _ in 0..6 {
+            macos_tile(&mut harness, 0, tile);
+            harness.advance(ms(280));
+        }
+        let mut before = 0;
+        harness
+            .mock_state
+            .update_window(0, |window| before = window.resize_writes);
+        for _ in 0..4 {
+            macos_tile(&mut harness, 0, tile);
+            harness.advance(ms(280));
+        }
+        let active = harness
+            .world()
+            .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
+            .unwrap();
+        let mut native = (tile, 0);
+        harness.mock_state.update_window(0, |window| {
+            native = (window.frame, window.resize_writes);
+        });
+        let actual = (
+            native.0,
+            bounds_of(&mut harness, 0),
+            native.1 - before,
+            active,
+        );
+        if actual != (tile, tile.size(), 0, false) {
+            failures.push((tile, actual));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "persistent refusal must be adopted without renewed restoration or active frames: {failures:?}"
     );
 }
 
