@@ -1167,13 +1167,16 @@ pub(super) fn commit_window_frame(
                 }
                 _ => None,
             };
-            objc2::rc::autoreleasepool(|_| {
-                if let Some(position) = position {
-                    window.reposition(position.0);
+            objc2::rc::autoreleasepool(|_| match (position, size) {
+                (Some(position), Some(size)) => {
+                    place(
+                        &mut window,
+                        IRect::from_corners(position.0, position.0 + size),
+                    );
                 }
-                if let Some(size) = size {
-                    window.resize(size);
-                }
+                (Some(position), None) => window.reposition(position.0),
+                (None, Some(size)) => window.resize(size),
+                (None, None) => {}
             });
         });
 }
@@ -1738,6 +1741,101 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
             );
             cache.insert(window_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_commit_tests {
+    use std::sync::{Arc, Mutex};
+
+    use bevy::{ecs::system::RunSystemOnce, prelude::*};
+
+    use crate::ecs::layout::LayoutStrip;
+    use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, Position, WidthRatio};
+    use crate::manager::{Display, MockWindowApi, Size, Window};
+
+    fn commit_with_resize_constraint(
+        initial: IRect,
+        target: IRect,
+        constrain: impl Fn(IRect, Size) -> Size + Send + 'static,
+    ) -> IRect {
+        bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let native_frame = Arc::new(Mutex::new(initial));
+        let mut window = MockWindowApi::new();
+        let resized = Arc::clone(&native_frame);
+        window.expect_resize().returning(move |size| {
+            let mut frame = resized.lock().unwrap();
+            frame.max = frame.min + constrain(*frame, size);
+        });
+        let moved = Arc::clone(&native_frame);
+        window.expect_reposition().returning(move |origin| {
+            let mut frame = moved.lock().unwrap();
+            *frame = IRect::from_corners(origin, origin + frame.size());
+        });
+
+        let mut world = World::new();
+        world.spawn((
+            Display::new(1, IRect::new(0, 30, 2560, 1440), 30),
+            ActiveDisplayMarker,
+        ));
+        world.spawn((LayoutStrip::new(1, 0), ActiveWorkspaceMarker));
+        world.spawn((
+            Window::new(Box::new(window)),
+            Position(target.min),
+            Bounds(target.size()),
+            WidthRatio(0.25),
+        ));
+        world.run_system_once(super::commit_window_frame).unwrap();
+        *native_frame.lock().unwrap()
+    }
+
+    #[test]
+    fn frame_commit_shrinks_a_full_height_sibling_into_the_lower_stack_slot() {
+        let target = IRect::new(640, 735, 1280, 1440);
+        let actual = commit_with_resize_constraint(
+            IRect::new(640, 30, 1280, 1440),
+            target,
+            |frame, mut size| {
+                // Native AX accepted the request but returned height 775 after
+                // the full-height sibling had moved below the display edge.
+                if frame.max.y > 1440 && size.y < frame.height() {
+                    size.y = size.y.max(775);
+                }
+                size
+            },
+        );
+        assert_eq!(actual, target);
+    }
+
+    #[test]
+    fn frame_commit_grows_at_the_target_position_when_the_old_position_limits_height() {
+        let target = IRect::new(640, 30, 1280, 1440);
+        let actual = commit_with_resize_constraint(
+            IRect::new(640, 735, 1280, 1440),
+            target,
+            |frame, mut size| {
+                size.y = size.y.min(1440 - frame.min.y);
+                size
+            },
+        );
+        assert_eq!(actual, target);
+    }
+
+    #[test]
+    fn frame_commit_shrinks_height_and_grows_width_across_opposing_origin_constraints() {
+        let target = IRect::new(1280, 735, 2560, 1440);
+        let actual = commit_with_resize_constraint(
+            IRect::new(1920, 30, 2560, 1440),
+            target,
+            |frame, mut size| {
+                size.x = size.x.min(2560 - frame.min.x);
+                if frame.max.y > 1440 && size.y < frame.height() {
+                    size.y = size.y.max(775);
+                }
+                size
+            },
+        );
+        assert_eq!(actual, target);
     }
 }
 
