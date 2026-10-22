@@ -18,6 +18,7 @@ mod query;
 use crate::config::Config;
 use crate::config::snippet::{RuleSubject, SnippetDialect, window_rule_snippet};
 use crate::ecs::display::{DisplayMoves, FloatingLayer, Placement};
+use crate::ecs::drag::NativeResizeStart;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, anchored_origin, clamp_origin_to_viewport,
@@ -837,6 +838,7 @@ fn width_anchor(
 /// * `windows` - A mutable query for all `Window` components.
 /// * `commands` - Bevy commands to trigger events.
 /// * `config` - The `Config` resource.
+#[allow(clippy::too_many_lines)]
 fn resize_window(
     mut messages: MessageReader<Event>,
     ctx: WindowCtx,
@@ -915,6 +917,21 @@ fn resize_window(
 
     let strip = active_display.active_strip();
     let strip_entity = active_display.active_strip_entity();
+    // An explicit width replaces any slot a native resize recorded for the
+    // column, so a later tile check cannot restore the older frame.
+    if size.x > 0
+        && size.y > 0
+        && let Some(column) = strip
+            .index_of(entity)
+            .ok()
+            .and_then(|idx| strip.get(idx).ok())
+    {
+        for member in column.window_iter() {
+            if let Ok(mut cmds) = commands.get_entity(member) {
+                cmds.try_remove::<NativeResizeStart>();
+            }
+        }
+    }
     let anchor = width_anchor(
         runs.get(entity).ok(),
         frame,
@@ -971,6 +988,7 @@ fn step_ratio(ratio: f64, direction: ResizeDirection, step: f64, maximum: f64) -
 /// Only stacks are eligible: `binpack_heights` stretches a column's lone member
 /// to the full strip height, so a height written anywhere else is overwritten on
 /// the next layout pass.
+#[allow(clippy::too_many_lines)]
 fn resize_window_vertical(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -1088,8 +1106,14 @@ fn resize_window_vertical(
         (&items[neighbour], pair - new_height),
     ] {
         for entity in item.window_iter() {
-            if let Some(size) = windows.size(entity) {
-                commands.resize_entity(entity, size.with_y(height));
+            if let Some(size) = windows.size(entity).map(|size| size.with_y(height)) {
+                if size.x > 0
+                    && size.y > 0
+                    && let Ok(mut cmds) = commands.get_entity(entity)
+                {
+                    cmds.try_remove::<NativeResizeStart>();
+                }
+                commands.resize_entity(entity, size);
             }
         }
     }
@@ -1114,6 +1138,12 @@ fn full_width_window(
     };
 
     let viewport = active_display.actual_bounds(&config);
+    // The native tabs that resize with the window, taken before unstacking.
+    // Former stack neighbours only reflow, so their recorded slots stay.
+    let tabs = active_display
+        .active_strip()
+        .tab_group(entity)
+        .unwrap_or_else(|| vec![entity]);
 
     if let Some(marker) = windows.full_width(entity) {
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -1121,6 +1151,13 @@ fn full_width_window(
         }
         let w = round_px(marker.width_ratio * f64::from(viewport.width()));
         let bounds = active_display.actual_bounds(&config).size().with_x(w);
+        if bounds.x > 0 && bounds.y > 0 {
+            for tab in &tabs {
+                if let Ok(mut entity_commands) = commands.get_entity(*tab) {
+                    entity_commands.try_remove::<NativeResizeStart>();
+                }
+            }
+        }
         commands.resize_entity(entity, bounds);
         commands.reshuffle_around(entity);
     } else {
@@ -1137,7 +1174,15 @@ fn full_width_window(
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(FullWidthMarker { width_ratio });
         }
-        commands.resize_entity(entity, Size::new(viewport.width(), viewport.height()));
+        let size = Size::new(viewport.width(), viewport.height());
+        if size.x > 0 && size.y > 0 {
+            for tab in &tabs {
+                if let Ok(mut entity_commands) = commands.get_entity(*tab) {
+                    entity_commands.try_remove::<NativeResizeStart>();
+                }
+            }
+        }
+        commands.resize_entity(entity, size);
         commands.reshuffle_around(entity);
     }
 }
@@ -1518,8 +1563,14 @@ fn equalize_column(
 
         for (item, height) in stack.iter().zip(heights) {
             for entity in item.window_iter() {
-                if let Some(size) = windows.size(entity) {
-                    commands.resize_entity(entity, size.with_y(height));
+                if let Some(size) = windows.size(entity).map(|size| size.with_y(height)) {
+                    if size.x > 0
+                        && size.y > 0
+                        && let Ok(mut cmds) = commands.get_entity(entity)
+                    {
+                        cmds.try_remove::<NativeResizeStart>();
+                    }
+                    commands.resize_entity(entity, size);
                 }
             }
         }
@@ -1561,8 +1612,14 @@ fn balance_strip(
                 cmds.try_remove::<FullWidthMarker>();
             }
 
-            if let Some(size) = windows.size(entity) {
-                commands.resize_entity(entity, size.with_x(focused_width));
+            if let Some(size) = windows.size(entity).map(|size| size.with_x(focused_width)) {
+                if size.x > 0
+                    && size.y > 0
+                    && let Ok(mut cmds) = commands.get_entity(entity)
+                {
+                    cmds.try_remove::<NativeResizeStart>();
+                }
+                commands.resize_entity(entity, size);
             }
         }
     }

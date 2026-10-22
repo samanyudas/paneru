@@ -2506,9 +2506,11 @@ fn explicit_resize_vertical_replaces_slots_for_both_stack_members() {
     harness.advance(SETTLE);
     assert_eq!(frame(harness.world(), 0), IRect::new(0, 20, 512, 269));
     assert_eq!(frame(harness.world(), 1), IRect::new(0, 269, 512, 768));
+    // The lower member reports first. Its top edge moving down grows the
+    // member above by the same amount, which then matches the app's frame.
     for (id, app_frame) in [
-        (0, IRect::new(0, 20, 512, 320)),
         (1, IRect::new(0, 320, 512, 768)),
+        (0, IRect::new(0, 20, 512, 320)),
     ] {
         harness
             .mock_state
@@ -2521,7 +2523,9 @@ fn explicit_resize_vertical_replaces_slots_for_both_stack_members() {
     harness
         .world()
         .write_message(command(Operation::ResizeVertical(Grow)));
-    harness.advance(FRAME);
+    // The resize lands this frame, and the lower member moves to its new top
+    // on the next.
+    harness.advance(FRAME * 2);
     let expected = [IRect::new(0, 20, 512, 394), IRect::new(0, 394, 512, 768)];
     assert_eq!(
         [frame(harness.world(), 0), frame(harness.world(), 1)],
@@ -2537,4 +2541,112 @@ fn explicit_resize_vertical_replaces_slots_for_both_stack_members() {
         [frame(harness.world(), 0), frame(harness.world(), 1)],
         expected,
     );
+}
+
+#[test]
+fn explicit_resize_equalize_replaces_slots_for_both_stack_members() {
+    use crate::commands::ResizeDirection::Shrink;
+
+    let mut harness = harness_with(
+        "[options]\nauto_center = false\npreset_stack_heights = [0.333333, 0.5, 0.666667]\n",
+        TEST_DISPLAY_HEIGHT,
+        2,
+    );
+    harness.run(vec![
+        command(Operation::Focus(Direction::Last)),
+        command(Operation::Stack(Side::West)),
+        command(Operation::Focus(Direction::North)),
+        command(Operation::SetWidth(0.5)),
+        command(Operation::ResizeVertical(Shrink)),
+    ]);
+    harness.advance(SETTLE);
+    // The app resizes both members. The lower one reports first, so its top
+    // edge grows the member above to the app's frame.
+    for (id, app_frame) in [
+        (1, IRect::new(0, 320, 512, 768)),
+        (0, IRect::new(0, 20, 512, 320)),
+    ] {
+        harness
+            .mock_state
+            .update_window(id, |window| window.frame = app_frame);
+        harness
+            .world()
+            .write_message(Event::WindowResized { window_id: id });
+    }
+    harness.advance(FRAME);
+    harness.world().write_message(command(Operation::Equalize));
+    harness.advance(FRAME * 2);
+    let expected = [IRect::new(0, 20, 512, 394), IRect::new(0, 394, 512, 768)];
+    assert_eq!(
+        [frame(harness.world(), 0), frame(harness.world(), 1)],
+        expected
+    );
+    for id in [0, 1] {
+        harness
+            .world()
+            .write_message(Event::WindowResized { window_id: id });
+    }
+    harness.advance(SETTLE);
+    assert_eq!(
+        [frame(harness.world(), 0), frame(harness.world(), 1)],
+        expected
+    );
+}
+
+#[test]
+fn explicit_resize_balance_replaces_the_slot_of_a_resized_column() {
+    let mut harness = harness_with("[options]\nauto_center = false\n", TEST_DISPLAY_HEIGHT, 2);
+    harness.run(vec![command(Operation::SetWidth(0.5))]);
+    harness.advance(SETTLE);
+    let start = frame(harness.world(), 1);
+    assert_eq!(start.min.x, 512, "window 1 starts beside the focused half");
+    // The app widens the other column's window on its own.
+    macos_tile(
+        &mut harness,
+        1,
+        IRect::new(512, start.min.y, 1072, start.max.y),
+    );
+    harness.world().write_message(command(Operation::Balance));
+    harness.advance(FRAME * 2);
+    let expected = IRect::new(512, start.min.y, 1024, start.max.y);
+    assert_eq!(frame(harness.world(), 1), expected);
+    harness
+        .world()
+        .write_message(Event::WindowResized { window_id: 1 });
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), 1), expected);
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn explicit_resize_declarative_frame_replaces_the_windows_old_slot() {
+    use crate::types::state::Frame;
+    use crate::types::windowset::LayoutOp;
+
+    let mut harness = harness_with("[options]\nauto_center = false\n", TEST_DISPLAY_HEIGHT, 1);
+    let start = frame(harness.world(), 0);
+    macos_tile(
+        &mut harness,
+        0,
+        IRect::new(0, start.min.y, 560, start.max.y),
+    );
+    let expected = IRect::new(0, start.min.y, 512, start.max.y);
+    harness.world().write_message(Event::Command {
+        command: Command::Layout(vec![LayoutOp::SetFrame {
+            window: 0,
+            frame: Frame {
+                x: expected.min.x,
+                y: expected.min.y,
+                width: expected.width(),
+                height: expected.height(),
+            },
+        }]),
+    });
+    harness.advance(FRAME * 2);
+    assert_eq!(frame(harness.world(), 0), expected);
+    harness
+        .world()
+        .write_message(Event::WindowResized { window_id: 0 });
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), 0), expected);
 }

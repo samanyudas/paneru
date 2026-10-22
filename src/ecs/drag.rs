@@ -13,7 +13,7 @@
 mod tiling;
 #[cfg(test)]
 pub(crate) use tiling::is_macos_tile;
-pub(crate) use tiling::{PointerResize, TilingRestore};
+pub(crate) use tiling::{NativeResizeStart, PointerResize, TilingRestore};
 
 use std::cell::OnceCell;
 use std::ops::Range;
