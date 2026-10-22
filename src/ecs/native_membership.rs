@@ -320,7 +320,7 @@ fn membership_work(native: Res<NativeMembership>, drag: Res<DragState>, time: Re
 }
 
 fn capture_activations(
-    activated: Query<
+    activated: Populated<
         &LayoutStrip,
         (
             Added<ActiveWorkspaceMarker>,
