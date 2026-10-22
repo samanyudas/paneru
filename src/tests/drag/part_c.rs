@@ -3220,3 +3220,132 @@ fn left_and_right_edge_scrolls_follow_physical_contact_at_pointer_height() {
         }
     }
 }
+
+fn drop_slot_survives_a_preexisting_tile_hold(cross_display: bool) {
+    let mut failures = Vec::new();
+    for native_tabs in [false, true] {
+        let config =
+            crate::config::Config::try_from("[options]\nauto_center = false\nstack_limit = 2\n")
+                .unwrap();
+        let mut harness = TestHarness::new().with_config(config);
+        if cross_display {
+            harness = harness.with_display(
+                EXT_DISPLAY_ID,
+                IRect::new(1024, 0, 2048, 768),
+                vec![EXT_WORKSPACE_ID],
+            );
+        }
+        harness = harness.with_windows(2);
+        if cross_display {
+            harness = harness.with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+                window.frame = IRect::new(1024, 20, 1536, 768);
+            });
+        }
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        if !cross_display {
+            harness.run(vec![command(Operation::SetWidth(0.5))]);
+        }
+        harness.advance(SETTLE);
+        if native_tabs {
+            add_native_tab(&mut harness, 1, 3);
+        }
+        let members = layout_on(harness.world(), TEST_WORKSPACE_ID)
+            .into_iter()
+            .find(|column| column.contains(&1))
+            .unwrap();
+        let grabbed = if native_tabs { 3 } else { 1 };
+        let start = frame(harness.world(), grabbed);
+        let began = harness.world().resource::<Time>().elapsed();
+        for &id in &members {
+            macos_tile(&mut harness, id, IRect::new(0, 20, 512, 768));
+        }
+        harness.advance(ms(100));
+        for &id in &members {
+            assert_eq!(
+                frame(harness.world(), id),
+                start,
+                "tile returns before drag"
+            );
+        }
+        let x = if cross_display { 1024 } else { 0 };
+        let destination = IRect::new(x, 394, x + 512, 768);
+        let point = Origin::new(x + 256, 600);
+        press_and_drag(&mut harness, grabbed, point);
+        assert!(matches!(
+            drag_state(harness.world()),
+            DragState::Dragging(_)
+        ));
+        release(&mut harness, point);
+        if cross_display {
+            for &id in &members {
+                macos_moves_to_ext(&mut harness, id);
+            }
+        }
+        harness.advance(FRAME * 3);
+        assert!(harness.world().resource::<Time>().elapsed() - began < ms(1000));
+        let workspace = if cross_display {
+            EXT_WORKSPACE_ID
+        } else {
+            TEST_WORKSPACE_ID
+        };
+        let target = if cross_display { 100 } else { 0 };
+        let mut expected_column = vec![target];
+        expected_column.extend(&members);
+        let columns = layout_on(harness.world(), workspace);
+        assert!(
+            columns.contains(&expected_column),
+            "tabs={native_tabs}, {columns:?}, expected {expected_column:?}"
+        );
+        for &id in &members {
+            assert_eq!(
+                frame(harness.world(), id),
+                destination,
+                "accepted drop, tabs={native_tabs}"
+            );
+        }
+        for &id in &members {
+            macos_tile(&mut harness, id, destination);
+        }
+        assert!(harness.world().resource::<Time>().elapsed() - began < ms(1000));
+        for (stage, wait) in [
+            ("echo", FRAME * 3),
+            ("old deadline", ms(1000)),
+            ("idle", SETTLE),
+        ] {
+            harness.advance(wait);
+            for &id in &members {
+                let cached = frame(harness.world(), id);
+                let mut actual = cached;
+                harness
+                    .mock_state
+                    .update_window(id, |window| actual = window.frame);
+                if actual != destination || cached != destination {
+                    failures.push((native_tabs, id, stage, destination, actual, cached));
+                }
+            }
+        }
+        assert_eq!(drag_state(harness.world()), DragState::Idle);
+        let active = harness
+            .world()
+            .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
+            .unwrap();
+        assert!(
+            !active,
+            "placement eventually becomes idle, tabs={native_tabs}"
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "cross_display={cross_display}, {failures:#?}"
+    );
+}
+
+#[test]
+fn drop_slot_cross_display_replaces_a_preexisting_tile_hold() {
+    drop_slot_survives_a_preexisting_tile_hold(true);
+}
+
+#[test]
+fn drop_slot_same_display_replaces_a_preexisting_tile_hold() {
+    drop_slot_survives_a_preexisting_tile_hold(false);
+}
