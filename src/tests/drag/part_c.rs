@@ -1955,3 +1955,48 @@ fn a_neighbor_display_showing_a_fullscreen_space_still_stops_the_edge_scroll() {
     harness.advance(ms(1200));
     assert_eq!(strip_x(harness.world(), TEST_WORKSPACE_ID), before);
 }
+
+/// The main display above a smaller, empty display, as on the native rig:
+/// 2560x1440 at the origin, and 2048x1332 below it.
+fn stacked_displays(config: &str) -> (TestHarness, IRect) {
+    let config = crate::config::Config::try_from(config).expect("config parses");
+    let lower = IRect::new(182, 1440, 2230, 2772);
+    let harness = TestHarness::new().with_config(config);
+    harness
+        .mock_state
+        .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, 2560, 1440));
+    let mut harness = harness
+        .with_display(EXT_DISPLAY_ID, lower, vec![EXT_WORKSPACE_ID])
+        .with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(SETTLE);
+    (harness, lower)
+}
+
+#[test]
+fn a_window_stacked_into_a_new_column_on_a_lower_display_stays_on_that_display() {
+    let (mut harness, lower) = stacked_displays("[options]\nstack_limit = 2\n");
+    title_drag(
+        &mut harness,
+        0,
+        Origin::new(lower.center().x, lower.min.y + 120),
+    );
+    assert_eq!(layout_on(harness.world(), EXT_WORKSPACE_ID), vec![vec![0]]);
+    let column = frame(harness.world(), 0);
+    assert!(lower.contains(column.center()), "{column:?}");
+
+    let bottom = Origin::new(column.center().x, lower.max.y - 100);
+    title_drag(&mut harness, 1, bottom);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![0, 1]]
+    );
+    let (top, below) = (frame(harness.world(), 0), frame(harness.world(), 1));
+    for frame in [top, below] {
+        assert!(
+            frame.min.y >= lower.min.y && frame.max.y <= lower.max.y,
+            "the stack stays inside the lower display: {top:?} {below:?}"
+        );
+    }
+    assert_eq!(top.min.y, column.min.y, "the column top does not move");
+}

@@ -183,7 +183,18 @@ impl DisplayMoves<'_, '_> {
             .or_else(|| source_strip.right_neighbour(entity))
             .filter(|neighbour| !members.contains(neighbour));
         for member in &members {
-            commands.resize_entity(*member, Size::new(width, target_viewport.height()));
+            // The destination layout sizes the window from `Bounds`. A resize
+            // animation toward the full height would outlive that layout: a
+            // window joining a stack keeps only its share, and the stale
+            // height would mislead every reader of the moving frame.
+            if let Ok(mut entity_commands) = commands.get_entity(*member) {
+                entity_commands
+                    .try_remove::<crate::ecs::ResizeMarker>()
+                    .try_insert((
+                        crate::ecs::Bounds(Size::new(width, target_viewport.height())),
+                        crate::ecs::VerifyWindowSize::default(),
+                    ));
+            }
             if matches!(placement, Placement::Into(..)) {
                 commands
                     .entity(*member)
