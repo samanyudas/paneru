@@ -860,9 +860,13 @@ pub(super) fn window_resized_update_frame(
         if resizing || verifying {
             continue;
         }
+        // A resize the engine did not start is left alone until it ends on a
+        // tile, or settles and is reported again.
         if tiled {
             let strip_x = active_strip.as_ref().map(|(_, position)| position.0.x);
-            tiling.adopting(entity, bounds.0, strip_x, &mut commands);
+            if tiling.defers(entity, bounds.0, strip_x, &mut commands) {
+                continue;
+            }
         }
         let tabbed = active_strip
             .as_ref()

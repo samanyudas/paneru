@@ -1606,6 +1606,8 @@ pub(super) struct SizeVerification<'w, 's> {
     windows: NativeSizeWindows<'w, 's>,
     layout_strips: Query<'w, 's, &'static LayoutStrip>,
     resizes: Query<'w, 's, &'static ResizeMarker>,
+    native_resizes: Query<'w, 's, &'static crate::ecs::drag::NativeResizeStart>,
+    time: Res<'w, Time>,
 }
 
 pub(super) fn window_resize_verifier(
@@ -1621,6 +1623,18 @@ pub(super) fn window_resize_verifier(
             continue;
         };
         if position.is_changed() || bounds.is_changed() {
+            continue;
+        }
+        // macOS puts a tile frame back while a restored slot holds, so a
+        // readback then is not the app refusing the size.
+        if verification
+            .native_resizes
+            .get(entity)
+            .is_ok_and(|start| start.holds(verification.time.elapsed()))
+        {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<VerifyWindowSize>();
+            }
             continue;
         }
         let frame = window.update_frame();

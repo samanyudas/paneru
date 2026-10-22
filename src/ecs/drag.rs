@@ -966,6 +966,14 @@ impl Plugin for DragEventsPlugin {
                         !matches!(*resize, PointerResize::Idle)
                     })),
             )
+            .add_observer(tiling::adopt_cleared_native_resize)
+            .add_systems(
+                Update,
+                tiling::settle_native_resizes
+                    .before(super::systems::window_resized_update_frame)
+                    .in_set(super::UpdateSet::Events)
+                    .run_if(|starts: Query<(), With<NativeResizeStart>>| !starts.is_empty()),
+            )
             .add_systems(
                 Update,
                 poll_pressed_window

@@ -2274,6 +2274,8 @@ fn explicit_resize_width_commands_keep_requested_frames_after_an_app_resize() {
             IRect::from_corners(start.min, start.min + IVec2::new(app_width, start.height()));
         macos_tile(&mut harness, 0, app_frame);
         assert_eq!(frame(harness.world(), 0), app_frame);
+        // The engine adopts an app's own resize once it settles.
+        harness.advance(ms(300));
 
         harness.world().write_message(command(operation.clone()));
         harness.advance(FRAME);
@@ -2649,4 +2651,85 @@ fn explicit_resize_declarative_frame_replaces_the_windows_old_slot() {
         .write_message(Event::WindowResized { window_id: 0 });
     harness.advance(SETTLE);
     assert_eq!(frame(harness.world(), 0), expected);
+}
+
+fn bounds_of(harness: &mut TestHarness, id: WinID) -> IVec2 {
+    let entity = window_entity(harness, id);
+    harness.world().get::<crate::ecs::Bounds>(entity).unwrap().0
+}
+
+#[test]
+fn a_macos_tile_that_macos_keeps_reapplying_returns_to_its_slot() {
+    let half = IRect::new(0, 20, 512, 768);
+    let fill = IRect::new(0, 20, 1024, 768);
+    for tile in [half, fill] {
+        let mut harness = three_columns();
+        let start = frame(harness.world(), 1);
+        let slot = bounds_of(&mut harness, 1);
+        for step in 1..=4 {
+            let at = |from: i32, to: i32| from + (to - from) * step / 4;
+            let frame = IRect::new(
+                at(start.min.x, tile.min.x),
+                at(start.min.y, tile.min.y),
+                at(start.max.x, tile.max.x),
+                at(start.max.y, tile.max.y),
+            );
+            macos_tile(&mut harness, 1, frame);
+        }
+        // macOS keeps the window's tile state: after each restore it puts the
+        // tile frame back, sometimes before the engine reads the size back.
+        for _ in 0..6 {
+            macos_tile(&mut harness, 1, tile);
+            harness
+                .mock_state
+                .update_window(1, |window| window.frame = tile);
+            harness.advance(FRAME * 3);
+        }
+        macos_tile(&mut harness, 1, tile);
+        harness.advance(SETTLE);
+        assert_eq!(frame(harness.world(), 1), start, "tile {tile:?}");
+        assert_eq!(bounds_of(&mut harness, 1), slot, "tile {tile:?}");
+    }
+}
+
+#[test]
+fn a_native_resize_animation_is_not_fought_and_a_non_tile_end_is_adopted() {
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 1);
+    let writes = |harness: &mut TestHarness| {
+        let mut writes = (0, 0);
+        harness.mock_state.update_window(1, |window| {
+            writes = (window.resize_writes, window.position_writes);
+        });
+        writes
+    };
+    let before = writes(&mut harness);
+    let end = IRect::new(start.min.x, start.min.y, start.max.x + 160, start.max.y);
+    for step in 1..=4 {
+        let frame = IRect::new(
+            start.min.x,
+            start.min.y,
+            start.max.x + 40 * step,
+            start.max.y,
+        );
+        macos_tile(&mut harness, 1, frame);
+        assert_eq!(writes(&mut harness), before, "step {step} is not fought");
+    }
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), 1), end);
+    assert_eq!(bounds_of(&mut harness, 1), end.size());
+}
+
+#[test]
+fn an_apps_size_refusal_outside_a_tile_hold_is_still_adopted() {
+    let mut harness = three_columns();
+    harness
+        .mock_state
+        .update_window(0, |window| window.maximum_size = Some(Size::new(450, 2000)));
+    harness
+        .world()
+        .write_message(command(Operation::SetWidth(0.75)));
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), 0).width(), 450);
+    assert_eq!(bounds_of(&mut harness, 0).x, 450);
 }

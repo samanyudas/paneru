@@ -199,6 +199,7 @@ pub struct FrameActivity<'w, 's> {
     time: Option<Res<'w, bevy::time::Time>>,
     pointer_resize: Option<Res<'w, crate::ecs::drag::PointerResize>>,
     drag_edges: Query<'w, 's, (), With<crate::ecs::drag::EdgeHold>>,
+    native_resizes: Query<'w, 's, (), With<crate::ecs::drag::NativeResizeStart>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -212,6 +213,7 @@ impl FrameActivity<'_, '_> {
             || !self.size_checks.is_empty()
             || !self.width_settlements.is_empty()
             || !self.drag_edges.is_empty()
+            || !self.native_resizes.is_empty()
             || self
                 .native
                 .as_ref()

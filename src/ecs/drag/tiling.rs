@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
-use bevy::ecs::message::MessageReader;
+use bevy::ecs::lifecycle::Remove;
+use bevy::ecs::message::{MessageReader, MessageWriter};
+use bevy::ecs::observer::On;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Commands, Query, Res, ResMut, SystemParam};
 use bevy::math::{IRect, IVec2};
@@ -20,6 +22,15 @@ const RESIZE_RELEASE_GRACE: Duration = Duration::from_millis(600);
 /// How long after its last step a resize the engine did not start still
 /// counts as one resize.
 const NATIVE_RESIZE_QUIET: Duration = Duration::from_millis(600);
+/// How long a resize the engine did not start must go without a step before
+/// the engine adopts its frame. macOS reports the steps of a tile animation
+/// every 10 to 25ms on the native rig, so a 200ms pause means it has ended.
+const NATIVE_RESIZE_SETTLE: Duration = Duration::from_millis(200);
+/// How long a restored slot stays authoritative after a macOS tile. macOS
+/// keeps a tiled window's tile state and puts the tile frame back for about
+/// 300ms after each restore. One second outlasts that with margin, and is
+/// short enough that the hold ends before a deliberate later resize.
+const TILE_RESTORE_HOLD: Duration = Duration::from_secs(1);
 
 /// The windows a left press may be resizing by an edge: every tiled window
 /// whose edge band holds the press point, with the native tabs grouped with
@@ -155,21 +166,71 @@ pub(crate) fn is_macos_tile(frame: IRect, visible: IRect) -> bool {
     })
 }
 
-/// The slot a window had when a resize the engine did not start began. The
-/// engine adopts each step of such a resize, so the steps of a native tile
-/// animation pass through `Bounds` and the strip offset. If the resize ends
-/// on a tile, the window returns to this slot instead.
+/// The slot a window had when a resize the engine did not start began.
+///
+/// While such a resize runs, the engine leaves the window's `Bounds` and
+/// strip offset alone, so it does not fight a native tile animation. If the
+/// resize ends on a tile, the window returns to this slot, and the slot then
+/// holds for [`TILE_RESTORE_HOLD`]: every tile frame macOS puts back returns
+/// to it, and a size readback cannot replace it. Otherwise the engine adopts
+/// the frame once the resize settles.
 #[derive(Component, Clone, Copy)]
 pub(crate) struct NativeResizeStart {
     origin: Origin,
     size: IVec2,
     strip_x: Option<i32>,
     last: Duration,
+    hold_until: Option<Duration>,
+    settled: bool,
 }
 
 impl NativeResizeStart {
     fn fresh(&self, now: Duration) -> bool {
-        now <= self.last + NATIVE_RESIZE_QUIET
+        now <= self.last + NATIVE_RESIZE_QUIET || self.holds(now)
+    }
+
+    /// Whether a restored slot still holds against macOS's tile frames.
+    pub(crate) fn holds(&self, now: Duration) -> bool {
+        self.hold_until.is_some_and(|until| now <= until)
+    }
+}
+
+/// Adopts the live size of a window whose deferred resize record is cleared,
+/// such as by an explicit resize, so clearing the record cannot drop the
+/// adoption it was deferring. A held or settled record adopts nothing here.
+pub(super) fn adopt_cleared_native_resize(
+    removed: On<Remove, NativeResizeStart>,
+    mut windows: Query<(&Window, &NativeResizeStart, &mut Bounds)>,
+    time: Res<Time>,
+) {
+    let Ok((window, start, mut bounds)) = windows.get_mut(removed.entity) else {
+        return;
+    };
+    if start.settled || start.holds(time.elapsed()) {
+        return;
+    }
+    let size = window.frame().size();
+    if bounds.0 != size {
+        bounds.0 = size;
+    }
+}
+
+/// Re-reports a resize the engine did not start once it has settled with no
+/// tile, so the engine adopts its frame. A held slot settles after its hold.
+pub(super) fn settle_native_resizes(
+    mut starts: Query<(&Window, &mut NativeResizeStart)>,
+    time: Res<Time>,
+    mut messages: MessageWriter<Event>,
+) {
+    let now = time.elapsed();
+    for (window, mut start) in &mut starts {
+        if start.settled || start.holds(now) || now < start.last + NATIVE_RESIZE_SETTLE {
+            continue;
+        }
+        start.settled = true;
+        messages.write(Event::WindowResized {
+            window_id: window.id(),
+        });
     }
 }
 
@@ -216,43 +277,63 @@ impl TilingRestore<'_, '_> {
             return None;
         }
         let (origin, resizing, start) = self.presented.get(entity).ok()?;
-        let start = start.filter(|start| start.fresh(now));
-        let (origin, size) = start.map_or_else(
-            || (origin.0, resizing.map_or(size, |resize| resize.0)),
-            |start| (start.origin, start.size),
-        );
-        if frame.min == origin && frame.size() == size {
+        // A settled resize is reported again to be adopted. A tile frame that
+        // outlasts the hold is the app keeping that size, not macOS.
+        if start.is_some_and(|start| start.settled) {
             return None;
         }
-        commands.reposition_entity(entity, origin);
-        commands.resize_entity(entity, size);
+        let start = start
+            .filter(|start| start.fresh(now))
+            .copied()
+            .unwrap_or(NativeResizeStart {
+                origin: origin.0,
+                size: resizing.map_or(size, |resize| resize.0),
+                strip_x: None,
+                last: now,
+                hold_until: None,
+                settled: false,
+            });
+        if frame.min == start.origin && frame.size() == start.size {
+            return None;
+        }
+        commands.reposition_entity(entity, start.origin);
+        commands.resize_entity(entity, start.size);
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_remove::<NativeResizeStart>();
+            entity_commands.try_insert(NativeResizeStart {
+                last: now,
+                hold_until: Some(now + TILE_RESTORE_HOLD),
+                settled: false,
+                ..start
+            });
         }
         Some(Restored {
-            strip_x: start.and_then(|start| start.strip_x),
+            strip_x: start.strip_x,
         })
     }
 
-    /// Records the slot `entity` has before the engine adopts a resize it did
-    /// not start. A user edge resize records nothing.
-    pub(crate) fn adopting(
+    /// Whether the engine defers a resize of `entity` it did not start,
+    /// recording the slot it began from. A user edge resize, and a resize
+    /// that has settled with no tile, are adopted at once instead.
+    pub(crate) fn defers(
         &self,
         entity: Entity,
         size: IVec2,
         strip_x: Option<i32>,
         commands: &mut Commands,
-    ) {
+    ) -> bool {
         let now = self.time.elapsed();
         let Ok((origin, _, start)) = self.presented.get(entity) else {
-            return;
+            return false;
         };
         let Ok(mut entity_commands) = commands.get_entity(entity) else {
-            return;
+            return false;
         };
-        if self.gesture.resizes(entity, now) {
+        if self.gesture.resizes(entity, now) || start.is_some_and(|start| start.settled) {
             entity_commands.try_remove::<NativeResizeStart>();
-            return;
+            return false;
+        }
+        if start.is_some_and(|start| start.holds(now)) {
+            return true;
         }
         let start = start.filter(|start| start.fresh(now)).map_or(
             NativeResizeStart {
@@ -260,6 +341,8 @@ impl TilingRestore<'_, '_> {
                 size,
                 strip_x,
                 last: now,
+                hold_until: None,
+                settled: false,
             },
             |start| NativeResizeStart {
                 last: now,
@@ -267,5 +350,6 @@ impl TilingRestore<'_, '_> {
             },
         );
         entity_commands.try_insert(start);
+        true
     }
 }
