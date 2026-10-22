@@ -894,6 +894,13 @@ impl Plugin for DragEventsPlugin {
             )
             .add_systems(
                 Update,
+                poll_pressed_window
+                    .before(super::systems::window_moved_update_frame)
+                    .in_set(super::UpdateSet::Events)
+                    .run_if(|state: Res<DragState>| awaiting_confirmation(&state).is_some()),
+            )
+            .add_systems(
+                Update,
                 (
                     drag_events
                         .after(super::systems::window_resized_update_frame)
@@ -954,6 +961,49 @@ type WindowInfo<'w, 's> = Query<
 type Presented<'w, 's> = Query<'w, 's, (&'static PresentedOrigin, Option<&'static TopBarHeight>)>;
 type Placements<'w, 's> =
     Query<'w, 's, (&'static mut LayoutPosition, &'static mut Bounds), With<Window>>;
+
+/// The press whose pointer has passed the drag threshold and whose window
+/// has not yet been seen to follow it.
+fn awaiting_confirmation(state: &DragState) -> Option<&Press> {
+    match state {
+        DragState::Pressed(press) | DragState::Released { press, .. }
+            if press.moved_at.is_some() =>
+        {
+            Some(press)
+        }
+        _ => None,
+    }
+}
+
+/// Reports a pressed window's move as soon as its own frame shows it.
+///
+/// An app's `WindowMoved` notification can reach the engine long after the
+/// window moved: the window ID lookup behind it took 188ms on a native rig,
+/// past the confirm window. While a press waits for its window to follow
+/// the pointer, its frame is read each frame instead, and a changed frame is
+/// reported as a move. [`step`] still requires the move to match the
+/// pointer within the confirm window, so a text selection, which moves no
+/// window, never becomes a drag.
+fn poll_pressed_window(
+    state: Res<DragState>,
+    mut windows: Query<&mut Window>,
+    mut messages: bevy::ecs::message::MessageWriter<Event>,
+) {
+    let Some(press) = awaiting_confirmation(&state) else {
+        return;
+    };
+    let Ok(mut window) = windows.get_mut(press.window) else {
+        return;
+    };
+    if window
+        .update_frame()
+        .is_ok_and(|frame| frame.min != press.frame.min)
+    {
+        messages.write(Event::WindowMoved {
+            window_id: window.id(),
+        });
+    }
+}
 
 /// Feeds mouse and window events to [`step`] and applies the drops it asks
 /// for.

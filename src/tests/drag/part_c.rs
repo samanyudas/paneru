@@ -2025,3 +2025,56 @@ fn an_animated_macos_tile_returns_to_the_slot_it_had_before_the_animation() {
         assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
     }
 }
+
+#[test]
+fn a_drag_whose_move_notification_arrives_late_still_drops() {
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 2);
+    let press = start.min + IVec2::new(100, 10);
+    let to = middle_of(harness.world(), 0, 600);
+    press_at(&mut harness, press);
+    harness.advance(FRAME);
+    // The window follows the pointer, but the app's move notifications reach
+    // the engine only 300ms later, as a slow window ID lookup delays them.
+    for at in 1..=6 {
+        let point = press + (to - press) * at / 6;
+        harness.world().write_message(mouse_dragged(point));
+        let origin = start.min + (point - press);
+        harness.mock_state.update_window(2, |window| {
+            window.frame = IRect::from_corners(origin, origin + start.size());
+        });
+        harness.advance(FRAME);
+    }
+    harness.advance(ms(300));
+    harness
+        .world()
+        .write_message(Event::WindowMoved { window_id: 2 });
+    harness.advance(FRAME);
+    release(&mut harness, to);
+    harness.advance(SETTLE);
+    assert_eq!(layout(harness.world()), vec![vec![0, 2], vec![1]]);
+}
+
+#[test]
+fn a_toolbar_text_selection_never_becomes_a_window_drag() {
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 2);
+    let press = start.min + IVec2::new(100, 10);
+    press_at(&mut harness, press);
+    harness.advance(FRAME);
+    for at in 1..=6 {
+        harness
+            .world()
+            .write_message(mouse_dragged(press + IVec2::new(30 * at, 0)));
+        harness.advance(FRAME);
+    }
+    harness.advance(ms(300));
+    harness
+        .world()
+        .write_message(mouse_dragged(press + IVec2::new(190, 0)));
+    harness.advance(FRAME);
+    assert_eq!(drag_state(harness.world()), DragState::Idle);
+    release(&mut harness, press + IVec2::new(190, 0));
+    harness.advance(SETTLE);
+    assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
+}
