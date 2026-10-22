@@ -25,9 +25,12 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::drag::DragOverlayHandle;
+use crate::ecs::drag::{
+    DragOverlayHandle, NativeFrame, NativeResizeStart, TilingRestore, tiled_in,
+};
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
+use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
     LowPowerMode, MinimumHeight, MissionControlActive, Position, PreLaunchFrame,
@@ -51,35 +54,19 @@ type TimedOutSpawns<'w, 's> = Populated<
     Or<(With<BProcess>, With<Application>)>,
 >;
 
-/// Windows as [`window_moved_update_frame`] sees them: the element to re-read,
-/// the origin to update, and the marker saying we are the ones moving it.
-type MovableWindows<'w, 's> = Query<
+type NativeFrameWindows<'w, 's> = Query<
     'w,
     's,
     (
+        Entity,
         &'static mut Window,
         &'static mut Position,
-        &'static Bounds,
-        Option<&'static Unmanaged>,
-        Has<RepositionMarker>,
-    ),
-    Without<LayoutStrip>,
->;
-
-/// Windows as the resize handler rewrites them: the OS handle to re-read the
-/// frame from, the size to overwrite, and whether the window is ours to lay
-/// out at all.
-type ResizableWindows<'w, 's> = Query<
-    'w,
-    's,
-    (
-        &'static mut Window,
-        Entity,
-        &'static Position,
         &'static mut Bounds,
         Option<&'static Unmanaged>,
-        Has<ResizeMarker>,
+        Option<&'static ResizeMarker>,
         Has<VerifyWindowSize>,
+        Has<RepositionMarker>,
+        Option<&'static MinimumHeight>,
     ),
     Without<LayoutStrip>,
 >;
@@ -804,123 +791,284 @@ pub(crate) fn pump_events(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn window_resized_update_frame(
+pub(crate) fn window_frame_update(
     mut messages: MessageReader<Event>,
-    mut windows: ResizableWindows,
+    mut windows: NativeFrameWindows,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
-    minimum_heights: Query<&MinimumHeight>,
+    native_resizes: Query<Entity, With<NativeResizeStart>>,
+    swipes: Query<&Scrolling, With<ActiveWorkspaceMarker>>,
+    tiling: TilingRestore,
     mut commands: Commands,
 ) {
-    for event in messages.read() {
-        let Event::WindowResized { window_id } = event else {
-            continue;
-        };
+    let swiping = swipes
+        .iter()
+        .next()
+        .is_some_and(|scrolling| scrolling.is_user_swiping);
+    let mut notified = if swiping {
+        Vec::new()
+    } else {
+        notified_windows(&mut messages, &windows)
+    };
+    for entity in &native_resizes {
+        if !notified.iter().any(|(notified, ..)| *notified == entity) {
+            notified.push((entity, false, false));
+        }
+    }
 
-        let Some((mut window, entity, position, mut bounds, unmanaged, resizing, verifying)) =
-            windows
-                .iter_mut()
-                .find(|window| window.0.id() == *window_id)
+    for (entity, moved, resized) in notified {
+        let Ok((_, mut window, position, bounds, unmanaged, resize, verifying, repositioning, _)) =
+            windows.get_mut(entity)
         else {
             continue;
         };
-        if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
-            continue;
+        let strip = workspaces.iter().find(|(strip, _)| strip.contains(entity));
+        let tiled = unmanaged.is_none() && strip.is_some_and(|(strip, _)| tiled_in(strip, entity));
+        if !tiled
+            && native_resizes.contains(entity)
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<NativeResizeStart>();
         }
-        if resizing || verifying {
+        if swiping
+            || matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden))
+            || !(moved || resized || (tiled && tiling.due(entity)))
+        {
             continue;
         }
         let Ok(new_frame) = window.update_frame() else {
-            continue;
-        };
-        let active_strip = workspaces
-            .iter_mut()
-            .find(|(strip, _)| strip.contains(entity));
-        let tabbed = active_strip
-            .as_ref()
-            .is_some_and(|strip| strip.0.tabbed(entity));
-
-        // The window now has less height than its recorded minimum, so the
-        // app accepts less than it once refused.
-        if minimum_heights
-            .get(entity)
-            .is_ok_and(|minimum| new_frame.height() < minimum.0)
-            && let Ok(mut entity_commands) = commands.get_entity(entity)
-        {
-            entity_commands.try_remove::<MinimumHeight>();
-        }
-        let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
-        if old_frame.size() != new_frame.size() {
-            if tabbed {
-                bounds.bypass_change_detection().0 = new_frame.size();
-            } else {
-                bounds.0 = new_frame.size();
+            if tiled {
+                tiling.retry(entity, &mut commands);
             }
-        }
-
-        // If the window was resized, shift LayoutStrip slightly to avoid moving right corner.
-        let Some((strip, mut strip_position)) = active_strip else {
-            // Floating window, don't nudge the strip.
             continue;
         };
-        if tabbed {
-            // Native tabs share a single layout slot. Keep the strip anchored
-            // and let the tab sync/layout systems propagate the new size.
-            continue;
-        }
+        let engine = resize.is_some() || verifying;
+        let outcome = if tiled {
+            tiling.observe(
+                entity,
+                new_frame,
+                IRect::from_corners(position.0, position.0 + bounds.0),
+                strip.map(|(_, position)| position.0.x),
+                (window.horizontal_padding(), window.vertical_padding()),
+                &mut commands,
+            )
+        } else {
+            NativeFrame::Ordinary
+        };
 
-        if old_frame.min.x != new_frame.min.x {
-            let shift = (old_frame.size() - new_frame.size()).with_y(0);
-            // Search marke: reposition_entity - Updating position directly to reduce jitter.
-            strip_position.0.x += shift.x;
-        }
-
-        // When the user drags the top edge of a stacked window, we adjust the window above to
-        // accomodate.
-        let diff = old_frame.min.y - new_frame.min.y;
-        if diff.abs() > 0
-            && let Some(above_entity) = strip.above(entity)
-            && let Ok((_, _, _, mut above_bounds, _, _, _)) = windows.get_mut(above_entity)
-            && above_bounds.0.y - diff > 200
+        let adopts_move = match outcome {
+            NativeFrame::Deferred => false,
+            NativeFrame::Restored(strip_x) => {
+                if let Some(x) = strip_x
+                    && let Some((_, mut strip_position)) = workspaces
+                        .iter_mut()
+                        .find(|(strip, _)| strip.contains(entity))
+                {
+                    strip_position.0.x = x;
+                }
+                false
+            }
+            NativeFrame::Refused => {
+                adopt_refused_frame(entity, new_frame, &mut windows, &workspaces, &mut commands);
+                false
+            }
+            NativeFrame::KeptRefusal => {
+                keep_refused_height(entity, new_frame, &mut windows, &mut commands);
+                false
+            }
+            NativeFrame::Settled => {
+                adopt_native_size(
+                    entity,
+                    new_frame,
+                    &mut windows,
+                    &mut workspaces,
+                    &mut commands,
+                );
+                !repositioning
+            }
+            NativeFrame::Ordinary => {
+                if resized && !engine {
+                    adopt_native_size(
+                        entity,
+                        new_frame,
+                        &mut windows,
+                        &mut workspaces,
+                        &mut commands,
+                    );
+                }
+                // Our own move, echoed back: `animate_entities` lerps from the
+                // current `Position`, so overwriting it with the echoed frame
+                // mid-animation restarts each step from behind, and the two
+                // chase each other.
+                moved && !repositioning
+            }
+            NativeFrame::Moved => moved && !repositioning,
+        };
+        if adopts_move
+            && let Ok((_, _, mut position, ..)) = windows.get_mut(entity)
+            && position.0 != new_frame.min
         {
-            above_bounds.0.y -= diff;
+            position.0 = new_frame.min;
         }
     }
 }
 
-#[instrument(level = Level::TRACE, skip_all)]
-pub(crate) fn window_moved_update_frame(
-    mut messages: MessageReader<Event>,
-    mut windows: MovableWindows,
-) {
+fn notified_windows(
+    messages: &mut MessageReader<Event>,
+    windows: &NativeFrameWindows,
+) -> Vec<(Entity, bool, bool)> {
+    let mut notified: Vec<(Entity, bool, bool)> = Vec::new();
     for event in messages.read() {
-        let Event::WindowMoved { window_id } = event else {
-            continue;
+        let (window_id, moved) = match event {
+            Event::WindowMoved { window_id } => (*window_id, true),
+            Event::WindowResized { window_id } => (*window_id, false),
+            _ => continue,
         };
-
-        let Some((mut window, mut position, bounds, unmanaged, repositioning)) = windows
-            .iter_mut()
-            .find(|window| window.0.id() == *window_id)
+        let Some((entity, ..)) = windows
+            .iter()
+            .find(|(_, window, ..)| window.id() == window_id)
         else {
             continue;
         };
-        if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
-            continue;
+        match notified
+            .iter_mut()
+            .find(|(notified, ..)| *notified == entity)
+        {
+            Some((_, was_moved, was_resized)) => {
+                *was_moved |= moved;
+                *was_resized |= !moved;
+            }
+            None => notified.push((entity, moved, !moved)),
         }
-        // Our own move, echoed back: `animate_entities` lerps from the current
-        // `Position`, so overwriting it with the echoed frame mid-animation
-        // restarts each step from behind, and the two chase each other.
-        if repositioning {
-            continue;
-        }
-        let Ok(new_frame) = window.update_frame() else {
-            continue;
-        };
+    }
+    notified
+}
 
-        let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
-        if old_frame.min != new_frame.min {
-            position.0 = new_frame.min;
+fn adopt_native_size(
+    entity: Entity,
+    new_frame: IRect,
+    windows: &mut NativeFrameWindows,
+    workspaces: &mut Query<(&LayoutStrip, &mut Position)>,
+    commands: &mut Commands,
+) {
+    let Ok((_, _, position, mut bounds, .., minimum_height)) = windows.get_mut(entity) else {
+        return;
+    };
+    let active_strip = workspaces
+        .iter_mut()
+        .find(|(strip, _)| strip.contains(entity));
+    let tabbed = active_strip
+        .as_ref()
+        .is_some_and(|strip| strip.0.tabbed(entity));
+
+    // The window now has less height than its recorded minimum, so the
+    // app accepts less than it once refused.
+    if minimum_height.is_some_and(|minimum| new_frame.height() < minimum.0)
+        && let Ok(mut entity_commands) = commands.get_entity(entity)
+    {
+        entity_commands.try_remove::<MinimumHeight>();
+    }
+    let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
+    if old_frame.size() != new_frame.size() {
+        if tabbed {
+            bounds.bypass_change_detection().0 = new_frame.size();
+        } else {
+            bounds.0 = new_frame.size();
         }
+    }
+
+    // If the window was resized, shift LayoutStrip slightly to avoid moving right corner.
+    let Some((strip, mut strip_position)) = active_strip else {
+        // Floating window, don't nudge the strip.
+        return;
+    };
+    if tabbed {
+        // Native tabs share a single layout slot. Keep the strip anchored
+        // and let the tab sync/layout systems propagate the new size.
+        return;
+    }
+
+    if old_frame.min.x != new_frame.min.x {
+        let shift = (old_frame.size() - new_frame.size()).with_y(0);
+        // Search marke: reposition_entity - Updating position directly to reduce jitter.
+        strip_position.0.x += shift.x;
+    }
+
+    // When the user drags the top edge of a stacked window, we adjust the window above to
+    // accomodate.
+    let diff = old_frame.min.y - new_frame.min.y;
+    if diff.abs() > 0
+        && let Some(above_entity) = strip.above(entity)
+        && let Ok((_, _, _, mut above_bounds, ..)) = windows.get_mut(above_entity)
+        && above_bounds.0.y - diff > 200
+    {
+        above_bounds.0.y -= diff;
+    }
+}
+
+fn keep_refused_height(
+    entity: Entity,
+    new_frame: IRect,
+    windows: &mut NativeFrameWindows,
+    commands: &mut Commands,
+) {
+    let Ok((_, _, position, mut bounds, ..)) = windows.get_mut(entity) else {
+        return;
+    };
+    if bounds.is_changed() {
+        return;
+    }
+    if position.0 == new_frame.min && bounds.0.x == new_frame.width() {
+        bounds.bypass_change_detection().0.y = new_frame.height();
+    }
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<NativeResizeStart>();
+    }
+}
+
+fn adopt_refused_frame(
+    entity: Entity,
+    new_frame: IRect,
+    windows: &mut NativeFrameWindows,
+    workspaces: &Query<(&LayoutStrip, &mut Position)>,
+    commands: &mut Commands,
+) {
+    let wider = windows
+        .get_mut(entity)
+        .is_ok_and(|(_, window, mut position, mut bounds, ..)| {
+            if position.0 != new_frame.min {
+                position.0 = new_frame.min;
+            }
+            adopt_refused_size(entity, &window, &mut bounds, new_frame.size(), commands)
+        });
+    if wider
+        && let Some(column) = workspaces.iter().find_map(|(strip, _)| {
+            strip
+                .index_of(entity)
+                .ok()
+                .and_then(|index| strip.get(index).ok())
+        })
+    {
+        widen_column_siblings(
+            entity,
+            &column,
+            |sibling| {
+                windows
+                    .get(sibling)
+                    .ok()
+                    .map(|(_, _, position, bounds, ..)| {
+                        IRect::from_corners(position.0, position.0 + bounds.0)
+                    })
+            },
+            |sibling| {
+                windows
+                    .get(sibling)
+                    .ok()
+                    .and_then(|(.., resize, _, _, _)| resize.map(|resize| resize.0.y))
+            },
+            commands,
+        );
     }
 }
 
@@ -1148,13 +1296,16 @@ pub(super) fn commit_window_frame(
                 }
                 _ => None,
             };
-            objc2::rc::autoreleasepool(|_| {
-                if let Some(position) = position {
-                    window.reposition(position.0);
+            objc2::rc::autoreleasepool(|_| match (position, size) {
+                (Some(position), Some(size)) => {
+                    place(
+                        &mut window,
+                        IRect::from_corners(position.0, position.0 + size),
+                    );
                 }
-                if let Some(size) = size {
-                    window.resize(size);
-                }
+                (Some(position), None) => window.reposition(position.0),
+                (None, Some(size)) => window.resize(size),
+                (None, None) => {}
             });
         });
 }
@@ -1719,6 +1870,101 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
             );
             cache.insert(window_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_commit_tests {
+    use std::sync::{Arc, Mutex};
+
+    use bevy::{ecs::system::RunSystemOnce, prelude::*};
+
+    use crate::ecs::layout::LayoutStrip;
+    use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, Position, WidthRatio};
+    use crate::manager::{Display, MockWindowApi, Size, Window};
+
+    fn commit_with_resize_constraint(
+        initial: IRect,
+        target: IRect,
+        constrain: impl Fn(IRect, Size) -> Size + Send + 'static,
+    ) -> IRect {
+        bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let native_frame = Arc::new(Mutex::new(initial));
+        let mut window = MockWindowApi::new();
+        let resized = Arc::clone(&native_frame);
+        window.expect_resize().returning(move |size| {
+            let mut frame = resized.lock().unwrap();
+            frame.max = frame.min + constrain(*frame, size);
+        });
+        let moved = Arc::clone(&native_frame);
+        window.expect_reposition().returning(move |origin| {
+            let mut frame = moved.lock().unwrap();
+            *frame = IRect::from_corners(origin, origin + frame.size());
+        });
+
+        let mut world = World::new();
+        world.spawn((
+            Display::new(1, IRect::new(0, 30, 2560, 1440), 30),
+            ActiveDisplayMarker,
+        ));
+        world.spawn((LayoutStrip::new(1, 0), ActiveWorkspaceMarker));
+        world.spawn((
+            Window::new(Box::new(window)),
+            Position(target.min),
+            Bounds(target.size()),
+            WidthRatio(0.25),
+        ));
+        world.run_system_once(super::commit_window_frame).unwrap();
+        *native_frame.lock().unwrap()
+    }
+
+    #[test]
+    fn frame_commit_shrinks_a_full_height_sibling_into_the_lower_stack_slot() {
+        let target = IRect::new(640, 735, 1280, 1440);
+        let actual = commit_with_resize_constraint(
+            IRect::new(640, 30, 1280, 1440),
+            target,
+            |frame, mut size| {
+                // Native AX accepted the request but returned height 775 after
+                // the full-height sibling had moved below the display edge.
+                if frame.max.y > 1440 && size.y < frame.height() {
+                    size.y = size.y.max(775);
+                }
+                size
+            },
+        );
+        assert_eq!(actual, target);
+    }
+
+    #[test]
+    fn frame_commit_grows_at_the_target_position_when_the_old_position_limits_height() {
+        let target = IRect::new(640, 30, 1280, 1440);
+        let actual = commit_with_resize_constraint(
+            IRect::new(640, 735, 1280, 1440),
+            target,
+            |frame, mut size| {
+                size.y = size.y.min(1440 - frame.min.y);
+                size
+            },
+        );
+        assert_eq!(actual, target);
+    }
+
+    #[test]
+    fn frame_commit_shrinks_height_and_grows_width_across_opposing_origin_constraints() {
+        let target = IRect::new(1280, 735, 2560, 1440);
+        let actual = commit_with_resize_constraint(
+            IRect::new(1920, 30, 2560, 1440),
+            target,
+            |frame, mut size| {
+                size.x = size.x.min(2560 - frame.min.x);
+                if frame.max.y > 1440 && size.y < frame.height() {
+                    size.y = size.y.max(775);
+                }
+                size
+            },
+        );
+        assert_eq!(actual, target);
     }
 }
 

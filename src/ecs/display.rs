@@ -8,7 +8,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Has, With};
 use bevy::ecs::schedule::IntoScheduleConfigs;
-use bevy::ecs::system::{Commands, NonSend, Query, Res};
+use bevy::ecs::system::{Commands, NonSend, Query, Res, SystemParam};
 use bevy::ecs::world::World;
 use bevy::math::IRect;
 use bevy::platform::collections::HashSet;
@@ -21,21 +21,211 @@ use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
 use crate::config::Config;
-use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
+use crate::ecs::layout::{Column, LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, EnsureVisibleMarker, FocusedMarker, LayoutPosition,
-    ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, EnsureVisibleMarker, FocusedMarker,
+    LayoutPosition, ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties,
     RefreshWindowSizeOnFocus, RepositionMarker, SelectedVirtualMarker, SendMessageTrigger,
-    SpawnCommandsExt, Timeout, Unmanaged,
+    SpawnCommandsExt, Timeout,
 };
 use crate::events::Event;
-use crate::manager::{Display, Window, WindowManager, irect_from};
-use crate::platform::{PlatformCallbacks, WinID, WorkspaceId};
+use crate::manager::{Display, Size, Window, WindowManager, irect_from};
+use crate::platform::{PlatformCallbacks, WorkspaceId};
 use crate::util::{read_screen_property, round_px};
 use bevy::ecs::entity::EntityHashSet;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::ResMut;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// A new column after the last one.
+    Append,
+    /// A new column at gap `index`, where gap 0 is before the first column.
+    Column(usize),
+    /// Into column `column`, `slot` items from the top, as `Into(column, slot)`.
+    Into(usize, usize),
+}
+
+pub(crate) struct DisplayMove {
+    /// The strip the window joined. `None` when the display shows no strip,
+    /// which only an [`Placement::Append`] move allows.
+    pub strip: Option<Entity>,
+    pub display_bounds: IRect,
+    pub left_behind: Option<Entity>,
+    /// The moved window and the native tabs grouped with it.
+    pub members: Vec<Entity>,
+}
+
+type MovableStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        &'static Position,
+        &'static ChildOf,
+        Has<SelectedVirtualMarker>,
+    ),
+>;
+
+type DisplaysWithDocks<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Display,
+        Option<&'static DockPosition>,
+        Has<ActiveDisplayMarker>,
+    ),
+>;
+
+#[derive(SystemParam)]
+pub(crate) struct DisplayMoves<'w, 's> {
+    pub strips: MovableStrips<'w, 's>,
+    pub displays: DisplaysWithDocks<'w, 's>,
+    window_manager: Res<'w, WindowManager>,
+    config: Res<'w, Config>,
+}
+
+impl DisplayMoves<'_, '_> {
+    pub(crate) fn active_display(&self) -> Option<&Display> {
+        self.displays
+            .iter()
+            .find_map(|(_, display, _, active)| active.then_some(display))
+    }
+
+    pub(crate) fn other_displays(&self) -> impl Iterator<Item = &Display> {
+        self.displays
+            .iter()
+            .filter_map(|(_, display, _, active)| (!active).then_some(display))
+    }
+
+    /// The strip shown on display `id`: the selected strip of the space macOS
+    /// shows there.
+    pub(crate) fn shown_strip(&self, id: CGDirectDisplayID) -> Option<Entity> {
+        let space = self.window_manager.active_display_space(id).ok()?;
+        self.strips
+            .iter()
+            .find(|(_, strip, _, _, selected)| *selected && strip.id() == space)
+            .map(|(entity, _, _, _, _)| entity)
+    }
+
+    fn viewport(&self, display_entity: Entity) -> Option<IRect> {
+        let (_, display, dock, _) = self.displays.get(display_entity).ok()?;
+        Some(display.actual_display_bounds(dock, &self.config))
+    }
+
+    /// Moves `entity`, with the native tabs grouped with it, from its strip
+    /// to the strip shown on display `target`, at `placement`.
+    ///
+    /// The window is sized for the destination: the width of the column it
+    /// joins, or for a new column the width it had relative to its old
+    /// display, and the height of the destination. `size` is its size now,
+    /// and `frame_of` gives the frame of any window, for a column's width.
+    /// The window it leaves behind refits its strip.
+    ///
+    /// Returns `None`, changing nothing, when `entity` is in no strip, there
+    /// is no display `target`, the target strip is its own, or `placement`
+    /// names a column the target strip cannot fill.
+    pub(crate) fn move_to_display(
+        &mut self,
+        entity: Entity,
+        target: CGDirectDisplayID,
+        placement: Placement,
+        size: Size,
+        frame_of: impl Fn(Entity) -> Option<IRect>,
+        commands: &mut Commands,
+    ) -> Option<DisplayMove> {
+        let (source, source_display) = self
+            .strips
+            .iter()
+            .find(|(_, strip, _, _, _)| strip.contains(entity))
+            .map(|(strip_entity, _, _, child, _)| (strip_entity, child.parent()))?;
+        let (target_display_entity, display_bounds) = self
+            .displays
+            .iter()
+            .find(|(_, display, _, _)| display.id() == target)
+            .map(|(display_entity, display, _, _)| (display_entity, display.bounds()))?;
+        let strip = self.shown_strip(target);
+        if strip == Some(source) {
+            return None;
+        }
+        let source_viewport = self.viewport(source_display)?;
+        let target_viewport = self.viewport(target_display_entity)?;
+
+        let joined_width = match placement {
+            Placement::Into(column, _) => {
+                let target_strip = self.strips.get(strip?).ok()?.1;
+                match target_strip.get(column).ok()? {
+                    Column::Fullscren(_) => return None,
+                    column => column.width(&frame_of),
+                }
+            }
+            Placement::Append | Placement::Column(_) => None,
+        };
+        if strip.is_none() && placement != Placement::Append {
+            return None;
+        }
+        let width = joined_width.unwrap_or_else(|| {
+            let ratio = (source_viewport.width() > 0)
+                .then(|| f64::from(size.x) / f64::from(source_viewport.width()));
+            ratio.map_or(size.x, |ratio| {
+                round_px(ratio * f64::from(target_viewport.width()))
+            })
+        });
+        let (_, mut source_strip, _, _, _) = self.strips.get_mut(source).ok()?;
+        let members = source_strip
+            .tab_group(entity)
+            .unwrap_or_else(|| vec![entity]);
+        let left_behind = source_strip
+            .left_neighbour(entity)
+            .or_else(|| source_strip.right_neighbour(entity))
+            .filter(|neighbour| !members.contains(neighbour));
+        for member in &members {
+            // The destination layout sizes the window from `Bounds`. A resize
+            // animation toward the full height would outlive that layout: a
+            // window joining a stack keeps only its share, and the stale
+            // height would mislead every reader of the moving frame.
+            if let Ok(mut entity_commands) = commands.get_entity(*member) {
+                entity_commands
+                    .try_remove::<crate::ecs::ResizeMarker>()
+                    .try_insert((
+                        crate::ecs::Bounds(Size::new(width, target_viewport.height())),
+                        crate::ecs::VerifyWindowSize::default(),
+                    ));
+            }
+            if matches!(placement, Placement::Into(..)) {
+                commands
+                    .entity(*member)
+                    .remove::<crate::ecs::FullWidthMarker>();
+            }
+            source_strip.remove(*member);
+        }
+        if let Some(neighbour) = left_behind {
+            commands.refit_after_removal(neighbour);
+        }
+
+        if let Some((_, mut target_strip, _, _, _)) =
+            strip.and_then(|strip| self.strips.get_mut(strip).ok())
+        {
+            match (placement, members.as_slice()) {
+                (Placement::Append, [_]) => target_strip.append(entity),
+                (Placement::Append, group) => target_strip.append_tab_group(group),
+                (Placement::Column(index), group) => target_strip.insert_tab_group_at(index, group),
+                (Placement::Into(column, slot), group) => {
+                    _ = target_strip.join_column(group, column, slot);
+                }
+            }
+        }
+        Some(DisplayMove {
+            strip,
+            display_bounds,
+            left_behind,
+            members,
+        })
+    }
+}
 
 const ORPHANED_SPACES_TIMEOUT_SEC: u64 = 30;
 const DISPLAY_SETTLE_DELAY: Duration = Duration::from_millis(350);
@@ -248,7 +438,9 @@ pub(crate) fn reconcile_displays(
     }
 
     commands.queue(move |world: &mut World| {
-        migrate_moved_windows_across_displays(world);
+        world
+            .resource_mut::<super::native_membership::NativeMembership>()
+            .request(super::native_membership::NativeScope::DisplayTopology);
         refresh_display_layout(world, &previous_parents);
     });
     commands.trigger(SendMessageTrigger(Event::DisplayChanged));
@@ -261,146 +453,51 @@ pub(crate) fn reconcile_displays(
     }
 }
 
-/// Reconciles virtual workspaces when displays are added or removed:
-/// Windows that macOS moved to a display's space are grouped by their
-/// previous virtual workspace strip and placed together into a strip on
-/// that display (populating its empty first workspace, or appending new
-/// virtual workspaces if multiple source workspaces moved or the target
-/// display already has windows).
-pub(crate) fn migrate_moved_windows_across_displays(world: &mut World) {
-    let mut seen = HashSet::new();
-    let targets: Vec<(Entity, WorkspaceId)> = world
-        .query::<(&LayoutStrip, &ChildOf, Has<NativeFullscreenMarker>)>()
-        .iter(world)
-        .filter_map(|(strip, child, fullscreen)| {
-            (!fullscreen && seen.insert((child.parent(), strip.id())))
-                .then_some((child.parent(), strip.id()))
-        })
-        .collect();
-
-    let mut affected_source_spaces = HashSet::new();
-    for (display_entity, target_space_id) in targets {
-        migrate_moved_windows_to_space(
-            world,
-            display_entity,
-            target_space_id,
-            &mut affected_source_spaces,
-        );
-    }
-
-    for source_space_id in affected_source_spaces {
-        compact_workspace_strips(world, source_space_id);
-    }
-}
-
-pub(crate) fn migrate_moved_windows_for_space(
+/// Moves the `admitted` windows, which macOS reports in `space` on `display`,
+/// out of their strips on other spaces. Each source strip's windows stay
+/// together: they fill the space's empty first strip, or open a new virtual
+/// strip after the existing ones.
+pub(crate) fn migrate_windows_to_space(
     world: &mut World,
-    display_entity: Entity,
-    target_space_id: WorkspaceId,
+    display: Entity,
+    space: WorkspaceId,
+    admitted: &EntityHashSet,
 ) {
-    let mut affected_source_spaces = HashSet::new();
-    migrate_moved_windows_to_space(
-        world,
-        display_entity,
-        target_space_id,
-        &mut affected_source_spaces,
-    );
-    for source_space_id in affected_source_spaces {
-        compact_workspace_strips(world, source_space_id);
-    }
-}
-
-fn migrate_moved_windows_to_space(
-    world: &mut World,
-    display_entity: Entity,
-    target_space_id: WorkspaceId,
-    affected_source_spaces: &mut HashSet<WorkspaceId>,
-) {
-    let Some(display_bounds) = world.get::<Display>(display_entity).map(Display::bounds) else {
+    let Some(bounds) = world.get::<Display>(display).map(Display::bounds) else {
         return;
     };
-    let Ok(win_ids) = world
-        .resource::<WindowManager>()
-        .windows_in_workspace(target_space_id)
-    else {
-        return;
-    };
-
-    let managed_windows: HashMap<WinID, Entity> = world
-        .query::<(&Window, Entity, Has<Unmanaged>)>()
-        .iter(world)
-        .filter_map(|(window, entity, unmanaged)| (!unmanaged).then_some((window.id(), entity)))
-        .collect();
-    if managed_windows.is_empty() {
-        return;
-    }
-
-    let moved_entities: EntityHashSet = {
-        let mut strip_query = world.query::<(&LayoutStrip, Has<NativeFullscreenMarker>)>();
-        let strips_in_space: Vec<&LayoutStrip> = strip_query
-            .iter(world)
-            .filter_map(|(strip, _)| (strip.id() == target_space_id).then_some(strip))
-            .collect();
-        let fullscreen_strips: Vec<&LayoutStrip> = strip_query
-            .iter(world)
-            .filter_map(|(strip, fullscreen)| fullscreen.then_some(strip))
-            .collect();
-
-        win_ids
-            .into_iter()
-            .filter_map(|id| managed_windows.get(&id).copied())
-            .filter(|&entity| {
-                !strips_in_space.iter().any(|strip| strip.contains(entity))
-                    && !fullscreen_strips.iter().any(|strip| strip.contains(entity))
-            })
-            .collect()
-    };
-    if moved_entities.is_empty() {
-        return;
-    }
-
-    let mut source_groups: Vec<(Entity, WorkspaceId, u32, EntityHashSet)> = world
+    let mut sources: Vec<_> = world
         .query::<(Entity, &LayoutStrip, Has<NativeFullscreenMarker>)>()
         .iter(world)
-        .filter_map(|(src_entity, src_strip, fullscreen)| {
-            if fullscreen || src_strip.id() == target_space_id {
+        .filter_map(|(entity, strip, fullscreen)| {
+            if fullscreen || strip.id() == space {
                 return None;
             }
-            let matching: EntityHashSet = src_strip
+            let members: EntityHashSet = strip
                 .all_windows()
                 .into_iter()
-                .filter(|entity| moved_entities.contains(entity))
-                .flat_map(|entity| src_strip.tab_group(entity).unwrap_or_else(|| vec![entity]))
+                .filter(|member| admitted.contains(member))
                 .collect();
-            (!matching.is_empty()).then_some((
-                src_entity,
-                src_strip.id(),
-                src_strip.virtual_index,
-                matching,
-            ))
+            (!members.is_empty()).then_some((entity, strip.id(), strip.virtual_index, members))
         })
         .collect();
-    source_groups.sort_by_key(|(_, space_id, v_idx, _)| (*space_id, *v_idx));
-
-    if !source_groups.is_empty() {
-        compact_workspace_strips(world, target_space_id);
+    sources.sort_by_key(|(_, id, index, _)| (*id, *index));
+    if !sources.is_empty() {
+        compact_workspace_strips(world, space);
     }
-
-    for (src_entity, src_space_id, _, moved_in_src) in source_groups {
-        affected_source_spaces.insert(src_space_id);
-        let mut extracted = LayoutStrip::new(target_space_id, 0);
-        if let Some(mut src_strip) = world.get_mut::<LayoutStrip>(src_entity) {
-            src_strip.extract_windows_into(&moved_in_src, &mut extracted);
+    let mut affected = HashSet::new();
+    for (source, source_space, _, members) in sources {
+        let mut extracted = LayoutStrip::new(space, 0);
+        if let Some(mut strip) = world.get_mut::<LayoutStrip>(source) {
+            strip.extract_windows_into(&members, &mut extracted);
         }
         if extracted.len() > 0 {
-            place_extracted_strip(
-                world,
-                display_entity,
-                display_bounds,
-                target_space_id,
-                extracted,
-            );
+            place_extracted_strip(world, display, bounds, space, extracted);
         }
+        affected.insert(source_space);
+    }
+    for source in affected {
+        compact_workspace_strips(world, source);
     }
 }
 

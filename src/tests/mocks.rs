@@ -45,10 +45,13 @@ pub(crate) struct MockWindowData {
     pub(crate) frame_read_delay: std::time::Duration,
     pub(crate) resize_writes: usize,
     pub(crate) position_writes: usize,
+    pub(crate) dropped_positions: u16,
     pub(crate) frame_read_failures: u8,
     pub(crate) title: String,
     pub(crate) minimized: bool,
     pub(crate) workspace_id: WorkspaceId,
+    /// Listed in every space, like a window assigned to all desktops.
+    pub(crate) on_all_spaces: bool,
     pub(crate) visible: bool,
     pub(crate) role: String,
     pub(crate) subrole: String,
@@ -86,10 +89,12 @@ impl Default for MockWindowData {
             frame_read_delay: std::time::Duration::ZERO,
             resize_writes: 0,
             position_writes: 0,
+            dropped_positions: 0,
             frame_read_failures: 0,
             title: String::new(),
             minimized: false,
             workspace_id: 0,
+            on_all_spaces: false,
             visible: true,
             role: "AXWindow".to_string(),
             subrole: "AXStandardWindow".to_string(),
@@ -121,6 +126,9 @@ struct MockStateInner {
     windows: HashMap<WinID, MockWindowData>,
     displays: HashMap<u32, MockDisplayData>,
     fullscreen_spaces: HashSet<WorkspaceId>,
+    membership_failures: HashMap<WorkspaceId, u16>,
+    membership_reads: HashMap<WorkspaceId, usize>,
+    window_list_reads: HashMap<Pid, usize>,
     active_display_id: u32,
     cursor_position: Origin,
     /// Whether the window server sees the left mouse button down.
@@ -170,6 +178,9 @@ impl MockState {
                 windows: HashMap::new(),
                 displays: HashMap::new(),
                 fullscreen_spaces: HashSet::new(),
+                membership_failures: HashMap::new(),
+                membership_reads: HashMap::new(),
+                window_list_reads: HashMap::new(),
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
                 left_button_down: false,
@@ -642,6 +653,34 @@ impl MockState {
         });
     }
 
+    /// Makes the next `failures` native membership reads of `space` fail.
+    pub fn fail_membership_reads(&self, space: WorkspaceId, failures: u16) {
+        self.inner
+            .force_write()
+            .membership_failures
+            .insert(space, failures);
+    }
+
+    /// How many native membership reads of `space` the engine made.
+    pub fn membership_reads(&self, space: WorkspaceId) -> usize {
+        self.inner
+            .force_read()
+            .membership_reads
+            .get(&space)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// How many times the engine asked app `pid` for its AX window list.
+    pub fn window_list_reads(&self, pid: Pid) -> usize {
+        self.inner
+            .force_read()
+            .window_list_reads
+            .get(&pid)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Sets whether the window server sees the left mouse button down. Only
     /// the button state changes: no mouse event is sent.
     pub fn set_left_button_down(&self, down: bool) {
@@ -719,6 +758,10 @@ impl MockState {
                 .filter(|w| w.ax_generation == ax_generation)
             {
                 w.position_writes += 1;
+                if w.dropped_positions > 0 {
+                    w.dropped_positions -= 1;
+                    return;
+                }
                 let size = w.frame.size();
                 w.frame.min = origin;
                 w.frame.max = origin + size;
@@ -1008,8 +1051,14 @@ impl MockState {
         };
 
         let (s, ids) = (self.clone(), window_ids.clone());
-        ma.expect_window_list()
-            .returning(move |_| ids().into_iter().map(|id| s.create_window(id)).collect());
+        ma.expect_window_list().returning(move |_| {
+            *s.inner
+                .force_write()
+                .window_list_reads
+                .entry(pid)
+                .or_default() += 1;
+            ids().into_iter().map(|id| s.create_window(id)).collect()
+        });
 
         let (s, ids) = (self.clone(), window_ids.clone());
         ma.expect_ax_window_ids().returning(move || {
@@ -1097,12 +1146,20 @@ impl MockState {
         let s = self.clone();
         wm.expect_windows_in_workspace()
             .returning(move |workspace_id| {
-                let mut windows = s
-                    .inner
-                    .force_read()
+                let mut inner = s.inner.force_write();
+                *inner.membership_reads.entry(workspace_id).or_default() += 1;
+                if let Some(failures) = inner.membership_failures.get_mut(&workspace_id)
+                    && *failures > 0
+                {
+                    *failures -= 1;
+                    return Err(Error::InvalidWindow);
+                }
+                let mut windows = inner
                     .windows
                     .values()
-                    .filter_map(|w| (w.workspace_id == workspace_id).then_some(w.id))
+                    .filter_map(|w| {
+                        (w.on_all_spaces || w.workspace_id == workspace_id).then_some(w.id)
+                    })
                     .collect::<Vec<_>>();
                 // Sort the windows to keep the tests consistent
                 windows.sort_unstable();

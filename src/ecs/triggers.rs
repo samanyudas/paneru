@@ -1,5 +1,5 @@
 use super::systems::unpadded;
-use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
+use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Mut, Ref};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::lifecycle::{Add, Remove};
@@ -24,7 +24,7 @@ use super::{
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
-use crate::ecs::layout::{LayoutStrip, anchored_origin};
+use crate::ecs::layout::{Column, LayoutStrip, anchored_origin};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
@@ -1606,6 +1606,8 @@ pub(super) struct SizeVerification<'w, 's> {
     windows: NativeSizeWindows<'w, 's>,
     layout_strips: Query<'w, 's, &'static LayoutStrip>,
     resizes: Query<'w, 's, &'static ResizeMarker>,
+    native_resizes: Query<'w, 's, &'static crate::ecs::drag::NativeResizeStart>,
+    time: Res<'w, Time>,
 }
 
 pub(super) fn window_resize_verifier(
@@ -1621,6 +1623,18 @@ pub(super) fn window_resize_verifier(
             continue;
         };
         if position.is_changed() || bounds.is_changed() {
+            continue;
+        }
+        // macOS puts a tile frame back while a restored slot holds, so a
+        // readback then is not the app refusing the size.
+        if verification
+            .native_resizes
+            .get(entity)
+            .is_ok_and(|start| start.held_size(verification.time.elapsed()).is_some())
+        {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<VerifyWindowSize>();
+            }
             continue;
         }
         let frame = window.update_frame();
@@ -1651,26 +1665,7 @@ impl SizeVerification<'_, '_> {
         let Ok((window, _, mut bounds)) = self.windows.get_mut(entity) else {
             return;
         };
-        let expected_size = bounds.0;
-        let width_ord = fuzzy_equal(actual_size.x, expected_size.x);
-        let height_ord = fuzzy_equal(actual_size.y, expected_size.y);
-        if width_ord == Ordering::Equal && height_ord == Ordering::Equal {
-            return;
-        }
-        debug!(
-            "window '{}'({}) did not fully resize to {}, was {} instead",
-            window.title().unwrap_or_default(),
-            window.id(),
-            expected_size,
-            actual_size
-        );
-        bounds.0 = actual_size;
-        if height_ord == Ordering::Less
-            && let Ok(mut entity_commands) = commands.get_entity(entity)
-        {
-            entity_commands.try_insert(MinimumHeight(actual_size.y));
-        }
-        if width_ord != Ordering::Less {
+        if !adopt_refused_size(entity, &window, &mut bounds, actual_size, commands) {
             return;
         }
         let Some(column) = self.layout_strips.iter().find_map(|strip| {
@@ -1681,21 +1676,13 @@ impl SizeVerification<'_, '_> {
         }) else {
             return;
         };
-        let get_window_frame = |entity| self.frame(entity);
-        let Some(column_width) = column.width(&get_window_frame) else {
-            return;
-        };
-        for sibling in column.window_iter().filter(|sibling| *sibling != entity) {
-            if let Some(frame) = get_window_frame(sibling)
-                && frame.width() < column_width
-            {
-                let height = self
-                    .resizes
-                    .get(sibling)
-                    .map_or(frame.height(), |resize| resize.0.y);
-                commands.resize_entity(sibling, Size::new(column_width, height));
-            }
-        }
+        widen_column_siblings(
+            entity,
+            &column,
+            |sibling| self.frame(sibling),
+            |sibling| self.resizes.get(sibling).ok().map(|resize| resize.0.y),
+            commands,
+        );
     }
 
     fn read_column(&mut self, members: &[Entity], commands: &mut Commands) -> bool {
@@ -1714,6 +1701,55 @@ impl SizeVerification<'_, '_> {
             self.reconcile(member, frame.size(), commands);
         }
         true
+    }
+}
+
+pub(crate) fn adopt_refused_size(
+    entity: Entity,
+    window: &Window,
+    bounds: &mut Mut<Bounds>,
+    actual_size: Size,
+    commands: &mut Commands,
+) -> bool {
+    let expected_size = bounds.0;
+    let width_ord = fuzzy_equal(actual_size.x, expected_size.x);
+    let height_ord = fuzzy_equal(actual_size.y, expected_size.y);
+    if width_ord == Ordering::Equal && height_ord == Ordering::Equal {
+        return false;
+    }
+    debug!(
+        "window '{}'({}) did not fully resize to {}, was {} instead",
+        window.title().unwrap_or_default(),
+        window.id(),
+        expected_size,
+        actual_size
+    );
+    bounds.0 = actual_size;
+    if height_ord == Ordering::Less
+        && let Ok(mut entity_commands) = commands.get_entity(entity)
+    {
+        entity_commands.try_insert(MinimumHeight(actual_size.y));
+    }
+    width_ord == Ordering::Less
+}
+
+pub(crate) fn widen_column_siblings(
+    entity: Entity,
+    column: &Column,
+    frame: impl Fn(Entity) -> Option<IRect>,
+    resizing_height: impl Fn(Entity) -> Option<i32>,
+    commands: &mut Commands,
+) {
+    let Some(column_width) = column.width(&frame) else {
+        return;
+    };
+    for sibling in column.window_iter().filter(|sibling| *sibling != entity) {
+        if let Some(frame) = frame(sibling)
+            && frame.width() < column_width
+        {
+            let height = resizing_height(sibling).unwrap_or(frame.height());
+            commands.resize_entity(sibling, Size::new(column_width, height));
+        }
     }
 }
 

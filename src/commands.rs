@@ -4,10 +4,10 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Has, With, Without};
+use bevy::ecs::query::{Has, With};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_changed};
-use bevy::ecs::system::{Commands, Query, Res, ResMut, Single, SystemParam};
+use bevy::ecs::system::{Commands, ParamSet, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
 use tracing::{Level, instrument};
@@ -17,7 +17,8 @@ mod query;
 
 use crate::config::Config;
 use crate::config::snippet::{RuleSubject, SnippetDialect, window_rule_snippet};
-use crate::ecs::display::FloatingLayer;
+use crate::ecs::display::{DisplayMoves, FloatingLayer, Placement};
+use crate::ecs::drag::NativeResizeStart;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, anchored_origin, clamp_origin_to_viewport,
@@ -25,9 +26,10 @@ use crate::ecs::layout::{
 };
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowCtx, Windows};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, FullWidthMarker,
-    ManualStripOffset, MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, RaiseWindow,
-    SelectedVirtualMarker, SpawnCommandsExt, Timeout, Unmanaged, WidthAnchor, WidthRun,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, FullWidthMarker, ManualStripOffset,
+    MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, RaiseWindow,
+    SelectedVirtualMarker, SpawnCommandsExt, Timeout, Unmanaged, VerifyWindowSize, WidthAnchor,
+    WidthRun,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Size, Window, WindowManager, origin_from};
@@ -37,21 +39,6 @@ use crate::util::round_px;
 pub use crate::types::commands::{
     Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, Side,
 };
-
-/// The strips that are selected on their display but not the one on screen —
-/// the parked virtual workspaces a window can be handed off to.
-type OffscreenStrips<'w, 's> = Query<
-    'w,
-    's,
-    (Entity, &'static mut LayoutStrip, &'static ChildOf),
-    (With<SelectedVirtualMarker>, Without<ActiveWorkspaceMarker>),
->;
-
-#[derive(SystemParam)]
-struct DisplayDestinations<'w, 's> {
-    strips: OffscreenStrips<'w, 's>,
-    docks: Query<'w, 's, &'static DockPosition>,
-}
 
 /// Every strip alongside the two flags that say where it sits: whether it is the
 /// one currently on screen, and whether it is its display's selected virtual
@@ -842,6 +829,16 @@ fn width_anchor(
     }
 }
 
+type WidthWork<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Option<&'static NativeResizeStart>,
+        Has<VerifyWindowSize>,
+        Has<PendingWidthSettlement>,
+    ),
+>;
+
 /// Resizes the focused window to the next or previous preset column width, or
 /// by one `window_resize_step` of the display width.
 ///
@@ -852,19 +849,16 @@ fn width_anchor(
 /// * `windows` - A mutable query for all `Window` components.
 /// * `commands` - Bevy commands to trigger events.
 /// * `config` - The `Config` resource.
+#[allow(clippy::too_many_lines)]
 fn resize_window(
     mut messages: MessageReader<Event>,
-    ctx: WindowCtx,
+    mut ctx: ParamSet<(WindowCtx, Query<&mut Window>)>,
+    engine_work: WidthWork,
     runs: Query<&WidthRun>,
     interrupted: Res<WidthBatchInterrupted>,
     time: Res<Time>,
     active_display: ActiveDisplay,
 ) {
-    let WindowCtx {
-        windows,
-        config,
-        mut commands,
-    } = ctx;
     let Some(operation) = filter_window_operations(&mut messages, |op| {
         matches!(
             op,
@@ -875,10 +869,21 @@ fn resize_window(
         return;
     };
 
-    let Some((frame, entity)) = windows
-        .focused()
-        .and_then(|(_, entity)| windows.frame(entity).zip(Some(entity)))
-    else {
+    let Some(entity) = ctx.p0().windows.focused().map(|(_, entity)| entity) else {
+        return;
+    };
+    let (native_resize, verifying, settling) = engine_work.get(entity).unwrap_or_default();
+    let pending = ctx.p0().windows.is_resizing(entity) || verifying || settling;
+    let held = native_resize.and_then(|start| start.held_size(time.elapsed()));
+    let native = (!matches!(operation, Operation::SetWidth(_)) && !pending && held.is_none())
+        .then(|| ctx.p1().get_mut(entity).ok()?.update_frame().ok())
+        .flatten();
+    let WindowCtx {
+        windows,
+        config,
+        mut commands,
+    } = ctx.p0();
+    let Some(frame) = windows.frame(entity) else {
         return;
     };
     if windows.full_width(entity).is_some()
@@ -889,8 +894,13 @@ fn resize_window(
 
     let viewport = active_display.actual_bounds(&config);
     // Pending resizes count, so a quick second press moves on to the next preset.
-    let pending = windows.moving_frame(entity).unwrap_or(frame);
-    let current_ratio = f64::from(pending.width()) / f64::from(viewport.width());
+    let width = if pending {
+        windows.moving_frame(entity).unwrap_or(frame).width()
+    } else {
+        held.or(native.map(|native| native.size()))
+            .map_or(frame.width(), |size| size.x)
+    };
+    let current_ratio = f64::from(width) / f64::from(viewport.width());
     let widths = config.preset_column_widths();
     let fallback = *widths.first().unwrap_or(&0.5);
     let cycle = config.window_resize_cycle();
@@ -930,6 +940,19 @@ fn resize_window(
 
     let strip = active_display.active_strip();
     let strip_entity = active_display.active_strip_entity();
+    if size.x > 0
+        && size.y > 0
+        && let Some(column) = strip
+            .index_of(entity)
+            .ok()
+            .and_then(|idx| strip.get(idx).ok())
+    {
+        for member in column.window_iter() {
+            if let Ok(mut cmds) = commands.get_entity(member) {
+                cmds.try_remove::<NativeResizeStart>();
+            }
+        }
+    }
     let anchor = width_anchor(
         runs.get(entity).ok(),
         frame,
@@ -986,6 +1009,7 @@ fn step_ratio(ratio: f64, direction: ResizeDirection, step: f64, maximum: f64) -
 /// Only stacks are eligible: `binpack_heights` stretches a column's lone member
 /// to the full strip height, so a height written anywhere else is overwritten on
 /// the next layout pass.
+#[allow(clippy::too_many_lines)]
 fn resize_window_vertical(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -1103,8 +1127,14 @@ fn resize_window_vertical(
         (&items[neighbour], pair - new_height),
     ] {
         for entity in item.window_iter() {
-            if let Some(size) = windows.size(entity) {
-                commands.resize_entity(entity, size.with_y(height));
+            if let Some(size) = windows.size(entity).map(|size| size.with_y(height)) {
+                if size.x > 0
+                    && size.y > 0
+                    && let Ok(mut cmds) = commands.get_entity(entity)
+                {
+                    cmds.try_remove::<NativeResizeStart>();
+                }
+                commands.resize_entity(entity, size);
             }
         }
     }
@@ -1129,6 +1159,10 @@ fn full_width_window(
     };
 
     let viewport = active_display.actual_bounds(&config);
+    let tabs = active_display
+        .active_strip()
+        .tab_group(entity)
+        .unwrap_or_else(|| vec![entity]);
 
     if let Some(marker) = windows.full_width(entity) {
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -1136,6 +1170,13 @@ fn full_width_window(
         }
         let w = round_px(marker.width_ratio * f64::from(viewport.width()));
         let bounds = active_display.actual_bounds(&config).size().with_x(w);
+        if bounds.x > 0 && bounds.y > 0 {
+            for tab in &tabs {
+                if let Ok(mut entity_commands) = commands.get_entity(*tab) {
+                    entity_commands.try_remove::<NativeResizeStart>();
+                }
+            }
+        }
         commands.resize_entity(entity, bounds);
         commands.reshuffle_around(entity);
     } else {
@@ -1152,7 +1193,15 @@ fn full_width_window(
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(FullWidthMarker { width_ratio });
         }
-        commands.resize_entity(entity, Size::new(viewport.width(), viewport.height()));
+        let size = Size::new(viewport.width(), viewport.height());
+        if size.x > 0 && size.y > 0 {
+            for tab in &tabs {
+                if let Ok(mut entity_commands) = commands.get_entity(*tab) {
+                    entity_commands.try_remove::<NativeResizeStart>();
+                }
+            }
+        }
+        commands.resize_entity(entity, size);
         commands.reshuffle_around(entity);
     }
 }
@@ -1265,21 +1314,12 @@ fn copy_window_rule(
     }
 }
 
-/// Moves the focused window to the next available display.
-///
-/// # Arguments
-///
-/// * `focused_entity` - The `Entity` of the currently focused window.
-/// * `windows` - A mutable query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
-/// * `active_display` - A mutable reference to the `ActiveDisplayMut` resource.
-/// * `commands` - Bevy commands to modify entities and trigger events.
 fn to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    mut active_display: ActiveDisplayMut,
-    mut destinations: DisplayDestinations,
+    mut moves: DisplayMoves,
     window_manager: Res<WindowManager>,
-    config: Res<Config>,
+    mut native: ResMut<crate::ecs::native_membership::NativeMembership>,
     mut commands: Commands,
 ) {
     let Some((move_focus, direction)) = filter_window_operations(&mut messages, |op| {
@@ -1306,90 +1346,60 @@ fn to_next_display(
         return;
     }
 
-    // Width relative to the source display's usable viewport (dock- and
-    // padding-adjusted). Captured before `other()` mutably borrows
-    // `active_display`. This matches how `resize_window` computes the ratio
-    // against `actual_bounds`, so a fixed (non-auto-hiding) dock is accounted
-    // for on both the source and target displays.
-    let source_viewport_width = active_display.actual_bounds(&config).width();
-
-    let source_bounds = active_display.bounds();
+    let Some(source_bounds) = moves.active_display().map(Display::bounds) else {
+        return;
+    };
     let target_id = match &direction {
-        None => active_display.other().next().map(|display| display.id()),
+        None => moves.other_displays().next().map(Display::id),
         Some(direction) => display_in_direction(
             direction,
             source_bounds,
-            active_display
-                .other()
+            moves
+                .other_displays()
                 .map(|display| (display.id(), display.bounds())),
         ),
     };
-    let Some(other) = target_id.and_then(|id| active_display.other().find(|d| d.id() == id)) else {
+    let Some(target_id) = target_id else {
         debug!("no display to move window to ({direction:?}).");
         return;
     };
-
-    debug!(
-        "moving window (id {}, {entity}) to display {}: {}.",
-        window.id(),
-        other.id(),
-        other.width() / 2,
-    );
-    let center = other.bounds().center().x;
-    let target_display_id = other.id();
-
-    let target_space_id = window_manager.active_display_space(target_display_id).ok();
-    let target_dock = target_space_id
-        .and_then(|id| {
-            destinations
-                .strips
-                .iter()
-                .find(|(_, strip, _)| strip.id() == id)
-        })
-        .and_then(|(_, _, child)| destinations.docks.get(child.parent()).ok());
-    let target_viewport = other.actual_display_bounds(target_dock, &config);
-
     let Some(size) = windows.size(entity) else {
         return;
     };
-    let width_ratio =
-        (source_viewport_width > 0).then(|| f64::from(size.x) / f64::from(source_viewport_width));
-    let width = width_ratio.map_or(size.x, |ratio| {
-        round_px(ratio * f64::from(target_viewport.width()))
-    });
-    commands.resize_entity(entity, Size::new(width, target_viewport.height()));
-    let dest = other.bounds().min.with_x(center - size.x / 2);
-    commands.reposition_entity(entity, dest);
+    let window_id = window.id();
+    let Some(arrival) = moves.move_to_display(
+        entity,
+        target_id,
+        Placement::Append,
+        size,
+        |entity| windows.frame(entity),
+        &mut commands,
+    ) else {
+        debug!("window {window_id} ({entity}) can not move to display {target_id}.");
+        return;
+    };
+    debug!("moved window (id {window_id}, {entity}) to display {target_id}.");
 
+    let bounds = arrival.display_bounds;
+    let origin = bounds.min.with_x(bounds.center().x - size.x / 2);
+    if arrival.strip.is_none() {
+        for member in &arrival.members {
+            commands.reposition_entity(*member, origin);
+        }
+    } else {
+        commands.reposition_entity(entity, origin);
+    }
+    native.placed(arrival.members);
     if matches!(move_focus, MoveFocus::Follow) {
-        window_manager.warp_mouse(other.bounds().center());
+        window_manager.warp_mouse(bounds.center());
     }
-
-    // Remove the window from the source strip.
-    let source_neighbour = active_display
-        .active_strip()
-        .left_neighbour(entity)
-        .or_else(|| active_display.active_strip().right_neighbour(entity));
-    active_display.active_strip().remove(entity);
-    if let Some(neighbour) = source_neighbour {
-        commands.refit_after_removal(neighbour);
-    }
-
     if matches!(move_focus, MoveFocus::Stay)
-        && let Some(neighbour) = source_neighbour
+        && let Some(neighbour) = arrival.left_behind
     {
         commands.focus_entity(neighbour, false);
     }
-
-    // Insert into the target display's selected strip.
-    if let Some(target_space_id) = target_space_id
-        && let Some((target_strip_entity, mut target_strip, _)) = destinations
-            .strips
-            .iter_mut()
-            .find(|(_, strip, _)| strip.id() == target_space_id)
-    {
-        target_strip.append(entity);
-        commands.place_after_arrival(entity, target_strip_entity);
+    if let Some(strip) = arrival.strip {
+        commands.place_after_arrival(entity, strip);
     }
 }
 
@@ -1572,8 +1582,14 @@ fn equalize_column(
 
         for (item, height) in stack.iter().zip(heights) {
             for entity in item.window_iter() {
-                if let Some(size) = windows.size(entity) {
-                    commands.resize_entity(entity, size.with_y(height));
+                if let Some(size) = windows.size(entity).map(|size| size.with_y(height)) {
+                    if size.x > 0
+                        && size.y > 0
+                        && let Ok(mut cmds) = commands.get_entity(entity)
+                    {
+                        cmds.try_remove::<NativeResizeStart>();
+                    }
+                    commands.resize_entity(entity, size);
                 }
             }
         }
@@ -1615,8 +1631,14 @@ fn balance_strip(
                 cmds.try_remove::<FullWidthMarker>();
             }
 
-            if let Some(size) = windows.size(entity) {
-                commands.resize_entity(entity, size.with_x(focused_width));
+            if let Some(size) = windows.size(entity).map(|size| size.with_x(focused_width)) {
+                if size.x > 0
+                    && size.y > 0
+                    && let Ok(mut cmds) = commands.get_entity(entity)
+                {
+                    cmds.try_remove::<NativeResizeStart>();
+                }
+                commands.resize_entity(entity, size);
             }
         }
     }

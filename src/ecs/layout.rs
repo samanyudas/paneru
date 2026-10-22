@@ -197,7 +197,7 @@ fn fitting_origin_x(
 }
 
 /// How far a stored width may drift before a [`ManualStripOffset`] counts as
-/// stale. `window_resized_update_frame` writes back the OS geometry, which can
+/// stale. `window_frame_update` writes back the OS geometry, which can
 /// land a pixel or two off the size the layout asked for.
 const SIGNATURE_WIDTH_TOLERANCE: i32 = 2;
 
@@ -972,9 +972,52 @@ impl LayoutStrip {
         } else {
             column - 1
         };
-        let Some(mut joined) = self.columns.get(target).and_then(Column::stack_items) else {
+        let Some(joined) = self.columns.get(target).and_then(Column::stack_items) else {
             return Ok(());
         };
+        self.join_items(target, joined, item, slot, tabbed_reorder);
+        Ok(())
+    }
+
+    /// Puts `windows`, which come from another strip, into column `column`
+    /// as one stack item, `slot` items from the top. `windows` is one window,
+    /// or the native tab group it belongs to. The column splits its height
+    /// evenly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Error)` if `windows` is empty, or if there is no column
+    /// `column` or it is fullscreen. The strip is then unchanged.
+    pub fn join_column(&mut self, windows: &[Entity], column: usize, slot: usize) -> Result<()> {
+        let item = match windows {
+            [] => {
+                return Err(Error::InvalidInput(format!(
+                    "{}: no window to join column {column}",
+                    function_name!()
+                )));
+            }
+            [window] => StackItem::Single(*window),
+            tabs => StackItem::Tabs(tabs.to_vec()),
+        };
+        let Some(joined) = self.columns.get(column).and_then(Column::stack_items) else {
+            return Err(Error::InvalidInput(format!(
+                "{}: column {column} can not take another window",
+                function_name!()
+            )));
+        };
+        self.even_splits.extend(item.top());
+        self.join_items(column, joined, item, slot, false);
+        Ok(())
+    }
+
+    fn join_items(
+        &mut self,
+        target: usize,
+        mut joined: Vec<StackItem>,
+        item: StackItem,
+        slot: usize,
+        tabbed_reorder: bool,
+    ) {
         // Joining a tabbed stack makes the newcomer tabbed too, so the stack
         // never mixes tabbed and split members (see `tabbed_stacks`).
         if tabbed_reorder
@@ -991,7 +1034,6 @@ impl LayoutStrip {
         if let Some(column) = self.columns.get_mut(target) {
             *column = Column::Stack(joined);
         }
-        Ok(())
     }
 
     /// Moves the stack item holding `entity` into a new column of its own at
@@ -2274,6 +2316,7 @@ fn position_layout_windows(
     workspaces: StripsForWindowPositioning,
     snap_guards: Query<&SnapStripMarker>,
     displays: DisplayViewports,
+    drag: Option<Res<crate::ecs::drag::DragState>>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -2295,7 +2338,22 @@ fn position_layout_windows(
         );
     }
 
+    let held = drag
+        .as_ref()
+        .filter(|drag| drag.holds_window())
+        .and_then(|drag| drag.window());
+    let held_group = held
+        .map(|held| {
+            workspaces
+                .iter()
+                .find_map(|(_, strip, _, _, _, _)| strip.tab_group(held))
+                .unwrap_or_else(|| vec![held])
+        })
+        .unwrap_or_default();
     for (entity, window, layout_position, mut position, mut bounds, resize) in positioned_windows {
+        if held_group.contains(&entity) {
+            continue;
+        }
         let Some(context) = strip_contexts.get(&entity) else {
             continue;
         };

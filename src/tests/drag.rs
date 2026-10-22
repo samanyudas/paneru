@@ -1,5 +1,7 @@
 //! Dragging a tiled window by its title bar into a column or to a new column
-//! (samanyudas/miri#43, part A: one display).
+//! (samanyudas/miri#43).
+
+mod part_c;
 
 use std::time::Duration;
 
@@ -58,6 +60,7 @@ fn down(window: Entity, point: IVec2) -> DragInput {
             frame: FRAME_RECT,
             top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: true,
+            screen_edges: bevy::math::BVec2::FALSE,
         }),
     }
 }
@@ -94,6 +97,12 @@ fn is_pressed(state: &DragState) -> bool {
     matches!(state, DragState::Pressed(_))
 }
 
+/// A press that did not become a drag, still holding its window until the
+/// button is released.
+fn is_unconfirmed(state: &DragState) -> bool {
+    matches!(state, DragState::Unconfirmed(_))
+}
+
 #[test]
 fn a_press_in_the_top_bar_of_a_tiled_window_may_start_a_drag() {
     let w = entities(1)[0];
@@ -117,6 +126,7 @@ fn other_presses_never_start_a_drag() {
             frame: FRAME_RECT,
             top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: false,
+            screen_edges: bevy::math::BVec2::FALSE,
         }),
     };
     let right_button = DragInput::Down {
@@ -127,6 +137,7 @@ fn other_presses_never_start_a_drag() {
             frame: FRAME_RECT,
             top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: true,
+            screen_edges: bevy::math::BVec2::FALSE,
         }),
     };
     let no_window = DragInput::Down {
@@ -213,7 +224,7 @@ fn a_resize_is_not_a_drag() {
         dragged,
         DragInput::WindowResized { window: w },
     ]);
-    assert_eq!(state, DragState::Idle, "a resize notification");
+    assert!(is_unconfirmed(&state), "a resize notification: {state:?}");
 
     // Dragging the top edge moves the origin and changes the size together.
     let top_edge = DragInput::WindowMoved {
@@ -221,7 +232,10 @@ fn a_resize_is_not_a_drag() {
         frame: IRect::from_corners(FRAME_RECT.min + IVec2::new(0, 30), FRAME_RECT.max),
     };
     let (state, _) = run(&[down(w, PRESS), dragged, top_edge]);
-    assert_eq!(state, DragState::Idle, "a move that changes the size");
+    assert!(
+        is_unconfirmed(&state),
+        "a move that changes the size: {state:?}"
+    );
 }
 
 #[test]
@@ -248,7 +262,7 @@ fn a_pointer_moving_without_its_window_is_not_a_drag() {
         }],
         ms(300),
     );
-    assert_eq!(state, DragState::Idle);
+    assert!(is_unconfirmed(&state), "{state:?}");
 }
 
 #[test]
@@ -292,7 +306,7 @@ fn a_window_moving_away_from_the_pointer_is_not_a_drag() {
         }],
         ms(300),
     );
-    assert_eq!(state, DragState::Idle);
+    assert!(is_unconfirmed(&state), "{state:?}");
 }
 
 #[test]
@@ -414,7 +428,7 @@ fn a_window_that_follows_only_after_the_confirm_window_is_not_a_drag() {
     // Text selection: the pointer moves and pauses, and much later the app
     // moves its window by the same amount.
     let (state, _) = run_from(state, &[moved_by(w, IVec2::new(50, 0))], ms(400));
-    assert_eq!(state, DragState::Idle);
+    assert!(is_unconfirmed(&state), "{state:?}");
 }
 
 #[test]
@@ -472,14 +486,18 @@ fn the_release_grace_runs_from_when_the_button_first_reads_up() {
 }
 
 #[test]
-fn a_still_hold_with_the_button_down_never_ends() {
+fn a_still_hold_with_the_button_down_ends_a_press_only_at_its_limit() {
     let w = entities(1)[0];
     let held = DragInput::Tick { button_down: true };
     let (pressed, _) = run(&[down(w, PRESS)]);
     let much_later = Duration::from_secs(60);
 
-    let (state, _) = run_from(pressed, &[held], much_later);
+    let (state, _) = run_from(pressed.clone(), &[held], Duration::from_secs(9));
     assert!(is_pressed(&state), "{state:?}");
+    // A button state stuck down cannot hold an unconfirmed window forever.
+    let (state, _) = run_from(pressed, &[held], much_later);
+    assert_eq!(state, DragState::Idle);
+    // A confirmed drag held still keeps going.
     let (state, effects) = run_from(dragging(w), &[held], much_later);
     assert!(matches!(state, DragState::Dragging(_)), "{state:?}");
     assert_eq!(effects, Vec::<DragEffect>::new());
@@ -622,7 +640,7 @@ fn column(index: usize, x: std::ops::Range<i32>, bands: Vec<Band>) -> ColumnSnap
 
 fn snapshot(columns: Vec<ColumnSnap>) -> LayoutSnapshot {
     LayoutSnapshot {
-        displays: vec![DisplaySnap {
+        managed_strip_displays: vec![DisplaySnap {
             id: DISPLAY,
             bounds: BOUNDS,
             viewport: VIEWPORT,
@@ -759,7 +777,7 @@ fn a_fullscreen_column_refuses_a_drop() {
         column(0, 0..400, vec![band(&[e[0]], 20..768)]),
         column(1, 400..800, vec![band(&[e[1]], 20..768)]),
     ]);
-    snap.displays[0].columns[1].kind = ColumnKind::Fullscreen;
+    snap.managed_strip_displays[0].columns[1].kind = ColumnKind::Fullscreen;
 
     assert_eq!(
         hit(&snap, e[0], 600, 300, 5),
@@ -883,6 +901,39 @@ fn a_new_column_shows_a_line_down_the_full_height_of_its_gap() {
 }
 
 #[test]
+fn a_new_column_on_an_empty_display_shows_a_full_line_inside_its_viewport() {
+    let e = entities(5);
+    let mut snap = four_columns(&e);
+    snap.managed_strip_displays.push(DisplaySnap {
+        id: DISPLAY + 1,
+        bounds: IRect::new(182, 1486, 2230, 2772),
+        viewport: IRect::new(182, 1486, 2230, 2772),
+        columns: vec![],
+    });
+    let pointer = IVec2::new(1206, 1560);
+    let target = hit_test(&snap, e[4], pointer, |_| 5);
+    assert_eq!(
+        target,
+        DropTarget::NewColumn {
+            display: DISPLAY + 1,
+            index: 0,
+        }
+    );
+
+    assert_eq!(
+        overlay_shape(&dragging_to(e[4], pointer, target), &snap),
+        Some(line(182..185, 1486..2772))
+    );
+}
+
+#[test]
+fn a_new_column_without_neighbors_on_a_nonempty_display_shows_nothing() {
+    let e = entities(5);
+
+    assert_eq!(shape(&e, 4, new_column(5)), None);
+}
+
+#[test]
 fn a_new_column_in_a_padded_gap_shows_its_line_in_the_middle() {
     let e = entities(3);
     let snap = snapshot(vec![
@@ -958,11 +1009,11 @@ fn a_viewport_too_small_for_a_line_shows_nothing() {
             column(0, 0..400, vec![band(&[e[0]], 20..20 + span)]),
             column(1, 400..800, vec![band(&[e[1]], 20..20 + span)]),
         ]);
-        snap.displays[0].viewport = IRect::new(0, 20, 1024, 20 + span);
+        snap.managed_strip_displays[0].viewport = IRect::new(0, 20, 1024, 20 + span);
         let into_column = dragging_to(e[2], IVec2::new(600, 20), into(1, 0));
         assert_eq!(overlay_shape(&into_column, &snap), None, "{span} pt high");
 
-        snap.displays[0].viewport = IRect::new(400, 20, 400 + span, 768);
+        snap.managed_strip_displays[0].viewport = IRect::new(400, 20, 400 + span, 768);
         let new_column = dragging_to(e[2], IVec2::new(400, 300), new_column(1));
         assert_eq!(overlay_shape(&new_column, &snap), None, "{span} pt wide");
     }
@@ -1413,7 +1464,7 @@ fn a_resize_from_the_top_edge_is_not_a_drag() {
         .os_resize_window(2, start.size().with_y(start.max.y - 300));
     harness.advance(FRAME);
     harness.advance(FRAME);
-    assert_eq!(drag_state(harness.world()), DragState::Idle);
+    assert!(is_unconfirmed(&drag_state(harness.world())));
     release(&mut harness, to);
     harness.advance(SETTLE);
 
@@ -1434,7 +1485,7 @@ fn a_pointer_drag_that_leaves_the_window_still_is_not_a_drag() {
         harness.world().write_message(mouse_dragged(point));
         harness.advance(FRAME);
     }
-    assert_eq!(drag_state(harness.world()), DragState::Idle);
+    assert!(is_unconfirmed(&drag_state(harness.world())));
     release(&mut harness, to);
     harness.advance(SETTLE);
 
@@ -1981,7 +2032,7 @@ fn a_still_drag_line_takes_the_new_color_when_the_appearance_changes() {
 /// The stack `[0, 1] | [2]` with window 2 held still just above the boundary
 /// between windows 0 and 1, so a drop lands between them.
 fn still_drag_over_a_stack_boundary() -> TestHarness {
-    let mut harness = three_columns();
+    let mut harness = harness_with("", 900, 3);
     harness.run(vec![
         command(Operation::Focus(Direction::First)),
         command(Operation::Focus(Direction::East)),
@@ -2025,7 +2076,7 @@ fn a_still_drag_line_follows_its_stack_boundary_on_the_first_frame_of_a_display_
     // Short enough that the layout must move the boundary up.
     harness
         .mock_state
-        .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, 500));
+        .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, 650));
     harness.world().write_message(Event::DisplayConfigured {
         display_id: TEST_DISPLAY_ID,
     });

@@ -16,6 +16,7 @@ use bevy::platform::collections::HashSet;
 use tracing::debug;
 
 use crate::commands::{Command, MoveFocus, Operation, Side};
+use crate::ecs::drag::NativeResizeStart;
 use crate::ecs::focus::FocusWindow;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::Windows;
@@ -165,6 +166,18 @@ fn apply(
                 debug!(target: "paneru::lua", "skipping {op:?}: a width ratio must be positive");
                 return;
             }
+            if let Some((strip, _)) = workspaces.iter().find(|(strip, _)| strip.contains(entity))
+                && let Some(column) = strip
+                    .index_of(entity)
+                    .ok()
+                    .and_then(|index| strip.get(index).ok())
+            {
+                for member in column.window_iter() {
+                    if let Ok(mut entity_commands) = commands.get_entity(member) {
+                        entity_commands.try_remove::<NativeResizeStart>();
+                    }
+                }
+            }
             // The layout pipeline turns the ratio into an actual width against
             // whichever display the window is on, so this does not have to.
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -220,6 +233,15 @@ fn apply(
             }
             let origin = Origin::new(frame.x, frame.y);
             let size = Size::new(frame.width.max(1), frame.height.max(1));
+            let group = workspaces
+                .iter()
+                .find_map(|(strip, _)| strip.tab_group(entity))
+                .unwrap_or_else(|| vec![entity]);
+            for member in group {
+                if let Ok(mut entity_commands) = commands.get_entity(member) {
+                    entity_commands.try_remove::<NativeResizeStart>();
+                }
+            }
             commands.reposition_entity(entity, origin);
             commands.resize_entity(entity, size);
         }

@@ -4,7 +4,6 @@ use bevy::{
         hierarchy::ChildOf,
         query::{With, Without},
         system::{Commands, Query, Res, ResMut, Single, SystemParam},
-        world::Mut,
     },
     math::IRect,
 };
@@ -164,8 +163,6 @@ pub struct ActiveDisplayMut<'w, 's> {
         (&'static mut Display, Entity, Option<&'static DockPosition>),
         With<ActiveDisplayMarker>,
     >,
-    /// A query for all other `Display` components that are not marked as active.
-    other_displays: Query<'w, 's, &'static mut Display, Without<ActiveDisplayMarker>>,
 }
 
 impl ActiveDisplayMut<'_, '_> {
@@ -177,18 +174,8 @@ impl ActiveDisplayMut<'_, '_> {
         self.display.2
     }
 
-    /// Returns an iterator over mutable references to all other displays (non-active).
-    pub fn other(&mut self) -> impl Iterator<Item = Mut<'_, Display>> {
-        self.other_displays.iter_mut()
-    }
-
     pub fn active_strip(&mut self) -> &mut LayoutStrip {
         &mut self.strip
-    }
-
-    /// Returns the `CGRect` representing the bounds of the active display.
-    pub fn bounds(&self) -> IRect {
-        self.display().bounds()
     }
 
     /// Returns the `IRect` representing the bounds of the active display, correctly padded by
@@ -208,6 +195,11 @@ pub struct FrameActivity<'w, 's> {
     awaiting_handles: Query<'w, 's, (), With<AwaitingHandle>>,
     size_checks: Query<'w, 's, (), With<VerifyWindowSize>>,
     width_settlements: Query<'w, 's, (), With<PendingWidthSettlement>>,
+    native: Option<Res<'w, crate::ecs::native_membership::NativeMembership>>,
+    time: Option<Res<'w, bevy::time::Time>>,
+    pointer_resize: Option<Res<'w, crate::ecs::drag::PointerResize>>,
+    drag_edges: Query<'w, 's, (), With<crate::ecs::drag::EdgeHold>>,
+    native_resizes: Query<'w, 's, &'static crate::ecs::drag::NativeResizeStart>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -220,6 +212,20 @@ impl FrameActivity<'_, '_> {
             || !self.awaiting_handles.is_empty()
             || !self.size_checks.is_empty()
             || !self.width_settlements.is_empty()
+            || !self.drag_edges.is_empty()
+            || self
+                .native_resizes
+                .iter()
+                .any(crate::ecs::drag::NativeResizeStart::needs_frame)
+            || self
+                .native
+                .as_ref()
+                .zip(self.time.as_ref())
+                .is_some_and(|(native, time)| native.needs_frame(time.elapsed()))
+            || self
+                .pointer_resize
+                .as_ref()
+                .is_some_and(|resize| !matches!(**resize, crate::ecs::drag::PointerResize::Idle))
     }
 }
 
