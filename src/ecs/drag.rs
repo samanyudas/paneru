@@ -37,7 +37,6 @@ use bevy::time::Time;
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::debug;
 
-use crate::commands::{Direction, display_in_direction};
 use crate::config::Config;
 use crate::ecs::display::{DisplayMoves, Placement};
 use crate::ecs::layout::{Column, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, effective_stack_limit};
@@ -828,6 +827,15 @@ pub(crate) struct EdgeHold {
     next_scroll: Duration,
 }
 
+/// How far apart two display edges may be and still touch.
+const NEIGHBOR_TOLERANCE: u32 = 2;
+
+/// The display side whose edge band holds `pointer`, when no other display
+/// touches that edge at the pointer's height. `snapshot` names the displays
+/// whose strip can scroll. `physical_displays` lists every display, because a
+/// neighbor that shows no managed strip, such as one in a native fullscreen
+/// space, is still a neighbor. A display beside only part of the edge, or
+/// only diagonally across a corner, is no neighbor where it does not touch.
 fn held_edge(
     snapshot: &LayoutSnapshot,
     physical_displays: &[(DisplayId, IRect)],
@@ -837,22 +845,27 @@ fn held_edge(
         .managed_strip_displays
         .iter()
         .find(|display| display.bounds.contains(pointer))?;
-    let (side, direction) = if pointer.x < display.bounds.min.x + EDGE_BAND {
-        (EdgeSide::Left, Direction::West)
+    let (side, edge) = if pointer.x < display.bounds.min.x + EDGE_BAND {
+        (EdgeSide::Left, display.bounds.min.x)
     } else if pointer.x >= display.bounds.max.x - EDGE_BAND {
-        (EdgeSide::Right, Direction::East)
+        (EdgeSide::Right, display.bounds.max.x)
     } else {
         return None;
     };
-    display_in_direction(
-        &direction,
-        display.bounds,
-        physical_displays
-            .iter()
-            .copied()
-            .filter(|(id, _)| *id != display.id),
-    )
-    .is_none()
+    let touches = |other: &IRect| {
+        let adjacent = match side {
+            EdgeSide::Left => {
+                other.min.x < edge && other.max.x.abs_diff(edge) <= NEIGHBOR_TOLERANCE
+            }
+            EdgeSide::Right => {
+                other.max.x > edge && other.min.x.abs_diff(edge) <= NEIGHBOR_TOLERANCE
+            }
+        };
+        adjacent && (other.min.y..other.max.y).contains(&pointer.y)
+    };
+    (!physical_displays
+        .iter()
+        .any(|(id, bounds)| *id != display.id && touches(bounds)))
     .then_some((display.id, side))
 }
 
@@ -889,7 +902,7 @@ fn drag_edge_scroll(
         .p0()
         .displays
         .iter()
-        .map(|(_, display, _, _)| (display.id(), display.bounds()))
+        .map(|(_, display, _, _)| (display.id(), display.physical_bounds()))
         .collect();
     let edge = held_edge(&snapshot, &physical_displays, drag.pointer);
     let mut current = None;
