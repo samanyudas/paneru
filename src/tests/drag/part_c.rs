@@ -2000,3 +2000,28 @@ fn a_window_stacked_into_a_new_column_on_a_lower_display_stays_on_that_display()
     }
     assert_eq!(top.min.y, column.min.y, "the column top does not move");
 }
+
+#[test]
+fn an_animated_macos_tile_returns_to_the_slot_it_had_before_the_animation() {
+    let quarter = IRect::new(512, 20, 1024, 394);
+    let half = IRect::new(0, 20, 512, 768);
+    let fill = IRect::new(0, 20, 1024, 768);
+    for tile in [half, quarter, fill] {
+        let mut harness = three_columns();
+        let start = frame(harness.world(), 1);
+        // macOS animates the window toward the tile, and reports each step.
+        for step in 1..=4 {
+            let at = |from: i32, to: i32| from + (to - from) * step / 4;
+            let frame = IRect::new(
+                at(start.min.x, tile.min.x),
+                at(start.min.y, tile.min.y),
+                at(start.max.x, tile.max.x),
+                at(start.max.y, tile.max.y),
+            );
+            macos_tile(&mut harness, 1, frame);
+        }
+        harness.advance(SETTLE);
+        assert_eq!(frame(harness.world(), 1), start, "tile {tile:?}");
+        assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
+    }
+}

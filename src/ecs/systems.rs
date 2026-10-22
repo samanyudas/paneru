@@ -831,18 +831,19 @@ pub(super) fn window_resized_update_frame(
         let Ok(new_frame) = window.update_frame() else {
             continue;
         };
-        let active_strip = workspaces
+        let mut active_strip = workspaces
             .iter_mut()
             .find(|(strip, _)| strip.contains(entity));
-        if unmanaged.is_none()
+        let tiled = unmanaged.is_none()
             && active_strip.as_ref().is_some_and(|(strip, _)| {
                 strip
                     .index_of(entity)
                     .ok()
                     .and_then(|index| strip.get(index).ok())
                     .is_some_and(|column| !matches!(column, Column::Fullscren(_)))
-            })
-            && tiling.restore(
+            });
+        if tiled
+            && let Some(restored) = tiling.restore(
                 entity,
                 new_frame,
                 bounds.0,
@@ -850,10 +851,18 @@ pub(super) fn window_resized_update_frame(
                 &mut commands,
             )
         {
+            if let (Some(x), Some((_, strip_position))) = (restored.strip_x, active_strip.as_mut())
+            {
+                strip_position.0.x = x;
+            }
             continue;
         }
         if resizing || verifying {
             continue;
+        }
+        if tiled {
+            let strip_x = active_strip.as_ref().map(|(_, position)| position.0.x);
+            tiling.adopting(entity, bounds.0, strip_x, &mut commands);
         }
         let tabbed = active_strip
             .as_ref()

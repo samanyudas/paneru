@@ -1,21 +1,25 @@
 use std::time::Duration;
 
+use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Commands, Query, Res, ResMut, SystemParam};
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::systems::unpadded;
 use crate::ecs::{Bounds, DockPosition, PresentedOrigin, ResizeMarker, SpawnCommandsExt};
 use crate::events::{Event, MouseButton};
-use crate::manager::{Display, Window, WindowManager, origin_from};
+use crate::manager::{Display, Origin, Window, WindowManager, origin_from};
 
 const EDGE_TOLERANCE: i32 = 6;
 const TILE_TOLERANCE: i32 = 2;
 const RESIZE_RELEASE_GRACE: Duration = Duration::from_millis(600);
+/// How long after its last step a resize the engine did not start still
+/// counts as one resize.
+const NATIVE_RESIZE_QUIET: Duration = Duration::from_millis(600);
 
 /// The windows a left press may be resizing by an edge: every tiled window
 /// whose edge band holds the press point, with the native tabs grouped with
@@ -151,39 +155,117 @@ pub(crate) fn is_macos_tile(frame: IRect, visible: IRect) -> bool {
     })
 }
 
+/// The slot a window had when a resize the engine did not start began. The
+/// engine adopts each step of such a resize, so the steps of a native tile
+/// animation pass through `Bounds` and the strip offset. If the resize ends
+/// on a tile, the window returns to this slot instead.
+#[derive(Component, Clone, Copy)]
+pub(crate) struct NativeResizeStart {
+    origin: Origin,
+    size: IVec2,
+    strip_x: Option<i32>,
+    last: Duration,
+}
+
+impl NativeResizeStart {
+    fn fresh(&self, now: Duration) -> bool {
+        now <= self.last + NATIVE_RESIZE_QUIET
+    }
+}
+
 #[derive(SystemParam)]
 pub(crate) struct TilingRestore<'w, 's> {
     displays: Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>,
-    presented: Query<'w, 's, (&'static PresentedOrigin, Option<&'static ResizeMarker>)>,
+    presented: Query<
+        'w,
+        's,
+        (
+            &'static PresentedOrigin,
+            Option<&'static ResizeMarker>,
+            Option<&'static NativeResizeStart>,
+        ),
+    >,
     gesture: Res<'w, PointerResize>,
     time: Res<'w, Time>,
 }
 
+/// A restore of a macOS tile: the strip offset to restore with the window,
+/// if the resize began from a recorded slot.
+pub(crate) struct Restored {
+    pub strip_x: Option<i32>,
+}
+
 impl TilingRestore<'_, '_> {
+    /// Returns the window to its slot when `frame` is a macOS tile it did not
+    /// get from the user or the engine. The slot is the one recorded when the
+    /// resize began, else the window's layout slot.
     pub(crate) fn restore(
         &self,
         entity: Entity,
         frame: IRect,
-        size: bevy::math::IVec2,
+        size: IVec2,
         padding: (i32, i32),
         commands: &mut Commands,
-    ) -> bool {
-        if self.gesture.resizes(entity, self.time.elapsed())
+    ) -> Option<Restored> {
+        let now = self.time.elapsed();
+        if self.gesture.resizes(entity, now)
             || !self.displays.iter().any(|(display, dock)| {
                 is_macos_tile(unpadded(frame, padding), display.visible_bounds(dock))
             })
         {
-            return false;
+            return None;
         }
-        let Ok((origin, resizing)) = self.presented.get(entity) else {
-            return false;
-        };
-        let size = resizing.map_or(size, |resize| resize.0);
-        if frame.min == origin.0 && frame.size() == size {
-            return false;
+        let (origin, resizing, start) = self.presented.get(entity).ok()?;
+        let start = start.filter(|start| start.fresh(now));
+        let (origin, size) = start.map_or_else(
+            || (origin.0, resizing.map_or(size, |resize| resize.0)),
+            |start| (start.origin, start.size),
+        );
+        if frame.min == origin && frame.size() == size {
+            return None;
         }
-        commands.reposition_entity(entity, origin.0);
+        commands.reposition_entity(entity, origin);
         commands.resize_entity(entity, size);
-        true
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<NativeResizeStart>();
+        }
+        Some(Restored {
+            strip_x: start.and_then(|start| start.strip_x),
+        })
+    }
+
+    /// Records the slot `entity` has before the engine adopts a resize it did
+    /// not start. A user edge resize records nothing.
+    pub(crate) fn adopting(
+        &self,
+        entity: Entity,
+        size: IVec2,
+        strip_x: Option<i32>,
+        commands: &mut Commands,
+    ) {
+        let now = self.time.elapsed();
+        let Ok((origin, _, start)) = self.presented.get(entity) else {
+            return;
+        };
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            return;
+        };
+        if self.gesture.resizes(entity, now) {
+            entity_commands.try_remove::<NativeResizeStart>();
+            return;
+        }
+        let start = start.filter(|start| start.fresh(now)).map_or(
+            NativeResizeStart {
+                origin: origin.0,
+                size,
+                strip_x,
+                last: now,
+            },
+            |start| NativeResizeStart {
+                last: now,
+                ..*start
+            },
+        );
+        entity_commands.try_insert(start);
     }
 }
