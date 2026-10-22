@@ -2733,3 +2733,110 @@ fn an_apps_size_refusal_outside_a_tile_hold_is_still_adopted() {
     assert_eq!(frame(harness.world(), 0).width(), 450);
     assert_eq!(bounds_of(&mut harness, 0).x, 450);
 }
+
+/// Six columns on the main display, the first focused so the rest overflow
+/// to the right, with the external display at `ext`.
+fn overflowing_right_with_display(ext: IRect) -> TestHarness {
+    let mut harness = TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
+        .with_windows(6);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(SETTLE);
+    harness.run(vec![command(Operation::Focus(Direction::First))]);
+    harness.advance(SETTLE);
+    harness
+}
+
+/// Holds window 0 at `edge` on the main display for 1200ms, and returns
+/// whether the strip scrolled.
+fn edge_hold_scrolls(harness: &mut TestHarness, edge: Origin) -> bool {
+    press_and_drag(harness, 0, edge);
+    let before = strip_x(harness.world(), TEST_WORKSPACE_ID);
+    harness.advance(ms(1200));
+    strip_x(harness.world(), TEST_WORKSPACE_ID) != before
+}
+
+#[test]
+fn a_display_diagonally_below_right_is_no_neighbor_at_the_right_edge() {
+    let ext = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
+    );
+    let mut harness = overflowing_right_with_display(ext);
+    assert!(edge_hold_scrolls(
+        &mut harness,
+        Origin::new(TEST_DISPLAY_WIDTH - 2, 500)
+    ));
+}
+
+#[test]
+fn a_display_beside_part_of_an_edge_is_a_neighbor_only_where_it_touches() {
+    let ext = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT / 2,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT / 2 + EXT_DISPLAY_HEIGHT,
+    );
+    for (y, scrolls) in [(200, true), (600, false)] {
+        let mut harness = overflowing_right_with_display(ext);
+        assert_eq!(
+            edge_hold_scrolls(&mut harness, Origin::new(TEST_DISPLAY_WIDTH - 2, y)),
+            scrolls,
+            "y={y}"
+        );
+    }
+}
+
+#[test]
+fn left_and_right_edge_scrolls_follow_physical_contact_at_pointer_height() {
+    for right in [false, true] {
+        for (gap, top, bottom, y, scrolls) in [
+            (0, 0, TEST_DISPLAY_HEIGHT, 500, false),
+            (2, 0, TEST_DISPLAY_HEIGHT, 500, false),
+            (3, 0, TEST_DISPLAY_HEIGHT, 500, true),
+            (0, TEST_DISPLAY_HEIGHT, TEST_DISPLAY_HEIGHT * 2, 500, true),
+            (0, -TEST_DISPLAY_HEIGHT, 0, 500, true),
+            (0, 400, TEST_DISPLAY_HEIGHT, 399, true),
+            (0, 400, TEST_DISPLAY_HEIGHT, 400, false),
+            (0, 0, 400, 399, false),
+            (0, 0, 400, 400, true),
+        ] {
+            let ext = if right {
+                IRect::new(
+                    TEST_DISPLAY_WIDTH + gap,
+                    top,
+                    TEST_DISPLAY_WIDTH + gap + EXT_DISPLAY_WIDTH,
+                    bottom,
+                )
+            } else {
+                IRect::new(-gap - EXT_DISPLAY_WIDTH, top, -gap, bottom)
+            };
+            let mut harness = overflowing_right_with_display(ext);
+            let (window, x) = if right {
+                (0, TEST_DISPLAY_WIDTH - 2)
+            } else {
+                harness.run(vec![command(Operation::Focus(Direction::Last))]);
+                harness.advance(SETTLE);
+                (5, 2)
+            };
+            press_and_drag(&mut harness, window, Origin::new(x, y));
+            let DragState::Dragging(drag) = drag_state(harness.world()) else {
+                panic!("edge hold must be a confirmed drag");
+            };
+            assert_eq!(drag.pointer, Origin::new(x, y));
+            let before = strip_x(harness.world(), TEST_WORKSPACE_ID);
+            harness.advance(ms(1200));
+            let after = strip_x(harness.world(), TEST_WORKSPACE_ID);
+            assert_eq!(
+                after != before,
+                scrolls,
+                "right={right}, gap={gap}, vertical={top}..{bottom}, y={y}, strip={before}->{after}"
+            );
+            if scrolls {
+                assert_eq!(after < before, right, "scroll exposes the held side");
+            }
+        }
+    }
+}
