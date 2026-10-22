@@ -2275,7 +2275,6 @@ fn explicit_resize_width_commands_keep_requested_frames_after_an_app_resize() {
             IRect::from_corners(start.min, start.min + IVec2::new(app_width, start.height()));
         macos_tile(&mut harness, 0, app_frame);
         assert_eq!(frame(harness.world(), 0), app_frame);
-        // The engine adopts an app's own resize once it settles.
         harness.advance(ms(300));
 
         harness.world().write_message(command(operation.clone()));
@@ -2509,8 +2508,6 @@ fn explicit_resize_vertical_replaces_slots_for_both_stack_members() {
     harness.advance(SETTLE);
     assert_eq!(frame(harness.world(), 0), IRect::new(0, 20, 512, 269));
     assert_eq!(frame(harness.world(), 1), IRect::new(0, 269, 512, 768));
-    // The lower member reports first. Its top edge moving down grows the
-    // member above by the same amount, which then matches the app's frame.
     for (id, app_frame) in [
         (1, IRect::new(0, 320, 512, 768)),
         (0, IRect::new(0, 20, 512, 320)),
@@ -2526,8 +2523,6 @@ fn explicit_resize_vertical_replaces_slots_for_both_stack_members() {
     harness
         .world()
         .write_message(command(Operation::ResizeVertical(Grow)));
-    // The resize lands this frame, and the lower member moves to its new top
-    // on the next.
     harness.advance(FRAME * 2);
     let expected = [IRect::new(0, 20, 512, 394), IRect::new(0, 394, 512, 768)];
     assert_eq!(
@@ -2563,8 +2558,6 @@ fn explicit_resize_equalize_replaces_slots_for_both_stack_members() {
         command(Operation::ResizeVertical(Shrink)),
     ]);
     harness.advance(SETTLE);
-    // The app resizes both members. The lower one reports first, so its top
-    // edge grows the member above to the app's frame.
     for (id, app_frame) in [
         (1, IRect::new(0, 320, 512, 768)),
         (0, IRect::new(0, 20, 512, 320)),
@@ -2603,7 +2596,6 @@ fn explicit_resize_balance_replaces_the_slot_of_a_resized_column() {
     harness.advance(SETTLE);
     let start = frame(harness.world(), 1);
     assert_eq!(start.min.x, 512, "window 1 starts beside the focused half");
-    // The app widens the other column's window on its own.
     macos_tile(
         &mut harness,
         1,
@@ -2677,8 +2669,6 @@ fn a_macos_tile_that_macos_keeps_reapplying_returns_to_its_slot() {
             );
             macos_tile(&mut harness, 1, frame);
         }
-        // macOS keeps the window's tile state: after each restore it puts the
-        // tile frame back, sometimes before the engine reads the size back.
         for _ in 0..6 {
             macos_tile(&mut harness, 1, tile);
             harness
@@ -2953,6 +2943,162 @@ fn tile_lifecycle_settlement_retries_after_swipe_or_frame_read_failure() {
         failures.is_empty(),
         "unacknowledged settlement: {failures:?}"
     );
+}
+
+#[test]
+fn tile_lifecycle_move_only_or_split_native_frames_are_not_fought() {
+    let moved = Event::WindowMoved { window_id: 1 };
+    let resized = Event::WindowResized { window_id: 1 };
+    let mut failures = Vec::new();
+    for frames in [
+        vec![vec![moved.clone()]],
+        vec![vec![moved.clone()], vec![resized.clone()]],
+        vec![vec![resized.clone()], vec![moved.clone()]],
+    ] {
+        let mut harness = three_columns();
+        let start = frame(harness.world(), 1);
+        let writes = |harness: &mut TestHarness| {
+            let mut writes = (0, 0);
+            harness.mock_state.update_window(1, |window| {
+                writes = (window.resize_writes, window.position_writes);
+            });
+            writes
+        };
+        let before = writes(&mut harness);
+        for step in 1..=4 {
+            let native = IRect::new(
+                start.min.x - 40 * step,
+                start.min.y,
+                start.max.x,
+                start.max.y,
+            );
+            harness
+                .mock_state
+                .update_window(1, |window| window.frame = native);
+            for events in &frames {
+                for event in events {
+                    harness.world().write_message(event.clone());
+                }
+                harness.advance(FRAME);
+            }
+            let actual = frame(harness.world(), 1);
+            if writes(&mut harness) != before || actual != native {
+                failures.push(format!("{frames:?}, step={step}, actual={actual:?}"));
+            }
+        }
+        harness.advance(SETTLE);
+        let end = IRect::new(start.min.x - 160, start.min.y, start.max.x, start.max.y);
+        let actual = frame(harness.world(), 1);
+        if actual != end || bounds_of(&mut harness, 1) != end.size() {
+            failures.push(format!("{frames:?}, settled={actual:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "native animation frame writes: {failures:?}"
+    );
+}
+
+#[test]
+fn tile_lifecycle_relative_width_in_the_same_pump_as_a_native_resize_reads_it() {
+    use crate::commands::ResizeDirection::{Grow, Shrink};
+
+    let mut failures = Vec::new();
+    for (operation, initial_width, app_width, width) in [
+        (Operation::ResizeStep(Shrink), 400, 768, 512),
+        (Operation::Resize(Grow), 256, 560, 768),
+    ] {
+        let mut harness = harness_with(
+            "[options]\nauto_center = false\npreset_column_widths = [0.25, 0.5, 0.75]\nwindow_resize_step = 0.25\n",
+            TEST_DISPLAY_HEIGHT,
+            1,
+        );
+        harness.run(vec![command(Operation::SetWidth(
+            f64::from(initial_width) / f64::from(TEST_DISPLAY_WIDTH),
+        ))]);
+        harness.advance(SETTLE);
+        let start = frame(harness.world(), 0);
+        let native =
+            IRect::from_corners(start.min, start.min + IVec2::new(app_width, start.height()));
+        harness
+            .mock_state
+            .update_window(0, |window| window.frame = native);
+        for event in [
+            Event::WindowMoved { window_id: 0 },
+            Event::WindowResized { window_id: 0 },
+            command(operation.clone()),
+        ] {
+            harness.world().write_message(event);
+        }
+        harness.advance(FRAME);
+        let expected =
+            IRect::from_corners(start.min, start.min + IVec2::new(width, start.height()));
+        let immediate = frame(harness.world(), 0);
+        harness.advance(SETTLE);
+        let settled = frame(harness.world(), 0);
+        if immediate != expected || settled != expected {
+            failures.push((operation, expected, immediate, settled));
+        }
+    }
+    assert!(failures.is_empty(), "relative command frames: {failures:?}");
+}
+
+#[test]
+fn tile_lifecycle_repeated_relative_width_steps_from_the_pending_target() {
+    use crate::commands::ResizeDirection::Shrink;
+
+    let mut harness = harness_with(
+        "[options]\nauto_center = false\nwindow_resize_step = 0.25\n",
+        TEST_DISPLAY_HEIGHT,
+        1,
+    );
+    let start = frame(harness.world(), 0);
+    macos_tile(
+        &mut harness,
+        0,
+        IRect::new(0, start.min.y, 768, start.max.y),
+    );
+    harness
+        .mock_state
+        .update_window(0, |window| window.dropped_resizes = 2);
+    for _ in 0..2 {
+        harness
+            .world()
+            .write_message(command(Operation::ResizeStep(Shrink)));
+        harness.advance(FRAME);
+    }
+    harness.advance(SETTLE);
+    assert_eq!(
+        frame(harness.world(), 0),
+        IRect::new(0, start.min.y, 256, start.max.y)
+    );
+}
+
+#[test]
+fn tile_lifecycle_relative_width_during_a_hold_uses_the_held_slot() {
+    use crate::commands::ResizeDirection::Grow;
+
+    let mut harness = harness_with(
+        "[options]\nauto_center = false\nwindow_resize_step = 0.25\n",
+        TEST_DISPLAY_HEIGHT,
+        1,
+    );
+    let start = frame(harness.world(), 0);
+    assert_eq!(start.width(), 400);
+    let tile = IRect::new(0, start.min.y, 512, start.max.y);
+    macos_tile(&mut harness, 0, tile);
+    harness.advance(FRAME * 5);
+    harness
+        .mock_state
+        .update_window(0, |window| window.frame = tile);
+    harness
+        .world()
+        .write_message(command(Operation::ResizeStep(Grow)));
+    harness.advance(FRAME);
+    let expected = IRect::new(0, start.min.y, 656, start.max.y);
+    assert_eq!(frame(harness.world(), 0), expected);
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), 0), expected);
 }
 
 /// Six columns on the main display, the first focused so the rest overflow

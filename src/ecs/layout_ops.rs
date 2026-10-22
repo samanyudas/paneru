@@ -166,8 +166,6 @@ fn apply(
                 debug!(target: "paneru::lua", "skipping {op:?}: a width ratio must be positive");
                 return;
             }
-            // An explicit width replaces any slot a native resize recorded for
-            // the named column, whether or not the window is focused.
             if let Some((strip, _)) = workspaces.iter().find(|(strip, _)| strip.contains(entity))
                 && let Some(column) = strip
                     .index_of(entity)
@@ -235,8 +233,6 @@ fn apply(
             }
             let origin = Origin::new(frame.x, frame.y);
             let size = Size::new(frame.width.max(1), frame.height.max(1));
-            // The explicit frame replaces any slot a native resize recorded
-            // for the window and the native tabs that share it.
             let group = workspaces
                 .iter()
                 .find_map(|(strip, _)| strip.tab_group(entity))

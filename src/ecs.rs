@@ -9,7 +9,9 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
-use bevy::ecs::schedule::common_conditions::{not, on_message, resource_changed, resource_exists};
+use bevy::ecs::schedule::common_conditions::{
+    any_with_component, not, on_message, resource_changed, resource_exists,
+};
 use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor, SystemSet};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
@@ -132,12 +134,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
 
     native_membership::register(app);
 
-    let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
-        scrolling
-            .iter()
-            .next()
-            .is_none_or(|marker| !marker.is_user_swiping)
-    };
     let overlays_dirty =
         |config: Option<Res<Config>>,
          theme: Option<Res<SystemTheme>>,
@@ -218,12 +214,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_systems(
         Update,
         (
-            (
-                systems::window_resized_update_frame,
-                systems::window_moved_update_frame,
-            )
-                .chain()
-                .run_if(not_swiping),
+            systems::window_frame_update.run_if(
+                on_message::<Event>
+                    .or_else(any_with_component::<crate::ecs::drag::NativeResizeStart>),
+            ),
             workspace::cleanup_unordered_windows
                 .run_if(not(resource_exists::<Initializing>))
                 .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
@@ -1005,7 +999,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         // buffer with bevy's `MessageRegistry`, so it's never double-buffered
         // and grows unbounded instead — every event lived for the process's
         // lifetime. Messages now live two frames, which every reader here
-        // tolerates: readers gated on `not_swiping` or IPC subscribers would
+        // tolerates: a frame reader skipping a swipe or IPC subscribers would
         // rather drop a missed frame than act on a backlog.
         .add_message::<Event>()
         .insert_resource(Time::<Virtual>::from_max_delta(Duration::from_secs(10)))

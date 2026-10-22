@@ -7,7 +7,7 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Has, With};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_changed};
-use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, ParamSet, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
 use tracing::{Level, instrument};
@@ -28,7 +28,8 @@ use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowCtx, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, FullWidthMarker, ManualStripOffset,
     MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, RaiseWindow,
-    SelectedVirtualMarker, SpawnCommandsExt, Timeout, Unmanaged, WidthAnchor, WidthRun,
+    SelectedVirtualMarker, SpawnCommandsExt, Timeout, Unmanaged, VerifyWindowSize, WidthAnchor,
+    WidthRun,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Size, Window, WindowManager, origin_from};
@@ -828,6 +829,16 @@ fn width_anchor(
     }
 }
 
+type WidthWork<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Option<&'static NativeResizeStart>,
+        Has<VerifyWindowSize>,
+        Has<PendingWidthSettlement>,
+    ),
+>;
+
 /// Resizes the focused window to the next or previous preset column width, or
 /// by one `window_resize_step` of the display width.
 ///
@@ -841,17 +852,13 @@ fn width_anchor(
 #[allow(clippy::too_many_lines)]
 fn resize_window(
     mut messages: MessageReader<Event>,
-    ctx: WindowCtx,
+    mut ctx: ParamSet<(WindowCtx, Query<&mut Window>)>,
+    engine_work: WidthWork,
     runs: Query<&WidthRun>,
     interrupted: Res<WidthBatchInterrupted>,
     time: Res<Time>,
     active_display: ActiveDisplay,
 ) {
-    let WindowCtx {
-        windows,
-        config,
-        mut commands,
-    } = ctx;
     let Some(operation) = filter_window_operations(&mut messages, |op| {
         matches!(
             op,
@@ -862,10 +869,21 @@ fn resize_window(
         return;
     };
 
-    let Some((frame, entity)) = windows
-        .focused()
-        .and_then(|(_, entity)| windows.frame(entity).zip(Some(entity)))
-    else {
+    let Some(entity) = ctx.p0().windows.focused().map(|(_, entity)| entity) else {
+        return;
+    };
+    let (native_resize, verifying, settling) = engine_work.get(entity).unwrap_or_default();
+    let pending = ctx.p0().windows.is_resizing(entity) || verifying || settling;
+    let held = native_resize.and_then(|start| start.held_size(time.elapsed()));
+    let native = (!matches!(operation, Operation::SetWidth(_)) && !pending && held.is_none())
+        .then(|| ctx.p1().get_mut(entity).ok()?.update_frame().ok())
+        .flatten();
+    let WindowCtx {
+        windows,
+        config,
+        mut commands,
+    } = ctx.p0();
+    let Some(frame) = windows.frame(entity) else {
         return;
     };
     if windows.full_width(entity).is_some()
@@ -876,8 +894,13 @@ fn resize_window(
 
     let viewport = active_display.actual_bounds(&config);
     // Pending resizes count, so a quick second press moves on to the next preset.
-    let pending = windows.moving_frame(entity).unwrap_or(frame);
-    let current_ratio = f64::from(pending.width()) / f64::from(viewport.width());
+    let width = if pending {
+        windows.moving_frame(entity).unwrap_or(frame).width()
+    } else {
+        held.or(native.map(|native| native.size()))
+            .map_or(frame.width(), |size| size.x)
+    };
+    let current_ratio = f64::from(width) / f64::from(viewport.width());
     let widths = config.preset_column_widths();
     let fallback = *widths.first().unwrap_or(&0.5);
     let cycle = config.window_resize_cycle();
@@ -917,8 +940,6 @@ fn resize_window(
 
     let strip = active_display.active_strip();
     let strip_entity = active_display.active_strip_entity();
-    // An explicit width replaces any slot a native resize recorded for the
-    // column, so a later tile check cannot restore the older frame.
     if size.x > 0
         && size.y > 0
         && let Some(column) = strip
@@ -1138,8 +1159,6 @@ fn full_width_window(
     };
 
     let viewport = active_display.actual_bounds(&config);
-    // The native tabs that resize with the window, taken before unstacking.
-    // Former stack neighbours only reflow, so their recorded slots stay.
     let tabs = active_display
         .active_strip()
         .tab_group(entity)

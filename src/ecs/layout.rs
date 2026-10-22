@@ -197,7 +197,7 @@ fn fitting_origin_x(
 }
 
 /// How far a stored width may drift before a [`ManualStripOffset`] counts as
-/// stale. `window_resized_update_frame` writes back the OS geometry, which can
+/// stale. `window_frame_update` writes back the OS geometry, which can
 /// land a pixel or two off the size the layout asked for.
 const SIGNATURE_WIDTH_TOLERANCE: i32 = 2;
 

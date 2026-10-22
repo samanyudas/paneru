@@ -13,7 +13,7 @@
 mod tiling;
 #[cfg(test)]
 pub(crate) use tiling::is_macos_tile;
-pub(crate) use tiling::{NativeResizeStart, PointerResize, TilingRestore};
+pub(crate) use tiling::{NativeFrame, NativeResizeStart, PointerResize, TilingRestore, tiled_in};
 
 use std::cell::OnceCell;
 use std::ops::Range;
@@ -973,24 +973,17 @@ impl Plugin for DragEventsPlugin {
             .add_systems(
                 Update,
                 tiling::track_resize_gesture
-                    .before(super::systems::window_resized_update_frame)
+                    .before(super::systems::window_frame_update)
                     .in_set(super::UpdateSet::Events)
                     .run_if(on_message::<Event>.or_eager(|resize: Res<PointerResize>| {
                         !matches!(*resize, PointerResize::Idle)
                     })),
             )
-            .add_observer(tiling::adopt_cleared_native_resize)
-            .add_systems(
-                Update,
-                tiling::settle_native_resizes
-                    .before(super::systems::window_resized_update_frame)
-                    .in_set(super::UpdateSet::Events)
-                    .run_if(|starts: Query<(), With<NativeResizeStart>>| !starts.is_empty()),
-            )
+            .add_observer(tiling::adopt_cancelled_native_resize)
             .add_systems(
                 Update,
                 poll_pressed_window
-                    .before(super::systems::window_moved_update_frame)
+                    .before(super::systems::window_frame_update)
                     .in_set(super::UpdateSet::Events)
                     .run_if(|state: Res<DragState>| awaiting_confirmation(&state).is_some()),
             )
@@ -998,8 +991,7 @@ impl Plugin for DragEventsPlugin {
                 Update,
                 (
                     drag_events
-                        .after(super::systems::window_resized_update_frame)
-                        .after(super::systems::window_moved_update_frame)
+                        .after(super::systems::window_frame_update)
                         .before(super::mouse::mouse_up_trigger)
                         // A drop focuses the window after giving it its new
                         // column's width. Run the other way round, the focus

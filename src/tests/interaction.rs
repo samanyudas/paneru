@@ -3062,8 +3062,8 @@ fn test_own_window_move_echo_is_ignored() {
     world.write_message(Event::WindowMoved { window_id: 0 });
 
     world
-        .run_system_once(crate::ecs::systems::window_moved_update_frame)
-        .expect("running window_moved_update_frame");
+        .run_system_once(crate::ecs::systems::window_frame_update)
+        .expect("running window_frame_update");
 
     assert_eq!(
         world.get::<Position>(entity).expect("window position").0,

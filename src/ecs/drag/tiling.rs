@@ -3,33 +3,27 @@ use std::time::Duration;
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::lifecycle::Remove;
-use bevy::ecs::message::{MessageReader, MessageWriter};
+use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
+use bevy::ecs::query::{Has, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Commands, Query, Res, ResMut, SystemParam};
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::systems::unpadded;
-use crate::ecs::{Bounds, DockPosition, PresentedOrigin, ResizeMarker, SpawnCommandsExt};
+use crate::ecs::{
+    Bounds, DockPosition, PresentedOrigin, RepositionMarker, ResizeMarker, SpawnCommandsExt,
+    Unmanaged, VerifyWindowSize,
+};
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Origin, Window, WindowManager, origin_from};
 
 const EDGE_TOLERANCE: i32 = 6;
 const TILE_TOLERANCE: i32 = 2;
 const RESIZE_RELEASE_GRACE: Duration = Duration::from_millis(600);
-/// How long after its last step a resize the engine did not start still
-/// counts as one resize.
-const NATIVE_RESIZE_QUIET: Duration = Duration::from_millis(600);
-/// How long a resize the engine did not start must go without a step before
-/// the engine adopts its frame. macOS reports the steps of a tile animation
-/// every 10 to 25ms on the native rig, so a 200ms pause means it has ended.
 const NATIVE_RESIZE_SETTLE: Duration = Duration::from_millis(200);
-/// How long a restored slot stays authoritative after a macOS tile. macOS
-/// keeps a tiled window's tile state and puts the tile frame back for about
-/// 300ms after each restore. One second outlasts that with margin, and is
-/// short enough that the hold ends before a deliberate later resize.
 const TILE_RESTORE_HOLD: Duration = Duration::from_secs(1);
 
 /// The windows a left press may be resizing by an edge: every tiled window
@@ -166,47 +160,95 @@ pub(crate) fn is_macos_tile(frame: IRect, visible: IRect) -> bool {
     })
 }
 
-/// The slot a window had when a resize the engine did not start began.
-///
-/// While such a resize runs, the engine leaves the window's `Bounds` and
-/// strip offset alone, so it does not fight a native tile animation. If the
-/// resize ends on a tile, the window returns to this slot, and the slot then
-/// holds for [`TILE_RESTORE_HOLD`]: every tile frame macOS puts back returns
-/// to it, and a size readback cannot replace it. Otherwise the engine adopts
-/// the frame once the resize settles.
+pub(crate) fn tiled_in(strip: &LayoutStrip, entity: Entity) -> bool {
+    strip
+        .index_of(entity)
+        .ok()
+        .and_then(|index| strip.get(index).ok())
+        .is_some_and(|column| !matches!(column, Column::Fullscren(_)))
+}
+
 #[derive(Component, Clone, Copy)]
 pub(crate) struct NativeResizeStart {
     origin: Origin,
     size: IVec2,
     strip_x: Option<i32>,
-    last: Duration,
-    hold_until: Option<Duration>,
-    settled: bool,
+    phase: Phase,
+}
+
+#[derive(Clone, Copy)]
+enum Phase {
+    Observing {
+        frame: IRect,
+        changed: Duration,
+    },
+    Holding {
+        until: Duration,
+    },
+    Settling {
+        settlement: Settlement,
+        retry: Duration,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum Settlement {
+    Adopt(IRect),
+    Refused,
 }
 
 impl NativeResizeStart {
-    fn fresh(&self, now: Duration) -> bool {
-        now <= self.last + NATIVE_RESIZE_QUIET || self.holds(now)
+    fn slot(&self) -> IRect {
+        IRect::from_corners(self.origin, self.origin + self.size)
     }
 
-    /// Whether a restored slot still holds against macOS's tile frames.
-    pub(crate) fn holds(&self, now: Duration) -> bool {
-        self.hold_until.is_some_and(|until| now <= until)
+    fn settlement(&self, now: Duration) -> Option<Settlement> {
+        match self.phase {
+            Phase::Observing { frame, changed } => {
+                (now >= changed + NATIVE_RESIZE_SETTLE).then_some(Settlement::Adopt(frame))
+            }
+            Phase::Holding { until } => (now >= until).then_some(Settlement::Refused),
+            Phase::Settling { settlement, .. } => Some(settlement),
+        }
+    }
+
+    fn due(&self, now: Duration) -> bool {
+        match self.phase {
+            Phase::Settling { retry, .. } => now >= retry,
+            _ => self.settlement(now).is_some(),
+        }
+    }
+
+    pub(crate) fn held_size(&self, now: Duration) -> Option<IVec2> {
+        matches!(self.phase, Phase::Holding { until } if now < until).then_some(self.size)
+    }
+
+    pub(crate) fn needs_frame(&self) -> bool {
+        !matches!(self.phase, Phase::Settling { .. })
+    }
+
+    fn adopts_when_cancelled(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Observing { .. }
+                | Phase::Settling {
+                    settlement: Settlement::Adopt(_),
+                    ..
+                }
+        )
     }
 }
 
-/// Adopts the live size of a window whose deferred resize record is cleared,
-/// such as by an explicit resize, so clearing the record cannot drop the
-/// adoption it was deferring. A held or settled record adopts nothing here.
-pub(super) fn adopt_cleared_native_resize(
+pub(super) fn adopt_cancelled_native_resize(
     removed: On<Remove, NativeResizeStart>,
-    mut windows: Query<(&Window, &NativeResizeStart, &mut Bounds)>,
-    time: Res<Time>,
+    mut windows: Query<(&Window, &NativeResizeStart, &mut Bounds), Without<Unmanaged>>,
+    strips: Query<&LayoutStrip>,
 ) {
     let Ok((window, start, mut bounds)) = windows.get_mut(removed.entity) else {
         return;
     };
-    if start.settled || start.holds(time.elapsed()) {
+    if !start.adopts_when_cancelled() || !strips.iter().any(|strip| tiled_in(strip, removed.entity))
+    {
         return;
     }
     let size = window.frame().size();
@@ -215,141 +257,187 @@ pub(super) fn adopt_cleared_native_resize(
     }
 }
 
-/// Re-reports a resize the engine did not start once it has settled with no
-/// tile, so the engine adopts its frame. A held slot settles after its hold.
-pub(super) fn settle_native_resizes(
-    mut starts: Query<(&Window, &mut NativeResizeStart)>,
-    time: Res<Time>,
-    mut messages: MessageWriter<Event>,
-) {
-    let now = time.elapsed();
-    for (window, mut start) in &mut starts {
-        if start.settled || start.holds(now) || now < start.last + NATIVE_RESIZE_SETTLE {
-            continue;
-        }
-        start.settled = true;
-        messages.write(Event::WindowResized {
-            window_id: window.id(),
-        });
-    }
-}
+type Presented<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static PresentedOrigin,
+        Option<&'static ResizeMarker>,
+        Option<&'static RepositionMarker>,
+        Has<VerifyWindowSize>,
+        Option<&'static NativeResizeStart>,
+    ),
+>;
 
 #[derive(SystemParam)]
 pub(crate) struct TilingRestore<'w, 's> {
     displays: Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>,
-    presented: Query<
-        'w,
-        's,
-        (
-            &'static PresentedOrigin,
-            Option<&'static ResizeMarker>,
-            Option<&'static NativeResizeStart>,
-        ),
-    >,
+    presented: Presented<'w, 's>,
     gesture: Res<'w, PointerResize>,
     time: Res<'w, Time>,
 }
 
-/// A restore of a macOS tile: the strip offset to restore with the window,
-/// if the resize began from a recorded slot.
-pub(crate) struct Restored {
-    pub strip_x: Option<i32>,
+pub(crate) enum NativeFrame {
+    Ordinary,
+    Moved,
+    Deferred,
+    Restored(Option<i32>),
+    Settled,
+    Refused,
 }
 
 impl TilingRestore<'_, '_> {
-    /// Returns the window to its slot when `frame` is a macOS tile it did not
-    /// get from the user or the engine. The slot is the one recorded when the
-    /// resize began, else the window's layout slot.
-    pub(crate) fn restore(
+    pub(crate) fn due(&self, entity: Entity) -> bool {
+        let now = self.time.elapsed();
+        self.presented
+            .get(entity)
+            .is_ok_and(|(_, resize, reposition, verifying, start)| {
+                start.is_some_and(|start| {
+                    start.due(now) && !Self::blocks(start, now, resize, reposition, verifying)
+                })
+            })
+    }
+
+    fn blocks(
+        start: &NativeResizeStart,
+        now: Duration,
+        resize: Option<&ResizeMarker>,
+        reposition: Option<&RepositionMarker>,
+        verifying: bool,
+    ) -> bool {
+        match start.settlement(now) {
+            Some(Settlement::Refused) => {
+                resize.is_some_and(|resize| resize.0 != start.size)
+                    || reposition.is_some_and(|reposition| reposition.0 != start.origin)
+            }
+            _ => resize.is_some() || verifying,
+        }
+    }
+
+    pub(crate) fn observe(
         &self,
         entity: Entity,
         frame: IRect,
-        size: IVec2,
+        managed: IRect,
+        strip_x: Option<i32>,
         padding: (i32, i32),
         commands: &mut Commands,
-    ) -> Option<Restored> {
+    ) -> NativeFrame {
         let now = self.time.elapsed();
-        if self.gesture.resizes(entity, now)
-            || !self.displays.iter().any(|(display, dock)| {
-                is_macos_tile(unpadded(frame, padding), display.visible_bounds(dock))
-            })
-        {
-            return None;
+        let Ok((origin, resize, reposition, verifying, start)) = self.presented.get(entity) else {
+            return NativeFrame::Ordinary;
+        };
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            return NativeFrame::Ordinary;
+        };
+        if self.gesture.resizes(entity, now) {
+            if start.is_some() {
+                entity_commands.try_remove::<NativeResizeStart>();
+            }
+            return NativeFrame::Ordinary;
         }
-        let (origin, resizing, start) = self.presented.get(entity).ok()?;
-        // A settled resize is reported again to be adopted. A tile frame that
-        // outlasts the hold is the app keeping that size, not macOS.
-        if start.is_some_and(|start| start.settled) {
-            return None;
-        }
-        let start = start
-            .filter(|start| start.fresh(now))
-            .copied()
-            .unwrap_or(NativeResizeStart {
+        let tile = self.displays.iter().any(|(display, dock)| {
+            is_macos_tile(unpadded(frame, padding), display.visible_bounds(dock))
+        });
+        let engine = resize.is_some() || verifying;
+        let Some(&start) = start else {
+            if frame == managed {
+                return NativeFrame::Moved;
+            }
+            let slot = NativeResizeStart {
                 origin: origin.0,
-                size: resizing.map_or(size, |resize| resize.0),
+                size: resize.map_or(managed.size(), |resize| resize.0),
                 strip_x: None,
-                last: now,
-                hold_until: None,
-                settled: false,
-            });
-        if frame.min == start.origin && frame.size() == start.size {
-            return None;
-        }
-        commands.reposition_entity(entity, start.origin);
-        commands.resize_entity(entity, start.size);
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                phase: Phase::Holding {
+                    until: now + TILE_RESTORE_HOLD,
+                },
+            };
+            if tile && frame != slot.slot() {
+                return Self::restore(entity, slot, commands);
+            }
+            if engine {
+                return NativeFrame::Ordinary;
+            }
+            if frame.size() == managed.size() {
+                return NativeFrame::Moved;
+            }
             entity_commands.try_insert(NativeResizeStart {
-                last: now,
-                hold_until: Some(now + TILE_RESTORE_HOLD),
-                settled: false,
+                origin: origin.0,
+                size: managed.size(),
+                strip_x,
+                phase: Phase::Observing {
+                    frame,
+                    changed: now,
+                },
+            });
+            return NativeFrame::Deferred;
+        };
+        let settlement = start.settlement(now);
+        match settlement {
+            Some(Settlement::Refused) => {
+                if Self::blocks(&start, now, resize, reposition, verifying) {
+                    return NativeFrame::Deferred;
+                }
+                entity_commands.try_remove::<(
+                    ResizeMarker,
+                    RepositionMarker,
+                    VerifyWindowSize,
+                    NativeResizeStart,
+                )>();
+                return NativeFrame::Refused;
+            }
+            _ if tile && frame != start.slot() => {
+                let phase = match start.phase {
+                    Phase::Holding { until } => Phase::Holding { until },
+                    _ => Phase::Holding {
+                        until: now + TILE_RESTORE_HOLD,
+                    },
+                };
+                return Self::restore(entity, NativeResizeStart { phase, ..start }, commands);
+            }
+            _ if engine || matches!(start.phase, Phase::Holding { .. }) => {
+                return NativeFrame::Deferred;
+            }
+            Some(Settlement::Adopt(seen)) if seen == frame => {
+                entity_commands.try_remove::<NativeResizeStart>();
+                return NativeFrame::Settled;
+            }
+            _ => {}
+        }
+        if !matches!(start.phase, Phase::Observing { frame: seen, .. } if seen == frame) {
+            entity_commands.try_insert(NativeResizeStart {
+                phase: Phase::Observing {
+                    frame,
+                    changed: now,
+                },
                 ..start
             });
         }
-        Some(Restored {
-            strip_x: start.strip_x,
-        })
+        NativeFrame::Deferred
     }
 
-    /// Whether the engine defers a resize of `entity` it did not start,
-    /// recording the slot it began from. A user edge resize, and a resize
-    /// that has settled with no tile, are adopted at once instead.
-    pub(crate) fn defers(
-        &self,
-        entity: Entity,
-        size: IVec2,
-        strip_x: Option<i32>,
-        commands: &mut Commands,
-    ) -> bool {
+    pub(crate) fn retry(&self, entity: Entity, commands: &mut Commands) {
         let now = self.time.elapsed();
-        let Ok((origin, _, start)) = self.presented.get(entity) else {
-            return false;
-        };
-        let Ok(mut entity_commands) = commands.get_entity(entity) else {
-            return false;
-        };
-        if self.gesture.resizes(entity, now) || start.is_some_and(|start| start.settled) {
-            entity_commands.try_remove::<NativeResizeStart>();
-            return false;
-        }
-        if start.is_some_and(|start| start.holds(now)) {
-            return true;
-        }
-        let start = start.filter(|start| start.fresh(now)).map_or(
-            NativeResizeStart {
-                origin: origin.0,
-                size,
-                strip_x,
-                last: now,
-                hold_until: None,
-                settled: false,
-            },
-            |start| NativeResizeStart {
-                last: now,
+        if let Ok((.., Some(start))) = self.presented.get(entity)
+            && let Some(settlement) = start.settlement(now)
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_insert(NativeResizeStart {
+                phase: Phase::Settling {
+                    settlement,
+                    retry: now + NATIVE_RESIZE_SETTLE,
+                },
                 ..*start
-            },
-        );
-        entity_commands.try_insert(start);
-        true
+            });
+        }
+    }
+
+    fn restore(entity: Entity, start: NativeResizeStart, commands: &mut Commands) -> NativeFrame {
+        commands.reposition_entity(entity, start.origin);
+        commands.resize_entity(entity, start.size);
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(start);
+        }
+        NativeFrame::Restored(start.strip_x)
     }
 }
