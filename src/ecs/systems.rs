@@ -791,6 +791,7 @@ pub(crate) fn pump_events(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn window_frame_update(
     mut messages: MessageReader<Event>,
@@ -870,6 +871,10 @@ pub(crate) fn window_frame_update(
             }
             NativeFrame::Refused => {
                 adopt_refused_frame(entity, new_frame, &mut windows, &workspaces, &mut commands);
+                false
+            }
+            NativeFrame::KeptRefusal => {
+                keep_refused_height(entity, new_frame, &mut windows, &mut commands);
                 false
             }
             NativeFrame::Settled => {
@@ -999,6 +1004,26 @@ fn adopt_native_size(
         && above_bounds.0.y - diff > 200
     {
         above_bounds.0.y -= diff;
+    }
+}
+
+fn keep_refused_height(
+    entity: Entity,
+    new_frame: IRect,
+    windows: &mut NativeFrameWindows,
+    commands: &mut Commands,
+) {
+    let Ok((_, _, position, mut bounds, ..)) = windows.get_mut(entity) else {
+        return;
+    };
+    if bounds.is_changed() {
+        return;
+    }
+    if position.0 == new_frame.min && bounds.0.x == new_frame.width() {
+        bounds.bypass_change_detection().0.y = new_frame.height();
+    }
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<NativeResizeStart>();
     }
 }
 

@@ -189,6 +189,9 @@ enum Phase {
         settlement: Settlement,
         retry: Duration,
     },
+    Refused {
+        frame: IRect,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -209,12 +212,14 @@ impl NativeResizeStart {
             }
             Phase::Holding { until } => (now >= until).then_some(Settlement::Refused),
             Phase::Settling { settlement, .. } => Some(settlement),
+            Phase::Refused { .. } => None,
         }
     }
 
     fn due(&self, now: Duration) -> bool {
         match self.phase {
             Phase::Settling { retry, .. } => now >= retry,
+            Phase::Refused { .. } => true,
             _ => self.settlement(now).is_some(),
         }
     }
@@ -224,7 +229,14 @@ impl NativeResizeStart {
     }
 
     pub(crate) fn needs_frame(&self) -> bool {
-        !matches!(self.phase, Phase::Settling { .. })
+        !matches!(self.phase, Phase::Settling { .. } | Phase::Refused { .. })
+    }
+
+    fn refused(&self) -> Option<IRect> {
+        match self.phase {
+            Phase::Refused { frame } => Some(frame),
+            _ => None,
+        }
     }
 
     fn adopts_when_cancelled(&self) -> bool {
@@ -284,6 +296,7 @@ pub(crate) enum NativeFrame {
     Restored(Option<i32>),
     Settled,
     Refused,
+    KeptRefusal,
 }
 
 impl TilingRestore<'_, '_> {
@@ -340,7 +353,16 @@ impl TilingRestore<'_, '_> {
             is_macos_tile(unpadded(frame, padding), display.visible_bounds(dock))
         });
         let engine = resize.is_some() || verifying;
-        let Some(&start) = start else {
+        if let Some(refused) = start.and_then(NativeResizeStart::refused) {
+            if engine {
+                return NativeFrame::Deferred;
+            }
+            if refused == frame {
+                return NativeFrame::KeptRefusal;
+            }
+            entity_commands.try_remove::<NativeResizeStart>();
+        }
+        let Some(&start) = start.filter(|start| start.refused().is_none()) else {
             if frame == managed {
                 return NativeFrame::Moved;
             }
@@ -378,12 +400,11 @@ impl TilingRestore<'_, '_> {
                 if Self::blocks(&start, now, resize, reposition, verifying) {
                     return NativeFrame::Deferred;
                 }
-                entity_commands.try_remove::<(
-                    ResizeMarker,
-                    RepositionMarker,
-                    VerifyWindowSize,
-                    NativeResizeStart,
-                )>();
+                entity_commands.try_remove::<(ResizeMarker, RepositionMarker, VerifyWindowSize)>();
+                entity_commands.try_insert(NativeResizeStart {
+                    phase: Phase::Refused { frame },
+                    ..start
+                });
                 return NativeFrame::Refused;
             }
             _ if tile && frame != start.slot() => {
