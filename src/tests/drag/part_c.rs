@@ -1,4 +1,5 @@
 use super::*;
+use bevy::ecs::system::RunSystemOnce;
 
 #[test]
 fn ending_a_press_replays_layout_changes_for_every_native_tab() {
@@ -2732,6 +2733,226 @@ fn an_apps_size_refusal_outside_a_tile_hold_is_still_adopted() {
     harness.advance(SETTLE);
     assert_eq!(frame(harness.world(), 0).width(), 450);
     assert_eq!(bounds_of(&mut harness, 0).x, 450);
+}
+
+#[test]
+fn tile_lifecycle_origin_changing_native_animation_is_not_fought() {
+    let mut failures = Vec::new();
+    for resized_first in [false, true] {
+        let mut harness = three_columns();
+        let start = frame(harness.world(), 1);
+        let mut before = (0, 0);
+        harness.mock_state.update_window(1, |window| {
+            before = (window.resize_writes, window.position_writes);
+        });
+        for step in 1..=4 {
+            let native = IRect::new(
+                start.min.x - 40 * step,
+                start.min.y,
+                start.max.x,
+                start.max.y,
+            );
+            harness
+                .mock_state
+                .update_window(1, |window| window.frame = native);
+            let mut events = [
+                Event::WindowMoved { window_id: 1 },
+                Event::WindowResized { window_id: 1 },
+            ];
+            if resized_first {
+                events.reverse();
+            }
+            for event in events {
+                harness.world().write_message(event);
+            }
+            harness.advance(FRAME);
+            harness.mock_state.update_window(1, |window| {
+                let writes = (window.resize_writes, window.position_writes);
+                if writes != before || window.frame != native {
+                    failures.push(format!(
+                        "resized_first={resized_first}, step={step}, expected={native:?}, actual={:?}, writes={before:?}->{writes:?}",
+                        window.frame
+                    ));
+                }
+            });
+        }
+        harness.advance(SETTLE);
+        let end = IRect::new(start.min.x - 160, start.min.y, start.max.x, start.max.y);
+        let actual = frame(harness.world(), 1);
+        if actual != end {
+            failures.push(format!(
+                "resized_first={resized_first}, settled expected={end:?}, actual={actual:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "native animation frame writes: {failures:?}"
+    );
+}
+
+#[test]
+fn tile_lifecycle_immediate_relative_width_uses_the_unsettled_native_frame() {
+    use crate::commands::ResizeDirection::{Grow, Shrink};
+
+    let mut failures = Vec::new();
+    for (operation, initial_width, app_width, width) in [
+        (Operation::ResizeStep(Shrink), 400, 768, 512),
+        (Operation::Resize(Grow), 256, 560, 768),
+    ] {
+        let mut harness = harness_with(
+            "[options]\nauto_center = false\npreset_column_widths = [0.25, 0.5, 0.75]\nwindow_resize_step = 0.25\n",
+            TEST_DISPLAY_HEIGHT,
+            1,
+        );
+        harness.run(vec![command(Operation::SetWidth(
+            f64::from(initial_width) / f64::from(TEST_DISPLAY_WIDTH),
+        ))]);
+        harness.advance(SETTLE);
+        let start = frame(harness.world(), 0);
+        assert_eq!(start.width(), initial_width);
+        let native =
+            IRect::from_corners(start.min, start.min + IVec2::new(app_width, start.height()));
+        macos_tile(&mut harness, 0, native);
+        assert_eq!(frame(harness.world(), 0), native);
+        harness.world().write_message(command(operation.clone()));
+        harness.advance(FRAME);
+        let expected =
+            IRect::from_corners(start.min, start.min + IVec2::new(width, start.height()));
+        let immediate = frame(harness.world(), 0);
+        harness
+            .world()
+            .write_message(Event::WindowResized { window_id: 0 });
+        harness.advance(SETTLE);
+        let settled = frame(harness.world(), 0);
+        if immediate != expected || settled != expected {
+            failures.push((operation, expected, immediate, settled));
+        }
+    }
+    assert!(failures.is_empty(), "relative command frames: {failures:?}");
+}
+
+#[test]
+fn tile_lifecycle_repeated_tile_refusal_has_an_absolute_deadline() {
+    let mut harness = harness_with("[options]\nauto_center = false\n", TEST_DISPLAY_HEIGHT, 1);
+    let tile = IRect::new(0, 20, 512, 768);
+    assert_eq!(frame(harness.world(), 0), IRect::new(0, 20, 400, 768));
+    harness.mock_state.update_window(0, |window| {
+        window.minimum_size = Some(tile.size());
+    });
+    for _ in 0..6 {
+        macos_tile(&mut harness, 0, tile);
+        harness.advance(ms(280));
+    }
+    let mut before = 0;
+    harness
+        .mock_state
+        .update_window(0, |window| before = window.resize_writes);
+    for _ in 0..4 {
+        macos_tile(&mut harness, 0, tile);
+        harness.advance(ms(280));
+    }
+    let active = harness
+        .world()
+        .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
+        .unwrap();
+    let mut actual = (tile, 0);
+    harness.mock_state.update_window(0, |window| {
+        actual = (window.frame, window.resize_writes);
+    });
+    assert_eq!(
+        (
+            actual.0,
+            bounds_of(&mut harness, 0),
+            actual.1 - before,
+            active
+        ),
+        (tile, tile.size(), 0, false),
+        "persistent refusal must be adopted without renewed restoration or active frames"
+    );
+}
+
+#[test]
+fn tile_lifecycle_minimized_or_hidden_resize_retires_before_idle() {
+    let mut failures = Vec::new();
+    for hidden in [false, true] {
+        let mut harness = harness_with("[options]\nauto_center = false\n", TEST_DISPLAY_HEIGHT, 1);
+        let native = IRect::new(0, 20, 560, 768);
+        macos_tile(&mut harness, 0, native);
+        if hidden {
+            harness.world().write_message(Event::ApplicationHidden {
+                pid: TEST_PROCESS_ID,
+            });
+        } else {
+            harness.mock_state.os_minimize_window(0, true);
+        }
+        harness.advance(SETTLE);
+        let active = harness
+            .world()
+            .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
+            .unwrap();
+        let actual = frame(harness.world(), 0);
+        if actual != native || active {
+            failures.push((hidden, actual, active));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "ineligible window settlement: {failures:?}"
+    );
+}
+
+#[test]
+fn tile_lifecycle_settlement_retries_after_swipe_or_frame_read_failure() {
+    let mut failures = Vec::new();
+    for swipe in [false, true] {
+        let mut harness = harness_with(
+            "[options]\nauto_center = false\nswipe_gesture_fingers = 3\n",
+            TEST_DISPLAY_HEIGHT,
+            1,
+        );
+        let native = IRect::new(0, 20, 560, 768);
+        macos_tile(&mut harness, 0, native);
+        if swipe {
+            for _ in 0..20 {
+                for delta in [0.01, -0.01] {
+                    harness
+                        .world()
+                        .write_message(Event::Swipe { delta, fingers: 3 });
+                }
+                harness.advance(FRAME * 2);
+            }
+            assert!(
+                harness
+                    .world()
+                    .query::<&crate::ecs::Scrolling>()
+                    .iter(harness.world())
+                    .any(|scroll| scroll.is_user_swiping)
+            );
+        } else {
+            harness
+                .mock_state
+                .update_window(0, |window| window.frame_read_failures = u8::MAX);
+            harness.advance(ms(400));
+            harness
+                .mock_state
+                .update_window(0, |window| window.frame_read_failures = 0);
+        }
+        harness.advance(SETTLE);
+        let active = harness
+            .world()
+            .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
+            .unwrap();
+        let actual = frame(harness.world(), 0);
+        let bounds = bounds_of(&mut harness, 0);
+        if actual != native || bounds != native.size() || active {
+            failures.push((swipe, actual, bounds, active));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "unacknowledged settlement: {failures:?}"
+    );
 }
 
 /// Six columns on the main display, the first focused so the rest overflow
