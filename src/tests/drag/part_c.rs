@@ -41,10 +41,15 @@ fn ending_a_press_replays_layout_changes_for_every_native_tab() {
                     modifiers: Modifiers::empty(),
                 });
             }
+            // The resize ends the press, which keeps the window while the
+            // button stays down, and lets it go at the release.
             "resize" => {
                 harness
                     .world()
                     .write_message(Event::WindowResized { window_id: 3 });
+                harness.advance(FRAME);
+                assert_eq!(frame(harness.world(), 3), start, "held until release");
+                release(&mut harness, point);
             }
             "confirmation" => {
                 let moved = point + IVec2::new(20, 0);
@@ -1109,6 +1114,8 @@ fn deferred_activation_requeries_after_a_press_is_cancelled_without_another_acti
     harness
         .world()
         .write_message(Event::WindowResized { window_id: 2 });
+    harness.advance(FRAME);
+    release(&mut harness, start.min + IVec2::new(100, 10));
     harness.advance(FRAME * 3);
     assert!(harness.mock_state.membership_reads(EXT_WORKSPACE_ID) > reads);
     assert_eq!(
@@ -1374,6 +1381,8 @@ fn a_deferred_activation_follows_a_different_live_space_on_replay() {
     harness
         .world()
         .write_message(Event::WindowResized { window_id: 2 });
+    harness.advance(FRAME);
+    release(&mut harness, start.min + IVec2::new(100, 10));
     harness.advance(SETTLE);
     let entity = window_entity(&mut harness, 2);
     assert!(
@@ -2073,8 +2082,96 @@ fn a_toolbar_text_selection_never_becomes_a_window_drag() {
         .world()
         .write_message(mouse_dragged(press + IVec2::new(190, 0)));
     harness.advance(FRAME);
-    assert_eq!(drag_state(harness.world()), DragState::Idle);
+    assert!(matches!(
+        drag_state(harness.world()),
+        DragState::Unconfirmed(_)
+    ));
     release(&mut harness, press + IVec2::new(190, 0));
+    assert_eq!(drag_state(harness.world()), DragState::Idle);
     harness.advance(SETTLE);
     assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
+}
+
+/// Presses window 1, away from every screen edge, and drags the pointer
+/// right and down while macOS moves the window only down. Returns the
+/// window's slot and the frame macOS left it at.
+fn drag_window_one_on_one_axis(harness: &mut TestHarness) -> (IRect, IRect, Origin) {
+    let start = frame(harness.world(), 1);
+    let press = start.min + IVec2::new(100, 10);
+    press_at(harness, press);
+    harness.advance(FRAME);
+    let mut pointer = press;
+    for at in 1..=6 {
+        pointer = press + IVec2::new(30 * at, 59 * at);
+        harness.world().write_message(mouse_dragged(pointer));
+        harness
+            .mock_state
+            .os_move_window(1, start.min.with_y(start.min.y + 59 * at));
+        harness.advance(FRAME);
+    }
+    // One more pointer sample after the confirm window ends the press.
+    harness.advance(ms(300));
+    harness.world().write_message(mouse_dragged(pointer));
+    harness.advance(FRAME);
+    let origin = start.min.with_y(start.min.y + 59 * 6);
+    (
+        start,
+        IRect::from_corners(origin, origin + start.size()),
+        pointer,
+    )
+}
+
+#[test]
+fn an_unconfirmed_press_leaves_the_window_where_macos_put_it_until_the_release() {
+    let mut harness = three_columns();
+    let (start, moved, pointer) = drag_window_one_on_one_axis(&mut harness);
+    harness.advance(SETTLE);
+    assert_eq!(
+        frame(harness.world(), 1),
+        moved,
+        "the engine does not pull back a window macOS may still be dragging"
+    );
+    release(&mut harness, pointer);
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), 1), start);
+}
+
+#[test]
+fn a_lost_release_with_the_button_up_returns_the_window_to_its_slot() {
+    let mut harness = three_columns();
+    let (start, moved, _) = drag_window_one_on_one_axis(&mut harness);
+    assert_eq!(frame(harness.world(), 1), moved);
+    // The release never reaches the tap, but the button reads up.
+    harness.mock_state.set_left_button_down(false);
+    harness.advance(ms(600));
+    assert_eq!(drag_state(harness.world()), DragState::Idle);
+    assert_eq!(frame(harness.world(), 1), start);
+}
+
+#[test]
+fn a_button_stuck_down_ends_an_unconfirmed_press_at_the_press_limit() {
+    for moved in [false, true] {
+        let mut harness = three_columns();
+        let start = frame(harness.world(), 1);
+        if moved {
+            drag_window_one_on_one_axis(&mut harness);
+        } else {
+            press_at(&mut harness, start.min + IVec2::new(100, 10));
+        }
+        // No more events, and the button reads down forever.
+        harness.advance(Duration::from_secs(9));
+        assert_ne!(
+            drag_state(harness.world()),
+            DragState::Idle,
+            "moved={moved}"
+        );
+        harness.advance(Duration::from_secs(2));
+        assert_eq!(
+            drag_state(harness.world()),
+            DragState::Idle,
+            "moved={moved}"
+        );
+        harness.advance(SETTLE);
+        assert_eq!(frame(harness.world(), 1), start, "moved={moved}");
+    }
 }

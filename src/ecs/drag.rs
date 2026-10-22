@@ -73,6 +73,13 @@ const MAX_SAMPLES: usize = 32;
 /// drops still in flight.
 pub(crate) const RELEASE_GRACE: Duration = Duration::from_millis(250);
 
+/// The longest a press that never became a drag holds its window, even while
+/// the button reads as down. A real drag moves its window within the confirm
+/// window, so a hold this long is a stuck button state or a lost release.
+/// Ten seconds leaves room for a user who holds a title bar before moving,
+/// while a stuck button state still cannot hold a window forever.
+const PRESS_LIMIT: Duration = Duration::from_secs(10);
+
 pub(crate) type DisplayId = CGDirectDisplayID;
 
 /// Where the windows of the dragged window's layout are, in screen points,
@@ -419,6 +426,8 @@ pub(crate) struct Press {
     pub window_moved: Option<IVec2>,
     /// When the button first read as up, if it reads up now.
     pub button_up_since: Option<Duration>,
+    /// When the button went down.
+    pub at: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -446,6 +455,10 @@ pub(crate) enum DragState {
     Pressed(Press),
     /// The button was released before its window move was confirmed.
     Released { press: Press, point: IVec2 },
+    /// The window did not follow the pointer, and the button may still be
+    /// down. macOS may still be dragging the window, so the press keeps it
+    /// until the release, and only then does the window go back to its slot.
+    Unconfirmed(Press),
     /// The window follows the pointer.
     Dragging(Drag),
     /// A drop just happened.
@@ -458,7 +471,7 @@ impl DragState {
     pub(crate) fn holds_window(&self) -> bool {
         matches!(
             self,
-            Self::Pressed(_) | Self::Released { .. } | Self::Dragging(_)
+            Self::Pressed(_) | Self::Released { .. } | Self::Unconfirmed(_) | Self::Dragging(_)
         )
     }
 
@@ -466,7 +479,9 @@ impl DragState {
     pub(crate) fn window(&self) -> Option<Entity> {
         match self {
             Self::Idle => None,
-            Self::Pressed(press) | Self::Released { press, .. } => Some(press.window),
+            Self::Pressed(press) | Self::Released { press, .. } | Self::Unconfirmed(press) => {
+                Some(press.window)
+            }
             Self::Dragging(drag) => Some(drag.window),
             Self::Settling(settle) => Some(settle.window),
         }
@@ -540,7 +555,7 @@ pub(crate) fn step(
             }],
             _ => vec![],
         };
-        return (press(point, button, window), effects);
+        return (press(point, button, window, now), effects);
     }
 
     match (state, input) {
@@ -574,11 +589,14 @@ pub(crate) fn step(
                     step(DragState::Dragging(drag), DragInput::Up { point }, now, hit)
                 }
                 DragState::Pressed(press) => (DragState::Released { press, point }, vec![]),
+                // The button is already up, so nothing holds the window.
+                DragState::Unconfirmed(_) => (DragState::Idle, vec![]),
                 next => (next, vec![]),
             }
         }
+        (DragState::Unconfirmed(press), input) => (unconfirmed(press, input, now), vec![]),
         (DragState::Pressed(mut press), DragInput::Tick { button_down }) => {
-            if let_go(&mut press.button_up_since, button_down, now) {
+            if press_ended(&mut press, button_down, now) {
                 (DragState::Idle, vec![])
             } else {
                 (DragState::Pressed(press), vec![])
@@ -629,7 +647,12 @@ pub(crate) fn step(
 
 /// The state a press leaves: [`DragState::Pressed`] for the left button in
 /// the top bar of a tiled window, otherwise idle.
-fn press(point: IVec2, button: MouseButton, window: Option<PressedWindow>) -> DragState {
+fn press(
+    point: IVec2,
+    button: MouseButton,
+    window: Option<PressedWindow>,
+    now: Duration,
+) -> DragState {
     let Some(window) = window else {
         return DragState::Idle;
     };
@@ -647,6 +670,7 @@ fn press(point: IVec2, button: MouseButton, window: Option<PressedWindow>) -> Dr
         moved_at: None,
         window_moved: None,
         button_up_since: None,
+        at: now,
     })
 }
 
@@ -677,7 +701,7 @@ fn pressed(
         }
         DragInput::WindowMoved { window, frame } if window == press.window => {
             if frame.size() != press.frame.size() {
-                return DragState::Idle;
+                return DragState::Unconfirmed(press);
             }
             let moved = frame.min - press.frame.min;
             // An app reporting a move it did not make, or a move too small to
@@ -687,7 +711,7 @@ fn pressed(
             }
         }
         DragInput::WindowResized { window } if window == press.window => {
-            return DragState::Idle;
+            return DragState::Unconfirmed(press);
         }
         DragInput::Up { .. } | DragInput::Moved { .. } => return DragState::Idle,
         _ => return DragState::Pressed(press),
@@ -699,7 +723,7 @@ fn pressed(
         .moved_at
         .is_some_and(|moved_at| now.saturating_sub(moved_at) > CONFIRM_WINDOW)
     {
-        return DragState::Idle;
+        return DragState::Unconfirmed(press);
     }
     let follows = press.window_moved.is_some_and(|moved| {
         press.samples.iter().any(|sample| {
@@ -717,6 +741,26 @@ fn pressed(
         }),
         _ => DragState::Pressed(press),
     }
+}
+
+/// The next state of a press that did not become a drag. It keeps its
+/// window until the button is released, or until [`PRESS_LIMIT`].
+fn unconfirmed(mut press: Press, input: DragInput, now: Duration) -> DragState {
+    match input {
+        DragInput::Up { .. } | DragInput::Moved { .. } => DragState::Idle,
+        DragInput::Tick { button_down } if press_ended(&mut press, button_down, now) => {
+            DragState::Idle
+        }
+        _ => DragState::Unconfirmed(press),
+    }
+}
+
+/// Whether a press that is not a drag ends at a read of the button: the
+/// button has been let go, or the press has reached [`PRESS_LIMIT`] even
+/// with the button reading down.
+fn press_ended(press: &mut Press, button_down: bool, now: Duration) -> bool {
+    let_go(&mut press.button_up_since, button_down, now)
+        || now.saturating_sub(press.at) > PRESS_LIMIT
 }
 
 /// Records a read of the button in `up_since`, and returns whether the

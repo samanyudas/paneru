@@ -96,6 +96,12 @@ fn is_pressed(state: &DragState) -> bool {
     matches!(state, DragState::Pressed(_))
 }
 
+/// A press that did not become a drag, still holding its window until the
+/// button is released.
+fn is_unconfirmed(state: &DragState) -> bool {
+    matches!(state, DragState::Unconfirmed(_))
+}
+
 #[test]
 fn a_press_in_the_top_bar_of_a_tiled_window_may_start_a_drag() {
     let w = entities(1)[0];
@@ -215,7 +221,7 @@ fn a_resize_is_not_a_drag() {
         dragged,
         DragInput::WindowResized { window: w },
     ]);
-    assert_eq!(state, DragState::Idle, "a resize notification");
+    assert!(is_unconfirmed(&state), "a resize notification: {state:?}");
 
     // Dragging the top edge moves the origin and changes the size together.
     let top_edge = DragInput::WindowMoved {
@@ -223,7 +229,10 @@ fn a_resize_is_not_a_drag() {
         frame: IRect::from_corners(FRAME_RECT.min + IVec2::new(0, 30), FRAME_RECT.max),
     };
     let (state, _) = run(&[down(w, PRESS), dragged, top_edge]);
-    assert_eq!(state, DragState::Idle, "a move that changes the size");
+    assert!(
+        is_unconfirmed(&state),
+        "a move that changes the size: {state:?}"
+    );
 }
 
 #[test]
@@ -250,7 +259,7 @@ fn a_pointer_moving_without_its_window_is_not_a_drag() {
         }],
         ms(300),
     );
-    assert_eq!(state, DragState::Idle);
+    assert!(is_unconfirmed(&state), "{state:?}");
 }
 
 #[test]
@@ -294,7 +303,7 @@ fn a_window_moving_away_from_the_pointer_is_not_a_drag() {
         }],
         ms(300),
     );
-    assert_eq!(state, DragState::Idle);
+    assert!(is_unconfirmed(&state), "{state:?}");
 }
 
 #[test]
@@ -416,7 +425,7 @@ fn a_window_that_follows_only_after_the_confirm_window_is_not_a_drag() {
     // Text selection: the pointer moves and pauses, and much later the app
     // moves its window by the same amount.
     let (state, _) = run_from(state, &[moved_by(w, IVec2::new(50, 0))], ms(400));
-    assert_eq!(state, DragState::Idle);
+    assert!(is_unconfirmed(&state), "{state:?}");
 }
 
 #[test]
@@ -474,14 +483,18 @@ fn the_release_grace_runs_from_when_the_button_first_reads_up() {
 }
 
 #[test]
-fn a_still_hold_with_the_button_down_never_ends() {
+fn a_still_hold_with_the_button_down_ends_a_press_only_at_its_limit() {
     let w = entities(1)[0];
     let held = DragInput::Tick { button_down: true };
     let (pressed, _) = run(&[down(w, PRESS)]);
     let much_later = Duration::from_secs(60);
 
-    let (state, _) = run_from(pressed, &[held], much_later);
+    let (state, _) = run_from(pressed.clone(), &[held], Duration::from_secs(9));
     assert!(is_pressed(&state), "{state:?}");
+    // A button state stuck down cannot hold an unconfirmed window forever.
+    let (state, _) = run_from(pressed, &[held], much_later);
+    assert_eq!(state, DragState::Idle);
+    // A confirmed drag held still keeps going.
     let (state, effects) = run_from(dragging(w), &[held], much_later);
     assert!(matches!(state, DragState::Dragging(_)), "{state:?}");
     assert_eq!(effects, Vec::<DragEffect>::new());
@@ -1448,7 +1461,7 @@ fn a_resize_from_the_top_edge_is_not_a_drag() {
         .os_resize_window(2, start.size().with_y(start.max.y - 300));
     harness.advance(FRAME);
     harness.advance(FRAME);
-    assert_eq!(drag_state(harness.world()), DragState::Idle);
+    assert!(is_unconfirmed(&drag_state(harness.world())));
     release(&mut harness, to);
     harness.advance(SETTLE);
 
@@ -1469,7 +1482,7 @@ fn a_pointer_drag_that_leaves_the_window_still_is_not_a_drag() {
         harness.world().write_message(mouse_dragged(point));
         harness.advance(FRAME);
     }
-    assert_eq!(drag_state(harness.world()), DragState::Idle);
+    assert!(is_unconfirmed(&drag_state(harness.world())));
     release(&mut harness, to);
     harness.advance(SETTLE);
 
