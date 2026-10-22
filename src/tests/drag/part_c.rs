@@ -3221,41 +3221,46 @@ fn left_and_right_edge_scrolls_follow_physical_contact_at_pointer_height() {
     }
 }
 
+fn drop_slot_harness(cross_display: bool, native_tabs: bool) -> TestHarness {
+    let config =
+        crate::config::Config::try_from("[options]\nauto_center = false\nstack_limit = 2\n")
+            .unwrap();
+    let mut harness = TestHarness::new().with_config(config);
+    if cross_display {
+        harness = harness.with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(1024, 0, 2048, 768),
+            vec![EXT_WORKSPACE_ID],
+        );
+    }
+    harness = harness.with_windows(2);
+    if cross_display {
+        harness = harness.with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+            window.frame = IRect::new(1024, 20, 1536, 768);
+        });
+    }
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    if !cross_display {
+        harness.run(vec![command(Operation::SetWidth(0.5))]);
+    }
+    harness.advance(SETTLE);
+    if native_tabs {
+        add_native_tab(&mut harness, 1, 3);
+    }
+    harness
+}
+
 fn drop_slot_survives_a_preexisting_tile_hold(cross_display: bool) {
     let mut failures = Vec::new();
     for native_tabs in [false, true] {
-        let config =
-            crate::config::Config::try_from("[options]\nauto_center = false\nstack_limit = 2\n")
-                .unwrap();
-        let mut harness = TestHarness::new().with_config(config);
-        if cross_display {
-            harness = harness.with_display(
-                EXT_DISPLAY_ID,
-                IRect::new(1024, 0, 2048, 768),
-                vec![EXT_WORKSPACE_ID],
-            );
-        }
-        harness = harness.with_windows(2);
-        if cross_display {
-            harness = harness.with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
-                window.frame = IRect::new(1024, 20, 1536, 768);
-            });
-        }
-        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
-        if !cross_display {
-            harness.run(vec![command(Operation::SetWidth(0.5))]);
-        }
-        harness.advance(SETTLE);
-        if native_tabs {
-            add_native_tab(&mut harness, 1, 3);
-        }
+        let mut harness = drop_slot_harness(cross_display, native_tabs);
         let members = layout_on(harness.world(), TEST_WORKSPACE_ID)
             .into_iter()
             .find(|column| column.contains(&1))
             .unwrap();
         let grabbed = if native_tabs { 3 } else { 1 };
         let start = frame(harness.world(), grabbed);
-        let began = harness.world().resource::<Time>().elapsed();
+        let deadline = harness.world().resource::<Time>().elapsed() + ms(1000);
         for &id in &members {
             macos_tile(&mut harness, id, IRect::new(0, 20, 512, 768));
         }
@@ -3282,7 +3287,7 @@ fn drop_slot_survives_a_preexisting_tile_hold(cross_display: bool) {
             }
         }
         harness.advance(FRAME * 3);
-        assert!(harness.world().resource::<Time>().elapsed() - began < ms(1000));
+        assert!(harness.world().resource::<Time>().elapsed() < deadline);
         let workspace = if cross_display {
             EXT_WORKSPACE_ID
         } else {
@@ -3306,7 +3311,7 @@ fn drop_slot_survives_a_preexisting_tile_hold(cross_display: bool) {
         for &id in &members {
             macos_tile(&mut harness, id, destination);
         }
-        assert!(harness.world().resource::<Time>().elapsed() - began < ms(1000));
+        assert!(harness.world().resource::<Time>().elapsed() < deadline);
         for (stage, wait) in [
             ("echo", FRAME * 3),
             ("old deadline", ms(1000)),
@@ -3348,4 +3353,124 @@ fn drop_slot_cross_display_replaces_a_preexisting_tile_hold() {
 #[test]
 fn drop_slot_same_display_replaces_a_preexisting_tile_hold() {
     drop_slot_survives_a_preexisting_tile_hold(false);
+}
+
+fn drop_slot_survives_an_adopting_resize(cross_display: bool, settling: bool) {
+    for native_tabs in [false, true] {
+        let config =
+            crate::config::Config::try_from("[options]\nauto_center = false\nstack_limit = 2\n")
+                .unwrap();
+        let mut harness = TestHarness::new().with_config(config);
+        if cross_display {
+            harness = harness
+                .with_display(
+                    EXT_DISPLAY_ID,
+                    IRect::new(1024, 0, 2048, 768),
+                    vec![EXT_WORKSPACE_ID],
+                )
+                .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+                    window.frame = IRect::new(1024, 20, 1536, 768);
+                });
+        }
+        harness = harness.with_windows(2);
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        if !cross_display {
+            harness.run(vec![command(Operation::SetWidth(0.5))]);
+        }
+        harness.advance(SETTLE);
+        if native_tabs {
+            add_native_tab(&mut harness, 1, 3);
+        }
+        let members = if native_tabs { vec![1, 3] } else { vec![1] };
+        let grabbed = *members.last().unwrap();
+        let x = if cross_display { 1024 } else { 0 };
+        let point = Origin::new(x + 256, 100);
+        press_and_drag(&mut harness, grabbed, point);
+        assert!(matches!(
+            drag_state(harness.world()),
+            DragState::Dragging(_)
+        ));
+        for &id in &members {
+            let current = frame(harness.world(), id);
+            let native =
+                IRect::from_corners(current.min, current.min + IVec2::new(560 + id * 10, 748));
+            macos_tile(&mut harness, id, native);
+            if settling {
+                harness.mock_state.update_window(id, |window| {
+                    window.frame_read_failures = u8::MAX;
+                });
+            }
+        }
+        if settling {
+            harness.advance(ms(240));
+            for &id in &members {
+                harness.mock_state.update_window(id, |window| {
+                    window.frame_read_failures = 0;
+                });
+            }
+        }
+        for &id in &members {
+            let entity = window_entity(&mut harness, id);
+            let start = harness
+                .world()
+                .get::<crate::ecs::drag::NativeResizeStart>(entity)
+                .expect("native resize remains pending at drop");
+            assert_eq!(start.needs_frame(), !settling);
+        }
+        release(&mut harness, point);
+        if cross_display {
+            for &id in &members {
+                macos_moves_to_ext(&mut harness, id);
+            }
+        }
+        harness.advance(SETTLE);
+        let accepted = IRect::new(x, 20, x + 512, 394);
+        for &id in &members {
+            assert_eq!(
+                frame(harness.world(), id),
+                accepted,
+                "accepted cached frame, cross={cross_display}, settling={settling}, tabs={native_tabs}, id={id}"
+            );
+            harness.mock_state.update_window(id, |window| {
+                assert_eq!(window.frame, accepted, "accepted mock frame, id={id}");
+            });
+        }
+        for &id in &members {
+            macos_tile(&mut harness, id, IRect::new(x, 20, x + 512, 768));
+        }
+        harness.advance(SETTLE);
+        for &id in &members {
+            assert_eq!(
+                frame(harness.world(), id),
+                accepted,
+                "fresh tile restores the accepted cached slot, id={id}"
+            );
+            harness.mock_state.update_window(id, |window| {
+                assert_eq!(
+                    window.frame, accepted,
+                    "fresh tile restores the mock slot, id={id}"
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn drop_slot_same_display_preserves_bounds_when_retiring_an_observing_resize() {
+    drop_slot_survives_an_adopting_resize(false, false);
+}
+
+#[test]
+fn drop_slot_cross_display_preserves_bounds_when_retiring_an_observing_resize() {
+    drop_slot_survives_an_adopting_resize(true, false);
+}
+
+#[test]
+fn drop_slot_same_display_preserves_bounds_when_retiring_a_settling_resize() {
+    drop_slot_survives_an_adopting_resize(false, true);
+}
+
+#[test]
+fn drop_slot_cross_display_preserves_bounds_when_retiring_a_settling_resize() {
+    drop_slot_survives_an_adopting_resize(true, true);
 }

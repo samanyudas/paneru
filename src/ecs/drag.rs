@@ -1649,7 +1649,7 @@ fn apply_drop(
             .is_ok_and(|(_, source, _, _)| source.id() != display)
     {
         let size = placements.get(window).ok().map(|(_, bounds)| bounds.0);
-        if let Some(size) = size {
+        let transfer = size.and_then(|size| {
             moves.move_to_display(
                 window,
                 display,
@@ -1661,9 +1661,13 @@ fn apply_drop(
                     })
                 },
                 commands,
-            );
-        }
-        if let Some((_, strip, _, _, _)) = moves
+            )
+        });
+        if let Some(transfer) = transfer {
+            tiling::supersede_native_resize(&transfer.members, commands);
+            restore_drop_members(&transfer.members, placements);
+            native.placed(transfer.members);
+        } else if let Some((_, strip, _, _, _)) = moves
             .strips
             .iter()
             .find(|(_, strip, _, _, _)| strip.contains(window))
@@ -1681,9 +1685,13 @@ fn apply_drop(
     };
     // A native tab group moves as one, so every tab goes where it goes.
     let members = strip.tab_group(window).unwrap_or_else(|| vec![window]);
+    let source_can_move = tiling::tiled_in(&strip, window);
 
-    match target {
+    let accepted = match target {
         DropTarget::IntoColumn { column, slot, .. } => {
+            let destination_can_join = strip
+                .get(column)
+                .is_ok_and(|column| !matches!(column, Column::Fullscren(_)));
             if strip.index_of(window).ok() != Some(column) {
                 // The window takes the width of the column it joins, even
                 // as its new top window.
@@ -1705,12 +1713,13 @@ fn apply_drop(
                     entity_commands.try_remove::<FullWidthMarker>();
                 }
             }
-            _ = strip.insert_into_column(window, column, slot);
+            strip.insert_into_column(window, column, slot).is_ok() && destination_can_join
         }
-        DropTarget::NewColumn { index, .. } => {
-            _ = strip.insert_as_column(window, index);
-        }
-        DropTarget::Refused { .. } | DropTarget::Home => {}
+        DropTarget::NewColumn { index, .. } => strip.insert_as_column(window, index).is_ok(),
+        DropTarget::Refused { .. } | DropTarget::Home => false,
+    };
+    if source_can_move && accepted {
+        tiling::supersede_native_resize(&members, commands);
     }
 
     // The user's drag left the window where it was released. Marking its

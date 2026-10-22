@@ -8,6 +8,7 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Has, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Commands, Query, Res, ResMut, SystemParam};
+use bevy::ecs::world::World;
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 
@@ -249,6 +250,27 @@ impl NativeResizeStart {
                 }
         )
     }
+}
+
+pub(super) fn supersede_native_resize(members: &[Entity], commands: &mut Commands) {
+    let members = members.to_vec();
+    commands.queue(move |world: &mut World| {
+        for member in members {
+            if world.get::<NativeResizeStart>(member).is_none() {
+                continue;
+            }
+            let accepted_size = world.get::<Bounds>(member).map(|bounds| bounds.0);
+            // Direct removal runs the adoption observer synchronously. Preserve
+            // the accepted Bounds after that observer, before layout can run.
+            world.entity_mut(member).remove::<NativeResizeStart>();
+            if let Some(size) = accepted_size
+                && let Some(mut bounds) = world.get_mut::<Bounds>(member)
+                && bounds.0 != size
+            {
+                bounds.0 = size;
+            }
+        }
+    });
 }
 
 pub(super) fn adopt_cancelled_native_resize(
