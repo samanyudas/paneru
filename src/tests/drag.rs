@@ -60,6 +60,7 @@ fn down(window: Entity, point: IVec2) -> DragInput {
             frame: FRAME_RECT,
             top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: true,
+            screen_edges: bevy::math::BVec2::FALSE,
         }),
     }
 }
@@ -125,6 +126,7 @@ fn other_presses_never_start_a_drag() {
             frame: FRAME_RECT,
             top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: false,
+            screen_edges: bevy::math::BVec2::FALSE,
         }),
     };
     let right_button = DragInput::Down {
@@ -135,6 +137,7 @@ fn other_presses_never_start_a_drag() {
             frame: FRAME_RECT,
             top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: true,
+            screen_edges: bevy::math::BVec2::FALSE,
         }),
     };
     let no_window = DragInput::Down {

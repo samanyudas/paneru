@@ -2092,6 +2092,63 @@ fn a_toolbar_text_selection_never_becomes_a_window_drag() {
     assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
 }
 
+#[test]
+fn a_window_held_at_a_screen_edge_still_drags_and_drops_at_the_pointer() {
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 0);
+    assert_eq!(start.min.x, 0, "window 0 sits on the screen's left edge");
+    let press = start.min + IVec2::new(100, 10);
+    press_at(&mut harness, press);
+    harness.advance(FRAME);
+    // The pointer moves right and down, but the screen edge holds the
+    // window's left edge, so macOS moves it only down.
+    for at in 1..=6 {
+        let pointer = press + IVec2::new(30 * at, 59 * at);
+        harness.world().write_message(mouse_dragged(pointer));
+        harness
+            .mock_state
+            .os_move_window(0, start.min.with_y(start.min.y + 59 * at));
+        harness.advance(FRAME);
+    }
+    let to = middle_of(harness.world(), 1, 600);
+    harness.world().write_message(mouse_dragged(to));
+    harness.advance(FRAME);
+    assert!(
+        matches!(drag_state(harness.world()), DragState::Dragging(_)),
+        "{:?}",
+        drag_state(harness.world())
+    );
+    release(&mut harness, to);
+    harness.advance(SETTLE);
+    assert_eq!(layout(harness.world()), vec![vec![1, 0], vec![2]]);
+}
+
+#[test]
+fn an_app_moving_its_window_across_the_pointer_is_not_a_drag() {
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 1);
+    let press = start.min + IVec2::new(100, 10);
+    press_at(&mut harness, press);
+    harness.advance(FRAME);
+    // The pointer moves right while the app moves its own window down.
+    for at in 1..=6 {
+        harness
+            .world()
+            .write_message(mouse_dragged(press + IVec2::new(30 * at, 0)));
+        harness
+            .mock_state
+            .os_move_window(1, start.min.with_y(start.min.y + 40 * at));
+        harness.advance(FRAME);
+    }
+    assert!(!matches!(
+        drag_state(harness.world()),
+        DragState::Dragging(_)
+    ));
+    release(&mut harness, press + IVec2::new(180, 0));
+    harness.advance(SETTLE);
+    assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
+}
+
 /// Presses window 1, away from every screen edge, and drags the pointer
 /// right and down while macOS moves the window only down. Returns the
 /// window's slot and the frame macOS left it at.
@@ -2119,6 +2176,21 @@ fn drag_window_one_on_one_axis(harness: &mut TestHarness) -> (IRect, IRect, Orig
         IRect::from_corners(origin, origin + start.size()),
         pointer,
     )
+}
+
+#[test]
+fn a_window_off_the_screen_edges_moving_on_one_axis_does_not_confirm() {
+    let mut harness = three_columns();
+    let (_, moved, pointer) = drag_window_one_on_one_axis(&mut harness);
+    assert_eq!(frame(harness.world(), 1), moved);
+    assert!(
+        matches!(drag_state(harness.world()), DragState::Unconfirmed(_)),
+        "{:?}",
+        drag_state(harness.world())
+    );
+    release(&mut harness, pointer);
+    harness.advance(SETTLE);
+    assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
 }
 
 #[test]

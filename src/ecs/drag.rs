@@ -32,7 +32,7 @@ use bevy::ecs::schedule::common_conditions::{
 };
 use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
 use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
-use bevy::math::{IRect, IVec2};
+use bevy::math::{BVec2, IRect, IVec2};
 use bevy::time::Time;
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::debug;
@@ -56,6 +56,12 @@ const DRAG_THRESHOLD: i32 = 4;
 /// How far the window's move may differ from the pointer's on each axis and
 /// still count as the window following the pointer.
 const MOVE_TOLERANCE: i32 = 8;
+
+/// How far a window held at a screen edge must move on its free axis to
+/// confirm a drag from that axis alone. Three times [`MOVE_TOLERANCE`], so the
+/// match cannot come from the tolerance band alone: a window that barely
+/// moves, or moves on its own, stays within that band and confirms nothing.
+const STRONG_MOVE: i32 = 3 * MOVE_TOLERANCE;
 
 /// How long the pointer may move past the threshold with no matching window
 /// move before the press stops being a possible drag.
@@ -370,6 +376,9 @@ pub(crate) struct PressedWindow {
     pub top_bar_height: i32,
     /// Whether the window is in a strip, rather than floating.
     pub tiled: bool,
+    /// Per axis, whether the window's frame touches a display edge on that
+    /// axis, so macOS can hold the window on it while the pointer moves.
+    pub screen_edges: BVec2,
 }
 
 /// One thing that happened, as the drag state machine sees it.
@@ -426,6 +435,8 @@ pub(crate) struct Press {
     pub window_moved: Option<IVec2>,
     /// When the button first read as up, if it reads up now.
     pub button_up_since: Option<Duration>,
+    /// Per axis, whether a display edge can hold the window on that axis.
+    pub screen_edges: BVec2,
     /// When the button went down.
     pub at: Duration,
 }
@@ -670,6 +681,7 @@ fn press(
         moved_at: None,
         window_moved: None,
         button_up_since: None,
+        screen_edges: window.screen_edges,
         at: now,
     })
 }
@@ -726,11 +738,10 @@ fn pressed(
         return DragState::Unconfirmed(press);
     }
     let follows = press.window_moved.is_some_and(|moved| {
-        press.samples.iter().any(|sample| {
-            let pointer = *sample - press.point;
-            let gap = (pointer - moved).abs();
-            past_threshold(pointer) && gap.x <= MOVE_TOLERANCE && gap.y <= MOVE_TOLERANCE
-        })
+        press
+            .samples
+            .iter()
+            .any(|sample| follows_pointer(moved, *sample - press.point, press.screen_edges))
     });
     match press.samples.last() {
         Some(pointer) if follows => DragState::Dragging(Drag {
@@ -741,6 +752,25 @@ fn pressed(
         }),
         _ => DragState::Pressed(press),
     }
+}
+
+/// Whether a window move of `moved` follows a pointer move of `pointer`.
+///
+/// Normally the window must match the pointer within [`MOVE_TOLERANCE`] on
+/// both axes. A display edge can hold a window on one axis: a window whose
+/// left edge is on a display's left edge moves only vertically while the
+/// pointer also moves sideways. Only for an axis in `screen_edges`, the
+/// other axis alone confirms, when it matches the pointer and moves at least
+/// [`STRONG_MOVE`].
+fn follows_pointer(moved: IVec2, pointer: IVec2, screen_edges: BVec2) -> bool {
+    if !past_threshold(pointer) {
+        return false;
+    }
+    let gap = (pointer - moved).abs();
+    let along = |gap: i32, moved: i32| gap <= MOVE_TOLERANCE && moved.abs() >= STRONG_MOVE;
+    (gap.x <= MOVE_TOLERANCE && gap.y <= MOVE_TOLERANCE)
+        || (screen_edges.x && along(gap.y, moved.y))
+        || (screen_edges.y && along(gap.x, moved.x))
 }
 
 /// The next state of a press that did not become a drag. It keeps its
@@ -1213,6 +1243,22 @@ fn drag_input(
     Some(input)
 }
 
+/// Per axis, whether `frame` has an edge on the matching edge of a display.
+fn screen_edges(frame: IRect, moves: &DisplayMoves) -> BVec2 {
+    let near = |a: i32, b: i32| (a - b).abs() <= MOVE_TOLERANCE;
+    moves
+        .displays
+        .iter()
+        .fold(BVec2::FALSE, |edges, (_, display, _, _)| {
+            let bounds = display.bounds();
+            edges
+                | BVec2::new(
+                    near(frame.min.x, bounds.min.x) || near(frame.max.x, bounds.max.x),
+                    near(frame.min.y, bounds.min.y) || near(frame.max.y, bounds.max.y),
+                )
+        })
+}
+
 /// The window a press at `point` landed on, given the window the window
 /// server reports on top there now.
 ///
@@ -1248,6 +1294,7 @@ fn pressed_window(
         frame,
         top_bar_height,
         tiled: true,
+        screen_edges: screen_edges(frame, moves),
     };
 
     if let Some((entity, window, unmanaged, _)) = on_top {
@@ -1267,6 +1314,7 @@ fn pressed_window(
                 frame: window.frame(),
                 top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
                 tiled: false,
+                screen_edges: BVec2::FALSE,
             });
         }
     }
