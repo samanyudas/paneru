@@ -24,7 +24,7 @@ use super::{
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
-use crate::ecs::layout::{Column, LayoutStrip, anchored_origin};
+use crate::ecs::layout::{Column, ExposeFocusedSurvivorAfterRemoval, LayoutStrip, anchored_origin};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
@@ -1092,14 +1092,20 @@ pub(super) fn window_destroyed_trigger(
 
         app.unobserve_window(window);
 
-        give_away_focus(
-            entity,
-            &windows,
-            active_display.active_strip(),
-            &active_display.bounds(),
-            &mut global_state,
-            &mut commands,
-        );
+        let has_focused_survivor = windows
+            .focused()
+            .and_then(|(_, focused)| windows.get_managed(focused))
+            .is_some_and(|(_, focused, unmanaged)| focused != entity && unmanaged.is_none());
+        if !has_focused_survivor {
+            give_away_focus(
+                entity,
+                &windows,
+                active_display.active_strip(),
+                &active_display.bounds(),
+                &mut global_state,
+                &mut commands,
+            );
+        }
 
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_despawn();
@@ -1555,18 +1561,25 @@ pub(super) fn refresh_configuration_trigger(
 
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
-    mut workspaces: Query<&mut LayoutStrip>,
+    mut workspaces: Query<(Entity, &mut LayoutStrip)>,
     mut focus_history: ResMut<FocusHistory>,
+    mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
     focus_history.forget(entity);
 
-    if let Some(mut strip) = workspaces.iter_mut().find(|strip| strip.contains(entity)) {
+    if let Some((strip_entity, mut strip)) = workspaces
+        .iter_mut()
+        .find(|(_, strip)| strip.contains(entity))
+    {
         debug!(
             "Removing despawned entity {entity} from strip {}",
             strip.id()
         );
         strip.remove(entity);
+        commands
+            .entity(strip_entity)
+            .try_insert(ExposeFocusedSurvivorAfterRemoval);
     }
 }
 

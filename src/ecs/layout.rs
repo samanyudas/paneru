@@ -18,13 +18,16 @@ use stdext::function_name;
 use tracing::{Level, debug, instrument, trace};
 
 use crate::config::{Config, StackLimit};
+use crate::ecs::drag::DragState;
+use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::params::Windows;
-use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
+use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
-    LayoutPosition, ManualStripOffset, MinimumHeight, PlaceAfterArrival, Position, PresentedOrigin,
-    RefitAfterRemoval, RepositionMarker, ReshuffleAroundMarker, ResizeMarker, Scrolling,
-    SpawnCommandsExt, TopBarHeight, TopBarRetry, VerifyWindowSize, WidthAnchor, WidthRun,
+    LayoutPosition, ManualStripOffset, MinimumHeight, MouseHeldMarker, PlaceAfterArrival, Position,
+    PresentedOrigin, RefitAfterRemoval, RepositionMarker, ReshuffleAroundMarker, ResizeMarker,
+    Scrolling, SkipReshuffle, SpawnCommandsExt, TopBarHeight, TopBarRetry, Unmanaged,
+    VerifyWindowSize, WidthAnchor, WidthRun,
 };
 use crate::errors::{Error, Result};
 use crate::events::Event;
@@ -253,6 +256,7 @@ impl Plugin for LayoutEventsPlugin {
                     layout_sizes_changed,
                     layout_strip_changed,
                     reshuffle_layout_strip,
+                    expose_focused_survivor_after_removal,
                     ensure_visible_in_strip,
                     position_layout_strips,
                     position_layout_windows,
@@ -262,6 +266,57 @@ impl Plugin for LayoutEventsPlugin {
                     .run_if(not(resource_exists::<Initializing>)),
             ),
         );
+    }
+}
+
+#[derive(Component)]
+pub(super) struct ExposeFocusedSurvivorAfterRemoval;
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn expose_focused_survivor_after_removal(
+    pending: Populated<
+        (
+            Entity,
+            &LayoutStrip,
+            Has<ActiveWorkspaceMarker>,
+            Has<PreviousStripPosition>,
+            Has<Scrolling>,
+        ),
+        With<ExposeFocusedSurvivorAfterRemoval>,
+    >,
+    focused: Query<
+        (Entity, Has<PendingFocusLayout>),
+        (With<Window>, With<FocusedMarker>, Without<Unmanaged>),
+    >,
+    mouse_held: Query<(), With<MouseHeldMarker>>,
+    drag: Option<Res<DragState>>,
+    restored: Query<&RestoreFocusMarker>,
+    skip_reshuffle: Res<SkipReshuffle>,
+    mut commands: Commands,
+) {
+    for (strip_entity, strip, active, previous_position, scrolling) in pending {
+        let survivor = focused.single().ok().filter(|(entity, _)| {
+            active
+                && !previous_position
+                && strip.contains(*entity)
+                && !restored.iter().any(|marker| marker.entity == *entity)
+        });
+        if let Some((entity, new_focus)) = survivor {
+            if scrolling
+                || !mouse_held.is_empty()
+                || drag.as_ref().is_some_and(|drag| {
+                    drag.holds_window() || drag.settling_window() == Some(entity)
+                })
+            {
+                continue;
+            }
+            if !new_focus && !skip_reshuffle.0 {
+                commands.ensure_visible(entity);
+            }
+        }
+        commands
+            .entity(strip_entity)
+            .try_remove::<ExposeFocusedSurvivorAfterRemoval>();
     }
 }
 
