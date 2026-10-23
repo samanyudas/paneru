@@ -216,7 +216,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
         (
             systems::window_frame_update.run_if(
                 on_message::<Event>
-                    .or_else(any_with_component::<crate::ecs::drag::NativeResizeStart>),
+                    .or_else(any_with_component::<crate::ecs::drag::NativeResizeStart>)
+                    .or_else(any_with_component::<systems::DeferredFrameRead>),
             ),
             workspace::cleanup_unordered_windows
                 .run_if(not(resource_exists::<Initializing>))

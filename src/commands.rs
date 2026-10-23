@@ -873,7 +873,14 @@ fn resize_window(
         return;
     };
     let (native_resize, verifying, settling) = engine_work.get(entity).unwrap_or_default();
-    let pending = ctx.p0().windows.is_resizing(entity) || verifying || settling;
+    // A write still on its way to the app counts as pending engine work: its
+    // frame is the one the engine asked for, and reading the app's frame
+    // would wait on the app.
+    let writing = ctx
+        .p1()
+        .get(entity)
+        .is_ok_and(|window| window.write_pending());
+    let pending = ctx.p0().windows.is_resizing(entity) || verifying || settling || writing;
     let held = native_resize.and_then(|start| start.held_size(time.elapsed()));
     let native = (!matches!(operation, Operation::SetWidth(_)) && !pending && held.is_none())
         .then(|| ctx.p1().get_mut(entity).ok()?.update_frame().ok())

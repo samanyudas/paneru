@@ -14,7 +14,8 @@
 //!    and falls to rule 3. The engine
 //!    parks off-screen columns as slivers that hang past the display's edge,
 //!    onto a neighboring display or onto no display at all, and an animation
-//!    passes through such frames.
+//!    passes through such frames. A window whose write the app has yet to
+//!    apply counts as at the frame the engine wrote.
 //! 2. A window of a parked virtual workspace is the exception. The engine
 //!    tucks the whole strip into a corner, so its frame is no evidence.
 //! 3. Any other frame is on the display that holds its center. A center on
@@ -515,7 +516,17 @@ fn on_another_display(world: &mut World, members: &[Entity], display: Entity) ->
 /// The display `member` is on, by the rule in the module docs. `None` is no
 /// evidence either way.
 fn window_display(world: &mut World, member: Entity) -> Option<Entity> {
-    let frame = world.get_mut::<Window>(member)?.update_frame().ok()?;
+    let frame = {
+        let mut window = world.get_mut::<Window>(member)?;
+        // The engine's own write is still on its way. The OS frame is the one
+        // the window is leaving, and reading it would wait on the app, so the
+        // frame the engine wrote is the evidence.
+        if window.write_pending() {
+            window.frame()
+        } else {
+            window.update_frame().ok()?
+        }
+    };
     let near = |a: IVec2, b: IVec2| (a - b).abs().max_element() <= FRAME_TOLERANCE;
     // `PresentedOrigin` is where the engine is taking the window. While a
     // `RepositionMarker` animates it, `Position` is the last frame the engine

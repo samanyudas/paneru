@@ -299,8 +299,8 @@ fn has<C: Component>(world: &mut World, id: WinID) -> bool {
 
 /// `window_frame_update`: an app resizes its own window while the engine's
 /// move to it is still on its way. The frame read must wait for the move
-/// to land, without holding up any engine frame, and then the app's size
-/// is adopted.
+/// to land, without holding up any engine frame, and then the app's width
+/// is adopted. The column keeps its full height.
 #[test]
 fn a_frame_notification_during_a_pending_write_is_read_once_the_write_lands() {
     let mut harness = harness();
@@ -314,9 +314,14 @@ fn a_frame_notification_during_a_pending_write_is_read_once_the_write_lands() {
 
     let entity = find_window_entity(0, harness.world());
     assert_eq!(
-        harness.world().get::<crate::ecs::Bounds>(entity).unwrap().0,
-        native,
-        "the engine adopted the size the app chose"
+        harness
+            .world()
+            .get::<crate::ecs::Bounds>(entity)
+            .unwrap()
+            .0
+            .x,
+        native.x,
+        "the engine adopted the width the app chose"
     );
 }
 

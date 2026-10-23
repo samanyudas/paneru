@@ -1082,6 +1082,12 @@ fn poll_pressed_window(
     let Ok(mut window) = windows.get_mut(press.window) else {
         return;
     };
+    // The engine's own write to the window is still on its way. Reading
+    // would wait on the app every frame, and a frame that changed now would
+    // be the engine's move, not the user's. The next frame polls again.
+    if window.write_pending() {
+        return;
+    }
     if window
         .update_frame()
         .is_ok_and(|frame| frame.min != press.frame.min)

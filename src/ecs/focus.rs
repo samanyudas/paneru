@@ -275,10 +275,19 @@ pub(super) fn fix_window_size_on_focus(
     if !verify_size {
         return;
     }
+    let window = windows.get_mut(entity).ok();
+    // The engine's own write is still on its way, so the frame cannot be
+    // read without waiting on the app. A later focus checks it instead.
+    if window
+        .as_ref()
+        .is_some_and(|(window, ..)| window.write_pending())
+    {
+        return;
+    }
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         entity_commands.try_remove::<RefreshWindowSizeOnFocus>();
     }
-    if let Ok((mut window, mut bounds, resizing)) = windows.get_mut(entity)
+    if let Some((mut window, mut bounds, resizing)) = window
         && !resizing
         && let Ok(frame) = window.update_frame()
         && frame.size() != bounds.0

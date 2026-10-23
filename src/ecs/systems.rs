@@ -1,5 +1,6 @@
 use bevy::app::AppExit;
 use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
+use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
@@ -787,13 +788,38 @@ pub(crate) fn pump_events(
     }
 }
 
+/// A move or resize notification that arrived while the engine's own write
+/// to the window was still on its way. Reading the frame then would wait on
+/// the app and see the frame the window is leaving, so it is read once the
+/// write has landed. The app may have changed the window since, and dropping
+/// the notification would lose that change.
+#[derive(Clone, Copy, Component, Debug, Default)]
+pub(crate) struct DeferredFrameRead {
+    moved: bool,
+    resized: bool,
+}
+
+/// Windows whose frame is read again without a fresh notification: a native
+/// resize or tile restore in progress, or a notification deferred until the
+/// engine's own write landed.
+type FrameRechecks<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        Has<NativeResizeStart>,
+        Option<&'static DeferredFrameRead>,
+    ),
+    Or<(With<NativeResizeStart>, With<DeferredFrameRead>)>,
+>;
+
 #[allow(clippy::too_many_lines)]
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn window_frame_update(
     mut messages: MessageReader<Event>,
     mut windows: NativeFrameWindows,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
-    native_resizes: Query<Entity, With<NativeResizeStart>>,
+    rechecks: FrameRechecks,
     swipes: Query<&Scrolling, With<ActiveWorkspaceMarker>>,
     tiling: TilingRestore,
     mut commands: Commands,
@@ -807,9 +833,17 @@ pub(crate) fn window_frame_update(
     } else {
         notified_windows(&mut messages, &windows)
     };
-    for entity in &native_resizes {
-        if !notified.iter().any(|(notified, ..)| *notified == entity) {
-            notified.push((entity, false, false));
+    for (entity, _, deferred) in &rechecks {
+        let read = deferred.copied().unwrap_or_default();
+        match notified
+            .iter_mut()
+            .find(|(notified, ..)| *notified == entity)
+        {
+            Some((_, moved, resized)) => {
+                *moved |= read.moved;
+                *resized |= read.resized;
+            }
+            None => notified.push((entity, read.moved, read.resized)),
         }
     }
 
@@ -821,17 +855,40 @@ pub(crate) fn window_frame_update(
         };
         let strip = workspaces.iter().find(|(strip, _)| strip.contains(entity));
         let tiled = unmanaged.is_none() && strip.is_some_and(|(strip, _)| tiled_in(strip, entity));
+        let (native_resize, deferred) = rechecks
+            .get(entity)
+            .map_or((false, false), |(_, native, deferred)| {
+                (native, deferred.is_some())
+            });
         if !tiled
-            && native_resizes.contains(entity)
+            && native_resize
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
             entity_commands.try_remove::<NativeResizeStart>();
         }
-        if swiping
-            || matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden))
-            || !(moved || resized || (tiled && tiling.due(entity)))
+        let hidden = matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
+        if hidden
+            && deferred
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
+            entity_commands.try_remove::<DeferredFrameRead>();
+        }
+        if swiping || hidden || !(moved || resized || (tiled && tiling.due(entity))) {
             continue;
+        }
+        // The engine's own write is still on its way. A tile restore or a
+        // native resize is checked again next frame anyway. A notification
+        // waits for the write to land.
+        if window.write_pending() {
+            if (moved || resized)
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_insert(DeferredFrameRead { moved, resized });
+            }
+            continue;
+        }
+        if deferred && let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<DeferredFrameRead>();
         }
         let Ok(new_frame) = window.update_frame() else {
             if tiled {
@@ -1309,6 +1366,11 @@ pub(super) fn verify_window_position(
     mut commands: Commands,
 ) {
     for (entity, mut window, position, mut verification) in &mut windows {
+        // Checked once the engine's own write has landed, without spending
+        // an attempt on the frame the window is leaving.
+        if window.write_pending() {
+            continue;
+        }
         if window
             .update_frame()
             .is_ok_and(|frame| frame.min == position.0)

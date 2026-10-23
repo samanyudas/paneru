@@ -1050,6 +1050,8 @@ impl MockState {
         let s = self.clone();
         mw.expect_update_frame()
             .returning(move || mock_read_frame(&s.inner, id, ax_generation));
+
+        mw.expect_write_pending().return_const(false);
     }
 
     /// Frame expectations for a window whose app gets its writes through
@@ -1074,6 +1076,9 @@ impl MockState {
         let w = writes.clone();
         mw.expect_reposition()
             .returning(move |origin| lock(&w).reposition(Some(pid), window, origin));
+        let w = writes.clone();
+        mw.expect_write_pending()
+            .returning(move || lock(&w).write_pending(Some(pid)));
         let w = writes.clone();
         mw.expect_place()
             .returning(move |frame: IRect| lock(&w).place(Some(pid), window, frame));

@@ -427,7 +427,15 @@ pub trait WindowApi: Send + Sync {
     /// position, then the position, then the size again if the app limited
     /// it at the old position.
     fn place(&mut self, frame: IRect);
+    /// Reads the window's frame back from the OS. Waits first, up to
+    /// `LANDING_TIMEOUT`, for any move or resize the engine asked for to
+    /// land, and fails if it has not. A system that must never wait on an
+    /// app checks [`Self::write_pending`] first.
     fn update_frame(&mut self) -> Result<IRect>;
+    /// Whether a move or resize the engine asked for has yet to reach the
+    /// window. Until it does, the OS reports the frame the window is
+    /// leaving, and [`Self::frame`] is the frame the engine asked for.
+    fn write_pending(&self) -> bool;
     fn focus_without_raise(
         &self,
         psn: ProcessSerialNumber,
@@ -1112,6 +1120,10 @@ impl WindowApi for WindowOS {
                 max: frame.max + padding,
             })
         })
+    }
+
+    fn write_pending(&self) -> bool {
+        self.writes.write_pending(self.pid().ok())
     }
 
     /// Focuses the window without raising it. This involves sending specific events to the process.

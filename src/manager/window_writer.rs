@@ -373,7 +373,6 @@ impl<S: WriteSink> WindowWriters<S> {
     }
 
     /// Whether a write to window `key` is queued or in flight.
-    #[cfg(test)]
     pub fn is_pending(&self, pid: Pid, key: WriteKey) -> bool {
         self.shared
             .mailbox(pid)
@@ -502,6 +501,12 @@ impl<S: WriteSink> FrameWrites<S> {
             // No app to queue behind: write it here.
             None => self.writers.write_inline(None, &write),
         }
+    }
+
+    /// Whether a move or resize the engine asked for has yet to reach the
+    /// window.
+    pub fn write_pending(&self, pid: Option<Pid>) -> bool {
+        pid.is_some_and(|pid| self.writers.is_pending(pid, self.key))
     }
 
     /// Reads the window's frame with `read`, after waiting up to

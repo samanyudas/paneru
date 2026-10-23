@@ -981,8 +981,12 @@ pub(super) fn recover_window_handles(
                 || apps
                     .get_mut(child.parent())
                     .is_ok_and(|mut app| adopt_fresh_handle(&mut window, &mut app, &config)));
-        let frame_ready =
-            handle_recovered && (unmanaged || geometry.is_none() || window.update_frame().is_ok());
+        // A write the engine made to the window is still on its way: read
+        // it once it lands rather than wait on the app.
+        let frame_ready = handle_recovered
+            && (unmanaged
+                || geometry.is_none()
+                || (!window.write_pending() && window.update_frame().is_ok()));
 
         if !frame_ready && !deadline.0.is_finished() && !matches!(ordered_in, Ok(false)) {
             continue;
@@ -1635,7 +1639,9 @@ pub(super) fn window_resize_verifier(
             }
             continue;
         };
-        if position.is_changed() || bounds.is_changed() {
+        // Checked once the engine's own write has landed, without spending
+        // an attempt on the frame the window is leaving.
+        if position.is_changed() || bounds.is_changed() || window.write_pending() {
             continue;
         }
         // macOS puts a tile frame back while a restored slot holds, so a
@@ -1821,15 +1827,16 @@ pub(super) fn settle_width_requests(
                 .try_remove::<PendingWidthSettlement>();
             continue;
         }
+        // A member whose write is still on its way has not settled either:
+        // reading it would wait on its app.
         if !ready.contains(request.strip)
             || members.iter().any(|member| {
                 !ready.contains(*member)
-                    || verification
-                        .windows
-                        .get_mut(*member)
-                        .is_ok_and(|(_, position, bounds)| {
-                            position.is_changed() || bounds.is_changed()
-                        })
+                    || verification.windows.get_mut(*member).is_ok_and(
+                        |(window, position, bounds)| {
+                            position.is_changed() || bounds.is_changed() || window.write_pending()
+                        },
+                    )
             })
         {
             continue;
