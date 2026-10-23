@@ -23,18 +23,17 @@ use super::{
     StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
-use crate::ecs::drag::DragState;
-use crate::ecs::focus::{FocusHistory, PendingFocusLayout};
-use crate::ecs::layout::{Column, LayoutStrip, anchored_origin};
+use crate::ecs::focus::FocusHistory;
+use crate::ecs::layout::{Column, ExposeFocusedSurvivorAfterRemoval, LayoutStrip, anchored_origin};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
-use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker};
+use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LaunchWindows, LayoutPosition,
-    MinimumHeight, MouseHeldMarker, PendingWidthSettlement, Position, PreLaunchFrame,
-    RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
-    SkipReshuffle, SpawnCommandsExt, VerifyWindowPosition, VerifyWindowSize, WidthRatio, WidthRun,
-    WidthSettlementPhase, WindowProperties,
+    MinimumHeight, PendingWidthSettlement, Position, PreLaunchFrame, RepositionMarker,
+    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    VerifyWindowPosition, VerifyWindowSize, WidthRatio, WidthRun, WidthSettlementPhase,
+    WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -1554,60 +1553,27 @@ pub(super) fn refresh_configuration_trigger(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
-    mut workspaces: Query<(
-        &mut LayoutStrip,
-        Has<ActiveWorkspaceMarker>,
-        Has<PreviousStripPosition>,
-    )>,
+    mut workspaces: Query<(Entity, &mut LayoutStrip)>,
     mut focus_history: ResMut<FocusHistory>,
-    focused: Query<
-        (Entity, Has<PendingFocusLayout>),
-        (With<Window>, With<FocusedMarker>, Without<Unmanaged>),
-    >,
-    mouse_held: Query<(), With<MouseHeldMarker>>,
-    scrolling: Query<(), With<Scrolling>>,
-    drag: Option<Res<DragState>>,
-    restored: Query<&RestoreFocusMarker>,
-    initializing: Option<Res<Initializing>>,
-    skip_reshuffle: Res<SkipReshuffle>,
     mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
     focus_history.forget(entity);
 
-    if let Some((mut strip, active, previous_position)) = workspaces
+    if let Some((strip_entity, mut strip)) = workspaces
         .iter_mut()
-        .find(|(strip, _, _)| strip.contains(entity))
+        .find(|(_, strip)| strip.contains(entity))
     {
         debug!(
             "Removing despawned entity {entity} from strip {}",
             strip.id()
         );
         strip.remove(entity);
-
-        let Ok((focused, pending_focus_layout)) = focused.single() else {
-            return;
-        };
-        if !active
-            || previous_position
-            || pending_focus_layout
-            || initializing.is_some()
-            || skip_reshuffle.0
-            || !mouse_held.is_empty()
-            || !scrolling.is_empty()
-            || focused == entity
-            || !strip.contains(focused)
-            || restored.iter().any(|marker| marker.entity == focused)
-            || drag
-                .is_some_and(|drag| drag.holds_window() || drag.settling_window() == Some(focused))
-        {
-            return;
-        }
-
-        commands.ensure_visible(focused);
+        commands
+            .entity(strip_entity)
+            .try_insert(ExposeFocusedSurvivorAfterRemoval);
     }
 }
 
