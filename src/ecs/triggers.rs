@@ -1092,14 +1092,20 @@ pub(super) fn window_destroyed_trigger(
 
         app.unobserve_window(window);
 
-        give_away_focus(
-            entity,
-            &windows,
-            active_display.active_strip(),
-            &active_display.bounds(),
-            &mut global_state,
-            &mut commands,
-        );
+        let has_focused_survivor = windows
+            .focused()
+            .and_then(|(_, focused)| windows.get_managed(focused))
+            .is_some_and(|(_, focused, unmanaged)| focused != entity && unmanaged.is_none());
+        if !has_focused_survivor {
+            give_away_focus(
+                entity,
+                &windows,
+                active_display.active_strip(),
+                &active_display.bounds(),
+                &mut global_state,
+                &mut commands,
+            );
+        }
 
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_despawn();
