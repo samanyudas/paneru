@@ -147,6 +147,9 @@ struct MockStateInner {
     background_tabs: HashSet<WinID>,
     /// How many times any window was raised.
     raise_count: usize,
+    /// Raises the window server loses, per window, as when raises sent to
+    /// different apps land out of order.
+    dropped_raises: HashMap<WinID, usize>,
     /// Whether raising a window also makes it its app's focused window, as
     /// `AXRaise` does for a window of the frontmost app.
     raise_takes_focus: bool,
@@ -190,6 +193,7 @@ impl MockState {
                 unordered_windows: HashSet::new(),
                 background_tabs: HashSet::new(),
                 raise_count: 0,
+                dropped_raises: HashMap::new(),
                 raise_takes_focus: false,
             })),
         }
@@ -294,9 +298,20 @@ impl MockState {
     /// Moves a window to the front of the window order.
     pub fn raise_window(&self, id: WinID) {
         let mut inner = self.inner.force_write();
+        inner.raise_count += 1;
+        if let Some(dropped) = inner.dropped_raises.get_mut(&id)
+            && *dropped > 0
+        {
+            *dropped -= 1;
+            return;
+        }
         inner.raised.retain(|raised| *raised != id);
         inner.raised.push(id);
-        inner.raise_count += 1;
+    }
+
+    /// Makes the window server lose the next `count` raises of a window.
+    pub fn drop_raises(&self, id: WinID, count: usize) {
+        self.inner.force_write().dropped_raises.insert(id, count);
     }
 
     /// How many times any window was raised.
@@ -1168,14 +1183,18 @@ impl MockState {
 
         let s = self.clone();
         wm.expect_windows_on_screen().returning(move || {
-            let windows = s
-                .inner
-                .force_read()
+            let inner = s.inner.force_read();
+            let mut windows = inner
                 .windows
                 .iter()
                 .filter_map(|(id, window)| window.visible.then_some(id))
                 .copied()
                 .collect::<Vec<_>>();
+            // Front to back, as the window server lists them.
+            windows.sort_by_key(|id| {
+                let raised = inner.raised.iter().position(|raised| raised == id);
+                std::cmp::Reverse((raised, std::cmp::Reverse(*id)))
+            });
             Some(windows)
         });
 
