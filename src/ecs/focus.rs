@@ -668,16 +668,17 @@ fn raise_window_trigger(
     window.raise_without_focus();
 }
 
-/// How long the window server gets to apply an overlapping stack's raises
-/// before the engine checks the order it shows.
 const OVERLAP_RECHECK_DELAY: Duration = Duration::from_millis(150);
-/// How many times the engine raises a stack again that still shows out of
-/// order.
 const OVERLAP_RECHECKS: u8 = 3;
 
-/// When to check that the overlapping stacks show the order last applied.
 #[derive(Default, Resource)]
-pub(crate) struct OverlapRecheck(Option<(Duration, u8)>);
+pub(crate) struct OverlapRecheck(Option<OverlapRecheckDeadline>);
+
+#[derive(Clone, Copy)]
+struct OverlapRecheckDeadline {
+    at: Duration,
+    remaining: u8,
+}
 
 fn overlapping_stacks_need_ordering(
     gained: Query<Entity, Added<FocusedMarker>>,
@@ -687,7 +688,9 @@ fn overlapping_stacks_need_ordering(
     time: Res<Time>,
 ) -> bool {
     let lost_focus = lost.read().count() > 0;
-    let recheck_due = recheck.0.is_some_and(|(at, _)| time.elapsed() >= at);
+    let recheck_due = recheck
+        .0
+        .is_some_and(|deadline| time.elapsed() >= deadline.at);
     !gained.is_empty() || lost_focus || !strips.is_empty() || recheck_due
 }
 
@@ -702,11 +705,10 @@ fn overlapping_stacks_need_ordering(
 /// can move an app's focus and emit focus notifications, so raising an
 /// ordered stack again on each of them would never settle.
 ///
-/// Each app applies its own raises, so the window server can apply raises
-/// sent to different apps out of order, and an AX raise cannot lift a window
-/// above the frontmost app's window. A short while after raising, the engine
-/// reads the order the window server shows and raises a stack again that is
-/// still out of order, a few times at most.
+/// Raises may not produce the requested onscreen order immediately, and macOS
+/// can keep the frontmost app's window above AX-raised background windows.
+/// A short while after raising, the engine reads the order the window server
+/// shows and raises a stack again that is still out of order, a few times at most.
 #[instrument(level = Level::DEBUG, skip_all)]
 #[allow(clippy::too_many_arguments)]
 fn order_overlapping_stacks(
@@ -781,14 +783,14 @@ fn order_overlapping_stacks(
 
     let now = time.elapsed();
     let attempts = match recheck.0 {
-        Some((at, left)) if now >= at => {
+        Some(OverlapRecheckDeadline { at, remaining }) if now >= at => {
             recheck.0 = None;
             let shown = shown_out_of_order(&applied, &windows, &window_manager);
-            if !back_to_front.is_empty() || shown.is_empty() || left == 0 {
+            if !back_to_front.is_empty() || shown.is_empty() || remaining == 0 {
                 (!back_to_front.is_empty()).then_some(OVERLAP_RECHECKS)
             } else {
                 back_to_front = shown;
-                Some(left - 1)
+                Some(remaining - 1)
             }
         }
         _ => (!back_to_front.is_empty()).then_some(OVERLAP_RECHECKS),
@@ -796,7 +798,10 @@ fn order_overlapping_stacks(
     let Some(attempts) = attempts else {
         return;
     };
-    recheck.0 = Some((now + OVERLAP_RECHECK_DELAY, attempts));
+    recheck.0 = Some(OverlapRecheckDeadline {
+        at: now + OVERLAP_RECHECK_DELAY,
+        remaining: attempts,
+    });
 
     for entity in back_to_front
         .into_iter()
@@ -812,8 +817,6 @@ fn order_overlapping_stacks(
     }
 }
 
-/// The windows of every order in `applied` that the window server does not
-/// show in that order, back to front.
 fn shown_out_of_order(
     applied: &[Vec<Entity>],
     windows: &Query<(&Window, &LayoutPosition, &Bounds)>,

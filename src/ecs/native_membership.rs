@@ -520,8 +520,8 @@ fn window_display(world: &mut World, member: Entity) -> Option<Entity> {
     // `PresentedOrigin` is where the engine is taking the window. While a
     // `RepositionMarker` animates it, `Position` is the last frame the engine
     // wrote. Otherwise `Position` can hold a native move the engine adopted.
-    // Only the origin counts: an app that refuses a size, such as a window
-    // taller than its minimum allows, keeps the origin the engine wrote.
+    // Only the origin counts: an app that refuses to make a window shorter
+    // than its minimum allows keeps the origin the engine wrote.
     let animated = world.get::<RepositionMarker>(member).is_some();
     let written = [
         world.get::<PresentedOrigin>(member).map(|origin| origin.0),

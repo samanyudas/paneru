@@ -462,9 +462,8 @@ fn focus_brings_an_overlapped_window_to_the_front_until_it_leaves() {
     assert_eq!(harness.mock_state.window_order(&stack), vec![0, 1, 2]);
 }
 
-/// The window server can apply raises sent to different apps out of order,
-/// so a raise is lost. The engine checks the order shown a little later and
-/// raises the stack again, so every top bar still shows.
+/// The mock drops one raise. The engine checks the order shown a little
+/// later and retries the raises to repair the stack order.
 #[test]
 fn an_overlapping_stack_raised_out_of_order_is_raised_again() {
     let mut harness = TestHarness::new().with_windows(4);

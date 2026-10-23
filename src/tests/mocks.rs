@@ -147,8 +147,6 @@ struct MockStateInner {
     background_tabs: HashSet<WinID>,
     /// How many times any window was raised.
     raise_count: usize,
-    /// Raises the window server loses, per window, as when raises sent to
-    /// different apps land out of order.
     dropped_raises: HashMap<WinID, usize>,
     /// Whether raising a window also makes it its app's focused window, as
     /// `AXRaise` does for a window of the frontmost app.
@@ -309,7 +307,6 @@ impl MockState {
         inner.raised.push(id);
     }
 
-    /// Makes the window server lose the next `count` raises of a window.
     pub fn drop_raises(&self, id: WinID, count: usize) {
         self.inner.force_write().dropped_raises.insert(id, count);
     }
