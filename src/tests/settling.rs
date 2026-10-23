@@ -119,6 +119,81 @@ fn swipe_past_the_end_settles_with_the_strip_end_on_the_viewport_edge() {
     }
 }
 
+#[test]
+fn application_termination_during_swipe_preserves_landing() {
+    for animation_speed in [None, Some(14.0)] {
+        let run = |terminate: bool| {
+            let mut harness = TestHarness::new()
+                .with_config(miri_config(animation_speed))
+                .with_app(2, "background", "Background", |_| {});
+            let state = harness.mock_state.clone();
+            let windows = (0..5)
+                .map(|id| {
+                    state.spawn_window(
+                        if id == 1 { 2 } else { TEST_PROCESS_ID },
+                        TEST_WORKSPACE_ID,
+                        id,
+                        IRect::new(id * 400, 24, id * 400 + 400, 764),
+                    )
+                })
+                .collect();
+            harness.existed_at_launch(0..5);
+            harness
+                .world()
+                .trigger(crate::ecs::SpawnWindowTrigger(windows));
+            harness.run(vec![
+                Event::MenuOpened { window_id: 0 },
+                focus(Direction::First),
+            ]);
+            state.set_cursor_position(IVec2::new(1000, 5));
+
+            send(&mut harness, Event::TouchpadDown);
+            send(&mut harness, swipe(0.6));
+            harness.advance(ONE_FRAME * 2);
+            assert_focused!(harness.world(), 0);
+            assert!(
+                state.create_window(0).frame().min.x < -350,
+                "the old focused window must be parked off-screen, got {:?}",
+                state.create_window(0).frame()
+            );
+            if terminate {
+                send(
+                    &mut harness,
+                    Event::ApplicationTerminated {
+                        psn: crate::platform::ProcessSerialNumber { high: 0, low: 2 },
+                    },
+                );
+            }
+            harness.advance(ONE_FRAME);
+            send(&mut harness, Event::TouchpadUp);
+            harness.advance(SETTLE);
+
+            let frames = [0, 2, 3, 4].map(|id| state.create_window(id).frame());
+            (harness, frames)
+        };
+        let (mut control, expected) = run(false);
+        assert_focused!(control.world(), 4);
+        assert_eq!(expected[3].max.x, TEST_DISPLAY_WIDTH);
+        let (mut terminated, actual) = run(true);
+        assert_eq!(
+            actual, expected,
+            "termination changed the swipe landing; animation_speed={animation_speed:?}"
+        );
+        assert_focused!(terminated.world(), 4);
+        assert_eq!(
+            terminated.mock_state.focused_window_id(TEST_PROCESS_ID),
+            Some(4)
+        );
+        let world = terminated.world();
+        assert!(
+            world
+                .query::<&Window>()
+                .iter(world)
+                .all(|window| window.id() != 1)
+        );
+    }
+}
+
 /// The mirror case: a flick back past the start lands on the first column
 /// with the strip start on the left viewport edge.
 #[test]
