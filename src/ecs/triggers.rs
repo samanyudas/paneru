@@ -1568,6 +1568,7 @@ pub(super) fn window_removal_trigger(
         (With<Window>, With<FocusedMarker>, Without<Unmanaged>),
     >,
     mouse_held: Query<(), With<MouseHeldMarker>>,
+    scrolling: Query<(), With<Scrolling>>,
     drag: Option<Res<DragState>>,
     restored: Query<&RestoreFocusMarker>,
     initializing: Option<Res<Initializing>>,
@@ -1596,6 +1597,7 @@ pub(super) fn window_removal_trigger(
             || initializing.is_some()
             || skip_reshuffle.0
             || !mouse_held.is_empty()
+            || !scrolling.is_empty()
             || focused == entity
             || !strip.contains(focused)
             || restored.iter().any(|marker| marker.entity == focused)
