@@ -259,6 +259,12 @@ static WRITERS: LazyLock<Arc<WindowWriters<AxApp>>> =
 /// How long an app's writer outlives its last write.
 const WRITER_IDLE: Duration = Duration::from_secs(5);
 
+/// Waits up to `timeout` for every window move and resize asked for so far
+/// to reach its app. Returns whether all of them did.
+pub(super) fn flush_window_writes(timeout: Duration) -> bool {
+    WRITERS.flush(timeout)
+}
+
 type RestoreEnhancedUi = Box<dyn FnOnce() -> Result<()> + Send>;
 
 /// One app as its window writer sees it.

@@ -204,3 +204,44 @@ fn a_stuck_app_gets_only_the_newest_frame_once_it_answers() {
     );
     assert_eq!(harness.mock_state.ax_frame(0), *asked.last().unwrap());
 }
+
+/// Runs the exit cleanup directly. Sending `AppExit` through the full
+/// schedule also runs the state-saving exit systems, which write the real user
+/// state file.
+fn run_exit_cleanup(world: &mut World) {
+    use bevy::app::AppExit;
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    world.write_message(AppExit::Success);
+    world
+        .run_system_once(crate::ecs::systems::cleanup_on_exit)
+        .expect("running cleanup_on_exit");
+}
+
+/// The engine process ends as soon as the exit cleanup returns, so every
+/// window must have its exit frame by then, even from an app that answers
+/// later than a frame read waits for.
+#[test]
+fn exit_cleanup_returns_only_once_a_slow_app_has_its_exit_frames() {
+    let mut harness = harness();
+    let parked = engine_frame(harness.world(), 2);
+    harness.mock_state.hold_writes(SLOW_APP);
+    // Past the time the cleanup takes to give up on both of the slow app's
+    // windows when it reads instead of waiting for the writes to land, yet
+    // inside its one second budget.
+    let release = {
+        let mock_state = harness.mock_state.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            mock_state.release_writes(SLOW_APP);
+        })
+    };
+
+    run_exit_cleanup(harness.world());
+    let landed = harness.mock_state.ax_frame(2);
+    release.join().unwrap();
+
+    let exit_frame = engine_frame(harness.world(), 2);
+    assert_ne!(exit_frame, parked, "the exit moved the parked window");
+    assert_eq!(landed, exit_frame);
+}

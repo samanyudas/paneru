@@ -1380,7 +1380,7 @@ pub(crate) fn cleanup_on_exit(
             window.place(target);
             targets.push((window.id(), target));
         }
-        settle_exit_frames(&mut all_windows, targets);
+        settle_exit_frames(&mut all_windows, &window_manager, targets);
     }
 }
 
@@ -1390,8 +1390,13 @@ pub(crate) fn cleanup_on_exit(
 /// any that has not landed. A window whose frame cannot be read is not checked
 /// again, and the whole pass stops at a deadline, so an app that does not
 /// respond cannot hold up Stop or Quit.
+///
+/// Each app's writer carries the writes off this thread, and the process ends
+/// once this returns, so every check, and the return, first waits for the
+/// writes asked for so far to reach their apps, within the same deadline.
 fn settle_exit_frames(
     all_windows: &mut Query<(&mut Window, Has<Unmanaged>, Option<&PreLaunchFrame>)>,
+    window_manager: &WindowManager,
     mut pending: Vec<(WinID, IRect)>,
 ) {
     const ROUNDS: usize = 5;
@@ -1399,8 +1404,10 @@ fn settle_exit_frames(
     const BUDGET: Duration = Duration::from_secs(1);
 
     let deadline = Instant::now() + BUDGET;
+    let writes_landed =
+        || window_manager.flush_window_writes(deadline.saturating_duration_since(Instant::now()));
     for _ in 0..ROUNDS {
-        if pending.is_empty() || Instant::now() + WAIT > deadline {
+        if pending.is_empty() || !writes_landed() || Instant::now() + WAIT > deadline {
             break;
         }
         std::thread::sleep(WAIT);
@@ -1426,6 +1433,9 @@ fn settle_exit_frames(
                 }
             }
         });
+    }
+    if !writes_landed() {
+        warn!("exit cleanup: some window moves did not reach their apps");
     }
     for (id, target) in pending {
         warn!("exit cleanup: window {id} did not reach {target:?}");

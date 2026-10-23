@@ -1,16 +1,26 @@
-//! Moves and resizes windows on behalf of the engine.
+//! Moves and resizes windows off the engine frame.
 //!
 //! An accessibility write is a synchronous round-trip served on the main
 //! thread of the window's app, and a busy app holds it for hundreds of
-//! milliseconds. The engine asks for a frame through [`FrameWrites`], and
-//! [`WindowWriters`] carries the write to the app through a [`WriteSink`].
+//! milliseconds. Writing inline made every frame wait for the slowest app it
+//! touched, freezing the whole strip mid-swipe. Instead the engine asks for a
+//! frame through [`FrameWrites`], which records it at once, and
+//! [`WindowWriters`] carries the write to the app on a thread for that app.
+//!
+//! A writer keeps only the newest frame asked for each window. Frames asked
+//! for while an earlier write is still in flight replace each other, so a
+//! slow app skips positions it could not keep up with instead of replaying
+//! them late.
 
 use bevy::math::IRect;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tracing::{debug, trace};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant};
+use tracing::{debug, trace, warn};
 
 use crate::errors::{Error, Result};
 use crate::manager::{Origin, Size};
@@ -56,6 +66,17 @@ pub(crate) struct PendingWrite<W> {
     pub to: IRect,
     pub position: bool,
     pub size: bool,
+}
+
+impl<W> PendingWrite<W> {
+    /// Takes on a newer request for the same window, keeping the frame the
+    /// window had before the older one.
+    fn merge(&mut self, newer: Self) {
+        self.window = newer.window;
+        self.to = newer.to;
+        self.position |= newer.position;
+        self.size |= newer.size;
+    }
 }
 
 /// Writes one window's frame. A write of both parts follows the order the
@@ -153,31 +174,197 @@ fn resize_staging_origin(
     })
 }
 
-/// Carries window writes to their apps. For now each write runs inline on
-/// the caller's thread, so nothing is ever pending.
-pub(crate) struct WindowWriters<S: WriteSink> {
-    open_sink: Box<dyn Fn(Option<Pid>) -> S + Send + Sync>,
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[allow(clippy::unused_self, dead_code)]
-impl<S: WriteSink> WindowWriters<S> {
-    pub fn new(
-        _idle: Duration,
-        open_sink: impl Fn(Option<Pid>) -> S + Send + Sync + 'static,
-    ) -> Self {
+/// One writer thread per app, each started on its first write and stopped
+/// once it has had nothing to do for `idle`. Writes to one app queue on its
+/// main thread anyway, and apps must not wait on each other.
+pub(crate) struct WindowWriters<S: WriteSink> {
+    shared: Arc<Shared<S>>,
+}
+
+struct Shared<S: WriteSink> {
+    /// Lock order: this map, then a mailbox's queue. A push holds the map
+    /// while it queues, and an idle writer holds it while it checks its
+    /// queue is still empty and leaves, so a push never lands in a writer
+    /// that has already gone.
+    writers: Mutex<HashMap<Pid, Arc<Mailbox<S::Window>>>>,
+    open_sink: Box<dyn Fn(Option<Pid>) -> S + Send + Sync>,
+    idle: Duration,
+}
+
+struct Mailbox<W> {
+    queue: Mutex<Queue<W>>,
+    /// Signalled when a write is queued.
+    work: Condvar,
+    /// Signalled when a batch has been written.
+    landed: Condvar,
+}
+
+struct Queue<W> {
+    pending: HashMap<WriteKey, PendingWrite<W>>,
+    in_flight: HashSet<WriteKey>,
+}
+
+impl<W> Queue<W> {
+    fn holds(&self, key: WriteKey) -> bool {
+        self.pending.contains_key(&key) || self.in_flight.contains(&key)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.in_flight.is_empty()
+    }
+}
+
+impl<W> Mailbox<W> {
+    fn new() -> Self {
         Self {
-            open_sink: Box::new(open_sink),
+            queue: Mutex::new(Queue {
+                pending: HashMap::new(),
+                in_flight: HashSet::new(),
+            }),
+            work: Condvar::new(),
+            landed: Condvar::new(),
         }
     }
 
-    /// Writes `write` to `pid`'s window `key`.
-    pub fn push(&self, pid: Pid, _key: WriteKey, write: PendingWrite<S::Window>) {
-        self.write_inline(Some(pid), &write);
+    /// Takes every queued write, or `None` once nothing has arrived for
+    /// `idle`.
+    fn next_batch(&self, idle: Duration) -> Option<HashMap<WriteKey, PendingWrite<W>>> {
+        let mut queue = lock(&self.queue);
+        while queue.pending.is_empty() {
+            let (guard, wait) = self
+                .work
+                .wait_timeout(queue, idle)
+                .unwrap_or_else(PoisonError::into_inner);
+            queue = guard;
+            if wait.timed_out() && queue.pending.is_empty() {
+                return None;
+            }
+        }
+        let batch = std::mem::take(&mut queue.pending);
+        queue.in_flight.extend(batch.keys().copied());
+        Some(batch)
+    }
+
+    fn land(&self) {
+        lock(&self.queue).in_flight.clear();
+        self.landed.notify_all();
+    }
+
+    fn wait_until(&self, deadline: Instant, done: impl Fn(&Queue<W>) -> bool) -> bool {
+        let mut queue = lock(&self.queue);
+        while !done(&queue) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            queue = self
+                .landed
+                .wait_timeout(queue, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+}
+
+impl<S: WriteSink> Shared<S> {
+    fn mailbox(&self, pid: Pid) -> Option<Arc<Mailbox<S::Window>>> {
+        lock(&self.writers).get(&pid).cloned()
+    }
+
+    /// Removes an idle writer, unless a write arrived since it gave up
+    /// waiting.
+    fn retire(&self, pid: Pid, mailbox: &Arc<Mailbox<S::Window>>) -> bool {
+        let mut writers = lock(&self.writers);
+        if !lock(&mailbox.queue).pending.is_empty() {
+            return false;
+        }
+        if writers
+            .get(&pid)
+            .is_some_and(|current| Arc::ptr_eq(current, mailbox))
+        {
+            writers.remove(&pid);
+        }
+        true
+    }
+
+    fn run(&self, pid: Pid, mailbox: &Arc<Mailbox<S::Window>>) {
+        let mut sink = (self.open_sink)(Some(pid));
+        loop {
+            let Some(batch) = mailbox.next_batch(self.idle) else {
+                if self.retire(pid, mailbox) {
+                    debug!("window writer for pid {pid} exits after idling");
+                    return;
+                }
+                continue;
+            };
+            objc2::rc::autoreleasepool(|_| {
+                sink.begin();
+                for write in batch.values() {
+                    apply(&mut sink, write);
+                }
+                sink.finish();
+            });
+            mailbox.land();
+        }
+    }
+}
+
+impl<S: WriteSink> WindowWriters<S> {
+    pub fn new(
+        idle: Duration,
+        open_sink: impl Fn(Option<Pid>) -> S + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                writers: Mutex::new(HashMap::new()),
+                open_sink: Box::new(open_sink),
+                idle,
+            }),
+        }
+    }
+
+    /// Queues `write` for `pid`'s writer, merged into whatever was still
+    /// queued for window `key`. Never waits on the app.
+    pub fn push(&self, pid: Pid, key: WriteKey, write: PendingWrite<S::Window>) {
+        let mut writers = lock(&self.shared.writers);
+        let mailbox = if let Some(mailbox) = writers.get(&pid) {
+            mailbox.clone()
+        } else {
+            let mailbox = Arc::new(Mailbox::new());
+            let shared = self.shared.clone();
+            let thread_mailbox = mailbox.clone();
+            let spawned = thread::Builder::new()
+                .name(format!("window-writer-{pid}"))
+                .spawn(move || shared.run(pid, &thread_mailbox));
+            if let Err(err) = spawned {
+                drop(writers);
+                warn!("cannot start a window writer for pid {pid}, writing inline: {err}");
+                self.write_inline(Some(pid), &write);
+                return;
+            }
+            writers.insert(pid, mailbox.clone());
+            mailbox
+        };
+        let mut queue = lock(&mailbox.queue);
+        match queue.pending.entry(key) {
+            Entry::Occupied(mut queued) => queued.get_mut().merge(write),
+            Entry::Vacant(slot) => {
+                slot.insert(write);
+            }
+        }
+        drop(queue);
+        drop(writers);
+        mailbox.work.notify_one();
     }
 
     /// Writes `write` on the calling thread.
     pub fn write_inline(&self, pid: Option<Pid>, write: &PendingWrite<S::Window>) {
-        let mut sink = (self.open_sink)(pid);
+        let mut sink = (self.shared.open_sink)(pid);
         objc2::rc::autoreleasepool(|_| {
             sink.begin();
             apply(&mut sink, write);
@@ -186,26 +373,39 @@ impl<S: WriteSink> WindowWriters<S> {
     }
 
     /// Whether a write to window `key` is queued or in flight.
-    pub fn is_pending(&self, _pid: Pid, _key: WriteKey) -> bool {
-        false
+    #[cfg(test)]
+    pub fn is_pending(&self, pid: Pid, key: WriteKey) -> bool {
+        self.shared
+            .mailbox(pid)
+            .is_some_and(|mailbox| lock(&mailbox.queue).holds(key))
     }
 
     /// Waits up to `timeout` until no write to window `key` is queued or in
     /// flight. Returns whether that happened.
-    pub fn wait_landed(&self, _pid: Pid, _key: WriteKey, _timeout: Duration) -> bool {
-        true
+    pub fn wait_landed(&self, pid: Pid, key: WriteKey, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        self.shared
+            .mailbox(pid)
+            .is_none_or(|mailbox| mailbox.wait_until(deadline, |queue| !queue.holds(key)))
     }
 
     /// Waits up to `timeout` until every writer has written everything queued
     /// so far. Returns whether that happened.
-    pub fn flush(&self, _timeout: Duration) -> bool {
-        true
+    pub fn flush(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mailboxes = lock(&self.shared.writers)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        mailboxes
+            .iter()
+            .all(|mailbox| mailbox.wait_until(deadline, Queue::is_empty))
     }
 
     /// How many writer threads are running.
     #[cfg(test)]
     pub fn writers(&self) -> usize {
-        0
+        lock(&self.shared.writers).len()
     }
 }
 

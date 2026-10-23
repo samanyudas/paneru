@@ -211,6 +211,10 @@ pub trait WindowManagerApi: Send + Sync {
 
     /// Every window that exists right now, on any Space, minimized or not.
     fn all_window_ids(&self) -> Vec<WinID>;
+
+    /// Waits up to `timeout` for every window move and resize asked for so
+    /// far to reach its app. Returns whether all of them did.
+    fn flush_window_writes(&self, timeout: Duration) -> bool;
 }
 
 /// `WindowManager` is a Bevy resource that holds a boxed `WindowManagerApi` trait object.
@@ -613,6 +617,10 @@ impl WindowManagerApi for WindowManagerOS {
         window_ids(
             CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
         )
+    }
+
+    fn flush_window_writes(&self, timeout: Duration) -> bool {
+        windows::flush_window_writes(timeout)
     }
 
     fn all_window_ids(&self) -> Vec<WinID> {

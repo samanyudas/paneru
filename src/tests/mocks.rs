@@ -1538,6 +1538,10 @@ impl MockState {
         wm.expect_get_associated_windows().return_const(vec![]);
 
         let s = self.clone();
+        wm.expect_flush_window_writes()
+            .returning(move |timeout| s.flush_writes(timeout));
+
+        let s = self.clone();
         wm.expect_find_window_at_point().returning(move |at_point| {
             let point = origin_from(*at_point);
             top_window_at(&s.inner.force_read(), point)
