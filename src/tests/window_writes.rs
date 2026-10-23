@@ -9,7 +9,7 @@ use crate::commands::{Command, Direction, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::SpawnWindowTrigger;
 use crate::events::Event;
-use crate::manager::Window;
+use crate::manager::{Size, Window};
 use crate::platform::{Pid, WinID};
 
 use super::*;
@@ -22,8 +22,9 @@ const OTHER_APP: Pid = 2;
 const WINDOW_WIDTH: i32 = 700;
 /// How long each of the slow app's writes takes, like Helium mid-swipe.
 const SLOW_WRITE: Duration = Duration::from_millis(200);
-/// Well under one slow write, and well over an engine frame.
-const FRAME_BUDGET: Duration = Duration::from_millis(100);
+/// Under one slow write and under the wait for a pending write, yet far over
+/// an engine frame, so tests running in parallel do not push a frame past it.
+const FRAME_BUDGET: Duration = Duration::from_millis(150);
 /// Simulated time per frame, as the harness runs it.
 const FRAME: Duration = Duration::from_millis(20);
 const FLUSH: Duration = Duration::from_secs(5);
@@ -31,6 +32,11 @@ const FLUSH: Duration = Duration::from_secs(5);
 /// Three columns, wider together than the display, whose apps take their
 /// writes through the engine's per-app writers, settled at the strip start.
 fn harness() -> TestHarness {
+    harness_with(|harness| harness)
+}
+
+/// [`harness`], with `setup` applied before any window opens.
+fn harness_with(setup: impl FnOnce(TestHarness) -> TestHarness) -> TestHarness {
     let config: Config = (
         MainOptions {
             swipe_gesture_fingers: Some(3),
@@ -39,10 +45,12 @@ fn harness() -> TestHarness {
         vec![],
     )
         .into();
-    let mut harness =
-        TestHarness::new()
-            .with_config(config)
-            .with_app(OTHER_APP, "other", "OtherApp", |_| {});
+    let mut harness = setup(TestHarness::new().with_config(config).with_app(
+        OTHER_APP,
+        "other",
+        "OtherApp",
+        |_| {},
+    ));
     harness.mock_state.queue_writes(SLOW_APP);
     harness.mock_state.queue_writes(OTHER_APP);
     for (id, pid) in [(0, SLOW_APP), (1, OTHER_APP), (2, SLOW_APP)] {
@@ -244,4 +252,311 @@ fn exit_cleanup_returns_only_once_a_slow_app_has_its_exit_frames() {
     let exit_frame = engine_frame(harness.world(), 2);
     assert_ne!(exit_frame, parked, "the exit moved the parked window");
     assert_eq!(landed, exit_frame);
+}
+
+// --- Readers of a window's frame while the engine's write to it is pending ---
+
+/// Holds the slow app, then has the engine move window `id` right by `dx`, so
+/// that write stays pending until the test releases the app. Returns the
+/// frame the engine asked for.
+fn pend_move(harness: &mut TestHarness, id: WinID, dx: i32) -> IRect {
+    harness.mock_state.hold_writes(SLOW_APP);
+    let entity = find_window_entity(id, harness.world());
+    harness
+        .world()
+        .get_mut::<crate::ecs::Position>(entity)
+        .expect("a tiled window has a position")
+        .0
+        .x += dx;
+    harness.advance(FRAME);
+    let asked = engine_frame(harness.world(), id);
+    assert_ne!(
+        harness.mock_state.ax_frame(id),
+        asked,
+        "the write is pending"
+    );
+    asked
+}
+
+/// Releases the slow app and waits until its writes land.
+fn release_slow_app(harness: &mut TestHarness) {
+    harness.mock_state.release_writes(SLOW_APP);
+    assert!(harness.mock_state.flush_writes(FLUSH));
+}
+
+fn assert_no_frame_waited(harness: &mut TestHarness, frames: usize) {
+    let slowest = run_frames(harness, frames);
+    assert!(
+        slowest < FRAME_BUDGET,
+        "an engine frame waited {slowest:?} on a pending write"
+    );
+}
+
+fn has<C: Component>(world: &mut World, id: WinID) -> bool {
+    let entity = find_window_entity(id, world);
+    world.get::<C>(entity).is_some()
+}
+
+/// `window_frame_update`: an app resizes its own window while the engine's
+/// move to it is still on its way. The frame read must wait for the move
+/// to land, without holding up any engine frame, and then the app's size
+/// is adopted.
+#[test]
+fn a_frame_notification_during_a_pending_write_is_read_once_the_write_lands() {
+    let mut harness = harness();
+    pend_move(&mut harness, 0, 40);
+    let native = Size::new(WINDOW_WIDTH - 120, TEST_WINDOW_HEIGHT - 300);
+    harness.mock_state.os_resize_window(0, native);
+
+    assert_no_frame_waited(&mut harness, 5);
+    release_slow_app(&mut harness);
+    harness.advance(Duration::from_secs(1));
+
+    let entity = find_window_entity(0, harness.world());
+    assert_eq!(
+        harness.world().get::<crate::ecs::Bounds>(entity).unwrap().0,
+        native,
+        "the engine adopted the size the app chose"
+    );
+}
+
+/// `verify_window_position`: a check of the engine's own pending move waits
+/// for it to land instead of reading the frame the window is leaving, and
+/// spends none of its attempts meanwhile.
+#[test]
+fn position_verification_waits_for_the_engines_pending_write() {
+    let mut harness = harness();
+    let asked = pend_move(&mut harness, 0, 40);
+    let entity = find_window_entity(0, harness.world());
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(crate::ecs::VerifyWindowPosition::default());
+
+    assert_no_frame_waited(&mut harness, 5);
+    assert!(
+        has::<crate::ecs::VerifyWindowPosition>(harness.world(), 0),
+        "the check waits for the write"
+    );
+
+    release_slow_app(&mut harness);
+    harness.advance(FRAME * 2);
+    assert!(!has::<crate::ecs::VerifyWindowPosition>(harness.world(), 0));
+    assert_eq!(harness.mock_state.ax_frame(0), asked);
+}
+
+/// `window_resize_verifier`: the app refuses the narrower size the engine is
+/// still writing. The check waits for the write to land, then adopts the
+/// width the app kept.
+#[test]
+fn size_verification_waits_for_the_engines_pending_write() {
+    let mut harness = harness();
+    let minimum = Size::new(WINDOW_WIDTH - 100, 100);
+    harness
+        .mock_state
+        .update_window(0, |window| window.minimum_size = Some(minimum));
+    harness.mock_state.hold_writes(SLOW_APP);
+    let entity = find_window_entity(0, harness.world());
+    harness
+        .world()
+        .get_mut::<crate::ecs::Bounds>(entity)
+        .unwrap()
+        .0
+        .x = WINDOW_WIDTH - 300;
+    harness.advance(FRAME);
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(crate::ecs::VerifyWindowSize::default());
+
+    assert_no_frame_waited(&mut harness, 5);
+    release_slow_app(&mut harness);
+    harness.advance(Duration::from_secs(1));
+
+    assert_eq!(
+        harness
+            .world()
+            .get::<crate::ecs::Bounds>(entity)
+            .unwrap()
+            .0
+            .x,
+        minimum.x,
+        "the engine adopted the width the app kept"
+    );
+}
+
+/// `fix_window_size_on_focus`: focus arrives while the engine's write is
+/// pending. The refresh does not wait, and stays due for a later focus.
+#[test]
+fn a_focus_size_refresh_waits_for_a_later_focus_while_a_write_is_pending() {
+    use crate::ecs::{FocusedMarker, RefreshWindowSizeOnFocus};
+
+    let mut harness = harness();
+    pend_move(&mut harness, 0, 40);
+    let entity = find_window_entity(0, harness.world());
+    harness.world().entity_mut(entity).remove::<FocusedMarker>();
+    harness.advance(FRAME);
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert((RefreshWindowSizeOnFocus, FocusedMarker));
+
+    assert_no_frame_waited(&mut harness, 3);
+    assert!(has::<RefreshWindowSizeOnFocus>(harness.world(), 0));
+    release_slow_app(&mut harness);
+}
+
+/// `poll_pressed_window`: a press on a window whose engine move is pending
+/// is polled every frame. The poll must neither wait for the move nor
+/// report it as the user dragging the window.
+#[test]
+fn a_pressed_window_is_not_polled_while_the_engines_write_is_pending() {
+    use crate::ecs::drag::DragState;
+    use crate::events::MouseButton;
+    use crate::platform::Modifiers;
+    use objc2_core_foundation::CGPoint;
+
+    let mut harness = harness();
+    let start = harness.mock_state.ax_frame(0);
+    pend_move(&mut harness, 0, 40);
+    let press = start.min + IVec2::new(100, 10);
+    let cg = |point: IVec2| CGPoint::new(point.x.into(), point.y.into());
+    harness.mock_state.set_left_button_down(true);
+    harness.world().write_message(Event::MouseDown {
+        point: cg(press),
+        modifiers: Modifiers::empty(),
+        button: MouseButton::Left,
+        window_id: Some(0),
+    });
+    harness.advance(FRAME);
+    harness.world().write_message(Event::MouseDragged {
+        point: cg(press + IVec2::new(60, 0)),
+        modifiers: Modifiers::empty(),
+        button: MouseButton::Left,
+    });
+
+    assert_no_frame_waited(&mut harness, 5);
+    assert!(
+        !matches!(
+            harness.world().resource::<DragState>(),
+            DragState::Dragging(_)
+        ),
+        "the engine's own move is no drag"
+    );
+    harness.mock_state.set_left_button_down(false);
+    release_slow_app(&mut harness);
+}
+
+/// `recover_window_handles`: a window awaiting a handle whose engine write
+/// is pending is not read until the write lands, then gets its frame.
+#[test]
+fn handle_recovery_waits_for_the_engines_pending_write() {
+    use crate::ecs::AwaitingHandle;
+    use bevy::time::{Timer, TimerMode};
+
+    let mut harness = harness();
+    let asked = pend_move(&mut harness, 0, 40);
+    let entity = find_window_entity(0, harness.world());
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(AwaitingHandle(Timer::new(
+            Duration::from_secs(5),
+            TimerMode::Once,
+        )));
+
+    assert_no_frame_waited(&mut harness, 5);
+    assert!(has::<AwaitingHandle>(harness.world(), 0));
+    release_slow_app(&mut harness);
+    harness.advance(FRAME * 2);
+    assert!(!has::<AwaitingHandle>(harness.world(), 0));
+    assert_eq!(harness.mock_state.ax_frame(0), asked);
+}
+
+/// `resize_window`: a width command on a window whose engine write is
+/// pending steps from the frame the engine asked for, without waiting.
+#[test]
+fn a_width_command_does_not_wait_for_a_pending_write() {
+    let mut harness = harness();
+    pend_move(&mut harness, 0, 40);
+    harness.world().write_message(Event::Command {
+        command: Command::Window(Operation::Resize(crate::commands::ResizeDirection::Grow)),
+    });
+
+    assert_no_frame_waited(&mut harness, 3);
+    release_slow_app(&mut harness);
+}
+
+/// Drag tiling: macOS tiles a window, and the engine restores its slot
+/// while the app is too busy to take the restore. No engine frame waits
+/// for the restore, and once the app answers the window is back in its
+/// slot.
+#[test]
+fn a_tile_restore_to_a_busy_app_holds_up_no_frame() {
+    let mut harness = harness();
+    let slot = engine_frame(harness.world(), 0);
+    let tile = IRect::new(0, TEST_MENUBAR_HEIGHT, 512, TEST_DISPLAY_HEIGHT);
+    harness.mock_state.hold_writes(SLOW_APP);
+    harness
+        .mock_state
+        .update_window(0, |window| window.frame = tile);
+    harness
+        .world()
+        .write_message(Event::WindowMoved { window_id: 0 });
+    harness
+        .world()
+        .write_message(Event::WindowResized { window_id: 0 });
+    harness.advance(FRAME);
+    assert_eq!(
+        engine_frame(harness.world(), 0),
+        slot,
+        "the engine restores the slot"
+    );
+    assert_eq!(
+        harness.mock_state.ax_frame(0),
+        tile,
+        "the restore is pending"
+    );
+
+    // Past the tile hold, which reads the frame back when it ends.
+    assert_no_frame_waited(&mut harness, 60);
+    release_slow_app(&mut harness);
+    harness.advance(Duration::from_secs(2));
+    assert!(harness.mock_state.flush_writes(FLUSH));
+
+    assert_eq!(engine_frame(harness.world(), 0), slot);
+    assert_eq!(harness.mock_state.ax_frame(0), slot);
+}
+
+/// Native membership: macOS reports a window in the space of another
+/// display while the engine's write that brings it back to its own strip is
+/// still pending. The frame the engine wrote is the evidence, so the stale
+/// report moves nothing, and reading it waits on no app.
+#[test]
+fn a_stale_space_report_during_a_pending_write_keeps_the_window_in_its_strip() {
+    let ext = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        EXT_DISPLAY_HEIGHT,
+    );
+    let mut harness =
+        harness_with(|harness| harness.with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID]));
+    crate::assert_on_workspace!(harness.world(), 0, TEST_WORKSPACE_ID);
+
+    pend_move(&mut harness, 0, 40);
+    // Still on the other display, where a refused drop left it, as far as
+    // macOS knows.
+    harness.mock_state.update_window(0, |window| {
+        window.workspace_id = EXT_WORKSPACE_ID;
+        window.frame = IRect::from_corners(
+            ext.min + IVec2::new(100, 20),
+            ext.min + IVec2::new(100 + WINDOW_WIDTH, 20 + 700),
+        );
+    });
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+
+    assert_no_frame_waited(&mut harness, 10);
+    crate::assert_on_workspace!(harness.world(), 0, TEST_WORKSPACE_ID);
+    release_slow_app(&mut harness);
 }
