@@ -12,9 +12,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, trace};
 
-use crate::errors::Result;
+use crate::errors::{Error, Result};
 use crate::manager::{Origin, Size};
 use crate::platform::Pid;
+
+/// How long reading a window's frame waits for the engine's own write to it
+/// to land. Reading before then would see the frame the window is leaving.
+pub(crate) const LANDING_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// The calls one app's writer makes, kept apart from the queueing so tests
 /// can stand in a fake app.
@@ -149,11 +153,13 @@ fn resize_staging_origin(
     })
 }
 
-/// Carries window writes to their apps.
+/// Carries window writes to their apps. For now each write runs inline on
+/// the caller's thread, so nothing is ever pending.
 pub(crate) struct WindowWriters<S: WriteSink> {
     open_sink: Box<dyn Fn(Option<Pid>) -> S + Send + Sync>,
 }
 
+#[allow(clippy::unused_self, dead_code)]
 impl<S: WriteSink> WindowWriters<S> {
     pub fn new(
         _idle: Duration,
@@ -177,6 +183,29 @@ impl<S: WriteSink> WindowWriters<S> {
             apply(&mut sink, write);
             sink.finish();
         });
+    }
+
+    /// Whether a write to window `key` is queued or in flight.
+    pub fn is_pending(&self, _pid: Pid, _key: WriteKey) -> bool {
+        false
+    }
+
+    /// Waits up to `timeout` until no write to window `key` is queued or in
+    /// flight. Returns whether that happened.
+    pub fn wait_landed(&self, _pid: Pid, _key: WriteKey, _timeout: Duration) -> bool {
+        true
+    }
+
+    /// Waits up to `timeout` until every writer has written everything queued
+    /// so far. Returns whether that happened.
+    pub fn flush(&self, _timeout: Duration) -> bool {
+        true
+    }
+
+    /// How many writer threads are running.
+    #[cfg(test)]
+    pub fn writers(&self) -> usize {
+        0
     }
 }
 
@@ -204,6 +233,13 @@ impl<S: WriteSink> FrameWrites<S> {
             key: WriteKey::next(),
             frame: IRect::default(),
         }
+    }
+
+    /// Starts from `frame` rather than from the first read.
+    #[cfg(test)]
+    pub fn starting_at(mut self, frame: IRect) -> Self {
+        self.frame = frame;
+        self
     }
 
     /// The frame last asked for or read back.
@@ -268,12 +304,24 @@ impl<S: WriteSink> FrameWrites<S> {
         }
     }
 
-    /// Reads the window's frame with `read`, and records it.
+    /// Reads the window's frame with `read`, after waiting up to
+    /// [`LANDING_TIMEOUT`] for the engine's own writes to it to land.
     ///
     /// # Errors
     ///
-    /// Fails if `read` fails.
-    pub fn update_frame(&mut self, read: impl FnOnce() -> Result<IRect>) -> Result<IRect> {
+    /// Fails if `read` fails, or if the writes did not land in time.
+    pub fn update_frame(
+        &mut self,
+        pid: Option<Pid>,
+        read: impl FnOnce() -> Result<IRect>,
+    ) -> Result<IRect> {
+        if let Some(pid) = pid
+            && !self.writers.wait_landed(pid, self.key, LANDING_TIMEOUT)
+        {
+            return Err(Error::Generic(
+                "the window's app has not applied the last move yet".to_string(),
+            ));
+        }
         self.frame = read()?;
         Ok(self.frame)
     }
@@ -492,5 +540,349 @@ mod tests {
         let previous = IRect::new(0, 40, 800, 640);
         let completed = IRect::new(0, 40, 4112, 640);
         assert_eq!(resize_staging_origin(previous, completed, 4112), None);
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Condvar, Mutex};
+    use std::thread;
+    use std::time::Instant;
+
+    /// Longer than any test holds an app, so a hold never ends by itself
+    /// while a test still expects it, yet short enough that a writer which
+    /// waits on the caller's thread fails the test instead of hanging it.
+    const HOLD_LIMIT: Duration = Duration::from_secs(1);
+    const SECOND: Duration = Duration::from_secs(1);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Op {
+        Begin,
+        Position(u32, Origin),
+        Size(u32, Size),
+        Finish,
+    }
+
+    /// What every fake app recorded, and a switch that makes an app hang
+    /// inside its next write until the test lets it go.
+    struct Probe {
+        log: Mutex<HashMap<Pid, Vec<Op>>>,
+        held: Mutex<HashSet<Pid>>,
+        released: Condvar,
+        entered: Mutex<Sender<Pid>>,
+        opened: AtomicUsize,
+    }
+
+    impl Probe {
+        fn new() -> (Arc<Self>, Receiver<Pid>) {
+            let (entered, receiver) = channel();
+            let probe = Arc::new(Self {
+                log: Mutex::new(HashMap::new()),
+                held: Mutex::new(HashSet::new()),
+                released: Condvar::new(),
+                entered: Mutex::new(entered),
+                opened: AtomicUsize::new(0),
+            });
+            (probe, receiver)
+        }
+
+        fn hold(&self, pid: Pid) {
+            self.held.lock().unwrap().insert(pid);
+        }
+
+        fn release(&self, pid: Pid) {
+            self.held.lock().unwrap().remove(&pid);
+            self.released.notify_all();
+        }
+
+        fn log(&self, pid: Pid) -> Vec<Op> {
+            self.log
+                .lock()
+                .unwrap()
+                .get(&pid)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn record(&self, pid: Pid, op: Op) {
+            self.log.lock().unwrap().entry(pid).or_default().push(op);
+        }
+
+        fn hang_if_held(&self, pid: Pid) {
+            let held = self.held.lock().unwrap();
+            if !held.contains(&pid) {
+                return;
+            }
+            let _ = self.entered.lock().unwrap().send(pid);
+            let _ = self
+                .released
+                .wait_timeout_while(held, HOLD_LIMIT, |held| held.contains(&pid))
+                .unwrap();
+        }
+    }
+
+    struct FakeApp {
+        pid: Pid,
+        probe: Arc<Probe>,
+    }
+
+    impl WriteSink for FakeApp {
+        type Window = u32;
+
+        fn begin(&mut self) {
+            self.probe.record(self.pid, Op::Begin);
+        }
+
+        fn set_position(&mut self, window: &u32, origin: Origin) {
+            self.probe.hang_if_held(self.pid);
+            self.probe.record(self.pid, Op::Position(*window, origin));
+        }
+
+        fn set_size(&mut self, window: &u32, size: Size) {
+            self.probe.hang_if_held(self.pid);
+            self.probe.record(self.pid, Op::Size(*window, size));
+        }
+
+        fn read_frame(&mut self, _window: &u32) -> Option<IRect> {
+            None
+        }
+
+        fn finish(&mut self) {
+            self.probe.record(self.pid, Op::Finish);
+        }
+    }
+
+    fn writers(probe: &Arc<Probe>, idle: Duration) -> WindowWriters<FakeApp> {
+        let probe = probe.clone();
+        WindowWriters::new(idle, move |pid| {
+            probe.opened.fetch_add(1, Ordering::SeqCst);
+            FakeApp {
+                pid: pid.unwrap_or_default(),
+                probe: probe.clone(),
+            }
+        })
+    }
+
+    /// One key per fake window, so tests can name windows by number.
+    fn key(window: u32) -> WriteKey {
+        static KEYS: Mutex<Vec<WriteKey>> = Mutex::new(Vec::new());
+        let mut keys = KEYS.lock().unwrap();
+        while keys.len() <= window as usize {
+            keys.push(WriteKey::next());
+        }
+        keys[window as usize]
+    }
+
+    fn moved(window: u32, x: i32) -> PendingWrite<u32> {
+        PendingWrite {
+            window,
+            from: IRect::new(0, 0, 100, 100),
+            to: IRect::new(x, 0, x + 100, 100),
+            position: true,
+            size: false,
+        }
+    }
+
+    fn resized(window: u32, frame: IRect) -> PendingWrite<u32> {
+        PendingWrite {
+            window,
+            from: IRect::new(0, 0, 100, 100),
+            to: frame,
+            position: false,
+            size: true,
+        }
+    }
+
+    #[test]
+    fn a_push_does_not_wait_for_a_hung_app() {
+        let (probe, entered) = Probe::new();
+        let writers = writers(&probe, SECOND);
+        probe.hold(1);
+        let started = Instant::now();
+        writers.push(1, key(7), moved(7, 10));
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+        writers.push(1, key(7), moved(7, 20));
+        let pushes_took = started.elapsed();
+
+        assert!(
+            pushes_took < Duration::from_millis(50),
+            "the pushes took {pushes_took:?}"
+        );
+        assert!(writers.is_pending(1, key(7)));
+        assert!(!writers.wait_landed(1, key(7), Duration::from_millis(20)));
+        assert_eq!(probe.log(1), vec![Op::Begin]);
+
+        probe.release(1);
+        assert!(writers.wait_landed(1, key(7), SECOND));
+        assert!(!writers.is_pending(1, key(7)));
+        assert_eq!(
+            probe.log(1),
+            vec![
+                Op::Begin,
+                Op::Position(7, Origin::new(10, 0)),
+                Op::Finish,
+                Op::Begin,
+                Op::Position(7, Origin::new(20, 0)),
+                Op::Finish,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hung_app_does_not_hold_up_another_app() {
+        let (probe, entered) = Probe::new();
+        let writers = writers(&probe, SECOND);
+        probe.hold(1);
+        writers.push(1, key(7), moved(7, 10));
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+
+        let started = Instant::now();
+        writers.push(2, key(8), moved(8, 50));
+        assert!(writers.wait_landed(2, key(8), SECOND));
+        let landed_after = started.elapsed();
+
+        assert!(
+            landed_after < Duration::from_millis(100),
+            "the other app's write landed after {landed_after:?}"
+        );
+        assert_eq!(
+            probe.log(2),
+            vec![Op::Begin, Op::Position(8, Origin::new(50, 0)), Op::Finish]
+        );
+        assert_eq!(probe.log(1), vec![Op::Begin]);
+
+        probe.release(1);
+        assert!(writers.flush(SECOND));
+        assert_eq!(
+            probe.log(1),
+            vec![Op::Begin, Op::Position(7, Origin::new(10, 0)), Op::Finish]
+        );
+    }
+
+    /// Frames asked for while an earlier write is in flight replace each
+    /// other, so the app gets only the newest once it answers. A position
+    /// and a later size merge into one write of both.
+    #[test]
+    fn requests_queued_behind_a_hung_write_collapse_to_the_newest() {
+        let (probe, entered) = Probe::new();
+        let writers = writers(&probe, SECOND);
+        probe.hold(1);
+        writers.push(1, key(7), moved(7, 10));
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+
+        writers.push(1, key(7), moved(7, 20));
+        writers.push(1, key(7), moved(7, 30));
+        writers.push(1, key(7), moved(7, 40));
+        writers.push(1, key(7), resized(7, IRect::new(40, 0, 240, 100)));
+        probe.release(1);
+
+        assert!(writers.flush(SECOND));
+        assert_eq!(
+            probe.log(1),
+            vec![
+                Op::Begin,
+                Op::Position(7, Origin::new(10, 0)),
+                Op::Finish,
+                Op::Begin,
+                Op::Size(7, Size::new(200, 100)),
+                Op::Position(7, Origin::new(40, 0)),
+                Op::Finish,
+            ]
+        );
+    }
+
+    #[test]
+    fn flush_waits_for_the_write_in_flight() {
+        let (probe, entered) = Probe::new();
+        let writers = writers(&probe, SECOND);
+        probe.hold(1);
+        writers.push(1, key(7), moved(7, 10));
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+
+        assert!(!writers.flush(Duration::from_millis(30)));
+
+        let releaser = {
+            let probe = probe.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                probe.release(1);
+            })
+        };
+        assert!(writers.flush(SECOND));
+        assert_eq!(
+            probe.log(1),
+            vec![Op::Begin, Op::Position(7, Origin::new(10, 0)), Op::Finish]
+        );
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn an_idle_writer_exits_and_comes_back_on_demand() {
+        let (probe, _entered) = Probe::new();
+        let writers = writers(&probe, Duration::from_millis(20));
+        writers.push(1, key(7), moved(7, 10));
+        assert!(writers.flush(SECOND));
+        assert_eq!(writers.writers(), 1);
+
+        let deadline = Instant::now() + SECOND;
+        while writers.writers() > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(writers.writers(), 0);
+
+        writers.push(1, key(7), moved(7, 20));
+        assert!(writers.flush(SECOND));
+        assert_eq!(probe.opened.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            probe.log(1),
+            vec![
+                Op::Begin,
+                Op::Position(7, Origin::new(10, 0)),
+                Op::Finish,
+                Op::Begin,
+                Op::Position(7, Origin::new(20, 0)),
+                Op::Finish,
+            ]
+        );
+    }
+
+    /// A writer that never waits gives up after every batch, so these pushes
+    /// keep landing right as their writer is leaving, and the pauses let it
+    /// actually leave. A push that lost the race against the exit would be
+    /// missing from the log.
+    #[test]
+    fn a_push_racing_an_idle_exit_is_never_lost() {
+        const PUSHES: u32 = 20_000;
+        let (probe, _entered) = Probe::new();
+        let writers = writers(&probe, Duration::ZERO);
+        let keys: Vec<_> = (0..PUSHES).map(|_| WriteKey::next()).collect();
+        for (window, key) in (0..PUSHES).zip(&keys) {
+            writers.push(1, *key, moved(window, window.cast_signed()));
+            if window % 1000 == 999 {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(writers.flush(Duration::from_secs(5)));
+
+        let mut landed = probe
+            .log(1)
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Position(window, origin) => Some((window, origin.x)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        landed.sort_unstable();
+        assert_eq!(
+            landed,
+            (0..PUSHES)
+                .map(|window| (window, window.cast_signed()))
+                .collect::<Vec<_>>()
+        );
+        assert!(probe.opened.load(Ordering::SeqCst) > 1);
     }
 }

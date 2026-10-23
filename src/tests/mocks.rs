@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, Weak};
 
 use bevy::prelude::*;
 use objc2_core_foundation::{CFNumber, CFRetained, CGPoint};
@@ -9,6 +9,7 @@ use stdext::prelude::RwLockExt;
 use crate::errors::Error;
 use crate::events::{DestroySource, Event, MouseButton};
 use crate::manager::app::MockApplicationApi;
+use crate::manager::window_writer::{FrameWrites, WindowWriters, WriteSink};
 use crate::manager::{
     Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
     Window, origin_from, origin_to,
@@ -26,6 +27,12 @@ pub(crate) struct MockAppData {
     pub(crate) focused_window_id: Option<WinID>,
     pub(crate) is_frontmost: bool,
     pub(crate) connection: Option<crate::platform::ConnID>,
+    /// The app's window writes go through the engine's per-app writers,
+    /// like `WindowOS`'s, instead of landing before each call returns.
+    /// Takes effect for windows created after it is set.
+    pub(crate) queued_writes: bool,
+    /// How long each queued position or size write takes, like a busy app.
+    pub(crate) write_delay: std::time::Duration,
 }
 
 /// Data for a mocked window.
@@ -179,34 +186,189 @@ fn top_window_at(inner: &MockStateInner, point: Origin) -> Option<WinID> {
 #[derive(Clone)]
 pub struct MockState {
     inner: Arc<RwLock<MockStateInner>>,
+    /// Carries the window writes of apps with `queued_writes`.
+    writers: Arc<WindowWriters<MockApp>>,
+    holds: Arc<WriteHolds>,
+}
+
+/// Apps whose writer hangs inside its next write until released, like an
+/// app busy on its main thread.
+#[derive(Default)]
+struct WriteHolds {
+    held: Mutex<HashSet<Pid>>,
+    released: Condvar,
+}
+
+impl WriteHolds {
+    /// Longer than any test holds an app, yet short enough that a write made
+    /// on the engine's own thread fails a test rather than hanging it.
+    const LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    fn wait_while_held(&self, pid: Pid) {
+        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = self
+            .released
+            .wait_timeout_while(held, Self::LIMIT, |held| held.contains(&pid))
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// A mock app as the engine's window writer for it sees it.
+pub(crate) struct MockApp {
+    pid: Pid,
+    inner: Weak<RwLock<MockStateInner>>,
+    holds: Arc<WriteHolds>,
+}
+
+impl MockApp {
+    /// Waits while the app is held, then for the app's write delay.
+    fn busy(&self, inner: &RwLock<MockStateInner>) {
+        self.holds.wait_while_held(self.pid);
+        let delay = inner
+            .force_read()
+            .apps
+            .get(&self.pid)
+            .map_or(std::time::Duration::ZERO, |app| app.write_delay);
+        std::thread::sleep(delay);
+    }
+}
+
+impl WriteSink for MockApp {
+    type Window = (WinID, u32);
+
+    fn begin(&mut self) {}
+
+    fn set_position(&mut self, &(id, ax_generation): &(WinID, u32), origin: Origin) {
+        if let Some(inner) = self.inner.upgrade() {
+            self.busy(&inner);
+            mock_reposition(&inner, id, ax_generation, origin);
+        }
+    }
+
+    fn set_size(&mut self, &(id, ax_generation): &(WinID, u32), size: Size) {
+        if let Some(inner) = self.inner.upgrade() {
+            self.busy(&inner);
+            mock_resize(&inner, id, ax_generation, size);
+        }
+    }
+
+    fn read_frame(&mut self, &(id, ax_generation): &(WinID, u32)) -> Option<IRect> {
+        let inner = self.inner.upgrade()?;
+        mock_read_frame(&inner, id, ax_generation).ok()
+    }
+
+    fn finish(&mut self) {}
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Applies a size write to window `id`, as its app would.
+fn mock_resize(inner: &RwLock<MockStateInner>, id: WinID, ax_generation: u32, size: Size) {
+    let mut inner = inner.force_write();
+    if let Some(w) = inner
+        .windows
+        .get_mut(&id)
+        .filter(|w| w.ax_generation == ax_generation)
+    {
+        w.resize_writes += 1;
+        if w.dropped_resizes > 0 {
+            w.dropped_resizes -= 1;
+            return;
+        }
+        let mut size = w.maximum_size.map_or(size, |maximum| size.min(maximum));
+        size = w.minimum_size.map_or(size, |minimum| size.max(minimum));
+        if let Some(bottom) = w.resize_bottom_limit
+            && size.y > 0
+        {
+            size.y = size.y.min((bottom - w.frame.min.y).max(0));
+        }
+        w.frame.max = w.frame.min + size;
+    }
+}
+
+/// Applies a position write to window `id`, as its app would.
+fn mock_reposition(inner: &RwLock<MockStateInner>, id: WinID, ax_generation: u32, origin: Origin) {
+    let mut inner = inner.force_write();
+    if let Some(w) = inner
+        .windows
+        .get_mut(&id)
+        .filter(|w| w.ax_generation == ax_generation)
+    {
+        w.position_writes += 1;
+        if w.dropped_positions > 0 {
+            w.dropped_positions -= 1;
+            return;
+        }
+        let size = w.frame.size();
+        w.frame.min = origin;
+        w.frame.max = origin + size;
+    }
+}
+
+/// Reads window `id`'s frame, as Accessibility would.
+fn mock_read_frame(
+    inner: &RwLock<MockStateInner>,
+    id: WinID,
+    ax_generation: u32,
+) -> crate::errors::Result<IRect> {
+    let mut inner = inner.force_write();
+    let window = inner
+        .windows
+        .get_mut(&id)
+        .filter(|w| w.ax_generation == ax_generation)
+        .ok_or(Error::InvalidWindow)?;
+    if window.frame_read_failures > 0 {
+        window.frame_read_failures -= 1;
+        return Err(Error::InvalidWindow);
+    }
+    std::thread::sleep(window.frame_read_delay);
+    Ok(window.frame)
 }
 
 impl MockState {
     pub fn new() -> Self {
+        let inner = Arc::new(RwLock::new(MockStateInner {
+            apps: HashMap::new(),
+            windows: HashMap::new(),
+            displays: HashMap::new(),
+            fullscreen_spaces: HashSet::new(),
+            membership_failures: HashMap::new(),
+            membership_reads: HashMap::new(),
+            window_list_reads: HashMap::new(),
+            active_display_id: 0,
+            cursor_position: Origin::ZERO,
+            left_button_down: false,
+            raised: Vec::new(),
+            event_queue: VecDeque::new(),
+            stale_window_ids: HashMap::new(),
+            unordered_windows: HashSet::new(),
+            background_tabs: HashSet::new(),
+            raise_count: 0,
+            raise_takes_focus: false,
+            lags: false,
+            pending_activations: Vec::new(),
+            activated: Vec::new(),
+            pending_raises: Vec::new(),
+        }));
+        let holds = Arc::new(WriteHolds::default());
+        let writers = {
+            let inner = Arc::downgrade(&inner);
+            let holds = holds.clone();
+            Arc::new(WindowWriters::new(
+                std::time::Duration::from_millis(200),
+                move |pid| MockApp {
+                    pid: pid.unwrap_or_default(),
+                    inner: inner.clone(),
+                    holds: holds.clone(),
+                },
+            ))
+        };
         Self {
-            inner: Arc::new(RwLock::new(MockStateInner {
-                apps: HashMap::new(),
-                windows: HashMap::new(),
-                displays: HashMap::new(),
-                fullscreen_spaces: HashSet::new(),
-                membership_failures: HashMap::new(),
-                membership_reads: HashMap::new(),
-                window_list_reads: HashMap::new(),
-                active_display_id: 0,
-                cursor_position: Origin::ZERO,
-                left_button_down: false,
-                raised: Vec::new(),
-                event_queue: VecDeque::new(),
-                stale_window_ids: HashMap::new(),
-                unordered_windows: HashSet::new(),
-                background_tabs: HashSet::new(),
-                raise_count: 0,
-                raise_takes_focus: false,
-                lags: false,
-                pending_activations: Vec::new(),
-                activated: Vec::new(),
-                pending_raises: Vec::new(),
-            })),
+            inner,
+            writers,
+            holds,
         }
     }
 
@@ -255,6 +417,8 @@ impl MockState {
                 focused_window_id: None,
                 is_frontmost: true,
                 connection: Some(0),
+                queued_writes: false,
+                write_delay: std::time::Duration::ZERO,
             },
         );
     }
@@ -805,71 +969,57 @@ impl MockState {
 
     // --- Mock Factory Methods ---
 
-    /// Applies a size write to window `id`, as its app would.
     fn mock_resize(&self, id: WinID, ax_generation: u32, size: Size) {
-        let mut inner = self.inner.force_write();
-        if let Some(w) = inner
-            .windows
-            .get_mut(&id)
-            .filter(|w| w.ax_generation == ax_generation)
-        {
-            w.resize_writes += 1;
-            if w.dropped_resizes > 0 {
-                w.dropped_resizes -= 1;
-                return;
-            }
-            let mut size = w.maximum_size.map_or(size, |maximum| size.min(maximum));
-            size = w.minimum_size.map_or(size, |minimum| size.max(minimum));
-            if let Some(bottom) = w.resize_bottom_limit
-                && size.y > 0
-            {
-                size.y = size.y.min((bottom - w.frame.min.y).max(0));
-            }
-            w.frame.max = w.frame.min + size;
-        }
+        mock_resize(&self.inner, id, ax_generation, size);
     }
 
-    /// Applies a position write to window `id`, as its app would.
     fn mock_reposition(&self, id: WinID, ax_generation: u32, origin: Origin) {
-        let mut inner = self.inner.force_write();
-        if let Some(w) = inner
-            .windows
-            .get_mut(&id)
-            .filter(|w| w.ax_generation == ax_generation)
-        {
-            w.position_writes += 1;
-            if w.dropped_positions > 0 {
-                w.dropped_positions -= 1;
-                return;
-            }
-            let size = w.frame.size();
-            w.frame.min = origin;
-            w.frame.max = origin + size;
-        }
+        mock_reposition(&self.inner, id, ax_generation, origin);
     }
 
-    #[allow(clippy::too_many_lines)]
-    pub fn create_window(&self, id: WinID) -> Window {
-        let mut mw = MockWindowApi::new();
-        let ax_generation = self
-            .inner
-            .force_read()
-            .windows
-            .get(&id)
-            .map_or(0, |w| w.ax_generation);
+    /// Sends the window writes of `pid`'s windows created from now on
+    /// through the engine's per-app writers.
+    pub fn queue_writes(&self, pid: Pid) {
+        self.update_app(pid, |app| app.queued_writes = true);
+    }
 
-        mw.expect_id().return_const(id);
+    /// Makes each queued write to `pid`'s windows take `delay`.
+    pub fn set_write_delay(&self, pid: Pid, delay: std::time::Duration) {
+        self.update_app(pid, |app| app.write_delay = delay);
+    }
 
-        let s = self.clone();
-        mw.expect_pid().returning(move || {
-            s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .map(|w| w.pid)
-                .ok_or(Error::InvalidWindow)
-        });
+    /// Makes `pid`'s writer hang inside its next write until released.
+    pub fn hold_writes(&self, pid: Pid) {
+        self.holds
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(pid);
+    }
 
+    pub fn release_writes(&self, pid: Pid) {
+        self.holds
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&pid);
+        self.holds.released.notify_all();
+    }
+
+    /// Waits up to `timeout` for every queued write to land.
+    pub fn flush_writes(&self, timeout: std::time::Duration) -> bool {
+        self.writers.flush(timeout)
+    }
+
+    /// The frame window `id` has as far as its app is concerned, which can
+    /// lag the frame the engine asked for.
+    pub fn ax_frame(&self, id: WinID) -> IRect {
+        self.inner.force_read().windows[&id].frame
+    }
+
+    /// Frame expectations for a window whose app applies each write before
+    /// the call returns.
+    fn expect_inline_writes(&self, mw: &mut MockWindowApi, id: WinID, ax_generation: u32) {
         let s = self.clone();
         mw.expect_frame().returning(move || {
             s.inner
@@ -898,6 +1048,78 @@ impl MockState {
         });
 
         let s = self.clone();
+        mw.expect_update_frame()
+            .returning(move || mock_read_frame(&s.inner, id, ax_generation));
+    }
+
+    /// Frame expectations for a window whose app gets its writes through
+    /// the engine's per-app writers, the way `WindowOS` writes them.
+    fn expect_queued_writes(
+        &self,
+        mw: &mut MockWindowApi,
+        id: WinID,
+        pid: Pid,
+        ax_generation: u32,
+    ) {
+        let writes = Arc::new(Mutex::new(
+            FrameWrites::new(self.writers.clone()).starting_at(self.ax_frame(id)),
+        ));
+        let window = move || (id, ax_generation);
+
+        let w = writes.clone();
+        mw.expect_frame().returning(move || lock(&w).frame());
+        let w = writes.clone();
+        mw.expect_resize()
+            .returning(move |size| lock(&w).resize(Some(pid), window, size));
+        let w = writes.clone();
+        mw.expect_reposition()
+            .returning(move |origin| lock(&w).reposition(Some(pid), window, origin));
+        let w = writes.clone();
+        mw.expect_place()
+            .returning(move |frame: IRect| lock(&w).place(Some(pid), window, frame));
+        let s = self.clone();
+        mw.expect_update_frame().returning(move || {
+            lock(&writes).update_frame(Some(pid), || mock_read_frame(&s.inner, id, ax_generation))
+        });
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn create_window(&self, id: WinID) -> Window {
+        let mut mw = MockWindowApi::new();
+        let ax_generation = self
+            .inner
+            .force_read()
+            .windows
+            .get(&id)
+            .map_or(0, |w| w.ax_generation);
+
+        mw.expect_id().return_const(id);
+
+        let s = self.clone();
+        mw.expect_pid().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.pid)
+                .ok_or(Error::InvalidWindow)
+        });
+
+        let queued_pid = {
+            let inner = self.inner.force_read();
+            inner
+                .windows
+                .get(&id)
+                .map(|w| w.pid)
+                .filter(|pid| inner.apps.get(pid).is_some_and(|app| app.queued_writes))
+        };
+        if let Some(pid) = queued_pid {
+            self.expect_queued_writes(&mut mw, id, pid, ax_generation);
+        } else {
+            self.expect_inline_writes(&mut mw, id, ax_generation);
+        }
+
+        let s = self.clone();
         mw.expect_focus_with_raise().returning(move |_psn| {
             s.raise_window(id);
             s.focus_window(id);
@@ -923,22 +1145,6 @@ impl MockState {
                 .windows
                 .get(&id)
                 .is_some_and(|w| w.minimized)
-        });
-
-        let s = self.clone();
-        mw.expect_update_frame().returning(move || {
-            let mut inner = s.inner.force_write();
-            let window = inner
-                .windows
-                .get_mut(&id)
-                .filter(|w| w.ax_generation == ax_generation)
-                .ok_or(Error::InvalidWindow)?;
-            if window.frame_read_failures > 0 {
-                window.frame_read_failures -= 1;
-                return Err(Error::InvalidWindow);
-            }
-            std::thread::sleep(window.frame_read_delay);
-            Ok(window.frame)
         });
 
         let s = self.clone();

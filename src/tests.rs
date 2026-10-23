@@ -12,6 +12,7 @@ mod state;
 mod tabbed_display;
 mod tabs;
 mod tiling;
+mod window_writes;
 
 pub(crate) use harness::*;
 pub(crate) use mocks::*;

@@ -1096,9 +1096,10 @@ impl WindowApi for WindowOS {
 
     /// Reads the window's frame back from Accessibility, padding included.
     fn update_frame(&mut self) -> Result<IRect> {
+        let pid = self.pid().ok();
         let padding = IVec2::new(self.horizontal_padding, self.vertical_padding);
         let element = &self.ax_element;
-        self.writes.update_frame(|| {
+        self.writes.update_frame(pid, || {
             let frame = ax_frame(element)?;
             Ok(IRect {
                 min: frame.min - padding,
