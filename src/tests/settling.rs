@@ -194,6 +194,134 @@ fn application_termination_during_swipe_preserves_landing() {
     }
 }
 
+fn terminate_predecessor_after_landing_focus() -> TestHarness {
+    let mut harness = TestHarness::new()
+        .with_config(miri_config(Some(14.0)))
+        .with_app(2, "predecessor", "Predecessor", |_| {});
+    let state = harness.mock_state.clone();
+    let windows = (0..4)
+        .map(|id| {
+            state.spawn_window(
+                if id == 0 { 2 } else { TEST_PROCESS_ID },
+                TEST_WORKSPACE_ID,
+                id,
+                IRect::new(id * 700, 24, id * 700 + 700, 764),
+            )
+        })
+        .collect();
+    harness.existed_at_launch(0..4);
+    harness
+        .world()
+        .trigger(crate::ecs::SpawnWindowTrigger(windows));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        focus(Direction::First),
+    ]);
+    state.set_cursor_position(IVec2::new(1000, 5));
+
+    send(&mut harness, swipe(0.05));
+    for _ in 0..50 {
+        harness.advance(ONE_FRAME);
+        if state.focused_window_id(TEST_PROCESS_ID) == Some(1) {
+            break;
+        }
+    }
+    harness.advance(ONE_FRAME * 2);
+    assert_focused!(harness.world(), 1);
+    assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(1));
+    let world = harness.world();
+    assert_eq!(
+        world
+            .query_filtered::<Entity, (
+                With<crate::ecs::FocusedMarker>,
+                Or<(
+                    With<crate::ecs::EnsureVisibleMarker>,
+                    With<crate::ecs::ReshuffleAroundMarker>,
+                )>,
+            )>()
+            .iter(world)
+            .count(),
+        0,
+        "landing focus has no pending layout request before removal"
+    );
+    assert!(
+        is_scrolling(harness.world()),
+        "landing focus selected during scrolling"
+    );
+    send(
+        &mut harness,
+        Event::ApplicationTerminated {
+            psn: crate::platform::ProcessSerialNumber { high: 0, low: 2 },
+        },
+    );
+    harness.advance(ONE_FRAME);
+    assert!(
+        is_scrolling(harness.world()),
+        "removal occurred during settling"
+    );
+    harness
+}
+
+fn assert_native_focus_inside_viewport(harness: &mut TestHarness, id: WinID) {
+    assert_focused!(harness.world(), id);
+    assert_eq!(
+        harness.mock_state.focused_window_id(TEST_PROCESS_ID),
+        Some(id)
+    );
+    let frame = harness.mock_state.create_window(id).frame();
+    let viewport = IRect::new(
+        0,
+        TEST_MENUBAR_HEIGHT,
+        TEST_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT,
+    );
+    assert_eq!(frame.size(), IVec2::new(700, 748));
+    assert!(
+        frame.min.cmpge(viewport.min).all() && frame.max.cmple(viewport.max).all(),
+        "focused survivor must be fully inside viewport, got {frame:?}"
+    );
+}
+
+#[test]
+fn application_termination_after_landing_focus_keeps_survivor_visible() {
+    let mut harness = terminate_predecessor_after_landing_focus();
+    harness.advance(SETTLE);
+
+    assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_native_focus_inside_viewport(&mut harness, 1);
+}
+
+#[test]
+fn removal_during_settle_uses_current_focus_after_keyboard_switch() {
+    let mut harness = terminate_predecessor_after_landing_focus();
+    send(&mut harness, focus(Direction::Last));
+    harness.advance(SETTLE);
+
+    assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_native_focus_inside_viewport(&mut harness, 3);
+    assert_eq!(window_x(harness.world(), 3), TEST_DISPLAY_WIDTH - 700);
+}
+
+#[test]
+fn removal_during_settle_preserves_workspace_restore_placement() {
+    let mut harness = terminate_predecessor_after_landing_focus();
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::VirtualNumber(1)),
+    }]);
+    harness.advance(SETTLE);
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::VirtualNumber(0)),
+    }]);
+    harness.advance(SETTLE);
+
+    assert_focused!(harness.world(), 1);
+    assert_eq!(
+        harness.mock_state.focused_window_id(TEST_PROCESS_ID),
+        Some(1)
+    );
+    assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 1400);
+}
+
 /// The mirror case: a flick back past the start lands on the first column
 /// with the strip start on the left viewport edge.
 #[test]
