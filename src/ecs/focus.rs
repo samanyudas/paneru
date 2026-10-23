@@ -11,11 +11,11 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Changed, Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
-use bevy::time::{Time, Timer, TimerMode};
+use bevy::time::{Timer, TimerMode};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, VerifyFocus};
@@ -134,7 +134,6 @@ pub struct FocusEventsPlugin;
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
-        app.init_resource::<OverlapRecheck>();
         app.add_systems(
             Update,
             (
@@ -668,30 +667,13 @@ fn raise_window_trigger(
     window.raise_without_focus();
 }
 
-const OVERLAP_RECHECK_DELAY: Duration = Duration::from_millis(150);
-const OVERLAP_RECHECKS: u8 = 3;
-
-#[derive(Default, Resource)]
-pub(crate) struct OverlapRecheck(Option<OverlapRecheckDeadline>);
-
-#[derive(Clone, Copy)]
-struct OverlapRecheckDeadline {
-    at: Duration,
-    remaining: u8,
-}
-
 fn overlapping_stacks_need_ordering(
     gained: Query<Entity, Added<FocusedMarker>>,
     mut lost: RemovedComponents<FocusedMarker>,
     strips: Query<(), (Changed<LayoutStrip>, With<ActiveWorkspaceMarker>)>,
-    recheck: Res<OverlapRecheck>,
-    time: Res<Time>,
 ) -> bool {
     let lost_focus = lost.read().count() > 0;
-    let recheck_due = recheck
-        .0
-        .is_some_and(|deadline| time.elapsed() >= deadline.at);
-    !gained.is_empty() || lost_focus || !strips.is_empty() || recheck_due
+    !gained.is_empty() || lost_focus || !strips.is_empty()
 }
 
 /// Keeps every top bar of an overlapping stack visible. Each lower window goes
@@ -704,13 +686,7 @@ fn overlapping_stacks_need_ordering(
 /// front. A stack already in the order it needs is not raised again. Raising
 /// can move an app's focus and emit focus notifications, so raising an
 /// ordered stack again on each of them would never settle.
-///
-/// Raises may not produce the requested onscreen order immediately, and macOS
-/// can keep the frontmost app's window above AX-raised background windows.
-/// A short while after raising, the engine reads the order the window server
-/// shows and raises a stack again that is still out of order, a few times at most.
 #[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::too_many_arguments)]
 fn order_overlapping_stacks(
     gained: Query<Entity, Added<FocusedMarker>>,
     mut lost: RemovedComponents<FocusedMarker>,
@@ -718,8 +694,6 @@ fn order_overlapping_stacks(
     windows: Query<(&Window, &LayoutPosition, &Bounds)>,
     focused: Query<Entity, With<FocusedMarker>>,
     window_manager: Res<WindowManager>,
-    mut recheck: ResMut<OverlapRecheck>,
-    time: Res<Time>,
     mut applied: Local<Vec<Vec<Entity>>>,
 ) {
     let touched = gained.iter().chain(lost.read()).collect::<Vec<_>>();
@@ -780,28 +754,9 @@ fn order_overlapping_stacks(
     }
     // Forget windows that are gone.
     applied.retain(|order| order.iter().all(|entity| windows.contains(*entity)));
-
-    let now = time.elapsed();
-    let attempts = match recheck.0 {
-        Some(OverlapRecheckDeadline { at, remaining }) if now >= at => {
-            recheck.0 = None;
-            let shown = shown_out_of_order(&applied, &windows, &window_manager);
-            if !back_to_front.is_empty() || shown.is_empty() || remaining == 0 {
-                (!back_to_front.is_empty()).then_some(OVERLAP_RECHECKS)
-            } else {
-                back_to_front = shown;
-                Some(remaining - 1)
-            }
-        }
-        _ => (!back_to_front.is_empty()).then_some(OVERLAP_RECHECKS),
-    };
-    let Some(attempts) = attempts else {
+    if back_to_front.is_empty() {
         return;
-    };
-    recheck.0 = Some(OverlapRecheckDeadline {
-        at: now + OVERLAP_RECHECK_DELAY,
-        remaining: attempts,
-    });
+    }
 
     for entity in back_to_front
         .into_iter()
@@ -815,37 +770,6 @@ fn order_overlapping_stacks(
     if let Some((window, _, _)) = focus.and_then(|focus| windows.get(focus).ok()) {
         window.raise_without_focus();
     }
-}
-
-fn shown_out_of_order(
-    applied: &[Vec<Entity>],
-    windows: &Query<(&Window, &LayoutPosition, &Bounds)>,
-    window_manager: &WindowManager,
-) -> Vec<Entity> {
-    let Some(front_to_back) = window_manager.windows_on_screen() else {
-        return vec![];
-    };
-    let id = |entity: &Entity| windows.get(*entity).ok().map(|(window, _, _)| window.id());
-    applied
-        .iter()
-        .filter(|order| {
-            let ids = order.iter().filter_map(id).collect::<Vec<_>>();
-            let shown = front_to_back
-                .iter()
-                .rev()
-                .filter(|window_id| ids.contains(window_id))
-                .copied()
-                .collect::<Vec<_>>();
-            let expected = ids
-                .iter()
-                .filter(|window_id| shown.contains(window_id))
-                .copied()
-                .collect::<Vec<_>>();
-            shown != expected
-        })
-        .flatten()
-        .copied()
-        .collect()
 }
 
 /// Whether any window of a stack, given top to bottom, starts above the

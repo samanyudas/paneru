@@ -462,30 +462,6 @@ fn focus_brings_an_overlapped_window_to_the_front_until_it_leaves() {
     assert_eq!(harness.mock_state.window_order(&stack), vec![0, 1, 2]);
 }
 
-/// The mock drops one raise. The engine checks the order shown a little
-/// later and retries the raises to repair the stack order.
-#[test]
-fn an_overlapping_stack_raised_out_of_order_is_raised_again() {
-    let mut harness = TestHarness::new().with_windows(4);
-    set_minimum_height(&harness, 1, 500);
-    stack_all(&mut harness, 3);
-    let stack = [0, 1, 2];
-    assert_eq!(harness.mock_state.window_order(&stack), vec![0, 1, 2]);
-
-    harness.mock_state.drop_raises(2, 1);
-    harness.run(vec![command(Operation::Focus(Direction::North))]);
-    harness.advance(SETTLE);
-    assert_eq!(harness.mock_state.window_order(&stack), vec![0, 2, 1]);
-
-    let settled = harness.mock_state.raise_count();
-    harness.advance(SETTLE);
-    assert_eq!(
-        harness.mock_state.raise_count(),
-        settled,
-        "a stack shown in order is not raised again"
-    );
-}
-
 /// `AXRaise` on a window of the frontmost app makes it the app's focused
 /// window, so ordering a stack emits focus notifications. They end on the
 /// window that already holds focus, so they must not order the stack again,
