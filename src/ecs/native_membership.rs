@@ -6,11 +6,12 @@
 //! is not on a display other than the one that shows S. One rule decides
 //! which display a window is on:
 //!
-//! 1. A window at a frame the engine wrote is on the display of the strip
-//!    that holds it, wherever that frame is. That is the frame the engine
-//!    placed it at, or, while an animation moves the window there, the last
-//!    frame the animation wrote. Any other frame, even while the engine is
-//!    moving the window, is a native move and falls to rule 3. The engine
+//! 1. A window at an origin the engine wrote is on the display of the strip
+//!    that holds it, wherever that frame is and whatever size the app kept.
+//!    That is the origin the engine placed it at, or, while an animation
+//!    moves the window there, the last origin the animation wrote. Any other
+//!    origin, even while the engine is moving the window, is a native move
+//!    and falls to rule 3. The engine
 //!    parks off-screen columns as slivers that hang past the display's edge,
 //!    onto a neighboring display or onto no display at all, and an animation
 //!    passes through such frames.
@@ -519,20 +520,19 @@ fn window_display(world: &mut World, member: Entity) -> Option<Entity> {
     // `PresentedOrigin` is where the engine is taking the window. While a
     // `RepositionMarker` animates it, `Position` is the last frame the engine
     // wrote. Otherwise `Position` can hold a native move the engine adopted.
+    // Only the origin counts: an app that refuses a size, such as a window
+    // taller than its minimum allows, keeps the origin the engine wrote.
     let animated = world.get::<RepositionMarker>(member).is_some();
-    let written = world.get::<Bounds>(member).is_some_and(|bounds| {
-        near(frame.size(), bounds.0)
-            && [
-                world.get::<PresentedOrigin>(member).map(|origin| origin.0),
-                world
-                    .get::<Position>(member)
-                    .filter(|_| animated)
-                    .map(|position| position.0),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|origin| near(frame.min, origin))
-    });
+    let written = [
+        world.get::<PresentedOrigin>(member).map(|origin| origin.0),
+        world
+            .get::<Position>(member)
+            .filter(|_| animated)
+            .map(|position| position.0),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|origin| near(frame.min, origin));
     let strip = world
         .query::<(&LayoutStrip, &ChildOf, Has<PreviousStripPosition>)>()
         .iter(world)

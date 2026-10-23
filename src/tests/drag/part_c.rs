@@ -1769,6 +1769,42 @@ fn a_stale_report_for_the_display_a_parked_column_overhangs_changes_nothing() {
 }
 
 #[test]
+fn a_window_that_refuses_its_size_stays_on_its_display() {
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    let mut harness = TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
+        .with_windows(2)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+            window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
+        });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(SETTLE);
+    let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
+    let placed = frame(harness.world(), 1);
+    assert!(!ext.contains(placed.center()), "{placed:?}");
+
+    // The app keeps a larger size at the origin the engine wrote, so the
+    // window's center lands on the external display and macOS lists it there.
+    let width = 2 * (ext.min.x - placed.min.x) + 200;
+    harness.mock_state.update_window(1, |window| {
+        window.frame = IRect::new(
+            placed.min.x,
+            placed.min.y,
+            placed.min.x + width,
+            placed.max.y,
+        );
+        window.workspace_id = EXT_WORKSPACE_ID;
+    });
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(SETTLE);
+    assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID), source);
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+}
+
+#[test]
 fn a_returned_window_parked_past_the_outer_edge_ignores_a_stale_report() {
     let config = crate::config::Config::try_from("[options]\nstack_limit = 1\n").unwrap();
     let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
