@@ -58,6 +58,7 @@ pub(crate) mod app;
 mod display;
 mod process;
 mod skylight;
+pub(crate) mod window_writer;
 mod windows;
 
 pub type Origin = IVec2;

@@ -1294,10 +1294,7 @@ pub(super) fn commit_window_frame(
             };
             objc2::rc::autoreleasepool(|_| match (position, size) {
                 (Some(position), Some(size)) => {
-                    place(
-                        &mut window,
-                        IRect::from_corners(position.0, position.0 + size),
-                    );
+                    window.place(IRect::from_corners(position.0, position.0 + size));
                 }
                 (Some(position), None) => window.reposition(position.0),
                 (None, Some(size)) => window.resize(size),
@@ -1380,19 +1377,11 @@ pub(crate) fn cleanup_on_exit(
                 target.size()
             );
             let target = padded(target, padding);
-            place(&mut window, target);
+            window.place(target);
             targets.push((window.id(), target));
         }
         settle_exit_frames(&mut all_windows, targets);
     }
-}
-
-/// Sets a window's frame the way an app accepts it: an app may limit a size at
-/// the old position, so the size is set again once the window has moved.
-fn place(window: &mut Window, frame: IRect) {
-    window.resize(frame.size());
-    window.reposition(frame.min);
-    window.resize(frame.size());
 }
 
 /// Some apps, Chromium browsers among them, apply a frame only after the
@@ -1428,7 +1417,7 @@ fn settle_exit_frames(
                 // The read itself can outlast the deadline.
                 Ok(_) if Instant::now() > deadline => true,
                 Ok(_) => {
-                    place(&mut window, *target);
+                    window.place(*target);
                     true
                 }
                 Err(err) => {
@@ -1877,25 +1866,64 @@ mod frame_commit_tests {
 
     use crate::ecs::layout::LayoutStrip;
     use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, Position, WidthRatio};
-    use crate::manager::{Display, MockWindowApi, Size, Window};
+    use crate::manager::window_writer::{PendingWrite, WriteSink, apply};
+    use crate::manager::{Display, MockWindowApi, Origin, Size, Window};
 
+    /// A window whose app limits each size it is given.
+    struct Constrained<F> {
+        frame: Arc<Mutex<IRect>>,
+        constrain: F,
+    }
+
+    impl<F: Fn(IRect, Size) -> Size + Send + 'static> WriteSink for Constrained<F> {
+        type Window = ();
+
+        fn begin(&mut self) {}
+
+        fn set_position(&mut self, (): &(), origin: Origin) {
+            let mut frame = self.frame.lock().unwrap();
+            *frame = IRect::from_corners(origin, origin + frame.size());
+        }
+
+        fn set_size(&mut self, (): &(), size: Size) {
+            let mut frame = self.frame.lock().unwrap();
+            frame.max = frame.min + (self.constrain)(*frame, size);
+        }
+
+        fn read_frame(&mut self, (): &()) -> Option<IRect> {
+            Some(*self.frame.lock().unwrap())
+        }
+
+        fn finish(&mut self) {}
+    }
+
+    /// Commits `target` to a window at `initial` whose app limits sizes with
+    /// `constrain`, through the same write sequence `WindowOS` uses.
     fn commit_with_resize_constraint(
         initial: IRect,
         target: IRect,
-        constrain: impl Fn(IRect, Size) -> Size + Send + 'static,
+        constrain: impl Fn(IRect, Size) -> Size + Send + Sync + Clone + 'static,
     ) -> IRect {
         bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
         let native_frame = Arc::new(Mutex::new(initial));
         let mut window = MockWindowApi::new();
-        let resized = Arc::clone(&native_frame);
-        window.expect_resize().returning(move |size| {
-            let mut frame = resized.lock().unwrap();
-            frame.max = frame.min + constrain(*frame, size);
-        });
-        let moved = Arc::clone(&native_frame);
-        window.expect_reposition().returning(move |origin| {
-            let mut frame = moved.lock().unwrap();
-            *frame = IRect::from_corners(origin, origin + frame.size());
+        let placed = Arc::clone(&native_frame);
+        window.expect_place().times(1).returning(move |to| {
+            let mut app = Constrained {
+                frame: Arc::clone(&placed),
+                constrain: constrain.clone(),
+            };
+            let from = *placed.lock().unwrap();
+            apply(
+                &mut app,
+                &PendingWrite {
+                    window: (),
+                    from,
+                    to,
+                    position: true,
+                    size: true,
+                },
+            );
         });
 
         let mut world = World::new();

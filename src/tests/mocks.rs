@@ -805,6 +805,49 @@ impl MockState {
 
     // --- Mock Factory Methods ---
 
+    /// Applies a size write to window `id`, as its app would.
+    fn mock_resize(&self, id: WinID, ax_generation: u32, size: Size) {
+        let mut inner = self.inner.force_write();
+        if let Some(w) = inner
+            .windows
+            .get_mut(&id)
+            .filter(|w| w.ax_generation == ax_generation)
+        {
+            w.resize_writes += 1;
+            if w.dropped_resizes > 0 {
+                w.dropped_resizes -= 1;
+                return;
+            }
+            let mut size = w.maximum_size.map_or(size, |maximum| size.min(maximum));
+            size = w.minimum_size.map_or(size, |minimum| size.max(minimum));
+            if let Some(bottom) = w.resize_bottom_limit
+                && size.y > 0
+            {
+                size.y = size.y.min((bottom - w.frame.min.y).max(0));
+            }
+            w.frame.max = w.frame.min + size;
+        }
+    }
+
+    /// Applies a position write to window `id`, as its app would.
+    fn mock_reposition(&self, id: WinID, ax_generation: u32, origin: Origin) {
+        let mut inner = self.inner.force_write();
+        if let Some(w) = inner
+            .windows
+            .get_mut(&id)
+            .filter(|w| w.ax_generation == ax_generation)
+        {
+            w.position_writes += 1;
+            if w.dropped_positions > 0 {
+                w.dropped_positions -= 1;
+                return;
+            }
+            let size = w.frame.size();
+            w.frame.min = origin;
+            w.frame.max = origin + size;
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn create_window(&self, id: WinID) -> Window {
         let mut mw = MockWindowApi::new();
@@ -838,46 +881,20 @@ impl MockState {
         });
 
         let s = self.clone();
-        mw.expect_resize().returning(move |size| {
-            let mut inner = s.inner.force_write();
-            if let Some(w) = inner
-                .windows
-                .get_mut(&id)
-                .filter(|w| w.ax_generation == ax_generation)
-            {
-                w.resize_writes += 1;
-                if w.dropped_resizes > 0 {
-                    w.dropped_resizes -= 1;
-                    return;
-                }
-                let mut size = w.maximum_size.map_or(size, |maximum| size.min(maximum));
-                size = w.minimum_size.map_or(size, |minimum| size.max(minimum));
-                if let Some(bottom) = w.resize_bottom_limit
-                    && size.y > 0
-                {
-                    size.y = size.y.min((bottom - w.frame.min.y).max(0));
-                }
-                w.frame.max = w.frame.min + size;
-            }
-        });
+        mw.expect_resize()
+            .returning(move |size| s.mock_resize(id, ax_generation, size));
 
-        let s_move = self.clone();
-        mw.expect_reposition().returning(move |origin| {
-            let mut inner = s_move.inner.force_write();
-            if let Some(w) = inner
-                .windows
-                .get_mut(&id)
-                .filter(|w| w.ax_generation == ax_generation)
-            {
-                w.position_writes += 1;
-                if w.dropped_positions > 0 {
-                    w.dropped_positions -= 1;
-                    return;
-                }
-                let size = w.frame.size();
-                w.frame.min = origin;
-                w.frame.max = origin + size;
-            }
+        let s = self.clone();
+        mw.expect_reposition()
+            .returning(move |origin| s.mock_reposition(id, ax_generation, origin));
+
+        // The order `WindowOS` writes a frame in: an app may limit a size at
+        // the old position, so the size is set again once the window moved.
+        let s = self.clone();
+        mw.expect_place().returning(move |frame: IRect| {
+            s.mock_resize(id, ax_generation, frame.size());
+            s.mock_reposition(id, ax_generation, frame.min);
+            s.mock_resize(id, ax_generation, frame.size());
         });
 
         let s = self.clone();
