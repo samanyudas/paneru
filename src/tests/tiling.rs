@@ -14,6 +14,79 @@ use bevy::prelude::*;
 use super::*;
 
 #[test]
+fn application_termination_keeps_focused_survivor_inside_viewport() {
+    let options = MainOptions {
+        focus_follows_mouse: Some(false),
+        padding_left: Some(4),
+        padding_right: Some(4),
+        padding_top: Some(4),
+        padding_bottom: Some(4),
+        ..MainOptions::default()
+    };
+    let mut params = WindowParams::new(".*", None);
+    params.horizontal_padding = Some(4);
+    params.vertical_padding = Some(4);
+    let config: Config = (options, vec![params]).into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_app(2, "close.b", "Close-B", |_| {})
+        .with_app(3, "close.c", "Close-C", |_| {})
+        .with_app(4, "close.d", "Close-D", |_| {});
+    let state = harness.mock_state.clone();
+    let windows = (0..4)
+        .map(|id| {
+            state.spawn_window(
+                id + 1,
+                TEST_WORKSPACE_ID,
+                id,
+                IRect::new(id * 400, 24, id * 400 + 400, 764),
+            )
+        })
+        .collect();
+    harness.existed_at_launch(0..4);
+    harness.world().trigger(SpawnWindowTrigger(windows));
+    state.focus_window(3);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 3 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+
+    let viewport = IRect::new(4, TEST_MENUBAR_HEIGHT + 4, TEST_DISPLAY_WIDTH - 4, 764);
+    let initial = state.create_window(3).frame();
+    assert!(viewport.contains(initial.min) && initial.max.cmple(viewport.max).all());
+    crate::assert_focused!(harness.world(), 3);
+    assert_eq!(state.focused_window_id(4), Some(3));
+
+    for pid in 1..=3 {
+        harness.run(vec![Event::ApplicationTerminated {
+            psn: crate::platform::ProcessSerialNumber { high: 0, low: pid },
+        }]);
+        let world = harness.world();
+        assert!(
+            world
+                .query::<&crate::manager::Window>()
+                .iter(world)
+                .all(|w| { w.id() != i32::try_from(pid).expect("small process ID") - 1 })
+        );
+        crate::assert_focused!(world, 3);
+        assert_eq!(state.focused_window_id(4), Some(3));
+    }
+
+    let final_frame = state.create_window(3).frame();
+    assert_eq!(
+        final_frame.size(),
+        initial.size(),
+        "D must retain its native size"
+    );
+    assert!(
+        final_frame.min.cmpge(viewport.min).all() && final_frame.max.cmple(viewport.max).all(),
+        "focused survivor native frame {final_frame:?} must fit usable viewport {viewport:?}; initial native frame {initial:?}"
+    );
+}
+
+#[test]
 fn new_window_starts_at_complement_of_focused_width() {
     let mut params = WindowParams::new(".*", None);
     params.width = Some(InitialWindowWidth::Mode(
