@@ -82,25 +82,30 @@ impl<W> PendingWrite<W> {
 /// Writes one window's frame. A write of both parts follows the order the
 /// engine has always used: the size at the old position, then the position,
 /// then the size again if the app limited it at the old position.
-pub(crate) fn apply<S: WriteSink>(sink: &mut S, write: &PendingWrite<S::Window>) {
+/// Returns the frame read back after a size was written, if any read
+/// succeeded.
+pub(crate) fn apply<S: WriteSink>(sink: &mut S, write: &PendingWrite<S::Window>) -> Option<IRect> {
     let window = &write.window;
     let size = write.to.size();
     match (write.position, write.size) {
         (true, true) => {
             let observed = resize(sink, window, write.from, size, write.from.min);
             sink.set_position(window, write.to.min);
-            if let Some(observed) = observed
-                && observed.size() != size
-            {
-                let moved = IRect::from_corners(write.to.min, write.to.min + observed.size());
-                resize(sink, window, moved, size, write.to.min);
+            match observed {
+                Some(observed) if observed.size() != size => {
+                    let moved = IRect::from_corners(write.to.min, write.to.min + observed.size());
+                    resize(sink, window, moved, size, write.to.min)
+                }
+                observed => observed
+                    .map(|frame| IRect::from_corners(write.to.min, write.to.min + frame.size())),
             }
         }
-        (true, false) => sink.set_position(window, write.to.min),
-        (false, true) => {
-            resize(sink, window, write.from, size, write.to.min);
+        (true, false) => {
+            sink.set_position(window, write.to.min);
+            None
         }
-        (false, false) => {}
+        (false, true) => resize(sink, window, write.from, size, write.to.min),
+        (false, false) => None,
     }
 }
 
@@ -193,6 +198,11 @@ struct Shared<S: WriteSink> {
     writers: Mutex<HashMap<Pid, Arc<Mailbox<S::Window>>>>,
     open_sink: Box<dyn Fn(Option<Pid>) -> S + Send + Sync>,
     idle: Duration,
+    /// Windows whose app last took a smaller size than the engine asked for.
+    /// The engine only writes a size when it changes, so the writer asks for
+    /// it again with each later write, as the app may allow it at the new
+    /// position.
+    limited: Mutex<HashSet<WriteKey>>,
 }
 
 struct Mailbox<W> {
@@ -272,6 +282,21 @@ impl<W> Mailbox<W> {
 }
 
 impl<S: WriteSink> Shared<S> {
+    /// Writes one window's frame through `sink`, asking again for a size
+    /// the app limited before.
+    fn write(&self, sink: &mut S, key: WriteKey, mut write: PendingWrite<S::Window>) {
+        write.size |= lock(&self.limited).contains(&key);
+        let observed = apply(sink, &write);
+        if write.size {
+            let mut limited = lock(&self.limited);
+            if observed.is_some_and(|frame| frame.size() != write.to.size()) {
+                limited.insert(key);
+            } else {
+                limited.remove(&key);
+            }
+        }
+    }
+
     fn mailbox(&self, pid: Pid) -> Option<Arc<Mailbox<S::Window>>> {
         lock(&self.writers).get(&pid).cloned()
     }
@@ -304,8 +329,8 @@ impl<S: WriteSink> Shared<S> {
             };
             objc2::rc::autoreleasepool(|_| {
                 sink.begin();
-                for write in batch.values() {
-                    apply(&mut sink, write);
+                for (key, write) in batch {
+                    self.write(&mut sink, key, write);
                 }
                 sink.finish();
             });
@@ -324,6 +349,7 @@ impl<S: WriteSink> WindowWriters<S> {
                 writers: Mutex::new(HashMap::new()),
                 open_sink: Box::new(open_sink),
                 idle,
+                limited: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -344,7 +370,7 @@ impl<S: WriteSink> WindowWriters<S> {
             if let Err(err) = spawned {
                 drop(writers);
                 warn!("cannot start a window writer for pid {pid}, writing inline: {err}");
-                self.write_inline(Some(pid), &write);
+                self.write_inline(Some(pid), key, write);
                 return;
             }
             writers.insert(pid, mailbox.clone());
@@ -363,11 +389,11 @@ impl<S: WriteSink> WindowWriters<S> {
     }
 
     /// Writes `write` on the calling thread.
-    pub fn write_inline(&self, pid: Option<Pid>, write: &PendingWrite<S::Window>) {
+    pub fn write_inline(&self, pid: Option<Pid>, key: WriteKey, write: PendingWrite<S::Window>) {
         let mut sink = (self.shared.open_sink)(pid);
         objc2::rc::autoreleasepool(|_| {
             sink.begin();
-            apply(&mut sink, write);
+            self.shared.write(&mut sink, key, write);
             sink.finish();
         });
     }
@@ -499,7 +525,7 @@ impl<S: WriteSink> FrameWrites<S> {
         match pid {
             Some(pid) => self.writers.push(pid, self.key, write),
             // No app to queue behind: write it here.
-            None => self.writers.write_inline(None, &write),
+            None => self.writers.write_inline(None, self.key, write),
         }
     }
 
@@ -718,6 +744,50 @@ mod tests {
                 Op::Position(Origin::new(-400, 40)),
             ]
         );
+    }
+
+    /// An app whose limits a later write can lift: the height it allows
+    /// depends on how far the window sits above the display's bottom edge.
+    struct Shelf(Arc<Mutex<(IRect, Vec<Op>)>>);
+
+    impl WriteSink for Shelf {
+        type Window = ();
+        fn begin(&mut self) {}
+        fn set_position(&mut self, (): &(), origin: Origin) {
+            let mut app = self.0.lock().unwrap();
+            app.1.push(Op::Position(origin));
+            app.0 = IRect::from_corners(origin, origin + app.0.size());
+        }
+        fn set_size(&mut self, (): &(), mut size: Size) {
+            let mut app = self.0.lock().unwrap();
+            app.1.push(Op::Size(size));
+            size.y = size.y.min(1440 - app.0.min.y);
+            app.0.max = app.0.min + size;
+        }
+        fn read_frame(&mut self, (): &()) -> Option<IRect> {
+            Some(self.0.lock().unwrap().0)
+        }
+        fn finish(&mut self) {}
+    }
+
+    /// A window animates up from a low slot to full height. The app limits
+    /// the first frame's height because the window is still low. Later
+    /// frames ask for the same size at higher positions, and the window
+    /// must still reach full height.
+    #[test]
+    fn a_size_the_app_limited_is_written_again_with_the_next_move() {
+        let start = IRect::new(640, 735, 1280, 1440);
+        let app = Arc::new(Mutex::new((start, Vec::new())));
+        let sink = app.clone();
+        let writers = Arc::new(WindowWriters::new(Duration::from_secs(1), move |_| {
+            Shelf(sink.clone())
+        }));
+        let mut window = FrameWrites::new(writers.clone()).starting_at(start);
+        for y in [500, 250, 30] {
+            window.place(Some(1), || (), IRect::new(640, y, 1280, y + 1410));
+            assert!(writers.flush(Duration::from_secs(1)));
+        }
+        assert_eq!(app.lock().unwrap().0, IRect::new(640, 30, 1280, 1440));
     }
 
     #[test]
