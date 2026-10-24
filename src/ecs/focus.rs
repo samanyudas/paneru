@@ -715,9 +715,8 @@ struct StackOrderWait(Option<Duration>);
 /// focus returns to its place in the stack.
 ///
 /// `AXRaise` puts a window of an app in the background just below the
-/// frontmost app's windows, wherever the window server shows them. macOS shows
-/// the focused window in front a moment after the engine focuses it, so a
-/// stack waits, each frame and for at most [`STACK_ORDER_WAIT`], until the
+/// frontmost app's focused window. macOS shows the focused window in front a
+/// moment after the engine focuses it, so a stack waits, each frame and for at most [`STACK_ORDER_WAIT`], until the
 /// window server shows the focused window in front of the stack. While an app
 /// with no windows is frontmost, such as Finder, raises go below the previous
 /// app's window instead, so a stack keeps its order until focus moves to a
@@ -855,41 +854,44 @@ const RAISE_SHOWN_TIMEOUT: Duration = Duration::from_millis(50);
 /// frontmost. `AXRaise` returns before an app in the background reorders its
 /// window, so raises sent to several apps at once reach the window server in
 /// any order. Each window is raised only when the window server does not
-/// already show it in front of the others, and the next waits until it does,
-/// or until [`RAISE_SHOWN_TIMEOUT`] passes. A raise that would not move its
-/// window could not be seen to land, and could land after a later one.
+/// already show it in front of the earlier entries, and the next waits until
+/// it does, or until [`RAISE_SHOWN_TIMEOUT`] passes. A raise that would not
+/// move its window could not be seen to land, and could land after a later
+/// one. When the focused window is included, it must be last.
 fn raise_in_order(raises: &[(&Window, bool)], window_manager: &WindowManager) {
-    // `AXRaise` puts a window of an app in the background just below the
-    // frontmost app's windows.
     let in_front = |index: usize| {
         let Some(front_to_back) = window_manager.windows_on_screen() else {
             return true;
         };
         let position = |window: &Window| front_to_back.iter().position(|id| *id == window.id());
-        let (window, frontmost) = raises[index];
+        let (window, _) = raises[index];
         let Some(own) = position(window) else {
             return true;
         };
-        raises
+        raises[..index]
             .iter()
-            .enumerate()
-            .filter(|(other, (_, other_frontmost))| {
-                *other != index && (frontmost || !other_frontmost)
-            })
-            .all(|(_, (other, _))| position(other).is_none_or(|other| own < other))
+            .all(|(other, _)| position(other).is_none_or(|other| own < other))
     };
-    for (index, (window, _)) in raises.iter().enumerate() {
-        if in_front(index) {
-            continue;
-        }
-        window.raise_without_focus();
-        let deadline = Instant::now() + RAISE_SHOWN_TIMEOUT;
-        while !in_front(index) {
-            if Instant::now() >= deadline {
-                debug!("window {} did not show where it was raised to", window.id());
-                break;
+    let focused = raises.len().saturating_sub(1);
+    for (index, (_, frontmost)) in raises.iter().enumerate() {
+        // Raising a window of the frontmost app can take that app's focus.
+        // The focused window goes back in front before the next raise, because
+        // a background app's window lands just below it.
+        let restore_focus = (*frontmost && index < focused && raises[focused].1).then_some(focused);
+        for index in std::iter::once(index).chain(restore_focus) {
+            if in_front(index) {
+                continue;
             }
-            thread::sleep(Duration::from_millis(1));
+            let (window, _) = raises[index];
+            window.raise_without_focus();
+            let deadline = Instant::now() + RAISE_SHOWN_TIMEOUT;
+            while !in_front(index) {
+                if Instant::now() >= deadline {
+                    debug!("window {} did not show where it was raised to", window.id());
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 }

@@ -471,8 +471,8 @@ impl MockState {
     }
 
     /// Moves a window to the front of the window order. A window of an app
-    /// that is not frontmost goes just below the frontmost app's windows,
-    /// wherever they are, as `AXRaise` places it.
+    /// that is not frontmost goes just below the frontmost app's focused
+    /// window, as observed with mixed-app overlapping stacks on macOS.
     pub fn raise_window(&self, id: WinID) {
         let mut inner = self.inner.force_write();
         inner.raised.retain(|raised| *raised != id);
@@ -489,7 +489,13 @@ impl MockState {
             inner
                 .raised
                 .iter()
-                .position(|raised| frontmost(&inner, raised))
+                .position(|raised| {
+                    inner.windows.get(raised).is_some_and(|window| {
+                        inner.apps.get(&window.pid).is_some_and(|app| {
+                            app.is_frontmost && app.focused_window_id == Some(*raised)
+                        })
+                    })
+                })
                 .unwrap_or(inner.raised.len())
         };
         inner.raised.insert(index, id);
@@ -1126,7 +1132,9 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_focus_with_raise().returning(move |_psn| {
-            s.raise_window(id);
+            if !s.inner.force_read().lags {
+                s.raise_window(id);
+            }
             s.focus_window(id);
         });
 

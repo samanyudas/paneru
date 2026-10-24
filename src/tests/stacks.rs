@@ -560,6 +560,95 @@ fn an_overlapping_stack_of_several_apps_waits_for_the_focused_window() {
     assert_eq!(state.raise_count(), raises);
 }
 
+#[test]
+fn an_overlapping_stack_interleaves_windows_of_the_frontmost_app() {
+    for pids in [
+        vec![TEST_PROCESS_ID, 2, TEST_PROCESS_ID],
+        vec![TEST_PROCESS_ID, TEST_PROCESS_ID, 2, TEST_PROCESS_ID],
+    ] {
+        let mut harness = TestHarness::new().with_app(2, "stack.b", "Stack-B", |_| {});
+        let state = harness.mock_state.clone();
+        state.set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, TALL));
+        let count = WinID::try_from(pids.len()).unwrap();
+        let windows = pids
+            .iter()
+            .enumerate()
+            .map(|(id, pid)| {
+                let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+                state.spawn_window(*pid, TEST_WORKSPACE_ID, WinID::try_from(id).unwrap(), frame)
+            })
+            .collect();
+        harness.existed_at_launch(0..count);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(windows));
+        for id in 0..count {
+            set_minimum_height(&harness, id, 500);
+        }
+        stack_all(&mut harness, count);
+        let stack = (0..count).collect::<Vec<_>>();
+        let frames = stack
+            .iter()
+            .map(|id| frame(harness.world(), *id))
+            .collect::<Vec<_>>();
+        assert!(frames.windows(2).all(|pair| {
+            pair[0].min.x == pair[1].min.x
+                && pair[0].min.y < pair[1].min.y
+                && pair[1].min.y < pair[0].max.y
+        }));
+        state.lag_like_macos(TEST_PROCESS_ID);
+        state.set_raise_takes_focus(true);
+
+        for _ in 0..5 {
+            let targets = (0..count - 1)
+                .rev()
+                .map(|id| (id, Direction::North))
+                .chain((1..count).map(|id| (id, Direction::South)));
+            for (target, direction) in targets {
+                harness.run(vec![command(Operation::Focus(direction))]);
+                crate::assert_focused!(harness.world(), target);
+                let pid = pids[usize::try_from(target).unwrap()];
+                assert_eq!(state.focused_window_id(pid), Some(target));
+                for app in [TEST_PROCESS_ID, 2] {
+                    state.update_app(app, |data| assert_eq!(data.is_frontmost, app == pid));
+                }
+                let expected = stack
+                    .iter()
+                    .copied()
+                    .filter(|id| *id != target)
+                    .chain(std::iter::once(target))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    state.window_order(&stack),
+                    expected,
+                    "top-to-bottom app IDs {pids:?}, focus {target}, order is back to front"
+                );
+                assert_eq!(
+                    stack
+                        .iter()
+                        .map(|id| frame(harness.world(), *id))
+                        .collect::<Vec<_>>(),
+                    frames
+                );
+                let raises = state.raise_count();
+                harness.advance(SETTLE);
+                assert_eq!(state.raise_count(), raises, "ordering must settle");
+            }
+            for target in [0, count - 1] {
+                state.focus_window(target);
+                harness.advance(SETTLE);
+            }
+            crate::assert_focused!(harness.world(), count - 1);
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(count - 1));
+            assert_eq!(
+                state.window_order(&stack),
+                stack,
+                "native focus jump, app IDs {pids:?}"
+            );
+        }
+    }
+}
+
 /// A tall harness whose three windows need 1100 points each and show 60
 /// point top bars. They overlap, and every window ends at the display bottom.
 fn overflowing_harness() -> TestHarness {
