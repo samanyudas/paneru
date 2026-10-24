@@ -150,6 +150,17 @@ struct MockStateInner {
     /// Whether raising a window also makes it its app's focused window, as
     /// `AXRaise` does for a window of the frontmost app.
     raise_takes_focus: bool,
+    /// Whether apps answer a moment late, as on macOS: focusing a window
+    /// activates its app only when the engine next reads platform events, and
+    /// an app in the background reorders a window it was asked to raise only
+    /// after `AXRaise` has returned.
+    lags: bool,
+    /// Windows focused and waiting for their app to activate.
+    pending_activations: Vec<WinID>,
+    /// Windows whose app activated, shown in front at the next drain.
+    activated: Vec<WinID>,
+    /// Raises sent to apps in the background and not yet shown, oldest first.
+    pending_raises: Vec<WinID>,
 }
 
 /// The window on top at `point`: raised windows first, then the lowest ID.
@@ -191,6 +202,10 @@ impl MockState {
                 background_tabs: HashSet::new(),
                 raise_count: 0,
                 raise_takes_focus: false,
+                lags: false,
+                pending_activations: Vec::new(),
+                activated: Vec::new(),
+                pending_raises: Vec::new(),
             })),
         }
     }
@@ -291,12 +306,59 @@ impl MockState {
         self.inner.force_write().cursor_position = position;
     }
 
-    /// Moves a window to the front of the window order.
+    /// Moves a window to the front of the window order. A window of an app
+    /// that is not frontmost goes just below the frontmost app's windows,
+    /// wherever they are, as `AXRaise` places it.
     pub fn raise_window(&self, id: WinID) {
         let mut inner = self.inner.force_write();
         inner.raised.retain(|raised| *raised != id);
-        inner.raised.push(id);
+        let frontmost = |inner: &MockStateInner, id: &WinID| {
+            inner
+                .windows
+                .get(id)
+                .and_then(|window| inner.apps.get(&window.pid))
+                .is_some_and(|app| app.is_frontmost)
+        };
+        let index = if frontmost(&inner, &id) {
+            inner.raised.len()
+        } else {
+            inner
+                .raised
+                .iter()
+                .position(|raised| frontmost(&inner, raised))
+                .unwrap_or(inner.raised.len())
+        };
+        inner.raised.insert(index, id);
         inner.raise_count += 1;
+    }
+
+    /// Makes `pid` the only frontmost app, and makes apps answer late.
+    /// Focusing a window activates its app at the next [`Self::drain_events`],
+    /// and shows the window in front at the drain after that.
+    /// A raise sent to an app in the background shows once time passes, and
+    /// raises sent to several apps at once can reach the window server in any
+    /// order: reading the window order shows the latest waiting raise, and
+    /// draining events shows the rest, newest first.
+    pub fn lag_like_macos(&self, pid: Pid) {
+        let mut inner = self.inner.force_write();
+        inner.lags = true;
+        for (app_pid, app) in &mut inner.apps {
+            app.is_frontmost = *app_pid == pid;
+        }
+    }
+
+    /// Makes `pid` the only frontmost app and reports the switch, as macOS
+    /// does when the user activates it.
+    pub fn activate_app(&self, pid: Pid) {
+        let mut inner = self.inner.force_write();
+        for (app_pid, app) in &mut inner.apps {
+            app.is_frontmost = *app_pid == pid;
+        }
+        if let Some(psn) = inner.apps.get(&pid).map(|app| app.psn) {
+            inner
+                .event_queue
+                .push_back(Event::ApplicationFrontSwitched { psn });
+        }
     }
 
     /// How many times any window was raised.
@@ -310,9 +372,35 @@ impl MockState {
         self.inner.force_write().raise_takes_focus = takes_focus;
     }
 
+    fn show_latest_raise(&self) {
+        let latest = self.inner.force_write().pending_raises.pop();
+        if let Some(id) = latest {
+            self.raise_window(id);
+        }
+    }
+
+    fn show_pending_raises(&self) {
+        let pending = std::mem::take(&mut self.inner.force_write().pending_raises);
+        for id in pending.into_iter().rev() {
+            self.raise_window(id);
+        }
+    }
+
     /// Raises a window without asking for focus, which can still move its
     /// app's focus to it. See [`Self::set_raise_takes_focus`].
     fn raise_without_focus(&self, id: WinID) {
+        {
+            let mut inner = self.inner.force_write();
+            let background = inner
+                .windows
+                .get(&id)
+                .and_then(|window| inner.apps.get(&window.pid))
+                .is_some_and(|app| !app.is_frontmost);
+            if inner.lags && background {
+                inner.pending_raises.push(id);
+                return;
+            }
+        }
         self.raise_window(id);
         let mut inner = self.inner.force_write();
         if !inner.raise_takes_focus {
@@ -342,6 +430,10 @@ impl MockState {
 
     pub fn focus_window(&self, id: WinID) {
         let mut inner = self.inner.force_write();
+        if inner.lags {
+            inner.pending_activations.push(id);
+            return;
+        }
         if let Some(win) = inner.windows.get(&id) {
             let pid = win.pid;
             if let Some(app) = inner.apps.get_mut(&pid) {
@@ -428,6 +520,26 @@ impl MockState {
     }
 
     pub fn drain_events(&self) -> Vec<Event> {
+        self.show_pending_raises();
+        let activated = std::mem::take(&mut self.inner.force_write().activated);
+        for id in activated {
+            self.raise_window(id);
+        }
+        let pending = std::mem::take(&mut self.inner.force_write().pending_activations);
+        for id in pending {
+            let Some(pid) = self.inner.force_read().windows.get(&id).map(|w| w.pid) else {
+                continue;
+            };
+            self.activate_app(pid);
+            let mut inner = self.inner.force_write();
+            if let Some(app) = inner.apps.get_mut(&pid) {
+                app.focused_window_id = Some(id);
+            }
+            inner.activated.push(id);
+            inner
+                .event_queue
+                .push_back(Event::WindowFocused { window_id: id });
+        }
         let mut inner = self.inner.force_write();
         inner.event_queue.drain(..).collect()
     }
@@ -1168,14 +1280,19 @@ impl MockState {
 
         let s = self.clone();
         wm.expect_windows_on_screen().returning(move || {
-            let windows = s
-                .inner
-                .force_read()
+            s.show_latest_raise();
+            let inner = s.inner.force_read();
+            let mut windows = inner
                 .windows
                 .iter()
                 .filter_map(|(id, window)| window.visible.then_some(id))
                 .copied()
                 .collect::<Vec<_>>();
+            // Front to back, as the window server lists them.
+            windows.sort_by_key(|id| {
+                let raised = inner.raised.iter().position(|raised| raised == id);
+                std::cmp::Reverse((raised, std::cmp::Reverse(*id)))
+            });
             Some(windows)
         });
 
