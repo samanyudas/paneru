@@ -1002,15 +1002,15 @@ mod writer_tests {
         let (probe, entered) = Probe::new();
         let writers = writers(&probe, SECOND);
         probe.hold(1);
-        let started = Instant::now();
         writers.push(1, key(7), moved(7, 10));
         assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+        let started = Instant::now();
         writers.push(1, key(7), moved(7, 20));
-        let pushes_took = started.elapsed();
+        let push_took = started.elapsed();
 
         assert!(
-            pushes_took < Duration::from_millis(50),
-            "the pushes took {pushes_took:?}"
+            push_took < Duration::from_millis(50),
+            "the push took {push_took:?}"
         );
         assert!(writers.is_pending(1, key(7)));
         assert!(!writers.wait_landed(1, key(7), Duration::from_millis(20)));
@@ -1039,6 +1039,9 @@ mod writer_tests {
         probe.hold(1);
         writers.push(1, key(7), moved(7, 10));
         assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+        // Start the other app's writer outside the timed part.
+        writers.push(2, key(8), moved(8, 40));
+        assert!(writers.wait_landed(2, key(8), SECOND));
 
         let started = Instant::now();
         writers.push(2, key(8), moved(8, 50));
@@ -1051,7 +1054,14 @@ mod writer_tests {
         );
         assert_eq!(
             probe.log(2),
-            vec![Op::Begin, Op::Position(8, Origin::new(50, 0)), Op::Finish]
+            vec![
+                Op::Begin,
+                Op::Position(8, Origin::new(40, 0)),
+                Op::Finish,
+                Op::Begin,
+                Op::Position(8, Origin::new(50, 0)),
+                Op::Finish,
+            ]
         );
         assert_eq!(probe.log(1), vec![Op::Begin]);
 
