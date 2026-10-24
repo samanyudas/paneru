@@ -1,5 +1,6 @@
 use bevy::app::AppExit;
 use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
+use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
@@ -787,13 +788,38 @@ pub(crate) fn pump_events(
     }
 }
 
+/// A move or resize notification that arrived while the engine's own write
+/// to the window was still on its way. Reading the frame then would wait on
+/// the app and see the frame the window is leaving, so it is read once the
+/// write has landed. The app may have changed the window since, and dropping
+/// the notification would lose that change.
+#[derive(Clone, Copy, Component, Debug, Default)]
+pub(crate) struct DeferredFrameRead {
+    moved: bool,
+    resized: bool,
+}
+
+/// Windows whose frame is read again without a fresh notification: a native
+/// resize or tile restore in progress, or a notification deferred until the
+/// engine's own write landed.
+type FrameRechecks<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        Has<NativeResizeStart>,
+        Option<&'static DeferredFrameRead>,
+    ),
+    Or<(With<NativeResizeStart>, With<DeferredFrameRead>)>,
+>;
+
 #[allow(clippy::too_many_lines)]
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn window_frame_update(
     mut messages: MessageReader<Event>,
     mut windows: NativeFrameWindows,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
-    native_resizes: Query<Entity, With<NativeResizeStart>>,
+    rechecks: FrameRechecks,
     swipes: Query<&Scrolling, With<ActiveWorkspaceMarker>>,
     tiling: TilingRestore,
     mut commands: Commands,
@@ -807,9 +833,17 @@ pub(crate) fn window_frame_update(
     } else {
         notified_windows(&mut messages, &windows)
     };
-    for entity in &native_resizes {
-        if !notified.iter().any(|(notified, ..)| *notified == entity) {
-            notified.push((entity, false, false));
+    for (entity, _, deferred) in &rechecks {
+        let read = deferred.copied().unwrap_or_default();
+        match notified
+            .iter_mut()
+            .find(|(notified, ..)| *notified == entity)
+        {
+            Some((_, moved, resized)) => {
+                *moved |= read.moved;
+                *resized |= read.resized;
+            }
+            None => notified.push((entity, read.moved, read.resized)),
         }
     }
 
@@ -821,17 +855,40 @@ pub(crate) fn window_frame_update(
         };
         let strip = workspaces.iter().find(|(strip, _)| strip.contains(entity));
         let tiled = unmanaged.is_none() && strip.is_some_and(|(strip, _)| tiled_in(strip, entity));
+        let (native_resize, deferred) = rechecks
+            .get(entity)
+            .map_or((false, false), |(_, native, deferred)| {
+                (native, deferred.is_some())
+            });
         if !tiled
-            && native_resizes.contains(entity)
+            && native_resize
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
             entity_commands.try_remove::<NativeResizeStart>();
         }
-        if swiping
-            || matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden))
-            || !(moved || resized || (tiled && tiling.due(entity)))
+        let hidden = matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
+        if hidden
+            && deferred
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
+            entity_commands.try_remove::<DeferredFrameRead>();
+        }
+        if swiping || hidden || !(moved || resized || (tiled && tiling.due(entity))) {
             continue;
+        }
+        // The engine's own write is still on its way. A tile restore or a
+        // native resize is checked again next frame anyway. A notification
+        // waits for the write to land.
+        if window.write_pending() {
+            if (moved || resized)
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_insert(DeferredFrameRead { moved, resized });
+            }
+            continue;
+        }
+        if deferred && let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<DeferredFrameRead>();
         }
         let Ok(new_frame) = window.update_frame() else {
             if tiled {
@@ -1294,10 +1351,7 @@ pub(super) fn commit_window_frame(
             };
             objc2::rc::autoreleasepool(|_| match (position, size) {
                 (Some(position), Some(size)) => {
-                    place(
-                        &mut window,
-                        IRect::from_corners(position.0, position.0 + size),
-                    );
+                    window.place(IRect::from_corners(position.0, position.0 + size));
                 }
                 (Some(position), None) => window.reposition(position.0),
                 (None, Some(size)) => window.resize(size),
@@ -1312,6 +1366,11 @@ pub(super) fn verify_window_position(
     mut commands: Commands,
 ) {
     for (entity, mut window, position, mut verification) in &mut windows {
+        // Checked once the engine's own write has landed, without spending
+        // an attempt on the frame the window is leaving.
+        if window.write_pending() {
+            continue;
+        }
         if window
             .update_frame()
             .is_ok_and(|frame| frame.min == position.0)
@@ -1380,19 +1439,11 @@ pub(crate) fn cleanup_on_exit(
                 target.size()
             );
             let target = padded(target, padding);
-            place(&mut window, target);
+            window.place(target);
             targets.push((window.id(), target));
         }
-        settle_exit_frames(&mut all_windows, targets);
+        settle_exit_frames(&mut all_windows, &window_manager, targets);
     }
-}
-
-/// Sets a window's frame the way an app accepts it: an app may limit a size at
-/// the old position, so the size is set again once the window has moved.
-fn place(window: &mut Window, frame: IRect) {
-    window.resize(frame.size());
-    window.reposition(frame.min);
-    window.resize(frame.size());
 }
 
 /// Some apps, Chromium browsers among them, apply a frame only after the
@@ -1401,8 +1452,13 @@ fn place(window: &mut Window, frame: IRect) {
 /// any that has not landed. A window whose frame cannot be read is not checked
 /// again, and the whole pass stops at a deadline, so an app that does not
 /// respond cannot hold up Stop or Quit.
+///
+/// Each app's writer carries the writes off this thread, and the process ends
+/// once this returns, so every check, and the return, first waits for the
+/// writes asked for so far to reach their apps, within the same deadline.
 fn settle_exit_frames(
     all_windows: &mut Query<(&mut Window, Has<Unmanaged>, Option<&PreLaunchFrame>)>,
+    window_manager: &WindowManager,
     mut pending: Vec<(WinID, IRect)>,
 ) {
     const ROUNDS: usize = 5;
@@ -1410,8 +1466,10 @@ fn settle_exit_frames(
     const BUDGET: Duration = Duration::from_secs(1);
 
     let deadline = Instant::now() + BUDGET;
+    let writes_landed =
+        || window_manager.flush_window_writes(deadline.saturating_duration_since(Instant::now()));
     for _ in 0..ROUNDS {
-        if pending.is_empty() || Instant::now() + WAIT > deadline {
+        if pending.is_empty() || !writes_landed() || Instant::now() + WAIT > deadline {
             break;
         }
         std::thread::sleep(WAIT);
@@ -1428,7 +1486,7 @@ fn settle_exit_frames(
                 // The read itself can outlast the deadline.
                 Ok(_) if Instant::now() > deadline => true,
                 Ok(_) => {
-                    place(&mut window, *target);
+                    window.place(*target);
                     true
                 }
                 Err(err) => {
@@ -1437,6 +1495,9 @@ fn settle_exit_frames(
                 }
             }
         });
+    }
+    if !writes_landed() {
+        warn!("exit cleanup: some window moves did not reach their apps");
     }
     for (id, target) in pending {
         warn!("exit cleanup: window {id} did not reach {target:?}");
@@ -1877,25 +1938,65 @@ mod frame_commit_tests {
 
     use crate::ecs::layout::LayoutStrip;
     use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, Position, WidthRatio};
-    use crate::manager::{Display, MockWindowApi, Size, Window};
+    use crate::manager::window_writer::{PendingWrite, WriteSink, apply};
+    use crate::manager::{Display, MockWindowApi, Origin, Size, Window};
 
+    /// A window whose app limits each size it is given.
+    struct Constrained<F> {
+        frame: Arc<Mutex<IRect>>,
+        constrain: F,
+    }
+
+    impl<F: Fn(IRect, Size) -> Size + Send + 'static> WriteSink for Constrained<F> {
+        type Window = ();
+
+        fn begin(&mut self) {}
+
+        fn set_position(&mut self, (): &(), origin: Origin) {
+            let mut frame = self.frame.lock().unwrap();
+            *frame = IRect::from_corners(origin, origin + frame.size());
+        }
+
+        fn set_size(&mut self, (): &(), size: Size) {
+            let mut frame = self.frame.lock().unwrap();
+            frame.max = frame.min + (self.constrain)(*frame, size);
+        }
+
+        fn read_frame(&mut self, (): &()) -> Option<IRect> {
+            Some(*self.frame.lock().unwrap())
+        }
+
+        fn finish(&mut self) {}
+    }
+
+    /// Commits `target` to a window at `initial` whose app limits sizes with
+    /// `constrain`, through the same write sequence `WindowOS` uses.
     fn commit_with_resize_constraint(
         initial: IRect,
         target: IRect,
-        constrain: impl Fn(IRect, Size) -> Size + Send + 'static,
+        constrain: impl Fn(IRect, Size) -> Size + Send + Sync + Clone + 'static,
     ) -> IRect {
         bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
         let native_frame = Arc::new(Mutex::new(initial));
         let mut window = MockWindowApi::new();
-        let resized = Arc::clone(&native_frame);
-        window.expect_resize().returning(move |size| {
-            let mut frame = resized.lock().unwrap();
-            frame.max = frame.min + constrain(*frame, size);
-        });
-        let moved = Arc::clone(&native_frame);
-        window.expect_reposition().returning(move |origin| {
-            let mut frame = moved.lock().unwrap();
-            *frame = IRect::from_corners(origin, origin + frame.size());
+        let placed = Arc::clone(&native_frame);
+        window.expect_place().times(1).returning(move |to| {
+            let mut app = Constrained {
+                frame: Arc::clone(&placed),
+                constrain: constrain.clone(),
+            };
+            let from = *placed.lock().unwrap();
+            apply(
+                &mut app,
+                &PendingWrite {
+                    window: (),
+                    from,
+                    to,
+                    position: true,
+                    size: true,
+                    size_limited: Arc::default(),
+                },
+            );
         });
 
         let mut world = World::new();

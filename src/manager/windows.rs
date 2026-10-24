@@ -6,7 +6,7 @@ use accessibility_sys::{
     kAXUnknownRole, kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
 };
 use bevy::ecs::component::Component;
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2};
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
@@ -17,7 +17,6 @@ use objc2_core_foundation::{
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -30,6 +29,7 @@ use super::skylight::{
     AXUIElementPerformAction, AXUIElementSetAttributeValue, SLPSPostEventRecordTo,
     SLSWindowIteratorAdvance,
 };
+use super::window_writer::{FrameWrites, WindowWriters, WriteSink};
 use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::manager::{Origin, Size, irect_from};
@@ -203,12 +203,7 @@ fn verify_enhanced_ui_write(
     result
 }
 
-fn set_enhanced_ui(
-    app_element: &CFRetained<AXUIWrapper>,
-    enabled: bool,
-    pid: Pid,
-    window_id: WinID,
-) -> Result<()> {
+fn set_enhanced_ui(app_element: &CFRetained<AXUIWrapper>, enabled: bool, pid: Pid) -> Result<()> {
     let value = unsafe {
         if enabled {
             kCFBooleanTrue
@@ -226,7 +221,6 @@ fn set_enhanced_ui(
     trace!(
         target: "paneru::ax_diagnostics",
         pid,
-        window_id,
         requested = enabled,
         ax_error,
         "AXEnhancedUserInterface write"
@@ -239,7 +233,6 @@ fn set_enhanced_ui(
             if observed.as_ref().is_ok_and(|value| *value == enabled) {
                 debug!(
                     pid,
-                    window_id,
                     requested = enabled,
                     ax_error,
                     observed = ?observed,
@@ -248,7 +241,6 @@ fn set_enhanced_ui(
             } else {
                 warn!(
                     pid,
-                    window_id,
                     requested = enabled,
                     ax_error,
                     observed = ?observed,
@@ -260,23 +252,147 @@ fn set_enhanced_ui(
     )
 }
 
-/// macOS may partially apply an AX width increase when the requested right edge
-/// would be far outside the display. Moving the partial result left by the
-/// missing width before retrying gives `WindowServer` enough offscreen room.
-///
-/// Only retry when the first attempt actually grew the window. Fixed-size apps
-/// otherwise look identical to this failure mode and must not be moved offscreen.
-fn resize_staging_origin(
-    previous_frame: IRect,
-    actual_frame: IRect,
-    target_width: i32,
-) -> Option<Origin> {
-    let actual_width = actual_frame.width();
-    (actual_width > previous_frame.width() && actual_width < target_width).then(|| {
-        actual_frame
-            .min
-            .with_x(actual_frame.min.x - (target_width - actual_width))
-    })
+/// Every window move and resize, carried to the window's app.
+static WRITERS: LazyLock<Arc<WindowWriters<AxApp>>> =
+    LazyLock::new(|| Arc::new(WindowWriters::new(WRITER_IDLE, AxApp::new)));
+
+/// How long an app's writer outlives its last write.
+const WRITER_IDLE: Duration = Duration::from_secs(5);
+
+/// Waits up to `timeout` for every window move and resize asked for so far
+/// to reach its app. Returns whether all of them did.
+pub(super) fn flush_window_writes(timeout: Duration) -> bool {
+    WRITERS.flush(timeout)
+}
+
+type RestoreEnhancedUi = Box<dyn FnOnce() -> Result<()> + Send>;
+
+/// One app as its window writer sees it.
+struct AxApp {
+    pid: Option<Pid>,
+    app: Option<CFRetained<AXUIWrapper>>,
+    /// Held from [`WriteSink::begin`] to [`WriteSink::finish`], so the app
+    /// keeps `AXEnhancedUserInterface` off for a whole batch of writes.
+    enhanced_ui: Option<EnhancedUiGuard<RestoreEnhancedUi>>,
+}
+
+/// A window as its app's writer addresses it.
+struct AxWindow {
+    element: CFRetained<AXUIWrapper>,
+    /// The `(horizontal, vertical)` padding the engine keeps on every side.
+    padding: IVec2,
+}
+
+impl AxApp {
+    fn new(pid: Option<Pid>) -> Self {
+        let app = pid.and_then(|pid| {
+            AXUIWrapper::from_retained(unsafe { AXUIElementCreateApplication(pid) })
+                .inspect_err(|err| warn!("error getting app reference: {err}"))
+                .ok()
+        });
+        Self {
+            pid,
+            app,
+            enhanced_ui: None,
+        }
+    }
+
+    /// Suppresses app-driven move/resize animations until the guard drops.
+    /// With `AXEnhancedUserInterface` on, apps like Chrome, Firefox, and Zen
+    /// Browser animate every move and resize, which breaks window
+    /// management. Accessibility clients such as Kindavim turn it on.
+    fn disable_enhanced_ui(&self) -> Option<EnhancedUiGuard<RestoreEnhancedUi>> {
+        let pid = self.pid?;
+        let app_element = self.app.clone()?;
+        let restore_element = app_element.clone();
+        let restore: RestoreEnhancedUi =
+            Box::new(move || set_enhanced_ui(&restore_element, true, pid));
+        acquire_enhanced_ui(
+            enhanced_ui_state(pid),
+            pid,
+            || {
+                read_enhanced_ui(&app_element).inspect(|enabled| {
+                    trace!(
+                        target: "paneru::ax_diagnostics",
+                        pid,
+                        enabled,
+                        "read AXEnhancedUserInterface"
+                    );
+                })
+            },
+            || set_enhanced_ui(&app_element, false, pid),
+            restore,
+        )
+        .inspect_err(|err| warn!(pid, "error reading enhanced UI: {err}"))
+        .ok()
+        .flatten()
+    }
+}
+
+impl WriteSink for AxApp {
+    type Window = AxWindow;
+
+    fn begin(&mut self) {
+        self.enhanced_ui = self.disable_enhanced_ui();
+    }
+
+    fn set_position(&mut self, window: &AxWindow, origin: Origin) {
+        set_ax_position(&window.element, origin + window.padding);
+    }
+
+    fn set_size(&mut self, window: &AxWindow, size: Size) {
+        set_ax_size(&window.element, size - 2 * window.padding);
+    }
+
+    fn read_frame(&mut self, window: &AxWindow) -> Option<IRect> {
+        let frame = ax_frame(&window.element).ok()?;
+        Some(IRect {
+            min: frame.min - window.padding,
+            max: frame.max + window.padding,
+        })
+    }
+
+    fn finish(&mut self) {
+        self.enhanced_ui = None;
+    }
+}
+
+fn set_ax_position(element: &AXUIWrapper, origin: Origin) {
+    let mut point = CGPoint::new(f64::from(origin.x), f64::from(origin.y));
+    let position_ref = unsafe {
+        AXValueCreate(
+            kAXValueTypeCGPoint,
+            NonNull::from(&mut point).as_ptr().cast(),
+        )
+    };
+    if let Ok(position) = AXUIWrapper::from_retained(position_ref) {
+        unsafe {
+            AXUIElementSetAttributeValue(
+                element.as_ptr(),
+                CFString::from_static_str(kAXPositionAttribute).as_ref(),
+                position.as_ref(),
+            )
+        };
+    }
+}
+
+fn set_ax_size(element: &AXUIWrapper, size: Size) {
+    let mut cgsize = CGSize::new(f64::from(size.x), f64::from(size.y));
+    let size_ref = unsafe {
+        AXValueCreate(
+            kAXValueTypeCGSize,
+            NonNull::from(&mut cgsize).as_ptr().cast(),
+        )
+    };
+    if let Ok(size_value) = AXUIWrapper::from_retained(size_ref) {
+        unsafe {
+            AXUIElementSetAttributeValue(
+                element.as_ptr(),
+                CFString::from_static_str(kAXSizeAttribute).as_ref(),
+                size_value.as_ref(),
+            )
+        };
+    }
 }
 
 #[derive(Debug)]
@@ -307,7 +423,19 @@ pub trait WindowApi: Send + Sync {
     fn is_full_screen(&self) -> bool;
     fn reposition(&mut self, origin: Origin);
     fn resize(&mut self, size: Size);
+    /// Moves and resizes the window in one write: the size at the old
+    /// position, then the position, then the size again if the app limited
+    /// it at the old position.
+    fn place(&mut self, frame: IRect);
+    /// Reads the window's frame back from the OS. Waits first, up to
+    /// `LANDING_TIMEOUT`, for any move or resize the engine asked for to
+    /// land, and fails if it has not. A system that must never wait on an
+    /// app checks [`Self::write_pending`] first.
     fn update_frame(&mut self) -> Result<IRect>;
+    /// Whether a move or resize the engine asked for has yet to reach the
+    /// window. Until it does, the OS reports the frame the window is
+    /// leaving, and [`Self::frame`] is the frame the engine asked for.
+    fn write_pending(&self) -> bool;
     fn focus_without_raise(
         &self,
         psn: ProcessSerialNumber,
@@ -665,18 +793,12 @@ const CPS_USER_GENERATED: u32 = 0x200;
 pub struct WindowOS {
     id: WinID,
     ax_element: CFRetained<AXUIWrapper>,
-    frame: IRect,
+    /// The frame last asked for or read back, and the writes on their way.
+    writes: FrameWrites<AxApp>,
     vertical_padding: i32,
     horizontal_padding: i32,
     border_radius: OnceLock<Option<f64>>,
     pid: OnceLock<Result<Pid>>,
-    app_reference: OnceLock<Option<CFRetained<AXUIWrapper>>>,
-    enhanced_ui_state: OnceLock<Arc<Mutex<EnhancedUiState>>>,
-    /// Set once this window's app is known not to use
-    /// `AXEnhancedUserInterface` (the common case), so the steady-state check
-    /// in [`Self::disable_enhanced_ui`] is a relaxed atomic load instead of
-    /// acquiring the PID lock from every `par_iter_mut` worker.
-    enhanced_ui_absent: AtomicBool,
 
     /// The last title read off the element, cached because reading one is a
     /// synchronous cross-process call and many callers want it for every
@@ -735,14 +857,11 @@ impl WindowOS {
         let window = Self {
             id,
             ax_element: element.clone(),
-            frame: IRect::default(),
+            writes: FrameWrites::new(WRITERS.clone()),
             vertical_padding: 0,
             horizontal_padding: 0,
             border_radius: OnceLock::new(),
             pid: OnceLock::new(),
-            app_reference: OnceLock::new(),
-            enhanced_ui_state: OnceLock::new(),
-            enhanced_ui_absent: AtomicBool::new(false),
             title: RwLock::new(None),
             role: OnceLock::new(),
             subrole: OnceLock::new(),
@@ -823,115 +942,11 @@ impl WindowOS {
                 && subrole.as_deref() == Some(kAXFloatingWindowSubrole))
     }
 
-    fn app_reference(&self) -> Option<CFRetained<AXUIWrapper>> {
-        self.app_reference
-            .get_or_init(|| {
-                self.pid()
-                    .map(|pid| unsafe { AXUIElementCreateApplication(pid) })
-                    .and_then(AXUIWrapper::from_retained)
-                    .inspect_err(|err| warn!("error getting app reference: {err}"))
-                    .ok()
-            })
-            .clone()
-    }
-
-    /// Suppresses app-driven move/resize animations until the last guard drops.
-    /// The PID lock covers flag/counter transitions, not the window operations.
-    fn disable_enhanced_ui(&self) -> Option<EnhancedUiGuard<impl FnOnce() -> Result<()> + use<>>> {
-        if self.enhanced_ui_absent.load(Ordering::Relaxed) {
-            return None;
-        }
-        let pid = self.pid().ok()?;
-        let state = self
-            .enhanced_ui_state
-            .get_or_init(|| enhanced_ui_state(pid))
-            .clone();
-        let app_element = self.app_reference()?;
-        let restore_element = app_element.clone();
-        let window_id = self.id;
-        match acquire_enhanced_ui(
-            state,
-            pid,
-            || {
-                read_enhanced_ui(&app_element).inspect(|enabled| {
-                    debug!(
-                        target: "paneru::ax_diagnostics",
-                        pid,
-                        window_id,
-                        enabled,
-                        "read AXEnhancedUserInterface"
-                    );
-                })
-            },
-            || set_enhanced_ui(&app_element, false, pid, window_id),
-            move || set_enhanced_ui(&restore_element, true, pid, window_id),
-        ) {
-            Ok(guard) => {
-                if guard.is_none() {
-                    debug!(
-                        target: "paneru::ax_diagnostics",
-                        pid,
-                        window_id,
-                        "permanently caching false; skipping enhanced UI workaround"
-                    );
-                    self.enhanced_ui_absent.store(true, Ordering::Relaxed);
-                }
-                guard
-            }
-            Err(err) => {
-                warn!(pid, window_id, "error reading enhanced UI: {err}");
-                None
-            }
-        }
-    }
-
-    fn set_ax_position(&mut self, origin: Origin) {
-        let mut point = CGPoint::new(
-            f64::from(origin.x + self.horizontal_padding),
-            f64::from(origin.y + self.vertical_padding),
-        );
-        let position_ref = unsafe {
-            AXValueCreate(
-                kAXValueTypeCGPoint,
-                NonNull::from(&mut point).as_ptr().cast(),
-            )
-        };
-        if let Ok(position) = AXUIWrapper::from_retained(position_ref) {
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    self.ax_element.as_ptr(),
-                    CFString::from_static_str(kAXPositionAttribute).as_ref(),
-                    position.as_ref(),
-                )
-            };
-            let size = self.frame.size();
-            self.frame.min = origin;
-            self.frame.max = origin + size;
-        }
-    }
-
-    fn set_ax_size(&mut self, size: Size) {
-        let width_padding = 2 * self.horizontal_padding;
-        let height_padding = 2 * self.vertical_padding;
-        let mut cgsize = CGSize::new(
-            f64::from(size.x - width_padding),
-            f64::from(size.y - height_padding),
-        );
-        let size_ref = unsafe {
-            AXValueCreate(
-                kAXValueTypeCGSize,
-                NonNull::from(&mut cgsize).as_ptr().cast(),
-            )
-        };
-        if let Ok(size_value) = AXUIWrapper::from_retained(size_ref) {
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    self.ax_element.as_ptr(),
-                    CFString::from_static_str(kAXSizeAttribute).as_ref(),
-                    size_value.as_ref(),
-                )
-            };
-            self.frame.max = self.frame.min + size;
+    /// The window as its app's writer addresses it.
+    fn ax_window(&self) -> AxWindow {
+        AxWindow {
+            element: self.ax_element.clone(),
+            padding: IVec2::new(self.horizontal_padding, self.vertical_padding),
         }
     }
 
@@ -979,7 +994,7 @@ impl WindowApi for WindowOS {
     ///
     /// The window's frame as `CGRect`.
     fn frame(&self) -> IRect {
-        self.frame
+        self.writes.frame()
     }
 
     /// Returns the accessibility element of the window.
@@ -1074,80 +1089,41 @@ impl WindowApi for WindowOS {
 
     #[instrument(level = Level::TRACE)]
     fn reposition(&mut self, origin: Origin) {
-        if self.frame.min == origin {
-            trace!("already in position.");
-            return;
-        }
-        let _enhanced_ui = self.disable_enhanced_ui();
-        self.set_ax_position(origin);
+        let pid = self.pid().ok();
+        let window = self.ax_window();
+        self.writes.reposition(pid, || window, origin);
     }
 
     #[instrument(level = Level::TRACE)]
     fn resize(&mut self, size: Size) {
-        if self.frame.size() == size {
-            trace!("already correct size.");
-            return;
-        }
-        let previous_frame = self.frame;
-        let target_origin = previous_frame.min;
-        let _enhanced_ui = self.disable_enhanced_ui();
-        self.set_ax_size(size);
-
-        let mut previous_observed_frame = previous_frame;
-        let mut staged = false;
-        for attempt in 1..=3 {
-            let Ok(actual_frame) = self.update_frame() else {
-                break;
-            };
-            let Some(staging_origin) =
-                resize_staging_origin(previous_observed_frame, actual_frame, size.x)
-            else {
-                break;
-            };
-            debug!(
-                attempt,
-                requested_width = size.x,
-                actual_width = actual_frame.width(),
-                staging_x = staging_origin.x,
-                "retrying partially constrained AX resize from an offscreen origin"
-            );
-            staged = true;
-            previous_observed_frame = actual_frame;
-            self.set_ax_position(staging_origin);
-            self.set_ax_size(size);
-        }
-
-        if staged {
-            if let Ok(final_frame) = self.update_frame() {
-                debug!(
-                    requested_width = size.x,
-                    actual_width = final_frame.width(),
-                    "completed staged AX resize"
-                );
-            }
-            self.set_ax_position(target_origin);
-        }
+        let pid = self.pid().ok();
+        let window = self.ax_window();
+        self.writes.resize(pid, || window, size);
     }
 
-    /// Updates the internal `frame` of the window by querying its current position and size from the Accessibility API.
-    /// It also updates the `width_ratio`.
-    ///
-    /// # Arguments
-    ///
-    /// * `display_bounds` - An optional `CGRect` representing the bounds of the display the window is on.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the frame is updated successfully, otherwise `Err(Error)`.
+    #[instrument(level = Level::TRACE)]
+    fn place(&mut self, frame: IRect) {
+        let pid = self.pid().ok();
+        let window = self.ax_window();
+        self.writes.place(pid, || window, frame);
+    }
+
+    /// Reads the window's frame back from Accessibility, padding included.
     fn update_frame(&mut self) -> Result<IRect> {
-        self.frame = ax_frame(&self.ax_element)?;
+        let pid = self.pid().ok();
+        let padding = IVec2::new(self.horizontal_padding, self.vertical_padding);
+        let element = &self.ax_element;
+        self.writes.update_frame(pid, || {
+            let frame = ax_frame(element)?;
+            Ok(IRect {
+                min: frame.min - padding,
+                max: frame.max + padding,
+            })
+        })
+    }
 
-        self.frame.min.x -= self.horizontal_padding;
-        self.frame.min.y -= self.vertical_padding;
-        self.frame.max.x += self.horizontal_padding;
-        self.frame.max.y += self.vertical_padding;
-
-        Ok(self.frame)
+    fn write_pending(&self) -> bool {
+        self.writes.write_pending(self.pid().ok())
     }
 
     /// Focuses the window without raising it. This involves sending specific events to the process.
@@ -1286,7 +1262,8 @@ mod tests {
     use crate::events::Event;
     use crate::platform::ProcessSerialNumber;
     use crate::tests::TestHarness;
-    use std::sync::{atomic::AtomicUsize, mpsc};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     #[test]
     fn enhanced_ui_termination_discards_failed_restoration_before_pid_reuse() {
@@ -1979,32 +1956,5 @@ mod tests {
     fn a_window_without_buttons_or_toolbars_has_no_measured_top_bar() {
         assert_eq!(top_bar_extent(None, vec![]), None);
         assert_eq!(top_bar_extent(None, vec![60..90, 120..150]), None);
-    }
-
-    #[test]
-    fn stages_partially_applied_width_growth() {
-        let previous = IRect::new(-400, 40, 400, 640);
-        let actual = IRect::new(-400, 40, 2416, 640);
-
-        assert_eq!(
-            resize_staging_origin(previous, actual, 4112),
-            Some(Origin::new(-1696, 40))
-        );
-
-        let nearly_complete = IRect::new(-2056, 40, 2016, 640);
-        assert_eq!(
-            resize_staging_origin(actual, nearly_complete, 4112),
-            Some(Origin::new(-2096, 40))
-        );
-    }
-
-    #[test]
-    fn does_not_stage_fixed_size_or_completed_resizes() {
-        let fixed = IRect::new(0, 40, 230, 448);
-        assert_eq!(resize_staging_origin(fixed, fixed, 4112), None);
-
-        let previous = IRect::new(0, 40, 800, 640);
-        let completed = IRect::new(0, 40, 4112, 640);
-        assert_eq!(resize_staging_origin(previous, completed, 4112), None);
     }
 }

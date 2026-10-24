@@ -67,6 +67,7 @@ type AddedWindowDefaults<'w, 's> = Populated<
     'w,
     's,
     (
+        Entity,
         &'static mut Window,
         &'static mut Position,
         &'static mut Bounds,
@@ -981,8 +982,12 @@ pub(super) fn recover_window_handles(
                 || apps
                     .get_mut(child.parent())
                     .is_ok_and(|mut app| adopt_fresh_handle(&mut window, &mut app, &config)));
-        let frame_ready =
-            handle_recovered && (unmanaged || geometry.is_none() || window.update_frame().is_ok());
+        // A write the engine made to the window is still on its way: read
+        // it once it lands rather than wait on the app.
+        let frame_ready = handle_recovered
+            && (unmanaged
+                || geometry.is_none()
+                || (!window.write_pending() && window.update_frame().is_ok()));
 
         if !frame_ready && !deadline.0.is_finished() && !matches!(ordered_in, Ok(false)) {
             continue;
@@ -1318,9 +1323,10 @@ pub(super) fn apply_window_defaults(
     active_display: ActiveDisplay,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
+    mut commands: Commands,
 ) {
     let focused_ratio = windows.p1().single().ok().map(|ratio| ratio.0);
-    for (ref mut window, mut position, mut bounds, mut width_ratio, child) in windows.p0() {
+    for (entity, ref mut window, mut position, mut bounds, mut width_ratio, child) in windows.p0() {
         let Ok((_, app)) = apps.get(child.parent()) else {
             continue;
         };
@@ -1365,10 +1371,18 @@ pub(super) fn apply_window_defaults(
             window.resize(Size::new(new_width, height));
             // Re-read the actual OS size: the app may enforce a minimum width
             // that differs from our request.
-            if let Ok(frame) = window.update_frame().inspect_err(|err| error!("{err}")) {
+            if let Ok(frame) = window.update_frame() {
                 position.0 = frame.min;
                 bounds.bypass_change_detection().0 = frame.size();
                 width_ratio.0 = f64::from(frame.width()) / display_width;
+            } else {
+                // The app has not taken the resize yet: keep the requested
+                // width, and check the size it takes once the write lands.
+                bounds.bypass_change_detection().0 = Size::new(new_width, height);
+                width_ratio.0 = f64::from(new_width) / display_width;
+                commands
+                    .entity(entity)
+                    .try_insert(VerifyWindowSize::default());
             }
         }
     }
@@ -1635,7 +1649,9 @@ pub(super) fn window_resize_verifier(
             }
             continue;
         };
-        if position.is_changed() || bounds.is_changed() {
+        // Checked once the engine's own write has landed, without spending
+        // an attempt on the frame the window is leaving.
+        if position.is_changed() || bounds.is_changed() || window.write_pending() {
             continue;
         }
         // macOS puts a tile frame back while a restored slot holds, so a
@@ -1821,15 +1837,16 @@ pub(super) fn settle_width_requests(
                 .try_remove::<PendingWidthSettlement>();
             continue;
         }
+        // A member whose write is still on its way has not settled either:
+        // reading it would wait on its app.
         if !ready.contains(request.strip)
             || members.iter().any(|member| {
                 !ready.contains(*member)
-                    || verification
-                        .windows
-                        .get_mut(*member)
-                        .is_ok_and(|(_, position, bounds)| {
-                            position.is_changed() || bounds.is_changed()
-                        })
+                    || verification.windows.get_mut(*member).is_ok_and(
+                        |(window, position, bounds)| {
+                            position.is_changed() || bounds.is_changed() || window.write_pending()
+                        },
+                    )
             })
         {
             continue;
