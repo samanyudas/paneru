@@ -2019,3 +2019,33 @@ fn test_full_width_centers_and_fills_viewport_when_window_was_partially_offscree
         })
         .run(commands);
 }
+
+/// macOS can focus a window the engine does not manage yet, while the engine
+/// still marks the window that had focus. The float command must not float
+/// that window, which the user is no longer looking at.
+#[test]
+fn floating_waits_for_the_window_macos_has_focused() {
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let state = harness.mock_state.clone();
+    let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 9, frame);
+    state.set_focused_window(9);
+    let manage = Event::Command {
+        command: Command::Window(Operation::Manage),
+    };
+    let floating = |harness: &mut TestHarness| {
+        let entity = find_window_entity(0, harness.world());
+        harness
+            .world()
+            .get::<crate::ecs::Unmanaged>(entity)
+            .is_some()
+    };
+
+    harness.run(vec![manage.clone()]);
+    assert!(!floating(&mut harness), "the unfocused window stays tiled");
+
+    state.set_focused_window(0);
+    harness.run(vec![manage]);
+    assert!(floating(&mut harness), "the focused window floats");
+}

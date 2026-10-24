@@ -1217,6 +1217,7 @@ fn full_width_window(
 fn manage_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
+    apps: Query<&Application>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     mut commands: Commands,
 ) {
@@ -1233,6 +1234,22 @@ fn manage_window(
     else {
         return;
     };
+    // The engine's focus lags behind macOS while a newly focused window is
+    // not managed yet. Toggling then would float a window the user is not
+    // looking at, so only the window macOS has focused is toggled.
+    let focused_by_macos = windows
+        .find_parent(window.id())
+        .and_then(|(_, _, parent)| apps.get(parent).ok())
+        .is_some_and(|app| {
+            app.is_frontmost() && app.focused_window_id().is_ok_and(|id| id == window.id())
+        });
+    if !focused_by_macos {
+        debug!(
+            "not toggling window {}: macOS has focused another window",
+            window.id()
+        );
+        return;
+    }
     debug!(
         "window: {} {entity} unmanaged: {}.",
         window.id(),

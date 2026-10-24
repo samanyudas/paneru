@@ -376,6 +376,15 @@ impl Process {
     ///
     /// - Adds or removes KVO observers based on the application's launch and activation state.
     pub fn ready(&mut self) -> bool {
+        // macOS can announce a launch before `NSRunningApplication` knows the
+        // process, and without one the process would never look launched.
+        if self.application.is_none() {
+            self.application =
+                NSRunningApplication::runningApplicationWithProcessIdentifier(self.pid);
+            if self.application.is_none() {
+                return false;
+            }
+        }
         if !self.finished_launching() {
             debug!(
                 "{} ({}) is not finished launching, subscribing to finishedLaunching changes",
