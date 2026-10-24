@@ -16,7 +16,7 @@ use bevy::math::IRect;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -66,12 +66,12 @@ pub(crate) struct PendingWrite<W> {
     pub to: IRect,
     pub position: bool,
     pub size: bool,
-    /// Whether the app last took a smaller size than the engine asked for.
+    /// The size the app last took, if smaller than the engine asked for.
     /// The engine only writes a size when it changes, so the writer asks for
-    /// it again with each later write, as the app may allow it at the new
-    /// position. The window's handle shares this flag, so it goes away with
-    /// the window.
-    pub size_limited: Arc<AtomicBool>,
+    /// it again after each later move, as the app may allow it at the new
+    /// position. The window's handle shares this, so it goes away with the
+    /// window.
+    pub size_limited: Arc<Mutex<Option<Size>>>,
 }
 
 impl<W> PendingWrite<W> {
@@ -285,12 +285,22 @@ impl<W> Mailbox<W> {
 impl<S: WriteSink> Shared<S> {
     /// Writes one window's frame through `sink`, asking again for a size
     /// the app limited before.
-    fn write(sink: &mut S, mut write: PendingWrite<S::Window>) {
-        write.size |= write.size_limited.load(Ordering::Relaxed);
-        let observed = apply(sink, &write);
-        if write.size {
-            let limited = observed.is_some_and(|frame| frame.size() != write.to.size());
-            write.size_limited.store(limited, Ordering::Relaxed);
+    fn write(sink: &mut S, write: PendingWrite<S::Window>) {
+        let limited = *lock(&write.size_limited);
+        let observed = match limited {
+            // The app limited the size at the old position, so ask again
+            // only at the new one.
+            Some(taken) if !write.size => {
+                sink.set_position(&write.window, write.to.min);
+                let moved = IRect::from_corners(write.to.min, write.to.min + taken);
+                resize(sink, &write.window, moved, write.to.size(), write.to.min)
+            }
+            _ => apply(sink, &write),
+        };
+        if write.size || limited.is_some() {
+            *lock(&write.size_limited) = observed
+                .map(|frame| frame.size())
+                .filter(|&taken| taken != write.to.size());
         }
     }
 
@@ -436,7 +446,7 @@ pub(crate) struct FrameWrites<S: WriteSink> {
     writers: Arc<WindowWriters<S>>,
     key: WriteKey,
     frame: IRect,
-    size_limited: Arc<AtomicBool>,
+    size_limited: Arc<Mutex<Option<Size>>>,
 }
 
 impl<S: WriteSink> fmt::Debug for FrameWrites<S> {
@@ -788,7 +798,19 @@ mod tests {
             window.place(Some(1), || (), IRect::new(640, y, 1280, y + 1410));
             assert!(writers.flush(Duration::from_secs(1)));
         }
-        assert_eq!(app.lock().unwrap().0, IRect::new(640, 30, 1280, 1440));
+        let app = app.lock().unwrap();
+        assert_eq!(app.0, IRect::new(640, 30, 1280, 1440));
+        // The app limited the size at the old position, so a retry asks for
+        // it once, after the move.
+        assert_eq!(
+            app.1[3..],
+            [
+                Op::Position(Origin::new(640, 250)),
+                Op::Size(Size::new(640, 1410)),
+                Op::Position(Origin::new(640, 30)),
+                Op::Size(Size::new(640, 1410)),
+            ]
+        );
     }
 
     #[test]
