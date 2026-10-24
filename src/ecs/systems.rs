@@ -1994,6 +1994,7 @@ mod frame_commit_tests {
                     to,
                     position: true,
                     size: true,
+                    size_limited: Arc::default(),
                 },
             );
         });

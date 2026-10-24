@@ -16,7 +16,7 @@ use bevy::math::IRect;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -66,6 +66,12 @@ pub(crate) struct PendingWrite<W> {
     pub to: IRect,
     pub position: bool,
     pub size: bool,
+    /// Whether the app last took a smaller size than the engine asked for.
+    /// The engine only writes a size when it changes, so the writer asks for
+    /// it again with each later write, as the app may allow it at the new
+    /// position. The window's handle shares this flag, so it goes away with
+    /// the window.
+    pub size_limited: Arc<AtomicBool>,
 }
 
 impl<W> PendingWrite<W> {
@@ -198,11 +204,6 @@ struct Shared<S: WriteSink> {
     writers: Mutex<HashMap<Pid, Arc<Mailbox<S::Window>>>>,
     open_sink: Box<dyn Fn(Option<Pid>) -> S + Send + Sync>,
     idle: Duration,
-    /// Windows whose app last took a smaller size than the engine asked for.
-    /// The engine only writes a size when it changes, so the writer asks for
-    /// it again with each later write, as the app may allow it at the new
-    /// position.
-    limited: Mutex<HashSet<WriteKey>>,
 }
 
 struct Mailbox<W> {
@@ -284,16 +285,12 @@ impl<W> Mailbox<W> {
 impl<S: WriteSink> Shared<S> {
     /// Writes one window's frame through `sink`, asking again for a size
     /// the app limited before.
-    fn write(&self, sink: &mut S, key: WriteKey, mut write: PendingWrite<S::Window>) {
-        write.size |= lock(&self.limited).contains(&key);
+    fn write(sink: &mut S, mut write: PendingWrite<S::Window>) {
+        write.size |= write.size_limited.load(Ordering::Relaxed);
         let observed = apply(sink, &write);
         if write.size {
-            let mut limited = lock(&self.limited);
-            if observed.is_some_and(|frame| frame.size() != write.to.size()) {
-                limited.insert(key);
-            } else {
-                limited.remove(&key);
-            }
+            let limited = observed.is_some_and(|frame| frame.size() != write.to.size());
+            write.size_limited.store(limited, Ordering::Relaxed);
         }
     }
 
@@ -329,8 +326,8 @@ impl<S: WriteSink> Shared<S> {
             };
             objc2::rc::autoreleasepool(|_| {
                 sink.begin();
-                for (key, write) in batch {
-                    self.write(&mut sink, key, write);
+                for write in batch.into_values() {
+                    Self::write(&mut sink, write);
                 }
                 sink.finish();
             });
@@ -349,7 +346,6 @@ impl<S: WriteSink> WindowWriters<S> {
                 writers: Mutex::new(HashMap::new()),
                 open_sink: Box::new(open_sink),
                 idle,
-                limited: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -370,7 +366,7 @@ impl<S: WriteSink> WindowWriters<S> {
             if let Err(err) = spawned {
                 drop(writers);
                 warn!("cannot start a window writer for pid {pid}, writing inline: {err}");
-                self.write_inline(Some(pid), key, write);
+                self.write_inline(Some(pid), write);
                 return;
             }
             writers.insert(pid, mailbox.clone());
@@ -389,11 +385,11 @@ impl<S: WriteSink> WindowWriters<S> {
     }
 
     /// Writes `write` on the calling thread.
-    pub fn write_inline(&self, pid: Option<Pid>, key: WriteKey, write: PendingWrite<S::Window>) {
+    pub fn write_inline(&self, pid: Option<Pid>, write: PendingWrite<S::Window>) {
         let mut sink = (self.shared.open_sink)(pid);
         objc2::rc::autoreleasepool(|_| {
             sink.begin();
-            self.shared.write(&mut sink, key, write);
+            Shared::write(&mut sink, write);
             sink.finish();
         });
     }
@@ -440,6 +436,7 @@ pub(crate) struct FrameWrites<S: WriteSink> {
     writers: Arc<WindowWriters<S>>,
     key: WriteKey,
     frame: IRect,
+    size_limited: Arc<AtomicBool>,
 }
 
 impl<S: WriteSink> fmt::Debug for FrameWrites<S> {
@@ -457,6 +454,7 @@ impl<S: WriteSink> FrameWrites<S> {
             writers,
             key: WriteKey::next(),
             frame: IRect::default(),
+            size_limited: Arc::default(),
         }
     }
 
@@ -520,12 +518,13 @@ impl<S: WriteSink> FrameWrites<S> {
             to,
             position,
             size,
+            size_limited: self.size_limited.clone(),
         };
         self.frame = to;
         match pid {
             Some(pid) => self.writers.push(pid, self.key, write),
             // No app to queue behind: write it here.
-            None => self.writers.write_inline(None, self.key, write),
+            None => self.writers.write_inline(None, write),
         }
     }
 
@@ -618,6 +617,7 @@ mod tests {
                 to,
                 position: true,
                 size: true,
+                size_limited: Arc::default(),
             },
         );
         (app.frame, app.ops)
@@ -729,6 +729,7 @@ mod tests {
                 to: IRect::new(-400, 40, 3712, 640),
                 position: false,
                 size: true,
+                size_limited: Arc::default(),
             },
         );
 
@@ -959,6 +960,7 @@ mod writer_tests {
             to: IRect::new(x, 0, x + 100, 100),
             position: true,
             size: false,
+            size_limited: Arc::default(),
         }
     }
 
@@ -969,6 +971,7 @@ mod writer_tests {
             to: frame,
             position: false,
             size: true,
+            size_limited: Arc::default(),
         }
     }
 
