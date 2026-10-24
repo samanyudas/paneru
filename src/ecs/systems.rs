@@ -415,14 +415,10 @@ pub(super) fn add_launched_process(
         };
 
         if app.observe().is_ok_and(|good| good) {
-            let timeout = Timeout::new(
-                APP_OBSERVABLE_TIMEOUT,
-                Some(format!(
-                    "{app} did not become observable in {}s.",
-                    APP_OBSERVABLE_TIMEOUT.as_secs()
-                )),
-                &mut commands,
-            );
+            // An app too busy to list its windows in time stays managed, so a
+            // window of it that is created or focused later still enters the
+            // layout.
+            let timeout = Timeout::for_component::<FreshMarker>(APP_OBSERVABLE_TIMEOUT);
             commands.spawn((app, FreshMarker, timeout, ChildOf(entity)));
         } else {
             debug!("failed to register some observers {}", process.name());
