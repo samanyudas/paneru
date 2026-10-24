@@ -1637,6 +1637,12 @@ pub(super) struct SizeVerification<'w, 's> {
     time: Res<'w, Time>,
 }
 
+/// How long a window may stay taller than the engine asked for before its
+/// height counts as the window's minimum. Chromium-based apps apply a size
+/// after the write returns, and a busy app applies it later still, so a
+/// readback right after the write can show the old height.
+const LATE_RESIZE_GRACE: Duration = Duration::from_millis(500);
+
 pub(super) fn window_resize_verifier(
     mut requested: Query<(Entity, &mut VerifyWindowSize), SizeCheckReady>,
     mut verification: SizeVerification,
@@ -1666,12 +1672,29 @@ pub(super) fn window_resize_verifier(
             }
             continue;
         }
+        let now = verification.time.elapsed();
+        if request
+            .taller_since
+            .is_some_and(|since| now < since + LATE_RESIZE_GRACE)
+        {
+            continue;
+        }
         let frame = window.update_frame();
         if frame.is_err() {
             request.remaining = request.remaining.saturating_sub(1);
             if request.remaining > 0 {
                 continue;
             }
+        }
+        // A window still taller than asked for may not have applied the size
+        // yet, so it is read again before its height counts as a minimum.
+        if request.taller_since.is_none()
+            && frame
+                .as_ref()
+                .is_ok_and(|frame| fuzzy_equal(frame.height(), bounds.0.y) == Ordering::Less)
+        {
+            request.taller_since = Some(now);
+            continue;
         }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<VerifyWindowSize>();

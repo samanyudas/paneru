@@ -48,6 +48,9 @@ pub(crate) struct MockWindowData {
     /// Size writes the app drops before it applies one, like an app that
     /// applies a size only after the call returns.
     pub(crate) dropped_resizes: u8,
+    /// The size writes the app dropped, which [`MockState::os_apply_late_resizes`]
+    /// applies in order, like an app busy when the calls returned.
+    pub(crate) late_resizes: Vec<Size>,
     /// How long a frame read takes, like an app slow to answer.
     pub(crate) frame_read_delay: std::time::Duration,
     pub(crate) resize_writes: usize,
@@ -93,6 +96,7 @@ impl Default for MockWindowData {
             minimum_size: None,
             resize_bottom_limit: None,
             dropped_resizes: 0,
+            late_resizes: Vec::new(),
             frame_read_delay: std::time::Duration::ZERO,
             resize_writes: 0,
             position_writes: 0,
@@ -275,6 +279,7 @@ fn mock_resize(inner: &RwLock<MockStateInner>, id: WinID, ax_generation: u32, si
         w.resize_writes += 1;
         if w.dropped_resizes > 0 {
             w.dropped_resizes -= 1;
+            w.late_resizes.push(size);
             return;
         }
         let mut size = w.maximum_size.map_or(size, |maximum| size.min(maximum));
@@ -751,6 +756,24 @@ impl MockState {
             inner
                 .event_queue
                 .push_back(Event::WindowResized { window_id: id });
+        }
+    }
+
+    /// Applies, in order, the size writes window `id`'s app dropped, and
+    /// applies later writes as they arrive.
+    pub fn os_apply_late_resizes(&self, id: WinID) {
+        let sizes = self
+            .inner
+            .force_write()
+            .windows
+            .get_mut(&id)
+            .map(|w| {
+                w.dropped_resizes = 0;
+                std::mem::take(&mut w.late_resizes)
+            })
+            .unwrap_or_default();
+        for size in sizes {
+            self.os_resize_window(id, size);
         }
     }
 
