@@ -86,6 +86,20 @@ pub(crate) struct MockWindowData {
     pub(crate) ax_unlisted: bool,
 }
 
+impl MockWindowData {
+    /// The size the app applies when asked for `size`, within its limits.
+    fn accepted_size(&self, size: Size) -> Size {
+        let mut size = self.maximum_size.map_or(size, |maximum| size.min(maximum));
+        size = self.minimum_size.map_or(size, |minimum| size.max(minimum));
+        if let Some(bottom) = self.resize_bottom_limit
+            && size.y > 0
+        {
+            size.y = size.y.min((bottom - self.frame.min.y).max(0));
+        }
+        size
+    }
+}
+
 impl Default for MockWindowData {
     fn default() -> Self {
         Self {
@@ -282,14 +296,7 @@ fn mock_resize(inner: &RwLock<MockStateInner>, id: WinID, ax_generation: u32, si
             w.late_resizes.push(size);
             return;
         }
-        let mut size = w.maximum_size.map_or(size, |maximum| size.min(maximum));
-        size = w.minimum_size.map_or(size, |minimum| size.max(minimum));
-        if let Some(bottom) = w.resize_bottom_limit
-            && size.y > 0
-        {
-            size.y = size.y.min((bottom - w.frame.min.y).max(0));
-        }
-        w.frame.max = w.frame.min + size;
+        w.frame.max = w.frame.min + w.accepted_size(size);
     }
 }
 
@@ -773,6 +780,7 @@ impl MockState {
             })
             .unwrap_or_default();
         for size in sizes {
+            let size = self.inner.force_read().windows[&id].accepted_size(size);
             self.os_resize_window(id, size);
         }
     }
