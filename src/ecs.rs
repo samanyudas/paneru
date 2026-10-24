@@ -701,11 +701,16 @@ impl PendingWidthSettlement {
 #[derive(Component)]
 pub struct VerifyWindowSize {
     remaining: u8,
+    /// When a readback first showed the window taller than asked for.
+    taller_since: Option<Duration>,
 }
 
 impl Default for VerifyWindowSize {
     fn default() -> Self {
-        Self { remaining: 3 }
+        Self {
+            remaining: 3,
+            taller_since: None,
+        }
     }
 }
 

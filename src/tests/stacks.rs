@@ -108,6 +108,46 @@ fn a_window_leaving_a_stack_splits_the_rest_evenly() {
     assert_even(&heights(&frames), COLUMN);
 }
 
+/// An app that applies a size after the write returns, as Chromium apps do,
+/// still shows its old height when the engine first reads it back. That
+/// height is not a minimum, so the stack splits evenly once the app catches up.
+#[test]
+fn a_window_that_resizes_late_gets_an_even_share() {
+    let mut harness = tall_harness();
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+    ]);
+    harness
+        .mock_state
+        .update_window(1, |window| window.dropped_resizes = u8::MAX);
+    harness
+        .world()
+        .write_message(command(Operation::Stack(Side::West)));
+    let dropped = |harness: &TestHarness| {
+        let mut dropped = 0;
+        harness
+            .mock_state
+            .update_window(1, |window| dropped = window.late_resizes.len());
+        dropped
+    };
+    for _ in 0..50 {
+        if dropped(&harness) > 0 {
+            break;
+        }
+        harness.advance(Duration::from_millis(20));
+    }
+    assert!(dropped(&harness) > 0, "the stack asks window 1 to shrink");
+    // The app catches up after the engine has read the old height back.
+    harness.advance(Duration::from_millis(100));
+    harness.mock_state.os_apply_late_resizes(1);
+    harness.advance(SETTLE);
+
+    let frames = column(harness.world(), &[0, 1]);
+    assert_even(&heights(&frames), COLUMN);
+}
+
 /// A window that will not shrink to its share keeps the height it accepts,
 /// and the windows below it move down instead of being covered.
 #[test]
