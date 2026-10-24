@@ -67,6 +67,7 @@ type AddedWindowDefaults<'w, 's> = Populated<
     'w,
     's,
     (
+        Entity,
         &'static mut Window,
         &'static mut Position,
         &'static mut Bounds,
@@ -1322,9 +1323,10 @@ pub(super) fn apply_window_defaults(
     active_display: ActiveDisplay,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
+    mut commands: Commands,
 ) {
     let focused_ratio = windows.p1().single().ok().map(|ratio| ratio.0);
-    for (ref mut window, mut position, mut bounds, mut width_ratio, child) in windows.p0() {
+    for (entity, ref mut window, mut position, mut bounds, mut width_ratio, child) in windows.p0() {
         let Ok((_, app)) = apps.get(child.parent()) else {
             continue;
         };
@@ -1369,10 +1371,18 @@ pub(super) fn apply_window_defaults(
             window.resize(Size::new(new_width, height));
             // Re-read the actual OS size: the app may enforce a minimum width
             // that differs from our request.
-            if let Ok(frame) = window.update_frame().inspect_err(|err| error!("{err}")) {
+            if let Ok(frame) = window.update_frame() {
                 position.0 = frame.min;
                 bounds.bypass_change_detection().0 = frame.size();
                 width_ratio.0 = f64::from(frame.width()) / display_width;
+            } else {
+                // The app has not taken the resize yet: keep the requested
+                // width, and check the size it takes once the write lands.
+                bounds.bypass_change_detection().0 = Size::new(new_width, height);
+                width_ratio.0 = f64::from(new_width) / display_width;
+                commands
+                    .entity(entity)
+                    .try_insert(VerifyWindowSize::default());
             }
         }
     }

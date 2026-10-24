@@ -565,3 +565,44 @@ fn a_stale_space_report_during_a_pending_write_keeps_the_window_in_its_strip() {
     crate::assert_on_workspace!(harness.world(), 0, TEST_WORKSPACE_ID);
     release_slow_app(&mut harness);
 }
+
+/// `apply_window_defaults`: a window opens with a configured width while
+/// its app is too busy to take the resize in time. The engine keeps the
+/// configured width instead of the width the window opened with.
+#[test]
+fn a_configured_width_survives_a_busy_app() {
+    use crate::config::{InitialWindowWidth, WindowParams};
+
+    let mut harness = harness_with(|harness| {
+        let mut params = WindowParams::new(".*", None);
+        params.width = Some(InitialWindowWidth::Ratio(0.5));
+        harness.with_config(
+            (
+                MainOptions {
+                    swipe_gesture_fingers: Some(3),
+                    ..Default::default()
+                },
+                vec![params],
+            )
+                .into(),
+        )
+    });
+    harness.mock_state.hold_writes(SLOW_APP);
+    let frame = IRect::new(0, 0, WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let window = harness
+        .mock_state
+        .spawn_window(SLOW_APP, TEST_WORKSPACE_ID, 3, frame);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(FRAME);
+    release_slow_app(&mut harness);
+    harness.advance(Duration::from_secs(1));
+    assert!(harness.mock_state.flush_writes(FLUSH));
+
+    let entity = find_window_entity(3, harness.world());
+    let bounds = harness.world().get::<crate::ecs::Bounds>(entity).unwrap().0;
+    assert_eq!(bounds.x, TEST_DISPLAY_WIDTH / 2);
+    assert_eq!(
+        harness.mock_state.ax_frame(3).width(),
+        TEST_DISPLAY_WIDTH / 2
+    );
+}
