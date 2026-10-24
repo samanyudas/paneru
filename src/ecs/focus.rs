@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use bevy::app::{App, Plugin, PostUpdate, Update};
 use bevy::ecs::change_detection::{DetectChanges, Ref};
@@ -11,11 +12,11 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Changed, Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, ResMut, Single, SystemParam};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
-use bevy::time::{Timer, TimerMode};
+use bevy::time::{Time, Timer, TimerMode};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, VerifyFocus};
@@ -134,6 +135,7 @@ pub struct FocusEventsPlugin;
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
+        app.init_resource::<StackOrderWait>();
         app.add_systems(
             Update,
             (
@@ -667,14 +669,35 @@ fn raise_window_trigger(
     window.raise_without_focus();
 }
 
-fn overlapping_stacks_need_ordering(
-    gained: Query<Entity, Added<FocusedMarker>>,
-    mut lost: RemovedComponents<FocusedMarker>,
-    strips: Query<(), (Changed<LayoutStrip>, With<ActiveWorkspaceMarker>)>,
-) -> bool {
-    let lost_focus = lost.read().count() > 0;
-    !gained.is_empty() || lost_focus || !strips.is_empty()
+/// The windows that gained or lost focus.
+#[derive(SystemParam)]
+struct FocusChanges<'w, 's> {
+    gained: Query<'w, 's, Entity, Added<FocusedMarker>>,
+    lost: RemovedComponents<'w, 's, FocusedMarker>,
 }
+
+impl FocusChanges<'_, '_> {
+    fn read(&mut self) -> Vec<Entity> {
+        self.gained.iter().chain(self.lost.read()).collect()
+    }
+}
+
+fn overlapping_stacks_need_ordering(
+    mut changes: FocusChanges,
+    strips: Query<(), (Changed<LayoutStrip>, With<ActiveWorkspaceMarker>)>,
+    wait: Res<StackOrderWait>,
+) -> bool {
+    !changes.read().is_empty() || !strips.is_empty() || wait.0.is_some()
+}
+
+/// How long an overlapping stack waits for the window server to show the
+/// focused window in front before it is ordered anyway.
+const STACK_ORDER_WAIT: Duration = Duration::from_millis(500);
+
+/// Until when overlapping stacks wait for the focused window to show in front,
+/// if any stack waits.
+#[derive(Default, Resource)]
+struct StackOrderWait(Option<Duration>);
 
 /// Keeps every top bar of an overlapping stack visible. Each lower window goes
 /// in front of the window above it, and the focused window goes in front of
@@ -682,38 +705,73 @@ fn overlapping_stacks_need_ordering(
 /// a stacked window and when a strip's layout changes, so a window that loses
 /// focus returns to its place in the stack.
 ///
+/// `AXRaise` puts a window of an app in the background just below the
+/// frontmost app's windows, wherever the window server shows them. macOS shows
+/// the focused window in front a moment after the engine focuses it, so a
+/// stack waits, each frame and for at most [`STACK_ORDER_WAIT`], until the
+/// window server shows the focused window in front of the stack. While an app
+/// with no windows is frontmost, such as Finder, raises go below the previous
+/// app's window instead, so a stack keeps its order until focus moves to a
+/// window.
+///
 /// `applied` holds the order last given to each overlapping stack, back to
 /// front. A stack already in the order it needs is not raised again. Raising
 /// can move an app's focus and emit focus notifications, so raising an
 /// ordered stack again on each of them would never settle.
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments)]
 fn order_overlapping_stacks(
-    gained: Query<Entity, Added<FocusedMarker>>,
-    mut lost: RemovedComponents<FocusedMarker>,
+    mut changes: FocusChanges,
     strips: Query<Ref<LayoutStrip>, With<ActiveWorkspaceMarker>>,
-    windows: Query<(&Window, &LayoutPosition, &Bounds)>,
+    windows: Query<(&Window, &LayoutPosition, &Bounds, &ChildOf)>,
+    apps: Query<&Application>,
     focused: Query<Entity, With<FocusedMarker>>,
     window_manager: Res<WindowManager>,
+    mut wait: ResMut<StackOrderWait>,
+    time: Res<Time>,
     mut applied: Local<Vec<Vec<Entity>>>,
 ) {
-    let touched = gained.iter().chain(lost.read()).collect::<Vec<_>>();
+    let touched = changes.read();
+    let now = time.elapsed();
+    let waited = wait.0.take();
+    // A focus change waits afresh.
+    let until = waited.filter(|_| touched.is_empty());
+    let waited_long_enough = until.is_some_and(|until| now >= until);
     let frame = |entity| {
         windows
             .get(entity)
             .ok()
-            .map(|(_, position, bounds)| IRect::from_corners(position.0, position.0 + bounds.0))
+            .map(|(_, position, bounds, _)| IRect::from_corners(position.0, position.0 + bounds.0))
+    };
+    let frontmost = |entity: Entity| {
+        windows
+            .get(entity)
+            .is_ok_and(|(_, _, _, app)| apps.get(app.parent()).is_ok_and(|app| app.is_frontmost()))
     };
     // A native tab group shows one tab, and raising a background tab would
     // switch to it.
     let shown = |item: &StackItem| match item {
         StackItem::Single(entity) => Some(*entity),
         StackItem::Tabs(tabs) => tabs.iter().copied().find(|entity| {
-            windows.get(*entity).is_ok_and(|(window, _, _)| {
+            windows.get(*entity).is_ok_and(|(window, _, _, _)| {
                 matches!(window_manager.window_ordered_in(window.id()), Ok(true))
             })
         }),
     };
     let focus = focused.iter().next();
+    let front_to_back = window_manager.windows_on_screen().unwrap_or_default();
+    let shows_in_front = |entity: Entity, others: &[Entity]| {
+        let position = |entity| {
+            let (window, _, _, _) = windows.get(entity).ok()?;
+            front_to_back.iter().position(|id| *id == window.id())
+        };
+        position(entity).is_none_or(|own| {
+            others
+                .iter()
+                .filter(|other| **other != entity)
+                .all(|other| position(*other).is_none_or(|other| own < other))
+        })
+    };
 
     let mut back_to_front = vec![];
     for strip in &strips {
@@ -722,6 +780,7 @@ fn order_overlapping_stacks(
                 continue;
             };
             let affected = strip.is_changed()
+                || waited.is_some()
                 || touched
                     .iter()
                     .any(|entity| items.iter().any(|item| item.contains(*entity)));
@@ -738,7 +797,11 @@ fn order_overlapping_stacks(
                 }
                 order
             });
-            if order.as_ref().is_some_and(|order| applied.contains(order)) {
+            let waiting = !waited_long_enough
+                && focus
+                    .zip(order.as_ref())
+                    .is_some_and(|(focus, order)| !shows_in_front(focus, order));
+            if !waiting && order.as_ref().is_some_and(|order| applied.contains(order)) {
                 continue;
             }
             applied.retain(|order| {
@@ -746,6 +809,10 @@ fn order_overlapping_stacks(
                     .iter()
                     .any(|entity| items.iter().any(|item| item.contains(*entity)))
             });
+            if waiting {
+                wait.0 = Some(until.unwrap_or(now + STACK_ORDER_WAIT));
+                continue;
+            }
             if let Some(order) = order {
                 back_to_front.extend(order.iter().copied());
                 applied.push(order);
@@ -758,17 +825,63 @@ fn order_overlapping_stacks(
         return;
     }
 
-    for entity in back_to_front
+    // The focused window last, because a raised window can take its app's
+    // focus.
+    let raises = back_to_front
         .into_iter()
         .filter(|entity| Some(*entity) != focus)
-    {
-        if let Ok((window, _, _)) = windows.get(entity) {
-            window.raise_without_focus();
+        .chain(focus)
+        .filter_map(|entity| {
+            let (window, _, _, _) = windows.get(entity).ok()?;
+            Some((window, frontmost(entity)))
+        })
+        .collect::<Vec<_>>();
+    raise_in_order(&raises, &window_manager);
+}
+
+/// How long a raised window gets to show where it was raised to.
+const RAISE_SHOWN_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// Raises `raises` back to front, each paired with whether its app is
+/// frontmost. `AXRaise` returns before an app in the background reorders its
+/// window, so raises sent to several apps at once reach the window server in
+/// any order. Each window is raised only when the window server does not
+/// already show it in front of the others, and the next waits until it does,
+/// or until [`RAISE_SHOWN_TIMEOUT`] passes. A raise that would not move its
+/// window could not be seen to land, and could land after a later one.
+fn raise_in_order(raises: &[(&Window, bool)], window_manager: &WindowManager) {
+    // `AXRaise` puts a window of an app in the background just below the
+    // frontmost app's windows.
+    let in_front = |index: usize| {
+        let Some(front_to_back) = window_manager.windows_on_screen() else {
+            return true;
+        };
+        let position = |window: &Window| front_to_back.iter().position(|id| *id == window.id());
+        let (window, frontmost) = raises[index];
+        let Some(own) = position(window) else {
+            return true;
+        };
+        raises
+            .iter()
+            .enumerate()
+            .filter(|(other, (_, other_frontmost))| {
+                *other != index && (frontmost || !other_frontmost)
+            })
+            .all(|(_, (other, _))| position(other).is_none_or(|other| own < other))
+    };
+    for (index, (window, _)) in raises.iter().enumerate() {
+        if in_front(index) {
+            continue;
         }
-    }
-    // Last, because a raised window can take its app's focus.
-    if let Some((window, _, _)) = focus.and_then(|focus| windows.get(focus).ok()) {
         window.raise_without_focus();
+        let deadline = Instant::now() + RAISE_SHOWN_TIMEOUT;
+        while !in_front(index) {
+            if Instant::now() >= deadline {
+                debug!("window {} did not show where it was raised to", window.id());
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 

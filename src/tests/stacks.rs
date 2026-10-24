@@ -505,6 +505,61 @@ fn ordering_an_overlapping_stack_settles_when_raising_takes_focus() {
     assert_eq!(harness.mock_state.raise_count(), settled);
 }
 
+/// macOS shows a focused window in front a moment after the engine asks.
+/// Raising a window of an app in the background puts it just below the
+/// frontmost app's windows, and only once that app gets to it. A stack of
+/// windows from different apps is ordered once the focused window shows in
+/// front, one window at a time, so the window that had focus does not stay over
+/// the rest and the raises do not land out of order.
+#[test]
+fn an_overlapping_stack_of_several_apps_waits_for_the_focused_window() {
+    let mut harness = TestHarness::new()
+        .with_app(2, "stack.b", "Stack-B", |_| {})
+        .with_app(3, "stack.c", "Stack-C", |_| {})
+        .with_app(4, "beside", "Beside", |_| {})
+        .with_app(5, "windowless", "Windowless", |_| {});
+    let state = harness.mock_state.clone();
+    let windows = (0..4)
+        .map(|id| {
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            state.spawn_window(id + 1, TEST_WORKSPACE_ID, id, frame)
+        })
+        .collect();
+    harness.existed_at_launch(0..4);
+    harness
+        .world()
+        .trigger(crate::ecs::SpawnWindowTrigger(windows));
+    set_minimum_height(&harness, 1, 500);
+    stack_all(&mut harness, 3);
+    let stack = [0, 1, 2];
+    assert_eq!(state.window_order(&stack), vec![0, 1, 2]);
+    state.lag_like_macos(3);
+
+    harness.run(vec![command(Operation::Focus(Direction::North))]);
+    assert_eq!(state.window_order(&stack), vec![0, 2, 1]);
+
+    harness.run(vec![command(Operation::Focus(Direction::North))]);
+    assert_eq!(state.window_order(&stack), vec![1, 2, 0]);
+
+    harness.run(vec![command(Operation::Focus(Direction::South))]);
+    assert_eq!(state.window_order(&stack), vec![0, 2, 1]);
+
+    harness.run(vec![command(Operation::Focus(Direction::East))]);
+    assert_eq!(state.window_order(&stack), vec![0, 1, 2]);
+
+    harness.run(vec![command(Operation::Focus(Direction::West))]);
+    crate::assert_focused!(harness.world(), 0);
+    assert_eq!(state.window_order(&stack), vec![1, 2, 0]);
+
+    // While an app with no windows is frontmost, a raise goes below the
+    // previous app's window, so the stack keeps its order.
+    let raises = state.raise_count();
+    state.activate_app(5);
+    harness.advance(SETTLE);
+    assert_eq!(state.window_order(&stack), vec![1, 2, 0]);
+    assert_eq!(state.raise_count(), raises);
+}
+
 /// A tall harness whose three windows need 1100 points each and show 60
 /// point top bars. They overlap, and every window ends at the display bottom.
 fn overflowing_harness() -> TestHarness {
