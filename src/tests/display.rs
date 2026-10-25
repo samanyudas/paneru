@@ -3134,3 +3134,130 @@ fn assert_removed_display_follows_focus(
         );
     }
 }
+
+/// How much of window `id` shows on the built-in display, in points across.
+fn shown_width(world: &mut World, id: WinID) -> i32 {
+    let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+    world
+        .query::<&Window>()
+        .iter(world)
+        .find(|window| window.id() == id)
+        .map_or(0, |window| window.frame().intersect(display).width())
+}
+
+/// Closing every window shown on a display whose strip overflows, while
+/// focus is on another display, must not leave that display empty with its
+/// other windows parked off screen (#73).
+#[test]
+fn test_closing_the_shown_windows_of_an_unfocused_display_shows_another() {
+    let closed = Rc::new(Cell::new(Vec::new()));
+    let recorded = closed.clone();
+    harness_with_display_above()
+        .with_windows(5)
+        .on_iteration(4, move |world, state| {
+            assert_focused!(world, 100);
+            let shown = (0..5)
+                .filter(|&id| shown_width(world, id) > PARKED_STRIP_SLIVER)
+                .collect::<Vec<_>>();
+            assert!(
+                !shown.is_empty() && shown.len() < 5,
+                "the strip overflows: {shown:?}"
+            );
+            for &id in &shown {
+                state.os_close_window(id);
+            }
+            recorded.set(shown);
+        })
+        .on_iteration(6, move |world, _state| {
+            let closed = closed.take();
+            assert!(!closed.is_empty(), "the shown windows were closed");
+            assert_focused!(world, 100);
+            let left = (0..5).filter(|id| !closed.contains(id)).collect::<Vec<_>>();
+            let widths = left
+                .iter()
+                .map(|&id| (id, shown_width(world, id)))
+                .collect::<Vec<_>>();
+            assert!(
+                widths.iter().any(|&(_, width)| width > PARKED_STRIP_SLIVER),
+                "a remaining window shows on the display: {widths:?}"
+            );
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::Last)),
+            window_command(Operation::FocusDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// The same closes on a display that has since switched to another native
+/// Space leave that hidden Space's strip where it was.
+#[test]
+fn test_closing_windows_of_a_hidden_space_does_not_scroll_its_strip() {
+    let before = Rc::new(Cell::new(Vec::new()));
+    let recorded = before.clone();
+    harness_with_display_above()
+        .with_windows(5)
+        .on_iteration(4, move |world, state| {
+            assert_focused!(world, 100);
+            let shown = (0..5)
+                .filter(|&id| shown_width(world, id) > PARKED_STRIP_SLIVER)
+                .collect::<Vec<_>>();
+            assert!(!shown.is_empty() && shown.len() < 5, "{shown:?}");
+            state.show_space(TEST_DISPLAY_ID, TEST_WORKSPACE_ID + 1000);
+            for &id in &shown {
+                state.os_close_window(id);
+            }
+            recorded.set(
+                (0..5)
+                    .filter(|id| !shown.contains(id))
+                    .map(|id| (id, window_x(world, id)))
+                    .collect(),
+            );
+        })
+        .on_iteration(6, move |world, _state| {
+            let before = before.take();
+            assert!(!before.is_empty(), "the shown windows were closed");
+            let after = before
+                .iter()
+                .map(|&(id, _)| (id, window_x(world, id)))
+                .collect::<Vec<_>>();
+            assert_eq!(after, before, "the hidden Space's strip stayed put");
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::Last)),
+            window_command(Operation::FocusDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+fn window_x(world: &mut World, id: WinID) -> i32 {
+    world
+        .query::<&Window>()
+        .iter(world)
+        .find(|window| window.id() == id)
+        .map_or(i32::MIN, |window| window.frame().min.x)
+}
