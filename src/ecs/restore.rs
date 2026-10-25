@@ -17,6 +17,7 @@ use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{
     PaneruState, SavedColumn, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
 };
+use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::{PreviousStripPosition, RestoredActivation};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, Position, RestoreWindowState,
@@ -413,6 +414,7 @@ pub(super) fn restore_window_state(
     window_manager: Res<WindowManager>,
     session: Option<Res<SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
+    overrides: Res<TileOverrides>,
     mut ctx: WindowCtx,
 ) {
     let restoration = if let Some(session) = session.as_deref() {
@@ -436,7 +438,8 @@ pub(super) fn restore_window_state(
         restoration
     };
 
-    let current = current_window_identities(&ctx.windows, &apps, restoration, &ctx.config);
+    let current =
+        current_window_identities(&ctx.windows, &apps, restoration, &ctx.config, &overrides);
     let plan = RestorePlanner::new(restoration).plan(&current);
 
     if plan.consumed_entities.is_empty() {
@@ -621,13 +624,17 @@ fn current_window_identities(
     apps: &Query<&Application>,
     restoration: &PaneruState,
     config: &Config,
+    overrides: &TileOverrides,
 ) -> Vec<CurrentWindowIdentity> {
     let mut current = windows
         .managed_iter()
         .filter_map(|(window, entity, child)| {
             let app = apps.get(child.parent()).ok()?;
-            // Windows that match a floating rule are never restored into a strip.
-            if WindowProperties::new(app, window, config).floating() {
+            // Windows that match a floating rule are never restored into a
+            // strip, unless the user tiled the window against the rule.
+            if WindowProperties::new(app, window, config).floating()
+                && !overrides.contains(window, app)
+            {
                 return None;
             }
             Some(CurrentWindowIdentity {

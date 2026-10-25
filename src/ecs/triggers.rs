@@ -27,6 +27,7 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, ExposeFocusedSurvivorAfterRemoval, LayoutStrip, anchored_origin};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
+use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LaunchWindows, LayoutPosition,
@@ -1045,6 +1046,7 @@ fn adopt_fresh_handle(window: &mut Window, app: &mut Application, config: &Confi
 /// * `windows` - A query for all windows with their parent.
 /// * `awaiting` - Windows waiting for the app to replace their AX element.
 /// * `commands` - Bevy commands to despawn entities and trigger events.
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn window_destroyed_trigger(
     mut messages: MessageReader<Event>,
@@ -1053,6 +1055,7 @@ pub(super) fn window_destroyed_trigger(
     mut global_state: GlobalState,
     windows: Windows,
     awaiting: Query<(), With<AwaitingHandle>>,
+    mut overrides: ResMut<TileOverrides>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
@@ -1096,6 +1099,7 @@ pub(super) fn window_destroyed_trigger(
         };
 
         app.unobserve_window(window);
+        overrides.forget(window.id());
 
         let has_focused_survivor = windows
             .focused()
@@ -1323,6 +1327,7 @@ pub(super) fn apply_window_defaults(
     active_display: ActiveDisplay,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
+    overrides: Res<TileOverrides>,
     mut commands: Commands,
 ) {
     let focused_ratio = windows.p1().single().ok().map(|ratio| ratio.0);
@@ -1337,7 +1342,7 @@ pub(super) fn apply_window_defaults(
         let initializing = initializing.is_some();
 
         // Do not add padding to floating windows.
-        if properties.floating() {
+        if properties.floating() && !overrides.contains(window, app) {
             // Skip grid_ratios during init: we don't know this window's display.
             if !initializing && let Some((rx, ry, rw, rh)) = properties.grid_ratios() {
                 let bounds = active_display.actual_bounds(&config);
@@ -1388,6 +1393,7 @@ pub(super) fn apply_window_defaults(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn apply_window_positions(
     added: Populated<Entity, Added<Window>>,
@@ -1396,6 +1402,7 @@ pub(super) fn apply_window_positions(
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
+    overrides: Res<TileOverrides>,
     mut ctx: WindowCtx,
 ) {
     for entity in added {
@@ -1418,8 +1425,9 @@ pub(super) fn apply_window_positions(
         let properties = WindowProperties::new(app, window, &ctx.config);
 
         // A floating rule wins over a saved tiled placement, so a rule added
-        // after the session was saved still applies.
-        if properties.floating() {
+        // after the session was saved still applies, unless the user tiled
+        // this window against the rule.
+        if properties.floating() && !overrides.contains(window, app) {
             if let Some(mut strip) = workspaces
                 .iter_mut()
                 .find_map(|(strip, _)| strip.contains(entity).then_some(strip))

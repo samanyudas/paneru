@@ -55,6 +55,7 @@ pub mod script_state;
 pub mod scroll;
 pub mod state;
 pub(crate) mod systems;
+pub mod tile_overrides;
 mod triggers;
 pub mod workspace;
 
@@ -981,6 +982,7 @@ fn autorelease_runner(mut app: BevyApp) -> bevy::app::AppExit {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
     crate::manager::app::bound_ax_messaging_timeout()?;
 
@@ -1100,6 +1102,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     // Overwrites the empty store `register_commands` put there, which is what
     // the mock harness keeps: only the real app reads the user's file.
     app.insert_resource(script_state::ScriptStateStore::load());
+    app.insert_resource(tile_overrides::TileOverrides::load());
 
     // Do not insert this in mocks.
     app.insert_resource(LowPowerMode(false));
@@ -1140,7 +1143,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     Ok(app)
 }
 
-struct WindowProperties {
+pub(crate) struct WindowProperties {
     params: Vec<WindowParams>,
 }
 
