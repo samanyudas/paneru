@@ -589,7 +589,7 @@ fn macos_tile(harness: &mut TestHarness, id: WinID, tile: IRect) {
 }
 
 #[test]
-fn macos_half_quarter_and_fill_after_a_drop_return_to_the_dropped_slot() {
+fn macos_half_quarter_and_fill_after_a_drop_return_to_the_windows_place() {
     for tile in [
         IRect::new(0, 20, 512, 768),
         IRect::new(512, 394, 1024, 768),
@@ -597,14 +597,39 @@ fn macos_half_quarter_and_fill_after_a_drop_return_to_the_dropped_slot() {
     ] {
         let mut harness = three_columns();
         let point = middle_of(harness.world(), 0, 600);
-        press_and_drag(&mut harness, 2, point);
+        let start = press_and_drag(&mut harness, 2, point);
         release(&mut harness, point);
         macos_tile(&mut harness, 2, tile);
         harness.advance(SETTLE);
-        assert_eq!(layout(harness.world()), vec![vec![0, 2], vec![1]]);
-        assert_one_column(harness.world(), &[0, 2]);
+        assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
+        assert_eq!(frame(harness.world(), 2).size(), start.size());
         assert_ne!(frame(harness.world(), 2), tile);
         crate::assert_focused!(harness.world(), 2);
+    }
+}
+
+#[test]
+fn a_drag_that_macos_tiles_at_a_screen_edge_returns_to_its_column() {
+    for (to, tile) in [
+        (
+            Origin::new(TEST_DISPLAY_WIDTH - 1, 300),
+            IRect::new(512, 20, 1024, 768),
+        ),
+        (Origin::new(0, 300), IRect::new(0, 20, 512, 768)),
+        (Origin::new(600, 1), IRect::new(0, 20, 1024, 768)),
+    ] {
+        let mut harness = three_columns();
+        let start = press_and_drag(&mut harness, 1, to);
+        release(&mut harness, to);
+        macos_tile(&mut harness, 1, tile);
+        harness.advance(SETTLE);
+        assert_eq!(
+            layout(harness.world()),
+            vec![vec![0], vec![1], vec![2]],
+            "{to:?}"
+        );
+        assert_eq!(frame(harness.world(), 1).size(), start.size(), "{to:?}");
+        crate::assert_focused!(harness.world(), 1);
     }
 }
 

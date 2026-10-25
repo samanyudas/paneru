@@ -229,6 +229,11 @@ impl NativeResizeStart {
         matches!(self.phase, Phase::Holding { until } if now < until).then_some(self.size)
     }
 
+    /// Whether macOS tiled the window and the engine is putting it back.
+    pub(crate) fn restores_tile(&self) -> bool {
+        matches!(self.phase, Phase::Holding { .. })
+    }
+
     pub(crate) fn needs_frame(&self) -> bool {
         !matches!(self.phase, Phase::Settling { .. } | Phase::Refused { .. })
     }

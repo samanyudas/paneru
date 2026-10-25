@@ -516,7 +516,7 @@ impl Iterator for ColumnWindowIter<'_> {
 
 /// `LayoutStrip` manages a horizontal strip of `Panel`s, where each panel can contain a single window or a stack of windows.
 /// It provides methods for manipulating the arrangement and access to windows within the pane.
-#[derive(Component, Debug, Default)]
+#[derive(Clone, Component, Debug, Default)]
 pub struct LayoutStrip {
     id: WorkspaceId,
     pub virtual_index: u32,
