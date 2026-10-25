@@ -929,14 +929,18 @@ pub fn bruteforce_windows(
     found_windows
 }
 
+/// Removes `window_id` from `window_list` only once `accept` takes the element,
+/// because an app can list another element with the window's id before the
+/// window itself, as Notes does with an outline.
 fn claim_unresolved_window<T>(
     window_list: &mut Vec<WinID>,
     window_id: WinID,
     accept: impl FnOnce() -> Option<T>,
 ) -> Option<T> {
     let index = window_list.iter().position(|&id| id == window_id)?;
+    let accepted = accept()?;
     window_list.remove(index);
-    accept()
+    Some(accepted)
 }
 
 /// Checks if the application has Accessibility privileges without showing UI.
