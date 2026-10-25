@@ -1672,10 +1672,29 @@ pub(super) fn window_resize_verifier(
         }
         // macOS puts a tile frame back while a restored slot holds, so a
         // readback then is not the app refusing the size.
+        if let Ok(start) = verification.native_resizes.get(entity)
+            && start.held_size(verification.time.elapsed()).is_some()
+        {
+            // An app that never reports its resize shows here that it took
+            // the restored size.
+            let seen = window
+                .update_frame()
+                .ok()
+                .and_then(|frame| start.seen(frame.size()));
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<VerifyWindowSize>();
+                if let Some(seen) = seen {
+                    entity_commands.try_insert(seen);
+                }
+            }
+            continue;
+        }
+        // After the hold, the tile restore decides whether a window that
+        // took its restored size has had a tile put back.
         if verification
             .native_resizes
             .get(entity)
-            .is_ok_and(|start| start.held_size(verification.time.elapsed()).is_some())
+            .is_ok_and(crate::ecs::drag::NativeResizeStart::reached)
         {
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<VerifyWindowSize>();
