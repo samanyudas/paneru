@@ -342,6 +342,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         .add_observer(triggers::send_message_trigger)
         .add_observer(triggers::window_removal_trigger)
         .add_observer(triggers::cleanup_timeout_trigger)
+        .add_observer(triggers::drop_step_partners_trigger)
         .add_observer(restore::restore_window_state);
 }
 
@@ -499,6 +500,14 @@ pub struct LaunchWindows(pub std::collections::HashSet<WinID>);
 /// smaller one. Stack layout never gives it less.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct MinimumHeight(pub i32);
+
+/// The stacked windows that took part in a height step with this window, the
+/// window that stepped or one it took height from or gave height to, each with
+/// the height it received, negative when it gave. A part of the step this
+/// window refuses goes back to them, so the rest of the stack keeps its
+/// heights. Dropped when the window's size check ends.
+#[derive(Component, Clone, Debug, Default)]
+pub struct StepPartners(pub Vec<(Entity, i32)>);
 
 /// How far a window's top bar (title bar, toolbar, or navigation bar) reaches
 /// below its top edge, as last measured. Measured the first time an

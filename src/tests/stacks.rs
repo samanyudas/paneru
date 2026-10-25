@@ -257,6 +257,159 @@ fn minimizing_a_stacked_window_splits_the_rest_evenly() {
     assert_even(&heights(&frames), COLUMN);
 }
 
+/// A column 1278 points tall, where one resize step is 64 points.
+const STEP_COLUMN: i32 = 1278;
+
+/// Three stacked windows on a display with a 1278 point column. Window 1
+/// refuses less than 628 points, so the others start with 325 each.
+fn step_stack(minimums: &[(WinID, i32)]) -> TestHarness {
+    let harness = TestHarness::new();
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, STEP_COLUMN + TEST_MENUBAR_HEIGHT),
+    );
+    let mut harness = harness.with_windows(3);
+    set_minimum_height(&harness, 1, 628);
+    for (id, height) in minimums {
+        set_minimum_height(&harness, *id, *height);
+    }
+    stack_three(&mut harness);
+    assert_eq!(
+        heights(&column(harness.world(), &[0, 1, 2])),
+        [325, 628, 325]
+    );
+    harness
+}
+
+fn step(direction: crate::commands::ResizeDirection) -> Event {
+    command(Operation::ResizeVerticalStep(direction))
+}
+
+/// A window that refuses part of a shrink step gives the refused part back
+/// to the window that received the step, and the rest of the stack keeps
+/// its heights.
+#[test]
+fn a_refused_shrink_step_returns_the_height_to_its_partner() {
+    let mut harness = step_stack(&[(0, 308)]);
+    harness.run(vec![
+        command(Operation::Focus(Direction::North)),
+        command(Operation::Focus(Direction::North)),
+        step(crate::commands::ResizeDirection::Shrink),
+    ]);
+    harness.advance(SETTLE);
+
+    assert_eq!(
+        heights(&column(harness.world(), &[0, 1, 2])),
+        [308, 645, 325]
+    );
+}
+
+/// A window that refuses part of a grow step gives the refused part back to
+/// the window it took the step from.
+#[test]
+fn a_refused_grow_step_returns_the_height_to_its_partner() {
+    let mut harness = step_stack(&[]);
+    harness.mock_state.update_window(2, |window| {
+        window.maximum_size = Some(Size::new(TEST_DISPLAY_WIDTH, 350));
+    });
+    harness.run(vec![step(crate::commands::ResizeDirection::Grow)]);
+    harness.advance(SETTLE);
+
+    assert_eq!(
+        heights(&column(harness.world(), &[0, 1, 2])),
+        [300, 628, 350]
+    );
+}
+
+/// A window that refuses part of the height a grow step takes from it keeps
+/// the refused part, and the growing window gives it up instead of a taller
+/// window outside the step.
+#[test]
+fn a_donor_that_refuses_a_grow_step_takes_the_height_from_the_grower() {
+    let harness = TestHarness::new();
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, STEP_COLUMN + TEST_MENUBAR_HEIGHT),
+    );
+    let mut harness = harness.with_windows(3);
+    set_minimum_height(&harness, 2, 400);
+    stack_three(&mut harness);
+    harness.run(vec![
+        command(Operation::Focus(Direction::North)),
+        command(Operation::Focus(Direction::North)),
+        step(crate::commands::ResizeDirection::Grow),
+        step(crate::commands::ResizeDirection::Grow),
+    ]);
+    harness.advance(SETTLE);
+    assert_eq!(
+        heights(&column(harness.world(), &[0, 1, 2])),
+        [554, 298, 426]
+    );
+    harness.run(vec![
+        command(Operation::Focus(Direction::South)),
+        step(crate::commands::ResizeDirection::Grow),
+    ]);
+    harness.advance(SETTLE);
+
+    assert_eq!(
+        heights(&column(harness.world(), &[0, 1, 2])),
+        [554, 324, 400]
+    );
+}
+
+/// A window whose minimum the engine learned keeps it when it rejoins a
+/// stack, and the windows without one share the rest evenly.
+#[test]
+fn a_learned_minimum_leaves_the_other_windows_an_even_share() {
+    let mut harness = step_stack(&[(0, 308)]);
+    harness.run(vec![
+        command(Operation::Focus(Direction::North)),
+        command(Operation::Focus(Direction::North)),
+        step(crate::commands::ResizeDirection::Shrink),
+    ]);
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), 0).height(), 308, "minimum learned");
+    harness.run(vec![command(Operation::Unstack(Side::East))]);
+    harness.advance(SETTLE);
+    harness.run(vec![command(Operation::Stack(Side::West))]);
+    harness.advance(SETTLE);
+
+    let order = layout(harness.world()).remove(0);
+    let frames = column(harness.world(), &order);
+    let height = |id: WinID| frames[order.iter().position(|o| *o == id).unwrap()].height();
+    assert_eq!(
+        (height(0), height(1), height(2)),
+        (325, 628, 325),
+        "{order:?}"
+    );
+}
+
+/// A grow step takes height from the nearest window that has room above its
+/// minimum, so a neighbour at its minimum does not stop it.
+#[test]
+fn a_grow_step_takes_height_past_a_neighbour_at_its_minimum() {
+    let mut harness = step_stack(&[]);
+    harness.run(vec![step(crate::commands::ResizeDirection::Grow)]);
+    harness.advance(SETTLE);
+    assert_eq!(
+        heights(&column(harness.world(), &[0, 1, 2])),
+        [261, 628, 389],
+        "the last window grows"
+    );
+
+    harness.run(vec![
+        command(Operation::Focus(Direction::North)),
+        command(Operation::Focus(Direction::North)),
+        step(crate::commands::ResizeDirection::Grow),
+    ]);
+    harness.advance(SETTLE);
+    assert_eq!(
+        heights(&column(harness.world(), &[0, 1, 2])),
+        [325, 628, 325],
+        "the first window grows"
+    );
+}
+
 fn animated_tall_harness() -> TestHarness {
     use crate::config::{Config, MainOptions};
 
