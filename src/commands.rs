@@ -25,11 +25,12 @@ use crate::ecs::layout::{
     effective_stack_limit, hold_minimum_heights, strip_signature,
 };
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowCtx, Windows};
+use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, FullWidthMarker, ManualStripOffset,
     MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, RaiseWindow,
     SelectedVirtualMarker, SpawnCommandsExt, StepPartners, Timeout, Unmanaged, VerifyWindowSize,
-    WidthAnchor, WidthRun,
+    WidthAnchor, WidthRun, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Size, Window, WindowManager, origin_from};
@@ -81,6 +82,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // Empty store so the mock harness and saveless runs still have one to
     // answer from; the real app overwrites it from disk.
     app.init_resource::<crate::ecs::script_state::ScriptStateStore>();
+    app.init_resource::<crate::ecs::tile_overrides::TileOverrides>();
     app.add_systems(
         PreUpdate,
         crate::ecs::script_state::script_state_handler.in_set(crate::ecs::PreUpdateSet::Dispatch),
@@ -1291,6 +1293,8 @@ fn manage_window(
     windows: Windows,
     apps: Query<&Application>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    config: Res<Config>,
+    mut overrides: ResMut<TileOverrides>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::Manage))
@@ -1309,12 +1313,12 @@ fn manage_window(
     // The engine's focus lags behind macOS while a newly focused window is
     // not managed yet. Toggling then would float a window the user is not
     // looking at, so only the window macOS has focused is toggled.
-    let focused_by_macos = windows
+    let app = windows
         .find_parent(window.id())
-        .and_then(|(_, _, parent)| apps.get(parent).ok())
-        .is_some_and(|app| {
-            app.is_frontmost() && app.focused_window_id().is_ok_and(|id| id == window.id())
-        });
+        .and_then(|(_, _, parent)| apps.get(parent).ok());
+    let focused_by_macos = app.is_some_and(|app| {
+        app.is_frontmost() && app.focused_window_id().is_ok_and(|id| id == window.id())
+    });
     if !focused_by_macos {
         debug!(
             "not toggling window {}: macOS has focused another window",
@@ -1328,6 +1332,17 @@ fn manage_window(
         unmanaged.is_some()
     );
     let was_unmanaged = unmanaged.is_some();
+    // Tiling a window that a floating rule matches overrides the rule for that
+    // window alone, until it floats again or closes.
+    match app {
+        Some(app)
+            if matches!(unmanaged, Some(Unmanaged::Floating))
+                && WindowProperties::new(app, window, &config).floating() =>
+        {
+            overrides.remember(window, app);
+        }
+        _ => overrides.forget(window.id()),
+    }
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         if was_unmanaged {
             entity_commands.try_remove::<Unmanaged>();

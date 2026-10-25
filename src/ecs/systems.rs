@@ -36,7 +36,7 @@ use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
     LowPowerMode, MinimumHeight, MissionControlActive, Position, PreLaunchFrame,
     ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    SystemTheme, Unmanaged, WidthRatio, WindowProperties,
+    SystemTheme, Unmanaged, WidthLimits, WidthRatio, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -67,7 +67,7 @@ type NativeFrameWindows<'w, 's> = Query<
         Option<&'static ResizeMarker>,
         Has<VerifyWindowSize>,
         Has<RepositionMarker>,
-        Option<&'static MinimumHeight>,
+        (Option<&'static MinimumHeight>, Option<&'static WidthLimits>),
     ),
     Without<LayoutStrip>,
 >;
@@ -1014,7 +1014,9 @@ fn adopt_native_size(
     workspaces: &mut Query<(&LayoutStrip, &mut Position)>,
     commands: &mut Commands,
 ) {
-    let Ok((_, _, position, mut bounds, .., minimum_height)) = windows.get_mut(entity) else {
+    let Ok((_, _, position, mut bounds, .., (minimum_height, width_limits))) =
+        windows.get_mut(entity)
+    else {
         return;
     };
     let active_strip = workspaces
@@ -1030,6 +1032,14 @@ fn adopt_native_size(
         && let Ok(mut entity_commands) = commands.get_entity(entity)
     {
         entity_commands.try_remove::<MinimumHeight>();
+    }
+    // Likewise for a width past either recorded limit.
+    if let Some(limits) = width_limits
+        && (limits.min.is_some_and(|min| new_frame.width() < min)
+            || limits.max.is_some_and(|max| new_frame.width() > max))
+        && let Ok(mut entity_commands) = commands.get_entity(entity)
+    {
+        entity_commands.try_remove::<WidthLimits>();
     }
     let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
     if old_frame.size() != new_frame.size() {
@@ -1096,14 +1106,21 @@ fn adopt_refused_frame(
     workspaces: &Query<(&LayoutStrip, &mut Position)>,
     commands: &mut Commands,
 ) {
-    let wider = windows
-        .get_mut(entity)
-        .is_ok_and(|(_, window, mut position, mut bounds, ..)| {
+    let wider = windows.get_mut(entity).is_ok_and(
+        |(_, window, mut position, mut bounds, .., (_, limits))| {
             if position.0 != new_frame.min {
                 position.0 = new_frame.min;
             }
-            adopt_refused_size(entity, &window, &mut bounds, new_frame.size(), commands)
-        });
+            adopt_refused_size(
+                entity,
+                &window,
+                &mut bounds,
+                new_frame.size(),
+                limits.copied(),
+                commands,
+            )
+        },
+    );
     if wider
         && let Some(column) = workspaces.iter().find_map(|(strip, _)| {
             strip
