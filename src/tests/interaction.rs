@@ -3890,7 +3890,7 @@ fn test_stack_commands_move_only_the_focused_window() {
 /// Runs the exit cleanup directly. Sending `AppExit` through the full
 /// schedule also runs the state-saving exit systems, which write the real user
 /// state file.
-fn run_exit_cleanup(world: &mut World) {
+pub(super) fn run_exit_cleanup(world: &mut World) {
     use bevy::app::AppExit;
     use bevy::ecs::system::RunSystemOnce as _;
 

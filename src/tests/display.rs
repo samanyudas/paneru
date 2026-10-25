@@ -1323,6 +1323,25 @@ fn display_round_trip_harness(
     })
 }
 
+/// A window open at launch on one display and later moved to another must
+/// stay on the display that now holds it when the engine exits, not jump back
+/// to its frame from before launch.
+#[test]
+fn exit_cleanup_keeps_a_moved_window_on_its_current_display() {
+    let main_bounds = IRect::new(0, 1440, 2048, 2772);
+    let mut harness = pending_display_arrival(MainOptions::default(), 0, 890);
+    harness.advance(Duration::from_secs(3));
+
+    let world = harness.world();
+    super::interaction::run_exit_cleanup(world);
+
+    let frame = harness.mock_state.create_window(0).frame();
+    assert!(
+        main_bounds.contains(frame.min) && main_bounds.contains(frame.max),
+        "exit frame {frame:?} must lie inside the main display {main_bounds:?}"
+    );
+}
+
 fn assert_display_round_trip_refits_source_strip(continuous_swipe: bool) {
     let harness = display_round_trip_harness(
         MainOptions {
