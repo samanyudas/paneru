@@ -1273,3 +1273,65 @@ fn test_width_settlement_unfocused_sibling_refusal_preserves_unequal_heights() {
         assert_eq!(frame.min.x, 312);
     }
 }
+
+/// Stacks window 1 under window 0, leaving window 2 as the next column.
+fn stack_two(harness: &mut TestHarness) {
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    harness.advance(SETTLE);
+}
+
+/// A narrow window that cannot grow, stacked above a wider window, keeps its
+/// own width at the column's left edge. The wider window keeps its width, and
+/// the next column starts after it instead of covering it (#93).
+#[test]
+fn a_window_that_cannot_grow_leaves_its_column_wide() {
+    let mut harness = tall_harness();
+    harness.mock_state.update_window(0, |window| {
+        window.maximum_size = Some(Size::new(300, TALL));
+    });
+    harness.mock_state.update_window(1, |window| {
+        window.minimum_size = Some(Size::new(350, 0));
+    });
+    stack_two(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1]);
+    assert_eq!(frames[0].width(), 300, "{frames:?}");
+    assert_eq!(frames[1].width(), TEST_WINDOW_WIDTH, "{frames:?}");
+    let next = frame(harness.world(), 2);
+    assert_eq!(next.min.x, frames[1].max.x, "{frames:?} then {next:?}");
+
+    // Once the wider window leaves, the column is only as wide as the
+    // narrow window, with no empty space beside it.
+    harness.run(vec![command(Operation::Unstack(Side::East))]);
+    harness.advance(SETTLE);
+    let narrow = frame(harness.world(), 0);
+    let wider = frame(harness.world(), 1);
+    assert_eq!(narrow.width(), 300);
+    assert_eq!(wider.min.x, narrow.max.x, "{narrow:?} then {wider:?}");
+}
+
+/// A fixed-width window stacked under a narrower fixed-width window keeps its
+/// width, and the column reserves it, since neither window can match the other.
+#[test]
+fn a_column_of_fixed_widths_reserves_the_widest() {
+    let mut harness = tall_harness();
+    harness.mock_state.update_window(0, |window| {
+        window.maximum_size = Some(Size::new(300, TALL));
+    });
+    harness.mock_state.update_window(1, |window| {
+        window.minimum_size = Some(Size::new(350, 0));
+        window.maximum_size = Some(Size::new(350, TALL));
+    });
+    stack_two(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1]);
+    assert_eq!(frames[0].width(), 300, "{frames:?}");
+    assert_eq!(frames[1].width(), 350, "{frames:?}");
+    let next = frame(harness.world(), 2);
+    assert_eq!(next.min.x, frames[1].max.x, "{frames:?} then {next:?}");
+}

@@ -27,7 +27,7 @@ use crate::ecs::{
     LayoutPosition, ManualStripOffset, MinimumHeight, MouseHeldMarker, PlaceAfterArrival, Position,
     PresentedOrigin, RefitAfterRemoval, RepositionMarker, ReshuffleAroundMarker, ResizeMarker,
     Scrolling, SelectedVirtualMarker, SkipReshuffle, SpawnCommandsExt, TopBarHeight, TopBarRetry,
-    Unmanaged, VerifyWindowSize, WidthAnchor, WidthRun,
+    Unmanaged, VerifyWindowSize, WidthAnchor, WidthLimits, WidthRun,
 };
 use crate::errors::{Error, Result};
 use crate::events::Event;
@@ -1276,6 +1276,7 @@ impl LayoutStrip {
             get_window_frame,
             &|_| None,
             &|_| FALLBACK_TOP_BAR_HEIGHT,
+            &|_| WidthLimits::default(),
         )
         .into_iter()
     }
@@ -1285,17 +1286,19 @@ impl LayoutStrip {
     /// `get_top_bar_height` the top bar a stack too tall for its column keeps
     /// visible. See [`overlapping_rows`].
     #[instrument(level = Level::TRACE, skip_all, fields(layout_strip_height))]
-    pub fn relative_positions_with_minimums<W, M, T>(
+    pub fn relative_positions_with_minimums<W, M, T, L>(
         &self,
         layout_strip_height: i32,
         get_window_frame: &W,
         get_minimum_height: &M,
         get_top_bar_height: &T,
+        get_width_limits: &L,
     ) -> Vec<(Entity, IRect)>
     where
         W: Fn(Entity) -> Option<IRect>,
         M: Fn(Entity) -> Option<i32>,
         T: Fn(Entity) -> i32,
+        L: Fn(Entity) -> WidthLimits,
     {
         self.column_positions(get_window_frame)
             .filter_map(move |(column, position)| {
@@ -1381,16 +1384,7 @@ impl LayoutStrip {
                     stacked_rows(&heights)
                 };
 
-                // Every window in a column shares the master's (top item's)
-                // width, so a window stacked onto a master of a different width
-                // resizes to match it instead of keeping its own width. This
-                // also matches the column slot width from column_positions,
-                // which is the widest member.
-                let column_width = items
-                    .first()
-                    .and_then(StackItem::top)
-                    .and_then(get_window_frame)
-                    .map(|frame| frame.width())?;
+                let column_width = column_width(&items, get_window_frame, get_width_limits)?;
 
                 let frames = items
                     .into_iter()
@@ -1399,7 +1393,10 @@ impl LayoutStrip {
                         let entity = item.top()?;
                         let mut frame = get_window_frame(entity)?;
                         frame.min.x = position;
-                        frame.max.x = frame.min.x + column_width;
+                        frame.max.x = frame.min.x
+                            + get_width_limits(entity)
+                                .max
+                                .map_or(column_width, |max| max.min(column_width));
 
                         frame.min.y = row.y;
                         frame.max.y = row.y + row.height;
@@ -1572,6 +1569,45 @@ impl std::fmt::Display for LayoutStrip {
 }
 
 /// Deduplicates `entities`, preserving first-seen order.
+/// The width every window in a column shares: the master's (top item's), so a
+/// window stacked onto a master of a different width resizes to match it
+/// instead of keeping its own width. This also matches the column slot width
+/// from `column_positions`, which is the widest member. A member at the widest
+/// width it accepts does not set the column width, and keeps its own width at
+/// the left edge, leaving the rest of the column empty. A member that refused
+/// anything narrower widens the column to its minimum.
+fn column_width<W, L>(
+    items: &[StackItem],
+    get_window_frame: &W,
+    get_width_limits: &L,
+) -> Option<i32>
+where
+    W: Fn(Entity) -> Option<IRect>,
+    L: Fn(Entity) -> WidthLimits,
+{
+    let widths = items
+        .iter()
+        .filter_map(StackItem::top)
+        .filter_map(|entity| {
+            let width = get_window_frame(entity)?.width();
+            let at_widest = get_width_limits(entity).max.is_some_and(|max| width >= max);
+            Some((width, at_widest))
+        })
+        .collect::<Vec<_>>();
+    let width = widths
+        .iter()
+        .find(|(_, at_widest)| !at_widest)
+        .or_else(|| widths.first())
+        .map(|(width, _)| *width)?;
+    Some(
+        items
+            .iter()
+            .flat_map(StackItem::window_iter)
+            .filter_map(|entity| get_width_limits(entity).min)
+            .fold(width, i32::max),
+    )
+}
+
 fn dedup_entities(entities: &[Entity]) -> Vec<Entity> {
     let mut seen = EntityHashSet::default();
     entities
@@ -1905,7 +1941,7 @@ fn refresh_top_bars(
 pub(super) fn layout_strip_changed(
     mut changed_strips: Populated<(&mut LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
     mut windows: WindowFrames,
-    minimum_heights: Query<&MinimumHeight>,
+    size_limits: Query<(Option<&MinimumHeight>, Option<&WidthLimits>)>,
     top_bars: Query<(&Window, Option<&TopBarHeight>, Has<TopBarRetry>)>,
     displays: DisplayViewports,
     config: Res<Config>,
@@ -1923,7 +1959,19 @@ pub(super) fn layout_strip_changed(
             })
             .ok()
     };
-    let get_minimum_height = |entity| minimum_heights.get(entity).ok().map(|m| m.0);
+    let get_minimum_height = |entity| {
+        size_limits
+            .get(entity)
+            .ok()
+            .and_then(|(minimum, _)| minimum.map(|m| m.0))
+    };
+    let get_width_limits = |entity| {
+        size_limits
+            .get(entity)
+            .ok()
+            .and_then(|(_, limits)| limits.copied())
+            .unwrap_or_default()
+    };
     let measured = RefCell::new(Vec::new());
     // A window waiting to retry an unreadable top bar keeps the fallback until
     // `refresh_top_bars` reads it.
@@ -1950,6 +1998,7 @@ pub(super) fn layout_strip_changed(
             &get_window_frame,
             &get_minimum_height,
             &get_top_bar_height,
+            &get_width_limits,
         ));
         // Applied now, so later passes keep the heights it set. Clearing it
         // is bookkeeping, not a layout change.
@@ -1978,8 +2027,10 @@ pub(super) fn layout_strip_changed(
                 // A smaller height is checked once the window settles, so an
                 // app that refuses it has its minimum recorded. Growth is not
                 // checked here: a window that cannot grow gets the height it
-                // has, and checking would relayout it forever.
-                if frame.height() < bounds.0.y
+                // has, and checking would relayout it forever. A width either
+                // way is checked, because the recorded limit keeps the next
+                // pass from asking for it again.
+                if (frame.height() < bounds.0.y || frame.width() != bounds.0.x)
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
                     entity_commands.try_insert(VerifyWindowSize::default());

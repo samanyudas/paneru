@@ -9,6 +9,7 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::state::{
     PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStrip, SavedWindow, SavedWorkspace,
 };
+use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{RestoreWindowState, SpawnWindowTrigger, Unmanaged};
 use crate::events::Event;
@@ -1240,4 +1241,104 @@ fn saved_window(window_id: i32) -> SavedWindow {
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
     }
+}
+
+/// A harness whose floating rule matches window 1, with both windows saved as
+/// tiled, as an engine restart finds them.
+fn restarted_with_floating_rule(overrides: TileOverrides) -> TestHarness {
+    let mut params = WindowParams::new("^Window 1$", Some("test".to_string()));
+    params.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    let world = harness.app.world_mut();
+    world.insert_resource(overrides);
+    world.insert_resource(state_with_strips(vec![SavedStrip {
+        virtual_index: 0,
+        columns: vec![
+            SavedColumn::Single(saved_window(0)),
+            SavedColumn::Single(saved_window(1)),
+        ],
+    }]));
+    for _ in 0..5 {
+        harness.app.update();
+    }
+    harness
+}
+
+fn floats(harness: &mut TestHarness, id: crate::platform::WinID) -> bool {
+    let world = harness.world();
+    let entity = find_window_entity(id, world);
+    matches!(
+        world.entity(entity).get::<Unmanaged>(),
+        Some(Unmanaged::Floating)
+    )
+}
+
+/// Focuses window `id` and toggles it between floating and tiled.
+fn toggle(harness: &mut TestHarness, id: crate::platform::WinID) {
+    harness.mock_state.focus_window(id);
+    harness.advance(Duration::from_millis(500));
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::Manage),
+    }]);
+    harness.advance(Duration::from_millis(500));
+}
+
+/// Toggles window 1 between floating and tiled, then returns the overrides an
+/// engine restart would load.
+fn toggle_window_one(harness: &mut TestHarness, times: usize) -> TileOverrides {
+    for _ in 0..times {
+        toggle(harness, 1);
+    }
+    harness
+        .world()
+        .remove_resource::<TileOverrides>()
+        .expect("overrides")
+}
+
+/// Tiling a window against its floating rule lasts across an engine restart
+/// while the window stays open.
+#[test]
+fn a_window_tiled_against_its_floating_rule_stays_tiled_after_a_restart() {
+    let mut harness = restarted_with_floating_rule(TileOverrides::default());
+    assert!(floats(&mut harness, 1));
+    let overrides = toggle_window_one(&mut harness, 1);
+    assert!(!floats(&mut harness, 1), "the toggle tiles the window");
+
+    let mut restarted = restarted_with_floating_rule(overrides);
+    assert!(!floats(&mut restarted, 1));
+    let world = restarted.world();
+    let entity = find_window_entity(1, world);
+    let mut strips = world.query::<&LayoutStrip>();
+    assert!(strips.iter(world).any(|strip| strip.contains(entity)));
+}
+
+/// Floating the window again ends the override, so the rule applies at the
+/// next restart.
+#[test]
+fn floating_a_window_again_ends_its_override() {
+    let mut harness = restarted_with_floating_rule(TileOverrides::default());
+    let overrides = toggle_window_one(&mut harness, 2);
+    assert!(floats(&mut harness, 1), "the second toggle floats it again");
+
+    let mut restarted = restarted_with_floating_rule(overrides);
+    assert!(floats(&mut restarted, 1));
+}
+
+/// Closing the window ends the override, so a window that later gets the
+/// same number does not inherit it.
+#[test]
+fn closing_a_window_ends_its_override() {
+    let mut harness = restarted_with_floating_rule(TileOverrides::default());
+    toggle(&mut harness, 1);
+    assert!(!floats(&mut harness, 1));
+    harness.mock_state.os_close_window(1);
+    harness.advance(Duration::from_secs(1));
+    let overrides = harness
+        .world()
+        .remove_resource::<TileOverrides>()
+        .expect("overrides");
+
+    let mut restarted = restarted_with_floating_rule(overrides);
+    assert!(floats(&mut restarted, 1));
 }
