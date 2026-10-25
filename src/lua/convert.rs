@@ -554,6 +554,7 @@ mod tests {
                 modifiers: Modifiers::ALT,
                 button: crate::events::MouseButton::Left,
                 window_id: None,
+                clicks: 1,
             },
         )
         .expect("mouse_down should marshal");

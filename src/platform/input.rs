@@ -434,6 +434,10 @@ impl InputHandler {
                     modifiers,
                     button,
                     window_id: WinID::try_from(window_id).ok().filter(|id| *id != 0),
+                    clicks: CGEvent::integer_value_field(
+                        Some(event),
+                        CGEventField::MouseEventClickState,
+                    ),
                 })
             }
             CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {

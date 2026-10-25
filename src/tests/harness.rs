@@ -276,6 +276,7 @@ fn setup_world() -> App {
         .insert_resource(LaunchWindows::default())
         .add_plugins(MouseEventsPlugin)
         .add_plugins(DragEventsPlugin)
+        .add_plugins(crate::ecs::maximize::MaximizePlugin)
         .add_plugins(ScrollEventsPlugin)
         .add_plugins(WorkspaceEventsPlugin)
         .add_plugins(LayoutEventsPlugin)

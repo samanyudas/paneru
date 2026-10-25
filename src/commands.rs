@@ -4,7 +4,7 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Has, With};
+use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_changed};
 use bevy::ecs::system::{Commands, ParamSet, Query, Res, ResMut, Single};
@@ -24,6 +24,7 @@ use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, anchored_origin, clamp_origin_to_viewport,
     effective_stack_limit, hold_minimum_heights, strip_signature,
 };
+use crate::ecs::maximize::Maximized;
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowCtx, Windows};
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::{
@@ -854,7 +855,7 @@ type WidthWork<'w, 's> = Query<
 #[allow(clippy::too_many_lines)]
 fn resize_window(
     mut messages: MessageReader<Event>,
-    mut ctx: ParamSet<(WindowCtx, Query<&mut Window>)>,
+    mut ctx: ParamSet<(WindowCtx, Query<&mut Window, Without<Maximized>>)>,
     engine_work: WidthWork,
     runs: Query<&WidthRun>,
     interrupted: Res<WidthBatchInterrupted>,

@@ -1,9 +1,10 @@
 use accessibility_sys::{
-    AXUIElementCreateApplication, AXUIElementRef, AXValueCreate, AXValueGetValue,
-    kAXChildrenAttribute, kAXCloseButtonAttribute, kAXErrorAttributeUnsupported, kAXErrorNoValue,
-    kAXErrorNotImplemented, kAXErrorSuccess, kAXFloatingWindowSubrole, kAXPositionAttribute,
-    kAXRaiseAction, kAXRoleAttribute, kAXSizeAttribute, kAXStandardWindowSubrole, kAXToolbarRole,
-    kAXUnknownRole, kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
+    AXUIElementCopyElementAtPosition, AXUIElementCreateApplication, AXUIElementRef, AXValueCreate,
+    AXValueGetValue, kAXChildrenAttribute, kAXCloseButtonAttribute, kAXErrorAttributeUnsupported,
+    kAXErrorNoValue, kAXErrorNotImplemented, kAXErrorSuccess, kAXFloatingWindowSubrole,
+    kAXParentAttribute, kAXPositionAttribute, kAXRaiseAction, kAXRoleAttribute, kAXSizeAttribute,
+    kAXStandardWindowSubrole, kAXToolbarRole, kAXUnknownRole, kAXUnknownSubrole,
+    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
 };
 use bevy::ecs::component::Component;
 use bevy::math::{IRect, IVec2};
@@ -459,6 +460,10 @@ pub trait WindowApi: Send + Sync {
     /// the top bar was read, so the caller tries again later rather than
     /// keeping a top bar that is missing a toolbar.
     fn top_bar_height(&self) -> Result<Option<i32>>;
+    /// Whether the element at `point` is a control, such as a button, tab,
+    /// or text field, or lies inside one. The bar around the controls is not
+    /// a control. An error when Accessibility cannot name the element.
+    fn control_at(&self, point: Origin) -> Result<bool>;
 }
 
 #[derive(Component, Deref, DerefMut)]
@@ -587,6 +592,31 @@ const TOP_BAR_LEAF_ROLES: [&str; 12] = [
     "AXTextArea",
     "AXTextField",
     "AXWebArea",
+];
+
+/// How many levels above the pressed element [`WindowApi::control_at`] looks
+/// for a control, so text inside a tab or button counts as that control.
+const CONTROL_SEARCH_DEPTH: usize = 6;
+/// Roles a press in a top bar acts on, so a double-click there is the
+/// control's own and does not maximize the window.
+const CONTROL_ROLES: [&str; 17] = [
+    "AXButton",
+    "AXCheckBox",
+    "AXComboBox",
+    "AXDisclosureTriangle",
+    "AXIncrementor",
+    "AXLink",
+    "AXMenuBar",
+    "AXMenuBarItem",
+    "AXMenuButton",
+    "AXMenuItem",
+    "AXPopUpButton",
+    "AXRadioButton",
+    "AXSlider",
+    "AXSplitter",
+    "AXTextArea",
+    "AXTextField",
+    "AXValueIndicator",
 ];
 
 /// The Accessibility reads a top bar measurement makes. `Ok(None)` means the
@@ -1253,6 +1283,38 @@ impl WindowApi for WindowOS {
 
     fn top_bar_height(&self) -> Result<Option<i32>> {
         measure_top_bar(&AxTopBarTree, &self.ax_element)
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "screen coordinates are far below f32's exact integer range"
+    )]
+    fn control_at(&self, point: Origin) -> Result<bool> {
+        let app = AXUIWrapper::from_retained(unsafe { AXUIElementCreateApplication(self.pid()?) })?;
+        let mut pressed: AXUIElementRef = null_mut();
+        unsafe {
+            AXUIElementCopyElementAtPosition(
+                app.as_ptr(),
+                point.x as f32,
+                point.y as f32,
+                &raw mut pressed,
+            )
+        }
+        .to_result(function_name!())?;
+        let mut element = AXUIWrapper::from_retained(pressed)?;
+        for _ in 0..CONTROL_SEARCH_DEPTH {
+            match AxTopBarTree.role(&element)?.as_deref() {
+                Some(role) if CONTROL_ROLES.contains(&role) => return Ok(true),
+                Some(role) if role == kAXWindowRole => return Ok(false),
+                _ => {}
+            }
+            let Some(parent) = AxTopBarTree::read::<AXUIWrapper>(&element, kAXParentAttribute)?
+            else {
+                return Ok(false);
+            };
+            element = parent;
+        }
+        Ok(false)
     }
 }
 

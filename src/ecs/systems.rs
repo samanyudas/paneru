@@ -30,6 +30,7 @@ use crate::ecs::drag::{
     DragOverlayHandle, NativeFrame, NativeResizeStart, TilingRestore, tiled_in,
 };
 use crate::ecs::layout::{Column, LayoutStrip};
+use crate::ecs::maximize::{FrameHold, Maximized};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
 use crate::ecs::{
@@ -69,7 +70,7 @@ type NativeFrameWindows<'w, 's> = Query<
         Has<RepositionMarker>,
         (Option<&'static MinimumHeight>, Option<&'static WidthLimits>),
     ),
-    Without<LayoutStrip>,
+    (Without<LayoutStrip>, Without<Maximized>, Without<FrameHold>),
 >;
 
 type ChangedWindowFrames<'w, 's> = Populated<
@@ -81,7 +82,7 @@ type ChangedWindowFrames<'w, 's> = Populated<
         Option<Ref<'static, Bounds>>,
         Option<&'static mut WidthRatio>,
     ),
-    Or<(Changed<Position>, Changed<Bounds>)>,
+    (Or<(Changed<Position>, Changed<Bounds>)>, Without<Maximized>),
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
@@ -1388,7 +1389,10 @@ pub(super) fn commit_window_frame(
 
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn verify_window_position(
-    mut windows: Populated<(Entity, &mut Window, &Position, &mut VerifyWindowPosition)>,
+    mut windows: Populated<
+        (Entity, &mut Window, &Position, &mut VerifyWindowPosition),
+        Without<Maximized>,
+    >,
     mut commands: Commands,
 ) {
     for (entity, mut window, position, mut verification) in &mut windows {

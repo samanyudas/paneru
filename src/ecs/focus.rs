@@ -23,6 +23,7 @@ use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, Ver
 use crate::config::Config;
 use crate::ecs::drag::DragState;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
+use crate::ecs::maximize::Maximized;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
@@ -268,7 +269,7 @@ fn shares_a_tab_group(
 #[instrument(level = Level::DEBUG, skip_all, fields(focused))]
 pub(super) fn fix_window_size_on_focus(
     focused: Single<(Entity, Has<RefreshWindowSizeOnFocus>), Added<FocusedMarker>>,
-    mut windows: Query<(&mut Window, &mut Bounds, Has<ResizeMarker>)>,
+    mut windows: Query<(&mut Window, &mut Bounds, Has<ResizeMarker>), Without<Maximized>>,
     mut commands: Commands,
 ) {
     let (entity, verify_size) = *focused;

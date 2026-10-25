@@ -145,6 +145,9 @@ pub enum Event {
         /// press, if it named one. A lookup when the press is handled can
         /// find another window, because the pressed one may have moved.
         window_id: Option<WinID>,
+        /// Which click of a rapid series this press is: 1 for a single
+        /// click, 2 for the second press of a double-click.
+        clicks: i64,
     },
     /// A mouse up event has occurred.
     MouseUp {

@@ -25,6 +25,7 @@ use super::{
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, ExposeFocusedSurvivorAfterRemoval, LayoutStrip, anchored_origin};
+use crate::ecs::maximize::Maximized;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::tile_overrides::TileOverrides;
@@ -62,6 +63,7 @@ type SizeCheckReady = (
     Without<ResizeMarker>,
     Without<RepositionMarker>,
     Without<AwaitingHandle>,
+    Without<Maximized>,
 );
 
 type AddedWindowDefaults<'w, 's> = Populated<
@@ -1634,6 +1636,7 @@ type NativeSizeWindows<'w, 's> = Query<
         Ref<'static, Position>,
         &'static mut Bounds,
     ),
+    Without<Maximized>,
 >;
 
 #[derive(SystemParam)]
