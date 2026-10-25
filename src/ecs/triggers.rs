@@ -32,7 +32,7 @@ use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LaunchWindows, LayoutPosition,
     MinimumHeight, PendingWidthSettlement, Position, PreLaunchFrame, RepositionMarker,
     ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    StepPartners, VerifyWindowPosition, VerifyWindowSize, WidthRatio, WidthRun,
+    StepPartners, VerifyWindowPosition, VerifyWindowSize, WidthLimits, WidthRatio, WidthRun,
     WidthSettlementPhase, WindowProperties,
 };
 use crate::events::{DestroySource, Event};
@@ -1633,6 +1633,7 @@ pub(super) struct SizeVerification<'w, 's> {
     windows: NativeSizeWindows<'w, 's>,
     layout_strips: Query<'w, 's, &'static LayoutStrip>,
     resizes: Query<'w, 's, &'static ResizeMarker>,
+    width_limits: Query<'w, 's, &'static WidthLimits>,
     native_resizes: Query<'w, 's, &'static crate::ecs::drag::NativeResizeStart>,
     step_partners: Query<'w, 's, &'static StepPartners>,
     time: Res<'w, Time>,
@@ -1703,7 +1704,7 @@ pub(super) fn window_resize_verifier(
         }
         let now = verification.time.elapsed();
         if request
-            .taller_since
+            .mismatched_since
             .is_some_and(|since| now < since + LATE_RESIZE_GRACE)
         {
             continue;
@@ -1715,14 +1716,16 @@ pub(super) fn window_resize_verifier(
                 continue;
             }
         }
-        // A window still taller than asked for may not have applied the size
-        // yet, so it is read again before its height counts as a minimum.
-        if request.taller_since.is_none()
-            && frame
-                .as_ref()
-                .is_ok_and(|frame| fuzzy_equal(frame.height(), bounds.0.y) == Ordering::Less)
+        // A window still taller than asked for, or of another width, may not
+        // have applied the size yet, so it is read again before the size
+        // counts as a limit.
+        if request.mismatched_since.is_none()
+            && frame.as_ref().is_ok_and(|frame| {
+                fuzzy_equal(frame.height(), bounds.0.y) == Ordering::Less
+                    || fuzzy_equal(frame.width(), bounds.0.x) != Ordering::Equal
+            })
         {
-            request.taller_since = Some(now);
+            request.mismatched_since = Some(now);
             continue;
         }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -1747,7 +1750,8 @@ impl SizeVerification<'_, '_> {
             return;
         };
         let asked = bounds.0.y;
-        let wider = adopt_refused_size(entity, &window, &mut bounds, actual_size, commands);
+        let limits = self.width_limits.get(entity).ok().copied();
+        let wider = adopt_refused_size(entity, &window, &mut bounds, actual_size, limits, commands);
         let refused = bounds.0.y - asked;
         self.return_refused_step(entity, refused, commands);
         if !wider {
@@ -1823,6 +1827,7 @@ pub(crate) fn adopt_refused_size(
     window: &Window,
     bounds: &mut Mut<Bounds>,
     actual_size: Size,
+    window_limits: Option<WidthLimits>,
     commands: &mut Commands,
 ) -> bool {
     let expected_size = bounds.0;
@@ -1839,10 +1844,19 @@ pub(crate) fn adopt_refused_size(
         actual_size
     );
     bounds.0 = actual_size;
-    if height_ord == Ordering::Less
-        && let Ok(mut entity_commands) = commands.get_entity(entity)
-    {
-        entity_commands.try_insert(MinimumHeight(actual_size.y));
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        if height_ord == Ordering::Less {
+            entity_commands.try_insert(MinimumHeight(actual_size.y));
+        }
+        if width_ord != Ordering::Equal {
+            let mut limits = window_limits.unwrap_or_default();
+            if width_ord == Ordering::Less {
+                limits.min = Some(actual_size.x);
+            } else {
+                limits.max = Some(actual_size.x);
+            }
+            entity_commands.try_insert(limits);
+        }
     }
     width_ord == Ordering::Less
 }
@@ -2114,8 +2128,13 @@ mod tests {
         let verifier = harness
             .world()
             .register_system(super::window_resize_verifier);
-        for _ in 0..3 {
+        // The fourth pass reads the width again after the late-resize grace.
+        for _ in 0..4 {
             harness.world().run_system(verifier).unwrap();
+            harness
+                .world()
+                .resource_mut::<Time>()
+                .advance_by(super::LATE_RESIZE_GRACE);
         }
         assert_eq!(
             harness

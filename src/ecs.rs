@@ -501,6 +501,16 @@ pub struct LaunchWindows(pub std::collections::HashSet<WinID>);
 #[derive(Component, Clone, Copy, Debug)]
 pub struct MinimumHeight(pub i32);
 
+/// The narrowest and widest widths a window has accepted, each learned when
+/// it refused a width past it. A column reserves the widest minimum among its
+/// members, and a member that cannot grow keeps its own width at the column's
+/// left edge, leaving the rest of the column empty.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct WidthLimits {
+    pub min: Option<i32>,
+    pub max: Option<i32>,
+}
+
 /// The stacked windows that took part in a height step with this window, the
 /// window that stepped or one it took height from or gave height to, each with
 /// the height it received, negative when it gave. A part of the step this
@@ -710,15 +720,16 @@ impl PendingWidthSettlement {
 #[derive(Component)]
 pub struct VerifyWindowSize {
     remaining: u8,
-    /// When a readback first showed the window taller than asked for.
-    taller_since: Option<Duration>,
+    /// When a readback first showed the window taller than asked for, or of
+    /// another width.
+    mismatched_since: Option<Duration>,
 }
 
 impl Default for VerifyWindowSize {
     fn default() -> Self {
         Self {
             remaining: 3,
-            taller_since: None,
+            mismatched_since: None,
         }
     }
 }
