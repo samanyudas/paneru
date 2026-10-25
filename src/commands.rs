@@ -28,8 +28,8 @@ use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowCtx, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, FullWidthMarker, ManualStripOffset,
     MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, RaiseWindow,
-    SelectedVirtualMarker, SpawnCommandsExt, Timeout, Unmanaged, VerifyWindowSize, WidthAnchor,
-    WidthRun,
+    SelectedVirtualMarker, SpawnCommandsExt, StepPartners, Timeout, Unmanaged, VerifyWindowSize,
+    WidthAnchor, WidthRun,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Size, Window, WindowManager, origin_from};
@@ -1022,6 +1022,7 @@ fn resize_window_vertical(
     windows: Windows,
     active_display: ActiveDisplay,
     minimum_heights: Query<&MinimumHeight>,
+    step_partners: Query<&StepPartners>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -1128,9 +1129,24 @@ fn resize_window_vertical(
     // survive `binpack_heights`, which hands the column's last item the
     // remainder.
     let new_heights = stepped_heights(&heights, &floors, position, new_height);
+    // A step the window has not confirmed yet, such as while the key is held,
+    // still counts: the window may refuse both at once.
+    let mut partners = step_partners
+        .get(entity)
+        .map(|partners| partners.0.clone())
+        .unwrap_or_default();
     for (index, item) in items.iter().enumerate() {
         if index != position && new_heights[index] == heights[index] {
             continue;
+        }
+        if index != position
+            && let Some(top) = item.top()
+        {
+            let moved = new_heights[index] - heights[index];
+            match partners.iter_mut().find(|(partner, _)| *partner == top) {
+                Some((_, total)) => *total += moved,
+                None => partners.push((top, moved)),
+            }
         }
         for entity in item.window_iter() {
             if let Some(size) = windows
@@ -1146,6 +1162,11 @@ fn resize_window_vertical(
                 commands.resize_entity(entity, size);
             }
         }
+    }
+    if !partners.is_empty()
+        && let Ok(mut entity_commands) = commands.get_entity(entity)
+    {
+        entity_commands.try_insert(StepPartners(partners));
     }
 }
 

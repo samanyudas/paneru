@@ -32,8 +32,8 @@ use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LaunchWindows, LayoutPosition,
     MinimumHeight, PendingWidthSettlement, Position, PreLaunchFrame, RepositionMarker,
     ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    VerifyWindowPosition, VerifyWindowSize, WidthRatio, WidthRun, WidthSettlementPhase,
-    WindowProperties,
+    StepPartners, VerifyWindowPosition, VerifyWindowSize, WidthRatio, WidthRun,
+    WidthSettlementPhase, WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -1634,7 +1634,17 @@ pub(super) struct SizeVerification<'w, 's> {
     layout_strips: Query<'w, 's, &'static LayoutStrip>,
     resizes: Query<'w, 's, &'static ResizeMarker>,
     native_resizes: Query<'w, 's, &'static crate::ecs::drag::NativeResizeStart>,
+    step_partners: Query<'w, 's, &'static StepPartners>,
     time: Res<'w, Time>,
+}
+
+pub(super) fn drop_step_partners_trigger(
+    trigger: On<Remove, VerifyWindowSize>,
+    mut commands: Commands,
+) {
+    if let Ok(mut entity_commands) = commands.get_entity(trigger.entity) {
+        entity_commands.try_remove::<StepPartners>();
+    }
 }
 
 /// How long a window may stay taller than the engine asked for before its
@@ -1717,7 +1727,11 @@ impl SizeVerification<'_, '_> {
         let Ok((window, _, mut bounds)) = self.windows.get_mut(entity) else {
             return;
         };
-        if !adopt_refused_size(entity, &window, &mut bounds, actual_size, commands) {
+        let asked = bounds.0.y;
+        let wider = adopt_refused_size(entity, &window, &mut bounds, actual_size, commands);
+        let refused = bounds.0.y - asked;
+        self.return_refused_step(entity, refused, commands);
+        if !wider {
             return;
         }
         let Some(column) = self.layout_strips.iter().find_map(|strip| {
@@ -1735,6 +1749,35 @@ impl SizeVerification<'_, '_> {
             |sibling| self.resizes.get(sibling).ok().map(|resize| resize.0.y),
             commands,
         );
+    }
+
+    /// Gives the `refused` part of a height step on `entity` back to the
+    /// windows the step moved height to or from, up to what each moved.
+    fn return_refused_step(&mut self, entity: Entity, mut refused: i32, commands: &mut Commands) {
+        let Ok(partners) = self.step_partners.get(entity) else {
+            return;
+        };
+        for &(partner, moved) in &partners.0 {
+            let back = if refused > 0 {
+                refused.min(moved).max(0)
+            } else {
+                refused.max(moved).min(0)
+            };
+            if back == 0 {
+                continue;
+            }
+            refused -= back;
+            if let Ok(resize) = self.resizes.get(partner) {
+                commands.resize_entity(partner, resize.0.with_y(resize.0.y - back));
+            } else if let Ok((_, _, mut bounds)) = self.windows.get_mut(partner) {
+                bounds.0.y -= back;
+                if back > 0
+                    && let Ok(mut entity_commands) = commands.get_entity(partner)
+                {
+                    entity_commands.try_insert(VerifyWindowSize::default());
+                }
+            }
+        }
     }
 
     fn read_column(&mut self, members: &[Entity], commands: &mut Commands) -> bool {
