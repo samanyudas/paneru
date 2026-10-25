@@ -304,6 +304,63 @@ fn test_startup_restore_preserves_saved_display_when_present() {
         .run(commands);
 }
 
+/// After a restart with focus on another display, the restored visible row on
+/// the external display shows its windows right away instead of waiting off
+/// screen until that display gets focus.
+#[test]
+fn test_startup_restore_shows_visible_strip_on_an_unfocused_display() {
+    let mut harness = TestHarness::new();
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let origin = Origin::new(0, -TEST_WINDOW_HEIGHT);
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        EXT_WORKSPACE_ID,
+        300,
+        IRect::from_corners(origin, origin + size),
+    );
+
+    harness.world().insert_resource(PaneruState {
+        version: 2,
+        timestamp: 123_456_789,
+        active_display_id: Some(EXT_DISPLAY_ID),
+        displays: vec![
+            saved_display(EXT_DISPLAY_ID, true),
+            saved_display(TEST_DISPLAY_ID, false),
+        ],
+        workspaces: vec![SavedWorkspace {
+            workspace_id: EXT_WORKSPACE_ID,
+            display_id: Some(EXT_DISPLAY_ID),
+            active_virtual_index: Some(0),
+            strips: vec![SavedStrip {
+                virtual_index: 0,
+                columns: vec![SavedColumn::Single(saved_window(300))],
+            }],
+        }],
+    });
+
+    harness
+        .on_iteration(0, |world, state| {
+            let ext_bounds = world
+                .query::<&Display>()
+                .iter(world)
+                .find(|display| display.id() == EXT_DISPLAY_ID)
+                .expect("external display exists")
+                .bounds();
+            let frame = state.create_window(300).frame();
+            assert!(
+                ext_bounds.contains(frame.min) && ext_bounds.contains(frame.max),
+                "window frame {frame:?} must be inside the external display {ext_bounds:?}"
+            );
+        })
+        .run(vec![Event::MenuOpened { window_id: 100 }]);
+}
+
 #[test]
 fn test_startup_restore_keeps_current_native_workspace_active_across_multiple_workspaces() {
     let mut harness = TestHarness::new();
