@@ -303,6 +303,15 @@ impl NativeResizeStart {
         matches!(self.phase, Phase::Holding { until } if now < until).then_some(self.size)
     }
 
+    /// This tile restore, aimed at the slot `origin` and `size` instead.
+    pub(crate) fn retarget(self, origin: Origin, size: IVec2) -> Self {
+        Self {
+            origin,
+            size,
+            ..self
+        }
+    }
+
     /// Whether macOS tiled the window and the engine is putting it back.
     pub(crate) fn restores_tile(&self) -> bool {
         matches!(self.phase, Phase::Holding { .. })

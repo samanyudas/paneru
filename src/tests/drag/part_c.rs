@@ -622,6 +622,13 @@ fn a_drag_that_macos_tiles_at_a_screen_edge_returns_to_its_column() {
         let start = press_and_drag(&mut harness, 1, to);
         release(&mut harness, to);
         macos_tile(&mut harness, 1, tile);
+        // macOS finishes the tile after the undo sent the window home.
+        let home = frame(harness.world(), 1).min;
+        macos_tile(
+            &mut harness,
+            1,
+            IRect::from_corners(home, home + tile.size()),
+        );
         harness.advance(SETTLE);
         assert_eq!(
             layout(harness.world()),

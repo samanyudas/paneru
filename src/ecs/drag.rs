@@ -43,11 +43,11 @@ use crate::ecs::layout::{Column, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, effective
 use crate::ecs::native_membership::NativeMembership;
 use crate::ecs::{
     Bounds, FocusedMarker, FullWidthMarker, Initializing, LayoutPosition, ManualStripOffset,
-    Position, PresentedOrigin, RepositionMarker, ResizeMarker, Scrolling, SpawnCommandsExt,
-    TopBarHeight, Unmanaged,
+    Position, PresentedOrigin, RepositionMarker, Scrolling, SpawnCommandsExt, TopBarHeight,
+    Unmanaged,
 };
 use crate::events::{Event, MouseButton};
-use crate::manager::{Display, Window, WindowManager, origin_from};
+use crate::manager::{Display, Origin, Window, WindowManager, origin_from};
 
 /// How far the pointer must move from the press before a drag can start.
 const DRAG_THRESHOLD: i32 = 4;
@@ -546,6 +546,8 @@ struct Undo {
     strip: Entity,
     layout: LayoutStrip,
     sizes: Vec<(Entity, IVec2)>,
+    /// Where the window was shown before the drop.
+    origin: Origin,
 }
 
 /// What the ECS side has to do after a step.
@@ -1187,7 +1189,7 @@ pub(super) fn drag_events(
         for DragEffect::Drop { window, target } in effects {
             debug!("dropping {window} at {target:?}");
             let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
-            undo.0 = undo_for(window, target, now, &moves, &placements);
+            undo.0 = undo_for(window, target, now, &moves, &placements, &presented);
             apply_drop(
                 window,
                 target,
@@ -1652,6 +1654,7 @@ fn undo_for(
     now: Duration,
     moves: &DisplayMoves,
     placements: &Placements,
+    presented: &Presented,
 ) -> Option<Undo> {
     let (strip, layout, _, parent, _) = moves
         .strips
@@ -1676,6 +1679,7 @@ fn undo_for(
         strip,
         layout: layout.clone(),
         sizes,
+        origin: presented.get(window).ok()?.0.0,
     })
 }
 
@@ -1697,17 +1701,19 @@ pub(super) fn undo_tiled_drop(
         undo.0 = None;
         return;
     }
-    if !tiles
+    let Some(&start) = tiles
         .get(pending.window)
-        .is_ok_and(NativeResizeStart::restores_tile)
-    {
+        .ok()
+        .filter(|start| start.restores_tile())
+    else {
         return;
-    }
+    };
     let Some(Undo {
         window,
         strip,
         layout,
         sizes,
+        origin,
         ..
     }) = undo.0.take()
     else {
@@ -1725,14 +1731,24 @@ pub(super) fn undo_tiled_drop(
         return;
     }
     *current = layout;
+    let mut home = None;
     for (entity, size) in sizes {
         if let Ok((mut position, mut bounds)) = placements.get_mut(entity) {
             bounds.0 = size;
             position.set_changed();
         }
+        if entity == window {
+            home = Some(size);
+        }
     }
-    if let Ok(mut entity_commands) = commands.get_entity(window) {
-        entity_commands.try_remove::<(NativeResizeStart, RepositionMarker, ResizeMarker)>();
+    // The tile restore goes on, now for the window's own slot, so a tile
+    // that macOS finishes after the undo still goes back there.
+    if let Some(size) = home {
+        commands.reposition_entity(window, origin);
+        commands.resize_entity(window, size);
+        if let Ok(mut entity_commands) = commands.get_entity(window) {
+            entity_commands.try_insert(start.retarget(origin, size));
+        }
     }
     commands.ensure_visible(window);
     commands.focus_entity(window, false);
