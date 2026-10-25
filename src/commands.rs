@@ -1010,8 +1010,8 @@ fn step_ratio(ratio: f64, direction: ResizeDirection, step: f64, maximum: f64) -
 }
 
 /// Cycles the focused window's height through `preset_stack_heights`, or
-/// changes it by one `window_resize_step` of the display height, letting the
-/// neighbour below (or above, when the window is last) absorb the difference.
+/// changes it by one `window_resize_step` of the display height. See
+/// [`stepped_heights`] for which windows absorb the difference.
 ///
 /// Only stacks are eligible: `binpack_heights` stretches a column's lone member
 /// to the full strip height, so a height written anywhere else is overwritten on
@@ -1054,53 +1054,50 @@ fn resize_window_vertical(
     let Some(position) = items.iter().position(|item| item.contains(entity)) else {
         return;
     };
-    let neighbour = if position + 1 < items.len() {
-        position + 1
-    } else if position > 0 {
-        position - 1
-    } else {
-        return;
-    };
-
     // Pending resizes count: holding the key down must keep advancing through
     // the presets instead of re-reading a mid-animation height.
-    let Some((frame, neighbour_frame)) = items[position]
-        .top()
-        .and_then(|entity| windows.moving_frame(entity))
-        .zip(
-            items[neighbour]
-                .top()
-                .and_then(|entity| windows.moving_frame(entity)),
-        )
+    let Some(heights) = items
+        .iter()
+        .map(|item| {
+            item.top()
+                .and_then(|entity| windows.moving_frame(entity))
+                .map(|frame| frame.height())
+        })
+        .collect::<Option<Vec<_>>>()
     else {
         return;
     };
 
     // A height an app is known to refuse is never asked for: the layout
     // would hold the window at its minimum while the resize kept pulling it.
-    let floor = |item: &StackItem| {
-        item.top()
-            .and_then(|entity| minimum_heights.get(entity).ok())
-            .map_or(MIN_WINDOW_HEIGHT, |minimum| {
-                minimum.0.max(MIN_WINDOW_HEIGHT)
-            })
-    };
-    let (floor, neighbour_floor) = (floor(&items[position]), floor(&items[neighbour]));
-    let pair = frame.height() + neighbour_frame.height();
-    if pair < floor + neighbour_floor {
+    let floors = items
+        .iter()
+        .map(|item| {
+            item.top()
+                .and_then(|entity| minimum_heights.get(entity).ok())
+                .map_or(MIN_WINDOW_HEIGHT, |minimum| {
+                    minimum.0.max(MIN_WINDOW_HEIGHT)
+                })
+        })
+        .collect::<Vec<_>>();
+    if items.len() < 2 || heights.iter().sum::<i32>() < floors.iter().sum::<i32>() {
         return;
     }
+    let room = (0..items.len())
+        .filter(|index| *index != position)
+        .map(|index| (heights[index] - floors[index]).max(0))
+        .sum::<i32>();
 
     let viewport = active_display.actual_bounds(&config);
-    let current_ratio = f64::from(frame.height()) / f64::from(viewport.height());
-    let heights = config.preset_stack_heights();
-    let fallback = *heights.first().unwrap_or(&0.5);
+    let current_ratio = f64::from(heights[position]) / f64::from(viewport.height());
+    let presets = config.preset_stack_heights();
+    let fallback = *presets.first().unwrap_or(&0.5);
     let cycle = config.window_resize_cycle();
     // The presets are assumed sorted ascending, and the `0.05` dead-band keeps
     // float noise from re-selecting the preset the window is already at.
     let next_ratio = match direction {
         _ if stepped => step_ratio(current_ratio, direction, config.window_resize_step(), 1.0),
-        ResizeDirection::Grow => heights
+        ResizeDirection::Grow => presets
             .iter()
             .copied()
             .find(|&r| r > current_ratio + 0.05)
@@ -1108,33 +1105,38 @@ fn resize_window_vertical(
                 if cycle {
                     fallback
                 } else {
-                    *heights.last().unwrap_or(&fallback)
+                    *presets.last().unwrap_or(&fallback)
                 }
             }),
-        ResizeDirection::Shrink => heights
+        ResizeDirection::Shrink => presets
             .iter()
             .rev()
             .copied()
             .find(|&r| r < current_ratio - 0.05)
             .unwrap_or_else(|| {
                 if cycle {
-                    *heights.last().unwrap_or(&fallback)
+                    *presets.last().unwrap_or(&fallback)
                 } else {
                     fallback
                 }
             }),
     };
-    let new_height =
-        round_px(next_ratio * f64::from(viewport.height())).clamp(floor, pair - neighbour_floor);
+    let new_height = round_px(next_ratio * f64::from(viewport.height()))
+        .clamp(floors[position], heights[position] + room);
 
-    // Leaving the pair's total untouched is what makes the new height survive
-    // `binpack_heights`, which hands the column's last item the remainder.
-    for (item, height) in [
-        (&items[position], new_height),
-        (&items[neighbour], pair - new_height),
-    ] {
+    // Leaving the column's total untouched is what makes the new height
+    // survive `binpack_heights`, which hands the column's last item the
+    // remainder.
+    let new_heights = stepped_heights(&heights, &floors, position, new_height);
+    for (index, item) in items.iter().enumerate() {
+        if index != position && new_heights[index] == heights[index] {
+            continue;
+        }
         for entity in item.window_iter() {
-            if let Some(size) = windows.size(entity).map(|size| size.with_y(height)) {
+            if let Some(size) = windows
+                .size(entity)
+                .map(|size| size.with_y(new_heights[index]))
+            {
                 if size.x > 0
                     && size.y > 0
                     && let Ok(mut cmds) = commands.get_entity(entity)
@@ -1145,6 +1147,33 @@ fn resize_window_vertical(
             }
         }
     }
+}
+
+/// A stacked column's `heights` once the window at `position` takes
+/// `height`. A shrink goes to the nearest window, the one below first. A grow
+/// takes from the nearest windows first, each down to its floor in `floors`,
+/// so a neighbour at its minimum does not stop it.
+fn stepped_heights(heights: &[i32], floors: &[i32], position: usize, height: i32) -> Vec<i32> {
+    let nearest = (1..heights.len())
+        .flat_map(|distance| [Some(position + distance), position.checked_sub(distance)])
+        .flatten()
+        .filter(|index| *index < heights.len());
+    let mut stepped = heights.to_vec();
+    stepped[position] = height;
+    let mut change = height - heights[position];
+    for index in nearest {
+        if change == 0 {
+            break;
+        }
+        let given = if change < 0 {
+            change
+        } else {
+            change.min((heights[index] - floors[index]).max(0))
+        };
+        stepped[index] -= given;
+        change -= given;
+    }
+    stepped
 }
 
 fn full_width_window(
