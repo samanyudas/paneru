@@ -10,14 +10,14 @@ use crate::ecs::state::{
     PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStrip, SavedWindow, SavedWorkspace,
 };
 use crate::ecs::workspace::PreviousStripPosition;
-use crate::ecs::{SpawnWindowTrigger, Unmanaged};
+use crate::ecs::{RestoreWindowState, SpawnWindowTrigger, Unmanaged};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size};
 use crate::platform::{ProcessSerialNumber, WorkspaceId};
 use crate::tests::{
-    EXT_DISPLAY_HEIGHT, EXT_DISPLAY_ID, EXT_DISPLAY_WIDTH, EXT_WORKSPACE_ID, TEST_DISPLAY_HEIGHT,
-    TEST_DISPLAY_ID, TEST_DISPLAY_WIDTH, TEST_MENUBAR_HEIGHT, TEST_PROCESS_ID, TEST_WINDOW_HEIGHT,
-    TEST_WINDOW_WIDTH, TEST_WORKSPACE_ID, TestHarness, find_window_entity,
+    EXT_DISPLAY_HEIGHT, EXT_DISPLAY_ID, EXT_DISPLAY_WIDTH, EXT_WORKSPACE_ID, MockState,
+    TEST_DISPLAY_HEIGHT, TEST_DISPLAY_ID, TEST_DISPLAY_WIDTH, TEST_MENUBAR_HEIGHT, TEST_PROCESS_ID,
+    TEST_WINDOW_HEIGHT, TEST_WINDOW_WIDTH, TEST_WORKSPACE_ID, TestHarness, find_window_entity,
 };
 
 #[test]
@@ -359,6 +359,124 @@ fn test_startup_restore_shows_visible_strip_on_an_unfocused_display() {
             );
         })
         .run(vec![Event::MenuOpened { window_id: 100 }]);
+}
+
+/// The restored visible row on an unfocused display sits inside the display's
+/// padding, where the layout puts every other row.
+#[test]
+fn test_startup_restore_pads_visible_strip_on_an_unfocused_display() {
+    let mut harness = TestHarness::new().with_config(padded_config());
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let origin = Origin::new(0, -TEST_WINDOW_HEIGHT);
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        EXT_WORKSPACE_ID,
+        300,
+        IRect::from_corners(origin, origin + size),
+    );
+
+    harness.world().insert_resource(PaneruState {
+        version: 2,
+        timestamp: 123_456_789,
+        active_display_id: Some(EXT_DISPLAY_ID),
+        displays: vec![
+            saved_display(EXT_DISPLAY_ID, true),
+            saved_display(TEST_DISPLAY_ID, false),
+        ],
+        workspaces: vec![SavedWorkspace {
+            workspace_id: EXT_WORKSPACE_ID,
+            display_id: Some(EXT_DISPLAY_ID),
+            active_virtual_index: Some(0),
+            strips: vec![SavedStrip {
+                virtual_index: 0,
+                columns: vec![SavedColumn::Single(saved_window(300))],
+            }],
+        }],
+    });
+
+    harness
+        .on_iteration(0, |world, state| {
+            let ext_bounds = world
+                .query::<&Display>()
+                .iter(world)
+                .find(|display| display.id() == EXT_DISPLAY_ID)
+                .expect("external display exists")
+                .bounds();
+            let frame = state.create_window(300).frame();
+            assert_eq!(
+                frame.min,
+                ext_bounds.min + PAD,
+                "window frame {frame:?} must start at the padded origin of {ext_bounds:?}"
+            );
+        })
+        .run(vec![Event::MenuOpened { window_id: 100 }]);
+}
+
+/// A restored row wider than the display keeps its focused last column in
+/// view, inside the display's padding, also when a window that turns up
+/// during the grace period applies the restore again without a focus change.
+#[test]
+fn test_startup_restore_shows_focused_last_column_of_a_wide_strip() {
+    let harness = TestHarness::new()
+        .with_config(padded_config())
+        .with_windows(3)
+        .with_state(PaneruState {
+            version: 2,
+            timestamp: 123_456_789,
+            active_display_id: Some(TEST_DISPLAY_ID),
+            displays: vec![saved_display(TEST_DISPLAY_ID, true)],
+            workspaces: vec![SavedWorkspace {
+                workspace_id: TEST_WORKSPACE_ID,
+                display_id: Some(TEST_DISPLAY_ID),
+                active_virtual_index: Some(0),
+                strips: vec![SavedStrip {
+                    virtual_index: 0,
+                    columns: [1, 2, 0]
+                        .into_iter()
+                        .map(|id| SavedColumn::Single(saved_window(id)))
+                        .collect(),
+                }],
+            }],
+        });
+
+    let viewport = IRect::new(
+        PAD,
+        TEST_MENUBAR_HEIGHT + PAD,
+        TEST_DISPLAY_WIDTH - PAD,
+        TEST_DISPLAY_HEIGHT - PAD,
+    );
+    let check = move |world: &mut World, state: MockState| {
+        crate::assert_focused!(world, 0);
+        let focused = state.create_window(0).frame();
+        assert!(
+            focused.min.cmpge(viewport.min).all() && focused.max.cmple(viewport.max).all(),
+            "focused window frame {focused:?} must lie inside the padded viewport {viewport:?}"
+        );
+        for id in 1..3 {
+            let frame = state.create_window(id).frame();
+            assert_eq!(
+                frame.min.y, viewport.min.y,
+                "window {id} frame {frame:?} must start at the padded top {}",
+                viewport.min.y
+            );
+        }
+    };
+    harness
+        .on_iteration(0, move |world, state| {
+            check(world, state);
+            world.trigger(RestoreWindowState);
+        })
+        .on_iteration(1, check)
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::MenuOpened { window_id: 0 },
+        ]);
 }
 
 #[test]
@@ -1043,6 +1161,20 @@ fn workspace_rows_state(
         .collect::<Vec<_>>();
     rows.sort_by_key(|(idx, ..)| *idx);
     rows
+}
+
+const PADDING: u16 = 4;
+const PAD: i32 = PADDING as i32;
+
+fn padded_config() -> Config {
+    let options = MainOptions {
+        padding_top: Some(PADDING),
+        padding_right: Some(PADDING),
+        padding_bottom: Some(PADDING),
+        padding_left: Some(PADDING),
+        ..MainOptions::default()
+    };
+    (options, vec![]).into()
 }
 
 fn saved_display(display_id: u32, active: bool) -> SavedDisplay {
