@@ -916,18 +916,27 @@ pub fn bruteforce_windows(
                 continue;
             };
 
-            if let Some(index) = window_list.iter().position(|&id| id == window_id) {
-                window_list.remove(index);
-                debug!("Found window {window_id:?}");
-                if let Ok(window) = WindowOS::new_with_config(&element_ref, config, bundle_id)
+            if let Some(window) = claim_unresolved_window(&mut window_list, window_id, || {
+                WindowOS::new_with_config(&element_ref, config, bundle_id)
                     .inspect_err(|err| warn!("{err}"))
-                {
-                    found_windows.push(Window::new(Box::new(window)));
-                }
+                    .ok()
+            }) {
+                debug!("Found window {window_id:?}");
+                found_windows.push(Window::new(Box::new(window)));
             }
         }
     });
     found_windows
+}
+
+fn claim_unresolved_window<T>(
+    window_list: &mut Vec<WinID>,
+    window_id: WinID,
+    accept: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    let index = window_list.iter().position(|&id| id == window_id)?;
+    window_list.remove(index);
+    accept()
 }
 
 /// Checks if the application has Accessibility privileges without showing UI.
@@ -1037,7 +1046,7 @@ mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use objc2_foundation::NSBundle;
 
-    use super::{accessibility_reset_command, irect_from};
+    use super::{accessibility_reset_command, claim_unresolved_window, irect_from};
 
     #[test]
     fn accessibility_reset_targets_embedded_bundle_identity() {
@@ -1063,6 +1072,19 @@ mod tests {
             command.get_args().collect::<Vec<_>>(),
             ["reset", "Accessibility", bundle_id.as_str()]
         );
+    }
+
+    #[test]
+    fn rejected_element_leaves_window_unresolved_for_a_later_element() {
+        let mut window_list = vec![40966, 100];
+
+        let outline: Option<&str> = claim_unresolved_window(&mut window_list, 40966, || None);
+        assert!(outline.is_none());
+        assert_eq!(window_list, vec![40966, 100]);
+
+        let window = claim_unresolved_window(&mut window_list, 40966, || Some("AXWindow"));
+        assert_eq!(window, Some("AXWindow"));
+        assert_eq!(window_list, vec![100]);
     }
 
     #[test]
