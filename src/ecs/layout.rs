@@ -1648,21 +1648,23 @@ pub(crate) fn overlapping_rows(column_height: i32, floors: &[i32], top_bars: &[i
 }
 
 /// Raises every stacked height below its window's minimum to that minimum,
-/// and takes the extra evenly from the other windows, none going below its own
-/// minimum or `MIN_WINDOW_HEIGHT`. Minimums that cannot all fit are left for
-/// [`overlapping_rows`], which the layout uses instead.
+/// and takes the extra from the tallest of the other windows first, none going
+/// below its own minimum or `MIN_WINDOW_HEIGHT`. Windows that give end up
+/// level, so a window with a smaller minimum keeps an even share. Minimums
+/// that cannot all fit are left for [`overlapping_rows`], which the layout
+/// uses instead.
 pub(crate) fn hold_minimum_heights(heights: &mut [i32], minimums: &[i32], total: i32) {
     for (height, minimum) in heights.iter_mut().zip(minimums) {
         *height = (*height).max(*minimum);
     }
     let floor = |index: usize| minimums[index].max(MIN_WINDOW_HEIGHT);
     let mut excess = heights.iter().sum::<i32>() - total;
-    // One pixel at a time from whichever window has the most room above its
-    // floor, which levels the givers instead of leaving rounding steps.
+    // One pixel at a time from the tallest window above its floor, which
+    // levels the givers instead of leaving rounding steps.
     while excess > 0 {
         let Some(tallest) = (0..heights.len())
             .filter(|index| heights[*index] > floor(*index))
-            .max_by_key(|index| (heights[*index] - floor(*index), std::cmp::Reverse(*index)))
+            .max_by_key(|index| (heights[*index], std::cmp::Reverse(*index)))
         else {
             return;
         };
@@ -3202,6 +3204,11 @@ mod tests {
         let mut heights = vec![200, 500, 570];
         hold_minimum_heights(&mut heights, &[0, 0, 700], 1270);
         assert_eq!(heights, vec![200, 370, 700]);
+
+        // A window with a smaller minimum above its share keeps an even share.
+        let mut heights = vec![426, 426, 426];
+        hold_minimum_heights(&mut heights, &[308, 628, 0], 1278);
+        assert_eq!(heights, vec![325, 628, 325]);
 
         // Minimums that cannot all fit overflow instead of overlapping.
         let mut heights = vec![400, 400];
