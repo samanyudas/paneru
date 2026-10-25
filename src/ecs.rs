@@ -501,10 +501,11 @@ pub struct LaunchWindows(pub std::collections::HashSet<WinID>);
 #[derive(Component, Clone, Copy, Debug)]
 pub struct MinimumHeight(pub i32);
 
-/// The stacked windows that a height step on this window moved height to or
-/// from, each with the height it received, negative when it gave. A part of
-/// the step the window refuses goes back to them, so the rest of the stack
-/// keeps its heights. Dropped when the window's size check ends.
+/// The stacked windows that took part in a height step with this window, the
+/// window that stepped or one it took height from or gave height to, each with
+/// the height it received, negative when it gave. A part of the step this
+/// window refuses goes back to them, so the rest of the stack keeps its
+/// heights. Dropped when the window's size check ends.
 #[derive(Component, Clone, Debug, Default)]
 pub struct StepPartners(pub Vec<(Entity, i32)>);
 

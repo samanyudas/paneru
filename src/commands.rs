@@ -1143,9 +1143,14 @@ fn resize_window_vertical(
             && let Some(top) = item.top()
         {
             let moved = new_heights[index] - heights[index];
-            match partners.iter_mut().find(|(partner, _)| *partner == top) {
-                Some((_, total)) => *total += moved,
-                None => partners.push((top, moved)),
+            add_step_partner(&mut partners, top, moved);
+            let mut back = step_partners
+                .get(top)
+                .map(|partners| partners.0.clone())
+                .unwrap_or_default();
+            add_step_partner(&mut back, entity, -moved);
+            if let Ok(mut entity_commands) = commands.get_entity(top) {
+                entity_commands.try_insert(StepPartners(back));
             }
         }
         for entity in item.window_iter() {
@@ -1167,6 +1172,13 @@ fn resize_window_vertical(
         && let Ok(mut entity_commands) = commands.get_entity(entity)
     {
         entity_commands.try_insert(StepPartners(partners));
+    }
+}
+
+fn add_step_partner(partners: &mut Vec<(Entity, i32)>, partner: Entity, moved: i32) {
+    match partners.iter_mut().find(|(entry, _)| *entry == partner) {
+        Some((_, total)) => *total += moved,
+        None => partners.push((partner, moved)),
     }
 }
 
