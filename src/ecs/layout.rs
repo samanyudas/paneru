@@ -26,8 +26,8 @@ use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
     LayoutPosition, ManualStripOffset, MinimumHeight, MouseHeldMarker, PlaceAfterArrival, Position,
     PresentedOrigin, RefitAfterRemoval, RepositionMarker, ReshuffleAroundMarker, ResizeMarker,
-    Scrolling, SkipReshuffle, SpawnCommandsExt, TopBarHeight, TopBarRetry, Unmanaged,
-    VerifyWindowSize, WidthAnchor, WidthRun,
+    Scrolling, SelectedVirtualMarker, SkipReshuffle, SpawnCommandsExt, TopBarHeight, TopBarRetry,
+    Unmanaged, VerifyWindowSize, WidthAnchor, WidthRun,
 };
 use crate::errors::{Error, Result};
 use crate::events::Event;
@@ -279,6 +279,7 @@ fn expose_focused_survivor_after_removal(
             Entity,
             &LayoutStrip,
             Has<ActiveWorkspaceMarker>,
+            Has<SelectedVirtualMarker>,
             Has<PreviousStripPosition>,
             Has<Scrolling>,
         ),
@@ -292,9 +293,13 @@ fn expose_focused_survivor_after_removal(
     drag: Option<Res<DragState>>,
     restored: Query<&RestoreFocusMarker>,
     skip_reshuffle: Res<SkipReshuffle>,
+    strips: StripPlacements,
+    displays: DisplayViewports,
+    windows: Windows,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
-    for (strip_entity, strip, active, previous_position, scrolling) in pending {
+    for (strip_entity, strip, active, selected, previous_position, scrolling) in pending {
         let survivor = focused.single().ok().filter(|(entity, _)| {
             active
                 && !previous_position
@@ -313,11 +318,59 @@ fn expose_focused_survivor_after_removal(
             if !new_focus && !skip_reshuffle.0 {
                 commands.ensure_visible(entity);
             }
+        } else if selected && !previous_position {
+            // Focus is elsewhere, such as on another display, so nothing above
+            // scrolls this strip, which its display still shows. Its display must not be left showing only
+            // slivers while its other windows sit off screen.
+            if scrolling
+                || !mouse_held.is_empty()
+                || drag.as_ref().is_some_and(|drag| drag.holds_window())
+            {
+                continue;
+            }
+            if let Some(column) = column_to_show(strip, &strips, &displays, &windows, &config) {
+                commands.ensure_visible(column);
+            }
         }
         commands
             .entity(strip_entity)
             .try_remove::<ExposeFocusedSurvivorAfterRemoval>();
     }
+}
+
+/// The column of `strip` nearest its display, when no column shows more than
+/// a sliver on that display once the strip settles. `None` while any column
+/// still shows.
+fn column_to_show(
+    strip: &LayoutStrip,
+    strips: &StripPlacements,
+    displays: &DisplayViewports,
+    windows: &Windows,
+    config: &Config,
+) -> Option<Entity> {
+    let columns = strip.all_columns();
+    let ctx = resolve_strip_scroll_context(*columns.first()?, strips, displays, config)?;
+    let viewport = ctx.display_bounds.min.x..ctx.display_bounds.max.x;
+    let mut nearest = None;
+    for column in columns {
+        let (Some(layout), Some(frame)) = (
+            windows.layout_position(column),
+            windows.moving_frame(column),
+        ) else {
+            continue;
+        };
+        let start = layout.x + ctx.strip_target.x;
+        let end = start + frame.width();
+        let shown = end.min(viewport.end) - start.max(viewport.start);
+        if shown > config.sliver_width() {
+            return None;
+        }
+        let distance = (viewport.start - end).max(start - viewport.end);
+        if nearest.is_none_or(|(_, best)| distance < best) {
+            nearest = Some((column, distance));
+        }
+    }
+    nearest.map(|(column, _)| column)
 }
 
 /// Represents an item within a stack, which can either be a single window or a group of tabs.
