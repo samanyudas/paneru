@@ -321,6 +321,42 @@ fn a_refused_grow_step_returns_the_height_to_its_partner() {
     );
 }
 
+/// A window that refuses part of the height a grow step takes from it keeps
+/// the refused part, and the growing window gives it up instead of a taller
+/// window outside the step.
+#[test]
+fn a_donor_that_refuses_a_grow_step_takes_the_height_from_the_grower() {
+    let harness = TestHarness::new();
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, STEP_COLUMN + TEST_MENUBAR_HEIGHT),
+    );
+    let mut harness = harness.with_windows(3);
+    set_minimum_height(&harness, 2, 400);
+    stack_three(&mut harness);
+    harness.run(vec![
+        command(Operation::Focus(Direction::North)),
+        command(Operation::Focus(Direction::North)),
+        step(crate::commands::ResizeDirection::Grow),
+        step(crate::commands::ResizeDirection::Grow),
+    ]);
+    harness.advance(SETTLE);
+    assert_eq!(
+        heights(&column(harness.world(), &[0, 1, 2])),
+        [554, 298, 426]
+    );
+    harness.run(vec![
+        command(Operation::Focus(Direction::South)),
+        step(crate::commands::ResizeDirection::Grow),
+    ]);
+    harness.advance(SETTLE);
+
+    assert_eq!(
+        heights(&column(harness.world(), &[0, 1, 2])),
+        [554, 324, 400]
+    );
+}
+
 /// A window whose minimum the engine learned keeps it when it rejoins a
 /// stack, and the windows without one share the rest evenly.
 #[test]
