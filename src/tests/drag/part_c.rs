@@ -589,7 +589,7 @@ fn macos_tile(harness: &mut TestHarness, id: WinID, tile: IRect) {
 }
 
 #[test]
-fn macos_half_quarter_and_fill_after_a_drop_return_to_the_dropped_slot() {
+fn macos_half_quarter_and_fill_after_a_drop_return_to_the_windows_place() {
     for tile in [
         IRect::new(0, 20, 512, 768),
         IRect::new(512, 394, 1024, 768),
@@ -597,14 +597,46 @@ fn macos_half_quarter_and_fill_after_a_drop_return_to_the_dropped_slot() {
     ] {
         let mut harness = three_columns();
         let point = middle_of(harness.world(), 0, 600);
-        press_and_drag(&mut harness, 2, point);
+        let start = press_and_drag(&mut harness, 2, point);
         release(&mut harness, point);
         macos_tile(&mut harness, 2, tile);
         harness.advance(SETTLE);
-        assert_eq!(layout(harness.world()), vec![vec![0, 2], vec![1]]);
-        assert_one_column(harness.world(), &[0, 2]);
+        assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
+        assert_eq!(frame(harness.world(), 2).size(), start.size());
         assert_ne!(frame(harness.world(), 2), tile);
         crate::assert_focused!(harness.world(), 2);
+    }
+}
+
+#[test]
+fn a_drag_that_macos_tiles_at_a_screen_edge_returns_to_its_column() {
+    for (to, tile) in [
+        (
+            Origin::new(TEST_DISPLAY_WIDTH - 1, 300),
+            IRect::new(512, 20, 1024, 768),
+        ),
+        (Origin::new(0, 300), IRect::new(0, 20, 512, 768)),
+        (Origin::new(600, 1), IRect::new(0, 20, 1024, 768)),
+    ] {
+        let mut harness = three_columns();
+        let start = press_and_drag(&mut harness, 1, to);
+        release(&mut harness, to);
+        macos_tile(&mut harness, 1, tile);
+        // macOS finishes the tile after the undo sent the window home.
+        let home = frame(harness.world(), 1).min;
+        macos_tile(
+            &mut harness,
+            1,
+            IRect::from_corners(home, home + tile.size()),
+        );
+        harness.advance(SETTLE);
+        assert_eq!(
+            layout(harness.world()),
+            vec![vec![0], vec![1], vec![2]],
+            "{to:?}"
+        );
+        assert_eq!(frame(harness.world(), 1).size(), start.size(), "{to:?}");
+        crate::assert_focused!(harness.world(), 1);
     }
 }
 
@@ -2847,6 +2879,76 @@ fn a_macos_tile_that_macos_keeps_reapplying_returns_to_its_slot() {
         assert_eq!(frame(harness.world(), 1), start, "tile {tile:?}");
         assert_eq!(bounds_of(&mut harness, 1), slot, "tile {tile:?}");
     }
+}
+
+#[test]
+fn a_tile_that_macos_puts_back_without_a_notification_returns_to_its_slot() {
+    let fill = IRect::new(0, 20, 1024, 768);
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 1);
+    let slot = bounds_of(&mut harness, 1);
+    for step in 1..=4 {
+        let at = |from: i32, to: i32| from + (to - from) * step / 4;
+        let frame = IRect::new(
+            at(start.min.x, fill.min.x),
+            at(start.min.y, fill.min.y),
+            at(start.max.x, fill.max.x),
+            at(start.max.y, fill.max.y),
+        );
+        macos_tile(&mut harness, 1, frame);
+    }
+    harness.advance(FRAME * 5);
+    // The app's resize notification never names the window, so the engine
+    // sees macOS put the fill back only when it reads the frame again.
+    harness
+        .mock_state
+        .update_window(1, |window| window.frame = fill);
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), 1), start);
+    assert_eq!(bounds_of(&mut harness, 1), slot);
+}
+
+#[test]
+fn a_tile_reported_without_a_window_id_returns_to_its_slot() {
+    let fill = IRect::new(0, 20, 1024, 768);
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 1);
+    let slot = bounds_of(&mut harness, 1);
+    let entity = window_entity(&mut harness, 1);
+    let element = harness
+        .world()
+        .get::<Window>(entity)
+        .and_then(|window| window.element())
+        .expect("window has an element");
+    harness
+        .mock_state
+        .update_window(1, |window| window.frame = fill);
+    // The app's notifications name no window ID, only the element.
+    for resized in [false, true] {
+        harness.world().write_message(Event::WindowChangedUnnamed {
+            element: element.clone(),
+            resized,
+        });
+    }
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), 1), start);
+    assert_eq!(bounds_of(&mut harness, 1), slot);
+}
+
+#[test]
+fn a_tile_size_that_macos_finishes_after_the_restore_returns_to_its_slot() {
+    let fill = IRect::new(0, 20, 1024, 768);
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 1);
+    let slot = bounds_of(&mut harness, 1);
+    macos_tile(&mut harness, 1, fill);
+    // macOS finishes the fill after the restore wrote the size, and the
+    // restore's move then puts the filled window at its slot.
+    let finished = IRect::from_corners(start.min, start.min + fill.size());
+    macos_tile(&mut harness, 1, finished);
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), 1), start);
+    assert_eq!(bounds_of(&mut harness, 1), slot);
 }
 
 #[test]

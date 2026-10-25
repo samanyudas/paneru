@@ -47,7 +47,7 @@ use crate::ecs::{
     Unmanaged,
 };
 use crate::events::{Event, MouseButton};
-use crate::manager::{Display, Window, WindowManager, origin_from};
+use crate::manager::{Display, Origin, Window, WindowManager, origin_from};
 
 /// How far the pointer must move from the press before a drag can start.
 const DRAG_THRESHOLD: i32 = 4;
@@ -68,6 +68,10 @@ const CONFIRM_WINDOW: Duration = Duration::from_millis(250);
 
 /// How long after a drop the dropped window stays watched.
 const SETTLE_WINDOW: Duration = Duration::from_millis(600);
+
+/// How long after a drop a macOS tile of the dropped window takes back the
+/// drop. macOS applies a tile a few hundred milliseconds after the release.
+const TILED_DROP_WINDOW: Duration = Duration::from_secs(1);
 
 /// The most pointer samples a press keeps to match a late window move.
 const MAX_SAMPLES: usize = 32;
@@ -530,6 +534,22 @@ pub(crate) struct DragFeedback {
     line_color: (f64, f64, f64),
 }
 
+/// The strip and sizes a drop replaced, kept for a moment after the drop.
+/// If macOS tiles the dropped window instead, the drop is undone, so the
+/// window goes back to its place in the layout.
+#[derive(Default, Resource)]
+pub(crate) struct DropUndo(Option<Undo>);
+
+struct Undo {
+    window: Entity,
+    until: Duration,
+    strip: Entity,
+    layout: LayoutStrip,
+    sizes: Vec<(Entity, IVec2)>,
+    /// Where the window was shown before the drop.
+    origin: Origin,
+}
+
 /// What the ECS side has to do after a step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DragEffect {
@@ -970,6 +990,7 @@ impl Plugin for DragEventsPlugin {
         app.init_resource::<DragState>()
             .init_resource::<DragFeedback>()
             .init_resource::<tiling::PointerResize>()
+            .init_resource::<DropUndo>()
             .add_systems(
                 Update,
                 tiling::track_resize_gesture
@@ -1000,6 +1021,10 @@ impl Plugin for DragEventsPlugin {
                         .after(super::focus::fix_window_size_on_focus)
                         .run_if(on_message::<Event>),
                     drag_watchdog.after(drag_events).run_if(in_progress),
+                    undo_tiled_drop
+                        .after(super::systems::window_frame_update)
+                        .before(drag_events)
+                        .run_if(|undo: Res<DropUndo>| undo.0.is_some()),
                     drag_edge_scroll
                         .after(drag_watchdog)
                         .run_if(in_progress.or_eager(resource_changed::<DragState>)),
@@ -1112,6 +1137,7 @@ pub(super) fn drag_events(
     mut moves: DisplayMoves,
     config: Res<Config>,
     mut native: ResMut<NativeMembership>,
+    mut undo: ResMut<DropUndo>,
     mut commands: Commands,
 ) {
     let now = time.elapsed();
@@ -1163,6 +1189,7 @@ pub(super) fn drag_events(
         for DragEffect::Drop { window, target } in effects {
             debug!("dropping {window} at {target:?}");
             let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
+            undo.0 = undo_for(window, target, now, &moves, &placements, &presented);
             apply_drop(
                 window,
                 target,
@@ -1618,6 +1645,113 @@ fn snapshot_of(
             })
             .collect(),
     }
+}
+
+/// The undo for a drop of `window` that moves it within its own strip.
+fn undo_for(
+    window: Entity,
+    target: DropTarget,
+    now: Duration,
+    moves: &DisplayMoves,
+    placements: &Placements,
+    presented: &Presented,
+) -> Option<Undo> {
+    let (strip, layout, _, parent, _) = moves
+        .strips
+        .iter()
+        .find(|(_, strip, _, _, _)| strip.contains(window))?;
+    let display = match target {
+        DropTarget::IntoColumn { display, .. } | DropTarget::NewColumn { display, .. } => display,
+        DropTarget::Home | DropTarget::Refused { .. } => return None,
+    };
+    let (_, source, _, _) = moves.displays.get(parent.parent()).ok()?;
+    if source.id() != display {
+        return None;
+    }
+    let sizes = layout
+        .all_windows()
+        .into_iter()
+        .filter_map(|entity| Some((entity, placements.get(entity).ok()?.1.0)))
+        .collect();
+    Some(Undo {
+        window,
+        until: now + TILED_DROP_WINDOW,
+        strip,
+        layout: layout.clone(),
+        sizes,
+        origin: presented.get(window).ok()?.0.0,
+    })
+}
+
+/// Undoes a drop when macOS tiles the dropped window instead: the strip and
+/// its sizes go back to how they were before the drop, and the window keeps
+/// focus.
+pub(super) fn undo_tiled_drop(
+    mut undo: ResMut<DropUndo>,
+    time: Res<Time>,
+    tiles: Query<&NativeResizeStart>,
+    mut strips: Query<&mut LayoutStrip>,
+    mut placements: Placements,
+    mut commands: Commands,
+) {
+    let Some(pending) = undo.0.as_ref() else {
+        return;
+    };
+    if time.elapsed() > pending.until {
+        undo.0 = None;
+        return;
+    }
+    let Some(&start) = tiles
+        .get(pending.window)
+        .ok()
+        .filter(|start| start.restores_tile())
+    else {
+        return;
+    };
+    let Some(Undo {
+        window,
+        strip,
+        layout,
+        sizes,
+        origin,
+        ..
+    }) = undo.0.take()
+    else {
+        return;
+    };
+    let Ok(mut current) = strips.get_mut(strip) else {
+        return;
+    };
+    // A window that came or went meanwhile would be lost or doubled.
+    let mut before = layout.all_windows();
+    let mut now = current.all_windows();
+    before.sort_unstable();
+    now.sort_unstable();
+    if before != now {
+        return;
+    }
+    *current = layout;
+    let mut home = None;
+    for (entity, size) in sizes {
+        if let Ok((mut position, mut bounds)) = placements.get_mut(entity) {
+            bounds.0 = size;
+            position.set_changed();
+        }
+        if entity == window {
+            home = Some(size);
+        }
+    }
+    // The tile restore goes on, now for the window's own slot, so a tile
+    // that macOS finishes after the undo still goes back there.
+    if let Some(size) = home {
+        commands.reposition_entity(window, origin);
+        commands.resize_entity(window, size);
+        if let Ok(mut entity_commands) = commands.get_entity(window) {
+            entity_commands.try_insert(start.retarget(origin, size));
+        }
+    }
+    commands.ensure_visible(window);
+    commands.focus_entity(window, false);
 }
 
 /// Moves `window` to `target` in its strip, then sends it to its slot, which

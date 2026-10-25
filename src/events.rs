@@ -123,6 +123,12 @@ pub enum Event {
     WindowMoved { window_id: WinID },
     /// A window has been resized.
     WindowResized { window_id: WinID },
+    /// A window moved or resized, but the window ID behind its element could
+    /// not be read. The element still names a window the engine manages.
+    WindowChangedUnnamed {
+        element: CFRetained<AXUIWrapper>,
+        resized: bool,
+    },
     /// A window has been minimized.
     WindowMinimized { window_id: WinID },
     /// A window has been de-minimized (restored).

@@ -973,15 +973,24 @@ fn notified_windows(
 ) -> Vec<(Entity, bool, bool)> {
     let mut notified: Vec<(Entity, bool, bool)> = Vec::new();
     for event in messages.read() {
-        let (window_id, moved) = match event {
-            Event::WindowMoved { window_id } => (*window_id, true),
-            Event::WindowResized { window_id } => (*window_id, false),
+        let found = match event {
+            Event::WindowMoved { window_id } | Event::WindowResized { window_id } => windows
+                .iter()
+                .find(|(_, window, ..)| window.id() == *window_id),
+            Event::WindowChangedUnnamed { element, .. } => windows
+                .iter()
+                .find(|(_, window, ..)| window.element().is_some_and(|own| own == *element)),
             _ => continue,
         };
-        let Some((entity, ..)) = windows
-            .iter()
-            .find(|(_, window, ..)| window.id() == window_id)
-        else {
+        let moved = match event {
+            Event::WindowMoved { .. } => true,
+            Event::WindowChangedUnnamed { resized, .. } => !resized,
+            _ => false,
+        };
+        let Some((entity, ..)) = found else {
+            if matches!(event, Event::WindowChangedUnnamed { .. }) {
+                debug!("no managed window has the element of an unnamed change");
+            }
             continue;
         };
         match notified

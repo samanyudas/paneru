@@ -476,7 +476,20 @@ impl WindowResolver {
                         Ok(window_id) => {
                             _ = events.send(pending.kind.into_event(window_id));
                         }
-                        Err(err) => debug!("naming window for {:?}: {err}", pending.kind),
+                        Err(err) => {
+                            debug!("naming window for {:?}: {err}", pending.kind);
+                            // A move or resize is still matched to its window
+                            // by element, so a tile is not missed.
+                            let resized = match pending.kind {
+                                WindowNotification::Moved => false,
+                                WindowNotification::Resized => true,
+                                _ => continue,
+                            };
+                            _ = events.send(Event::WindowChangedUnnamed {
+                                element: pending.element,
+                                resized,
+                            });
+                        }
                     }
                 }
             })

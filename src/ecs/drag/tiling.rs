@@ -26,6 +26,9 @@ const TILE_TOLERANCE: i32 = 2;
 const RESIZE_RELEASE_GRACE: Duration = Duration::from_millis(600);
 const NATIVE_RESIZE_SETTLE: Duration = Duration::from_millis(200);
 const TILE_RESTORE_HOLD: Duration = Duration::from_secs(1);
+/// How many times a tile that macOS puts back after the hold is restored
+/// again before its frame counts as the app's own.
+const MAX_RETILES: u8 = 3;
 
 /// The windows a left press may be resizing by an edge: every tiled window
 /// whose edge band holds the press point, with the native tabs grouped with
@@ -175,6 +178,14 @@ pub(crate) struct NativeResizeStart {
     size: IVec2,
     strip_x: Option<i32>,
     phase: Phase,
+    /// Whether the window has shown its restored size since the last tile,
+    /// which an app that refuses the size never does.
+    reached: bool,
+    /// The size of the tile the window was last restored from. macOS can
+    /// finish a tile animation after the restore, so the window then shows
+    /// this size at the slot the engine moved it back to.
+    tile: Option<IVec2>,
+    retiles: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -202,6 +213,22 @@ enum Settlement {
 }
 
 impl NativeResizeStart {
+    fn new(origin: Origin, size: IVec2, strip_x: Option<i32>, phase: Phase) -> Self {
+        Self {
+            origin,
+            size,
+            strip_x,
+            phase,
+            reached: false,
+            tile: None,
+            retiles: 0,
+        }
+    }
+
+    fn with_phase(self, phase: Phase) -> Self {
+        Self { phase, ..self }
+    }
+
     fn slot(&self) -> IRect {
         IRect::from_corners(self.origin, self.origin + self.size)
     }
@@ -225,8 +252,69 @@ impl NativeResizeStart {
         }
     }
 
+    /// This start, noting that the window showed `size` while it holds.
+    pub(crate) fn seen(self, size: IVec2) -> Option<Self> {
+        (!self.reached && size == self.size && matches!(self.phase, Phase::Holding { .. }))
+            .then_some(Self {
+                reached: true,
+                ..self
+            })
+    }
+
+    /// The restore to start again while the hold lasts: `frame` is a tile,
+    /// or shows the size of the tile the window was restored from.
+    fn again(self, tile: bool, frame: IRect, now: Duration) -> Option<Self> {
+        let shows_tile = tile || self.tile == Some(frame.size());
+        (shows_tile && frame != self.slot()).then(|| Self {
+            phase: match self.phase {
+                Phase::Holding { until } => Phase::Holding { until },
+                _ => Phase::Holding {
+                    until: now + TILE_RESTORE_HOLD,
+                },
+            },
+            tile: if tile { Some(frame.size()) } else { self.tile },
+            ..self
+        })
+    }
+
+    /// The restore to start again when `frame`, read after the hold, is a
+    /// tile. After the window showed its restored size, a tile frame is
+    /// macOS putting the tile back, which an app may never have reported.
+    fn retile(self, tile: bool, frame: IRect, now: Duration) -> Option<Self> {
+        (tile && frame != self.slot() && self.reached && self.retiles < MAX_RETILES).then_some(
+            Self {
+                phase: Phase::Holding {
+                    until: now + TILE_RESTORE_HOLD,
+                },
+                reached: false,
+                retiles: self.retiles + 1,
+                ..self
+            },
+        )
+    }
+
+    /// Whether the window showed its restored size since the last tile, so
+    /// a different size now is macOS's, for the tile restore to judge.
+    pub(crate) fn reached(&self) -> bool {
+        self.reached
+    }
+
     pub(crate) fn held_size(&self, now: Duration) -> Option<IVec2> {
         matches!(self.phase, Phase::Holding { until } if now < until).then_some(self.size)
+    }
+
+    /// This tile restore, aimed at the slot `origin` and `size` instead.
+    pub(crate) fn retarget(self, origin: Origin, size: IVec2) -> Self {
+        Self {
+            origin,
+            size,
+            ..self
+        }
+    }
+
+    /// Whether macOS tiled the window and the engine is putting it back.
+    pub(crate) fn restores_tile(&self) -> bool {
+        matches!(self.phase, Phase::Holding { .. })
     }
 
     pub(crate) fn needs_frame(&self) -> bool {
@@ -388,15 +476,19 @@ impl TilingRestore<'_, '_> {
             if frame == managed {
                 return NativeFrame::Moved;
             }
-            let slot = NativeResizeStart {
-                origin: origin.0,
-                size: resize.map_or(managed.size(), |resize| resize.0),
-                strip_x: None,
-                phase: Phase::Holding {
+            let slot = NativeResizeStart::new(
+                origin.0,
+                resize.map_or(managed.size(), |resize| resize.0),
+                None,
+                Phase::Holding {
                     until: now + TILE_RESTORE_HOLD,
                 },
-            };
+            );
             if tile && frame != slot.slot() {
+                let slot = NativeResizeStart {
+                    tile: Some(frame.size()),
+                    ..slot
+                };
                 return Self::restore(entity, slot, commands);
             }
             if engine {
@@ -405,38 +497,35 @@ impl TilingRestore<'_, '_> {
             if frame.size() == managed.size() {
                 return NativeFrame::Moved;
             }
-            entity_commands.try_insert(NativeResizeStart {
-                origin: origin.0,
-                size: managed.size(),
+            entity_commands.try_insert(NativeResizeStart::new(
+                origin.0,
+                managed.size(),
                 strip_x,
-                phase: Phase::Observing {
+                Phase::Observing {
                     frame,
                     changed: now,
                 },
-            });
+            ));
             return NativeFrame::Deferred;
         };
         let settlement = start.settlement(now);
+        if !matches!(settlement, Some(Settlement::Refused))
+            && let Some(again) = start.again(tile, frame, now)
+        {
+            return Self::restore(entity, again, commands);
+        }
         match settlement {
             Some(Settlement::Refused) => {
                 if Self::blocks(&start, now, resize, reposition, verifying) {
                     return NativeFrame::Deferred;
                 }
+                let tile = tile || start.tile == Some(frame.size());
+                if let Some(again) = start.retile(tile, frame, now) {
+                    return Self::restore(entity, again, commands);
+                }
                 entity_commands.try_remove::<(ResizeMarker, RepositionMarker, VerifyWindowSize)>();
-                entity_commands.try_insert(NativeResizeStart {
-                    phase: Phase::Refused { frame },
-                    ..start
-                });
+                entity_commands.try_insert(start.with_phase(Phase::Refused { frame }));
                 return NativeFrame::Refused;
-            }
-            _ if tile && frame != start.slot() => {
-                let phase = match start.phase {
-                    Phase::Holding { until } => Phase::Holding { until },
-                    _ => Phase::Holding {
-                        until: now + TILE_RESTORE_HOLD,
-                    },
-                };
-                return Self::restore(entity, NativeResizeStart { phase, ..start }, commands);
             }
             _ if engine || matches!(start.phase, Phase::Holding { .. }) => {
                 return NativeFrame::Deferred;
