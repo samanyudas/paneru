@@ -1393,11 +1393,12 @@ pub(super) fn verify_window_position(
 /// Restores user-visible window state before Paneru shuts down: clears any
 /// brightness dim, removes the drag overlay and the dim/border overlay window,
 /// and puts every tiled window where [`exit_frame`] says, so none is left
-/// parked off-screen.
+/// parked off-screen. A window in a strip stays on that strip's display.
 /// Floating, minimized, and hidden windows stay where they are.
 pub(crate) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    mut all_windows: Query<(&mut Window, Has<Unmanaged>, Option<&PreLaunchFrame>)>,
+    mut all_windows: Query<ExitWindow>,
+    strips: Query<(&LayoutStrip, &ChildOf)>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
@@ -1412,7 +1413,7 @@ pub(crate) fn cleanup_on_exit(
         }
         let ids = all_windows
             .iter()
-            .map(|(w, _, _)| w.id())
+            .map(|(_, w, _, _)| w.id())
             .collect::<Vec<_>>();
         info!("exit cleanup: restoring {} window(s)", ids.len());
         window_manager.dim_windows(&ids, 0.0);
@@ -1422,14 +1423,25 @@ pub(crate) fn cleanup_on_exit(
         }
 
         let display_bounds = displays.iter().map(Display::bounds).collect::<Vec<_>>();
+        let strip_display = |entity: Entity| {
+            strips
+                .iter()
+                .find(|(strip, _)| strip.contains(entity))
+                .and_then(|(_, child)| displays.get(child.parent()).ok())
+                .map(Display::bounds)
+        };
         let mut targets = Vec::new();
-        for (mut window, unmanaged, pre_launch) in &mut all_windows {
+        for (entity, mut window, unmanaged, pre_launch) in &mut all_windows {
             if unmanaged {
                 continue;
             }
+            let home = strip_display(entity);
+            let candidates = home
+                .as_ref()
+                .map_or(display_bounds.as_slice(), std::slice::from_ref);
             let padding = (window.horizontal_padding(), window.vertical_padding());
             let current = unpadded(window.frame(), padding);
-            let Some(target) = exit_frame(current, pre_launch.map(|f| f.0), &display_bounds) else {
+            let Some(target) = exit_frame(current, pre_launch.map(|f| f.0), candidates) else {
                 return;
             };
             info!(
@@ -1446,6 +1458,13 @@ pub(crate) fn cleanup_on_exit(
     }
 }
 
+type ExitWindow = (
+    Entity,
+    &'static mut Window,
+    Has<Unmanaged>,
+    Option<&'static PreLaunchFrame>,
+);
+
 /// Some apps, Chromium browsers among them, apply a frame only after the
 /// accessibility call returns, and can drop a size that arrives mid-change. The
 /// engine is exiting, so it rechecks every window a few times and places again
@@ -1457,7 +1476,7 @@ pub(crate) fn cleanup_on_exit(
 /// once this returns, so every check, and the return, first waits for the
 /// writes asked for so far to reach their apps, within the same deadline.
 fn settle_exit_frames(
-    all_windows: &mut Query<(&mut Window, Has<Unmanaged>, Option<&PreLaunchFrame>)>,
+    all_windows: &mut Query<ExitWindow>,
     window_manager: &WindowManager,
     mut pending: Vec<(WinID, IRect)>,
 ) {
@@ -1477,7 +1496,8 @@ fn settle_exit_frames(
             if Instant::now() > deadline {
                 return true;
             }
-            let Some((mut window, _, _)) = all_windows.iter_mut().find(|(w, _, _)| w.id() == *id)
+            let Some((_, mut window, _, _)) =
+                all_windows.iter_mut().find(|(_, w, _, _)| w.id() == *id)
             else {
                 return false;
             };
