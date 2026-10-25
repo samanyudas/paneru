@@ -646,6 +646,16 @@ impl MockState {
         );
     }
 
+    /// Makes display `id` show native Space `workspace`, without telling the
+    /// engine, as when it has not yet seen the switch.
+    #[allow(unused)]
+    pub fn show_space(&self, id: u32, workspace: WorkspaceId) {
+        let mut inner = self.inner.force_write();
+        let display = inner.displays.get_mut(&id).expect("finding display");
+        display.workspaces.retain(|&shown| shown != workspace);
+        display.workspaces.insert(0, workspace);
+    }
+
     pub fn set_display_bounds(&self, id: u32, bounds: IRect) {
         let mut inner = self.inner.force_write();
         inner.displays.get_mut(&id).expect("finding display").bounds = bounds;

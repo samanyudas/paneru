@@ -3200,3 +3200,64 @@ fn test_closing_the_shown_windows_of_an_unfocused_display_shows_another() {
             },
         ]);
 }
+
+/// The same closes on a display that has since switched to another native
+/// Space leave that hidden Space's strip where it was.
+#[test]
+fn test_closing_windows_of_a_hidden_space_does_not_scroll_its_strip() {
+    let before = Rc::new(Cell::new(Vec::new()));
+    let recorded = before.clone();
+    harness_with_display_above()
+        .with_windows(5)
+        .on_iteration(4, move |world, state| {
+            assert_focused!(world, 100);
+            let shown = (0..5)
+                .filter(|&id| shown_width(world, id) > PARKED_STRIP_SLIVER)
+                .collect::<Vec<_>>();
+            assert!(!shown.is_empty() && shown.len() < 5, "{shown:?}");
+            state.show_space(TEST_DISPLAY_ID, TEST_WORKSPACE_ID + 1000);
+            for &id in &shown {
+                state.os_close_window(id);
+            }
+            recorded.set(
+                (0..5)
+                    .filter(|id| !shown.contains(id))
+                    .map(|id| (id, window_x(world, id)))
+                    .collect(),
+            );
+        })
+        .on_iteration(6, move |world, _state| {
+            let before = before.take();
+            assert!(!before.is_empty(), "the shown windows were closed");
+            let after = before
+                .iter()
+                .map(|&(id, _)| (id, window_x(world, id)))
+                .collect::<Vec<_>>();
+            assert_eq!(after, before, "the hidden Space's strip stayed put");
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::Last)),
+            window_command(Operation::FocusDisplay(Direction::North)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+fn window_x(world: &mut World, id: WinID) -> i32 {
+    world
+        .query::<&Window>()
+        .iter(world)
+        .find(|window| window.id() == id)
+        .map_or(i32::MIN, |window| window.frame().min.x)
+}

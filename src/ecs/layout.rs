@@ -31,7 +31,7 @@ use crate::ecs::{
 };
 use crate::errors::{Error, Result};
 use crate::events::Event;
-use crate::manager::{Display, Origin, Size, Window};
+use crate::manager::{Display, Origin, Size, Window, WindowManager};
 use crate::platform::WorkspaceId;
 use crate::types::commands::Side;
 use crate::util::round_px;
@@ -297,6 +297,7 @@ fn expose_focused_survivor_after_removal(
     displays: DisplayViewports,
     windows: Windows,
     config: Res<Config>,
+    window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
     for (strip_entity, strip, active, selected, previous_position, scrolling) in pending {
@@ -320,7 +321,7 @@ fn expose_focused_survivor_after_removal(
             }
         } else if selected && !previous_position {
             // Focus is elsewhere, such as on another display, so nothing above
-            // scrolls this strip, which its display still shows. Its display must not be left showing only
+            // scrolls this strip. Its display must not be left showing only
             // slivers while its other windows sit off screen.
             if scrolling
                 || !mouse_held.is_empty()
@@ -328,7 +329,14 @@ fn expose_focused_survivor_after_removal(
             {
                 continue;
             }
-            if let Some(column) = column_to_show(strip, &strips, &displays, &windows, &config) {
+            if let Some(column) = column_to_show(
+                strip_entity,
+                &strips,
+                &displays,
+                &windows,
+                &config,
+                &window_manager,
+            ) {
                 commands.ensure_visible(column);
             }
         }
@@ -338,16 +346,22 @@ fn expose_focused_survivor_after_removal(
     }
 }
 
-/// The column of `strip` nearest its display, when no column shows more than
-/// a sliver on that display once the strip settles. `None` while any column
-/// still shows.
+/// The column of strip `strip_entity` nearest its display, when the display
+/// shows that strip's native Space and no column shows more than a sliver
+/// there once the strip settles. `None` while any column still shows.
 fn column_to_show(
-    strip: &LayoutStrip,
+    strip_entity: Entity,
     strips: &StripPlacements,
     displays: &DisplayViewports,
     windows: &Windows,
     config: &Config,
+    window_manager: &WindowManager,
 ) -> Option<Entity> {
+    let (strip, _, _, child, ..) = strips.get(strip_entity).ok()?;
+    let (display, _) = displays.get(child.parent()).ok()?;
+    if window_manager.active_display_space(display.id()).ok()? != strip.id() {
+        return None;
+    }
     let columns = strip.all_columns();
     let ctx = resolve_strip_scroll_context(*columns.first()?, strips, displays, config)?;
     let viewport = ctx.display_bounds.min.x..ctx.display_bounds.max.x;
