@@ -22,7 +22,7 @@ use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Position, RestoreWindowState,
     SelectedVirtualMarker, SpawnCommandsExt, Unmanaged, WindowProperties,
 };
-use crate::manager::{Application, Display, Window};
+use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{Pid, WinID, WorkspaceId};
 use crate::types::commands::Side;
 
@@ -397,7 +397,7 @@ pub(crate) fn matches_startup_restore_state(
     saved_windows_in_state(state).any(|saved| saved.hard_match(window.id(), pid, &bundle_id))
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn restore_window_state(
     _: On<RestoreWindowState>,
@@ -409,6 +409,7 @@ pub(super) fn restore_window_state(
     )>,
     displays: Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
     apps: Query<&Application>,
+    window_manager: Res<WindowManager>,
     session: Option<Res<SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
     mut ctx: WindowCtx,
@@ -530,7 +531,12 @@ pub(super) fn restore_window_state(
             .get(&planned.workspace_id)
             .is_some_and(|active| *active == planned.virtual_index);
         let is_global_active = is_active && active_workspace_ids.contains(&planned.workspace_id);
-        let origin = if is_global_active {
+        let is_shown = is_global_active
+            || is_active
+                && window_manager
+                    .active_display_space(display.id())
+                    .is_ok_and(|space| space == planned.workspace_id);
+        let origin = if is_shown {
             display.bounds().min
         } else {
             display.bounds().max - PARKED_STRIP_SLIVER
@@ -569,7 +575,9 @@ pub(super) fn restore_window_state(
             if !is_active {
                 spawned.remove::<SelectedVirtualMarker>();
             }
-            spawned.insert(previous);
+            if !is_shown {
+                spawned.insert(previous);
+            }
         }
         restored_strips += 1;
     }
