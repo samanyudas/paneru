@@ -34,7 +34,7 @@ fn entities(count: usize) -> Vec<Entity> {
 
 /// A hit test that names where the pointer is, so a test can see which
 /// pointer position a target came from.
-fn hit_at(_window: Entity, pointer: IVec2) -> DropTarget {
+fn hit_at(_window: Entity, pointer: IVec2, _centre_dx: i32) -> DropTarget {
     DropTarget::NewColumn {
         display: DISPLAY,
         index: usize::try_from(pointer.x).unwrap_or(0),
@@ -164,7 +164,7 @@ fn a_window_following_the_pointer_starts_a_drag() {
         panic!("{state:?}");
     };
     assert_eq!(drag.window, w);
-    assert_eq!(drag.target, hit_at(w, PRESS + IVec2::new(50, 5)));
+    assert_eq!(drag.target, hit_at(w, PRESS + IVec2::new(50, 5), 0));
     assert_eq!(effects, Vec::<DragEffect>::new());
 }
 
@@ -379,7 +379,7 @@ fn a_delayed_move_uses_the_release_point_despite_later_pointer_input() {
         effects,
         vec![DragEffect::Drop {
             window: w,
-            target: hit_at(w, release)
+            target: hit_at(w, release, 0)
         }]
     );
 }
@@ -473,7 +473,7 @@ fn the_release_grace_runs_from_when_the_button_first_reads_up() {
         effects,
         vec![DragEffect::Drop {
             window: w,
-            target: hit_at(w, release),
+            target: hit_at(w, release, 0),
         }]
     );
 
@@ -554,7 +554,7 @@ fn a_drag_follows_the_pointer_and_drops_on_release() {
     let DragState::Dragging(drag) = &state else {
         panic!("{state:?}");
     };
-    assert_eq!(drag.target, hit_at(w, pointer));
+    assert_eq!(drag.target, hit_at(w, pointer, 0));
     assert_eq!(effects, Vec::<DragEffect>::new());
 
     let release = IVec2::new(320, 200);
@@ -563,7 +563,7 @@ fn a_drag_follows_the_pointer_and_drops_on_release() {
         effects,
         vec![DragEffect::Drop {
             window: w,
-            target: hit_at(w, release),
+            target: hit_at(w, release, 0),
         }]
     );
     assert_eq!(state.settling_window(), Some(w));
@@ -679,7 +679,7 @@ fn new_column(index: usize) -> DropTarget {
 }
 
 fn hit(snapshot: &LayoutSnapshot, dragged: Entity, x: i32, y: i32, limit: usize) -> DropTarget {
-    hit_test(snapshot, dragged, IVec2::new(x, y), |_| limit)
+    hit_test(snapshot, dragged, IVec2::new(x, y), 0, |_| limit)
 }
 
 #[test]
@@ -712,6 +712,58 @@ fn the_outer_quarters_of_a_column_open_a_new_column_beside_it() {
     assert_eq!(hit(&snap, e[4], 500, 300, 5), into(1, 1));
     assert_eq!(hit(&snap, e[4], 699, 300, 5), into(1, 1));
     assert_eq!(hit(&snap, e[4], 700, 300, 5), new_column(2));
+}
+
+/// A window grabbed near one edge of its top bar puts the pointer in a
+/// column's outer quarter while the window's centre is over the middle half,
+/// so the centre, not the pointer, picks the zone.
+#[test]
+fn the_dragged_windows_centre_picks_the_zone_not_the_pointer() {
+    let e = entities(5);
+    let snap = four_columns(&e);
+    let at = |x, centre_dx| hit_test(&snap, e[4], IVec2::new(x, 300), centre_dx, |_| 5);
+
+    assert_eq!(at(790, -190), into(1, 1), "grabbed near the right edge");
+    assert_eq!(at(410, 190), into(1, 1), "grabbed near the left edge");
+    assert_eq!(at(600, 150), new_column(2), "centre over the right quarter");
+    assert_eq!(at(600, -150), new_column(1), "centre over the left quarter");
+}
+
+/// The pointer picks the display. A centre still on the display the drag
+/// left counts as the nearest point of the pointer's display, so the drop
+/// never lands in a column scrolled away past that display's edge.
+#[test]
+fn a_centre_outside_the_pointers_display_counts_as_its_nearest_edge() {
+    const RIGHT: u32 = 2;
+    let e = entities(3);
+    let right = IRect::new(1024, 0, 2048, 768);
+    let snap = LayoutSnapshot {
+        managed_strip_displays: vec![
+            DisplaySnap {
+                id: DISPLAY,
+                bounds: BOUNDS,
+                viewport: VIEWPORT,
+                columns: vec![column(0, 0..1024, vec![band(&[e[0]], 20..768)])],
+            },
+            DisplaySnap {
+                id: RIGHT,
+                bounds: right,
+                viewport: IRect::new(1024, 20, 2048, 768),
+                columns: vec![
+                    column(0, 624..1024, vec![band(&[e[1]], 20..768)]),
+                    column(1, 1024..1424, vec![band(&[e[2]], 20..768)]),
+                ],
+            },
+        ],
+    };
+
+    assert_eq!(
+        hit_test(&snap, e[0], IVec2::new(1300, 300), -400, |_| 5),
+        DropTarget::NewColumn {
+            display: RIGHT,
+            index: 1,
+        }
+    );
 }
 
 #[test]
@@ -822,6 +874,7 @@ fn dragging_to(window: Entity, pointer: IVec2, target: DropTarget) -> DragState 
     DragState::Dragging(Drag {
         window,
         pointer,
+        centre_dx: 0,
         target,
         button_up_since: None,
     })
@@ -911,7 +964,7 @@ fn a_new_column_on_an_empty_display_shows_a_full_line_inside_its_viewport() {
         columns: vec![],
     });
     let pointer = IVec2::new(1206, 1560);
-    let target = hit_test(&snap, e[4], pointer, |_| 5);
+    let target = hit_test(&snap, e[4], pointer, 0, |_| 5);
     assert_eq!(
         target,
         DropTarget::NewColumn {
@@ -1095,12 +1148,19 @@ fn drag_state(world: &mut World) -> DragState {
     world.resource::<DragState>().clone()
 }
 
+/// The point in the top bar of a window at `frame` where a test grabs it:
+/// across from its centre, so the pointer and the window's centre pick the
+/// same column.
+fn grab(frame: IRect) -> Origin {
+    Origin::new(frame.center().x, frame.min.y + 10)
+}
+
 /// Presses window `id`'s title bar and drags it to `to` in six steps, the way
 /// macOS reports it: each pointer move, then the window following one frame
 /// later with a `WindowMoved`. Returns the window's frame before the drag.
 fn press_and_drag(harness: &mut TestHarness, id: WinID, to: Origin) -> IRect {
     let start = frame(harness.world(), id);
-    let press = start.min + IVec2::new(100, 10);
+    let press = grab(start);
     press_at(harness, press);
     harness.advance(FRAME);
     let steps = 6;
@@ -1142,6 +1202,12 @@ fn title_drag(harness: &mut TestHarness, id: WinID, to: Origin) -> IRect {
 fn middle_of(world: &mut World, id: WinID, y: i32) -> Origin {
     let frame = frame(world, id);
     Origin::new(frame.center().x, y)
+}
+
+/// Where the pointer goes, `y` points down, so a window at `frame` grabbed at
+/// `grab` has its centre over the middle of window `id`'s column.
+fn centred_over(world: &mut World, id: WinID, y: i32, frame: IRect, grab: Origin) -> Origin {
+    middle_of(world, id, y) - IVec2::new(frame.center().x - grab.x, 0)
 }
 
 fn harness_with(config: &str, display_height: i32, windows: i32) -> TestHarness {
@@ -1238,7 +1304,7 @@ fn a_window_dropped_on_a_column_joins_it_where_it_lands() {
 fn a_quick_drop_waits_for_its_delayed_move_notification() {
     let mut harness = three_columns();
     let start = frame(harness.world(), 2);
-    let press = start.min + IVec2::new(100, 10);
+    let press = grab(start);
     let to = middle_of(harness.world(), 0, 600);
     press_at(&mut harness, press);
     harness.advance(FRAME);
@@ -1263,7 +1329,7 @@ fn a_quick_drop_waits_for_a_move_after_release_within_the_original_deadline() {
     for delay in [FRAME, Duration::from_millis(300)] {
         let mut harness = three_columns();
         let start = frame(harness.world(), 2);
-        let press = start.min + IVec2::new(100, 10);
+        let press = grab(start);
         let to = middle_of(harness.world(), 0, 600);
         press_at(&mut harness, press);
         harness.advance(FRAME);
@@ -1294,7 +1360,7 @@ fn a_drop_restoring_focus_scrolls_only_as_far_as_needed_with_auto_center() {
     assert!(parked.min.x >= TEST_DISPLAY_WIDTH - 10, "{parked:?}");
     harness.mock_state.raise_window(2);
     let start = parked.min + IVec2::new(2, 10);
-    let to = middle_of(harness.world(), 1, 600);
+    let to = centred_over(harness.world(), 1, 600, parked, start);
 
     press_at(&mut harness, start);
     harness.advance(FRAME);
@@ -1375,6 +1441,45 @@ fn a_drop_within_its_own_stack_reorders_it() {
     assert_one_column(harness.world(), &[2, 0]);
 }
 
+/// Sam's case from #72: the top window of a stack grabbed beside the
+/// right end of its top bar and dragged straight down. The pointer stays in
+/// the column's right quarter, but the window's centre stays over its
+/// middle, so the drop reorders the stack instead of opening a new column.
+#[test]
+fn a_stack_member_grabbed_near_its_right_edge_and_dragged_down_reorders_it() {
+    let mut harness = three_columns();
+    let below_the_middle = middle_of(harness.world(), 0, 600);
+    title_drag(&mut harness, 2, below_the_middle);
+    assert_eq!(layout(harness.world()), vec![vec![0, 2], vec![1]]);
+
+    let start = frame(harness.world(), 0);
+    let press = Origin::new(start.max.x - 5, start.min.y + 10);
+    press_at(&mut harness, press);
+    harness.advance(FRAME);
+    let to = Origin::new(press.x, TEST_DISPLAY_HEIGHT - 1);
+    for at in 1..=6 {
+        let point = press + (to - press) * at / 6;
+        harness.world().write_message(mouse_dragged(point));
+        harness
+            .mock_state
+            .os_move_window(0, start.min + (point - press));
+        harness.advance(FRAME);
+    }
+    assert!(
+        matches!(
+            feedback(harness.world()),
+            Some(OverlayShape::Line(line)) if line.width() > line.height()
+        ),
+        "a horizontal insertion line: {:?}",
+        feedback(harness.world())
+    );
+    release(&mut harness, to);
+    harness.advance(SETTLE);
+
+    assert_eq!(layout(harness.world()), vec![vec![2, 0], vec![1]]);
+    assert_one_column(harness.world(), &[2, 0]);
+}
+
 #[test]
 fn a_full_column_refuses_a_drop_and_the_window_returns() {
     let mut harness = harness_with("[options]\nstack_limit = 2\n", TEST_DISPLAY_HEIGHT, 3);
@@ -1430,7 +1535,7 @@ fn a_small_jitter_is_not_a_drag_in_the_engine() {
     let mut harness = three_columns();
 
     let start = frame(harness.world(), 2);
-    let press = start.min + IVec2::new(100, 10);
+    let press = grab(start);
     let jitter = press + IVec2::new(3, 1);
     press_at(&mut harness, press);
     harness.advance(FRAME);
@@ -1476,7 +1581,7 @@ fn a_pointer_drag_that_leaves_the_window_still_is_not_a_drag() {
     let mut harness = three_columns();
 
     let start = frame(harness.world(), 2);
-    let press = start.min + IVec2::new(100, 10);
+    let press = grab(start);
     press_at(&mut harness, press);
     harness.advance(FRAME);
     let to = middle_of(harness.world(), 0, 600);
@@ -1526,7 +1631,7 @@ fn a_native_tab_group_moves_as_one() {
 fn a_gesture_batched_into_one_update_still_drops() {
     let mut harness = three_columns();
     let start = frame(harness.world(), 2);
-    let press = start.min + IVec2::new(100, 10);
+    let press = grab(start);
     let to = middle_of(harness.world(), 0, 600);
 
     press_at(&mut harness, press);
@@ -1597,7 +1702,7 @@ fn a_parked_window_is_dragged_by_its_visible_title_bar() {
     // The sliver sits over the right edge of window 2, and is on top.
     harness.mock_state.raise_window(3);
     let start = parked.min + IVec2::new(2, 10);
-    let to = middle_of(harness.world(), 0, 600);
+    let to = centred_over(harness.world(), 0, 600, parked, start);
     press_at(&mut harness, start);
     harness.advance(FRAME);
     for at in 1..=6 {
@@ -1628,7 +1733,7 @@ fn a_batched_drag_of_a_parked_window_moves_that_window() {
     let parked = frame(harness.world(), 3);
     harness.mock_state.raise_window(3);
     let start = parked.min + IVec2::new(2, 10);
-    let to = middle_of(harness.world(), 0, 600);
+    let to = centred_over(harness.world(), 0, 600, parked, start);
 
     press_at(&mut harness, start);
     for at in 1..=6 {
@@ -1657,7 +1762,7 @@ fn a_batched_press_of_a_parked_window_holds_that_window() {
     let parked = frame(harness.world(), 4);
     harness.mock_state.raise_window(4);
     let start = parked.min + IVec2::new(2, 10);
-    let to = middle_of(harness.world(), 0, 600);
+    let to = centred_over(harness.world(), 0, 600, parked, start);
 
     press_at(&mut harness, start);
     for at in 1..=6 {
@@ -1829,7 +1934,7 @@ fn a_release_the_tap_never_reports_hides_the_overlay() {
 fn a_press_that_never_becomes_a_drag_shows_nothing() {
     let mut harness = three_columns();
     let start = frame(harness.world(), 1);
-    press_at(&mut harness, start.min + IVec2::new(100, 10));
+    press_at(&mut harness, grab(start));
     harness.advance(FRAME);
 
     assert!(matches!(drag_state(harness.world()), DragState::Pressed(_)));

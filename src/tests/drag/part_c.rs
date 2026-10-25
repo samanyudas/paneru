@@ -147,7 +147,7 @@ fn ending_a_press_replays_layout_changes_for_every_native_tab() {
         let mut harness = three_columns();
         add_native_tab(&mut harness, 1, 3);
         let start = frame(harness.world(), 3);
-        let point = start.min + IVec2::new(100, 10);
+        let point = grab(start);
         press_at(&mut harness, point);
         harness.advance(FRAME);
         assert!(is_pressed(&drag_state(harness.world())));
@@ -1044,7 +1044,7 @@ fn a_late_accessibility_element_keeps_a_cross_display_drop() {
 fn a_batched_gesture_and_display_activation_keep_a_refused_drag_in_its_source() {
     let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
     let start = frame(harness.world(), 2);
-    let press = start.min + IVec2::new(100, 10);
+    let press = grab(start);
     let point = middle_of(harness.world(), 100, 900);
     press_at(&mut harness, press);
     for at in 1..=6 {
@@ -1262,7 +1262,7 @@ fn refused_return_with_native_echo() -> TestHarness {
 fn deferred_activation_requeries_after_a_press_is_cancelled_without_another_activation() {
     let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
     let start = frame(harness.world(), 2);
-    press_at(&mut harness, start.min + IVec2::new(100, 10));
+    press_at(&mut harness, grab(start));
     harness.advance(FRAME);
     macos_moves_to_ext(&mut harness, 2);
     harness.advance(FRAME * 3);
@@ -1275,7 +1275,7 @@ fn deferred_activation_requeries_after_a_press_is_cancelled_without_another_acti
         .world()
         .write_message(Event::WindowResized { window_id: 2 });
     harness.advance(FRAME);
-    release(&mut harness, start.min + IVec2::new(100, 10));
+    release(&mut harness, grab(start));
     harness.advance(FRAME * 3);
     assert!(harness.mock_state.membership_reads(EXT_WORKSPACE_ID) > reads);
     assert_eq!(
@@ -1288,7 +1288,7 @@ fn deferred_activation_requeries_after_a_press_is_cancelled_without_another_acti
 fn deferred_activation_uses_the_latest_native_destination() {
     let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
     let start = frame(harness.world(), 2);
-    press_at(&mut harness, start.min + IVec2::new(100, 10));
+    press_at(&mut harness, grab(start));
     harness.advance(FRAME);
     macos_moves_to_ext(&mut harness, 2);
     harness.advance(FRAME * 3);
@@ -1531,7 +1531,7 @@ fn a_deferred_activation_follows_a_different_live_space_on_replay() {
         crate::ecs::SelectedVirtualMarker,
     ));
     let start = frame(harness.world(), 2);
-    press_at(&mut harness, start.min + IVec2::new(100, 10));
+    press_at(&mut harness, grab(start));
     harness.advance(FRAME);
     macos_moves_to_ext(&mut harness, 2);
     harness.advance(FRAME * 3);
@@ -1542,7 +1542,7 @@ fn a_deferred_activation_follows_a_different_live_space_on_replay() {
         .world()
         .write_message(Event::WindowResized { window_id: 2 });
     harness.advance(FRAME);
-    release(&mut harness, start.min + IVec2::new(100, 10));
+    release(&mut harness, grab(start));
     harness.advance(SETTLE);
     let entity = window_entity(&mut harness, 2);
     assert!(
@@ -2238,7 +2238,7 @@ fn an_animated_macos_tile_returns_to_the_slot_it_had_before_the_animation() {
 fn a_drag_whose_move_notification_arrives_late_still_drops() {
     let mut harness = three_columns();
     let start = frame(harness.world(), 2);
-    let press = start.min + IVec2::new(100, 10);
+    let press = grab(start);
     let to = middle_of(harness.world(), 0, 600);
     press_at(&mut harness, press);
     harness.advance(FRAME);
@@ -2267,7 +2267,7 @@ fn a_drag_whose_move_notification_arrives_late_still_drops() {
 fn a_toolbar_text_selection_never_becomes_a_window_drag() {
     let mut harness = three_columns();
     let start = frame(harness.world(), 2);
-    let press = start.min + IVec2::new(100, 10);
+    let press = grab(start);
     press_at(&mut harness, press);
     harness.advance(FRAME);
     for at in 1..=6 {
@@ -2296,7 +2296,7 @@ fn a_window_held_at_a_screen_edge_still_drags_and_drops_at_the_pointer() {
     let mut harness = three_columns();
     let start = frame(harness.world(), 0);
     assert_eq!(start.min.x, 0, "window 0 sits on the screen's left edge");
-    let press = start.min + IVec2::new(100, 10);
+    let press = grab(start);
     press_at(&mut harness, press);
     harness.advance(FRAME);
     // The pointer moves right and down, but the screen edge holds the
@@ -2326,7 +2326,7 @@ fn a_window_held_at_a_screen_edge_still_drags_and_drops_at_the_pointer() {
 fn an_app_moving_its_window_across_the_pointer_is_not_a_drag() {
     let mut harness = three_columns();
     let start = frame(harness.world(), 1);
-    let press = start.min + IVec2::new(100, 10);
+    let press = grab(start);
     press_at(&mut harness, press);
     harness.advance(FRAME);
     // The pointer moves right while the app moves its own window down.
@@ -2353,7 +2353,7 @@ fn an_app_moving_its_window_across_the_pointer_is_not_a_drag() {
 /// window's slot and the frame macOS left it at.
 fn drag_window_one_on_one_axis(harness: &mut TestHarness) -> (IRect, IRect, Origin) {
     let start = frame(harness.world(), 1);
-    let press = start.min + IVec2::new(100, 10);
+    let press = grab(start);
     press_at(harness, press);
     harness.advance(FRAME);
     let mut pointer = press;
@@ -2427,7 +2427,7 @@ fn a_button_stuck_down_ends_an_unconfirmed_press_at_the_press_limit() {
         if moved {
             drag_window_one_on_one_axis(&mut harness);
         } else {
-            press_at(&mut harness, start.min + IVec2::new(100, 10));
+            press_at(&mut harness, grab(start));
         }
         // No more events, and the button reads down forever.
         harness.advance(Duration::from_secs(9));
