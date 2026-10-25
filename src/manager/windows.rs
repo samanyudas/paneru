@@ -789,6 +789,37 @@ fn top_bar_extent(title_bar: Option<i32>, mut toolbars: Vec<Range<i32>>) -> Opti
 const CPS_USER_GENERATED: u32 = 0x200;
 // const CPS_NO_WINDOWS: u32 = 0x400;
 
+/// Makes `window_id` the key window of the process `psn` by sending synthesized events.
+fn make_key_window(psn: &ProcessSerialNumber, window_id: WinID) {
+    // Reason: On macOS 14 (Sonoma), CGSEncodeEventRecord serializes the raw event
+    // buffer via NSKeyedArchiver, misinterpreting 0xFF fill as an ObjC class pointer,
+    // causing SIGABRT. See https://github.com/karinushka/paneru/issues/123
+    if macos_major_version() == 14 {
+        debug!("make_key_window: skipped on macOS 14 (Sonoma) to prevent crash");
+        return;
+    }
+    let mut event_bytes = [0u8; 0xf8];
+    event_bytes[0x04] = 0xf8;
+    event_bytes[0x3a] = 0x10;
+    event_bytes[0x3c..0x40].copy_from_slice(&window_id.to_ne_bytes());
+    event_bytes[0x20..0x30].fill(0xff);
+
+    event_bytes[0x08] = 0x01;
+    unsafe { SLPSPostEventRecordTo(psn, event_bytes.as_ptr().cast()) };
+
+    event_bytes[0x08] = 0x02;
+    unsafe { SLPSPostEventRecordTo(psn, event_bytes.as_ptr().cast()) };
+}
+
+/// Brings the process `psn` to the front with `window_id` as its key window,
+/// without raising the window.
+pub(super) fn focus_window(psn: ProcessSerialNumber, window_id: WinID) {
+    unsafe {
+        _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
+    }
+    make_key_window(&psn, window_id);
+}
+
 #[derive(Debug)]
 pub struct WindowOS {
     id: WinID,
@@ -948,33 +979,6 @@ impl WindowOS {
             element: self.ax_element.clone(),
             padding: IVec2::new(self.horizontal_padding, self.vertical_padding),
         }
-    }
-
-    /// Makes the window the key window for its application by sending synthesized events.
-    ///
-    /// # Arguments
-    ///
-    /// * `psn` - The process serial number of the application.
-    fn make_key_window(&self, psn: &ProcessSerialNumber) {
-        // Reason: On macOS 14 (Sonoma), CGSEncodeEventRecord serializes the raw event
-        // buffer via NSKeyedArchiver, misinterpreting 0xFF fill as an ObjC class pointer,
-        // causing SIGABRT. See https://github.com/karinushka/paneru/issues/123
-        if macos_major_version() == 14 {
-            debug!("make_key_window: skipped on macOS 14 (Sonoma) to prevent crash");
-            return;
-        }
-        let window_id = self.id();
-        let mut event_bytes = [0u8; 0xf8];
-        event_bytes[0x04] = 0xf8;
-        event_bytes[0x3a] = 0x10;
-        event_bytes[0x3c..0x40].copy_from_slice(&window_id.to_ne_bytes());
-        event_bytes[0x20..0x30].fill(0xff);
-
-        event_bytes[0x08] = 0x01;
-        unsafe { SLPSPostEventRecordTo(psn, event_bytes.as_ptr().cast()) };
-
-        event_bytes[0x08] = 0x02;
-        unsafe { SLPSPostEventRecordTo(psn, event_bytes.as_ptr().cast()) };
     }
 }
 
@@ -1165,7 +1169,7 @@ impl WindowApi for WindowOS {
         unsafe {
             _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
         }
-        self.make_key_window(&psn);
+        make_key_window(&psn, window_id);
     }
 
     /// Focuses the window and raises it to the front.
@@ -1175,7 +1179,7 @@ impl WindowApi for WindowOS {
         unsafe {
             _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
         }
-        self.make_key_window(&psn);
+        make_key_window(&psn, window_id);
         let element_ref = self.ax_element.as_ptr();
         let action = CFString::from_static_str(kAXRaiseAction);
         unsafe { AXUIElementPerformAction(element_ref, &action) };

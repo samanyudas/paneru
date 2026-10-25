@@ -156,6 +156,8 @@ struct MockStateInner {
     window_list_reads: HashMap<Pid, usize>,
     active_display_id: u32,
     cursor_position: Origin,
+    /// The display bounds whose desktop the engine last focused.
+    focused_desktop: Option<IRect>,
     /// Whether the window server sees the left mouse button down.
     left_button_down: bool,
     /// Windows raised above the rest, bottom to top. Windows not in it sit
@@ -351,6 +353,7 @@ impl MockState {
             window_list_reads: HashMap::new(),
             active_display_id: 0,
             cursor_position: Origin::ZERO,
+            focused_desktop: None,
             left_button_down: false,
             raised: Vec::new(),
             event_queue: VecDeque::new(),
@@ -1014,6 +1017,10 @@ impl MockState {
         self.inner.force_read().cursor_position
     }
 
+    pub fn focused_desktop(&self) -> Option<IRect> {
+        self.inner.force_read().focused_desktop
+    }
+
     // --- Mock Factory Methods ---
 
     fn mock_resize(&self, id: WinID, ax_generation: u32, size: Size) {
@@ -1580,6 +1587,12 @@ impl MockState {
         let s = self.clone();
         wm.expect_warp_mouse()
             .returning(move |origin| s.inner.force_write().cursor_position = origin);
+
+        let s = self.clone();
+        wm.expect_focus_desktop().returning(move |bounds| {
+            s.inner.force_write().focused_desktop = Some(bounds);
+            Ok(())
+        });
 
         let s = self.clone();
         wm.expect_cursor_position()

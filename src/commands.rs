@@ -11,7 +11,7 @@ use bevy::ecs::system::{Commands, ParamSet, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
 use tracing::{Level, instrument};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 mod query;
 
@@ -693,6 +693,7 @@ fn command_center_window(
     windows: Windows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::Center))
@@ -729,7 +730,9 @@ fn command_center_window(
             commands.reposition_entity(entity, origin);
         }
 
-        window_manager.warp_mouse(active_display.bounds().center());
+        if config.mouse_follows_focus() {
+            window_manager.warp_mouse(active_display.bounds().center());
+        }
     }
 }
 
@@ -1405,6 +1408,7 @@ fn to_next_display(
     windows: Windows,
     mut moves: DisplayMoves,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut native: ResMut<crate::ecs::native_membership::NativeMembership>,
     mut commands: Commands,
 ) {
@@ -1476,7 +1480,7 @@ fn to_next_display(
         commands.reposition_entity(entity, origin);
     }
     native.placed(arrival.members);
-    if matches!(move_focus, MoveFocus::Follow) {
+    if matches!(move_focus, MoveFocus::Follow) && config.mouse_follows_focus() {
         window_manager.warp_mouse(bounds.center());
     }
     if matches!(move_focus, MoveFocus::Stay)
@@ -1491,7 +1495,10 @@ fn to_next_display(
 
 /// Focuses the display in a compass direction from the active one: the window
 /// that last had focus on it when that window is visible, otherwise its most
-/// visible window, with the pointer moved onto that window.
+/// visible window. A display without one gets its desktop focused instead, so
+/// it becomes the active display. The pointer moves only with
+/// `mouse_follows_focus`.
+#[allow(clippy::too_many_arguments)]
 fn focus_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -1499,6 +1506,7 @@ fn focus_display(
     layout_strips: Query<&LayoutStrip, With<SelectedVirtualMarker>>,
     focus_history: Res<FocusHistory>,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let Some(Operation::FocusDisplay(direction)) =
@@ -1551,9 +1559,19 @@ fn focus_display(
     });
 
     if let Some((entity, frame)) = entity.and_then(|entity| Some((entity, visible(entity)?))) {
-        window_manager.warp_mouse(frame.center());
+        if config.mouse_follows_focus() {
+            window_manager.warp_mouse(frame.center());
+        }
         commands.focus_entity(entity, true);
-    } else {
+        return;
+    }
+    if let Err(err) = window_manager.focus_desktop(target_bounds) {
+        warn!(
+            "can not focus the desktop of display {}: {err}",
+            target.id()
+        );
+    }
+    if config.mouse_follows_focus() {
         window_manager.warp_mouse(target_bounds.center());
     }
 }
