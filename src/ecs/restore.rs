@@ -19,7 +19,7 @@ use crate::ecs::state::{
 };
 use crate::ecs::workspace::{PreviousStripPosition, RestoredActivation};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Position, RestoreWindowState,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, Position, RestoreWindowState,
     SelectedVirtualMarker, SpawnCommandsExt, Unmanaged, WindowProperties,
 };
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -408,6 +408,7 @@ pub(super) fn restore_window_state(
         Has<ActiveWorkspaceMarker>,
     )>,
     displays: Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
+    docks: Query<&DockPosition>,
     apps: Query<&Application>,
     window_manager: Res<WindowManager>,
     session: Option<Res<SessionRestore>>,
@@ -536,8 +537,9 @@ pub(super) fn restore_window_state(
                 && window_manager
                     .active_display_space(display.id())
                     .is_ok_and(|space| space == planned.workspace_id);
+        let viewport = display.actual_display_bounds(docks.get(display_entity).ok(), &ctx.config);
         let origin = if is_shown {
-            display.bounds().min
+            viewport.min
         } else {
             display.bounds().max - PARKED_STRIP_SLIVER
         };
@@ -549,7 +551,7 @@ pub(super) fn restore_window_state(
                     && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
                 {
                     let existing_previous = PreviousStripPosition {
-                        origin: display.bounds().min,
+                        origin: viewport.min,
                         focus: strip.all_windows().first().copied(),
                     };
                     entity_commands
@@ -561,9 +563,18 @@ pub(super) fn restore_window_state(
         }
 
         let previous = PreviousStripPosition {
-            origin: display.bounds().min,
+            origin: viewport.min,
             focus: strip.all_windows().first().copied(),
         };
+
+        let focused = ctx
+            .windows
+            .focused()
+            .map(|(_, entity)| entity)
+            .filter(|entity| is_shown && strip.contains(*entity));
+        if let Some(entity) = focused {
+            ctx.commands.ensure_visible(entity);
+        }
 
         let mut spawned =
             ctx.commands
