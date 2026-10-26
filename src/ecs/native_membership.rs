@@ -49,7 +49,7 @@ use tracing::{debug, warn};
 
 use super::display::migrate_windows_to_space;
 use super::drag::DragState;
-use super::layout::LayoutStrip;
+use super::layout::{Before, LayoutStrip};
 use super::workspace::PreviousStripPosition;
 use super::{
     ActiveWorkspaceMarker, AwaitingHandle, Bounds, Initializing, NativeFullscreenMarker, Position,
@@ -138,6 +138,15 @@ struct Placing {
     /// The layout frames seen on the last pass. A placement is done once its
     /// windows stop moving and these stay the same for a pass.
     targets: Vec<(Entity, IRect)>,
+    maximized: Option<Before>,
+}
+
+/// A group a placement left in no strip, because the destination display
+/// showed none. A later native report adds it as one item, maximized again
+/// when it was.
+struct Stripless {
+    members: Vec<Entity>,
+    maximized: Option<Before>,
 }
 
 struct IgnoredWindow {
@@ -164,9 +173,7 @@ pub(crate) struct NativeMembership {
     topology: bool,
     held: Option<HeldDragGroup>,
     placing: Vec<Placing>,
-    /// Groups a placement left in no strip, because the destination display
-    /// showed none. A later native report adds each as one item.
-    stripless: Vec<Vec<Entity>>,
+    stripless: Vec<Stripless>,
     ignored: HashMap<WinID, IgnoredWindow>,
 }
 
@@ -185,7 +192,9 @@ impl NativeMembership {
 
     /// Holds `members`, which the engine just placed explicitly, against
     /// native reports until the engine has moved them into place.
-    pub(crate) fn placed(&mut self, members: Vec<Entity>) {
+    /// `maximized` is what they return to when they are a maximized window
+    /// that joined no strip yet.
+    pub(crate) fn placed(&mut self, members: Vec<Entity>, maximized: Option<Before>) {
         debug!(?members, "Explicit placement holds native membership");
         self.placing.retain(|placing| {
             !placing
@@ -196,6 +205,7 @@ impl NativeMembership {
         self.placing.push(Placing {
             members,
             targets: Vec::new(),
+            maximized,
         });
     }
 
@@ -239,8 +249,8 @@ impl NativeMembership {
             .or_else(|| {
                 self.stripless
                     .iter()
-                    .find(|group| group.contains(&member))
-                    .cloned()
+                    .find(|group| group.members.contains(&member))
+                    .map(|group| group.members.clone())
             })
             .unwrap_or_else(|| vec![member])
     }
@@ -368,9 +378,15 @@ fn reconcile(world: &mut World) {
                 members: native.group(world, window),
             });
         }
-        native
-            .stripless
-            .retain(|group| group.iter().all(|member| stripless(world, *member)));
+        for group in &mut native.stripless {
+            group
+                .members
+                .retain(|member| world.get::<Window>(*member).is_some());
+        }
+        native.stripless.retain(|group| {
+            !group.members.is_empty()
+                && group.members.iter().all(|member| stripless(world, *member))
+        });
         let spaces = live_spaces(world);
         let live = |space: &WorkspaceId| spaces.iter().any(|(live, _)| live == space);
         if native.dirty.keys().any(|space| !live(space)) {
@@ -608,6 +624,21 @@ fn reconcile_space(
     }
     if !admitted.is_empty() {
         apply_native_move(world, space, display, &admitted, topology);
+        for members in &admitted {
+            let maximized = native
+                .stripless
+                .iter()
+                .find(|group| group.members == *members)
+                .and_then(|group| group.maximized.clone());
+            if let Some(before) = maximized
+                && let Some(mut strip) = world
+                    .query::<&mut LayoutStrip>()
+                    .iter_mut(world)
+                    .find(|strip| strip.contains(members[0]))
+            {
+                strip.adopt_maximized(members[0], before);
+            }
+        }
     }
     held
 }
@@ -687,9 +718,10 @@ fn observe_placements(world: &mut World) {
         let mut moving = world.query_filtered::<(), Moving>();
         let mut ended = false;
         for mut placing in std::mem::take(&mut native.placing) {
-            let gone = placing.members.iter().any(|member| {
-                world.get::<Window>(*member).is_none() || world.get::<Unmanaged>(*member).is_some()
+            placing.members.retain(|member| {
+                world.get::<Window>(*member).is_some() && world.get::<Unmanaged>(*member).is_none()
             });
+            let gone = placing.members.is_empty();
             let targets = layout_frames(world, &placing.members);
             let settled = targets == placing.targets
                 && !placing
@@ -709,7 +741,10 @@ fn observe_placements(world: &mut World) {
                     .iter()
                     .all(|member| stripless(world, *member))
             {
-                native.stripless.push(placing.members);
+                native.stripless.push(Stripless {
+                    members: placing.members,
+                    maximized: placing.maximized,
+                });
             }
         }
         if ended {

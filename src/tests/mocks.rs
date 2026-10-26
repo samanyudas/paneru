@@ -93,6 +93,9 @@ pub(crate) struct MockWindowData {
     /// The last horizontal and vertical padding the engine set, which the
     /// mock does not apply to its frames.
     pub(crate) padding_set: (Option<i32>, Option<i32>),
+    /// The edge padding the engine has the window fill. Unlike the padding,
+    /// the mock applies it to its frames, as `WindowOS` does.
+    pub(crate) fill: Option<Margins>,
     pub(crate) child_role: bool,
     /// Bumped when the app replaces the window's AX element. A `Window`
     /// handle created before the bump is stale and its `role()` fails.
@@ -165,6 +168,7 @@ impl Default for MockWindowData {
             horizontal_padding: 0,
             vertical_padding: 0,
             padding_set: (None, None),
+            fill: None,
             child_role: false,
             ax_generation: 0,
             ax_unlisted: false,
@@ -288,27 +292,30 @@ impl MockApp {
 }
 
 impl WriteSink for MockApp {
-    type Window = (WinID, u32);
+    /// The window and the fill margins it had when the write was asked for.
+    type Window = (WinID, u32, Margins);
 
     fn begin(&mut self) {}
 
-    fn set_position(&mut self, &(id, ax_generation): &(WinID, u32), origin: Origin) {
+    fn set_position(&mut self, &(id, ax_generation, margins): &Self::Window, origin: Origin) {
         if let Some(inner) = self.inner.upgrade() {
             self.busy(&inner);
-            mock_reposition(&inner, id, ax_generation, origin);
+            mock_reposition(&inner, id, ax_generation, origin + margins.min);
         }
     }
 
-    fn set_size(&mut self, &(id, ax_generation): &(WinID, u32), size: Size) {
+    fn set_size(&mut self, &(id, ax_generation, margins): &Self::Window, size: Size) {
         if let Some(inner) = self.inner.upgrade() {
             self.busy(&inner);
-            mock_resize(&inner, id, ax_generation, size);
+            mock_resize(&inner, id, ax_generation, size - margins.min - margins.max);
         }
     }
 
-    fn read_frame(&mut self, &(id, ax_generation): &(WinID, u32)) -> Option<IRect> {
+    fn read_frame(&mut self, &(id, ax_generation, margins): &Self::Window) -> Option<IRect> {
         let inner = self.inner.upgrade()?;
-        mock_read_frame(&inner, id, ax_generation).ok()
+        mock_read_frame(&inner, id, ax_generation)
+            .ok()
+            .map(|frame| margins.tracked(frame))
     }
 
     fn finish(&mut self) {}
@@ -316,6 +323,17 @@ impl WriteSink for MockApp {
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The margins the mock applies to window `id`'s frames: only a fill.
+fn fill_margins(inner: &RwLock<MockStateInner>, id: WinID) -> Margins {
+    inner
+        .force_read()
+        .windows
+        .get(&id)
+        .and_then(|w| w.fill)
+        .map(Margins::filling)
+        .unwrap_or_default()
 }
 
 /// Applies a size write to window `id`, as its app would.
@@ -1150,34 +1168,49 @@ impl MockState {
     fn expect_inline_writes(&self, mw: &mut MockWindowApi, id: WinID, ax_generation: u32) {
         let s = self.clone();
         mw.expect_frame().returning(move || {
+            let margins = fill_margins(&s.inner, id);
             s.inner
                 .force_read()
                 .windows
                 .get(&id)
-                .map(|w| w.frame)
+                .map(|w| margins.tracked(w.frame))
                 .unwrap_or_default()
         });
 
         let s = self.clone();
-        mw.expect_resize()
-            .returning(move |size| s.mock_resize(id, ax_generation, size));
+        mw.expect_resize().returning(move |size| {
+            let margins = fill_margins(&s.inner, id);
+            s.mock_resize(id, ax_generation, size - margins.min - margins.max);
+        });
 
         let s = self.clone();
-        mw.expect_reposition()
-            .returning(move |origin| s.mock_reposition(id, ax_generation, origin));
+        mw.expect_reposition().returning(move |origin| {
+            let margins = fill_margins(&s.inner, id);
+            s.mock_reposition(id, ax_generation, origin + margins.min);
+        });
 
         // The order `WindowOS` writes a frame in: an app may limit a size at
         // the old position, so the size is set again once the window moved.
         let s = self.clone();
         mw.expect_place().returning(move |frame: IRect| {
+            let frame = fill_margins(&s.inner, id).shown(frame);
             s.mock_resize(id, ax_generation, frame.size());
             s.mock_reposition(id, ax_generation, frame.min);
             s.mock_resize(id, ax_generation, frame.size());
         });
 
         let s = self.clone();
-        mw.expect_update_frame()
-            .returning(move || mock_read_frame(&s.inner, id, ax_generation));
+        mw.expect_update_frame().returning(move || {
+            let margins = fill_margins(&s.inner, id);
+            mock_read_frame(&s.inner, id, ax_generation).map(|frame| margins.tracked(frame))
+        });
+
+        let s = self.clone();
+        mw.expect_set_fill().returning(move |fill| {
+            if let Some(window) = s.inner.force_write().windows.get_mut(&id) {
+                window.fill = fill;
+            }
+        });
 
         mw.expect_write_pending().return_const(false);
     }
@@ -1194,25 +1227,40 @@ impl MockState {
         let writes = Arc::new(Mutex::new(
             FrameWrites::new(self.writers.clone()).starting_at(self.ax_frame(id)),
         ));
-        let window = move || (id, ax_generation);
+        let s = self.clone();
+        let window = move || (id, ax_generation, fill_margins(&s.inner, id));
 
         let w = writes.clone();
         mw.expect_frame().returning(move || lock(&w).frame());
         let w = writes.clone();
+        let to = window.clone();
         mw.expect_resize()
-            .returning(move |size| lock(&w).resize(Some(pid), window, size));
+            .returning(move |size| lock(&w).resize(Some(pid), &to, size));
         let w = writes.clone();
+        let to = window.clone();
         mw.expect_reposition()
-            .returning(move |origin| lock(&w).reposition(Some(pid), window, origin));
+            .returning(move |origin| lock(&w).reposition(Some(pid), &to, origin));
         let w = writes.clone();
         mw.expect_write_pending()
             .returning(move || lock(&w).write_pending(Some(pid)));
         let w = writes.clone();
         mw.expect_place()
-            .returning(move |frame: IRect| lock(&w).place(Some(pid), window, frame));
+            .returning(move |frame: IRect| lock(&w).place(Some(pid), &window, frame));
         let s = self.clone();
+        let w = writes.clone();
         mw.expect_update_frame().returning(move || {
-            lock(&writes).update_frame(Some(pid), || mock_read_frame(&s.inner, id, ax_generation))
+            let margins = fill_margins(&s.inner, id);
+            lock(&w).update_frame(Some(pid), || {
+                mock_read_frame(&s.inner, id, ax_generation).map(|frame| margins.tracked(frame))
+            })
+        });
+        let s = self.clone();
+        mw.expect_set_fill().returning(move |fill| {
+            let shown = fill_margins(&s.inner, id).shown(lock(&writes).frame());
+            if let Some(window) = s.inner.force_write().windows.get_mut(&id) {
+                window.fill = fill;
+            }
+            lock(&writes).track(fill_margins(&s.inner, id).tracked(shown));
         });
     }
 
@@ -1382,9 +1430,18 @@ impl MockState {
                 .force_read()
                 .windows
                 .get(&id)
-                .map(|w| Margins::padding(IVec2::new(w.horizontal_padding, w.vertical_padding)))
+                .map(|w| {
+                    w.fill.map_or_else(
+                        || Margins::padding(IVec2::new(w.horizontal_padding, w.vertical_padding)),
+                        Margins::filling,
+                    )
+                })
                 .unwrap_or_default()
         });
+
+        let s = self.clone();
+        mw.expect_fill()
+            .returning(move || s.inner.force_read().windows.get(&id).and_then(|w| w.fill));
 
         let s = self.clone();
         mw.expect_is_full_screen().returning(move || {

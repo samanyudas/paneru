@@ -1,17 +1,16 @@
 //! Maximizing a window with a double-click on its title bar, and restoring it
 //! with the next one.
 //!
-//! A maximized window fills the usable area of its display and may cover the
-//! windows around it. It keeps its place: its [`Position`] and [`Bounds`]
-//! go on tracking the slot or floating frame it returns to, and the engine
-//! does not write them to the window until it is restored. So the windows
-//! around it keep their sizes and places, and a stacked window returns to its
-//! stack.
+//! A maximized tiled window is a column of its strip as wide as the
+//! viewport, and the window fills the usable area of its display: it is
+//! drawn over the edge padding, without its window padding. It scrolls with
+//! the strip like any column, and moves with it to another display or
+//! workspace. A stacked window leaves its stack for a column of its own to
+//! the right of the stack, and goes back to its place there on restore when
+//! it can. See [`LayoutStrip::maximize`].
 //!
-//! A maximized window moved to another display, by a display command or a
-//! title-bar drag, stays maximized and fills that display's usable area. A
-//! tiled one takes a place in that display's layout: at the end of the strip
-//! for a display command, and at the drop line for a drag.
+//! A maximized floating window fills the usable area of its display over the
+//! layout, and returns to its frame on restore.
 
 use std::time::Duration;
 
@@ -19,21 +18,28 @@ use bevy::app::{App, Plugin, Update};
 use bevy::ecs::change_detection::DetectChangesMut as _;
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
+use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{any_with_component, on_message};
 use bevy::ecs::system::{Commands, Local, Query, Res};
-use bevy::ecs::world::World;
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 use tracing::debug;
 
+use crate::commands::Side;
+use crate::config::Config;
 use crate::ecs::drag::tiling::supersede_native_resize;
-use crate::ecs::layout::{FALLBACK_TOP_BAR_HEIGHT, LayoutStrip};
-use crate::ecs::{Bounds, DockPosition, Position, TopBarHeight, Unmanaged, UpdateSet};
+use crate::ecs::layout::{
+    Before, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, ViewportAnchor, ViewportShare,
+    effective_stack_limit,
+};
+use crate::ecs::{
+    Bounds, DockPosition, Position, ResizeMarker, SpawnCommandsExt as _, TopBarHeight, Unmanaged,
+    UpdateSet, WidthRun,
+};
 use crate::events::{Event, InputEvent, MouseButton};
-use crate::manager::{Display, Origin, Window, WindowManager, origin_from};
-use objc2_core_graphics::CGDirectDisplayID;
+use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
 
 /// How long the engine holds a window at the frame a toggle gave it. The
 /// app answers the same double-click with its own zoom, which can land
@@ -44,13 +50,13 @@ const FRAME_HOLD: Duration = Duration::from_secs(1);
 /// See [`approach`].
 pub(crate) const EDGE_RELEASE: i32 = 100;
 
-/// A window maximized by a title-bar double-click.
+/// A floating window maximized by a title-bar double-click.
 #[derive(Component, Clone, Copy, Debug)]
-pub(crate) struct Maximized {
+pub(crate) struct FloatingMaximized {
     /// The frame that fills the display's usable area, padding included.
     frame: IRect,
-    /// How far a floating window sat from the usable area's top-left corner,
-    /// so it returns to the same place relative to its display.
+    /// How far the window sat from the usable area's top-left corner, so it
+    /// returns to the same place relative to its display.
     offset: IVec2,
 }
 
@@ -89,19 +95,21 @@ type Toggles<'w, 's> = Query<
         &'static mut Bounds,
         Option<&'static Unmanaged>,
         Option<&'static TopBarHeight>,
-        Option<&'static Maximized>,
+        Option<&'static FloatingMaximized>,
     ),
 >;
 
 /// Maximizes a window when its title bar is double-clicked, and restores it
 /// on the next double-click. A double-click on a control in the title bar,
 /// such as a button or tab, is the control's own.
+#[allow(clippy::too_many_arguments)]
 fn toggle_maximize(
     mut messages: MessageReader<InputEvent>,
     mut windows: Toggles,
-    strips: Query<&LayoutStrip>,
+    mut strips: Query<(&mut LayoutStrip, &ChildOf)>,
     displays: Query<(&Display, Option<&DockPosition>)>,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
     time: Res<Time>,
     mut commands: Commands,
 ) {
@@ -128,8 +136,8 @@ fn toggle_maximize(
         else {
             continue;
         };
-        // The engine stops reading a maximized window's moves, so a window
-        // the user dragged is read here to find its top bar.
+        // The engine stops reading a maximized floating window's moves, so a
+        // window the user dragged is read here to find its top bar.
         if maximized.is_some() && !window.write_pending() {
             _ = window.update_frame();
         }
@@ -146,6 +154,35 @@ fn toggle_maximize(
                 continue;
             }
         }
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            continue;
+        };
+        entity_commands.try_insert(FrameHold {
+            until: time.elapsed() + FRAME_HOLD,
+        });
+
+        let tiled = unmanaged
+            .is_none()
+            .then(|| strips.iter_mut().find(|(strip, _)| strip.contains(entity)))
+            .flatten();
+        if let Some((mut strip, child_of)) = tiled {
+            let Ok((display, dock)) = displays.get(child_of.parent()) else {
+                continue;
+            };
+            let viewport = display.actual_display_bounds(dock, &config);
+            let frame = IRect::from_corners(position.0, position.0 + bounds.0);
+            toggle_tiled(
+                entity,
+                frame,
+                &mut strip,
+                viewport,
+                &config,
+                &mut windows,
+                &mut commands,
+            );
+            continue;
+        }
+
         let Some(visible) = displays
             .iter()
             .find(|(display, _)| display.bounds().contains(point))
@@ -154,44 +191,88 @@ fn toggle_maximize(
             continue;
         };
         let padding = IVec2::new(window.horizontal_padding(), window.vertical_padding());
-        let Ok(mut entity_commands) = commands.get_entity(entity) else {
-            continue;
-        };
-        entity_commands.try_insert(FrameHold {
-            until: time.elapsed() + FRAME_HOLD,
-        });
-
         if let Some(maximized) = maximized {
             debug!("restoring maximized window {window_id}");
-            entity_commands.try_remove::<Maximized>();
-            let floating =
-                unmanaged.is_some() || !strips.iter().any(|strip| strip.contains(entity));
-            if floating {
-                // Set without a change, so the frame is not written at once
-                // and the window can first end clear of the screen's edge.
-                let frame = floating_frame(bounds.0, maximized.offset, visible, padding);
-                position.bypass_change_detection().0 = frame.min;
-                bounds.bypass_change_detection().0 = frame.size();
-            }
+            entity_commands.try_remove::<FloatingMaximized>();
+            // Set without a change, so the frame is not written at once and
+            // the window can first end clear of the screen's edge.
+            let frame = floating_frame(bounds.0, maximized.offset, visible, padding);
+            position.bypass_change_detection().0 = frame.min;
+            bounds.bypass_change_detection().0 = frame.size();
             let from = window.frame();
-            approach(
-                &mut window,
-                from,
-                IRect::from_corners(position.0, position.0 + bounds.0),
-            );
+            approach(&mut window, from, frame);
         } else {
             debug!("maximizing window {window_id}");
             let frame = filled(&window, visible);
-            entity_commands.try_insert(Maximized {
+            entity_commands.try_insert(FloatingMaximized {
                 frame,
                 offset: position.0 - visible.min,
             });
-            // A native resize the window was settling would otherwise adopt
-            // the maximized size into the slot.
-            supersede_native_resize(&[entity], &mut commands);
             window.place(frame);
         }
     }
+}
+
+/// Maximizes tiled window `entity`, which shows `frame`, in `strip`, whose
+/// viewport is `viewport`, or restores it when it is maximized.
+fn toggle_tiled(
+    entity: Entity,
+    frame: IRect,
+    strip: &mut LayoutStrip,
+    viewport: IRect,
+    config: &Config,
+    windows: &mut Toggles,
+    commands: &mut Commands,
+) {
+    let members = strip.tab_group(entity).unwrap_or_else(|| vec![entity]);
+    let limit = effective_stack_limit(config, viewport.height());
+    if let Some(restored) = strip.unmaximize(entity, limit) {
+        debug!("restoring maximized window {entity}");
+        let size = Size::new(
+            restored.width.of_viewport(viewport.width()),
+            restored.height.map_or(viewport.height(), |height| {
+                height.of_viewport(viewport.height())
+            }),
+        );
+        // The column goes back to where it stood, as after a width change,
+        // rather than where the maximized column was.
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(WidthRun {
+                anchor: restored.anchor.in_viewport(viewport),
+            });
+        }
+        for member in members {
+            if let Ok((.., mut bounds, _, _, _)) = windows.get_mut(member) {
+                bounds.0 = size;
+            }
+            if let Ok(mut entity_commands) = commands.get_entity(member) {
+                entity_commands.try_remove::<ResizeMarker>();
+            }
+        }
+    } else {
+        debug!("maximizing window {entity}");
+        let index = strip.index_of(entity).ok();
+        let anchor = ViewportAnchor::of(
+            frame,
+            viewport,
+            index == Some(0),
+            index.is_some_and(|index| index + 1 == strip.len()),
+            config.auto_center(),
+        );
+        let before = Before::new(
+            ViewportShare::of(frame.width(), viewport.width()),
+            ViewportShare::of(frame.height(), viewport.height()),
+            anchor,
+        );
+        if let Err(err) = strip.maximize(entity, Side::East, before) {
+            debug!("no maximize: {err}");
+            return;
+        }
+        // A native resize the window was settling would otherwise adopt the
+        // window's old size into the column it left.
+        supersede_native_resize(&members, commands);
+    }
+    commands.reshuffle_around(entity);
 }
 
 /// The frame that fills `visible`, a display's usable area, padding included.
@@ -200,25 +281,9 @@ fn filled(window: &Window, visible: IRect) -> IRect {
     IRect::from_corners(visible.min - padding, visible.max + padding)
 }
 
-/// Fills `visible` with a maximized window and holds it there, unless it
-/// already fills it. Returns whether the window had to move.
-fn fill(window: &mut Window, maximized: &mut Maximized, visible: IRect) -> bool {
-    let frame = filled(window, visible);
-    if maximized.frame == frame {
-        return false;
-    }
-    debug!("fitting maximized window {} to {frame:?}", window.id());
-    maximized.frame = frame;
-    window.place(frame);
-    true
-}
-
-/// Reads the frame of a maximized window when it is pressed, so the drag
-/// that may follow starts from where the window is.
-///
-/// A maximized window dropped on another display after a title-bar drag
-/// fills that display's usable area. A drop on its own display leaves it
-/// where the user put it.
+/// Reads the frame of a maximized floating window when it is pressed, and
+/// fills the usable area of the display it is dropped on, unless it already
+/// fills it.
 ///
 /// macOS keeps a dropped window on the display under the pointer, so the
 /// pointer at the release picks the display. The window is the one pressed,
@@ -227,7 +292,7 @@ fn fill(window: &mut Window, maximized: &mut Maximized, visible: IRect) -> bool 
 fn fill_drop_display(
     mut messages: MessageReader<InputEvent>,
     mut pressed: Local<Option<Entity>>,
-    mut windows: Query<(Entity, &mut Window, &mut Maximized)>,
+    mut windows: Query<(Entity, &mut Window, &mut FloatingMaximized)>,
     displays: Query<(&Display, Option<&DockPosition>)>,
     window_manager: Res<WindowManager>,
     time: Res<Time>,
@@ -247,9 +312,8 @@ fn fill_drop_display(
                     .iter_mut()
                     .find(|(_, window, _)| Some(window.id()) == window_id)
                     .map(|(entity, mut window, _)| {
-                        // The engine stops reading a maximized window's
-                        // moves, so an app may have moved it since. A drag
-                        // starts from where the window is now.
+                        // The engine stops reading a maximized floating
+                        // window's moves, so an app may have moved it since.
                         if !window.write_pending() {
                             _ = window.update_frame();
                         }
@@ -278,9 +342,14 @@ fn fill_drop_display(
                 else {
                     continue;
                 };
-                if fill(&mut window, &mut maximized, visible)
-                    && let Ok(mut entity_commands) = commands.get_entity(entity)
-                {
+                let frame = filled(&window, visible);
+                if maximized.frame == frame {
+                    continue;
+                }
+                debug!("fitting maximized window {} to {frame:?}", window.id());
+                maximized.frame = frame;
+                window.place(frame);
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_insert(FrameHold {
                         until: time.elapsed() + FRAME_HOLD,
                     });
@@ -289,31 +358,6 @@ fn fill_drop_display(
             _ => {}
         }
     }
-}
-
-/// Fills the usable area of display `display` with `entity`, when it is
-/// maximized, after a display command moved it there.
-pub(crate) fn fill_display(commands: &mut Commands, entity: Entity, display: CGDirectDisplayID) {
-    commands.queue(move |world: &mut World| {
-        let Some(visible) = world
-            .query::<(&Display, Option<&DockPosition>)>()
-            .iter(world)
-            .find(|(candidate, _)| candidate.id() == display)
-            .map(|(display, dock)| display.visible_bounds(dock))
-        else {
-            return;
-        };
-        let until = world.resource::<Time>().elapsed() + FRAME_HOLD;
-        let Ok((mut window, mut maximized)) = world
-            .query::<(&mut Window, &mut Maximized)>()
-            .get_mut(world, entity)
-        else {
-            return;
-        };
-        if fill(&mut window, &mut maximized, visible) {
-            world.entity_mut(entity).insert(FrameHold { until });
-        }
-    });
 }
 
 /// Whether `point` is in the window's top bar: its title bar, toolbar, or
@@ -351,7 +395,7 @@ type Held<'w, 's> = Query<
         &'static mut Window,
         &'static Position,
         &'static Bounds,
-        Option<&'static Maximized>,
+        Option<&'static FloatingMaximized>,
         &'static FrameHold,
     ),
 >;

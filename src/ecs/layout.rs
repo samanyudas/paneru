@@ -8,8 +8,8 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Changed, Has, Or, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::system::{Commands, ParamSet, Populated, Query, Res};
-use bevy::math::IRect;
+use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res};
+use bevy::math::{IRect, IVec2};
 use bevy::time::{Time, Timer, TimerMode};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -32,7 +32,7 @@ use crate::ecs::{
 };
 use crate::errors::{Error, Result};
 use crate::events::Event;
-use crate::manager::{Display, Origin, Size, Window, WindowManager};
+use crate::manager::{Display, Margins, Origin, Size, Window, WindowManager};
 use crate::platform::WorkspaceId;
 use crate::types::commands::Side;
 use crate::util::round_px;
@@ -255,7 +255,9 @@ impl Plugin for LayoutEventsPlugin {
                 (
                     refresh_top_bars.run_if(top_bars_need_refresh),
                     layout_sizes_changed,
+                    relayout_on_edge_padding_change,
                     layout_strip_changed,
+                    fit_maximized_windows,
                     reshuffle_layout_strip,
                     expose_focused_survivor_after_removal,
                     ensure_visible_in_strip,
@@ -456,6 +458,119 @@ impl DoubleEndedIterator for StackItemIter<'_> {
     }
 }
 
+/// A length as a share of the same length of the strip viewport, so it
+/// carries over to a viewport of another size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ViewportShare(f64);
+
+impl ViewportShare {
+    pub(crate) fn of(length: i32, viewport: i32) -> Self {
+        Self(f64::from(length) / f64::from(viewport.max(1)))
+    }
+
+    pub(crate) fn of_viewport(self, viewport: i32) -> i32 {
+        round_px(self.0 * f64::from(viewport))
+    }
+}
+
+/// Where a column stood in the viewport: flush against one of its edges, or
+/// around a point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ViewportAnchor {
+    Left,
+    Right,
+    /// The column's centre, as a share of the viewport width from its left.
+    Center(ViewportShare),
+}
+
+impl ViewportAnchor {
+    /// The anchor of a column at `frame` in `viewport`, with whether it is
+    /// the strip's `first` and `last` column. The same rule a width change
+    /// keeps a column by.
+    pub(crate) fn of(
+        frame: IRect,
+        viewport: IRect,
+        first: bool,
+        last: bool,
+        auto_center: bool,
+    ) -> Self {
+        if !auto_center && first && frame.min.x == viewport.min.x {
+            Self::Left
+        } else if !auto_center && last && frame.max.x == viewport.max.x {
+            Self::Right
+        } else {
+            Self::Center(ViewportShare::of(
+                frame.center().x - viewport.min.x,
+                viewport.width(),
+            ))
+        }
+    }
+
+    pub(crate) fn in_viewport(self, viewport: IRect) -> WidthAnchor {
+        match self {
+            Self::Left => WidthAnchor::Left,
+            Self::Right => WidthAnchor::Right,
+            Self::Center(share) => {
+                WidthAnchor::Center(viewport.min.x + share.of_viewport(viewport.width()))
+            }
+        }
+    }
+}
+
+/// A maximized window's size and place just before it was maximized.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Before {
+    width: ViewportShare,
+    height: ViewportShare,
+    anchor: ViewportAnchor,
+    home: Option<StackHome>,
+}
+
+impl Before {
+    pub(crate) fn new(width: ViewportShare, height: ViewportShare, anchor: ViewportAnchor) -> Self {
+        Self {
+            width,
+            height,
+            anchor,
+            home: None,
+        }
+    }
+}
+
+/// The stack a maximized window left: the windows that stayed in it, top to
+/// bottom, and the window's place among them.
+#[derive(Clone, Debug, PartialEq)]
+struct StackHome {
+    mates: Vec<Entity>,
+    slot: usize,
+}
+
+impl StackHome {
+    /// `None` without a mate: a stack of one is not a stack to go back to.
+    fn new(mates: Vec<Entity>, slot: usize) -> Option<Self> {
+        (!mates.is_empty()).then_some(Self { mates, slot })
+    }
+}
+
+/// A maximized window, or native tab group. The layout gives it the whole
+/// strip viewport, and nothing can join it. Only [`LayoutStrip`] builds one,
+/// so it always has a [`Before`] to restore.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaximizedColumn {
+    item: StackItem,
+    before: Before,
+}
+
+/// The size a restored window takes, as shares of the strip viewport: its
+/// earlier width, and its earlier height when it went back into its stack.
+/// `anchor` is where its column stood before it was maximized.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Restored {
+    pub width: ViewportShare,
+    pub height: Option<ViewportShare>,
+    pub anchor: ViewportAnchor,
+}
+
 /// Represents a single panel within a `LayoutStrip`, which can either hold a single window, a stack of items, or a group of tabs.
 #[derive(Clone, Debug)]
 pub enum Column {
@@ -466,6 +581,7 @@ pub enum Column {
     /// A panel containing a group of native tabs.
     Tabs(Vec<Entity>),
     Fullscren(Entity),
+    Maximized(MaximizedColumn),
 }
 
 impl Column {
@@ -477,6 +593,7 @@ impl Column {
             Column::Single(id) | Column::Fullscren(id) => Some(*id),
             Column::Stack(stack) => stack.first().and_then(StackItem::top),
             Column::Tabs(tabs) => tabs.first().copied(),
+            Column::Maximized(maximized) => maximized.item.top(),
         }
     }
 
@@ -489,6 +606,9 @@ impl Column {
             Column::Tabs(tabs) => ColumnWindowIter::Tabs(tabs.iter().copied()),
             Column::Stack(items) => {
                 ColumnWindowIter::Stack(items.iter().flat_map(StackItem::window_iter))
+            }
+            Column::Maximized(maximized) => {
+                ColumnWindowIter::Maximized(maximized.item.window_iter())
             }
         }
     }
@@ -512,6 +632,7 @@ impl Column {
                 .or_else(|| stack.last())
                 .and_then(StackItem::top),
             Column::Tabs(tabs) => tabs.first().copied(),
+            Column::Maximized(maximized) => maximized.item.top(),
         }
     }
 
@@ -521,17 +642,18 @@ impl Column {
             Column::Single(id) | Column::Fullscren(id) => (*id == entity).then_some(0),
             Column::Stack(stack) => stack.iter().position(|item| item.contains(entity)),
             Column::Tabs(tabs) => tabs.contains(&entity).then_some(0),
+            Column::Maximized(maximized) => maximized.item.contains(entity).then_some(0),
         }
     }
 
-    /// The stack items this column holds, or `None` for a fullscreen column,
-    /// which nothing can join.
+    /// The stack items this column holds, or `None` for a fullscreen or
+    /// maximized column, which nothing can join.
     fn stack_items(&self) -> Option<Vec<StackItem>> {
         match self {
             Column::Single(id) => Some(vec![StackItem::Single(*id)]),
             Column::Tabs(tabs) => Some(vec![StackItem::Tabs(tabs.clone())]),
             Column::Stack(items) => Some(items.clone()),
-            Column::Fullscren(_) => None,
+            Column::Fullscren(_) | Column::Maximized(_) => None,
         }
     }
 
@@ -541,12 +663,16 @@ impl Column {
     /// detection alone when `entity` was already in front.
     pub fn move_to_front(&mut self, entity: Entity) -> bool {
         let tabs = match self {
-            Column::Single(_) | Column::Fullscren(_) => return false,
             Column::Stack(stack) => match stack.iter_mut().find(|item| item.contains(entity)) {
                 Some(StackItem::Tabs(tabs)) => tabs,
                 _ => return false,
             },
-            Column::Tabs(tabs) => tabs,
+            Column::Tabs(tabs)
+            | Column::Maximized(MaximizedColumn {
+                item: StackItem::Tabs(tabs),
+                ..
+            }) => tabs,
+            Column::Single(_) | Column::Fullscren(_) | Column::Maximized(_) => return false,
         };
         match tabs.iter().position(|&e| e == entity) {
             Some(pos) if pos > 0 => {
@@ -568,6 +694,7 @@ pub enum ColumnWindowIter<'a> {
             fn(&'a StackItem) -> StackItemIter<'a>,
         >,
     ),
+    Maximized(StackItemIter<'a>),
 }
 
 impl Iterator for ColumnWindowIter<'_> {
@@ -578,6 +705,7 @@ impl Iterator for ColumnWindowIter<'_> {
             Self::Single(iter) => iter.next(),
             Self::Tabs(iter) => iter.next(),
             Self::Stack(iter) => iter.next(),
+            Self::Maximized(iter) => iter.next(),
         }
     }
 }
@@ -601,6 +729,9 @@ pub struct LayoutStrip {
     /// Windows whose column splits its height evenly at the next layout,
     /// because a stack item joined or left that column.
     even_splits: EntityHashSet,
+    /// Windows that left a maximized column since the last layout, so the
+    /// layout gives them back their own margins.
+    released: EntityHashSet,
 }
 
 impl LayoutStrip {
@@ -611,6 +742,7 @@ impl LayoutStrip {
             columns: VecDeque::new(),
             tabbed_stacks: EntityHashSet::default(),
             even_splits: EntityHashSet::default(),
+            released: EntityHashSet::default(),
         }
     }
 
@@ -623,6 +755,7 @@ impl LayoutStrip {
             columns,
             tabbed_stacks: EntityHashSet::default(),
             even_splits: EntityHashSet::default(),
+            released: EntityHashSet::default(),
         }
     }
 
@@ -639,11 +772,7 @@ impl LayoutStrip {
     pub fn index_of(&self, entity: Entity) -> Result<usize> {
         self.columns
             .iter()
-            .position(|column| match column {
-                Column::Single(id) | Column::Fullscren(id) => *id == entity,
-                Column::Stack(stack) => stack.iter().any(|item| item.contains(entity)),
-                Column::Tabs(stack) => stack.contains(&entity),
-            })
+            .position(|column| column.position_of(entity).is_some())
             .ok_or(Error::NotFound(format!(
                 "{}: can not find window {entity} in the current pane.",
                 function_name!()
@@ -652,11 +781,9 @@ impl LayoutStrip {
 
     /// Returns `true` if the strip contains the given entity.
     pub fn contains(&self, entity: Entity) -> bool {
-        self.columns.iter().any(|column| match column {
-            Column::Single(id) | Column::Fullscren(id) => *id == entity,
-            Column::Stack(stack) => stack.iter().any(|item| item.contains(entity)),
-            Column::Tabs(stack) => stack.contains(&entity),
-        })
+        self.columns
+            .iter()
+            .any(|column| column.position_of(entity).is_some())
     }
 
     /// Inserts a window ID into the pane at a specified position.
@@ -690,6 +817,7 @@ impl LayoutStrip {
     pub(crate) fn append_strip(&mut self, other: &mut Self) {
         self.columns.append(&mut other.columns);
         self.tabbed_stacks.extend(other.tabbed_stacks.drain());
+        self.released.extend(other.released.drain());
     }
 
     /// Extracts all windows in `moved` from `self` and appends them to `target`,
@@ -812,6 +940,19 @@ impl LayoutStrip {
                 }
                 self.columns.insert(index, Column::Tabs(tabs));
             }
+            Column::Maximized(MaximizedColumn { item, before }) => {
+                let item = match item {
+                    StackItem::Single(id) => StackItem::Tabs(vec![follower, id]),
+                    StackItem::Tabs(mut tabs) => {
+                        if !tabs.contains(&follower) {
+                            tabs.insert(0, follower);
+                        }
+                        StackItem::Tabs(tabs)
+                    }
+                };
+                self.columns
+                    .insert(index, Column::Maximized(MaximizedColumn { item, before }));
+            }
         }
         Ok(())
     }
@@ -865,6 +1006,24 @@ impl LayoutStrip {
                         self.columns.insert(index, Column::Tabs(tabs));
                     } else if let Some(remaining_id) = tabs.first() {
                         self.columns.insert(index, Column::Single(*remaining_id));
+                    }
+                }
+                Column::Maximized(MaximizedColumn { item, before }) => {
+                    self.released.insert(entity);
+                    let item = match item {
+                        StackItem::Single(_) => None,
+                        StackItem::Tabs(mut tabs) => {
+                            tabs.retain(|id| *id != entity);
+                            match tabs.as_slice() {
+                                [] => None,
+                                [remaining] => Some(StackItem::Single(*remaining)),
+                                _ => Some(StackItem::Tabs(tabs)),
+                            }
+                        }
+                    };
+                    if let Some(item) = item {
+                        self.columns
+                            .insert(index, Column::Maximized(MaximizedColumn { item, before }));
                     }
                 }
             }
@@ -1169,6 +1328,14 @@ impl LayoutStrip {
     /// Returns `Err(Error)` if the window is not in the strip.
     pub fn insert_as_column(&mut self, entity: Entity, index: usize) -> Result<()> {
         let source = self.index_of(entity)?;
+        if matches!(self.columns.get(source), Some(Column::Maximized(_))) {
+            // The whole column moves, so the window stays maximized.
+            let at = if index <= source { index } else { index - 1 };
+            if let Some(column) = self.columns.remove(source) {
+                self.columns.insert(at.min(self.len()), column);
+            }
+            return Ok(());
+        }
         let mate = self.column_mate(entity);
         let Some((item, source_kept)) = self.detach_item(source, entity) else {
             return Ok(());
@@ -1187,7 +1354,8 @@ impl LayoutStrip {
 
     /// Takes the stack item holding `entity` out of column `index`, and
     /// returns it with whether any of the column remains. Leaves the strip
-    /// untouched and returns `None` for a fullscreen column.
+    /// untouched and returns `None` for a fullscreen column. An item taken
+    /// from a maximized column is no longer maximized.
     fn detach_item(&mut self, index: usize, entity: Entity) -> Option<(StackItem, bool)> {
         let position = match self.columns.get(index)? {
             Column::Fullscren(_) => return None,
@@ -1196,6 +1364,10 @@ impl LayoutStrip {
         let item = match self.columns.remove(index)? {
             Column::Single(id) | Column::Fullscren(id) => StackItem::Single(id),
             Column::Tabs(tabs) => StackItem::Tabs(tabs),
+            Column::Maximized(MaximizedColumn { item, .. }) => {
+                self.released.extend(item.window_iter());
+                item
+            }
             Column::Stack(mut items) => {
                 let item = items.remove(position);
                 // The item no longer shares a column with its former
@@ -1237,14 +1409,7 @@ impl LayoutStrip {
     ///
     /// A `Vec<Entity>` containing all window IDs.
     pub fn all_windows(&self) -> Vec<Entity> {
-        self.columns
-            .iter()
-            .flat_map(|column| match column {
-                Column::Single(entity) | Column::Fullscren(entity) => vec![*entity],
-                Column::Stack(items) => items.iter().flat_map(StackItem::window_iter).collect(),
-                Column::Tabs(ids) => ids.clone(),
-            })
-            .collect()
+        self.columns.iter().flat_map(Column::window_iter).collect()
     }
 
     pub fn get_column_mut(&mut self, index: usize) -> Option<&mut Column> {
@@ -1266,14 +1431,14 @@ impl LayoutStrip {
     #[cfg(test)]
     pub fn relative_positions<W>(
         &self,
-        layout_strip_height: i32,
+        viewport: Size,
         get_window_frame: &W,
     ) -> impl Iterator<Item = (Entity, IRect)>
     where
         W: Fn(Entity) -> Option<IRect>,
     {
         self.relative_positions_with_minimums(
-            layout_strip_height,
+            viewport,
             get_window_frame,
             &|_| None,
             &|_| None,
@@ -1286,11 +1451,13 @@ impl LayoutStrip {
     /// [`Self::relative_positions`], with `get_minimum_height` giving the
     /// height below which a stacked window must not be squeezed, and
     /// `get_top_bar_height` the top bar a stack too tall for its column keeps
-    /// visible. See [`overlapping_rows`].
-    #[instrument(level = Level::TRACE, skip_all, fields(layout_strip_height))]
+    /// visible. See [`overlapping_rows`]. A maximized column takes the whole
+    /// `viewport`, whatever its window's frame.
+    #[allow(clippy::too_many_lines)]
+    #[instrument(level = Level::TRACE, skip_all, fields(viewport))]
     pub fn relative_positions_with_minimums<W, M, X, T, L>(
         &self,
-        layout_strip_height: i32,
+        viewport: Size,
         get_window_frame: &W,
         get_minimum_height: &M,
         get_maximum_height: &X,
@@ -1304,7 +1471,8 @@ impl LayoutStrip {
         T: Fn(Entity) -> i32,
         L: Fn(Entity) -> WidthLimits,
     {
-        self.column_positions(get_window_frame)
+        let layout_strip_height = viewport.y;
+        self.column_positions(get_window_frame, viewport.x)
             .filter_map(move |(column, position)| {
                 let items: Vec<StackItem> = match column {
                     Column::Single(entity) | Column::Fullscren(entity) => {
@@ -1312,6 +1480,10 @@ impl LayoutStrip {
                     }
                     Column::Stack(stack) => stack.clone(),
                     Column::Tabs(tabs) => vec![StackItem::Tabs(tabs.clone())],
+                    Column::Maximized(maximized) => {
+                        let frame = IRect::new(position, 0, position + viewport.x, viewport.y);
+                        return Some(maximized.item.window_iter().map(|e| (e, frame)).collect());
+                    }
                 };
 
                 // A tabbed display shares one frame across every member,
@@ -1431,15 +1603,24 @@ impl LayoutStrip {
             .collect()
     }
 
+    /// Each column with its left edge, the columns laid edge to edge. A
+    /// maximized column is `viewport_width` wide.
     #[instrument(level = Level::TRACE, skip_all)]
-    pub fn column_positions<W>(&self, get_window_frame: &W) -> impl Iterator<Item = (&Column, i32)>
+    pub fn column_positions<W>(
+        &self,
+        get_window_frame: &W,
+        viewport_width: i32,
+    ) -> impl Iterator<Item = (&Column, i32)>
     where
         W: Fn(Entity) -> Option<IRect>,
     {
         let mut left_edge = 0;
 
         self.columns().filter_map(move |column| {
-            let width = column.width(get_window_frame);
+            let width = match column {
+                Column::Maximized(_) => Some(viewport_width),
+                column => column.width(get_window_frame),
+            };
 
             width.map(|width| {
                 let temp = left_edge;
@@ -1453,7 +1634,9 @@ impl LayoutStrip {
         let index = self.index_of(entity).ok()?;
         let column = self.get(index).ok()?;
         match column {
-            Column::Single(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
+            Column::Single(_) | Column::Tabs(_) | Column::Fullscren(_) | Column::Maximized(_) => {
+                None
+            }
             Column::Stack(items) => {
                 let pos = items.iter().position(|item| item.contains(entity))?;
                 (pos > 0).then(|| items[pos - 1].top()).flatten()
@@ -1465,7 +1648,11 @@ impl LayoutStrip {
         self.index_of(entity)
             .and_then(|idx| self.get(idx))
             .map(|col| match col {
-                Column::Tabs(tabs) => tabs.contains(&entity),
+                Column::Tabs(tabs)
+                | Column::Maximized(MaximizedColumn {
+                    item: StackItem::Tabs(tabs),
+                    ..
+                }) => tabs.contains(&entity),
                 Column::Stack(items) => items.iter().any(|item| {
                     if let StackItem::Tabs(tabs) = item {
                         tabs.contains(&entity)
@@ -1473,21 +1660,27 @@ impl LayoutStrip {
                         false
                     }
                 }),
-                Column::Single(_) | Column::Fullscren(_) => false,
+                Column::Single(_) | Column::Fullscren(_) | Column::Maximized(_) => false,
             })
             .is_ok_and(|t| t)
     }
 
     pub fn tab_group(&self, entity: Entity) -> Option<Vec<Entity>> {
         self.columns.iter().find_map(|column| match column {
-            Column::Tabs(tabs) if tabs.contains(&entity) && tabs.len() > 1 => Some(tabs.clone()),
+            Column::Tabs(tabs)
+            | Column::Maximized(MaximizedColumn {
+                item: StackItem::Tabs(tabs),
+                ..
+            }) if tabs.contains(&entity) && tabs.len() > 1 => Some(tabs.clone()),
             Column::Stack(items) => items.iter().find_map(|item| match item {
                 StackItem::Tabs(tabs) if tabs.contains(&entity) && tabs.len() > 1 => {
                     Some(tabs.clone())
                 }
                 StackItem::Single(_) | StackItem::Tabs(_) => None,
             }),
-            Column::Single(_) | Column::Fullscren(_) | Column::Tabs(_) => None,
+            Column::Single(_) | Column::Fullscren(_) | Column::Tabs(_) | Column::Maximized(_) => {
+                None
+            }
         })
     }
 
@@ -1532,6 +1725,133 @@ impl LayoutStrip {
     /// layout has applied it.
     pub fn take_even_splits(&mut self) {
         self.even_splits.clear();
+    }
+
+    /// The windows of every maximized column.
+    pub(crate) fn maximized_windows(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.columns
+            .iter()
+            .filter(|column| matches!(column, Column::Maximized(_)))
+            .flat_map(Column::window_iter)
+    }
+
+    /// The windows that left a maximized column since the last call.
+    pub(crate) fn take_released(&mut self) -> EntityHashSet {
+        std::mem::take(&mut self.released)
+    }
+
+    /// What maximized window `entity` returns to, or `None` when it is not
+    /// maximized.
+    pub fn maximized(&self, entity: Entity) -> Option<&Before> {
+        self.columns.iter().find_map(|column| match column {
+            Column::Maximized(maximized) if maximized.item.contains(entity) => {
+                Some(&maximized.before)
+            }
+            _ => None,
+        })
+    }
+
+    /// Maximizes the column holding `entity`. A window or native tab group
+    /// in a stack first leaves it for a column of its own on `side` of the
+    /// stack, and remembers its place there. Returns `Ok(false)` when it is
+    /// already maximized.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Error)` if the window is not in the strip, or is in a
+    /// fullscreen column.
+    pub fn maximize(&mut self, entity: Entity, side: Side, mut before: Before) -> Result<bool> {
+        let index = self.index_of(entity)?;
+        let item = match self.columns.get(index) {
+            Some(Column::Maximized(_)) => return Ok(false),
+            Some(Column::Stack(items)) => {
+                let slot = items
+                    .iter()
+                    .position(|item| item.contains(entity))
+                    .unwrap_or_default();
+                let mates = items
+                    .iter()
+                    .filter(|item| !item.contains(entity))
+                    .flat_map(StackItem::window_iter)
+                    .collect();
+                before.home = StackHome::new(mates, slot);
+                let mate = self.column_mate(entity);
+                let Some((item, kept)) = self.detach_item(index, entity) else {
+                    return Ok(false);
+                };
+                if kept {
+                    self.even_splits.extend(mate);
+                }
+                let at = match side {
+                    Side::West => index,
+                    Side::East => index + usize::from(kept),
+                };
+                self.columns
+                    .insert(at, Column::Maximized(MaximizedColumn { item, before }));
+                return Ok(true);
+            }
+            Some(Column::Single(id)) => StackItem::Single(*id),
+            Some(Column::Tabs(tabs)) => StackItem::Tabs(tabs.clone()),
+            Some(Column::Fullscren(_)) | None => {
+                return Err(Error::InvalidInput(format!(
+                    "{}: window {entity} can not be maximized",
+                    function_name!()
+                )));
+            }
+        };
+        self.columns[index] = Column::Maximized(MaximizedColumn { item, before });
+        Ok(true)
+    }
+
+    /// Makes the column of `entity`, a window or native tab group that is
+    /// its own column, maximized with `before` to restore. Returns whether
+    /// it did.
+    pub fn adopt_maximized(&mut self, entity: Entity, before: Before) -> bool {
+        let Ok(index) = self.index_of(entity) else {
+            return false;
+        };
+        let item = match &self.columns[index] {
+            Column::Single(id) => StackItem::Single(*id),
+            Column::Tabs(tabs) => StackItem::Tabs(tabs.clone()),
+            Column::Stack(_) | Column::Fullscren(_) | Column::Maximized(_) => return false,
+        };
+        self.columns[index] = Column::Maximized(MaximizedColumn { item, before });
+        true
+    }
+
+    /// Ends maximize for the column holding `entity`. It goes back to its
+    /// place in the stack it left when one of the windows that stayed there
+    /// is in a column of this strip with fewer than `limit` items. Otherwise
+    /// it stays a column of its own. Returns `None` when it is not
+    /// maximized.
+    pub fn unmaximize(&mut self, entity: Entity, limit: usize) -> Option<Restored> {
+        let index = self.index_of(entity).ok()?;
+        let Column::Maximized(maximized) = self.columns.get(index)? else {
+            return None;
+        };
+        let MaximizedColumn { item, before } = maximized.clone();
+        self.columns.remove(index);
+        self.released.extend(item.window_iter());
+        let home = before.home.as_ref().and_then(|home| {
+            home.mates.iter().find_map(|mate| {
+                let column = self.index_of(*mate).ok()?;
+                let items = self.columns.get(column)?.stack_items()?;
+                (items.len() < limit).then_some((column, items, home.slot))
+            })
+        });
+        let height = if let Some((column, items, slot)) = home {
+            self.join_items(column, items, item, slot, false);
+            Some(before.height)
+        } else {
+            self.columns
+                .insert(index.min(self.len()), item.into_column());
+            None
+        };
+        Some(Restored {
+            width: before.width,
+            height,
+            anchor: before.anchor,
+        })
     }
 
     /// A window in the same column as `entity` that is not in `entity`'s own
@@ -1839,24 +2159,9 @@ fn strip_has_changed_window(strip: &LayoutStrip, changed_entities: &EntityHashSe
 }
 
 fn column_has_changed_window(column: &Column, changed_entities: &EntityHashSet) -> bool {
-    match column {
-        Column::Single(entity) | Column::Fullscren(entity) => changed_entities.contains(entity),
-        Column::Stack(stack) => stack
-            .iter()
-            .any(|item| stack_item_has_changed_window(item, changed_entities)),
-        Column::Tabs(entities) => entities
-            .iter()
-            .any(|entity| changed_entities.contains(entity)),
-    }
-}
-
-fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHashSet) -> bool {
-    match item {
-        StackItem::Single(entity) => changed_entities.contains(entity),
-        StackItem::Tabs(entities) => entities
-            .iter()
-            .any(|entity| changed_entities.contains(entity)),
-    }
+    column
+        .window_iter()
+        .any(|entity| changed_entities.contains(&entity))
 }
 
 fn top_bars_need_refresh(
@@ -2043,9 +2348,9 @@ pub(super) fn layout_strip_changed(
         let Ok((display, dock)) = displays.get(child_of.parent()) else {
             continue;
         };
-        let height = display.actual_display_bounds(dock, &config).height();
+        let viewport = display.actual_display_bounds(dock, &config).size();
         changed.extend(layout_strip.relative_positions_with_minimums(
-            height,
+            viewport,
             &get_window_frame,
             &get_minimum_height,
             &get_maximum_height,
@@ -2089,6 +2394,134 @@ pub(super) fn layout_strip_changed(
                 }
                 bounds.0 = frame.size();
             }
+        }
+    }
+}
+
+/// Lays every strip out again when the display edge padding changes, as a
+/// config reload can do: the viewport, and with it every maximized window,
+/// depends on it. Each strip in view on any display moves with its viewport,
+/// so it keeps where the user scrolled it, unless the column the user sees
+/// there is maximized: then that column is placed to fill the new viewport.
+#[allow(clippy::type_complexity)]
+fn relayout_on_edge_padding_change(
+    config: Res<Config>,
+    mut last: Local<Option<(i32, i32, i32, i32)>>,
+    mut strips: Query<(
+        Entity,
+        &mut LayoutStrip,
+        &ChildOf,
+        &Position,
+        Option<&RepositionMarker>,
+        Option<&Scrolling>,
+        Has<SelectedVirtualMarker>,
+        Has<PreviousStripPosition>,
+    )>,
+    displays: DisplayViewports,
+    windows: Windows,
+    mut commands: Commands,
+) {
+    let padding = config.edge_padding();
+    let Some(old) = last.replace(padding).filter(|old| *old != padding) else {
+        return;
+    };
+    let (top, _, _, left) = padding;
+    let (old_top, _, _, old_left) = old;
+    let shift = IVec2::new(left - old_left, top - old_top);
+    let focused = windows.focused().map(|(_, entity)| entity);
+    for (entity, mut strip, child, position, reposition, scrolling, selected, parked) in &mut strips
+    {
+        strip.set_changed();
+        if !selected || parked {
+            continue;
+        }
+        let destination = strip_destination(position, reposition, scrolling);
+        let target = displays
+            .get(child.parent())
+            .ok()
+            .and_then(|(display, dock)| {
+                let viewport = display.actual_display_bounds(dock, &config);
+                origin_filling_viewport(
+                    &strip,
+                    destination,
+                    display.bounds(),
+                    viewport,
+                    focused,
+                    &windows,
+                )
+            })
+            .unwrap_or(destination + shift);
+        if target != destination {
+            commands.reposition_entity(entity, target);
+        }
+    }
+}
+
+/// The origin that puts the column the user sees in `strip` at the origin
+/// of `viewport`, if that column is maximized. The column seen is the one
+/// with the focused window, or else the one most on `display` with the strip
+/// at `destination`. Columns are placed at the width of `viewport`, since a
+/// maximized column before the one seen changes its place.
+fn origin_filling_viewport(
+    strip: &LayoutStrip,
+    destination: Origin,
+    display: IRect,
+    viewport: IRect,
+    focused: Option<Entity>,
+    windows: &Windows,
+) -> Option<Origin> {
+    let frame = |entity| windows.moving_frame(entity);
+    let anchor = focused
+        .filter(|entity| strip.contains(*entity))
+        .or_else(|| {
+            strip
+                .columns()
+                .filter_map(Column::top)
+                .filter_map(|entity| {
+                    let min = windows.layout_position(entity)?.0 + destination;
+                    let size = frame(entity)?.size();
+                    let shown = IRect::from_corners(min, min + size).intersect(display);
+                    (shown.width() > 0).then_some((entity, shown.width()))
+                })
+                .max_by_key(|(_, shown)| *shown)
+                .map(|(entity, _)| entity)
+        })?;
+    let (column, x) = strip
+        .column_positions(&frame, viewport.width())
+        .find(|(column, _)| column.position_of(anchor).is_some())?;
+    matches!(column, Column::Maximized(_)).then(|| Origin::new(viewport.min.x - x, viewport.min.y))
+}
+
+/// Has every window of a maximized column fill the display's edge padding,
+/// and gives every other window of a changed strip, and every window that
+/// left a maximized column, its own margins back. A window whose margins
+/// change is written again.
+fn fit_maximized_windows(
+    mut strips: Query<&mut LayoutStrip>,
+    mut windows: Query<(&mut Window, &mut Bounds)>,
+    config: Res<Config>,
+) {
+    let (top, right, bottom, left) = config.edge_padding();
+    let edges = Margins {
+        min: IVec2::new(left, top),
+        max: IVec2::new(right, bottom),
+    };
+    let mut filled = EntityHashSet::default();
+    let mut refit = Vec::new();
+    for mut strip in &mut strips {
+        filled.extend(strip.maximized_windows());
+        if strip.is_changed() {
+            refit.extend(strip.all_windows());
+        }
+        refit.extend(strip.bypass_change_detection().take_released());
+    }
+    for entity in refit {
+        let fill = filled.contains(&entity).then_some(edges);
+        if let Ok((mut window, mut bounds)) = windows.get_mut(entity)
+            && window.fill() != fill
+        {
+            window.set_fill(fill);
+            bounds.set_changed();
         }
     }
 }
@@ -2492,6 +2925,17 @@ fn insert_column_window_contexts(
                 );
             }
         }
+        Column::Maximized(maximized) => {
+            insert_stack_item_window_contexts(
+                contexts,
+                &maximized.item,
+                strip_position,
+                swiping,
+                display_entity,
+                stacked,
+                snap_settling,
+            );
+        }
     }
 }
 
@@ -2593,10 +3037,10 @@ fn position_layout_windows(
             continue;
         };
 
-        // Account for per-window horizontal_padding: reposition() adds
-        // h_pad to the virtual x, so subtract it here so the OS window
-        // lands exactly sliver_width pixels from the screen edge.
-        let h_pad = window.horizontal_padding();
+        // The window shows inside its frame by its margins, so they are
+        // taken off here for the window to land exactly sliver_width pixels
+        // from the screen edge.
+        let margins = window.margins();
         let target_size = resize.map_or(bounds.0, |resize| bounds.0.with_x(resize.0.x));
         let mut frame = IRect::from_corners(layout_position.0, layout_position.0 + target_size);
         let width = frame.width();
@@ -2604,18 +3048,18 @@ fn position_layout_windows(
         frame.max += context.strip_position;
 
         let mut offscreen = false;
-        if frame.max.x <= viewport.min.x + h_pad {
+        if frame.max.x <= viewport.min.x + margins.max.x {
             // Window hidden to the left — position so exactly
             // sliver_width CG pixels are visible from the real
-            // display edge.  The +h_pad accounts for the gap that
-            // reposition() adds, which can leave a window just
+            // display edge. The right margin can leave a window just
             // inside the viewport edge while its CG frame is fully
             // past it.
-            frame.min.x = viewport.min.x - width + offscreen_sliver_width - pad_left + h_pad;
+            frame.min.x =
+                viewport.min.x - width + offscreen_sliver_width - pad_left + margins.max.x;
             offscreen = true;
-        } else if frame.min.x >= viewport.max.x - h_pad {
+        } else if frame.min.x >= viewport.max.x - margins.min.x {
             // Window hidden to the right — mirror of above.
-            frame.min.x = viewport.max.x - offscreen_sliver_width + pad_right - h_pad;
+            frame.min.x = viewport.max.x - offscreen_sliver_width + pad_right - margins.min.x;
             offscreen = true;
         }
         frame.max.x = frame.min.x + width;
@@ -2999,6 +3443,10 @@ mod tests {
                 Column::Single(entity) => name(entity),
                 Column::Fullscren(entity) => format!("!{}", name(entity)),
                 Column::Tabs(entities) => tabs(entities),
+                Column::Maximized(maximized) => match &maximized.item {
+                    StackItem::Single(entity) => format!("^{}", name(entity)),
+                    StackItem::Tabs(entities) => format!("^{}", tabs(entities)),
+                },
                 Column::Stack(items) => format!(
                     "[{}]",
                     items
@@ -3025,6 +3473,148 @@ mod tests {
             strip.append(*entity);
         }
         (world, strip, entities)
+    }
+
+    /// What a window half the viewport wide and tall restores to.
+    fn half() -> Before {
+        Before::new(ViewportShare(0.5), ViewportShare(0.5), ViewportAnchor::Left)
+    }
+
+    #[test]
+    fn a_maximized_column_takes_the_viewport_whatever_its_bounds() {
+        let (_world, mut strip, e) = strip_of(3);
+        strip.maximize(e[1], Side::East, half()).unwrap();
+        let frame = |_| Some(IRect::new(0, 0, 300, 500));
+
+        let frames = strip
+            .relative_positions(Size::new(1000, 700), &frame)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            frames,
+            vec![
+                (e[0], IRect::new(0, 0, 300, 700)),
+                (e[1], IRect::new(300, 0, 1300, 700)),
+                (e[2], IRect::new(1300, 0, 1600, 700)),
+            ]
+        );
+    }
+
+    #[test]
+    fn maximizing_twice_changes_nothing() {
+        let (_world, mut strip, e) = strip_of(2);
+        assert!(strip.maximize(e[0], Side::East, half()).unwrap());
+        assert!(!strip.maximize(e[0], Side::East, half()).unwrap());
+        assert_eq!(render(&strip, &e), "^A | B");
+        assert_eq!(strip.maximized(e[0]), Some(&half()));
+    }
+
+    #[test]
+    fn a_stacked_window_maximizes_beside_its_stack_and_restores_into_it() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[1], Side::West).unwrap();
+        strip.stack(e[2], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B, C] | D");
+
+        strip.maximize(e[1], Side::East, half()).unwrap();
+        assert_eq!(render(&strip, &e), "[A, C] | ^B | D");
+        strip.maximize(e[3], Side::West, half()).unwrap();
+        assert_eq!(render(&strip, &e), "[A, C] | ^B | ^D");
+
+        let restored = strip.unmaximize(e[1], 3).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B, C] | ^D");
+        assert_eq!(restored.height, Some(ViewportShare(0.5)));
+        assert_eq!(strip.unmaximize(e[1], 3), None, "no longer maximized");
+    }
+
+    #[test]
+    fn a_restored_window_stays_a_column_when_its_stack_is_gone_or_full() {
+        let (_world, mut strip, e) = strip_of(3);
+        strip.stack(e[1], Side::West).unwrap();
+        strip.maximize(e[1], Side::East, half()).unwrap();
+        strip.remove(e[0]);
+        let restored = strip.unmaximize(e[1], 3).unwrap();
+        assert_eq!(render(&strip, &e), "B | C");
+        assert_eq!(restored.height, None);
+    }
+
+    /// Window A, B's mate, moves into C's column while B is maximized.
+    fn a_mate_moved_away() -> (World, LayoutStrip, Vec<Entity>) {
+        let (world, mut strip, e) = strip_of(4);
+        strip.stack(e[1], Side::West).unwrap();
+        strip.maximize(e[1], Side::East, half()).unwrap();
+        strip.insert_as_column(e[0], 3).unwrap();
+        strip.stack(e[0], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "^B | [C, A] | D");
+        (world, strip, e)
+    }
+
+    #[test]
+    fn a_restored_window_goes_back_to_a_mate_that_moved() {
+        let (_world, mut strip, e) = a_mate_moved_away();
+        strip.unmaximize(e[1], 3);
+        assert_eq!(render(&strip, &e), "[C, B, A] | D");
+    }
+
+    #[test]
+    fn a_restored_window_stays_a_column_when_its_mates_column_is_full() {
+        let (_world, mut strip, e) = a_mate_moved_away();
+        strip.unmaximize(e[1], 2);
+        assert_eq!(render(&strip, &e), "B | [C, A] | D");
+    }
+
+    #[test]
+    fn nothing_joins_a_maximized_column() {
+        let (_world, mut strip, e) = strip_of(3);
+        strip.maximize(e[1], Side::East, half()).unwrap();
+        strip.stack(e[0], Side::East).unwrap();
+        strip.stack(e[2], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "A | ^B | C");
+        assert!(strip.join_column(&[e[0]], 1, 0).is_err());
+    }
+
+    #[test]
+    fn a_reorder_keeps_a_column_maximized() {
+        let (_world, mut strip, e) = strip_of(3);
+        strip.maximize(e[1], Side::East, half()).unwrap();
+        strip.insert_as_column(e[1], 3).unwrap();
+        assert_eq!(render(&strip, &e), "A | C | ^B");
+        strip.insert_as_column(e[1], 0).unwrap();
+        assert_eq!(render(&strip, &e), "^B | A | C");
+        assert_eq!(strip.maximized(e[1]), Some(&half()));
+    }
+
+    #[test]
+    fn a_window_leaving_a_maximized_column_is_released() {
+        let (_world, mut strip, e) = strip_of(3);
+        strip.maximize(e[0], Side::East, half()).unwrap();
+        strip.maximize(e[1], Side::East, half()).unwrap();
+        strip.maximize(e[2], Side::East, half()).unwrap();
+        strip.unmaximize(e[0], 3);
+        strip.remove(e[1]);
+        strip.stack(e[2], Side::West).unwrap();
+        assert_eq!(render(&strip, &e), "[A, C]");
+        assert_eq!(strip.take_released(), e.iter().copied().collect());
+        assert!(strip.take_released().is_empty());
+    }
+
+    #[test]
+    fn an_adopted_window_restores_what_it_carried() {
+        let (_world, mut strip, e) = strip_of(2);
+        assert!(strip.adopt_maximized(e[1], half()));
+        assert_eq!(render(&strip, &e), "A | ^B");
+        let restored = strip.unmaximize(e[1], 3).unwrap();
+        assert_eq!(restored.width, ViewportShare(0.5));
+        assert_eq!(render(&strip, &e), "A | B");
+    }
+
+    #[test]
+    fn a_column_anchor_carries_to_another_viewport() {
+        let small = IRect::new(0, 0, 1000, 700);
+        let large = IRect::new(1000, 0, 3000, 1200);
+        let middle = ViewportAnchor::of(IRect::new(400, 0, 600, 700), small, false, false, false);
+        assert_eq!(middle.in_viewport(large), WidthAnchor::Center(2000));
+        let left = ViewportAnchor::of(IRect::new(0, 0, 600, 700), small, true, false, false);
+        assert_eq!(left.in_viewport(large), WidthAnchor::Left);
     }
 
     #[test]
@@ -3351,7 +3941,7 @@ mod tests {
                 assert_eq!(stack[0], StackItem::Single(entities[0]));
                 assert_eq!(stack[1], StackItem::Single(entities[1]));
             }
-            Column::Single(_) | Column::Fullscren(_) | Column::Tabs(_) => {
+            Column::Single(_) | Column::Fullscren(_) | Column::Tabs(_) | Column::Maximized(_) => {
                 panic!("Expected a stack")
             }
         }
@@ -3377,7 +3967,7 @@ mod tests {
         let minimum = |entity| Some(if entity == e[0] { 100 } else { 700 });
         let maximum = |entity| (entity == e[0]).then_some(100);
         let frames = strip.relative_positions_with_minimums(
-            848,
+            Size::new(1000, 848),
             &frame,
             &minimum,
             &maximum,
@@ -3502,7 +4092,9 @@ mod tests {
             Some(IRect::new(0, 0, 300, heights[index]))
         };
 
-        let out = strip.relative_positions(1000, &frame).collect::<Vec<_>>();
+        let out = strip
+            .relative_positions(Size::new(1000, 1000), &frame)
+            .collect::<Vec<_>>();
         assert_eq!(
             out.iter()
                 .map(|(_, frame)| (frame.min.y, frame.height()))
@@ -3528,7 +4120,9 @@ mod tests {
         }
         let frame = |_| Some(IRect::new(0, 0, 300, 300));
 
-        let out = strip.relative_positions(700, &frame).collect::<Vec<_>>();
+        let out = strip
+            .relative_positions(Size::new(1000, 700), &frame)
+            .collect::<Vec<_>>();
         // 500 above the last window: 156 of top bars, 344 shared.
         assert_eq!(
             out.iter()
@@ -3581,7 +4175,7 @@ mod tests {
         _ = strip.stack(entities[2], Side::West);
         let get_window_frame = |_| Some(sizes[0]);
         let out = strip
-            .relative_positions(500, &get_window_frame)
+            .relative_positions(Size::new(1000, 500), &get_window_frame)
             .collect::<Vec<_>>();
 
         let xpos = out.iter().map(|(_, frame)| frame.min.x).collect::<Vec<_>>();
@@ -3607,7 +4201,9 @@ mod tests {
         }
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 400));
-        let out: Vec<_> = strip.relative_positions(800, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1000, 800), &get_window_frame)
+            .collect();
 
         assert_eq!(out.len(), 3);
         for (_, f) in &out {
@@ -3648,7 +4244,9 @@ mod tests {
             }
         };
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1000, 600), &get_window_frame)
+            .collect();
         assert_eq!(out.len(), 4);
 
         // Every window in the stacked column must adopt the master's width.
@@ -3738,7 +4336,9 @@ mod tests {
         strip.toggle_tabbed_display(entities[1]);
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 400, 300));
-        let out: Vec<_> = strip.relative_positions(700, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1000, 700), &get_window_frame)
+            .collect();
 
         assert_eq!(out.len(), 3);
         for (_, frame) in &out {
@@ -3772,7 +4372,9 @@ mod tests {
         strip.toggle_tabbed_display(entities[1]);
         strip.toggle_tabbed_display(entities[1]);
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1000, 600), &get_window_frame)
+            .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(
             heights.iter().sum::<i32>(),
@@ -3941,7 +4543,9 @@ mod tests {
 
         // relative_positions should yield e1, e4 (same frame) and e2
         let get_window_frame = |_| Some(IRect::new(0, 0, 100, 100));
-        let out: Vec<_> = strip.relative_positions(400, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1000, 400), &get_window_frame)
+            .collect();
 
         // We expect e1, e4, e2 from the first column, and e3 from the second.
         assert_eq!(out.len(), 4);
@@ -3970,7 +4574,9 @@ mod tests {
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 250));
 
         // Before unstack: e0 and e1 share 500px height.
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1000, 500), &get_window_frame)
+            .collect();
         let e1_height = out
             .iter()
             .find(|(e, _)| *e == entities[1])
@@ -3983,7 +4589,9 @@ mod tests {
         strip.unstack(entities[1], Side::East).unwrap();
         assert_eq!(strip.len(), 3);
 
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1000, 500), &get_window_frame)
+            .collect();
         for (_, f) in &out {
             assert_eq!(
                 f.height(),
@@ -4007,21 +4615,27 @@ mod tests {
 
         // Stack: [Stack(e0, e1)]
         strip.stack(entities[1], Side::West).unwrap();
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1000, 500), &get_window_frame)
+            .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(heights.iter().sum::<i32>(), 500);
         assert_eq!(heights.len(), 2);
 
         // Unstack: [Single(e0), Single(e1)]
         strip.unstack(entities[1], Side::East).unwrap();
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1000, 500), &get_window_frame)
+            .collect();
         for (_, f) in &out {
             assert_eq!(f.height(), 500);
         }
 
         // Re-stack: [Stack(e0, e1)] — e1 stacks onto left neighbor e0
         strip.stack(entities[1], Side::West).unwrap();
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1000, 500), &get_window_frame)
+            .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(heights.iter().sum::<i32>(), 500);
         assert_eq!(heights.len(), 2);
@@ -4060,7 +4674,9 @@ mod tests {
             }
         };
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1000, 600), &get_window_frame)
+            .collect();
         assert_eq!(out.len(), 3);
 
         // Columns must be edge-to-edge: each column starts where the previous ends.
@@ -4096,7 +4712,9 @@ mod tests {
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 600));
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1000, 600), &get_window_frame)
+            .collect();
         let xs: Vec<_> = out.iter().map(|(_, f)| f.min.x).collect();
         assert_eq!(xs, vec![0, 300, 600]);
 
@@ -4236,7 +4854,7 @@ mod tests {
         };
 
         let out = strip
-            .relative_positions(600, &get_window_frame)
+            .relative_positions(Size::new(1000, 600), &get_window_frame)
             .collect::<Vec<_>>();
 
         assert_eq!(out.len(), 2);

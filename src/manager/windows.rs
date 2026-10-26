@@ -423,6 +423,15 @@ impl Margins {
         }
     }
 
+    /// The margins of a window drawn over `edges`, the display's edge
+    /// padding: the shown frame reaches past the tracked one by `edges`.
+    pub fn filling(edges: Self) -> Self {
+        Self {
+            min: -edges.min,
+            max: -edges.max,
+        }
+    }
+
     pub fn shown(self, frame: IRect) -> IRect {
         IRect::from_corners(frame.min + self.min, frame.max - self.max)
     }
@@ -502,6 +511,12 @@ pub trait WindowApi: Send + Sync {
     /// Maps the frame the engine tracks to the frame the window shows. The
     /// engine writes and reads every frame through it.
     fn margins(&self) -> Margins;
+    /// `Some(edges)` while the window fills a maximized column: it then shows
+    /// over `edges`, the display's edge padding, instead of keeping its
+    /// window padding. The frame the window shows stays where it is until
+    /// the next write.
+    fn set_fill(&mut self, edges: Option<Margins>);
+    fn fill(&self) -> Option<Margins>;
     fn border_radius(&self) -> Option<f64>;
     /// How far the window's top bar (title bar, toolbar, or navigation bar)
     /// reaches below its top edge, read through Accessibility. `Ok(None)`
@@ -552,6 +567,7 @@ impl Window {
         }
         fresh.set_padding(WindowPadding::Horizontal(self.horizontal_padding()));
         fresh.set_padding(WindowPadding::Vertical(self.vertical_padding()));
+        fresh.set_fill(self.fill());
         fresh.update_frame()?;
         Ok(std::mem::replace(self, fresh))
     }
@@ -926,6 +942,7 @@ pub struct WindowOS {
     writes: FrameWrites<AxApp>,
     vertical_padding: i32,
     horizontal_padding: i32,
+    fill: Option<Margins>,
     border_radius: OnceLock<Option<f64>>,
     pid: OnceLock<Result<Pid>>,
 
@@ -997,6 +1014,7 @@ impl WindowOS {
             writes: FrameWrites::new(WRITERS.clone()),
             vertical_padding: 0,
             horizontal_padding: 0,
+            fill: None,
             border_radius: OnceLock::new(),
             pid: OnceLock::new(),
             title: RwLock::new(None),
@@ -1364,7 +1382,20 @@ impl WindowApi for WindowOS {
     }
 
     fn margins(&self) -> Margins {
-        Margins::padding(IVec2::new(self.horizontal_padding, self.vertical_padding))
+        self.fill.map_or_else(
+            || Margins::padding(IVec2::new(self.horizontal_padding, self.vertical_padding)),
+            Margins::filling,
+        )
+    }
+
+    fn set_fill(&mut self, edges: Option<Margins>) {
+        let shown = self.margins().shown(self.writes.frame());
+        self.fill = edges;
+        self.writes.track(self.margins().tracked(shown));
+    }
+
+    fn fill(&self) -> Option<Margins> {
+        self.fill
     }
 
     // Based on:
