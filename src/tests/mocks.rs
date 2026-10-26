@@ -55,6 +55,9 @@ pub(crate) struct MockWindowData {
     /// The size writes the app dropped, which [`MockState::os_apply_late_resizes`]
     /// applies in order, like an app busy when the calls returned.
     pub(crate) late_resizes: Vec<Size>,
+    /// A height whose next size write the app applies late, as one of
+    /// [`Self::late_resizes`].
+    pub(crate) late_height: Option<i32>,
     /// How long a frame read takes, like an app slow to answer.
     pub(crate) frame_read_delay: std::time::Duration,
     pub(crate) resize_writes: usize,
@@ -135,6 +138,7 @@ impl Default for MockWindowData {
             sticky_bottom: None,
             dropped_resizes: 0,
             late_resizes: Vec::new(),
+            late_height: None,
             frame_read_delay: std::time::Duration::ZERO,
             resize_writes: 0,
             position_writes: 0,
@@ -320,6 +324,11 @@ fn mock_resize(inner: &RwLock<MockStateInner>, id: WinID, ax_generation: u32, si
         .filter(|w| w.ax_generation == ax_generation)
     {
         w.resize_writes += 1;
+        if w.late_height == Some(size.y) {
+            w.late_height = None;
+            w.late_resizes.push(size);
+            return;
+        }
         if w.dropped_resizes > 0 {
             w.dropped_resizes -= 1;
             w.late_resizes.push(size);
