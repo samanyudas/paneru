@@ -3313,3 +3313,95 @@ fn window_x(world: &mut World, id: WinID) -> i32 {
         .find(|window| window.id() == id)
         .map_or(i32::MIN, |window| window.frame().min.x)
 }
+
+/// Moves window `id` from the display it is on to the display in `direction`
+/// and lets the arrival settle.
+fn move_and_settle(harness: &mut TestHarness, id: WinID, direction: Direction) -> IRect {
+    let (from, to, workspace) = match direction {
+        Direction::South => (EXT_DISPLAY_ID, TEST_DISPLAY_ID, TEST_WORKSPACE_ID),
+        _ => (TEST_DISPLAY_ID, EXT_DISPLAY_ID, EXT_WORKSPACE_ID),
+    };
+    harness.mock_state.os_activate_display(from);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+    harness.run(vec![window_command(Operation::MoveToDisplay(direction))]);
+    harness
+        .mock_state
+        .update_window(id, |window| window.workspace_id = workspace);
+    harness.mock_state.os_activate_display(to);
+    harness.advance(Duration::from_secs(3));
+    harness.mock_state.create_window(id).frame()
+}
+
+/// A window that fills its display, as macOS Fill or Zoom leaves it, is wider
+/// than the tiled viewport. Moved to another display, it fills that display's
+/// viewport instead of overflowing it, in both directions.
+#[test]
+fn test_move_to_display_fits_a_filled_window_to_the_destination() {
+    let mut harness = display_round_trip_harness(MainOptions::default(), 0, 890);
+    harness
+        .mock_state
+        .update_window(0, |window| window.frame = IRect::new(0, 20, 2560, 1440));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 1 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::FocusDisplay(Direction::North)),
+    ]);
+    let frame = move_and_settle(&mut harness, 0, Direction::South);
+    assert_eq!(frame, IRect::new(4, 1460, 2044, 2772));
+    assert_focused!(harness.world(), 0);
+
+    harness
+        .mock_state
+        .update_window(0, |window| window.frame = IRect::new(0, 1460, 2048, 2772));
+    harness
+        .world()
+        .write_message(Event::WindowResized { window_id: 0 });
+    harness.advance(Duration::from_secs(1));
+    let frame = move_and_settle(&mut harness, 0, Direction::North);
+    assert_eq!((frame.min.x, frame.max.x), (4, 2556));
+    assert_focused!(harness.world(), 0);
+}
+
+/// Make column full width already fits the viewport, so it moves unchanged.
+#[test]
+fn test_move_to_display_keeps_a_full_width_column_full_width() {
+    let mut harness = display_round_trip_harness(MainOptions::default(), 0, 890);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 1 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::FocusDisplay(Direction::North)),
+    ]);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.run(vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        window_command(Operation::FullWidth),
+    ]);
+    harness.advance(Duration::from_secs(1));
+    assert_eq!(harness.mock_state.create_window(0).frame().width(), 2552);
+    let frame = move_and_settle(&mut harness, 0, Direction::South);
+    assert_eq!(frame, IRect::new(4, 1460, 2044, 2772));
+}
+
+/// A window whose minimum width exceeds the destination stays at its minimum
+/// and overflows only where the strip can pan to it.
+#[test]
+fn test_move_to_display_leaves_a_window_too_wide_to_fit_reachable() {
+    let mut harness = display_round_trip_harness(MainOptions::default(), 0, 890);
+    harness.mock_state.update_window(0, |window| {
+        window.frame = IRect::new(0, 20, 2560, 1440);
+        window.minimum_size = Some(Size::new(2300, 400));
+    });
+    harness.run(vec![
+        Event::MenuOpened { window_id: 1 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::FocusDisplay(Direction::North)),
+    ]);
+    let frame = move_and_settle(&mut harness, 0, Direction::South);
+    assert_eq!(frame.width(), 2300);
+    assert!(frame.min.x <= 4 && frame.max.x >= 2044, "{frame:?}");
+    assert_focused!(harness.world(), 0);
+}

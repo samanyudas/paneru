@@ -7,6 +7,9 @@
 //! does not write them to the window until it is restored. So the windows
 //! around it keep their sizes and places, and a stacked window returns to its
 //! stack.
+//!
+//! A maximized window moved to another display, by a display command or a
+//! title-bar drag, stays maximized and fills that display's usable area.
 
 use std::time::Duration;
 
@@ -17,7 +20,8 @@ use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{any_with_component, on_message};
-use bevy::ecs::system::{Commands, Query, Res};
+use bevy::ecs::system::{Commands, Local, Query, Res};
+use bevy::ecs::world::World;
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 use tracing::debug;
@@ -28,6 +32,7 @@ use crate::ecs::systems::unpadded;
 use crate::ecs::{Bounds, DockPosition, Position, TopBarHeight, Unmanaged, UpdateSet};
 use crate::events::{Event, InputEvent, MouseButton};
 use crate::manager::{Display, Origin, Window, WindowManager, origin_from};
+use objc2_core_graphics::CGDirectDisplayID;
 
 /// How long the engine holds a window at the frame a toggle gave it. The
 /// app answers the same double-click with its own zoom, which can land
@@ -60,7 +65,7 @@ impl Plugin for MaximizePlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            toggle_maximize
+            (toggle_maximize, fill_drop_display)
                 .in_set(UpdateSet::Input)
                 .run_if(on_message::<InputEvent>),
         )
@@ -175,7 +180,7 @@ fn toggle_maximize(
             );
         } else {
             debug!("maximizing window {window_id}");
-            let frame = IRect::from_corners(visible.min - padding, visible.max + padding);
+            let frame = filled(&window, visible);
             entity_commands.try_insert(Maximized {
                 frame,
                 offset: position.0 - visible.min,
@@ -186,6 +191,117 @@ fn toggle_maximize(
             window.place(frame);
         }
     }
+}
+
+/// The frame that fills `visible`, a display's usable area, padding included.
+fn filled(window: &Window, visible: IRect) -> IRect {
+    let padding = IVec2::new(window.horizontal_padding(), window.vertical_padding());
+    IRect::from_corners(visible.min - padding, visible.max + padding)
+}
+
+/// Fills `visible` with a maximized window and holds it there, unless it
+/// already fills it. Returns whether the window had to move.
+fn fill(window: &mut Window, maximized: &mut Maximized, visible: IRect) -> bool {
+    let frame = filled(window, visible);
+    if maximized.frame == frame {
+        return false;
+    }
+    debug!("fitting maximized window {} to {frame:?}", window.id());
+    maximized.frame = frame;
+    window.place(frame);
+    true
+}
+
+/// A maximized window dropped on another display after a title-bar drag
+/// fills that display's usable area. A drop on its own display leaves it
+/// where the user put it.
+///
+/// macOS keeps a dropped window on the display under the pointer, so the
+/// pointer at the release picks the display. The window is the one pressed,
+/// because macOS can drop it short of the pointer: on a native rig Finder
+/// ended 18 points below it.
+fn fill_drop_display(
+    mut messages: MessageReader<InputEvent>,
+    mut pressed: Local<Option<Entity>>,
+    mut windows: Query<(Entity, &mut Window, &mut Maximized)>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
+    window_manager: Res<WindowManager>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    for InputEvent(event) in messages.read() {
+        match event {
+            Event::MouseDown {
+                point,
+                button: MouseButton::Left,
+                window_id,
+                ..
+            } => {
+                let window_id =
+                    window_id.or_else(|| window_manager.find_window_at_point(point).ok());
+                *pressed = windows
+                    .iter()
+                    .find(|(_, window, _)| Some(window.id()) == window_id)
+                    .map(|(entity, _, _)| entity);
+            }
+            Event::MouseUp {
+                point,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let Some(entity) = pressed.take() else {
+                    continue;
+                };
+                let Ok((_, mut window, mut maximized)) = windows.get_mut(entity) else {
+                    continue;
+                };
+                if window.write_pending() || window.update_frame().ok() == Some(maximized.frame) {
+                    continue;
+                }
+                let point = origin_from(*point);
+                let Some(visible) = displays
+                    .iter()
+                    .find(|(display, _)| display.bounds().contains(point))
+                    .map(|(display, dock)| display.visible_bounds(dock))
+                else {
+                    continue;
+                };
+                if fill(&mut window, &mut maximized, visible)
+                    && let Ok(mut entity_commands) = commands.get_entity(entity)
+                {
+                    entity_commands.try_insert(FrameHold {
+                        until: time.elapsed() + FRAME_HOLD,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Fills the usable area of display `display` with `entity`, when it is
+/// maximized, after a display command moved it there.
+pub(crate) fn fill_display(commands: &mut Commands, entity: Entity, display: CGDirectDisplayID) {
+    commands.queue(move |world: &mut World| {
+        let Some(visible) = world
+            .query::<(&Display, Option<&DockPosition>)>()
+            .iter(world)
+            .find(|(candidate, _)| candidate.id() == display)
+            .map(|(display, dock)| display.visible_bounds(dock))
+        else {
+            return;
+        };
+        let until = world.resource::<Time>().elapsed() + FRAME_HOLD;
+        let Ok((mut window, mut maximized)) = world
+            .query::<(&mut Window, &mut Maximized)>()
+            .get_mut(world, entity)
+        else {
+            return;
+        };
+        if fill(&mut window, &mut maximized, visible) {
+            world.entity_mut(entity).insert(FrameHold { until });
+        }
+    });
 }
 
 /// Whether `point` is in the window's top bar: its title bar, toolbar, or

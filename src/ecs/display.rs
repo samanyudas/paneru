@@ -121,7 +121,8 @@ impl DisplayMoves<'_, '_> {
     ///
     /// The window is sized for the destination: the width of the column it
     /// joins, or for a new column the width it had relative to its old
-    /// display, and the height of the destination. `size` is its size now,
+    /// display, at most the destination's width, and the height of the
+    /// destination. `size` is its size now,
     /// and `frame_of` gives the frame of any window, for a column's width.
     /// The window it leaves behind refits its strip.
     ///
@@ -170,9 +171,13 @@ impl DisplayMoves<'_, '_> {
         let width = joined_width.unwrap_or_else(|| {
             let ratio = (source_viewport.width() > 0)
                 .then(|| f64::from(size.x) / f64::from(source_viewport.width()));
-            ratio.map_or(size.x, |ratio| {
-                round_px(ratio * f64::from(target_viewport.width()))
-            })
+            // A window wider than its old viewport, such as one macOS filled,
+            // fills the new viewport instead of overflowing it.
+            ratio
+                .map_or(size.x, |ratio| {
+                    round_px(ratio * f64::from(target_viewport.width()))
+                })
+                .min(target_viewport.width())
         });
         let (_, mut source_strip, _, _, _) = self.strips.get_mut(source).ok()?;
         let members = source_strip

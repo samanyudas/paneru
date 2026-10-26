@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 
+use crate::assert_focused;
 use crate::commands::{Command, Direction, Operation, Side};
 use crate::config::MainOptions;
 use crate::ecs::DockPosition;
@@ -277,4 +278,139 @@ fn a_dragged_maximized_window_restores_from_where_it_is() {
 
     double_click_title_bar(&mut harness, 1);
     assert_eq!(frames(&harness, &[0, 1, 2]), before);
+}
+
+const EXT_BOUNDS: IRect = IRect {
+    min: IVec2::new(0, -EXT_DISPLAY_HEIGHT),
+    max: IVec2::new(EXT_DISPLAY_WIDTH, 0),
+};
+
+/// The usable area of display `id`.
+fn usable_area_of(harness: &mut TestHarness, id: u32) -> IRect {
+    let world = harness.world();
+    world
+        .query::<(&Display, Option<&DockPosition>)>()
+        .iter(world)
+        .find(|(display, _)| display.id() == id)
+        .map(|(display, dock)| display.visible_bounds(dock))
+        .expect("the display")
+}
+
+/// Three tiled windows on the built-in display, with a larger display above
+/// it, and window 1 focused and maximized.
+fn maximized_below_a_larger_display() -> TestHarness {
+    let mut harness = TestHarness::new()
+        .with_windows(3)
+        .with_display(EXT_DISPLAY_ID, EXT_BOUNDS, vec![EXT_WORKSPACE_ID])
+        .with_window(100, |window| {
+            window.workspace_id = EXT_WORKSPACE_ID;
+            window.frame = IRect::new(100, -1100, 900, -100);
+        });
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+    ]);
+    harness.advance(SETTLE);
+    double_click_title_bar(&mut harness, 1);
+    let area = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    assert_eq!(os_frame(&harness, 1), area);
+    harness
+}
+
+/// Moves the focused window 1 to the display in `direction`, as the
+/// display commands do.
+fn move_to_display(harness: &mut TestHarness, direction: Direction, display: u32, space: u64) {
+    harness.run(vec![command(Operation::MoveToDisplay(direction))]);
+    harness
+        .mock_state
+        .update_window(1, |window| window.workspace_id = space);
+    harness.mock_state.os_activate_display(display);
+    harness.advance(SETTLE);
+}
+
+/// Drags window 1 by its title bar to `origin`, with the pointer released
+/// at `release`.
+fn drag_to(harness: &mut TestHarness, origin: Origin, release: Origin, space: u64) {
+    let start = title_bar(harness, 1);
+    harness.mock_state.simulate_drag(start, release);
+    harness.mock_state.os_move_window(1, origin);
+    harness
+        .mock_state
+        .update_window(1, |window| window.workspace_id = space);
+    harness.advance(SETTLE);
+}
+
+/// A maximized window moved by the display commands stays maximized and
+/// fills the usable area of each display it reaches, and keeps the focus.
+#[test]
+fn a_maximized_window_moved_to_another_display_fills_it() {
+    let mut harness = maximized_below_a_larger_display();
+
+    move_to_display(
+        &mut harness,
+        Direction::North,
+        EXT_DISPLAY_ID,
+        EXT_WORKSPACE_ID,
+    );
+    let area = usable_area_of(&mut harness, EXT_DISPLAY_ID);
+    assert_eq!(os_frame(&harness, 1), area);
+    assert_focused!(harness.world(), 1);
+
+    move_to_display(
+        &mut harness,
+        Direction::South,
+        TEST_DISPLAY_ID,
+        TEST_WORKSPACE_ID,
+    );
+    let area = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    assert_eq!(os_frame(&harness, 1), area);
+    assert_focused!(harness.world(), 1);
+}
+
+/// A maximized window dragged by its title bar to another display fills
+/// that display's usable area, in both directions. A drag within one
+/// display leaves it where the user dropped it.
+#[test]
+fn a_maximized_window_dragged_to_another_display_fills_it() {
+    let mut harness = maximized_below_a_larger_display();
+
+    // macOS can drop the window below the pointer: on a native rig Finder
+    // ended 18 points lower.
+    drag_to(
+        &mut harness,
+        Origin::new(0, -1082),
+        Origin::new(500, -1100),
+        EXT_WORKSPACE_ID,
+    );
+    let area = usable_area_of(&mut harness, EXT_DISPLAY_ID);
+    assert_eq!(os_frame(&harness, 1), area);
+
+    // Dropped low on the large display, the window's centre is on the
+    // display below, but the pointer and macOS keep it on the large one.
+    drag_to(
+        &mut harness,
+        Origin::new(0, -500),
+        Origin::new(500, -490),
+        EXT_WORKSPACE_ID,
+    );
+    assert_eq!(os_frame(&harness, 1).min, Origin::new(0, -500));
+    assert_eq!(os_frame(&harness, 1).size(), area.size());
+
+    drag_to(
+        &mut harness,
+        Origin::new(-200, 100),
+        Origin::new(500, 110),
+        TEST_WORKSPACE_ID,
+    );
+    let area = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    assert_eq!(os_frame(&harness, 1), area);
+
+    drag_to(
+        &mut harness,
+        Origin::new(50, 60),
+        Origin::new(500, 70),
+        TEST_WORKSPACE_ID,
+    );
+    assert_eq!(os_frame(&harness, 1).min, Origin::new(50, 60));
 }

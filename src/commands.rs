@@ -1495,6 +1495,9 @@ fn to_next_display(
     } else {
         commands.reposition_entity(entity, origin);
     }
+    for member in &arrival.members {
+        crate::ecs::maximize::fill_display(&mut commands, *member, target_id);
+    }
     native.placed(arrival.members);
     if matches!(move_focus, MoveFocus::Follow) && config.mouse_follows_focus() {
         window_manager.warp_mouse(bounds.center());
