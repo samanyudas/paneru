@@ -854,17 +854,15 @@ impl Config {
     }
 
     /// Returns `true` if focus should follow the mouse based on the current configuration.
-    /// If the configuration option is not set, it defaults to `true`.
+    /// Miri keeps pointer movement from changing focus, so it defaults to `false`.
     pub fn focus_follows_mouse(&self) -> bool {
-        // Default is enabled.
-        self.options().focus_follows_mouse.is_none_or(|ffm| ffm)
+        self.options().focus_follows_mouse.unwrap_or(false)
     }
 
     /// Returns `true` if the mouse cursor should follow the focused window based on the current configuration.
-    /// If the configuration option is not set, it defaults to `true`.
+    /// Miri keeps keyboard commands from moving the pointer, so it defaults to `false`.
     pub fn mouse_follows_focus(&self) -> bool {
-        // Default is enabled.
-        self.options().mouse_follows_focus.is_none_or(|mff| mff)
+        self.options().mouse_follows_focus.unwrap_or(false)
     }
 
     pub fn horizontal_mouse_warp_offset(&self) -> i32 {

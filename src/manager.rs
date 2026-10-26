@@ -13,8 +13,10 @@ use objc2_core_foundation::{
 };
 use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGEventSource,
-    CGEventSourceStateID, CGGetActiveDisplayList, CGMouseButton, CGWarpMouseCursorPosition,
-    CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowNumber,
+    CGEventSourceStateID, CGGetActiveDisplayList, CGMouseButton,
+    CGRectMakeWithDictionaryRepresentation, CGWarpMouseCursorPosition, CGWindowLevelForKey,
+    CGWindowLevelKey, CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID,
+    kCGWindowBounds, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use objc2_foundation::NSBundle;
 use std::path::Path;
@@ -147,6 +149,14 @@ pub trait WindowManagerApi: Send + Sync {
     /// * `window` - A reference to the `Window` to center the mouse on.
     /// * `display_bounds` - The `CGRect` representing the bounds of the display the window is on.
     fn warp_mouse(&self, origin: Origin);
+    /// Focuses the desktop of the display with `bounds`, which makes that
+    /// display the active one without moving the pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Error` when no desktop window covers the display's centre,
+    /// as when Finder does not draw the desktop.
+    fn focus_desktop(&self, bounds: IRect) -> Result<()>;
     /// Adds existing windows for a given application, potentially resolving unresolved windows.
     ///
     /// # Arguments
@@ -451,6 +461,13 @@ impl WindowManagerApi for WindowManagerOS {
         CGAssociateMouseAndMouseCursorPosition(true);
     }
 
+    fn focus_desktop(&self, bounds: IRect) -> Result<()> {
+        let (window_id, pid) = desktop_window_at(bounds.center())
+            .ok_or_else(|| Error::NotFound(format!("no desktop window covers {bounds:?}")))?;
+        windows::focus_window(process::psn_for_pid(pid)?, window_id);
+        Ok(())
+    }
+
     /// Adds existing windows for a given application, attempting to resolve any that are not yet found.
     /// It compares the application's reported window list with the global window list and uses brute-forcing if necessary.
     ///
@@ -627,6 +644,35 @@ impl WindowManagerApi for WindowManagerOS {
         window_ids(CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements)
             .unwrap_or_default()
     }
+}
+
+/// The ID and owner of the on-screen desktop-icon window under `point`.
+/// Finder draws one over each display's desktop.
+fn desktop_window_at(point: Origin) -> Option<(WinID, Pid)> {
+    let level = CGWindowLevelForKey(CGWindowLevelKey::DesktopIconWindowLevelKey);
+    let window_list_info =
+        CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, kCGNullWindowID)?;
+    let array = unsafe { window_list_info.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+    array.iter().find_map(|dict| {
+        let number = |key: &CFString| dict.get(key)?.downcast::<CFNumber>().ok()?.as_i32();
+        if number(unsafe { kCGWindowLayer })? != level {
+            return None;
+        }
+        let bounds = dict
+            .get(unsafe { kCGWindowBounds })?
+            .downcast::<CFDictionary>()
+            .ok()?;
+        let mut frame = CGRect::default();
+        unsafe { CGRectMakeWithDictionaryRepresentation(Some(&bounds), &raw mut frame) }
+            .then_some(())?;
+        if !irect_from(frame).contains(point) {
+            return None;
+        }
+        Some((
+            number(unsafe { kCGWindowNumber })?,
+            number(unsafe { kCGWindowOwnerPID })?,
+        ))
+    })
 }
 
 /// The IDs of the windows `CGWindowListCopyWindowInfo` lists for `options`.
