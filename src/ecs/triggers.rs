@@ -1422,6 +1422,25 @@ pub(super) fn apply_window_defaults(
     }
 }
 
+/// Gives a window that just opened focus. A window kept above ordinary
+/// windows, such as Picture-in-Picture, often opens without focus, so the
+/// engine focuses it once, unless it opened minimized. For any other
+/// window, macOS already focused it, and the engine only records that.
+fn focus_opened_window(
+    entity: Entity,
+    window: &Window,
+    properties: &WindowProperties,
+    commands: &mut Commands,
+) {
+    if properties.above_ordinary() && !window.is_minimized() {
+        commands.focus_entity(entity, true);
+    } else {
+        commands.trigger(SendMessageTrigger(Event::WindowFocused {
+            window_id: window.id(),
+        }));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn apply_window_positions(
@@ -1474,18 +1493,9 @@ pub(super) fn apply_window_positions(
                 }
             }
             // macOS reported the new window's focus before it was tracked, so
-            // it takes focus here, as a tiled window does below. A window kept
-            // above ordinary windows, such as Picture-in-Picture, often opens
-            // without focus, so the engine gives it focus once.
+            // it takes focus here, as a tiled window does below.
             if initializing.is_none() && !minimized && !properties.dont_focus() {
-                if properties.above_ordinary() {
-                    ctx.commands.focus_entity(entity, true);
-                } else {
-                    ctx.commands
-                        .trigger(SendMessageTrigger(Event::WindowFocused {
-                            window_id: window.id(),
-                        }));
-                }
+                focus_opened_window(entity, window, &properties, &mut ctx.commands);
             }
             continue;
         }
@@ -1547,11 +1557,8 @@ pub(super) fn apply_window_positions(
                     ctx.commands.focus_entity(prev, true);
                 }
             } else {
-                debug!("Synthesizing WindowFocused for newly spawned window {entity}");
-                ctx.commands
-                    .trigger(SendMessageTrigger(Event::WindowFocused {
-                        window_id: window.id(),
-                    }));
+                debug!("Focusing newly spawned window {entity}");
+                focus_opened_window(entity, window, &properties, &mut ctx.commands);
             }
         }
     }

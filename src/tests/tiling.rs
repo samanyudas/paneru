@@ -1294,7 +1294,8 @@ fn a_window_above_ordinary_windows_floats_and_takes_focus() {
     assert_eq!(window_x(world, 2), TEST_WINDOW_WIDTH * 2);
 }
 
-/// A rule can still tile a window its app keeps above ordinary windows.
+/// A rule can still tile a window its app keeps above ordinary windows, and
+/// it still takes focus once.
 #[test]
 fn a_rule_can_tile_a_window_above_ordinary_windows() {
     let mut params = WindowParams::new("^Window 3$", None);
@@ -1311,6 +1312,7 @@ fn a_rule_can_tile_a_window_above_ordinary_windows() {
     );
     let mut query = world.query::<&LayoutStrip>();
     assert!(query.iter(world).any(|strip| strip.contains(entity)));
+    crate::assert_focused!(world, 3);
 }
 
 /// Closing a window while its application stays alive must free its slot in
