@@ -540,6 +540,29 @@ impl Before {
     pub(crate) fn width(&self) -> ViewportShare {
         self.width
     }
+
+    pub(crate) fn height(&self) -> ViewportShare {
+        self.height
+    }
+
+    pub(crate) fn anchor(&self) -> ViewportAnchor {
+        self.anchor
+    }
+
+    /// The windows that stayed in the stack the window left, top to bottom,
+    /// and its place among them.
+    pub(crate) fn stack_home(&self) -> Option<(&[Entity], usize)> {
+        self.home
+            .as_ref()
+            .map(|home| (home.mates.as_slice(), home.slot))
+    }
+
+    /// The same, returning to its place `slot` among stack `mates`. Without
+    /// a mate it returns to a column of its own.
+    pub(crate) fn with_stack_home(mut self, mates: Vec<Entity>, slot: usize) -> Self {
+        self.home = StackHome::new(mates, slot);
+        self
+    }
 }
 
 /// Where a window goes when it is restored.
@@ -580,6 +603,12 @@ impl StackHome {
 pub struct MaximizedColumn {
     item: StackItem,
     before: Before,
+}
+
+impl MaximizedColumn {
+    pub(crate) fn before(&self) -> &Before {
+        &self.before
+    }
 }
 
 /// The size a restored window takes, as shares of the strip viewport: its

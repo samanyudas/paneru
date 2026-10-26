@@ -202,6 +202,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // Registered with `add_message`, not `init_resource`, so the buffer is
     // double-buffered and dropped after a frame like any other message stream.
     app.add_message::<InputEvent>();
+    app.add_message::<state::SaveSession>();
     app.add_systems(
         PreUpdate,
         (
@@ -270,7 +271,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(resource_exists::<LowPowerMode>)
                 .run_if(on_timer(LOW_POWER_MODE_CHECK)),
             restore::tick_restore_grace,
-            state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
+            state::periodic_state_save.run_if(
+                on_message::<state::SaveSession>.or_eager(on_timer(Duration::from_mins(5))),
+            ),
             state::cleanup_on_exit,
             script_state::periodic_script_state_save.run_if(on_timer(Duration::from_mins(5))),
             script_state::script_state_cleanup_on_exit,

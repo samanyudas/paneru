@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bevy::app::AppExit;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::message::MessageReader;
+use bevy::ecs::message::{Message, MessageReader};
 use bevy::ecs::query::Has;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Query, Res, SystemParam};
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
-use crate::ecs::layout::{Column, LayoutStrip, StackItem, ViewportAnchor, ViewportShare};
+use crate::ecs::layout::{Before, Column, LayoutStrip, StackItem, ViewportAnchor, ViewportShare};
 use crate::ecs::params::Windows;
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker, Unmanaged};
 use crate::manager::{Application, Display, WindowManager};
@@ -128,6 +128,11 @@ pub struct SavedStackHome {
 #[derive(Clone, Debug, Resource)]
 pub struct StateFile(pub PathBuf);
 
+/// Saves the session now rather than at the next periodic save, after a
+/// change a crash should not lose.
+#[derive(Clone, Copy, Debug, Message)]
+pub struct SaveSession;
+
 // These wire-format types live in the shared `paneru_shared_types` crate;
 // aliased here to the names the rest of the daemon already uses.
 pub use crate::types::state::{
@@ -163,6 +168,41 @@ impl From<IRect> for SavedRect {
             min_y: rect.min.y,
             max_x: rect.max.x,
             max_y: rect.max.y,
+        }
+    }
+}
+
+impl SavedMaximize {
+    /// `before` as saved, with each stack mate known by its window id.
+    fn of(before: &Before, windows: &Windows) -> Self {
+        Self {
+            width: before.width(),
+            height: before.height(),
+            anchor: before.anchor(),
+            stack: before
+                .stack_home()
+                .map(|(mates, slot)| SavedStackHome {
+                    mates: mates
+                        .iter()
+                        .filter_map(|&mate| windows.get(mate).map(|window| window.id()))
+                        .collect(),
+                    slot,
+                })
+                .filter(|home| !home.mates.is_empty()),
+        }
+    }
+
+    /// What the window returns to, with each stack mate that `entity` finds
+    /// by its saved window id. Without a mate it returns to a column of its
+    /// own.
+    pub(crate) fn before(&self, entity: impl Fn(WinID) -> Option<Entity>) -> Before {
+        let before = Before::new(self.width, self.height, self.anchor);
+        match &self.stack {
+            Some(home) => before.with_stack_home(
+                home.mates.iter().filter_map(|&mate| entity(mate)).collect(),
+                home.slot,
+            ),
+            None => before,
         }
     }
 }
@@ -274,13 +314,14 @@ impl PaneruState {
                     }
                     Column::Fullscren(entity) => SavedWindow::from_entity(*entity, windows, apps)
                         .map(SavedColumn::Fullscreen),
-                    // The session does not keep maximize yet: the window
-                    // comes back as a column of its own.
-                    Column::Maximized(_) => {
-                        let saved: Vec<_> = col
+                    Column::Maximized(maximized) => {
+                        let mut saved: Vec<_> = col
                             .window_iter()
                             .filter_map(|e| SavedWindow::from_entity(e, windows, apps))
                             .collect();
+                        if let Some(top) = saved.first_mut() {
+                            top.maximized = Some(SavedMaximize::of(maximized.before(), windows));
+                        }
                         match <[SavedWindow; 1]>::try_from(saved) {
                             Ok([window]) => Some(SavedColumn::Single(window)),
                             Err(tabs) if tabs.is_empty() => None,

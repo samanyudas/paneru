@@ -15,7 +15,8 @@ use crate::config::{Config, MissingWindowBehavior};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{
-    PaneruState, SavedColumn, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
+    PaneruState, SavedColumn, SavedMaximize, SavedStackItem, SavedStrip, SavedWindow,
+    SavedWorkspace,
 };
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::{PreviousStripPosition, RestoredActivation};
@@ -111,12 +112,14 @@ impl WindowHardMatchKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PlannedColumn {
     Single(Entity),
     Stack(Vec<PlannedStackItem>),
     Tabs(Vec<Entity>),
     Fullscreen(Entity),
+    /// A maximized window or native tab group, with what it returns to.
+    Maximized(PlannedStackItem, SavedMaximize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,7 +128,7 @@ pub(crate) enum PlannedStackItem {
     Tabs(Vec<Entity>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PlannedStrip {
     pub workspace_id: WorkspaceId,
     pub display_id: Option<CGDirectDisplayID>,
@@ -133,11 +136,13 @@ pub(crate) struct PlannedStrip {
     pub columns: Vec<PlannedColumn>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct RestorePlan {
     pub strips: Vec<PlannedStrip>,
     pub active_virtual_by_workspace: HashMap<WorkspaceId, u32>,
     pub consumed_entities: HashSet<Entity>,
+    /// The window each saved window id matched.
+    pub matched: HashMap<WinID, Entity>,
     pub ignored_missing_windows: usize,
     pub skipped_ambiguous_matches: usize,
 }
@@ -208,17 +213,18 @@ impl<'a> RestorePlanner<'a> {
         plan: &mut RestorePlan,
     ) -> Option<PlannedColumn> {
         match column {
-            SavedColumn::Single(saved) => self
-                .match_window(saved, current, plan)
-                .map(PlannedColumn::Single),
+            SavedColumn::Single(saved) => self.match_window(saved, current, plan).map(|entity| {
+                planned_column(PlannedStackItem::Single(entity), saved.maximized.as_ref())
+            }),
             SavedColumn::Fullscreen(saved) => self
                 .match_window(saved, current, plan)
                 .map(PlannedColumn::Fullscreen),
-            SavedColumn::Tabs(tabs) => compact_entities(
+            SavedColumn::Tabs(tabs) => compact_stack_tabs(
                 tabs.iter()
                     .filter_map(|saved| self.match_window(saved, current, plan))
                     .collect(),
-            ),
+            )
+            .map(|item| planned_column(item, tabs.iter().find_map(|tab| tab.maximized.as_ref()))),
             SavedColumn::Stack(items) => compact_stack_items(
                 items
                     .iter()
@@ -257,6 +263,7 @@ impl<'a> RestorePlanner<'a> {
                 && saved.hard_match(window.window_id, window.pid, &window.bundle_id)
         }) {
             plan.consumed_entities.insert(window.entity);
+            plan.matched.insert(saved.window_id, window.entity);
             return Some(window.entity);
         }
 
@@ -272,6 +279,7 @@ impl<'a> RestorePlanner<'a> {
         match fallback_matches.as_slice() {
             [window] => {
                 plan.consumed_entities.insert(window.entity);
+                plan.matched.insert(saved.window_id, window.entity);
                 Some(window.entity)
             }
             [] => {
@@ -507,7 +515,7 @@ pub(super) fn restore_window_state(
             continue;
         };
 
-        let mut strip = layout_strip_from_plan(planned);
+        let mut strip = layout_strip_from_plan(planned, &plan.matched);
         if strip.all_windows().is_empty() {
             continue;
         }
@@ -604,7 +612,7 @@ pub(super) fn restore_window_state(
     );
 }
 
-fn layout_strip_from_plan(planned: &PlannedStrip) -> LayoutStrip {
+fn layout_strip_from_plan(planned: &PlannedStrip, matched: &HashMap<WinID, Entity>) -> LayoutStrip {
     if let [PlannedColumn::Fullscreen(entity)] = planned.columns.as_slice() {
         let mut strip = LayoutStrip::fullscreen(planned.workspace_id, *entity);
         strip.virtual_index = planned.virtual_index;
@@ -612,7 +620,7 @@ fn layout_strip_from_plan(planned: &PlannedStrip) -> LayoutStrip {
     }
 
     let mut strip = LayoutStrip::new(planned.workspace_id, planned.virtual_index);
-    apply_planned_columns(&mut strip, &planned.columns);
+    apply_planned_columns(&mut strip, &planned.columns, matched);
     // Rebuilding saved columns is not a stack membership change, so the
     // windows keep the heights they have.
     strip.take_even_splits();
@@ -725,7 +733,13 @@ fn select_display<'a>(
         .map(|(entity, display, _)| (entity, display))
 }
 
-fn apply_planned_columns(strip: &mut LayoutStrip, columns: &[PlannedColumn]) {
+/// Appends `columns` to `strip`. A maximized column's stack mates are the
+/// windows their saved ids `matched`, and one that matched none is dropped.
+fn apply_planned_columns(
+    strip: &mut LayoutStrip,
+    columns: &[PlannedColumn],
+    matched: &HashMap<WinID, Entity>,
+) {
     for column in columns {
         match column {
             PlannedColumn::Single(entity) | PlannedColumn::Fullscreen(entity) => {
@@ -736,6 +750,11 @@ fn apply_planned_columns(strip: &mut LayoutStrip, columns: &[PlannedColumn]) {
             }
             PlannedColumn::Stack(items) => {
                 append_stack(strip, items);
+            }
+            PlannedColumn::Maximized(item, maximize) => {
+                if let Some(top) = append_stack_item(strip, item) {
+                    strip.adopt_maximized(top, maximize.before(|id| matched.get(&id).copied()));
+                }
             }
         }
     }
@@ -774,11 +793,11 @@ fn append_stack_item(strip: &mut LayoutStrip, item: &PlannedStackItem) -> Option
     }
 }
 
-fn compact_entities(entities: Vec<Entity>) -> Option<PlannedColumn> {
-    match entities.as_slice() {
-        [] => None,
-        [entity] => Some(PlannedColumn::Single(*entity)),
-        _ => Some(PlannedColumn::Tabs(entities)),
+fn planned_column(item: PlannedStackItem, maximized: Option<&SavedMaximize>) -> PlannedColumn {
+    match (item, maximized) {
+        (item, Some(maximized)) => PlannedColumn::Maximized(item, maximized.clone()),
+        (PlannedStackItem::Single(entity), None) => PlannedColumn::Single(entity),
+        (PlannedStackItem::Tabs(entities), None) => PlannedColumn::Tabs(entities),
     }
 }
 
