@@ -93,6 +93,70 @@ fn a_title_bar_double_click_maximizes_and_the_next_restores() {
     assert_eq!(frames(&harness, &[0, 1, 2]), before);
 }
 
+/// Sends `window <verb>` as a key binding or the command line does, and
+/// lets it settle.
+fn run_window_verb(harness: &mut TestHarness, verb: &str) {
+    let command = crate::config::parse_command(&["window", verb]).expect("a window command");
+    harness.run(vec![Event::Command { command }]);
+    harness.advance(SETTLE);
+}
+
+/// The command toggles the focused window, and a double-click on its title
+/// bar toggles the same state. `fullwidth` is the command's older name, which
+/// existing bindings still use.
+#[test]
+fn the_command_and_a_double_click_toggle_one_state() {
+    for verb in ["fullwidth", "maximize"] {
+        let mut harness = three_windows();
+        harness.mock_state.focus_window(1);
+        harness.advance(SETTLE);
+        let before = frames(&harness, &[0, 1, 2]);
+
+        run_window_verb(&mut harness, verb);
+        assert_eq!(os_frame(&harness, 1), usable_area(&mut harness), "{verb}");
+        assert_nothing_covers(&mut harness, 1, &[0, 2]);
+        double_click_title_bar(&mut harness, 1);
+        assert_eq!(
+            frames(&harness, &[0, 1, 2]),
+            before,
+            "{verb}: the double-click restores"
+        );
+
+        double_click_title_bar(&mut harness, 1);
+        assert_eq!(os_frame(&harness, 1), usable_area(&mut harness), "{verb}");
+        run_window_verb(&mut harness, verb);
+        assert_eq!(
+            frames(&harness, &[0, 1, 2]),
+            before,
+            "{verb}: the command restores"
+        );
+    }
+}
+
+/// On a floating window the command fills the usable area over the layout,
+/// as a double-click does, and the next toggle of either kind restores it.
+#[test]
+fn the_command_fills_a_floating_window_and_restores_it() {
+    let mut harness = three_windows();
+    harness.mock_state.focus_window(1);
+    harness.advance(SETTLE);
+    harness.run(vec![command(Operation::Manage)]);
+    harness.advance(SETTLE);
+    let before = os_frame(&harness, 1);
+    let tiled = frames(&harness, &[0, 2]);
+
+    run_window_verb(&mut harness, "maximize");
+    assert_eq!(os_frame(&harness, 1), usable_area(&mut harness));
+    assert_eq!(frames(&harness, &[0, 2]), tiled, "the layout stays");
+    run_window_verb(&mut harness, "maximize");
+    assert_eq!(os_frame(&harness, 1), before);
+
+    run_window_verb(&mut harness, "maximize");
+    assert_eq!(os_frame(&harness, 1), usable_area(&mut harness));
+    double_click_title_bar(&mut harness, 1);
+    assert_eq!(os_frame(&harness, 1), before);
+}
+
 /// Repeated toggles return the window to the same frame every time.
 #[test]
 fn repeated_toggles_do_not_drift() {

@@ -571,6 +571,22 @@ mod tests {
         );
     }
 
+    /// `full_width`, the name older scripts use, and `maximize` both send
+    /// the maximize toggle, in each shape the API takes.
+    #[test]
+    fn full_width_and_maximize_send_the_maximize_toggle() {
+        let commands = run(r#"
+            paneru.window.full_width()
+            paneru.window.maximize()
+            paneru.command({ window = "full_width" })
+            paneru.command({ window = "maximize" })
+        "#)
+        .unwrap();
+
+        let maximize = parse_command(&["window", "maximize"]).unwrap();
+        assert_eq!(commands, vec![maximize; 4]);
+    }
+
     #[test]
     fn display_and_step_verbs_build_their_commands() {
         let commands = run(r#"
