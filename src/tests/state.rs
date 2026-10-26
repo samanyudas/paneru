@@ -1,13 +1,13 @@
 use bevy::prelude::*;
 
 use crate::config::Config;
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{LayoutStrip, ViewportAnchor, ViewportShare};
 use crate::ecs::params::Windows;
 use crate::ecs::restore::CurrentWindowIdentity;
 use crate::ecs::state::QueryState;
 use crate::ecs::state::{
-    PaneruQueryState, PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStackItem,
-    SavedStrip, SavedWindow, SavedWorkspace,
+    PaneruQueryState, PaneruState, SavedColumn, SavedDisplay, SavedMaximize, SavedRect,
+    SavedStackHome, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
 };
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker};
 use crate::events::Event;
@@ -78,6 +78,7 @@ fn test_state_serialization() {
         identifier: "finder-main".to_string(),
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
+        maximized: None,
     };
 
     let state = PaneruState {
@@ -123,6 +124,7 @@ fn test_state_restoration() {
         identifier: "finder-main".to_string(),
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
+        maximized: None,
     };
 
     let state = PaneruState {
@@ -330,6 +332,69 @@ fn test_state_save_is_loadable_from_path() {
     let _ = std::fs::remove_file(path);
 }
 
+/// A file an engine without maximize in its session wrote still loads, and
+/// a window that is not maximized is saved as before, so such an engine
+/// loads the files this one writes too.
+#[test]
+fn a_v2_file_without_maximized_loads() {
+    let path = unique_state_path("v2-without-maximized");
+    std::fs::write(
+        &path,
+        r#"{"version":2,"timestamp":123456789,"active_display_id":1,"workspaces":[
+            {"workspace_id":2,"display_id":1,"active_virtual_index":0,"strips":[
+                {"virtual_index":0,"columns":[{"Single":{"window_id":1,"pid":123,
+                "psn":{"high":0,"low":1},"bundle_id":"com.apple.Finder","title":"Finder",
+                "identifier":"main","role":"AXWindow","subrole":"AXStandardWindow"}}]}]}]}"#,
+    )
+    .expect("state fixture should write");
+
+    let state = PaneruState::load_from_file(&path);
+    let _ = std::fs::remove_file(path);
+
+    let state = state.expect("a version 2 file without maximize loads");
+    let SavedColumn::Single(window) = &state.workspaces[0].strips[0].columns[0] else {
+        panic!("expected a single window");
+    };
+    assert_eq!(window.maximized, None);
+    let json = serde_json::to_string(&state).expect("state serializes");
+    assert!(
+        !json.contains("maximized"),
+        "a window that is not maximized writes no maximize field: {json}"
+    );
+}
+
+/// A maximized window's earlier size, place, and stack survive a save and a
+/// load.
+#[test]
+fn saved_maximize_round_trips() {
+    let mut window = saved_window(1, 123, "com.apple.Finder", "Finder");
+    window.maximized = Some(SavedMaximize {
+        width: ViewportShare::of(3, 5),
+        height: ViewportShare::of(1, 2),
+        anchor: ViewportAnchor::Center(ViewportShare::of(1, 4)),
+        stack: Some(SavedStackHome {
+            mates: vec![2, 3],
+            slot: 1,
+        }),
+    });
+    let state = restore_state(vec![SavedWorkspace {
+        workspace_id: TEST_WORKSPACE_ID,
+        display_id: Some(TEST_DISPLAY_ID),
+        active_virtual_index: Some(0),
+        strips: vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(window)],
+        }],
+    }]);
+    let path = unique_state_path("saved-maximize");
+
+    state.save_to_file(&path).expect("state saves");
+    let loaded = PaneruState::load_from_file(&path);
+    let _ = std::fs::remove_file(path);
+
+    assert_eq!(loaded, Some(state));
+}
+
 fn unique_state_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "paneru-{name}-{}-{}.json",
@@ -517,6 +582,7 @@ fn saved_window(window_id: WinID, pid: Pid, bundle_id: &str, title: &str) -> Sav
         identifier: "main".to_string(),
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
+        maximized: None,
     }
 }
 

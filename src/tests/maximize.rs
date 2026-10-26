@@ -18,6 +18,7 @@ use crate::platform::{Modifiers, WinID, WorkspaceId};
 use super::*;
 
 mod restore_first;
+mod session;
 
 const SETTLE: Duration = Duration::from_secs(2);
 
