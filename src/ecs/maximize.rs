@@ -243,6 +243,11 @@ fn toggle_maximize(
         return;
     }
 
+    // The engine stops reading a maximized window's moves, so an app may
+    // have moved it to another display since.
+    if maximized.is_some() && !window.write_pending() {
+        _ = window.update_frame();
+    }
     let point = at.unwrap_or_else(|| window.frame().center());
     let Some(visible) = displays
         .iter()

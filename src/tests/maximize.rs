@@ -157,6 +157,41 @@ fn the_command_fills_a_floating_window_and_restores_it() {
     assert_eq!(os_frame(&harness, 1), before);
 }
 
+/// An app can move a maximized floating window to another display, and the
+/// engine stops reading its frame while it is maximized. The command still
+/// restores it on the display it is on now, as a double-click does.
+#[test]
+fn the_command_restores_a_floating_window_on_the_display_it_was_moved_to() {
+    let mut harness = TestHarness::new().with_windows(3).with_display(
+        EXT_DISPLAY_ID,
+        EXT_BOUNDS,
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.mock_state.focus_window(1);
+    harness.advance(SETTLE);
+    harness.run(vec![command(Operation::Manage)]);
+    harness.advance(SETTLE);
+
+    run_window_verb(&mut harness, "maximize");
+    assert_eq!(
+        os_frame(&harness, 1),
+        usable_area_of(&mut harness, TEST_DISPLAY_ID)
+    );
+    harness.mock_state.update_window(1, |window| {
+        let size = window.frame.size();
+        window.frame = IRect::from_corners(Origin::new(100, -1000), Origin::new(100, -1000) + size);
+    });
+    harness.advance(SETTLE);
+
+    run_window_verb(&mut harness, "maximize");
+    let restored = os_frame(&harness, 1);
+    assert!(
+        EXT_BOUNDS.contains(restored.center()),
+        "restored on the display it was moved to: {restored:?}"
+    );
+}
+
 /// Repeated toggles return the window to the same frame every time.
 #[test]
 fn repeated_toggles_do_not_drift() {
