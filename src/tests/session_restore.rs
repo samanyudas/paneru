@@ -1387,3 +1387,26 @@ fn a_fixed_size_window_tiled_by_the_user_stays_tiled_after_a_restart() {
     let mut restarted = restarted_with_fixed_size_window(None, overrides);
     assert!(!floats(&mut restarted, 1));
 }
+
+/// Minimizing and restoring a floating window keeps it floating.
+#[test]
+fn a_fixed_size_window_floats_after_it_is_minimized_and_restored() {
+    let mut harness = restarted_with_fixed_size_window(None, TileOverrides::default());
+    assert!(floats(&mut harness, 1));
+    harness.mock_state.os_minimize_window(1, true);
+    harness.advance(Duration::from_millis(500));
+    let world = harness.world();
+    let entity = find_window_entity(1, world);
+    assert!(matches!(
+        world.entity(entity).get::<Unmanaged>(),
+        Some(Unmanaged::Minimized)
+    ));
+    harness.mock_state.os_minimize_window(1, false);
+    harness.advance(Duration::from_millis(500));
+
+    assert!(floats(&mut harness, 1));
+    let world = harness.world();
+    let entity = find_window_entity(1, world);
+    let mut strips = world.query::<&LayoutStrip>();
+    assert!(!strips.iter(world).any(|strip| strip.contains(entity)));
+}

@@ -18,7 +18,7 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, AwaitingHandle, BProcess, FocusedMarker, FreshMarker,
+    ActiveDisplayMarker, AwaitingHandle, BProcess, FloatsWhenRestored, FocusedMarker, FreshMarker,
     MissionControlActive, PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger,
     StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
@@ -565,6 +565,7 @@ pub(super) fn dispatch_application_messages(
     windows: Windows,
     applications: Query<(&Application, &Children)>,
     unmanaged_query: Query<&Unmanaged>,
+    floats_when_restored: Query<(), With<FloatsWhenRestored>>,
     mut commands: Commands,
 ) {
     let find_window = |window_id| windows.find(window_id);
@@ -575,6 +576,9 @@ pub(super) fn dispatch_application_messages(
                 if let Some((_, entity)) = find_window(*window_id)
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
+                    if matches!(unmanaged_query.get(entity), Ok(Unmanaged::Floating)) {
+                        entity_commands.try_insert(FloatsWhenRestored);
+                    }
                     entity_commands.try_insert(Unmanaged::Minimized);
                 }
             }
@@ -584,7 +588,13 @@ pub(super) fn dispatch_application_messages(
                     && matches!(unmanaged_query.get(entity), Ok(Unmanaged::Minimized))
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
-                    entity_commands.try_remove::<Unmanaged>();
+                    if floats_when_restored.contains(entity) {
+                        entity_commands
+                            .try_remove::<FloatsWhenRestored>()
+                            .try_insert(Unmanaged::Floating);
+                    } else {
+                        entity_commands.try_remove::<Unmanaged>();
+                    }
                 }
             }
 
