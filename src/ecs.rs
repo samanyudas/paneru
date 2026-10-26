@@ -735,6 +735,27 @@ pub struct VerifyWindowSize {
     /// When a readback first showed the window taller than asked for, or of
     /// another width.
     mismatched_since: Option<Duration>,
+    /// How far the check has got in releasing a window that kept a taller
+    /// height, before that height counts as its minimum.
+    release: Release,
+}
+
+/// macOS ignores a small shrink that leaves a window's bottom edge near the
+/// bottom of the screen, but takes a larger one and then lets the window grow
+/// into that zone. A window that kept a taller height is first lowered, then
+/// grown back to the asked height, and only a height it keeps after that is
+/// its minimum. Each step waits until its write has landed, then until the
+/// window shows it, for at most `LATE_RESIZE_GRACE`, since an app can apply
+/// a size late.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Release {
+    #[default]
+    Untried,
+    /// Asked for a lower height, landed since the time given, if it has.
+    Lowering(Option<Duration>),
+    /// Asked for the height back, landed since the time given, if it has.
+    Regrowing(Option<Duration>),
+    Done,
 }
 
 impl Default for VerifyWindowSize {
@@ -742,6 +763,7 @@ impl Default for VerifyWindowSize {
         Self {
             remaining: 3,
             mismatched_since: None,
+            release: Release::Untried,
         }
     }
 }

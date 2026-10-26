@@ -26,6 +26,7 @@ use super::{
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, ExposeFocusedSurvivorAfterRemoval, LayoutStrip, anchored_origin};
+use crate::ecs::maximize::EDGE_RELEASE;
 use crate::ecs::maximize::Maximized;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
@@ -33,7 +34,7 @@ use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LaunchWindows, LayoutPosition,
-    MaximumHeight, MinimumHeight, PendingWidthSettlement, Position, PreLaunchFrame,
+    MaximumHeight, MinimumHeight, PendingWidthSettlement, Position, PreLaunchFrame, Release,
     RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
     SpawnCommandsExt, StepPartners, VerifyWindowPosition, VerifyWindowSize, WidthLimits,
     WidthRatio, WidthRun, WidthSettlementPhase, WindowProperties,
@@ -1723,6 +1724,11 @@ pub(super) fn window_resize_verifier(
         if position.is_changed() || bounds.is_changed() || window.write_pending() {
             continue;
         }
+        // A window being released moves on once it shows each step.
+        let now = verification.time.elapsed();
+        if step_release(&mut request, &mut window, bounds.0, now) {
+            continue;
+        }
         // macOS puts a tile frame back while a restored slot holds, so a
         // readback then is not the app refusing the size.
         if let Ok(start) = verification.native_resizes.get(entity)
@@ -1754,7 +1760,6 @@ pub(super) fn window_resize_verifier(
             }
             continue;
         }
-        let now = verification.time.elapsed();
         if request
             .mismatched_since
             .is_some_and(|since| now < since + LATE_RESIZE_GRACE)
@@ -1780,6 +1785,19 @@ pub(super) fn window_resize_verifier(
             request.mismatched_since = Some(now);
             continue;
         }
+        // A resizable window that kept a taller height is released once
+        // before that height counts as its minimum. See [`Release`].
+        if request.release == Release::Untried
+            && window.is_resizable()
+            && frame
+                .as_ref()
+                .is_ok_and(|frame| fuzzy_equal(frame.height(), bounds.0.y) == Ordering::Less)
+        {
+            let lift = EDGE_RELEASE.min(bounds.0.y / 2);
+            window.resize(Size::new(bounds.0.x, bounds.0.y - lift));
+            request.release = Release::Lowering(None);
+            continue;
+        }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<VerifyWindowSize>();
         }
@@ -1787,6 +1805,45 @@ pub(super) fn window_resize_verifier(
             verification.reconcile(entity, frame.size(), &mut commands);
         }
     }
+}
+
+/// Takes the next step of a release once the window shows the last one, and
+/// tells whether the check waits. See [`Release`].
+fn step_release(
+    request: &mut VerifyWindowSize,
+    window: &mut Window,
+    asked: Size,
+    now: Duration,
+) -> bool {
+    let shorter = |window: &mut Window| {
+        window
+            .update_frame()
+            .is_ok_and(|frame| fuzzy_equal(frame.height(), asked.y) == Ordering::Greater)
+    };
+    match request.release {
+        Release::Lowering(None) => request.release = Release::Lowering(Some(now)),
+        Release::Lowering(Some(since)) => {
+            if shorter(window) {
+                window.resize(asked);
+                request.release = Release::Regrowing(None);
+            } else if now >= since + LATE_RESIZE_GRACE {
+                // It refused even a large shrink, so its height is a minimum.
+                request.release = Release::Done;
+                request.mismatched_since = Some(since);
+                return false;
+            }
+        }
+        Release::Regrowing(None) => request.release = Release::Regrowing(Some(now)),
+        Release::Regrowing(Some(since)) => {
+            if !shorter(window) || now >= since + LATE_RESIZE_GRACE {
+                request.release = Release::Done;
+                request.mismatched_since = Some(since);
+                return false;
+            }
+        }
+        Release::Untried | Release::Done => return false,
+    }
+    true
 }
 
 impl SizeVerification<'_, '_> {

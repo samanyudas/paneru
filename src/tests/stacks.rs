@@ -1431,3 +1431,200 @@ fn a_fixed_size_window_refusing_less_height_records_its_maximum() {
     let entity = find_window_entity(0, world);
     assert!(world.entity(entity).contains::<crate::ecs::MaximumHeight>());
 }
+
+/// A window whose bottom edge sits at the screen's bottom refuses a small
+/// shrink, as macOS keeps the edge there. When the display gets a little
+/// shorter, the engine still reaches the new height instead of taking the
+/// old one as the window's minimum, so a window stacked under it fits (#101).
+#[test]
+fn a_small_shrink_at_the_screen_bottom_is_not_a_minimum() {
+    const SHORTER: i32 = TALL - 16;
+    let mut harness = tall_harness();
+    harness.advance(SETTLE);
+    harness.mock_state.update_window(0, |window| {
+        window.sticky_bottom = Some(TALL);
+    });
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, SHORTER),
+    );
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayConfigured {
+            display_id: TEST_DISPLAY_ID,
+        });
+    harness.advance(SETTLE);
+    let shrunk = harness.mock_state.create_window(0).frame();
+    assert_eq!(shrunk.height(), SHORTER - TEST_MENUBAR_HEIGHT, "{shrunk:?}");
+
+    stack_two(&mut harness);
+    let frames = column(harness.world(), &[0, 1]);
+    assert_eq!(
+        heights(&frames).iter().sum::<i32>(),
+        SHORTER - TEST_MENUBAR_HEIGHT,
+        "{frames:?}"
+    );
+}
+
+/// The same when the app applies the growth back to the asked height late,
+/// as Chromium-based apps do. The check waits for it instead of taking the
+/// lowered height as the window's size.
+#[test]
+fn a_late_regrowth_after_a_release_keeps_the_asked_height() {
+    const SHORTER: i32 = TALL - 16;
+    const ASKED: i32 = SHORTER - TEST_MENUBAR_HEIGHT;
+    let mut harness = tall_harness();
+    harness.advance(SETTLE);
+    harness.mock_state.update_window(0, |window| {
+        window.sticky_bottom = Some(TALL);
+    });
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, SHORTER),
+    );
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayConfigured {
+            display_id: TEST_DISPLAY_ID,
+        });
+    // Drops the growth back once the lowered height has landed.
+    let mut lowered = false;
+    for _ in 0..200 {
+        harness.advance(Duration::from_millis(16));
+        if harness.mock_state.create_window(0).frame().height() < ASKED {
+            harness.mock_state.update_window(0, |window| {
+                window.dropped_resizes = 1;
+            });
+            lowered = true;
+            break;
+        }
+    }
+    assert!(lowered, "the window is lowered first");
+    for _ in 0..25 {
+        harness.advance(Duration::from_millis(16));
+        let world = harness.world();
+        let entity = find_window_entity(0, world);
+        let bounds = world.entity(entity).get::<crate::ecs::Bounds>().unwrap().0;
+        assert_eq!(bounds.y, ASKED, "kept while the growth is late");
+    }
+    harness.mock_state.os_apply_late_resizes(0);
+    harness.advance(SETTLE);
+
+    let native = harness.mock_state.create_window(0).frame();
+    assert_eq!(native.height(), ASKED, "{native:?}");
+    let engine = frame(harness.world(), 0);
+    assert_eq!(engine.height(), ASKED, "{engine:?}");
+}
+
+/// The same when the growth back also reaches a busy app late, so the grace
+/// starts once the write has landed rather than when it was queued.
+#[test]
+fn a_slow_late_regrowth_after_a_release_keeps_the_asked_height() {
+    const SHORTER: i32 = TALL - 16;
+    const ASKED: i32 = SHORTER - TEST_MENUBAR_HEIGHT;
+    fn assert_kept(harness: &mut TestHarness, steps: usize) {
+        for _ in 0..steps {
+            harness.advance(Duration::from_millis(16));
+            let world = harness.world();
+            let entity = find_window_entity(0, world);
+            let bounds = world.entity(entity).get::<crate::ecs::Bounds>().unwrap().0;
+            assert_eq!(bounds.y, ASKED, "kept while the growth is late");
+        }
+    }
+    let harness = TestHarness::new();
+    harness
+        .mock_state
+        .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, TALL));
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    let mut harness = harness.with_windows(3);
+    harness.advance(SETTLE);
+    harness.mock_state.flush_writes(Duration::from_secs(1));
+    harness.mock_state.update_window(0, |window| {
+        window.sticky_bottom = Some(TALL);
+    });
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, SHORTER),
+    );
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayConfigured {
+            display_id: TEST_DISPLAY_ID,
+        });
+    let mut lowered = false;
+    for _ in 0..200 {
+        harness.advance(Duration::from_millis(16));
+        harness.mock_state.flush_writes(Duration::from_millis(100));
+        if harness.mock_state.create_window(0).frame().height() < ASKED {
+            harness.mock_state.update_window(0, |window| {
+                window.dropped_resizes = 1;
+            });
+            harness.mock_state.hold_writes(TEST_PROCESS_ID);
+            lowered = true;
+            break;
+        }
+    }
+    assert!(lowered, "the window is lowered first");
+    assert_kept(&mut harness, 40);
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    harness.mock_state.flush_writes(Duration::from_secs(1));
+    assert_kept(&mut harness, 6);
+    harness.mock_state.os_apply_late_resizes(0);
+    harness.advance(SETTLE);
+
+    let native = harness.mock_state.create_window(0).frame();
+    assert_eq!(native.height(), ASKED, "{native:?}");
+}
+
+/// The same when the app applies the lowering late: the window grows back
+/// only once it shows the lower height.
+#[test]
+fn a_late_lowering_in_a_release_keeps_the_asked_height() {
+    const SHORTER: i32 = TALL - 16;
+    const ASKED: i32 = SHORTER - TEST_MENUBAR_HEIGHT;
+    const LOWERED: i32 = ASKED - crate::ecs::maximize::EDGE_RELEASE;
+    let mut harness = tall_harness();
+    harness.advance(SETTLE);
+    harness.mock_state.update_window(0, |window| {
+        window.sticky_bottom = Some(TALL);
+        window.late_height = Some(LOWERED);
+    });
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, SHORTER),
+    );
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayConfigured {
+            display_id: TEST_DISPLAY_ID,
+        });
+    let mut delayed = false;
+    for _ in 0..200 {
+        harness.advance(Duration::from_millis(16));
+        harness
+            .mock_state
+            .update_window(0, |window| delayed = !window.late_resizes.is_empty());
+        if delayed {
+            break;
+        }
+    }
+    assert!(delayed, "the lowering is delayed");
+    let assert_kept = |harness: &mut TestHarness, steps: usize| {
+        for _ in 0..steps {
+            harness.advance(Duration::from_millis(16));
+            let world = harness.world();
+            let entity = find_window_entity(0, world);
+            let bounds = world.entity(entity).get::<crate::ecs::Bounds>().unwrap().0;
+            assert_eq!(bounds.y, ASKED, "kept while the lowering is late");
+        }
+    };
+    assert_kept(&mut harness, 12);
+    harness.mock_state.os_apply_late_resizes(0);
+    assert_kept(&mut harness, 60);
+
+    let native = harness.mock_state.create_window(0).frame();
+    assert_eq!(native.height(), ASKED, "{native:?}");
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    assert!(!world.entity(entity).contains::<crate::ecs::MinimumHeight>());
+}
