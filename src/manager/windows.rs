@@ -1,10 +1,10 @@
 use accessibility_sys::{
-    AXUIElementCopyElementAtPosition, AXUIElementCreateApplication, AXUIElementRef, AXValueCreate,
-    AXValueGetValue, kAXChildrenAttribute, kAXCloseButtonAttribute, kAXErrorAttributeUnsupported,
-    kAXErrorNoValue, kAXErrorNotImplemented, kAXErrorSuccess, kAXFloatingWindowSubrole,
-    kAXParentAttribute, kAXPositionAttribute, kAXRaiseAction, kAXRoleAttribute, kAXSizeAttribute,
-    kAXStandardWindowSubrole, kAXToolbarRole, kAXUnknownRole, kAXUnknownSubrole,
-    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
+    AXUIElementCopyElementAtPosition, AXUIElementCreateApplication, AXUIElementIsAttributeSettable,
+    AXUIElementRef, AXValueCreate, AXValueGetValue, kAXChildrenAttribute, kAXCloseButtonAttribute,
+    kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXErrorNotImplemented, kAXErrorSuccess,
+    kAXFloatingWindowSubrole, kAXParentAttribute, kAXPositionAttribute, kAXRaiseAction,
+    kAXRoleAttribute, kAXSizeAttribute, kAXStandardWindowSubrole, kAXToolbarRole, kAXUnknownRole,
+    kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
 };
 use bevy::ecs::component::Component;
 use bevy::math::{IRect, IVec2};
@@ -422,6 +422,10 @@ pub trait WindowApi: Send + Sync {
     fn is_alive(&self) -> bool;
     fn is_minimized(&self) -> bool;
     fn is_full_screen(&self) -> bool;
+    /// Whether the app lets the window's size change at all. A window that
+    /// does not, such as a fixed-size panel, floats unless a rule says
+    /// otherwise. A failed read counts as resizable.
+    fn is_resizable(&self) -> bool;
     fn reposition(&mut self, origin: Origin);
     fn resize(&mut self, size: Size);
     /// Moves and resizes the window in one write: the size at the old
@@ -879,6 +883,9 @@ pub struct WindowOS {
     /// Never caches `AXUnknown`: some apps report it briefly while a window
     /// is still being created.
     subrole: OnceLock<String>,
+    /// Whether the size can be set, cached after the first successful read:
+    /// a window keeps its style for its whole life.
+    resizable: OnceLock<bool>,
 }
 
 impl WindowOS {
@@ -926,6 +933,7 @@ impl WindowOS {
             title: RwLock::new(None),
             role: OnceLock::new(),
             subrole: OnceLock::new(),
+            resizable: OnceLock::new(),
         };
 
         let forced = window.is_forced_manage(config, bundle_id);
@@ -1119,6 +1127,27 @@ impl WindowApi for WindowOS {
 
     fn is_full_screen(&self) -> bool {
         self.ax_element.full_screen().unwrap_or(false)
+    }
+
+    fn is_resizable(&self) -> bool {
+        if let Some(resizable) = self.resizable.get() {
+            return *resizable;
+        }
+        let attribute = CFString::from_static_str(kAXSizeAttribute);
+        let mut settable = 0;
+        let code = unsafe {
+            AXUIElementIsAttributeSettable(
+                self.ax_element.as_ptr(),
+                (&raw const *attribute).cast(),
+                &raw mut settable,
+            )
+        };
+        if code != kAXErrorSuccess {
+            return true;
+        }
+        let resizable = settable != 0;
+        let _ = self.resizable.set(resizable);
+        resizable
     }
 
     #[instrument(level = Level::TRACE)]
