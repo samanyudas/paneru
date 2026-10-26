@@ -552,6 +552,9 @@ pub(crate) enum RestoreTo {
     /// on, such as a stack command or a drop, decides where it goes from
     /// the layout the user sees.
     Here,
+    /// Where it stands, as `Here`, but at its earlier height too: the window
+    /// leaves the layout to float, so no column sets its height.
+    Float,
 }
 
 /// The stack a maximized window left: the windows that stayed in it, top to
@@ -579,8 +582,8 @@ pub struct MaximizedColumn {
 }
 
 /// The size a restored window takes, as shares of the strip viewport: its
-/// earlier width, and its earlier height when it went back into its stack.
-/// `anchor` is where its column stood before it was maximized.
+/// earlier width, and its earlier height when it went back into its stack
+/// or is to float. `anchor` is where its column stood before it was maximized.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Restored {
     pub width: ViewportShare,
@@ -1860,7 +1863,7 @@ impl LayoutStrip {
         } else {
             self.columns
                 .insert(index.min(self.len()), item.into_column());
-            None
+            (to == RestoreTo::Float).then_some(before.height)
         };
         Some(Restored {
             width: before.width,

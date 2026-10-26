@@ -210,6 +210,28 @@ fn floating_a_maximized_window_floats_it_at_its_earlier_size() {
     );
 }
 
+/// A maximized window from a stack floats at the size it had in the stack,
+/// not the height of a column of its own, and the stack does not take it
+/// back.
+#[test]
+fn floating_a_maximized_stacked_window_floats_it_at_its_stacked_size() {
+    let mut reference = stacked();
+    reference.mock_state.focus_window(1);
+    reference.advance(SETTLE);
+    run(&mut reference, Operation::Manage);
+    let floated = os_frame(&reference, 1);
+    let area = usable_area(&mut reference);
+    assert!(floated.height() < area.height() / 2 + 50, "{floated:?}");
+
+    let mut harness = stacked_one_maximized();
+    run(&mut harness, Operation::Manage);
+    assert_eq!(os_frame(&harness, 1).size(), floated.size());
+    assert_eq!(
+        layout_on(&mut harness, TEST_WORKSPACE_ID),
+        vec![vec![0], vec![2]]
+    );
+}
+
 /// A press on a window's edge, the resize macOS then reports, and the
 /// release, the way a user resizes a window with the pointer.
 fn edge_resize(harness: &mut TestHarness, id: WinID, edge: Origin, size: Size) {

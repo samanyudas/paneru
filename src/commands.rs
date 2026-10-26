@@ -1316,7 +1316,13 @@ fn manage_window(
         && let Ok((display, dock)) = displays.get(child_of.parent())
     {
         let viewport = display.actual_display_bounds(dock, &config);
-        restore_tiled(entity, &mut strip, RestoreTo::Here, viewport, &mut commands);
+        restore_tiled(
+            entity,
+            &mut strip,
+            RestoreTo::Float,
+            viewport,
+            &mut commands,
+        );
     }
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         if was_unmanaged {
