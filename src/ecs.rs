@@ -255,6 +255,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::finish_setup
                 .after(triggers::apply_window_positions)
                 .run_if(resource_exists::<Initializing>),
+            triggers::recheck_window_level
+                .after(triggers::apply_window_positions)
+                .run_if(any_with_component::<AboveOrdinaryCheck>),
         )
             .in_set(UpdateSet::Spawn),
     );
@@ -661,6 +664,16 @@ pub struct VerifyFocus {
 /// Uses its own timer because the window's `Timeout` can verify focus.
 #[derive(Component)]
 pub struct AwaitingHandle(pub Timer);
+
+/// Reads a newly tiled window's level again each frame until the timer ends.
+/// Chrome shows its Picture-in-Picture window at the normal level and raises
+/// it a few tens of milliseconds later, after the engine has tiled it.
+#[derive(Component)]
+pub struct AboveOrdinaryCheck {
+    pub timer: Timer,
+    /// The frame the window opened with, before the engine tiled it.
+    pub opened: bevy::math::IRect,
+}
 
 #[derive(Component)]
 pub struct BruteforceWindows(Task<Vec<Window>>);

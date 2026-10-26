@@ -194,6 +194,7 @@ pub struct FrameActivity<'w, 's> {
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
     awaiting_handles: Query<'w, 's, (), With<AwaitingHandle>>,
     size_checks: Query<'w, 's, (), With<VerifyWindowSize>>,
+    level_checks: Query<'w, 's, (), With<crate::ecs::AboveOrdinaryCheck>>,
     width_settlements: Query<'w, 's, (), With<PendingWidthSettlement>>,
     native: Option<Res<'w, crate::ecs::native_membership::NativeMembership>>,
     time: Option<Res<'w, bevy::time::Time>>,
@@ -211,6 +212,7 @@ impl FrameActivity<'_, '_> {
             || !self.flash_messages.is_empty()
             || !self.awaiting_handles.is_empty()
             || !self.size_checks.is_empty()
+            || !self.level_checks.is_empty()
             || !self.width_settlements.is_empty()
             || !self.drag_edges.is_empty()
             || self

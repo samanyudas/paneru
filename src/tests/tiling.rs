@@ -1315,6 +1315,117 @@ fn a_rule_can_tile_a_window_above_ordinary_windows() {
     crate::assert_focused!(world, 3);
 }
 
+/// Spawns window 3 at an ordinary level next to the tiled windows 0 to 2 with
+/// 0 focused, as Chrome shows a Picture-in-Picture window before it raises
+/// it. Returns the frame the window opened with.
+fn spawned_ordinary_window(harness: &mut TestHarness) -> IRect {
+    harness.advance(Duration::from_millis(500));
+    let frame = IRect::new(1000, 500, 400, 225);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 3, frame);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_millis(40));
+    frame
+}
+
+/// Chrome raises its Picture-in-Picture window a few tens of milliseconds
+/// after it shows it. The engine still floats the window, gives back the
+/// frame it opened with, focuses it once, and closes the gap in the strip.
+#[test]
+fn a_window_raised_just_after_it_opens_floats_and_takes_focus() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    let opened = spawned_ordinary_window(&mut harness);
+    harness
+        .mock_state
+        .update_window(3, |window| window.above_ordinary = true);
+    harness.advance(Duration::from_millis(500));
+
+    let world = harness.world();
+    let entity = find_window_entity(3, world);
+    assert!(matches!(
+        world.entity(entity).get::<crate::ecs::Unmanaged>(),
+        Some(crate::ecs::Unmanaged::Floating)
+    ));
+    let mut query = world.query::<&LayoutStrip>();
+    assert!(
+        !query.iter(world).any(|strip| strip.contains(entity)),
+        "a window raised above ordinary windows must leave its column"
+    );
+    crate::assert_focused!(world, 3);
+    let mut query = world.query::<&crate::manager::Window>();
+    let frame = query
+        .iter(world)
+        .find(|window| window.id() == 3)
+        .map(|window| window.frame());
+    assert_eq!(frame, Some(opened));
+    assert_eq!(window_x(world, 0), 0);
+    assert_eq!(window_x(world, 1), TEST_WINDOW_WIDTH);
+    assert_eq!(window_x(world, 2), TEST_WINDOW_WIDTH * 2);
+}
+
+/// A window that stays at the ordinary level stays tiled, and the engine
+/// stops reading its level once the check ends.
+#[test]
+fn a_window_that_stays_ordinary_stays_tiled() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    spawned_ordinary_window(&mut harness);
+    harness.advance(Duration::from_secs(2));
+
+    let world = harness.world();
+    let entity = find_window_entity(3, world);
+    assert!(
+        world
+            .entity(entity)
+            .get::<crate::ecs::Unmanaged>()
+            .is_none()
+    );
+    assert!(
+        world
+            .entity(entity)
+            .get::<crate::ecs::AboveOrdinaryCheck>()
+            .is_none()
+    );
+
+    // A raise after the check ends no longer floats the window.
+    harness
+        .mock_state
+        .update_window(3, |window| window.above_ordinary = true);
+    harness.advance(Duration::from_millis(500));
+    let world = harness.world();
+    let entity = find_window_entity(3, world);
+    let mut query = world.query::<&LayoutStrip>();
+    assert!(query.iter(world).any(|strip| strip.contains(entity)));
+}
+
+/// A rule that tiles a window keeps it tiled when its app raises it just
+/// after it opens.
+#[test]
+fn a_rule_keeps_a_window_raised_after_it_opens_tiled() {
+    let mut params = WindowParams::new("^Window 3$", None);
+    params.floating = Some(false);
+    let mut harness = TestHarness::new()
+        .with_config((MainOptions::default(), vec![params]).into())
+        .with_windows(3)
+        .with_focused_window(0);
+    spawned_ordinary_window(&mut harness);
+    harness
+        .mock_state
+        .update_window(3, |window| window.above_ordinary = true);
+    harness.advance(Duration::from_millis(500));
+
+    let world = harness.world();
+    let entity = find_window_entity(3, world);
+    assert!(
+        world
+            .entity(entity)
+            .get::<crate::ecs::Unmanaged>()
+            .is_none()
+    );
+    let mut query = world.query::<&LayoutStrip>();
+    assert!(query.iter(world).any(|strip| strip.contains(entity)));
+}
+
 /// Closing a window while its application stays alive must free its slot in
 /// the strip. The AX element of such a window often keeps answering queries
 /// after the window is gone, which used to make `window_destroyed_trigger`

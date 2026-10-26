@@ -1405,13 +1405,25 @@ impl MockState {
         });
 
         let s = self.clone();
-        mw.expect_is_above_ordinary_windows().returning(move || {
+        // Cached like the real window: a later raise shows only after a
+        // refresh.
+        let cached_above = Arc::new(Mutex::new(None::<bool>));
+        let read_above = move || {
             s.inner
                 .force_read()
                 .windows
                 .get(&id)
                 .is_some_and(|w| w.above_ordinary)
-        });
+        };
+        let (cache, read) = (cached_above.clone(), read_above.clone());
+        mw.expect_is_above_ordinary_windows()
+            .returning(move || *cache.lock().unwrap().get_or_insert_with(&read));
+        mw.expect_refresh_above_ordinary_windows()
+            .returning(move || {
+                let above = read_above();
+                *cached_above.lock().unwrap() = Some(above);
+                above
+            });
 
         let s = self.clone();
         mw.expect_border_radius().returning(move || {

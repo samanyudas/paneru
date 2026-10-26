@@ -18,9 +18,9 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, AwaitingHandle, BProcess, FloatsWhenRestored, FocusedMarker, FreshMarker,
-    MissionControlActive, PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger,
-    StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    AboveOrdinaryCheck, ActiveDisplayMarker, AwaitingHandle, BProcess, FloatsWhenRestored,
+    FocusedMarker, FreshMarker, MissionControlActive, PreviousManagedStrip, RetryFrontSwitch,
+    SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -1441,6 +1441,67 @@ fn focus_opened_window(
     }
 }
 
+/// How long the engine keeps reading a new window's level. Chrome raised its
+/// Picture-in-Picture window 20 to 90 ms after showing it in native checks.
+const ABOVE_ORDINARY_CHECK: Duration = Duration::from_secs(1);
+
+/// Floats a newly tiled window once its app raises it above ordinary
+/// windows, as [`apply_window_positions`] would have if the raise had come
+/// first: the window gets back the frame it opened with and takes focus once.
+/// A rule that decides whether the window floats still wins.
+pub(super) fn recheck_window_level(
+    mut checks: Query<(Entity, &mut AboveOrdinaryCheck)>,
+    windows: Windows,
+    apps: Query<&Application>,
+    config: Res<Config>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    for (entity, mut check) in &mut checks {
+        check.timer.tick(time.delta());
+        let Some((window, _, unmanaged)) = windows.get_managed(entity) else {
+            continue;
+        };
+        // A window the user floated, or that was minimized, is done with.
+        let floated = unmanaged.is_some();
+        let raised = !floated && window.refresh_above_ordinary_windows();
+        if !floated && !raised && !check.timer.is_finished() {
+            continue;
+        }
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            continue;
+        };
+        entity_commands.try_remove::<AboveOrdinaryCheck>();
+        if !raised {
+            continue;
+        }
+        let Some(app) = windows
+            .find_parent(window.id())
+            .and_then(|(_, _, parent)| apps.get(parent).ok())
+        else {
+            continue;
+        };
+        let properties = WindowProperties::new(app, window, &config);
+        if !properties.floating() {
+            continue;
+        }
+        debug!(
+            "window {} rose above ordinary windows after it opened, floating it",
+            window.id()
+        );
+        entity_commands.try_insert(Unmanaged::Floating);
+        // Chrome reports a zero size until it shows the window, and then the
+        // frame it has is the one to keep.
+        if check.opened.width() > 0 && check.opened.height() > 0 {
+            commands.reposition_entity(entity, check.opened.min);
+            commands.resize_entity(entity, check.opened.size());
+        }
+        if !properties.dont_focus() {
+            commands.focus_entity(entity, true);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn apply_window_positions(
@@ -1498,6 +1559,20 @@ pub(super) fn apply_window_positions(
                 focus_opened_window(entity, window, &properties, &mut ctx.commands);
             }
             continue;
+        }
+
+        // The level read above can come too early for an app that raises
+        // the window just after it shows it, so it is read again for a while.
+        if initializing.is_none()
+            && !properties.above_ordinary()
+            && !window.is_minimized()
+            && let Some(opened) = ctx.windows.frame(entity)
+            && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
+        {
+            entity_commands.try_insert(AboveOrdinaryCheck {
+                timer: Timer::new(ABOVE_ORDINARY_CHECK, TimerMode::Once),
+                opened,
+            });
         }
 
         if crate::ecs::restore::matches_startup_restore_state(
