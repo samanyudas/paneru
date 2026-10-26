@@ -625,7 +625,7 @@ fn install_script_state(
 #[allow(clippy::too_many_lines)]
 fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     use crate::config::{
-        MainOptions, RestoreOptions, StackLimit, format_modifiers,
+        MainOptions, MaximizedWindowSide, RestoreOptions, StackLimit, format_modifiers,
         padding::PaddingOptions,
         swipe::{GestureOptions, ScrollOptions, SwipeOptions},
     };
@@ -670,6 +670,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         window_resize_cycle: _,
         window_resize_step: _,
         stack_limit: _,
+        maximized_window_side: _,
         reap_empty_workspaces: _,
         disable_native_tabs: _,
         virtual_workspace_animations: _,
@@ -703,6 +704,11 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         StackLimit::Fit => "fit".into_lua(lua)?,
     };
     options.set("stack_limit", stack_limit)?;
+    let maximized_window_side = match config.maximized_window_side() {
+        MaximizedWindowSide::Left => "left",
+        MaximizedWindowSide::Right => "right",
+    };
+    options.set("maximized_window_side", maximized_window_side)?;
     options.set("reap_empty_workspaces", config.reap_empty_workspaces())?;
     options.set("disable_native_tabs", !config.native_tabs_enabled())?;
     options.set(
@@ -968,5 +974,26 @@ mod tests {
                 "RestoreOptions field '{field}' is missing from paneru.config.restore!"
             );
         }
+    }
+
+    #[test]
+    fn setup_table_sets_the_maximized_window_side() {
+        let lua = Lua::new();
+        let side = |source: &str| -> mlua::Result<String> {
+            let value = lua.load(source).eval()?;
+            let config = config_from_lua(&lua, value)?;
+            let options: Table = config_to_lua_table(&lua, &config)?.get("options")?;
+            options.get("maximized_window_side")
+        };
+        assert_eq!(side("return {}").unwrap(), "right");
+        assert_eq!(
+            side(r#"return { options = { maximized_window_side = "left" } }"#).unwrap(),
+            "left"
+        );
+        assert_eq!(
+            side(r#"return { options = { maximized_window_side = "right" } }"#).unwrap(),
+            "right"
+        );
+        assert!(side(r#"return { options = { maximized_window_side = "up" } }"#).is_err());
     }
 }

@@ -253,7 +253,11 @@ fn the_apps_own_zoom_does_not_replace_the_toggle() {
 
 /// Stacks window 1 under window 0.
 fn stacked() -> TestHarness {
-    let mut harness = TestHarness::new().with_windows(3);
+    stacked_with(Config::default())
+}
+
+fn stacked_with(config: Config) -> TestHarness {
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
     harness.run(vec![
         Event::MenuOpened { window_id: 0 },
         command(Operation::Focus(Direction::First)),
@@ -1038,11 +1042,12 @@ fn restore_returns_the_earlier_width_and_neighbors_keep_theirs() {
     assert_eq!(sizes(&after), sizes(&before));
 }
 
-/// A stacked window leaves its stack for a column of its own to the right of
-/// the stack, and goes back to its place in the stack when restored.
-#[test]
-fn a_stacked_window_pops_out_right_and_returns_to_its_slot() {
-    let mut harness = stacked();
+/// A stacked window leaves its stack for a column of its own on the side
+/// `config` chooses, `popped` the layout then, and goes back to its place in
+/// the stack when restored.
+fn pops_out_and_returns_to_its_slot(config: &str, popped: &[&[WinID]]) {
+    let config = Config::try_from(config).expect("config parses");
+    let mut harness = stacked_with(config);
     let before = frames(&harness, &[0, 1, 2]);
     assert_eq!(
         layout_on(&mut harness, TEST_WORKSPACE_ID),
@@ -1050,10 +1055,7 @@ fn a_stacked_window_pops_out_right_and_returns_to_its_slot() {
     );
 
     double_click_title_bar(&mut harness, 1);
-    assert_eq!(
-        layout_on(&mut harness, TEST_WORKSPACE_ID),
-        vec![vec![0], vec![1], vec![2]]
-    );
+    assert_eq!(layout_on(&mut harness, TEST_WORKSPACE_ID), popped);
     assert_eq!(os_frame(&harness, 1), usable_area(&mut harness));
 
     double_click_title_bar(&mut harness, 1);
@@ -1062,6 +1064,41 @@ fn a_stacked_window_pops_out_right_and_returns_to_its_slot() {
         vec![vec![0, 1], vec![2]]
     );
     assert_eq!(frames(&harness, &[0, 1, 2]), before);
+}
+
+#[test]
+fn a_stacked_window_pops_out_right_by_default() {
+    pops_out_and_returns_to_its_slot("", &[&[0], &[1], &[2]]);
+}
+
+#[test]
+fn a_stacked_window_pops_out_right_when_configured() {
+    pops_out_and_returns_to_its_slot(
+        "[options]\nmaximized_window_side = \"right\"\n",
+        &[&[0], &[1], &[2]],
+    );
+}
+
+#[test]
+fn a_stacked_window_pops_out_left_when_configured() {
+    pops_out_and_returns_to_its_slot(
+        "[options]\nmaximized_window_side = \"left\"\n",
+        &[&[1], &[0], &[2]],
+    );
+}
+
+#[test]
+fn maximized_window_side_parses_left_or_right() {
+    let parse = |value: &str| {
+        Config::try_from(format!("[options]\nmaximized_window_side = {value}\n").as_str())
+    };
+    assert!(parse("\"left\"").is_ok());
+    assert!(parse("\"right\"").is_ok());
+    let error = parse("\"up\"").expect_err("up is not a side").to_string();
+    assert!(
+        error.contains("unknown variant `up`, expected `left` or `right`"),
+        "{error}"
+    );
 }
 
 /// A maximized window moved to another display stays a maximized column of
