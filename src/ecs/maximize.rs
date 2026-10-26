@@ -31,7 +31,7 @@ use bevy::prelude::Event as BevyEvent;
 use bevy::time::Time;
 use tracing::debug;
 
-use crate::commands::{Operation, Side, filter_window_operations};
+use crate::commands::{Operation, filter_window_operations};
 use crate::config::Config;
 use crate::ecs::drag::tiling::supersede_native_resize;
 use crate::ecs::layout::{
@@ -329,7 +329,7 @@ fn toggle_tiled(
             ViewportShare::of(frame.height(), viewport.height()),
             anchor,
         );
-        if let Err(err) = strip.maximize(entity, Side::East, before) {
+        if let Err(err) = strip.maximize(entity, config.maximized_window_side().into(), before) {
             debug!("no maximize: {err}");
             return;
         }

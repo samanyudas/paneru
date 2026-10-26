@@ -845,6 +845,11 @@ impl Config {
         self.options().stack_limit.unwrap_or_default()
     }
 
+    /// Which side of its stack a stacked window opens on when it is maximized.
+    pub fn maximized_window_side(&self) -> MaximizedWindowSide {
+        self.options().maximized_window_side.unwrap_or_default()
+    }
+
     pub fn auto_center(&self) -> bool {
         self.options().auto_center.is_some_and(|center| center)
     }
@@ -1351,6 +1356,10 @@ pub struct MainOptions {
     /// number is capped at that same count. Default: 5.
     pub stack_limit: Option<StackLimit>,
 
+    /// Which side of its stack a stacked window opens on, in a column of its
+    /// own, when it is maximized: `"left"` or `"right"`. Default: right.
+    pub maximized_window_side: Option<MaximizedWindowSide>,
+
     /// If enabled, an empty virtual workspace will be removed.
     /// Default: true.
     pub reap_empty_workspaces: Option<bool>,
@@ -1431,6 +1440,24 @@ impl<'de> Deserialize<'de> for Keybinding {
             modifiers,
             command: Command::Quit,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "snake_case")]
+pub enum MaximizedWindowSide {
+    Left,
+    #[default]
+    Right,
+}
+
+impl From<MaximizedWindowSide> for crate::commands::Side {
+    fn from(side: MaximizedWindowSide) -> Self {
+        match side {
+            MaximizedWindowSide::Left => Self::West,
+            MaximizedWindowSide::Right => Self::East,
+        }
     }
 }
 
