@@ -2190,21 +2190,10 @@ fn test_window_resize_middle_column_centers_around_window_and_shifts_strip() {
         .run(commands);
 }
 
+/// Even when `window_hidden_ratio` lets a window stay partly off screen,
+/// maximize brings it fully on screen, and restore puts it back in place.
 #[test]
-fn test_full_width_centers_and_fills_viewport_when_window_was_partially_offscreen() {
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Center),
-        },
-        Event::Command {
-            command: Command::Window(Operation::FullWidth),
-        },
-        Event::Command {
-            command: Command::Window(Operation::FullWidth),
-        },
-    ];
-
+fn test_maximize_fills_the_display_when_window_was_partially_offscreen() {
     let config: Config = (
         MainOptions {
             window_hidden_ratio: Some(0.5),
@@ -2214,28 +2203,28 @@ fn test_full_width_centers_and_fills_viewport_when_window_was_partially_offscree
         vec![],
     )
         .into();
+    let window_command = |operation| Event::Command {
+        command: Command::Window(operation),
+    };
+    let settle = Duration::from_secs(2);
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Center),
+    ]);
+    harness.advance(settle);
+    // Window 0 (width 400) is centered at x = 312.
+    assert_window_at!(harness.world(), 0, 312, TEST_MENUBAR_HEIGHT);
 
-    TestHarness::new()
-        .with_config(config)
-        .with_windows(2)
-        .on_iteration(1, |world, _state| {
-            // Window 0 (width 400) is centered at x = 312.
-            assert_window_at!(world, 0, 312, TEST_MENUBAR_HEIGHT);
-        })
-        .on_iteration(2, |world, _state| {
-            // Even when `window_hidden_ratio` is set (312 / 1024 = 0.30 < 0.5)
-            // and window 0 was off-origin, `FullWidth` must bring it fully on
-            // screen (`x = 0`, `width = 1024`).
-            assert_window_size!(world, 0, 1024, 748);
-            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-        })
-        .on_iteration(3, |world, _state| {
-            // Toggling `FullWidth` off restores the original width (400) and
-            // centers it in place (`512 - 200 = 312`).
-            assert_window_size!(world, 0, 400, 748);
-            assert_window_at!(world, 0, 312, TEST_MENUBAR_HEIGHT);
-        })
-        .run(commands);
+    harness.run(vec![window_command(Operation::Maximize)]);
+    harness.advance(settle);
+    assert_window_size!(harness.world(), 0, 1024, 748);
+    assert_window_at!(harness.world(), 0, 0, TEST_MENUBAR_HEIGHT);
+
+    harness.run(vec![window_command(Operation::Maximize)]);
+    harness.advance(settle);
+    assert_window_size!(harness.world(), 0, 400, 748);
+    assert_window_at!(harness.world(), 0, 312, TEST_MENUBAR_HEIGHT);
 }
 
 /// macOS can focus a window the engine does not manage yet, while the engine

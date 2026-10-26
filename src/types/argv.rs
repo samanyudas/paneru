@@ -95,7 +95,8 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
             }
             Some(arg) => Operation::ResizeVertical(ResizeDirection::parse(arg)?),
         },
-        "fullwidth" => Operation::FullWidth,
+        // `fullwidth` is the older name, which existing configs still bind.
+        "maximize" | "fullwidth" => Operation::Maximize,
         "manage" => Operation::Manage,
         "equalize" => Operation::Equalize,
         "balance" => Operation::Balance,
@@ -213,9 +214,9 @@ impl Operation {
             Operation::ResizeVerticalStep(direction) => {
                 owned(&["vertical", "step", direction.token()])
             }
-            // `SetWidth` comes from window rules, not from a command line; it has
-            // no argv verb, so encode it as the equivalent full-width toggle.
-            Operation::SetWidth(_) | Operation::FullWidth => owned(&["fullwidth"]),
+            // `SetWidth` comes from window rules, not from a command line, and
+            // has no argv verb of its own.
+            Operation::SetWidth(_) | Operation::Maximize => owned(&["maximize"]),
             Operation::ToNextDisplay(MoveFocus::Follow) => owned(&["nextdisplay"]),
             Operation::ToNextDisplay(MoveFocus::Stay) => owned(&["nextdisplaysend"]),
             Operation::FocusDisplay(direction) => {
@@ -312,7 +313,7 @@ mod tests {
             Operation::ResizeStep(ResizeDirection::Shrink),
             Operation::ResizeVerticalStep(ResizeDirection::Grow),
             Operation::ResizeVerticalStep(ResizeDirection::Shrink),
-            Operation::FullWidth,
+            Operation::Maximize,
             Operation::ToNextDisplay(MoveFocus::Follow),
             Operation::ToNextDisplay(MoveFocus::Stay),
             Operation::FocusDisplay(Direction::North),

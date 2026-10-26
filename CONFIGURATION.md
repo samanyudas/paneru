@@ -239,7 +239,7 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_vertical_shrink` | Cycle a stacked window through preset heights (Shrink). |
 | `window_step_grow` / `_shrink` | Widen/narrow the column by `window_resize_step` of the display width. Stops at full width and at one step, without wrapping. |
 | `window_vertical_step_grow` / `_shrink` | Make a stacked window taller/shorter by `window_resize_step` of the display height. Its neighbour absorbs the difference. No-op outside a stack. |
-| `window_fullwidth` | Toggle full-width mode. |
+| `window_maximize` | Maximize the focused window to fill the usable area of its display, or restore it. A double-click on a window's title bar toggles the same state. `window_fullwidth` is an alias. |
 | `window_manage` | Toggle between tiled and floating state. |
 | `window_stack` | Alias for `window_stack_west`. |
 | `window_stack_west` / `_east` | Move the current window to the bottom of the column on the left/right. The rest of its old stack stays in place. No-op at the edge of the strip. When that column already holds `stack_limit` windows, the window leaves its stack for a new column between the two instead. |

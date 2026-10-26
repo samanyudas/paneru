@@ -2458,7 +2458,6 @@ fn explicit_resize_width_commands_keep_requested_frames_after_an_app_resize() {
         (Operation::SetWidth(0.5), 400, 560, 512),
         (Operation::Resize(Grow), 256, 384, 512),
         (Operation::ResizeStep(Shrink), 400, 768, 512),
-        (Operation::FullWidth, 400, 560, 1024),
     ] {
         let mut harness = harness_with(
             "[options]\nauto_center = false\npreset_column_widths = [0.25, 0.5, 0.75]\nwindow_resize_step = 0.25\n",
@@ -2540,7 +2539,7 @@ fn explicit_resize_width_replaces_slots_for_stacked_windows_and_native_tabs() {
 }
 
 #[test]
-fn explicit_resize_fullwidth_replaces_the_slot_for_every_native_tab() {
+fn maximize_fills_the_usable_area_for_every_native_tab() {
     let mut harness = harness_with("[options]\nauto_center = false\n", TEST_DISPLAY_HEIGHT, 1);
     add_native_tab(&mut harness, 0, 1);
     let start = frame(harness.world(), 1);
@@ -2554,7 +2553,7 @@ fn explicit_resize_fullwidth_replaces_the_slot_for_every_native_tab() {
             .write_message(Event::WindowResized { window_id: id });
     }
     harness.advance(FRAME);
-    harness.world().write_message(command(Operation::FullWidth));
+    harness.world().write_message(command(Operation::Maximize));
     harness.advance(FRAME);
     let expected = IRect::new(
         0,

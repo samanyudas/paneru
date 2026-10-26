@@ -281,8 +281,10 @@ pub enum Operation {
     ResizeVerticalStep(ResizeDirection),
     /// Resizes the focused window to an exact display-width ratio.
     SetWidth(f64),
-    /// Toggles the focused window to full width or a preset width.
-    FullWidth,
+    /// Maximizes the focused window, or restores it when it is maximized, as
+    /// a double-click on its title bar does. `full_width` is its older name.
+    #[serde(alias = "full_width")]
+    Maximize,
     /// Moves the focused window to the next available display.
     ToNextDisplay(MoveFocus),
     /// Focuses the display that lies north, south, west, or east of the active

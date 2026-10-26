@@ -209,11 +209,6 @@ impl DisplayMoves<'_, '_> {
                         crate::ecs::VerifyWindowSize::default(),
                     ));
             }
-            if matches!(placement, Placement::Into(..)) {
-                commands
-                    .entity(*member)
-                    .remove::<crate::ecs::FullWidthMarker>();
-            }
             source_strip.remove(*member);
         }
         if let Some(neighbour) = left_behind {
