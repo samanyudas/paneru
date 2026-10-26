@@ -249,11 +249,19 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_tabbeddisplay` | Toggle the focused stack between a normal split display and a tabbed display (one window visible at a time, sharing the full column). Cycle tabs with `window_focus_north`/`window_focus_south`. |
 | `window_equalize` | Make all windows in a stack equal height. |
 | `window_balance` | Make all columns in the strip the same width as the focused window. |
-| `window_nextdisplay` | Move focused window to the next monitor and follow it. |
-| `window_nextdisplaysend` | Move focused window to the next monitor but stay on current. |
+| `window_nextdisplay` | Move the focused window's whole column to the next monitor and follow it. |
+| `window_nextdisplaysend` | Move the focused window's whole column to the next monitor but stay on current. |
 | `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
 | `window_focusdisplay_north` / `_south` / `_west` / `_east` | Focus the display in that direction in the physical arrangement, on its last-focused or most visible window. |
-| `window_movedisplay_north` / `_south` / `_west` / `_east` | Move the focused window to the display in that direction and follow it. |
+| `window_movedisplay_north` / `_south` / `_west` / `_east` | Move the focused window's whole column to the display in that direction and follow it. |
+| `window_focusedge_west` / `_east` | Focus the first/last column, as `window_focus_first`/`_last` do. When that column already has focus, or the strip is empty, focus the display on that side, as `window_focusdisplay_west`/`_east` do. |
+| `window_moveedge_west` / `_east` | Move the focused window's whole column to the first/last position, as `window_swap_first`/`_last` do. When it is already there, move it to the display on that side, as `window_movedisplay_west`/`_east` do. |
+
+A display move takes the focused window's whole column: every window of its stack, in order, with their native tabs.
+The column lands right after the destination's active column, the window `window_focusdisplay_*` would focus there, or as the first column of an empty strip.
+It keeps its width relative to the display, and a stack shares the destination height evenly.
+A stack with more windows than `stack_limit` allows on the destination still arrives whole, and its windows overlap below each top bar as in any stack that does not fit.
+A stack does not move to a display that shows no window strip.
 | `window_snap` | Snap an overflowing window into the viewport. |
 | `window_raise_floating` | Make the floating windows layer visible on the current workspace. |
 | `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |
