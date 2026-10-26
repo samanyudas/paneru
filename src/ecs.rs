@@ -666,7 +666,8 @@ pub struct AwaitingHandle(pub Timer);
 #[derive(Component)]
 pub struct AboveOrdinaryCheck {
     pub timer: Timer,
-    /// The frame the window opened with, before the engine tiled it.
+    /// The frame the window opened with, before the engine tiled it. When it
+    /// is empty, the engine has not tiled the window yet.
     pub opened: bevy::math::IRect,
 }
 
