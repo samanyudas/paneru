@@ -1260,13 +1260,25 @@ fn restarted_with_window_one(
     fixed_size: bool,
     overrides: TileOverrides,
 ) -> TestHarness {
+    restarted_with(floating, fixed_size, false, overrides)
+}
+
+fn restarted_with(
+    floating: Option<bool>,
+    fixed_size: bool,
+    minimized: bool,
+    overrides: TileOverrides,
+) -> TestHarness {
     let mut params = WindowParams::new("^Window 1$", Some("test".to_string()));
     params.floating = floating;
     let config: Config = (MainOptions::default(), vec![params]).into();
     let mut harness = TestHarness::new()
         .with_config(config)
         .with_windows(1)
-        .with_window(1, |window| window.fixed_size = fixed_size);
+        .with_window(1, |window| {
+            window.fixed_size = fixed_size;
+            window.minimized = minimized;
+        });
     let world = harness.app.world_mut();
     world.insert_resource(overrides);
     world.insert_resource(state_with_strips(vec![SavedStrip {
@@ -1407,6 +1419,26 @@ fn a_fixed_size_window_floats_after_it_is_minimized_and_restored() {
     assert!(floats(&mut harness, 1));
     let world = harness.world();
     let entity = find_window_entity(1, world);
+    let mut strips = world.query::<&LayoutStrip>();
+    assert!(!strips.iter(world).any(|strip| strip.contains(entity)));
+}
+
+/// A floating window that was minimized when the engine started counts as
+/// minimized, and floats once it is restored.
+#[test]
+fn a_fixed_size_window_minimized_at_start_floats_when_restored() {
+    let mut harness = restarted_with(None, true, true, TileOverrides::default());
+    let world = harness.world();
+    let entity = find_window_entity(1, world);
+    assert!(matches!(
+        world.entity(entity).get::<Unmanaged>(),
+        Some(Unmanaged::Minimized)
+    ));
+    harness.mock_state.os_minimize_window(1, false);
+    harness.advance(Duration::from_millis(500));
+
+    assert!(floats(&mut harness, 1));
+    let world = harness.world();
     let mut strips = world.query::<&LayoutStrip>();
     assert!(!strips.iter(world).any(|strip| strip.contains(entity)));
 }

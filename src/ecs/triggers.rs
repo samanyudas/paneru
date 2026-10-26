@@ -1446,13 +1446,19 @@ pub(super) fn apply_window_positions(
             {
                 strip.remove(entity);
             }
+            let minimized = window.is_minimized();
             if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-                // Avoid managing window if it's floating.
-                entity_commands.try_insert(Unmanaged::Floating);
+                // Avoid managing window if it's floating. A minimized one
+                // floats once it is restored.
+                if minimized {
+                    entity_commands.try_insert((Unmanaged::Minimized, FloatsWhenRestored));
+                } else {
+                    entity_commands.try_insert(Unmanaged::Floating);
+                }
             }
             // macOS reported the new window's focus before it was tracked, so
             // it takes focus here, as a tiled window does below.
-            if initializing.is_none() && !properties.dont_focus() {
+            if initializing.is_none() && !minimized && !properties.dont_focus() {
                 ctx.commands
                     .trigger(SendMessageTrigger(Event::WindowFocused {
                         window_id: window.id(),
