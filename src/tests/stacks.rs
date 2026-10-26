@@ -1515,3 +1515,63 @@ fn a_late_regrowth_after_a_release_keeps_the_asked_height() {
     let engine = frame(harness.world(), 0);
     assert_eq!(engine.height(), ASKED, "{engine:?}");
 }
+
+/// The same when the growth back also reaches a busy app late, so the grace
+/// starts once the write has landed rather than when it was queued.
+#[test]
+fn a_slow_late_regrowth_after_a_release_keeps_the_asked_height() {
+    const SHORTER: i32 = TALL - 16;
+    const ASKED: i32 = SHORTER - TEST_MENUBAR_HEIGHT;
+    fn assert_kept(harness: &mut TestHarness, steps: usize) {
+        for _ in 0..steps {
+            harness.advance(Duration::from_millis(16));
+            let world = harness.world();
+            let entity = find_window_entity(0, world);
+            let bounds = world.entity(entity).get::<crate::ecs::Bounds>().unwrap().0;
+            assert_eq!(bounds.y, ASKED, "kept while the growth is late");
+        }
+    }
+    let harness = TestHarness::new();
+    harness
+        .mock_state
+        .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, TALL));
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    let mut harness = harness.with_windows(3);
+    harness.advance(SETTLE);
+    harness.mock_state.flush_writes(Duration::from_secs(1));
+    harness.mock_state.update_window(0, |window| {
+        window.sticky_bottom = Some(TALL);
+    });
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, SHORTER),
+    );
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayConfigured {
+            display_id: TEST_DISPLAY_ID,
+        });
+    let mut lowered = false;
+    for _ in 0..200 {
+        harness.advance(Duration::from_millis(16));
+        harness.mock_state.flush_writes(Duration::from_millis(100));
+        if harness.mock_state.create_window(0).frame().height() < ASKED {
+            harness.mock_state.update_window(0, |window| {
+                window.dropped_resizes = 1;
+            });
+            harness.mock_state.hold_writes(TEST_PROCESS_ID);
+            lowered = true;
+            break;
+        }
+    }
+    assert!(lowered, "the window is lowered first");
+    assert_kept(&mut harness, 40);
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    harness.mock_state.flush_writes(Duration::from_secs(1));
+    assert_kept(&mut harness, 6);
+    harness.mock_state.os_apply_late_resizes(0);
+    harness.advance(SETTLE);
+
+    let native = harness.mock_state.create_window(0).frame();
+    assert_eq!(native.height(), ASKED, "{native:?}");
+}

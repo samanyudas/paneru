@@ -1725,10 +1725,14 @@ pub(super) fn window_resize_verifier(
             continue;
         }
         // The lowered height has landed, so the window grows to the asked one.
-        // An app can apply that growth late, so the readback waits out the
-        // grace whatever height it shows.
         if request.release == Release::Lowered {
             window.resize(bounds.0);
+            request.release = Release::Regrowing;
+            continue;
+        }
+        // The growth has reached the app, which can apply it late, so the
+        // readback waits out the grace whatever height it shows.
+        if request.release == Release::Regrowing {
             request.release = Release::Regrown;
             request.mismatched_since = Some(verification.time.elapsed());
             continue;

@@ -750,6 +750,8 @@ enum Release {
     #[default]
     Untried,
     Lowered,
+    /// The growth back is on its way to the app.
+    Regrowing,
     Regrown,
 }
 
