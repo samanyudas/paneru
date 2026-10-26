@@ -2400,22 +2400,50 @@ pub(super) fn layout_strip_changed(
 
 /// Lays every strip out again when the display edge padding changes, as a
 /// config reload can do: the viewport, and with it every maximized window,
-/// depends on it.
+/// depends on it. Each strip in view on any display is placed in its new
+/// viewport around the window the user sees there: the focused window, or
+/// on a display without the focus, the window most on its display.
 fn relayout_on_edge_padding_change(
     config: Res<Config>,
     mut last: Local<Option<(i32, i32, i32, i32)>>,
-    mut strips: Query<&mut LayoutStrip>,
-    focused: Query<Entity, With<FocusedMarker>>,
+    mut strips: Query<(
+        &mut LayoutStrip,
+        &ChildOf,
+        Has<SelectedVirtualMarker>,
+        Has<PreviousStripPosition>,
+    )>,
+    displays: Query<&Display>,
+    windows: Windows,
     mut commands: Commands,
 ) {
     let padding = config.edge_padding();
-    if last.replace(padding).is_some_and(|last| last != padding) {
-        for mut strip in &mut strips {
-            strip.set_changed();
+    if last.replace(padding).is_none_or(|last| last == padding) {
+        return;
+    }
+    let focused = windows.focused().map(|(_, entity)| entity);
+    for (mut strip, child, selected, parked) in &mut strips {
+        strip.set_changed();
+        if !selected || parked {
+            continue;
         }
-        // The viewport moved, so the strip in view is placed in it again.
-        for entity in &focused {
-            commands.reshuffle_around(entity);
+        let Ok(bounds) = displays.get(child.parent()).map(Display::bounds) else {
+            continue;
+        };
+        let anchor = focused
+            .filter(|entity| strip.contains(*entity))
+            .or_else(|| {
+                strip
+                    .columns()
+                    .filter_map(Column::top)
+                    .filter_map(|entity| {
+                        let shown = windows.frame(entity)?.intersect(bounds).width();
+                        (shown > 0).then_some((entity, shown))
+                    })
+                    .max_by_key(|(_, shown)| *shown)
+                    .map(|(entity, _)| entity)
+            });
+        if let Some(anchor) = anchor {
+            commands.reshuffle_around(anchor);
         }
     }
 }

@@ -941,25 +941,19 @@ fn a_workspace_move_keeps_a_window_maximized() {
     assert_eq!(os_frame(&harness, 1), area);
 }
 
-/// A config reload that changes the gaps fits a maximized window to the
-/// usable area again.
-#[test]
-fn a_padding_reload_refits_a_maximized_window() {
-    let mut harness = three_windows_one_focused();
-    double_click_title_bar(&mut harness, 1);
-    let area = usable_area(&mut harness);
-
-    // Outer and inner gaps of 16: an edge padding of 8 and a window padding
-    // of 8.
-    for id in 0..3 {
-        harness.mock_state.update_window(id, |window| {
+/// Reloads the config with outer and inner gaps of 16: an edge padding of 8
+/// and a window padding of 8 for windows `ids`.
+fn reload_with_gaps(harness: &mut TestHarness, ids: &[WinID]) {
+    for id in ids {
+        harness.mock_state.update_window(*id, |window| {
             window.horizontal_padding = 8;
             window.vertical_padding = 8;
         });
     }
     let path = std::env::temp_dir().join(format!(
-        "paneru-maximize-reload-{}.toml",
-        std::process::id()
+        "paneru-maximize-reload-{}-{}.toml",
+        std::process::id(),
+        ids.len()
     ));
     std::fs::write(
         &path,
@@ -973,6 +967,17 @@ fn a_padding_reload_refits_a_maximized_window() {
     std::fs::remove_file(&path).expect("removing the new config");
     reloaded.expect("reloading the config");
     harness.advance(SETTLE);
+}
+
+/// A config reload that changes the gaps fits a maximized window to the
+/// usable area again.
+#[test]
+fn a_padding_reload_refits_a_maximized_window() {
+    let mut harness = three_windows_one_focused();
+    double_click_title_bar(&mut harness, 1);
+    let area = usable_area(&mut harness);
+
+    reload_with_gaps(&mut harness, &[0, 1, 2]);
     assert_eq!(os_frame(&harness, 1), area);
 
     focus(&mut harness, Direction::East);
@@ -980,6 +985,27 @@ fn a_padding_reload_refits_a_maximized_window() {
     focus(&mut harness, Direction::West);
     assert_eq!(os_frame(&harness, 1), area);
     assert_nothing_covers(&mut harness, 1, &[0, 2]);
+}
+
+/// A config reload that changes the gaps also fits a maximized window on a
+/// display without the focus to that display's usable area.
+#[test]
+fn a_padding_reload_refits_a_maximized_window_on_another_display() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    move_to_display(
+        &mut harness,
+        Direction::East,
+        EXT_DISPLAY_ID,
+        EXT_WORKSPACE_ID,
+    );
+    let ext = usable_area_of(&mut harness, EXT_DISPLAY_ID);
+    assert_eq!(os_frame(&harness, 1), ext);
+    harness.mock_state.focus_window(0);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 0);
+
+    reload_with_gaps(&mut harness, &[0, 1, 2, 100]);
+    assert_eq!(os_frame(&harness, 1), ext);
 }
 
 /// Repeated toggles with scrolling in between end where they started.
