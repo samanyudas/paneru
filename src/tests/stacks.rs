@@ -1575,3 +1575,70 @@ fn a_slow_late_regrowth_after_a_release_keeps_the_asked_height() {
     let native = harness.mock_state.create_window(0).frame();
     assert_eq!(native.height(), ASKED, "{native:?}");
 }
+
+/// The same when the app applies the lowering late: the window grows back
+/// only once it shows the lower height.
+#[test]
+fn a_late_lowering_in_a_release_keeps_the_asked_height() {
+    const SHORTER: i32 = TALL - 16;
+    const ASKED: i32 = SHORTER - TEST_MENUBAR_HEIGHT;
+    let mut harness = tall_harness();
+    harness.advance(SETTLE);
+    harness.mock_state.update_window(0, |window| {
+        window.sticky_bottom = Some(TALL);
+    });
+    let mut writes = 0;
+    harness
+        .mock_state
+        .update_window(0, |window| writes = window.resize_writes);
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, SHORTER),
+    );
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayConfigured {
+            display_id: TEST_DISPLAY_ID,
+        });
+    // Drops the next write, the lowering, once the layout's own write has
+    // been refused.
+    let mut refused = false;
+    for _ in 0..200 {
+        harness.advance(Duration::from_millis(16));
+        let mut now = 0;
+        harness
+            .mock_state
+            .update_window(0, |window| now = window.resize_writes);
+        if now > writes {
+            harness.mock_state.update_window(0, |window| {
+                window.dropped_resizes = 1;
+            });
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "the layout asks for the lower height first");
+    for _ in 0..12 {
+        harness.advance(Duration::from_millis(16));
+        let world = harness.world();
+        let entity = find_window_entity(0, world);
+        let bounds = world.entity(entity).get::<crate::ecs::Bounds>().unwrap().0;
+        assert_eq!(bounds.y, ASKED, "kept while the lowering is late");
+    }
+    harness.mock_state.os_apply_late_resizes(0);
+    for _ in 0..60 {
+        harness.advance(Duration::from_millis(16));
+        let world = harness.world();
+        let entity = find_window_entity(0, world);
+        let bounds = world.entity(entity).get::<crate::ecs::Bounds>().unwrap().0;
+        assert_eq!(bounds.y, ASKED, "kept after the late lowering lands");
+    }
+
+    let native = harness.mock_state.create_window(0).frame();
+    assert_eq!(native.height(), ASKED, "{native:?}");
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    let bounds = world.entity(entity).get::<crate::ecs::Bounds>().unwrap().0;
+    assert_eq!(bounds.y, ASKED);
+    assert!(!world.entity(entity).contains::<crate::ecs::MinimumHeight>());
+}

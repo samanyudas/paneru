@@ -1724,17 +1724,9 @@ pub(super) fn window_resize_verifier(
         if position.is_changed() || bounds.is_changed() || window.write_pending() {
             continue;
         }
-        // The lowered height has landed, so the window grows to the asked one.
-        if request.release == Release::Lowered {
-            window.resize(bounds.0);
-            request.release = Release::Regrowing;
-            continue;
-        }
-        // The growth has reached the app, which can apply it late, so the
-        // readback waits out the grace whatever height it shows.
-        if request.release == Release::Regrowing {
-            request.release = Release::Regrown;
-            request.mismatched_since = Some(verification.time.elapsed());
+        // A window being released moves on once it shows each step.
+        let now = verification.time.elapsed();
+        if step_release(&mut request, &mut window, bounds.0, now) {
             continue;
         }
         // macOS puts a tile frame back while a restored slot holds, so a
@@ -1768,7 +1760,6 @@ pub(super) fn window_resize_verifier(
             }
             continue;
         }
-        let now = verification.time.elapsed();
         if request
             .mismatched_since
             .is_some_and(|since| now < since + LATE_RESIZE_GRACE)
@@ -1804,8 +1795,7 @@ pub(super) fn window_resize_verifier(
         {
             let lift = EDGE_RELEASE.min(bounds.0.y / 2);
             window.resize(Size::new(bounds.0.x, bounds.0.y - lift));
-            request.release = Release::Lowered;
-            request.mismatched_since = None;
+            request.release = Release::Lowering(None);
             continue;
         }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -1815,6 +1805,45 @@ pub(super) fn window_resize_verifier(
             verification.reconcile(entity, frame.size(), &mut commands);
         }
     }
+}
+
+/// Takes the next step of a release once the window shows the last one, and
+/// tells whether the check waits. See [`Release`].
+fn step_release(
+    request: &mut VerifyWindowSize,
+    window: &mut Window,
+    asked: Size,
+    now: Duration,
+) -> bool {
+    let shorter = |window: &mut Window| {
+        window
+            .update_frame()
+            .is_ok_and(|frame| fuzzy_equal(frame.height(), asked.y) == Ordering::Greater)
+    };
+    match request.release {
+        Release::Lowering(None) => request.release = Release::Lowering(Some(now)),
+        Release::Lowering(Some(since)) => {
+            if shorter(window) {
+                window.resize(asked);
+                request.release = Release::Regrowing(None);
+            } else if now >= since + LATE_RESIZE_GRACE {
+                // It refused even a large shrink, so its height is a minimum.
+                request.release = Release::Done;
+                request.mismatched_since = Some(since);
+                return false;
+            }
+        }
+        Release::Regrowing(None) => request.release = Release::Regrowing(Some(now)),
+        Release::Regrowing(Some(since)) => {
+            if !shorter(window) || now >= since + LATE_RESIZE_GRACE {
+                request.release = Release::Done;
+                request.mismatched_since = Some(since);
+                return false;
+            }
+        }
+        Release::Untried | Release::Done => return false,
+    }
+    true
 }
 
 impl SizeVerification<'_, '_> {
