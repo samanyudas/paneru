@@ -2156,3 +2156,54 @@ fn floating_waits_for_the_window_macos_has_focused() {
     harness.run(vec![manage]);
     assert!(floating(&mut harness), "the focused window floats");
 }
+
+/// macOS Fill tiles a window to the usable area. The engine puts the window
+/// back in its slot, and macOS ignores a small shrink while a window's bottom
+/// edge is near the bottom of the screen. The window must still end inside
+/// the display, at its slot.
+#[test]
+fn macos_fill_returns_a_tiled_window_to_its_slot_near_the_screen_bottom() {
+    let config = Config::try_from(
+        r#"
+[padding]
+top = 4
+right = 4
+bottom = 4
+left = 4
+
+[windows.gaps]
+title = ".*"
+horizontal_padding = 4
+vertical_padding = 4
+"#,
+    )
+    .expect("config parses");
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_secs(2));
+    let os_frame = |harness: &TestHarness| {
+        let mut frame = None;
+        harness
+            .mock_state
+            .update_window(1, |window| frame = Some(window.frame));
+        frame.expect("window 1")
+    };
+    let slot = os_frame(&harness);
+    harness.mock_state.update_window(1, |window| {
+        window.sticky_bottom = Some(TEST_DISPLAY_HEIGHT);
+    });
+
+    harness
+        .mock_state
+        .os_move_window(1, crate::manager::Origin::new(0, TEST_MENUBAR_HEIGHT));
+    harness.mock_state.os_resize_window(
+        1,
+        crate::manager::Size::new(
+            TEST_DISPLAY_WIDTH,
+            TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT,
+        ),
+    );
+    harness.advance(Duration::from_secs(3));
+
+    assert_eq!(os_frame(&harness), slot);
+}
