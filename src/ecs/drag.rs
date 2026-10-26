@@ -915,7 +915,7 @@ fn drag_edge_scroll(
     time: Res<Time>,
     mut holds: Query<(Entity, &mut EdgeHold)>,
     mut parameters: bevy::ecs::system::ParamSet<(DisplayMoves, EdgeStrips)>,
-    placements: Query<(&LayoutPosition, &Bounds), With<Window>>,
+    placements: Query<(&LayoutPosition, &Bounds, Has<Maximized>), With<Window>>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -932,7 +932,7 @@ fn drag_edge_scroll(
             placements
                 .get(entity)
                 .ok()
-                .map(|(position, bounds)| (position.0, bounds.0))
+                .map(|(position, bounds, _)| (position.0, bounds.0))
         },
         &config,
     );
@@ -942,7 +942,12 @@ fn drag_edge_scroll(
         .iter()
         .map(|(_, display, _, _)| (display.id(), display.physical_bounds()))
         .collect();
-    let edge = held_edge(&snapshot, &physical_displays, drag.pointer);
+    let maximized = placements
+        .get(drag.window)
+        .is_ok_and(|(_, _, maximized)| maximized);
+    let edge = (!maximized || !on_own_display(&snapshot, drag.window, drag.pointer))
+        .then(|| held_edge(&snapshot, &physical_displays, drag.pointer))
+        .flatten();
     let mut current = None;
     for (entity, hold) in &mut holds {
         if edge == Some((hold.display, hold.side)) {
@@ -1199,6 +1204,13 @@ pub(super) fn drag_events(
                         &config,
                     )
                 });
+                if presented
+                    .get(dragged)
+                    .is_ok_and(|(_, _, maximized)| maximized)
+                    && on_own_display(snapshot, dragged, pointer)
+                {
+                    return DropTarget::Home;
+                }
                 hit_test(snapshot, dragged, pointer, centre_dx, |id| {
                     stack_limit(snapshot, id, &config)
                 })
@@ -1213,6 +1225,15 @@ pub(super) fn drag_events(
         state.set_if_neq(next);
 
         for DragEffect::Drop { window, target } in effects {
+            // A maximized window dropped on its own display stays where the
+            // user put it.
+            if target == DropTarget::Home
+                && presented
+                    .get(window)
+                    .is_ok_and(|(_, _, maximized)| maximized)
+            {
+                continue;
+            }
             debug!("dropping {window} at {target:?}");
             let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
             undo.0 = undo_for(window, target, now, &moves, &placements, &presented);
@@ -1331,6 +1352,17 @@ fn screen_edges(frame: IRect, moves: &DisplayMoves) -> BVec2 {
         })
 }
 
+/// Whether `pointer` is off every managed display or on the one whose strip
+/// holds `dragged`. A maximized window dragged there only moves, so it has
+/// no drop target and does not scroll the strip.
+fn on_own_display(snapshot: &LayoutSnapshot, dragged: Entity, pointer: IVec2) -> bool {
+    snapshot
+        .managed_strip_displays
+        .iter()
+        .find(|display| display.bounds.contains(pointer))
+        .is_none_or(|display| display.columns.iter().any(|column| column.holds(dragged)))
+}
+
 /// The window a press at `point` landed on, given the window the window
 /// server reports on top there now.
 ///
@@ -1373,13 +1405,22 @@ fn pressed_window(
     };
 
     if let Some((entity, window, unmanaged, _)) = on_top {
-        // A maximized window is not in the layout's place, and a drag only
-        // moves it.
-        if presented
-            .get(entity)
-            .is_ok_and(|(_, _, maximized)| maximized)
-        {
-            return None;
+        // A maximized window is not in its slot, so its top bar is where the
+        // window is. Only a tiled one can go to another display's layout.
+        if let Ok((_, top_bar, true)) = presented.get(entity) {
+            let tiled = unmanaged.is_none()
+                && moves
+                    .strips
+                    .iter()
+                    .any(|(_, strip, _, _, _)| strip.contains(entity));
+            let frame = window.frame();
+            return tiled.then(|| PressedWindow {
+                entity,
+                frame,
+                top_bar_height: top_bar.map_or(FALLBACK_TOP_BAR_HEIGHT, |height| height.0),
+                tiled: true,
+                screen_edges: screen_edges(frame, moves),
+            });
         }
         // Of the tiled windows whose slot holds the press, such as the tabs
         // of a group, the one on top is the one pressed.
@@ -1417,6 +1458,7 @@ pub(super) fn drag_watchdog(
     mut placements: Placements,
     mut moves: DisplayMoves,
     mut native: ResMut<NativeMembership>,
+    maximized: Query<(), With<Maximized>>,
     mut commands: Commands,
 ) {
     let Some(window) = state.window() else {
@@ -1445,6 +1487,10 @@ pub(super) fn drag_watchdog(
     }
     state.set_if_neq(next);
     for DragEffect::Drop { window, target } in effects {
+        // As in `drag_events`, a maximized window's free move keeps its slot.
+        if target == DropTarget::Home && maximized.contains(window) {
+            continue;
+        }
         let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
         apply_drop(
             window,
