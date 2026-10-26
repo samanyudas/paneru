@@ -1897,13 +1897,14 @@ pub(crate) fn adopt_refused_size(
     );
     bounds.0 = actual_size;
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        if height_ord == Ordering::Less {
+        // A window that cannot be resized has one height, whichever way it
+        // refused. Only such a window gets a maximum: a resizable one can
+        // come back shorter for a moment, such as at the screen's bottom edge.
+        if height_ord != Ordering::Equal && !window.is_resizable() {
+            entity_commands
+                .try_insert((MinimumHeight(actual_size.y), MaximumHeight(actual_size.y)));
+        } else if height_ord == Ordering::Less {
             entity_commands.try_insert(MinimumHeight(actual_size.y));
-        }
-        // Only a window that cannot be resized: a resizable one can come
-        // back shorter for a moment, such as at the screen's bottom edge.
-        if height_ord == Ordering::Greater && !window.is_resizable() {
-            entity_commands.try_insert(MaximumHeight(actual_size.y));
         }
         if width_ord != Ordering::Equal {
             let mut limits = window_limits.unwrap_or_default();

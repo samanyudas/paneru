@@ -1403,3 +1403,31 @@ fn a_stale_fixed_size_window_below_gives_its_spare_height_to_the_stack() {
     let native = harness.mock_state.create_window(0).frame();
     assert_eq!(native.height(), COLUMN - 300, "{native:?}");
 }
+
+/// Two windows that cannot be resized, the upper one taller than its even
+/// share, keep their own heights whichever refusal the engine reads first.
+#[test]
+fn a_stack_of_fixed_sizes_taller_than_their_shares_keeps_them() {
+    let mut harness = tall_harness();
+    fix_size(&mut harness, 0, Size::new(TEST_WINDOW_WIDTH, 700));
+    fix_size(&mut harness, 1, Size::new(TEST_WINDOW_WIDTH, 400));
+    stack_two(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1]);
+    assert_eq!(heights(&frames), vec![700, 400], "{frames:?}");
+}
+
+/// A window that cannot be resized and refuses a smaller height records its
+/// one height as a maximum too, so a later pass cannot grow its row past it.
+#[test]
+fn a_fixed_size_window_refusing_less_height_records_its_maximum() {
+    let mut harness = tall_harness();
+    fix_size(&mut harness, 0, Size::new(TEST_WINDOW_WIDTH, 700));
+    stack_two(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1]);
+    assert_eq!(heights(&frames), vec![700, COLUMN - 700], "{frames:?}");
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    assert!(world.entity(entity).contains::<crate::ecs::MaximumHeight>());
+}

@@ -1330,9 +1330,19 @@ impl LayoutStrip {
                     .iter()
                     .map(|item| item.top().and_then(get_minimum_height).unwrap_or(0))
                     .collect::<Vec<_>>();
+                let maximums = items
+                    .iter()
+                    .map(|item| item.top().and_then(get_maximum_height))
+                    .collect::<Vec<_>>();
+                // A window that cannot be resized needs only its own height,
+                // even below the minimum window height.
                 let floors = minimums
                     .iter()
-                    .map(|minimum| (*minimum).max(MIN_WINDOW_HEIGHT))
+                    .zip(&maximums)
+                    .map(|(minimum, maximum)| {
+                        let floor = (*minimum).max(MIN_WINDOW_HEIGHT);
+                        maximum.map_or(floor, |maximum| floor.min(maximum))
+                    })
                     .collect::<Vec<_>>();
 
                 let rows = if is_tabbed_column {
@@ -1384,12 +1394,10 @@ impl LayoutStrip {
                             .unwrap_or_else(|| {
                                 even_heights(current_heights.len(), layout_strip_height)
                             });
-                    hold_minimum_heights(&mut heights, &minimums, layout_strip_height);
-                    let maximums = items
-                        .iter()
-                        .map(|item| item.top().and_then(get_maximum_height))
-                        .collect::<Vec<_>>();
+                    // Capped first, so the spare height reaches the windows
+                    // that can use it before any minimum takes its share.
                     hold_maximum_heights(&mut heights, &maximums);
+                    hold_minimum_heights(&mut heights, &minimums, layout_strip_height);
                     stacked_rows(&heights)
                 };
 
@@ -3354,6 +3362,33 @@ mod tests {
         assert_eq!(strip.index_of(entities[1]).unwrap(), 0);
         assert_eq!(strip.index_of(entities[0]).unwrap(), 1);
         assert_eq!(strip.index_of(entities[2]).unwrap(), 2);
+    }
+
+    /// A short window that cannot be resized counts at its own height when
+    /// deciding whether a stack fits, not at the minimum window height.
+    #[test]
+    fn a_short_fixed_height_counts_at_its_height_when_fitting() {
+        let (_world, mut strip, e) = strip_of(2);
+        strip.stack(e[1], Side::West).unwrap();
+        let frame = |entity| {
+            let height = if entity == e[0] { 100 } else { 700 };
+            Some(IRect::new(0, 0, 400, height))
+        };
+        let minimum = |entity| Some(if entity == e[0] { 100 } else { 700 });
+        let maximum = |entity| (entity == e[0]).then_some(100);
+        let frames = strip.relative_positions_with_minimums(
+            848,
+            &frame,
+            &minimum,
+            &maximum,
+            &|_| FALLBACK_TOP_BAR_HEIGHT,
+            &|_| WidthLimits::default(),
+        );
+        let rows = frames
+            .iter()
+            .map(|(_, frame)| (frame.min.y, frame.height()))
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![(0, 100), (100, 748)]);
     }
 
     #[test]
