@@ -1448,11 +1448,13 @@ const ABOVE_ORDINARY_CHECK: Duration = Duration::from_secs(1);
 /// Floats a newly tiled window once its app raises it above ordinary
 /// windows, as [`apply_window_positions`] would have if the raise had come
 /// first: the window gets back the frame it opened with and takes focus once.
-/// A rule that decides whether the window floats still wins.
+/// A rule that decides whether the window floats still wins. A window that
+/// opened without a size tiles only when its check ends without it floating.
 pub(super) fn recheck_window_level(
     mut checks: Query<(Entity, &mut AboveOrdinaryCheck)>,
     windows: Windows,
     apps: Query<&Application>,
+    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     config: Res<Config>,
     time: Res<Time>,
     mut commands: Commands,
@@ -1472,27 +1474,33 @@ pub(super) fn recheck_window_level(
             continue;
         };
         entity_commands.try_remove::<AboveOrdinaryCheck>();
-        if !raised {
-            continue;
-        }
-        let Some(app) = windows
+        let properties = windows
             .find_parent(window.id())
             .and_then(|(_, _, parent)| apps.get(parent).ok())
+            .map(|app| WindowProperties::new(app, window, &config));
+        let Some(properties) = properties.filter(|properties| raised && properties.floating())
         else {
+            // A window that opened without a size waited for this check to
+            // tile.
+            if !floated
+                && check.opened.is_empty()
+                && let Some(mut strip) = workspaces
+                    .iter_mut()
+                    .find_map(|(strip, active)| active.then_some(strip))
+            {
+                strip.append(entity);
+                commands.reshuffle_around(entity);
+            }
             continue;
         };
-        let properties = WindowProperties::new(app, window, &config);
-        if !properties.floating() {
-            continue;
-        }
         debug!(
             "window {} rose above ordinary windows after it opened, floating it",
             window.id()
         );
         entity_commands.try_insert(Unmanaged::Floating);
-        // Chrome reports a zero size until it shows the window, and then the
-        // frame it has is the one to keep.
-        if check.opened.width() > 0 && check.opened.height() > 0 {
+        // A window that opened without a size was never tiled, so the frame
+        // its app gave it stands.
+        if !check.opened.is_empty() {
             commands.reposition_entity(entity, check.opened.min);
             commands.resize_entity(entity, check.opened.size());
         }
@@ -1500,6 +1508,22 @@ pub(super) fn recheck_window_level(
             commands.focus_entity(entity, true);
         }
     }
+}
+
+/// Starts reading a new window's level again, because the read on arrival
+/// can come too early for an app that raises the window just after it shows
+/// it. Returns whether the window waits for the check to tile: a window
+/// without a size yet may get its size and its level in one step, and tiling
+/// it now would write over that size.
+fn start_level_check(entity: Entity, opened: Option<IRect>, commands: &mut Commands) -> bool {
+    let (Some(opened), Ok(mut entity_commands)) = (opened, commands.get_entity(entity)) else {
+        return false;
+    };
+    entity_commands.try_insert(AboveOrdinaryCheck {
+        timer: Timer::new(ABOVE_ORDINARY_CHECK, TimerMode::Once),
+        opened,
+    });
+    opened.is_empty()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1561,18 +1585,12 @@ pub(super) fn apply_window_positions(
             continue;
         }
 
-        // The level read above can come too early for an app that raises
-        // the window just after it shows it, so it is read again for a while.
         if initializing.is_none()
             && !properties.above_ordinary()
             && !window.is_minimized()
-            && let Some(opened) = ctx.windows.frame(entity)
-            && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
+            && start_level_check(entity, ctx.windows.frame(entity), &mut ctx.commands)
         {
-            entity_commands.try_insert(AboveOrdinaryCheck {
-                timer: Timer::new(ABOVE_ORDINARY_CHECK, TimerMode::Once),
-                opened,
-            });
+            continue;
         }
 
         if crate::ecs::restore::matches_startup_restore_state(

@@ -1398,6 +1398,81 @@ fn a_window_that_stays_ordinary_stays_tiled() {
     assert!(query.iter(world).any(|strip| strip.contains(entity)));
 }
 
+/// Spawns window 3 without a size next to the tiled windows 0 to 2 with 0
+/// focused, as an app may show a window before it sizes and raises it.
+fn spawned_window_without_size(harness: &mut TestHarness) {
+    harness.advance(Duration::from_millis(500));
+    let empty = IRect::new(1000, 500, 1000, 500);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 3, empty);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_millis(40));
+}
+
+fn in_a_strip(world: &mut World, id: i32) -> bool {
+    let entity = find_window_entity(id, world);
+    let mut query = world.query::<&LayoutStrip>();
+    query.iter(world).any(|strip| strip.contains(entity))
+}
+
+/// A window shown without a size waits for its level before it tiles. When
+/// its app then sizes and raises it, it floats at the frame the app gave it.
+#[test]
+fn a_window_shown_without_a_size_floats_at_the_frame_its_app_gives_it() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    spawned_window_without_size(&mut harness);
+    assert!(!in_a_strip(harness.world(), 3));
+
+    harness
+        .mock_state
+        .os_resize_window(3, bevy::math::IVec2::new(400, 225));
+    harness
+        .mock_state
+        .update_window(3, |window| window.above_ordinary = true);
+    harness.advance(Duration::from_millis(500));
+
+    let world = harness.world();
+    let entity = find_window_entity(3, world);
+    assert!(matches!(
+        world.entity(entity).get::<crate::ecs::Unmanaged>(),
+        Some(crate::ecs::Unmanaged::Floating)
+    ));
+    assert!(!in_a_strip(world, 3));
+    crate::assert_focused!(world, 3);
+    let mut query = world.query::<&crate::manager::Window>();
+    let frame = query
+        .iter(world)
+        .find(|window| window.id() == 3)
+        .map(|window| window.frame());
+    assert_eq!(frame, Some(IRect::new(1000, 500, 1400, 725)));
+    assert_eq!(window_x(world, 0), 0);
+    assert_eq!(window_x(world, 1), TEST_WINDOW_WIDTH);
+    assert_eq!(window_x(world, 2), TEST_WINDOW_WIDTH * 2);
+}
+
+/// A window shown without a size that stays at the ordinary level tiles once
+/// the check ends.
+#[test]
+fn a_window_shown_without_a_size_tiles_when_it_stays_ordinary() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    spawned_window_without_size(&mut harness);
+    harness
+        .mock_state
+        .os_resize_window(3, bevy::math::IVec2::new(400, 225));
+    harness.advance(Duration::from_secs(2));
+
+    let world = harness.world();
+    let entity = find_window_entity(3, world);
+    assert!(
+        world
+            .entity(entity)
+            .get::<crate::ecs::Unmanaged>()
+            .is_none()
+    );
+    assert!(in_a_strip(world, 3));
+}
+
 /// A rule that tiles a window keeps it tiled when its app raises it just
 /// after it opens.
 #[test]
