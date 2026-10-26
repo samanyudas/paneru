@@ -3441,7 +3441,7 @@ fn the_pointer_not_the_windows_centre_starts_an_edge_hold() {
         } else {
             let press = Origin::new(start.min.x + 5, start.min.y + 10);
             let centre_dx = start.center().x - press.x;
-            (press, Origin::new(TEST_DISPLAY_WIDTH - centre_dx, 500))
+            (press, Origin::new(TEST_DISPLAY_WIDTH - 2 - centre_dx, 500))
         };
         drag_from(&mut harness, 0, press, to);
         let before = strip_x(harness.world(), TEST_WORKSPACE_ID);
