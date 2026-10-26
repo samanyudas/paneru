@@ -284,8 +284,7 @@ struct AxApp {
 /// A window as its app's writer addresses it.
 struct AxWindow {
     element: CFRetained<AXUIWrapper>,
-    /// The `(horizontal, vertical)` padding the engine keeps on every side.
-    padding: IVec2,
+    margins: Margins,
 }
 
 impl AxApp {
@@ -342,19 +341,19 @@ impl WriteSink for AxApp {
     }
 
     fn set_position(&mut self, window: &AxWindow, origin: Origin) {
-        set_ax_position(&window.element, origin + window.padding);
+        set_ax_position(&window.element, origin + window.margins.min);
     }
 
     fn set_size(&mut self, window: &AxWindow, size: Size) {
-        set_ax_size(&window.element, size - 2 * window.padding);
+        set_ax_size(
+            &window.element,
+            size - window.margins.min - window.margins.max,
+        );
     }
 
     fn read_frame(&mut self, window: &AxWindow) -> Option<IRect> {
         let frame = ax_frame(&window.element).ok()?;
-        Some(IRect {
-            min: frame.min - window.padding,
-            max: frame.max + window.padding,
-        })
+        Some(window.margins.tracked(frame))
     }
 
     fn finish(&mut self) {
@@ -404,6 +403,36 @@ fn set_ax_size(element: &AXUIWrapper, size: Size) {
 pub enum WindowPadding {
     Vertical(i32),
     Horizontal(i32),
+}
+
+/// How far the frame a window shows sits inside the frame the engine tracks
+/// for it, on each side.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Margins {
+    /// The left and top margins.
+    pub min: IVec2,
+    /// The right and bottom margins.
+    pub max: IVec2,
+}
+
+impl Margins {
+    pub fn padding(padding: IVec2) -> Self {
+        Self {
+            min: padding,
+            max: padding,
+        }
+    }
+
+    pub fn shown(self, frame: IRect) -> IRect {
+        IRect::from_corners(frame.min + self.min, frame.max - self.max)
+    }
+
+    pub fn tracked(self, frame: IRect) -> IRect {
+        IRect {
+            min: frame.min - self.min,
+            max: frame.max + self.max,
+        }
+    }
 }
 
 #[automock]
@@ -464,6 +493,9 @@ pub trait WindowApi: Send + Sync {
     fn set_padding(&mut self, padding: WindowPadding);
     fn horizontal_padding(&self) -> i32;
     fn vertical_padding(&self) -> i32;
+    /// Maps the frame the engine tracks to the frame the window shows. The
+    /// engine writes and reads every frame through it.
+    fn margins(&self) -> Margins;
     fn border_radius(&self) -> Option<f64>;
     /// How far the window's top bar (title bar, toolbar, or navigation bar)
     /// reaches below its top edge, read through Accessibility. `Ok(None)`
@@ -484,6 +516,11 @@ pub struct Window(Box<dyn WindowApi>);
 impl Window {
     pub fn new(window: Box<dyn WindowApi>) -> Self {
         Window(window)
+    }
+
+    /// The frame the user sees, in screen points.
+    pub fn shown_frame(&self) -> IRect {
+        self.margins().shown(self.frame())
     }
 
     /// Whether `element` is this window's AX element. A window without an
@@ -1040,7 +1077,7 @@ impl WindowOS {
     fn ax_window(&self) -> AxWindow {
         AxWindow {
             element: self.ax_element.clone(),
-            padding: IVec2::new(self.horizontal_padding, self.vertical_padding),
+            margins: self.margins(),
         }
     }
 }
@@ -1211,15 +1248,10 @@ impl WindowApi for WindowOS {
     /// Reads the window's frame back from Accessibility, padding included.
     fn update_frame(&mut self) -> Result<IRect> {
         let pid = self.pid().ok();
-        let padding = IVec2::new(self.horizontal_padding, self.vertical_padding);
+        let margins = self.margins();
         let element = &self.ax_element;
-        self.writes.update_frame(pid, || {
-            let frame = ax_frame(element)?;
-            Ok(IRect {
-                min: frame.min - padding,
-                max: frame.max + padding,
-            })
-        })
+        self.writes
+            .update_frame(pid, || Ok(margins.tracked(ax_frame(element)?)))
     }
 
     fn write_pending(&self) -> bool {
@@ -1317,6 +1349,10 @@ impl WindowApi for WindowOS {
 
     fn vertical_padding(&self) -> i32 {
         self.vertical_padding
+    }
+
+    fn margins(&self) -> Margins {
+        Margins::padding(IVec2::new(self.horizontal_padding, self.vertical_padding))
     }
 
     // Based on:

@@ -8,7 +8,7 @@ use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
 use bevy::ecs::system::{
     Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
 };
-use bevy::math::{IRect, IVec2};
+use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
@@ -908,7 +908,7 @@ pub(crate) fn window_frame_update(
                 new_frame,
                 IRect::from_corners(position.0, position.0 + bounds.0),
                 strip.map(|(_, position)| position.0.x),
-                (window.horizontal_padding(), window.vertical_padding()),
+                window.margins(),
                 &mut commands,
             )
         } else {
@@ -1312,17 +1312,12 @@ pub(super) fn update_overlays(
     // Find the focused managed window's absolute CG frame.
     let focused_abs_cg = {
         let frame = window.frame();
-        let h_pad = window.horizontal_padding();
-        let v_pad = window.vertical_padding();
+        let margins = window.margins();
+        let origin = frame.min + margins.min;
+        let size = frame.size() - margins.min - margins.max;
         Some(NSRect::new(
-            NSPoint::new(
-                f64::from(frame.min.x + h_pad),
-                f64::from(frame.min.y + v_pad),
-            ),
-            NSSize::new(
-                f64::from(frame.width() - 2 * h_pad),
-                f64::from(frame.height() - 2 * v_pad),
-            ),
+            NSPoint::new(f64::from(origin.x), f64::from(origin.y)),
+            NSSize::new(f64::from(size.x), f64::from(size.y)),
         ))
     };
 
@@ -1478,9 +1473,9 @@ pub(crate) fn cleanup_on_exit(
             let candidates = home
                 .as_ref()
                 .map_or(display_bounds.as_slice(), std::slice::from_ref);
-            let padding = (window.horizontal_padding(), window.vertical_padding());
-            let current = unpadded(window.frame(), padding);
-            let Some(target) = exit_frame(current, pre_launch.map(|f| f.0), candidates) else {
+            let Some(target) =
+                exit_frame(window.shown_frame(), pre_launch.map(|f| f.0), candidates)
+            else {
                 return;
             };
             info!(
@@ -1489,7 +1484,7 @@ pub(crate) fn cleanup_on_exit(
                 target.min,
                 target.size()
             );
-            let target = padded(target, padding);
+            let target = window.margins().tracked(target);
             window.place(target);
             targets.push((window.id(), target));
         }
@@ -1563,16 +1558,10 @@ fn settle_exit_frames(
     }
 }
 
-/// A window's macOS frame, from the frame Paneru tracks, which includes the
-/// `(horizontal, vertical)` padding on every side.
-pub(crate) fn unpadded(frame: IRect, (horizontal, vertical): (i32, i32)) -> IRect {
-    let padding = IVec2::new(horizontal, vertical);
-    IRect::from_corners(frame.min + padding, frame.max - padding)
-}
-
 /// The frame Paneru tracks for a window whose macOS frame is `frame`.
+#[cfg(test)]
 pub(crate) fn padded(frame: IRect, (horizontal, vertical): (i32, i32)) -> IRect {
-    let padding = IVec2::new(horizontal, vertical);
+    let padding = bevy::math::IVec2::new(horizontal, vertical);
     IRect::from_corners(frame.min - padding, frame.max + padding)
 }
 

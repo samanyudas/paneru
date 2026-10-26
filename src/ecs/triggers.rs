@@ -1,4 +1,3 @@
-use super::systems::unpadded;
 use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Mut, Ref};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
@@ -1295,7 +1294,7 @@ pub(super) fn spawn_window_trigger(
         let Ok(frame) = window.update_frame().inspect_err(|err| error!("{err}")) else {
             continue;
         };
-        let window_padding = (window.horizontal_padding(), window.vertical_padding());
+        let margins = window.margins();
         let position = Position(frame.min);
         let bounds = Bounds(frame.size());
         let width_ratio =
@@ -1328,7 +1327,7 @@ pub(super) fn spawn_window_trigger(
             .as_ref()
             .is_some_and(|launch| launch.0.contains(&window_id))
         {
-            let pre_launch = unpadded(frame, window_padding);
+            let pre_launch = margins.shown(frame);
             spawned.insert(PreLaunchFrame(pre_launch));
         }
 

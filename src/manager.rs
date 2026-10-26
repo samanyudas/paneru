@@ -49,7 +49,9 @@ use skylight::{
     SLSWindowQueryWindows,
 };
 pub(crate) use windows::forget_enhanced_ui_state;
-pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
+pub use windows::{
+    Margins, Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id,
+};
 
 #[cfg(test)]
 pub use process::MockProcessApi;
