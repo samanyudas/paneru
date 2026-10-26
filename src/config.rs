@@ -2118,6 +2118,12 @@ enum UCKeyAction {
 ///
 /// A `Vec<(String, u8)>` containing the translated key names and their keycodes. Returns an empty vector if an error occurs during keyboard layout fetching.
 fn generate_virtual_keymap() -> Vec<(String, u8)> {
+    // macOS aborts the process when two threads use the keyboard layout API
+    // at once, so only one thread builds a keymap at a time.
+    static KEYBOARD_LAYOUT_API: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = KEYBOARD_LAYOUT_API
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let keyboard = AXUIWrapper::from_retained(unsafe {
         TISCopyCurrentASCIICapableKeyboardLayoutInputSource()
     })
@@ -2169,6 +2175,24 @@ fn generate_virtual_keymap() -> Vec<(String, u8)> {
         })
         .flatten()
         .collect()
+}
+
+/// macOS aborts the process when two threads use the keyboard layout API at
+/// once, as tests and a config reload off the main thread can.
+#[test]
+fn keymaps_built_on_several_threads_at_once_do_not_abort() {
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                for _ in 0..5 {
+                    generate_virtual_keymap();
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("building a keymap");
+    }
 }
 
 #[cfg(test)]
