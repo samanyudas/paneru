@@ -36,7 +36,7 @@ const FRAME_HOLD: Duration = Duration::from_secs(1);
 
 /// How far above its target's bottom edge a shrinking window first ends.
 /// See [`approach`].
-const EDGE_RELEASE: i32 = 100;
+pub(crate) const EDGE_RELEASE: i32 = 100;
 
 /// A window maximized by a title-bar double-click.
 #[derive(Component, Clone, Copy, Debug)]

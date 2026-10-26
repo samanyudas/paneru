@@ -1431,3 +1431,37 @@ fn a_fixed_size_window_refusing_less_height_records_its_maximum() {
     let entity = find_window_entity(0, world);
     assert!(world.entity(entity).contains::<crate::ecs::MaximumHeight>());
 }
+
+/// A window whose bottom edge sits at the screen's bottom refuses a small
+/// shrink, as macOS keeps the edge there. When the display gets a little
+/// shorter, the engine still reaches the new height instead of taking the
+/// old one as the window's minimum, so a window stacked under it fits (#101).
+#[test]
+fn a_small_shrink_at_the_screen_bottom_is_not_a_minimum() {
+    const SHORTER: i32 = TALL - 16;
+    let mut harness = tall_harness();
+    harness.advance(SETTLE);
+    harness.mock_state.update_window(0, |window| {
+        window.sticky_bottom = Some(TALL);
+    });
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, SHORTER),
+    );
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayConfigured {
+            display_id: TEST_DISPLAY_ID,
+        });
+    harness.advance(SETTLE);
+    let shrunk = harness.mock_state.create_window(0).frame();
+    assert_eq!(shrunk.height(), SHORTER - TEST_MENUBAR_HEIGHT, "{shrunk:?}");
+
+    stack_two(&mut harness);
+    let frames = column(harness.world(), &[0, 1]);
+    assert_eq!(
+        heights(&frames).iter().sum::<i32>(),
+        SHORTER - TEST_MENUBAR_HEIGHT,
+        "{frames:?}"
+    );
+}
