@@ -15,9 +15,9 @@ use crate::{
     config::Config,
     ecs::{
         ActiveWorkspaceMarker, AwaitingHandle, Bounds, DockPosition, FlashMessage, FocusedMarker,
-        FullWidthMarker, Initializing, LayoutPosition, NativeFullscreenMarker,
-        PendingWidthSettlement, Position, RepositionMarker, ResizeMarker, Scrolling, Unmanaged,
-        VerifyWindowSize, WidthRatio, layout::LayoutStrip,
+        Initializing, LayoutPosition, NativeFullscreenMarker, PendingWidthSettlement, Position,
+        RepositionMarker, ResizeMarker, Scrolling, Unmanaged, VerifyWindowSize, WidthRatio,
+        layout::LayoutStrip,
     },
     manager::{Application, Display, Origin, Size, Window},
     platform::{ProcessSerialNumber, WinID},
@@ -270,17 +270,6 @@ pub struct Windows<'w, 's> {
         ),
     >,
     focus: Query<'w, 's, (&'static Window, Entity), With<FocusedMarker>>,
-    previous_size: Query<
-        'w,
-        's,
-        (
-            &'static Window,
-            Entity,
-            &'static WidthRatio,
-            &'static FullWidthMarker,
-        ),
-        With<FullWidthMarker>,
-    >,
     positions: WindowPlacements<'w, 's>,
 }
 
@@ -336,13 +325,6 @@ impl Windows<'_, '_> {
             .filter_map(|(window, entity, childof, unmanaged)| {
                 unmanaged.is_none().then_some((window, entity, childof))
             })
-    }
-
-    pub fn full_width(&self, entity: Entity) -> Option<&FullWidthMarker> {
-        self.previous_size
-            .get(entity)
-            .map(|(_, _, _, marker)| marker)
-            .ok()
     }
 
     pub fn psn(&self, window_id: WinID, apps: &Query<&Application>) -> Option<ProcessSerialNumber> {

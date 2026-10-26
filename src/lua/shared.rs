@@ -217,7 +217,8 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
         ("stack_east", Operation::Stack(Side::East)),
         ("unstack", Operation::Unstack(Side::East)),
         ("unstack_west", Operation::Unstack(Side::West)),
-        ("full_width", Operation::FullWidth),
+        ("maximize", Operation::Maximize),
+        ("full_width", Operation::Maximize),
         ("grow", Operation::Resize(ResizeDirection::Grow)),
         ("shrink", Operation::Resize(ResizeDirection::Shrink)),
         (
@@ -569,6 +570,22 @@ mod tests {
                 Command::Window(Operation::Unstack(Side::West)),
             ])
         );
+    }
+
+    /// `full_width`, the name older scripts use, and `maximize` both send
+    /// the maximize toggle, in each shape the API takes.
+    #[test]
+    fn full_width_and_maximize_send_the_maximize_toggle() {
+        let commands = run(r#"
+            paneru.window.full_width()
+            paneru.window.maximize()
+            paneru.command({ window = "full_width" })
+            paneru.command({ window = "maximize" })
+        "#)
+        .unwrap();
+
+        let maximize = parse_command(&["window", "maximize"]).unwrap();
+        assert_eq!(commands, vec![maximize; 4]);
     }
 
     #[test]

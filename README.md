@@ -281,7 +281,7 @@ $ paneru send-cmd <command> [args...]
 | `window vertical shrink`   | Shrink a stacked window to the previous preset height |
 | `window step [grow\|shrink]` | Change the column width by `window_resize_step` |
 | `window vertical step [grow\|shrink]` | Change a stacked window's height by `window_resize_step` |
-| `window fullwidth`         | Toggle full-width mode for the focused window    |
+| `window maximize`          | Maximize or restore the focused window, like a title-bar double-click (`window fullwidth` is an alias) |
 | `window manage`            | Toggle managed/floating state                    |
 | `window equalize`          | Distribute equal heights in the focused stack    |
 | `window balance`           | Make all columns match the focused window width  |

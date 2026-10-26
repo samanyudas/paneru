@@ -2720,8 +2720,15 @@ pub(super) fn reshuffle_layout_strip(
         // Check how much of the window is hidden. Slivers don't count as
         // meaningfully visible, so subtract sliver_width from the visible
         // portion. If the hidden fraction is within the allowed ratio, skip.
+        // A maximized window always fills the display, so it never stays
+        // partly hidden.
         let hidden_ratio = config.window_hidden_ratio();
-        if !resizing && width_run.is_none() && refitted_x.is_none() && hidden_ratio > 0.0 {
+        if !resizing
+            && width_run.is_none()
+            && refitted_x.is_none()
+            && hidden_ratio > 0.0
+            && strip.maximized(entity).is_none()
+        {
             let meaningful = (visible_width - config.sliver_width()).max(0);
             let visible_fraction = f64::from(meaningful) / f64::from(frame.width().max(1));
             let hidden_fraction = 1.0 - visible_fraction;

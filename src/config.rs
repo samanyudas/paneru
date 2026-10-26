@@ -2371,6 +2371,32 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
     ));
 }
 
+/// `window_fullwidth`, the binding older configs use, and `window_maximize`
+/// both bind the maximize toggle.
+#[test]
+fn test_config_parsing_maximize_bindings() {
+    let input = r#"
+[bindings]
+window_fullwidth = "ctrl+alt-f"
+window_maximize = "ctrl+alt-m"
+"#;
+    let virtual_keys = test_virtual_keymap();
+    let config = Config {
+        inner: Arc::new(ArcSwap::from_pointee(
+            InnerConfig::parse_config_with_virtual_keys(input, &virtual_keys)
+                .expect("Failed to parse config"),
+        )),
+    };
+    let bound = |name: &str| {
+        let keycode = keycode_for_key_name(name, &virtual_keys).unwrap();
+        config.find_keybind(keycode, Modifiers::CTRL | Modifiers::ALT)
+    };
+    let maximize = parse_command(&["window", "maximize"]).ok();
+    assert!(maximize.is_some(), "window maximize parses");
+    assert_eq!(bound("f"), maximize, "window_fullwidth");
+    assert_eq!(bound("m"), maximize, "window_maximize");
+}
+
 #[test]
 fn test_config_parsing_drops_binding_with_unknown_key() {
     let input = r#"

@@ -3364,7 +3364,7 @@ fn test_move_to_display_fits_a_filled_window_to_the_destination() {
     assert_focused!(harness.world(), 0);
 }
 
-/// Make column full width already fits the viewport, so it moves unchanged.
+/// A column as wide as the viewport already fits it, so it moves unchanged.
 #[test]
 fn test_move_to_display_keeps_a_full_width_column_full_width() {
     let mut harness = display_round_trip_harness(MainOptions::default(), 0, 890);
@@ -3378,7 +3378,7 @@ fn test_move_to_display_keeps_a_full_width_column_full_width() {
         Event::Command {
             command: Command::PrintState,
         },
-        window_command(Operation::FullWidth),
+        window_command(Operation::SetWidth(1.0)),
     ]);
     harness.advance(Duration::from_secs(1));
     assert_eq!(harness.mock_state.create_window(0).frame().width(), 2552);

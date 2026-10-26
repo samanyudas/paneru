@@ -42,9 +42,8 @@ use crate::ecs::display::{DisplayMoves, Placement};
 use crate::ecs::layout::{Column, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, effective_stack_limit};
 use crate::ecs::native_membership::NativeMembership;
 use crate::ecs::{
-    Bounds, FocusedMarker, FullWidthMarker, Initializing, LayoutPosition, ManualStripOffset,
-    Position, PresentedOrigin, RepositionMarker, Scrolling, SpawnCommandsExt, TopBarHeight,
-    Unmanaged,
+    Bounds, FocusedMarker, Initializing, LayoutPosition, ManualStripOffset, Position,
+    PresentedOrigin, RepositionMarker, Scrolling, SpawnCommandsExt, TopBarHeight, Unmanaged,
 };
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Origin, Window, WindowManager, origin_from};
@@ -1875,9 +1874,6 @@ fn apply_drop(
                     {
                         bounds.0.x = width;
                     }
-                }
-                if let Ok(mut entity_commands) = commands.get_entity(window) {
-                    entity_commands.try_remove::<FullWidthMarker>();
                 }
             }
             strip.insert_into_column(window, column, slot).is_ok() && destination_can_join

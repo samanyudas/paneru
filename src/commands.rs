@@ -28,10 +28,10 @@ use crate::ecs::maximize::FloatingMaximized;
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowCtx, Windows};
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, FullWidthMarker, ManualStripOffset,
-    MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, RaiseWindow,
-    SelectedVirtualMarker, SpawnCommandsExt, StepPartners, Timeout, Unmanaged, VerifyWindowSize,
-    WidthAnchor, WidthRun, WindowProperties,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, ManualStripOffset, MinimumHeight,
+    NativeFullscreenMarker, PendingWidthSettlement, RaiseWindow, SelectedVirtualMarker,
+    SpawnCommandsExt, StepPartners, Timeout, Unmanaged, VerifyWindowSize, WidthAnchor, WidthRun,
+    WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Size, Window, WindowManager, origin_from};
@@ -98,7 +98,6 @@ pub fn register_commands(app: &mut bevy::app::App) {
             resize_window,
             resize_window_vertical,
             command_center_window,
-            full_width_window,
             to_next_display,
             equalize_column,
             balance_strip,
@@ -908,12 +907,6 @@ fn resize_window(
     let Some(frame) = windows.frame(entity) else {
         return;
     };
-    if windows.full_width(entity).is_some()
-        && let Ok(mut cmds) = commands.get_entity(entity)
-    {
-        cmds.try_remove::<FullWidthMarker>();
-    }
-
     let viewport = active_display.actual_bounds(&config);
     // Pending resizes count, so a quick second press moves on to the next preset.
     let width = if pending {
@@ -1222,72 +1215,6 @@ fn stepped_heights(heights: &[i32], floors: &[i32], position: usize, height: i32
         change -= given;
     }
     stepped
-}
-
-fn full_width_window(
-    mut messages: MessageReader<Event>,
-    windows: Windows,
-    mut active_display: ActiveDisplayMut,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
-    if filter_window_operations(&mut messages, |op| matches!(op, Operation::FullWidth))
-        .next()
-        .is_none()
-    {
-        return;
-    }
-
-    let Some((_, entity)) = windows.focused() else {
-        return;
-    };
-
-    let viewport = active_display.actual_bounds(&config);
-    let tabs = active_display
-        .active_strip()
-        .tab_group(entity)
-        .unwrap_or_else(|| vec![entity]);
-
-    if let Some(marker) = windows.full_width(entity) {
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_remove::<FullWidthMarker>();
-        }
-        let w = round_px(marker.width_ratio * f64::from(viewport.width()));
-        let bounds = active_display.actual_bounds(&config).size().with_x(w);
-        if bounds.x > 0 && bounds.y > 0 {
-            for tab in &tabs {
-                if let Ok(mut entity_commands) = commands.get_entity(*tab) {
-                    entity_commands.try_remove::<NativeResizeStart>();
-                }
-            }
-        }
-        commands.resize_entity(entity, bounds);
-        commands.reshuffle_around(entity);
-    } else {
-        let strip = active_display.active_strip();
-        if strip
-            .index_of(entity)
-            .ok()
-            .and_then(|idx| strip.get(idx).ok())
-            .is_some_and(|col| matches!(col, Column::Stack(_)))
-        {
-            _ = strip.unstack(entity, Side::East);
-        }
-        let width_ratio = windows.width_ratio(entity).unwrap_or(0.5);
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_insert(FullWidthMarker { width_ratio });
-        }
-        let size = Size::new(viewport.width(), viewport.height());
-        if size.x > 0 && size.y > 0 {
-            for tab in &tabs {
-                if let Ok(mut entity_commands) = commands.get_entity(*tab) {
-                    entity_commands.try_remove::<NativeResizeStart>();
-                }
-            }
-        }
-        commands.resize_entity(entity, size);
-        commands.reshuffle_around(entity);
-    }
 }
 
 /// Toggles the managed state of the focused window.
@@ -1754,12 +1681,6 @@ fn balance_strip(
         }
 
         for entity in column.window_iter() {
-            if windows.full_width(entity).is_some()
-                && let Ok(mut cmds) = commands.get_entity(entity)
-            {
-                cmds.try_remove::<FullWidthMarker>();
-            }
-
             if let Some(size) = windows.size(entity).map(|size| size.with_x(focused_width)) {
                 if size.x > 0
                     && size.y > 0
@@ -1843,11 +1764,6 @@ pub fn stack_windows_handler(
         .and_then(|(_, entity)| windows.get_managed(entity))
         && unmanaged.is_none()
     {
-        if windows.full_width(entity).is_some()
-            && let Ok(mut entity_commands) = commands.get_entity(entity)
-        {
-            entity_commands.try_remove::<FullWidthMarker>();
-        }
         let limit = effective_stack_limit(&config, active_display.actual_bounds(&config).height());
         let strip = active_display.active_strip();
         _ = match operation {
