@@ -1461,3 +1461,26 @@ fn quitting_the_app_ends_its_overrides() {
         .expect("overrides");
     assert!(overrides.is_empty());
 }
+
+/// A window that opened floating gets the padding of a tiled window once the
+/// user tiles it.
+#[test]
+fn a_window_tiled_from_floating_gets_its_padding() {
+    let mut floating = WindowParams::new("^Window 1$", Some("test".to_string()));
+    floating.floating = Some(true);
+    let mut padded = WindowParams::new(".*", None);
+    padded.horizontal_padding = Some(4);
+    padded.vertical_padding = Some(4);
+    let config: Config = (MainOptions::default(), vec![floating, padded]).into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.advance(Duration::from_millis(500));
+    assert!(floats(&mut harness, 1));
+
+    toggle(&mut harness, 1);
+    assert!(!floats(&mut harness, 1));
+    let mut set = (None, None);
+    harness
+        .mock_state
+        .update_window(1, |window| set = window.padding_set);
+    assert_eq!(set, (Some(4), Some(4)));
+}

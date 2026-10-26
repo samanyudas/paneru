@@ -12,7 +12,7 @@ use crate::manager::app::MockApplicationApi;
 use crate::manager::window_writer::{FrameWrites, WindowWriters, WriteSink};
 use crate::manager::{
     Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
-    Window, origin_from, origin_to,
+    Window, WindowPadding, origin_from, origin_to,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::util::AXUIWrapper;
@@ -85,6 +85,9 @@ pub(crate) struct MockWindowData {
     pub(crate) controls: Vec<IRect>,
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
+    /// The last horizontal and vertical padding the engine set, which the
+    /// mock does not apply to its frames.
+    pub(crate) padding_set: (Option<i32>, Option<i32>),
     pub(crate) child_role: bool,
     /// Bumped when the app replaces the window's AX element. A `Window`
     /// handle created before the bump is stale and its `role()` fails.
@@ -154,6 +157,7 @@ impl Default for MockWindowData {
             controls: Vec::new(),
             horizontal_padding: 0,
             vertical_padding: 0,
+            padding_set: (None, None),
             child_role: false,
             ax_generation: 0,
             ax_unlisted: false,
@@ -1429,7 +1433,15 @@ impl MockState {
             .returning(move |_psn, _focused, _focused_psn| {
                 s.set_focused_window(id);
             });
-        mw.expect_set_padding().return_const(());
+        let s = self.clone();
+        mw.expect_set_padding().returning(move |padding| {
+            if let Some(window) = s.inner.force_write().windows.get_mut(&id) {
+                match padding {
+                    WindowPadding::Horizontal(padding) => window.padding_set.0 = Some(padding),
+                    WindowPadding::Vertical(padding) => window.padding_set.1 = Some(padding),
+                }
+            }
+        });
 
         Window::new(Box::new(mw))
     }
