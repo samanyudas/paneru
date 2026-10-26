@@ -1395,6 +1395,7 @@ fn a_press_during_late_handle_recovery_supersedes_the_old_placement() {
         point: crate::manager::origin_to(body),
         button: MouseButton::Left,
         window_id: Some(2),
+        clicks: 1,
         modifiers: Modifiers::empty(),
     });
     harness.advance(FRAME);
@@ -1818,6 +1819,7 @@ fn an_edge_resize_from_a_shared_column_boundary_keeps_the_users_size() {
             modifiers: Modifiers::empty(),
             button: MouseButton::Left,
             window_id,
+            clicks: 1,
         });
         harness.advance(FRAME);
         let tile = IRect::new(0, 20, 512, 768);

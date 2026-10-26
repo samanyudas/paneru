@@ -10,7 +10,7 @@
 //! - [`drag_events`] feeds platform events to [`step`] and applies its
 //!   effects to the [`LayoutStrip`].
 //!
-mod tiling;
+pub(crate) mod tiling;
 #[cfg(test)]
 pub(crate) use tiling::is_macos_tile;
 pub(crate) use tiling::{NativeFrame, NativeResizeStart, PointerResize, TilingRestore, tiled_in};
@@ -40,6 +40,7 @@ use tracing::debug;
 use crate::config::Config;
 use crate::ecs::display::{DisplayMoves, Placement};
 use crate::ecs::layout::{Column, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, effective_stack_limit};
+use crate::ecs::maximize::Maximized;
 use crate::ecs::native_membership::NativeMembership;
 use crate::ecs::{
     Bounds, FocusedMarker, FullWidthMarker, Initializing, LayoutPosition, ManualStripOffset,
@@ -1087,7 +1088,15 @@ type WindowInfo<'w, 's> = Query<
         Has<FocusedMarker>,
     ),
 >;
-type Presented<'w, 's> = Query<'w, 's, (&'static PresentedOrigin, Option<&'static TopBarHeight>)>;
+type Presented<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static PresentedOrigin,
+        Option<&'static TopBarHeight>,
+        Has<Maximized>,
+    ),
+>;
 type Placements<'w, 's> =
     Query<'w, 's, (&'static mut LayoutPosition, &'static mut Bounds), With<Window>>;
 
@@ -1342,7 +1351,10 @@ fn pressed_window(
         .iter()
         .flat_map(|(_, strip, _, _, _)| {
             strip.all_windows().into_iter().filter_map(|entity| {
-                let (origin, top_bar) = presented.get(entity).ok()?;
+                let (origin, top_bar, maximized) = presented.get(entity).ok()?;
+                if maximized {
+                    return None;
+                }
                 // An app can resize its window after the layout placed it,
                 // so the size comes from the current bounds.
                 let (_, bounds) = placements.get(entity).ok()?;
@@ -1361,6 +1373,14 @@ fn pressed_window(
     };
 
     if let Some((entity, window, unmanaged, _)) = on_top {
+        // A maximized window is not in the layout's place, and a drag only
+        // moves it.
+        if presented
+            .get(entity)
+            .is_ok_and(|(_, _, maximized)| maximized)
+        {
+            return None;
+        }
         // Of the tiled windows whose slot holds the press, such as the tabs
         // of a group, the one on top is the one pressed.
         if let Some(slot) = slots.iter().find(|(slotted, _, _)| *slotted == entity) {

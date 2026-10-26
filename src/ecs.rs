@@ -47,6 +47,7 @@ pub mod focus;
 pub mod layout;
 #[cfg(feature = "lua")]
 pub mod layout_ops;
+pub(crate) mod maximize;
 pub mod mouse;
 pub(crate) mod native_membership;
 pub mod params;
@@ -1043,6 +1044,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_non_send(watcher)
         .add_plugins(mouse::MouseEventsPlugin)
         .add_plugins(drag::DragEventsPlugin)
+        .add_plugins(maximize::MaximizePlugin)
         .add_plugins(scroll::ScrollEventsPlugin)
         .add_plugins(workspace::WorkspaceEventsPlugin)
         .add_plugins(layout::LayoutEventsPlugin)

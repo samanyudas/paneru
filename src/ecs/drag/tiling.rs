@@ -340,7 +340,7 @@ impl NativeResizeStart {
     }
 }
 
-pub(super) fn supersede_native_resize(members: &[Entity], commands: &mut Commands) {
+pub(crate) fn supersede_native_resize(members: &[Entity], commands: &mut Commands) {
     let members = members.to_vec();
     commands.queue(move |world: &mut World| {
         for member in members {

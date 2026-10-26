@@ -45,6 +45,10 @@ pub(crate) struct MockWindowData {
     /// The smallest size the app accepts, like an app with a minimum height.
     pub(crate) minimum_size: Option<Size>,
     pub(crate) resize_bottom_limit: Option<i32>,
+    /// The screen's bottom edge, which holds on to the window's bottom edge
+    /// as macOS does: a shrink that leaves the bottom within
+    /// [`STICKY_ZONE`] of the edge, from a bottom already there, is ignored.
+    pub(crate) sticky_bottom: Option<i32>,
     /// Size writes the app drops before it applies one, like an app that
     /// applies a size only after the call returns.
     pub(crate) dropped_resizes: u8,
@@ -75,6 +79,8 @@ pub(crate) struct MockWindowData {
     /// app is busy.
     pub(crate) top_bar_unreadable: bool,
     pub(crate) top_bar_reads: usize,
+    /// Screen areas where a press lands on a control, such as a toolbar button.
+    pub(crate) controls: Vec<IRect>,
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
     pub(crate) child_role: bool,
@@ -86,6 +92,11 @@ pub(crate) struct MockWindowData {
     pub(crate) ax_unlisted: bool,
 }
 
+/// How far above the screen's bottom edge [`MockWindowData::sticky_bottom`]
+/// holds a window's bottom edge. On a native rig the zone reached between 22
+/// and 42 points.
+const STICKY_ZONE: i32 = 32;
+
 impl MockWindowData {
     /// The size the app applies when asked for `size`, within its limits.
     fn accepted_size(&self, size: Size) -> Size {
@@ -95,6 +106,13 @@ impl MockWindowData {
             && size.y > 0
         {
             size.y = size.y.min((bottom - self.frame.min.y).max(0));
+        }
+        if let Some(edge) = self.sticky_bottom
+            && self.frame.max.y >= edge - STICKY_ZONE
+            && self.frame.min.y + size.y >= edge - STICKY_ZONE
+            && size.y < self.frame.height()
+        {
+            size.y = self.frame.height();
         }
         size
     }
@@ -109,6 +127,7 @@ impl Default for MockWindowData {
             maximum_size: None,
             minimum_size: None,
             resize_bottom_limit: None,
+            sticky_bottom: None,
             dropped_resizes: 0,
             late_resizes: Vec::new(),
             frame_read_delay: std::time::Duration::ZERO,
@@ -129,6 +148,7 @@ impl Default for MockWindowData {
             top_bar_height: None,
             top_bar_unreadable: false,
             top_bar_reads: 0,
+            controls: Vec::new(),
             horizontal_padding: 0,
             vertical_padding: 0,
             child_role: false,
@@ -937,12 +957,35 @@ impl MockState {
             modifiers: Modifiers::empty(),
             button: MouseButton::Left,
             window_id,
+            clicks: 1,
         });
         inner.event_queue.push_back(Event::MouseUp {
             point,
             modifiers: Modifiers::empty(),
             button: MouseButton::Left,
         });
+    }
+
+    /// Presses `point` twice in a row, as a double-click does.
+    #[allow(unused)]
+    pub fn simulate_double_click(&self, point: Origin) {
+        let mut inner = self.inner.force_write();
+        let point = CGPoint::new(point.x.into(), point.y.into());
+        let window_id = top_window_at(&inner, origin_from(point));
+        for clicks in 1..=2 {
+            inner.event_queue.push_back(Event::MouseDown {
+                point,
+                modifiers: Modifiers::empty(),
+                button: MouseButton::Left,
+                window_id,
+                clicks,
+            });
+            inner.event_queue.push_back(Event::MouseUp {
+                point,
+                modifiers: Modifiers::empty(),
+                button: MouseButton::Left,
+            });
+        }
     }
 
     #[allow(unused)]
@@ -966,6 +1009,7 @@ impl MockState {
             modifiers: Modifiers::empty(),
             button: MouseButton::Left,
             window_id,
+            clicks: 1,
         });
         inner.event_queue.push_back(Event::MouseDragged {
             point: end_p,
@@ -1339,6 +1383,15 @@ impl MockState {
                 return Err(Error::Generic(format!("window {id} is unreadable")));
             }
             Ok(window.top_bar_height)
+        });
+
+        let s = self.clone();
+        mw.expect_control_at().returning(move |point| {
+            Ok(s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .is_some_and(|w| w.controls.iter().any(|control| control.contains(point))))
         });
 
         // Focusing without raising still moves the OS focus, it just leaves the
