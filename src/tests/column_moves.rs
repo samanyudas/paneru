@@ -432,3 +432,25 @@ fn edge_focus_from_a_floating_window_focuses_the_end_column() {
     harness.run(vec![command(Operation::FocusEdge(Side::West))]);
     assert_focused!(harness.world(), 1);
 }
+
+/// A stack shown as tabs stays tabbed on the display it moves to.
+#[test]
+fn a_tabbed_stack_stays_tabbed_across_displays() {
+    let mut harness = stacked_beside(external_bounds(&Direction::North), &[100]);
+    harness.run(vec![command(Operation::ToggleTabbedDisplay)]);
+    harness.run(vec![command(Operation::MoveToDisplay(Direction::North))]);
+    let world = harness.world();
+    assert_eq!(columns(world, EXT_WORKSPACE_ID), [vec![100], vec![0, 1, 2]]);
+    let members = [0, 1, 2].map(|id| find_window_entity(id, world));
+    let tabbed = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .find(|strip| strip.id() == EXT_WORKSPACE_ID)
+        .is_some_and(|strip| {
+            members
+                .iter()
+                .all(|member| strip.is_tabbed_display(*member))
+        });
+    assert!(tabbed, "every member stays tabbed");
+    assert_focused!(world, 1);
+}
