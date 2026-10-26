@@ -483,3 +483,152 @@ fn a_window_dropped_from_another_display_into_a_maximized_column_joins_it_restor
     );
     assert_eq!(widths(&harness, &[1, 100]), vec![TEST_WINDOW_WIDTH; 2]);
 }
+
+/// A Lua handler's layout ops name a window, and restore it first as the
+/// native commands do.
+#[cfg(feature = "lua")]
+mod scripts {
+    use crate::types::windowset::LayoutOp;
+
+    use super::*;
+
+    fn layout_ops(harness: &mut TestHarness, ops: Vec<LayoutOp>) {
+        harness.run(vec![Event::Command {
+            command: Command::Layout(ops),
+        }]);
+        harness.advance(SETTLE);
+    }
+
+    /// A script that floats a maximized window, or stops managing it, restores
+    /// it first, as the float toggle does, though the window has no focus.
+    #[test]
+    fn a_script_floats_a_maximized_window_at_its_earlier_size() {
+        let float_ops = [
+            LayoutOp::SetFloating {
+                window: 1,
+                floating: true,
+            },
+            LayoutOp::SetManaged {
+                window: 1,
+                managed: false,
+            },
+        ];
+        for op in float_ops {
+            let mut reference = stacked();
+            layout_ops(&mut reference, vec![op]);
+            let floated = os_frame(&reference, 1);
+
+            let mut harness = stacked_one_maximized();
+            focus(&mut harness, Direction::East);
+            assert_focused!(harness.world(), 2);
+            layout_ops(&mut harness, vec![op]);
+            assert_eq!(os_frame(&harness, 1).size(), floated.size(), "{op:?}");
+            assert_eq!(
+                layout_on(&mut harness, TEST_WORKSPACE_ID),
+                vec![vec![0], vec![2]],
+                "{op:?}"
+            );
+        }
+    }
+
+    /// A script that stacks a maximized window restores it first, so it joins
+    /// at its earlier width, though the window has no focus.
+    #[test]
+    fn a_script_stacks_a_maximized_window_restored() {
+        let mut harness = one_maximized();
+        focus(&mut harness, Direction::East);
+
+        layout_ops(
+            &mut harness,
+            vec![LayoutOp::Stack {
+                window: 1,
+                onto: 0,
+                tabs: false,
+            }],
+        );
+        assert_eq!(
+            layout_on(&mut harness, TEST_WORKSPACE_ID),
+            vec![vec![0, 1], vec![2]]
+        );
+        assert_eq!(widths(&harness, &[0, 1]), vec![TEST_WINDOW_WIDTH; 2]);
+    }
+
+    /// A script that stacks a window onto a maximized one restores that one
+    /// first, and the two share its earlier width.
+    #[test]
+    fn a_script_stacks_a_window_onto_a_maximized_one_restored() {
+        let mut harness = one_maximized();
+
+        layout_ops(
+            &mut harness,
+            vec![LayoutOp::Stack {
+                window: 2,
+                onto: 1,
+                tabs: false,
+            }],
+        );
+        assert_eq!(
+            layout_on(&mut harness, TEST_WORKSPACE_ID),
+            vec![vec![0], vec![1, 2]]
+        );
+        assert_eq!(widths(&harness, &[1, 2]), vec![TEST_WINDOW_WIDTH; 2]);
+    }
+
+    /// A script that unstacks a maximized window restores it to a column of
+    /// its own at its earlier width, though the window has no focus.
+    #[test]
+    fn a_script_unstacks_a_maximized_window_restored() {
+        let mut harness = stacked_one_maximized();
+        let area = usable_area(&mut harness);
+        focus(&mut harness, Direction::East);
+
+        layout_ops(&mut harness, vec![LayoutOp::Unstack(1)]);
+        assert_eq!(
+            layout_on(&mut harness, TEST_WORKSPACE_ID),
+            vec![vec![0], vec![1], vec![2]]
+        );
+        let restored = os_frame(&harness, 1);
+        assert_eq!(restored.width(), TEST_WINDOW_WIDTH);
+        assert_eq!(restored.height(), area.height());
+    }
+
+    /// A script that sets the width of a maximized window without the focus
+    /// restores it to its stack first, as the width commands do.
+    #[test]
+    fn a_script_sets_the_width_of_a_maximized_window_restored_home() {
+        let mut harness = stacked();
+        harness.mock_state.focus_window(1);
+        harness.advance(SETTLE);
+        let before = os_frame(&harness, 1);
+        run(&mut harness, Operation::Maximize);
+        focus(&mut harness, Direction::East);
+        assert_focused!(harness.world(), 2);
+
+        layout_ops(
+            &mut harness,
+            vec![LayoutOp::SetWidth {
+                window: 1,
+                ratio: 0.6,
+            }],
+        );
+        assert_eq!(
+            layout_on(&mut harness, TEST_WORKSPACE_ID),
+            vec![vec![0, 1], vec![2]]
+        );
+        assert_eq!(os_frame(&harness, 1).height(), before.height());
+    }
+
+    /// A script restores a maximized window to the size it had on its own
+    /// display, though another display is active.
+    #[test]
+    fn a_script_restores_a_maximized_window_by_its_own_display() {
+        let mut harness = maximized_below_a_larger_display();
+        harness.mock_state.focus_window(100);
+        harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+        harness.advance(SETTLE);
+        assert_focused!(harness.world(), 100);
+
+        layout_ops(&mut harness, vec![LayoutOp::Unstack(1)]);
+        assert_eq!(os_frame(&harness, 1).width(), TEST_WINDOW_WIDTH);
+    }
+}
