@@ -39,7 +39,10 @@ use tracing::debug;
 
 use crate::config::Config;
 use crate::ecs::display::{DisplayMoves, Placement};
-use crate::ecs::layout::{Column, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, effective_stack_limit};
+use crate::ecs::layout::{
+    Column, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, RestoreTo, effective_stack_limit,
+};
+use crate::ecs::maximize::restore_tiled;
 use crate::ecs::native_membership::NativeMembership;
 use crate::ecs::{
     Bounds, FocusedMarker, Initializing, LayoutPosition, ManualStripOffset, Position,
@@ -132,7 +135,6 @@ pub(crate) struct Band {
 pub(crate) enum ColumnKind {
     Tiled,
     Fullscreen,
-    Maximized,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,8 +143,6 @@ pub(crate) enum Refusal {
     StackFull,
     /// A fullscreen column holds only its own window.
     Fullscreen,
-    /// A maximized column holds only its own window.
-    Maximized,
 }
 
 /// What a drop at the pointer does.
@@ -245,15 +245,11 @@ fn column_target(
         };
     }
     let own = column.holds(dragged);
-    let refusal = match column.kind {
-        ColumnKind::Tiled => None,
-        ColumnKind::Fullscreen => Some(Refusal::Fullscreen),
-        ColumnKind::Maximized => Some(Refusal::Maximized),
-    };
-    if let Some(reason) = refusal
-        && !own
-    {
-        return DropTarget::Refused { reason, display };
+    if column.kind == ColumnKind::Fullscreen && !own {
+        return DropTarget::Refused {
+            reason: Refusal::Fullscreen,
+            display,
+        };
     }
     // A reorder within its own stack never adds a window.
     if !own && column.bands.len() + 1 > limit {
@@ -1614,9 +1610,9 @@ fn snapshot_of(
                             Column::Fullscren(entity) => {
                                 (vec![vec![*entity]], ColumnKind::Fullscreen)
                             }
-                            Column::Tabs(tabs) => (vec![tabs.clone()], ColumnKind::Tiled),
-                            Column::Maximized(_) => {
-                                (vec![column.window_iter().collect()], ColumnKind::Maximized)
+                            // A drop into a maximized column restores it first.
+                            Column::Tabs(_) | Column::Maximized(_) => {
+                                (vec![column.window_iter().collect()], ColumnKind::Tiled)
                             }
                             Column::Stack(items) => (
                                 items
@@ -1791,6 +1787,7 @@ fn apply_drop(
     commands: &mut Commands,
     native: &mut NativeMembership,
 ) {
+    restore_joined_column(window, target, moves, placements, commands);
     let Some((source, _, _, source_display, _)) = moves
         .strips
         .iter()
@@ -1892,6 +1889,58 @@ fn apply_drop(
     commands.ensure_visible(window);
     if !focused {
         commands.focus_entity(window, false);
+    }
+}
+
+/// Restores a maximized window whose column `window` is dropped into, where
+/// it stands, so `window` joins it at the width it had before.
+fn restore_joined_column(
+    window: Entity,
+    target: DropTarget,
+    moves: &mut DisplayMoves,
+    placements: &mut Placements,
+    commands: &mut Commands,
+) {
+    let DropTarget::IntoColumn {
+        display, column, ..
+    } = target
+    else {
+        return;
+    };
+    let Some(viewport) = moves
+        .displays
+        .iter()
+        .find(|(_, shown, _, _)| shown.id() == display)
+        .and_then(|(entity, ..)| moves.viewport(entity))
+    else {
+        return;
+    };
+    let Some((_, mut strip, ..)) = moves
+        .shown_strip(display)
+        .and_then(|strip| moves.strips.get_mut(strip).ok())
+    else {
+        return;
+    };
+    let Some(top) = strip
+        .get(column)
+        .ok()
+        .and_then(|column| column.top())
+        .filter(|top| *top != window && strip.maximized(*top).is_some())
+    else {
+        return;
+    };
+    let Some(restored) = restore_tiled(top, &mut strip, RestoreTo::Here, viewport, commands) else {
+        return;
+    };
+    // The join reads the column's width before the restore's commands apply.
+    for member in strip
+        .get(column)
+        .iter()
+        .flat_map(|column| column.window_iter())
+    {
+        if let Ok((_, mut bounds)) = placements.get_mut(member) {
+            bounds.0 = restored.size;
+        }
     }
 }
 

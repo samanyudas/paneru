@@ -17,6 +17,8 @@ use crate::platform::{Modifiers, WinID, WorkspaceId};
 
 use super::*;
 
+mod restore_first;
+
 const SETTLE: Duration = Duration::from_secs(2);
 
 fn command(operation: Operation) -> Event {

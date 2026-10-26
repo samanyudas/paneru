@@ -21,17 +21,17 @@ use crate::ecs::display::{DisplayMoves, FloatingLayer, Placement};
 use crate::ecs::drag::NativeResizeStart;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{
-    Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, anchored_origin, clamp_origin_to_viewport,
-    effective_stack_limit, hold_minimum_heights, strip_signature,
+    Column, LayoutStrip, MIN_WINDOW_HEIGHT, RestoreTo, StackItem, anchored_origin,
+    clamp_origin_to_viewport, effective_stack_limit, hold_minimum_heights, strip_signature,
 };
-use crate::ecs::maximize::FloatingMaximized;
+use crate::ecs::maximize::{FloatingMaximized, restore_tiled};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowCtx, Windows};
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, ManualStripOffset, MinimumHeight,
-    NativeFullscreenMarker, PendingWidthSettlement, RaiseWindow, SelectedVirtualMarker,
-    SpawnCommandsExt, StepPartners, Timeout, Unmanaged, VerifyWindowSize, WidthAnchor, WidthRun,
-    WindowProperties,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, ManualStripOffset,
+    MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, RaiseWindow,
+    SelectedVirtualMarker, SpawnCommandsExt, StepPartners, Timeout, Unmanaged, VerifyWindowSize,
+    WidthAnchor, WidthRun, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Size, Window, WindowManager, origin_from};
@@ -820,14 +820,14 @@ fn end_width_runs_on_focus(
 /// The anchor for a width change: the current run's anchor, otherwise a fresh
 /// one from where the column stands.
 fn width_anchor(
-    run: Option<&WidthRun>,
+    run: Option<WidthAnchor>,
     frame: IRect,
     first_at_left: bool,
     last_at_right: bool,
     auto_center: bool,
 ) -> WidthAnchor {
-    if let Some(run) = run {
-        return run.anchor;
+    if let Some(anchor) = run {
+        return anchor;
     }
     if !auto_center && first_at_left {
         WidthAnchor::Left
@@ -866,7 +866,7 @@ fn resize_window(
     runs: Query<&WidthRun>,
     interrupted: Res<WidthBatchInterrupted>,
     time: Res<Time>,
-    active_display: ActiveDisplay,
+    mut active_display: ActiveDisplayMut,
 ) {
     let Some(operation) = filter_window_operations(&mut messages, |op| {
         matches!(
@@ -881,11 +881,26 @@ fn resize_window(
     let Some(entity) = ctx.p0().windows.focused().map(|(_, entity)| entity) else {
         return;
     };
-    // A maximized column is as wide as the viewport whatever its window's
-    // width, so a width change has nothing to act on until it is restored.
-    if active_display.active_strip().maximized(entity).is_some() {
-        return;
-    }
+    // A maximized window is restored first, and the change starts from the
+    // width it had before.
+    let restored = if active_display.strip().maximized(entity).is_some() {
+        let WindowCtx {
+            config,
+            mut commands,
+            ..
+        } = ctx.p0();
+        let viewport = active_display.actual_bounds(&config);
+        let limit = effective_stack_limit(&config, viewport.height());
+        restore_tiled(
+            entity,
+            active_display.active_strip(),
+            RestoreTo::Home { limit },
+            viewport,
+            &mut commands,
+        )
+    } else {
+        None
+    };
     let (native_resize, verifying, settling) = engine_work.get(entity).unwrap_or_default();
     // A write still on its way to the app counts as pending engine work: its
     // frame is the one the engine asked for, and reading the app's frame
@@ -896,9 +911,12 @@ fn resize_window(
         .is_ok_and(|window| window.write_pending());
     let pending = ctx.p0().windows.is_resizing(entity) || verifying || settling || writing;
     let held = native_resize.and_then(|start| start.held_size(time.elapsed()));
-    let native = (!matches!(operation, Operation::SetWidth(_)) && !pending && held.is_none())
-        .then(|| ctx.p1().get_mut(entity).ok()?.update_frame().ok())
-        .flatten();
+    let native = (restored.is_none()
+        && !matches!(operation, Operation::SetWidth(_))
+        && !pending
+        && held.is_none())
+    .then(|| ctx.p1().get_mut(entity).ok()?.update_frame().ok())
+    .flatten();
     let WindowCtx {
         windows,
         config,
@@ -907,9 +925,14 @@ fn resize_window(
     let Some(frame) = windows.frame(entity) else {
         return;
     };
+    let frame = restored.map_or(frame, |restored| {
+        IRect::from_corners(frame.min, frame.min + restored.size)
+    });
     let viewport = active_display.actual_bounds(&config);
     // Pending resizes count, so a quick second press moves on to the next preset.
-    let width = if pending {
+    let width = if restored.is_some() {
+        frame.width()
+    } else if pending {
         windows.moving_frame(entity).unwrap_or(frame).width()
     } else {
         held.or(native.map(|native| native.size()))
@@ -953,7 +976,7 @@ fn resize_window(
     let new_width = round_px(next_ratio * f64::from(viewport.width()));
     let size = Size::new(new_width, frame.height());
 
-    let strip = active_display.active_strip();
+    let strip = active_display.strip();
     let strip_entity = active_display.active_strip_entity();
     if size.x > 0
         && size.y > 0
@@ -969,7 +992,9 @@ fn resize_window(
         }
     }
     let anchor = width_anchor(
-        runs.get(entity).ok(),
+        restored
+            .map(|restored| restored.anchor)
+            .or_else(|| runs.get(entity).ok().map(|run| run.anchor)),
         frame,
         strip.index_of(entity).ok() == Some(0) && frame.min.x == viewport.min.x,
         strip
@@ -1225,11 +1250,13 @@ fn stepped_heights(heights: &[i32], floors: &[i32], position: usize, height: i32
 /// * `focused_entity` - The `Entity` of the currently focused window.
 /// * `windows` - A mutable query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
 /// * `commands` - Bevy commands to modify entities.
+#[allow(clippy::too_many_arguments)]
 fn manage_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
     apps: Query<&Application>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>, &ChildOf)>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
     config: Res<Config>,
     mut overrides: ResMut<TileOverrides>,
     mut commands: Commands,
@@ -1280,6 +1307,23 @@ fn manage_window(
         }
         _ => overrides.forget(window.id()),
     }
+    // A maximized window is restored first, so it floats at the size it had
+    // before.
+    if !was_unmanaged
+        && let Some((mut strip, _, child_of)) = workspaces
+            .iter_mut()
+            .find(|(strip, _, _)| strip.maximized(entity).is_some())
+        && let Ok((display, dock)) = displays.get(child_of.parent())
+    {
+        let viewport = display.actual_display_bounds(dock, &config);
+        restore_tiled(
+            entity,
+            &mut strip,
+            RestoreTo::Float,
+            viewport,
+            &mut commands,
+        );
+    }
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         if was_unmanaged {
             entity_commands.try_remove::<Unmanaged>();
@@ -1296,10 +1340,12 @@ fn manage_window(
     // and the user thinks the keybind is broken. Append to the active
     // strip and reshuffle so the layout pipeline tiles it.
     if was_unmanaged
-        && !workspaces.iter().any(|(strip, _)| strip.contains(entity))
+        && !workspaces
+            .iter()
+            .any(|(strip, _, _)| strip.contains(entity))
         && let Some(mut strip) = workspaces
             .iter_mut()
-            .find_map(|(strip, active)| active.then_some(strip))
+            .find_map(|(strip, active, _)| active.then_some(strip))
     {
         strip.append(entity);
         commands.reshuffle_around(entity);
@@ -1657,6 +1703,7 @@ fn balance_strip(
     mut messages: MessageReader<Event>,
     windows: Windows,
     active_display: ActiveDisplay,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::Balance))
@@ -1669,14 +1716,22 @@ fn balance_strip(
     let Some((_, focused_entity)) = windows.focused() else {
         return;
     };
-    let Some(focused_width) = windows.size(focused_entity).map(|s| s.x) else {
+    let strip = active_display.active_strip();
+    // A maximized window counts with the width it returns to.
+    let focused_width = match strip.maximized(focused_entity) {
+        Some(before) => Some(
+            before
+                .width()
+                .of_viewport(active_display.actual_bounds(&config).width()),
+        ),
+        None => windows.size(focused_entity).map(|s| s.x),
+    };
+    let Some(focused_width) = focused_width else {
         return;
     };
 
-    let strip = active_display.active_strip();
-
     for column in strip.columns() {
-        if matches!(column, Column::Fullscren(_)) {
+        if matches!(column, Column::Fullscren(_) | Column::Maximized(_)) {
             continue;
         }
 
@@ -1764,8 +1819,20 @@ pub fn stack_windows_handler(
         .and_then(|(_, entity)| windows.get_managed(entity))
         && unmanaged.is_none()
     {
-        let limit = effective_stack_limit(&config, active_display.actual_bounds(&config).height());
+        let viewport = active_display.actual_bounds(&config);
+        let limit = effective_stack_limit(&config, viewport.height());
         let strip = active_display.active_strip();
+        // A maximized window, and a maximized column it would join, are
+        // restored where they stand first, so the window goes where the
+        // layout the user sees says.
+        let target = match operation {
+            Operation::Stack(Side::West) => strip.left_neighbour(entity),
+            Operation::Stack(Side::East) => strip.right_neighbour(entity),
+            _ => None,
+        };
+        for window in std::iter::once(entity).chain(target) {
+            restore_tiled(window, strip, RestoreTo::Here, viewport, &mut commands);
+        }
         _ = match operation {
             Operation::Stack(side) => strip.stack_within_limit(entity, side, limit),
             Operation::Unstack(side) => strip.unstack(entity, side),

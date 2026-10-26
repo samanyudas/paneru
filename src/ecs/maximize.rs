@@ -8,7 +8,9 @@
 //! the strip like any column, and moves with it to another display or
 //! workspace. A stacked window leaves its stack for a column of its own to
 //! the right of the stack, and goes back to its place there on restore when
-//! it can. See [`LayoutStrip::maximize`].
+//! it can. See [`LayoutStrip::maximize`]. A width, stack, or float command,
+//! or a drop into its column, restores it first and then applies. A user's
+//! edge resize ends maximize at the new width.
 //!
 //! A maximized floating window fills the usable area of its display over the
 //! layout, and returns to its frame on restore.
@@ -33,14 +35,16 @@ use tracing::debug;
 
 use crate::commands::{Operation, filter_window_operations};
 use crate::config::Config;
-use crate::ecs::drag::tiling::supersede_native_resize;
+use crate::ecs::drag::PointerResize;
+use crate::ecs::drag::tiling::{supersede_native_resize, track_resize_gesture};
 use crate::ecs::layout::{
-    Before, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, ViewportAnchor, ViewportShare,
+    Before, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, RestoreTo, ViewportAnchor, ViewportShare,
     effective_stack_limit,
 };
+use crate::ecs::systems::window_frame_update;
 use crate::ecs::{
     Bounds, DockPosition, FocusedMarker, Position, PreUpdateSet, ResizeMarker,
-    SpawnCommandsExt as _, TopBarHeight, Unmanaged, UpdateSet, WidthRun,
+    SpawnCommandsExt as _, TopBarHeight, Unmanaged, UpdateSet, WidthAnchor, WidthRun,
 };
 use crate::events::{Event, InputEvent, MouseButton};
 use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
@@ -100,6 +104,8 @@ impl Plugin for MaximizePlugin {
             .add_systems(
                 Update,
                 hold_frames
+                    .after(track_resize_gesture)
+                    .before(window_frame_update)
                     .in_set(UpdateSet::Events)
                     .run_if(any_with_component::<FrameHold>),
             );
@@ -231,15 +237,7 @@ fn toggle_maximize(
         };
         let viewport = display.actual_display_bounds(dock, &config);
         let frame = IRect::from_corners(position.0, position.0 + bounds.0);
-        toggle_tiled(
-            entity,
-            frame,
-            &mut strip,
-            viewport,
-            &config,
-            &mut windows,
-            &mut commands,
-        );
+        toggle_tiled(entity, frame, &mut strip, viewport, &config, &mut commands);
         return;
     }
 
@@ -278,6 +276,47 @@ fn toggle_maximize(
     }
 }
 
+/// The size a restored tiled window takes, and where its column stood
+/// before it was maximized.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RestoredFrame {
+    pub size: Size,
+    pub anchor: WidthAnchor,
+}
+
+/// Ends maximize for tiled window `entity` of `strip`, whose viewport is
+/// `viewport`. The window, and every tab grouped with it, takes its size
+/// from before it was maximized, and goes where `to` says. Returns `None`
+/// when it is not maximized.
+pub(crate) fn restore_tiled(
+    entity: Entity,
+    strip: &mut LayoutStrip,
+    to: RestoreTo,
+    viewport: IRect,
+    commands: &mut Commands,
+) -> Option<RestoredFrame> {
+    let members = strip.tab_group(entity).unwrap_or_else(|| vec![entity]);
+    let restored = strip.unmaximize(entity, to)?;
+    debug!("restoring maximized window {entity}");
+    let size = Size::new(
+        restored.width.of_viewport(viewport.width()),
+        restored.height.map_or(viewport.height(), |height| {
+            height.of_viewport(viewport.height())
+        }),
+    );
+    for member in members {
+        if let Ok(mut entity_commands) = commands.get_entity(member) {
+            entity_commands
+                .try_remove::<ResizeMarker>()
+                .try_insert(Bounds(size));
+        }
+    }
+    Some(RestoredFrame {
+        size,
+        anchor: restored.anchor.in_viewport(viewport),
+    })
+}
+
 /// Maximizes tiled window `entity`, which shows `frame`, in `strip`, whose
 /// viewport is `viewport`, or restores it when it is maximized.
 fn toggle_tiled(
@@ -286,35 +325,21 @@ fn toggle_tiled(
     strip: &mut LayoutStrip,
     viewport: IRect,
     config: &Config,
-    windows: &mut Toggles,
     commands: &mut Commands,
 ) {
-    let members = strip.tab_group(entity).unwrap_or_else(|| vec![entity]);
     let limit = effective_stack_limit(config, viewport.height());
-    if let Some(restored) = strip.unmaximize(entity, limit) {
-        debug!("restoring maximized window {entity}");
-        let size = Size::new(
-            restored.width.of_viewport(viewport.width()),
-            restored.height.map_or(viewport.height(), |height| {
-                height.of_viewport(viewport.height())
-            }),
-        );
+    if let Some(restored) =
+        restore_tiled(entity, strip, RestoreTo::Home { limit }, viewport, commands)
+    {
         // The column goes back to where it stood, as after a width change,
         // rather than where the maximized column was.
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(WidthRun {
-                anchor: restored.anchor.in_viewport(viewport),
+                anchor: restored.anchor,
             });
         }
-        for member in members {
-            if let Ok((_, _, mut bounds, ..)) = windows.get_mut(member) {
-                bounds.0 = size;
-            }
-            if let Ok(mut entity_commands) = commands.get_entity(member) {
-                entity_commands.try_remove::<ResizeMarker>();
-            }
-        }
     } else {
+        let members = strip.tab_group(entity).unwrap_or_else(|| vec![entity]);
         debug!("maximizing window {entity}");
         let index = strip.index_of(entity).ok();
         let anchor = ViewportAnchor::of(
@@ -468,7 +493,12 @@ type Held<'w, 's> = Query<
 /// Puts a window back at the frame its last toggle gave it whenever the
 /// window shows another frame until the hold ends, such as after the app's
 /// own zoom.
-fn hold_frames(mut windows: Held, time: Res<Time>, mut commands: Commands) {
+fn hold_frames(
+    mut windows: Held,
+    gesture: Res<PointerResize>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
     let now = time.elapsed();
     for (entity, mut window, position, bounds, maximized, hold) in &mut windows {
         if now >= hold.until
@@ -486,6 +516,14 @@ fn hold_frames(mut windows: Held, time: Res<Time>, mut commands: Commands) {
         if let Ok(frame) = window.update_frame()
             && frame != target
         {
+            // The user's edge resize is no zoom to undo. The hold ends here,
+            // before the frame update, which takes the new size.
+            if gesture.resizes(entity, now) {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<FrameHold>();
+                }
+                continue;
+            }
             debug!("holding window {} at {target:?}", window.id());
             approach(&mut window, frame, target);
         }

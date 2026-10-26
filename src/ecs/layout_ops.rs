@@ -9,29 +9,49 @@
 
 use crate::types::windowset::LayoutOp;
 use bevy::ecs::entity::Entity;
+use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, Without};
-use bevy::ecs::system::{Commands, Query};
+use bevy::ecs::system::{Commands, Query, Res};
+use bevy::math::IRect;
 use bevy::platform::collections::HashSet;
 use tracing::debug;
 
 use crate::commands::{Command, MoveFocus, Operation, Side};
+use crate::config::Config;
 use crate::ecs::drag::NativeResizeStart;
 use crate::ecs::focus::FocusWindow;
-use crate::ecs::layout::{Column, LayoutStrip, StackItem};
+use crate::ecs::layout::{Column, LayoutStrip, RestoreTo, StackItem, effective_stack_limit};
+use crate::ecs::maximize::restore_tiled;
 use crate::ecs::params::Windows;
 use crate::ecs::workspace::VirtualMoveMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, Window,
+    ActiveWorkspaceMarker, DockPosition, SendMessageTrigger, SpawnCommandsExt, Unmanaged,
+    WidthRatio, Window,
 };
 use crate::events::Event;
-use crate::manager::{Origin, Size};
+use crate::manager::{Display, Origin, Size};
+
+type Workspaces<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        &'static ChildOf,
+    ),
+    Without<Window>,
+>;
+
+type Displays<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
 
 /// Applies the layout operations a Lua handler returned.
 pub(crate) fn apply_layout_ops(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>), Without<Window>>,
+    mut workspaces: Workspaces,
+    displays: Displays,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let batches: Vec<Vec<LayoutOp>> = messages
@@ -50,7 +70,15 @@ pub(crate) fn apply_layout_ops(
         // genuinely tiled (needed by `SetFrame`).
         let mut floated: HashSet<Entity> = HashSet::new();
         for op in ops {
-            apply(op, &windows, &mut workspaces, &mut floated, &mut commands);
+            apply(
+                op,
+                &windows,
+                &mut workspaces,
+                &displays,
+                &config,
+                &mut floated,
+                &mut commands,
+            );
         }
     }
 }
@@ -60,7 +88,9 @@ pub(crate) fn apply_layout_ops(
 fn apply(
     op: LayoutOp,
     windows: &Windows,
-    workspaces: &mut Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>), Without<Window>>,
+    workspaces: &mut Workspaces,
+    displays: &Displays,
+    config: &Config,
     floated: &mut HashSet<Entity>,
     commands: &mut Commands,
 ) {
@@ -93,9 +123,9 @@ fn apply(
                 debug!(target: "paneru::lua", "skipping {op:?}: window {other} is gone");
                 return;
             };
-            let Some((mut strip, _)) = workspaces
+            let Some((mut strip, ..)) = workspaces
                 .iter_mut()
-                .find(|(strip, _)| strip.contains(entity) && strip.contains(other_entity))
+                .find(|(strip, ..)| strip.contains(entity) && strip.contains(other_entity))
             else {
                 debug!(target: "paneru::lua", "skipping {op:?}: the two windows share no strip");
                 return;
@@ -147,7 +177,7 @@ fn apply(
             } else {
                 floated.remove(&entity);
             }
-            set_floating(entity, floating, workspaces, commands);
+            set_floating(entity, floating, workspaces, displays, config, commands);
         }
 
         LayoutOp::SetManaged { managed, .. } => {
@@ -157,7 +187,7 @@ fn apply(
             } else {
                 floated.insert(entity);
             }
-            set_floating(entity, !managed, workspaces, commands);
+            set_floating(entity, !managed, workspaces, displays, config, commands);
         }
 
         LayoutOp::SetWidth { ratio, .. } => {
@@ -166,7 +196,25 @@ fn apply(
                 debug!(target: "paneru::lua", "skipping {op:?}: a width ratio must be positive");
                 return;
             }
-            if let Some((strip, _)) = workspaces.iter().find(|(strip, _)| strip.contains(entity))
+            let focused = windows
+                .focused()
+                .is_some_and(|(_, focused)| focused == entity);
+            // A maximized window goes back to its stack first, as for the
+            // width commands. The focused one takes `resize_window` below,
+            // which restores it itself.
+            if !focused {
+                restore_first(
+                    entity,
+                    |viewport| RestoreTo::Home {
+                        limit: effective_stack_limit(config, viewport.height()),
+                    },
+                    workspaces,
+                    displays,
+                    config,
+                    commands,
+                );
+            }
+            if let Some((strip, ..)) = workspaces.iter().find(|(strip, ..)| strip.contains(entity))
                 && let Some(column) = strip
                     .index_of(entity)
                     .ok()
@@ -184,7 +232,7 @@ fn apply(
                 entity_commands.try_insert(WidthRatio(ratio));
             }
             // Stacked siblings share a column, and so its width.
-            if let Some((strip, _)) = workspaces.iter().find(|(strip, _)| strip.contains(entity))
+            if let Some((strip, ..)) = workspaces.iter().find(|(strip, ..)| strip.contains(entity))
                 && let Some(Column::Stack(stack)) = strip
                     .index_of(entity)
                     .ok()
@@ -205,10 +253,7 @@ fn apply(
             // width picker) does the real work — pixel size, viewport
             // clamping, stacked siblings, reshuffle — but only for the
             // focused window, so route through it when we can.
-            if windows
-                .focused()
-                .is_some_and(|(_, focused)| focused == entity)
-            {
+            if focused {
                 commands.trigger(SendMessageTrigger(Event::Command {
                     command: Command::Window(Operation::SetWidth(ratio)),
                 }));
@@ -235,7 +280,7 @@ fn apply(
             let size = Size::new(frame.width.max(1), frame.height.max(1));
             let group = workspaces
                 .iter()
-                .find_map(|(strip, _)| strip.tab_group(entity))
+                .find_map(|(strip, ..)| strip.tab_group(entity))
                 .unwrap_or_else(|| vec![entity]);
             for member in group {
                 if let Ok(mut entity_commands) = commands.get_entity(member) {
@@ -252,9 +297,25 @@ fn apply(
                 debug!(target: "paneru::lua", "skipping {op:?}: window {onto} is gone");
                 return;
             };
-            let Some((mut strip, _)) = workspaces
+            // The window, and a maximized column it would join, are restored
+            // where they stand first, as for the stack commands.
+            let target = workspaces
+                .iter()
+                .find(|(strip, ..)| strip.contains(entity))
+                .and_then(|(strip, ..)| strip.left_neighbour(entity));
+            for window in std::iter::once(entity).chain(target) {
+                restore_first(
+                    window,
+                    |_| RestoreTo::Here,
+                    workspaces,
+                    displays,
+                    config,
+                    commands,
+                );
+            }
+            let Some((mut strip, ..)) = workspaces
                 .iter_mut()
-                .find(|(strip, _)| strip.contains(entity) && strip.contains(onto_entity))
+                .find(|(strip, ..)| strip.contains(entity) && strip.contains(onto_entity))
             else {
                 debug!(target: "paneru::lua", "skipping {op:?}: the two windows share no strip");
                 return;
@@ -268,9 +329,17 @@ fn apply(
 
         LayoutOp::Unstack(_) => {
             let entity = entity.expect("Unstack names a window");
-            let Some((mut strip, _)) = workspaces
+            restore_first(
+                entity,
+                |_| RestoreTo::Here,
+                workspaces,
+                displays,
+                config,
+                commands,
+            );
+            let Some((mut strip, ..)) = workspaces
                 .iter_mut()
-                .find(|(strip, _)| strip.contains(entity))
+                .find(|(strip, ..)| strip.contains(entity))
             else {
                 return;
             };
@@ -289,9 +358,22 @@ fn apply(
 fn set_floating(
     entity: Entity,
     floating: bool,
-    workspaces: &mut Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>), Without<Window>>,
+    workspaces: &mut Workspaces,
+    displays: &Displays,
+    config: &Config,
     commands: &mut Commands,
 ) {
+    // A maximized window is restored first, as the float toggle does.
+    if floating {
+        restore_first(
+            entity,
+            |_| RestoreTo::Float,
+            workspaces,
+            displays,
+            config,
+            commands,
+        );
+    }
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         if floating {
             entity_commands.try_insert(Unmanaged::Floating);
@@ -301,10 +383,31 @@ fn set_floating(
     }
 
     if !floating
-        && !workspaces.iter().any(|(strip, _)| strip.contains(entity))
-        && let Some((mut strip, _)) = workspaces.iter_mut().find(|(_, active)| *active)
+        && !workspaces.iter().any(|(strip, ..)| strip.contains(entity))
+        && let Some((mut strip, ..)) = workspaces.iter_mut().find(|(_, active, _)| *active)
     {
         strip.append(entity);
         commands.reshuffle_around(entity);
+    }
+}
+
+/// Restores `entity` first when it is maximized in a strip, as the native
+/// command an op matches does. `to` picks where it goes from the viewport of
+/// the display that shows its strip.
+fn restore_first(
+    entity: Entity,
+    to: impl FnOnce(IRect) -> RestoreTo,
+    workspaces: &mut Workspaces,
+    displays: &Displays,
+    config: &Config,
+    commands: &mut Commands,
+) {
+    if let Some((mut strip, _, child_of)) = workspaces
+        .iter_mut()
+        .find(|(strip, ..)| strip.maximized(entity).is_some())
+        && let Ok((display, dock)) = displays.get(child_of.parent())
+    {
+        let viewport = display.actual_display_bounds(dock, config);
+        restore_tiled(entity, &mut strip, to(viewport), viewport, commands);
     }
 }

@@ -535,6 +535,26 @@ impl Before {
             home: None,
         }
     }
+
+    pub(crate) fn width(&self) -> ViewportShare {
+        self.width
+    }
+}
+
+/// Where a window goes when it is restored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestoreTo {
+    /// Back to its place in the stack it left, when one of the windows that
+    /// stayed there is in a column with fewer than `limit` items. Otherwise
+    /// where it stands.
+    Home { limit: usize },
+    /// Where it stands, a column of its own. An action that moves the window
+    /// on, such as a stack command or a drop, decides where it goes from
+    /// the layout the user sees.
+    Here,
+    /// Where it stands, as `Here`, but at its earlier height too: the window
+    /// leaves the layout to float, so no column sets its height.
+    Float,
 }
 
 /// The stack a maximized window left: the windows that stayed in it, top to
@@ -562,8 +582,8 @@ pub struct MaximizedColumn {
 }
 
 /// The size a restored window takes, as shares of the strip viewport: its
-/// earlier width, and its earlier height when it went back into its stack.
-/// `anchor` is where its column stood before it was maximized.
+/// earlier width, and its earlier height when it went back into its stack
+/// or is to float. `anchor` is where its column stood before it was maximized.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Restored {
     pub width: ViewportShare,
@@ -1819,12 +1839,9 @@ impl LayoutStrip {
         true
     }
 
-    /// Ends maximize for the column holding `entity`. It goes back to its
-    /// place in the stack it left when one of the windows that stayed there
-    /// is in a column of this strip with fewer than `limit` items. Otherwise
-    /// it stays a column of its own. Returns `None` when it is not
-    /// maximized.
-    pub fn unmaximize(&mut self, entity: Entity, limit: usize) -> Option<Restored> {
+    /// Ends maximize for the column holding `entity`, which goes where `to`
+    /// says. Returns `None` when it is not maximized.
+    pub(crate) fn unmaximize(&mut self, entity: Entity, to: RestoreTo) -> Option<Restored> {
         let index = self.index_of(entity).ok()?;
         let Column::Maximized(maximized) = self.columns.get(index)? else {
             return None;
@@ -1832,20 +1849,21 @@ impl LayoutStrip {
         let MaximizedColumn { item, before } = maximized.clone();
         self.columns.remove(index);
         self.released.extend(item.window_iter());
-        let home = before.home.as_ref().and_then(|home| {
-            home.mates.iter().find_map(|mate| {
+        let home = match (to, before.home.as_ref()) {
+            (RestoreTo::Home { limit }, Some(home)) => home.mates.iter().find_map(|mate| {
                 let column = self.index_of(*mate).ok()?;
                 let items = self.columns.get(column)?.stack_items()?;
                 (items.len() < limit).then_some((column, items, home.slot))
-            })
-        });
+            }),
+            _ => None,
+        };
         let height = if let Some((column, items, slot)) = home {
             self.join_items(column, items, item, slot, false);
             Some(before.height)
         } else {
             self.columns
                 .insert(index.min(self.len()), item.into_column());
-            None
+            (to == RestoreTo::Float).then_some(before.height)
         };
         Some(Restored {
             width: before.width,
@@ -3527,10 +3545,24 @@ mod tests {
         strip.maximize(e[3], Side::West, half()).unwrap();
         assert_eq!(render(&strip, &e), "[A, C] | ^B | ^D");
 
-        let restored = strip.unmaximize(e[1], 3).unwrap();
+        let restored = strip.unmaximize(e[1], home(3)).unwrap();
         assert_eq!(render(&strip, &e), "[A, B, C] | ^D");
         assert_eq!(restored.height, Some(ViewportShare(0.5)));
-        assert_eq!(strip.unmaximize(e[1], 3), None, "no longer maximized");
+        assert_eq!(strip.unmaximize(e[1], home(3)), None, "no longer maximized");
+    }
+
+    fn home(limit: usize) -> RestoreTo {
+        RestoreTo::Home { limit }
+    }
+
+    #[test]
+    fn a_window_restored_here_stays_a_column_where_it_stands() {
+        let (_world, mut strip, e) = strip_of(3);
+        strip.stack(e[1], Side::West).unwrap();
+        strip.maximize(e[1], Side::East, half()).unwrap();
+        let restored = strip.unmaximize(e[1], RestoreTo::Here).unwrap();
+        assert_eq!(render(&strip, &e), "A | B | C");
+        assert_eq!(restored.height, None);
     }
 
     #[test]
@@ -3539,7 +3571,7 @@ mod tests {
         strip.stack(e[1], Side::West).unwrap();
         strip.maximize(e[1], Side::East, half()).unwrap();
         strip.remove(e[0]);
-        let restored = strip.unmaximize(e[1], 3).unwrap();
+        let restored = strip.unmaximize(e[1], home(3)).unwrap();
         assert_eq!(render(&strip, &e), "B | C");
         assert_eq!(restored.height, None);
     }
@@ -3558,14 +3590,14 @@ mod tests {
     #[test]
     fn a_restored_window_goes_back_to_a_mate_that_moved() {
         let (_world, mut strip, e) = a_mate_moved_away();
-        strip.unmaximize(e[1], 3);
+        strip.unmaximize(e[1], home(3));
         assert_eq!(render(&strip, &e), "[C, B, A] | D");
     }
 
     #[test]
     fn a_restored_window_stays_a_column_when_its_mates_column_is_full() {
         let (_world, mut strip, e) = a_mate_moved_away();
-        strip.unmaximize(e[1], 2);
+        strip.unmaximize(e[1], home(2));
         assert_eq!(render(&strip, &e), "B | [C, A] | D");
     }
 
@@ -3596,7 +3628,7 @@ mod tests {
         strip.maximize(e[0], Side::East, half()).unwrap();
         strip.maximize(e[1], Side::East, half()).unwrap();
         strip.maximize(e[2], Side::East, half()).unwrap();
-        strip.unmaximize(e[0], 3);
+        strip.unmaximize(e[0], home(3));
         strip.remove(e[1]);
         strip.stack(e[2], Side::West).unwrap();
         assert_eq!(render(&strip, &e), "[A, C]");
@@ -3609,7 +3641,7 @@ mod tests {
         let (_world, mut strip, e) = strip_of(2);
         assert!(strip.adopt_maximized(e[1], half()));
         assert_eq!(render(&strip, &e), "A | ^B");
-        let restored = strip.unmaximize(e[1], 3).unwrap();
+        let restored = strip.unmaximize(e[1], home(3)).unwrap();
         assert_eq!(restored.width, ViewportShare(0.5));
         assert_eq!(render(&strip, &e), "A | B");
     }

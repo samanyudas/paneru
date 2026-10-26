@@ -45,7 +45,7 @@ pub(crate) enum PointerResize {
 }
 
 impl PointerResize {
-    fn resizes(&self, entity: Entity, now: Duration) -> bool {
+    pub(crate) fn resizes(&self, entity: Entity, now: Duration) -> bool {
         match self {
             Self::Held(windows) => windows.contains(&entity),
             Self::Released { windows, until } => now <= *until && windows.contains(&entity),
@@ -65,7 +65,7 @@ impl PointerResize {
 
 /// A resize remains a user resize when its last AX notification arrives
 /// after mouse-up. The next press starts a separate gesture.
-pub(super) fn track_resize_gesture(
+pub(crate) fn track_resize_gesture(
     mut events: MessageReader<Event>,
     mut gesture: ResMut<PointerResize>,
     windows: Query<
@@ -412,6 +412,11 @@ pub(crate) enum NativeFrame {
 }
 
 impl TilingRestore<'_, '_> {
+    /// Whether the user is resizing `entity` by an edge with the pointer.
+    pub(crate) fn user_resizes(&self, entity: Entity) -> bool {
+        self.gesture.resizes(entity, self.time.elapsed())
+    }
+
     pub(crate) fn due(&self, entity: Entity) -> bool {
         let now = self.time.elapsed();
         self.presented
