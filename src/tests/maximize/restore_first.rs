@@ -274,6 +274,29 @@ fn an_edge_resize_ends_maximize_and_keeps_the_new_width() {
     assert_eq!(os_frame(&harness, 1), area, "the next toggle maximizes");
 }
 
+/// An edge resize right after the toggle, while the engine still holds the
+/// window at its maximized frame against the app's own zoom, is the user's:
+/// it ends maximize and keeps the new width.
+#[test]
+fn an_edge_resize_during_the_frame_hold_ends_maximize() {
+    let mut harness = three_windows_one_focused();
+    let area = usable_area(&mut harness);
+    harness.run(vec![command(Operation::Maximize)]);
+    harness.advance(Duration::from_millis(200));
+    assert_eq!(os_frame(&harness, 1), area);
+
+    edge_resize(
+        &mut harness,
+        1,
+        Origin::new(area.max.x - 1, area.center().y),
+        Size::new(700, area.height()),
+    );
+    assert_eq!(os_frame(&harness, 1).width(), 700);
+
+    run(&mut harness, Operation::Maximize);
+    assert_eq!(os_frame(&harness, 1), area, "the next toggle maximizes");
+}
+
 /// A window that opens while a maximized window has the focus opens in a
 /// column beside it, and the maximized window stays maximized.
 #[test]

@@ -35,11 +35,13 @@ use tracing::debug;
 
 use crate::commands::{Operation, filter_window_operations};
 use crate::config::Config;
-use crate::ecs::drag::tiling::supersede_native_resize;
+use crate::ecs::drag::PointerResize;
+use crate::ecs::drag::tiling::{supersede_native_resize, track_resize_gesture};
 use crate::ecs::layout::{
     Before, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, RestoreTo, ViewportAnchor, ViewportShare,
     effective_stack_limit,
 };
+use crate::ecs::systems::window_frame_update;
 use crate::ecs::{
     Bounds, DockPosition, FocusedMarker, Position, PreUpdateSet, ResizeMarker,
     SpawnCommandsExt as _, TopBarHeight, Unmanaged, UpdateSet, WidthAnchor, WidthRun,
@@ -102,6 +104,8 @@ impl Plugin for MaximizePlugin {
             .add_systems(
                 Update,
                 hold_frames
+                    .after(track_resize_gesture)
+                    .before(window_frame_update)
                     .in_set(UpdateSet::Events)
                     .run_if(any_with_component::<FrameHold>),
             );
@@ -489,7 +493,12 @@ type Held<'w, 's> = Query<
 /// Puts a window back at the frame its last toggle gave it whenever the
 /// window shows another frame until the hold ends, such as after the app's
 /// own zoom.
-fn hold_frames(mut windows: Held, time: Res<Time>, mut commands: Commands) {
+fn hold_frames(
+    mut windows: Held,
+    gesture: Res<PointerResize>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
     let now = time.elapsed();
     for (entity, mut window, position, bounds, maximized, hold) in &mut windows {
         if now >= hold.until
@@ -507,6 +516,14 @@ fn hold_frames(mut windows: Held, time: Res<Time>, mut commands: Commands) {
         if let Ok(frame) = window.update_frame()
             && frame != target
         {
+            // The user's edge resize is no zoom to undo. The hold ends here,
+            // before the frame update, which takes the new size.
+            if gesture.resizes(entity, now) {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<FrameHold>();
+                }
+                continue;
+            }
             debug!("holding window {} at {target:?}", window.id());
             approach(&mut window, frame, target);
         }
