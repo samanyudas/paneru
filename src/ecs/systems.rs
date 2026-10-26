@@ -29,7 +29,7 @@ use crate::ecs::display::FloatingLayer;
 use crate::ecs::drag::{
     DragOverlayHandle, NativeFrame, NativeResizeStart, TilingRestore, tiled_in,
 };
-use crate::ecs::layout::{Column, LayoutStrip};
+use crate::ecs::layout::{Column, LayoutStrip, RestoreTo};
 use crate::ecs::maximize::{FloatingMaximized, FrameHold};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
@@ -830,7 +830,7 @@ type FrameRechecks<'w, 's> = Query<
 pub(crate) fn window_frame_update(
     mut messages: MessageReader<Event>,
     mut windows: NativeFrameWindows,
-    mut workspaces: Query<(&LayoutStrip, &mut Position)>,
+    mut workspaces: Query<(&mut LayoutStrip, &mut Position)>,
     rechecks: FrameRechecks,
     swipes: Query<&Scrolling, With<ActiveWorkspaceMarker>>,
     tiling: TilingRestore,
@@ -954,6 +954,15 @@ pub(crate) fn window_frame_update(
             }
             NativeFrame::Ordinary => {
                 if resized && !engine {
+                    // The user's edge resize of a maximized window ends
+                    // maximize, and the window keeps the width it was given.
+                    if tiling.user_resizes(entity)
+                        && let Some((mut strip, _)) = workspaces
+                            .iter_mut()
+                            .find(|(strip, _)| strip.maximized(entity).is_some())
+                    {
+                        strip.unmaximize(entity, RestoreTo::Here);
+                    }
                     adopt_native_size(
                         entity,
                         new_frame,
@@ -1023,7 +1032,7 @@ fn adopt_native_size(
     entity: Entity,
     new_frame: IRect,
     windows: &mut NativeFrameWindows,
-    workspaces: &mut Query<(&LayoutStrip, &mut Position)>,
+    workspaces: &mut Query<(&mut LayoutStrip, &mut Position)>,
     commands: &mut Commands,
 ) {
     let Ok((_, _, position, mut bounds, .., (minimum_height, maximum_height, width_limits))) =
@@ -1120,7 +1129,7 @@ fn adopt_refused_frame(
     entity: Entity,
     new_frame: IRect,
     windows: &mut NativeFrameWindows,
-    workspaces: &Query<(&LayoutStrip, &mut Position)>,
+    workspaces: &Query<(&mut LayoutStrip, &mut Position)>,
     commands: &mut Commands,
 ) {
     let wider = windows.get_mut(entity).is_ok_and(

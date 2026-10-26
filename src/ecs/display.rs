@@ -114,7 +114,7 @@ impl DisplayMoves<'_, '_> {
             .map(|(entity, _, _, _, _)| entity)
     }
 
-    fn viewport(&self, display_entity: Entity) -> Option<IRect> {
+    pub(crate) fn viewport(&self, display_entity: Entity) -> Option<IRect> {
         let (_, display, dock, _) = self.displays.get(display_entity).ok()?;
         Some(display.actual_display_bounds(dock, &self.config))
     }

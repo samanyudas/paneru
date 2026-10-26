@@ -412,6 +412,11 @@ pub(crate) enum NativeFrame {
 }
 
 impl TilingRestore<'_, '_> {
+    /// Whether the user is resizing `entity` by an edge with the pointer.
+    pub(crate) fn user_resizes(&self, entity: Entity) -> bool {
+        self.gesture.resizes(entity, self.time.elapsed())
+    }
+
     pub(crate) fn due(&self, entity: Entity) -> bool {
         let now = self.time.elapsed();
         self.presented
