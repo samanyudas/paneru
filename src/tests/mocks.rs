@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, Weak};
 
 use bevy::prelude::*;
@@ -247,6 +248,8 @@ pub struct MockState {
     /// Carries the window writes of apps with `queued_writes`.
     writers: Arc<WindowWriters<MockApp>>,
     holds: Arc<WriteHolds>,
+    /// See [`Self::engine_waits`].
+    engine_waits: Arc<AtomicUsize>,
 }
 
 /// Apps whose writer hangs inside its next write until released, like an
@@ -441,6 +444,7 @@ impl MockState {
             inner,
             writers,
             holds,
+            engine_waits: Arc::default(),
         }
     }
 
@@ -1152,6 +1156,12 @@ impl MockState {
         self.holds.released.notify_all();
     }
 
+    /// How many times the engine started a frame read or a flush while a
+    /// queued write had yet to land, each of which waits on an app's writer.
+    pub fn engine_waits(&self) -> usize {
+        self.engine_waits.load(Ordering::Relaxed)
+    }
+
     /// Waits up to `timeout` for every queued write to land.
     pub fn flush_writes(&self, timeout: std::time::Duration) -> bool {
         self.writers.flush(timeout)
@@ -1250,7 +1260,11 @@ impl MockState {
         let w = writes.clone();
         mw.expect_update_frame().returning(move || {
             let margins = fill_margins(&s.inner, id);
-            lock(&w).update_frame(Some(pid), || {
+            let mut writes = lock(&w);
+            if writes.write_pending(Some(pid)) {
+                s.engine_waits.fetch_add(1, Ordering::Relaxed);
+            }
+            writes.update_frame(Some(pid), || {
                 mock_read_frame(&s.inner, id, ax_generation).map(|frame| margins.tracked(frame))
             })
         });
@@ -1793,8 +1807,12 @@ impl MockState {
         wm.expect_get_associated_windows().return_const(vec![]);
 
         let s = self.clone();
-        wm.expect_flush_window_writes()
-            .returning(move |timeout| s.flush_writes(timeout));
+        wm.expect_flush_window_writes().returning(move |timeout| {
+            if !s.flush_writes(std::time::Duration::ZERO) {
+                s.engine_waits.fetch_add(1, Ordering::Relaxed);
+            }
+            s.flush_writes(timeout)
+        });
 
         let s = self.clone();
         wm.expect_find_window_at_point().returning(move |at_point| {
