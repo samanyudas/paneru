@@ -1160,8 +1160,14 @@ fn grab(frame: IRect) -> Origin {
 /// macOS reports it: each pointer move, then the window following one frame
 /// later with a `WindowMoved`. Returns the window's frame before the drag.
 fn press_and_drag(harness: &mut TestHarness, id: WinID, to: Origin) -> IRect {
+    let press = grab(frame(harness.world(), id));
+    drag_from(harness, id, press, to)
+}
+
+/// [`press_and_drag`] with window `id` grabbed at `press` instead of across
+/// from its centre.
+fn drag_from(harness: &mut TestHarness, id: WinID, press: Origin, to: Origin) -> IRect {
     let start = frame(harness.world(), id);
-    let press = grab(start);
     press_at(harness, press);
     harness.advance(FRAME);
     let steps = 6;
@@ -1442,43 +1448,45 @@ fn a_drop_within_its_own_stack_reorders_it() {
     assert_one_column(harness.world(), &[2, 0]);
 }
 
-/// Sam's case from #72: the top window of a stack grabbed beside the
-/// right end of its top bar and dragged straight down. The pointer stays in
-/// the column's right quarter, but the window's centre stays over its
-/// middle, so the drop reorders the stack instead of opening a new column.
+/// Sam's case from #72: the top window of a stack grabbed beside one end of
+/// its top bar and dragged straight down. The pointer stays in the column's
+/// outer quarter, but the window's centre stays over its middle, so the drop
+/// reorders the stack instead of opening a new column.
 #[test]
-fn a_stack_member_grabbed_near_its_right_edge_and_dragged_down_reorders_it() {
-    let mut harness = three_columns();
-    let below_the_middle = middle_of(harness.world(), 0, 600);
-    title_drag(&mut harness, 2, below_the_middle);
-    assert_eq!(layout(harness.world()), vec![vec![0, 2], vec![1]]);
+fn a_stack_member_grabbed_near_either_edge_and_dragged_down_reorders_it() {
+    for right in [false, true] {
+        let mut harness = three_columns();
+        let below_the_middle = middle_of(harness.world(), 0, 600);
+        title_drag(&mut harness, 2, below_the_middle);
+        assert_eq!(layout(harness.world()), vec![vec![0, 2], vec![1]]);
 
-    let start = frame(harness.world(), 0);
-    let press = Origin::new(start.max.x - 5, start.min.y + 10);
-    press_at(&mut harness, press);
-    harness.advance(FRAME);
-    let to = Origin::new(press.x, TEST_DISPLAY_HEIGHT - 1);
-    for at in 1..=6 {
-        let point = press + (to - press) * at / 6;
-        harness.world().write_message(mouse_dragged(point));
-        harness
-            .mock_state
-            .os_move_window(0, start.min + (point - press));
-        harness.advance(FRAME);
+        let start = frame(harness.world(), 0);
+        let x = if right {
+            start.max.x - 5
+        } else {
+            start.min.x + 5
+        };
+        let press = Origin::new(x, start.min.y + 10);
+        let to = Origin::new(x, TEST_DISPLAY_HEIGHT - 1);
+        drag_from(&mut harness, 0, press, to);
+        assert!(
+            matches!(
+                feedback(harness.world()),
+                Some(OverlayShape::Line(line)) if line.width() > line.height()
+            ),
+            "right={right}: a horizontal insertion line: {:?}",
+            feedback(harness.world())
+        );
+        release(&mut harness, to);
+        harness.advance(SETTLE);
+
+        assert_eq!(
+            layout(harness.world()),
+            vec![vec![2, 0], vec![1]],
+            "right={right}"
+        );
+        assert_one_column(harness.world(), &[2, 0]);
     }
-    assert!(
-        matches!(
-            feedback(harness.world()),
-            Some(OverlayShape::Line(line)) if line.width() > line.height()
-        ),
-        "a horizontal insertion line: {:?}",
-        feedback(harness.world())
-    );
-    release(&mut harness, to);
-    harness.advance(SETTLE);
-
-    assert_eq!(layout(harness.world()), vec![vec![2, 0], vec![1]]);
-    assert_one_column(harness.world(), &[2, 0]);
 }
 
 #[test]
