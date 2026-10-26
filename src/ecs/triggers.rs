@@ -1474,12 +1474,18 @@ pub(super) fn apply_window_positions(
                 }
             }
             // macOS reported the new window's focus before it was tracked, so
-            // it takes focus here, as a tiled window does below.
+            // it takes focus here, as a tiled window does below. A window kept
+            // above ordinary windows, such as Picture-in-Picture, often opens
+            // without focus, so the engine gives it focus once.
             if initializing.is_none() && !minimized && !properties.dont_focus() {
-                ctx.commands
-                    .trigger(SendMessageTrigger(Event::WindowFocused {
-                        window_id: window.id(),
-                    }));
+                if properties.above_ordinary() {
+                    ctx.commands.focus_entity(entity, true);
+                } else {
+                    ctx.commands
+                        .trigger(SendMessageTrigger(Event::WindowFocused {
+                            window_id: window.id(),
+                        }));
+                }
             }
             continue;
         }
