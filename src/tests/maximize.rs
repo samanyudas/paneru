@@ -10,7 +10,7 @@ use crate::commands::{Command, Direction, Operation, Side};
 use crate::config::{Config, MainOptions};
 use crate::ecs::drag::{DragFeedback, DragState, OverlayShape};
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::{DockPosition, Position, SelectedVirtualMarker};
+use crate::ecs::{DockPosition, SelectedVirtualMarker};
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::{Modifiers, WinID, WorkspaceId};
@@ -78,8 +78,16 @@ fn a_title_bar_double_click_maximizes_and_the_next_restores() {
 
     double_click_title_bar(&mut harness, 1);
     assert_eq!(os_frame(&harness, 1), usable_area(&mut harness));
-    let others = frames(&harness, &[0, 2]);
-    assert_eq!(others, vec![before[0], before[2]], "neighbors stay put");
+    let sizes = frames(&harness, &[0, 2])
+        .iter()
+        .map(IRect::size)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sizes,
+        vec![before[0].size(), before[2].size()],
+        "neighbors keep their sizes"
+    );
+    assert_nothing_covers(&mut harness, 1, &[0, 2]);
 
     double_click_title_bar(&mut harness, 1);
     assert_eq!(frames(&harness, &[0, 1, 2]), before);
@@ -168,7 +176,11 @@ fn a_stacked_window_returns_to_its_place_in_the_stack() {
 
     double_click_title_bar(&mut harness, 1);
     assert_eq!(os_frame(&harness, 1), usable_area(&mut harness));
-    assert_eq!(os_frame(&harness, 0), before[0], "its stack mate stays put");
+    assert_eq!(
+        os_frame(&harness, 0).width(),
+        before[0].width(),
+        "its stack mate keeps its width"
+    );
 
     double_click_title_bar(&mut harness, 1);
     assert_eq!(frames(&harness, &[0, 1, 2]), before);
@@ -261,8 +273,8 @@ fn a_window_returns_to_a_slot_that_ends_near_the_screen_edge() {
     assert_eq!(frames(&harness, &[0, 1, 2]), before);
 }
 
-/// A maximized window the user dragged away still restores from its top
-/// bar where it is now.
+/// A maximized window moved away from its column still restores from its
+/// top bar where it is now.
 #[test]
 fn a_dragged_maximized_window_restores_from_where_it_is() {
     // Queued writes keep the frame the engine last wrote or read, as the
@@ -347,16 +359,13 @@ fn move_to_display(harness: &mut TestHarness, direction: Direction, display: u32
     harness.advance(SETTLE);
 }
 
-/// Drags window 1 by its title bar to `origin`, with the pointer released
-/// at `release`.
-fn drag_to(harness: &mut TestHarness, origin: Origin, release: Origin, space: u64) {
-    let start = title_bar(harness, 1);
-    harness.mock_state.simulate_drag(start, release);
-    harness.mock_state.os_move_window(1, origin);
-    harness
-        .mock_state
-        .update_window(1, |window| window.workspace_id = space);
-    harness.advance(SETTLE);
+/// Drags window 1 by its title bar to `to`, where macOS reports it in
+/// `space` when the button is released.
+fn drag_title_bar(harness: &mut TestHarness, to: Origin, space: WorkspaceId) {
+    let press = title_bar(harness, 1);
+    press_title_bar(harness, press);
+    drag_steps(harness, press, to);
+    release_at(harness, to, space);
 }
 
 /// A maximized window moved by the display commands stays maximized and
@@ -387,50 +396,25 @@ fn a_maximized_window_moved_to_another_display_fills_it() {
 }
 
 /// A maximized window dragged by its title bar to another display fills
-/// that display's usable area, in both directions. A drag within one
-/// display leaves it where the user dropped it.
+/// that display's usable area, in both directions. A drag within its own
+/// display leaves it maximized in its row, filling the display.
 #[test]
 fn a_maximized_window_dragged_to_another_display_fills_it() {
     let mut harness = maximized_below_a_larger_display();
 
-    // macOS can drop the window below the pointer: on a native rig Finder
-    // ended 18 points lower.
-    drag_to(
-        &mut harness,
-        Origin::new(0, -1082),
-        Origin::new(500, -1100),
-        EXT_WORKSPACE_ID,
-    );
+    drag_title_bar(&mut harness, Origin::new(700, -600), EXT_WORKSPACE_ID);
     let area = usable_area_of(&mut harness, EXT_DISPLAY_ID);
     assert_eq!(os_frame(&harness, 1), area);
 
-    // Dropped low on the large display, the window's centre is on the
-    // display below, but the pointer and macOS keep it on the large one.
-    drag_to(
-        &mut harness,
-        Origin::new(0, -500),
-        Origin::new(500, -490),
-        EXT_WORKSPACE_ID,
-    );
-    assert_eq!(os_frame(&harness, 1).min, Origin::new(0, -500));
-    assert_eq!(os_frame(&harness, 1).size(), area.size());
+    drag_title_bar(&mut harness, Origin::new(1000, -1000), EXT_WORKSPACE_ID);
+    assert_eq!(os_frame(&harness, 1), area);
 
-    drag_to(
-        &mut harness,
-        Origin::new(-200, 100),
-        Origin::new(500, 110),
-        TEST_WORKSPACE_ID,
-    );
+    drag_title_bar(&mut harness, Origin::new(900, 300), TEST_WORKSPACE_ID);
     let area = usable_area_of(&mut harness, TEST_DISPLAY_ID);
     assert_eq!(os_frame(&harness, 1), area);
 
-    drag_to(
-        &mut harness,
-        Origin::new(50, 60),
-        Origin::new(500, 70),
-        TEST_WORKSPACE_ID,
-    );
-    assert_eq!(os_frame(&harness, 1).min, Origin::new(50, 60));
+    drag_title_bar(&mut harness, Origin::new(600, 400), TEST_WORKSPACE_ID);
+    assert_eq!(os_frame(&harness, 1), area);
 }
 
 /// With the larger display to the right, a maximized window moved by the
@@ -459,20 +443,10 @@ fn a_maximized_window_moved_between_side_by_side_displays_fills_them() {
     assert_eq!(os_frame(&harness, 1), test);
     assert_focused!(harness.world(), 1);
 
-    drag_to(
-        &mut harness,
-        Origin::new(1200, 40),
-        Origin::new(1700, 50),
-        EXT_WORKSPACE_ID,
-    );
+    drag_title_bar(&mut harness, Origin::new(2800, 300), EXT_WORKSPACE_ID);
     assert_eq!(os_frame(&harness, 1), ext);
 
-    drag_to(
-        &mut harness,
-        Origin::new(-300, 40),
-        Origin::new(200, 50),
-        TEST_WORKSPACE_ID,
-    );
+    drag_title_bar(&mut harness, Origin::new(900, 300), TEST_WORKSPACE_ID);
     assert_eq!(os_frame(&harness, 1), test);
 }
 
@@ -544,17 +518,6 @@ fn release_at(harness: &mut TestHarness, point: Origin, space: WorkspaceId) {
     harness.advance(SETTLE);
 }
 
-/// The position of the shown strip on `workspace`.
-fn strip_position(harness: &mut TestHarness, workspace: WorkspaceId) -> IVec2 {
-    let world = harness.world();
-    world
-        .query_filtered::<(&LayoutStrip, &Position), With<SelectedVirtualMarker>>()
-        .iter(world)
-        .find(|(strip, _)| strip.id() == workspace)
-        .map(|(_, position)| position.0)
-        .expect("a strip for the workspace")
-}
-
 /// A maximized window dragged by its title bar shows no drop line over its
 /// own display, and the usual line over another one. Dropped there, it
 /// joins that display's layout at the line, fills the display, and keeps
@@ -600,15 +563,14 @@ fn a_maximized_window_dragged_to_another_display_joins_its_layout() {
     );
 }
 
-/// The engine stops reading a maximized window's moves. An app that moves
-/// the window afterwards does not stop a drag from its title bar where it is
-/// now.
+/// An app that nudges a maximized window does not stop a drag from its
+/// title bar, and the window fills the display it is dropped on.
 #[test]
 fn a_maximized_window_an_app_moved_still_drags_to_another_display() {
     let mut harness = maximized_below_a_larger_display();
-    harness.mock_state.os_move_window(1, Origin::new(0, 200));
+    harness.mock_state.os_move_window(1, Origin::new(0, 30));
     harness.advance(SETTLE);
-    let press = Origin::new(500, 210);
+    let press = Origin::new(500, 40);
     let across = Origin::new(700, -600);
 
     press_title_bar(&mut harness, press);
@@ -628,27 +590,12 @@ fn a_maximized_window_an_app_moved_still_drags_to_another_display() {
 }
 
 /// A drag of a maximized window within its display whose release never
-/// reaches the engine ends when the button reads up. The window stays where
-/// it was let go, and the strip behind it does not scroll to its slot.
+/// reaches the engine ends when the button reads up. The window stays
+/// maximized in its row and fills the display again.
 #[test]
-fn a_lost_release_of_a_maximized_window_on_its_display_keeps_the_strip() {
+fn a_lost_release_of_a_maximized_window_on_its_display_keeps_it_maximized() {
     let mut harness = maximized_below_a_larger_display();
-    // Scroll the strip so window 1's slot is off the display.
-    let world = harness.world();
-    let strip = world
-        .query_filtered::<(Entity, &LayoutStrip), With<SelectedVirtualMarker>>()
-        .iter(world)
-        .find(|(_, strip)| strip.id() == TEST_WORKSPACE_ID)
-        .map(|(entity, _)| entity)
-        .expect("a strip");
-    world
-        .entity_mut(strip)
-        .get_mut::<Position>()
-        .expect("a position")
-        .0
-        .x -= 2000;
-    harness.advance(SETTLE);
-    let scrolled = strip_position(&mut harness, TEST_WORKSPACE_ID);
+    let area = usable_area_of(&mut harness, TEST_DISPLAY_ID);
     let press = Origin::new(500, 30);
     let within = Origin::new(600, 200);
 
@@ -665,8 +612,7 @@ fn a_lost_release_of_a_maximized_window_on_its_display_keeps_the_strip() {
     harness.advance(SETTLE);
 
     assert!(!harness.world().resource::<DragState>().holds_window());
-    assert_eq!(strip_position(&mut harness, TEST_WORKSPACE_ID), scrolled);
-    assert_eq!(os_frame(&harness, 1).min, Origin::new(100, 190));
+    assert_eq!(os_frame(&harness, 1), area);
 }
 
 /// The frame the engine has the window show, padding applied.
@@ -989,4 +935,33 @@ fn repeated_toggles_with_scrolling_do_not_drift() {
     }
     let sizes = |frames: &[IRect]| frames.iter().map(IRect::size).collect::<Vec<_>>();
     assert_eq!(sizes(&frames(&harness, &[0, 1, 2])), sizes(&before));
+}
+
+/// A window already as wide as the viewport keeps the same column frame when
+/// maximized, yet still fills the usable area: only its gaps change. Its app
+/// gets the writes through the engine's per-app writers, as with `WindowOS`.
+#[test]
+fn a_full_width_window_fills_the_usable_area_when_maximized() {
+    let options = MainOptions {
+        padding_top: Some(4),
+        padding_right: Some(4),
+        padding_bottom: Some(4),
+        padding_left: Some(4),
+        ..MainOptions::default()
+    };
+    let harness = TestHarness::new().with_config((options, vec![]).into());
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    let mut harness = harness.with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.mock_state.focus_window(1);
+    harness.advance(SETTLE);
+    harness.run(vec![command(Operation::SetWidth(1.0))]);
+    harness.advance(SETTLE);
+    let area = usable_area(&mut harness);
+    assert_eq!(os_frame(&harness, 1).width(), area.width() - 8);
+
+    double_click_title_bar(&mut harness, 1);
+    assert_eq!(os_frame(&harness, 1), area);
+    double_click_title_bar(&mut harness, 1);
+    assert_eq!(os_frame(&harness, 1).width(), area.width() - 8);
 }

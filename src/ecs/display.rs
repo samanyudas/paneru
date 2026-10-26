@@ -187,6 +187,12 @@ impl DisplayMoves<'_, '_> {
             .left_neighbour(entity)
             .or_else(|| source_strip.right_neighbour(entity))
             .filter(|neighbour| !members.contains(neighbour));
+        // A maximized window stays maximized in a column of its own. One
+        // dropped into a column joins it as an ordinary window.
+        let maximized = source_strip
+            .maximized(entity)
+            .filter(|_| !matches!(placement, Placement::Into(..)))
+            .cloned();
         for member in &members {
             // The destination layout sizes the window from `Bounds`. A resize
             // animation toward the full height would outlive that layout: a
@@ -221,6 +227,9 @@ impl DisplayMoves<'_, '_> {
                 (Placement::Into(column, slot), group) => {
                     _ = target_strip.join_column(group, column, slot);
                 }
+            }
+            if let Some(before) = maximized {
+                target_strip.adopt_maximized(entity, before);
             }
         }
         Some(DisplayMove {

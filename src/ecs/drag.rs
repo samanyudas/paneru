@@ -40,7 +40,6 @@ use tracing::debug;
 use crate::config::Config;
 use crate::ecs::display::{DisplayMoves, Placement};
 use crate::ecs::layout::{Column, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, effective_stack_limit};
-use crate::ecs::maximize::Maximized;
 use crate::ecs::native_membership::NativeMembership;
 use crate::ecs::{
     Bounds, FocusedMarker, FullWidthMarker, Initializing, LayoutPosition, ManualStripOffset,
@@ -134,6 +133,7 @@ pub(crate) struct Band {
 pub(crate) enum ColumnKind {
     Tiled,
     Fullscreen,
+    Maximized,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +142,8 @@ pub(crate) enum Refusal {
     StackFull,
     /// A fullscreen column holds only its own window.
     Fullscreen,
+    /// A maximized column holds only its own window.
+    Maximized,
 }
 
 /// What a drop at the pointer does.
@@ -244,11 +246,15 @@ fn column_target(
         };
     }
     let own = column.holds(dragged);
-    if column.kind == ColumnKind::Fullscreen && !own {
-        return DropTarget::Refused {
-            reason: Refusal::Fullscreen,
-            display,
-        };
+    let refusal = match column.kind {
+        ColumnKind::Tiled => None,
+        ColumnKind::Fullscreen => Some(Refusal::Fullscreen),
+        ColumnKind::Maximized => Some(Refusal::Maximized),
+    };
+    if let Some(reason) = refusal
+        && !own
+    {
+        return DropTarget::Refused { reason, display };
     }
     // A reorder within its own stack never adds a window.
     if !own && column.bands.len() + 1 > limit {
@@ -915,7 +921,7 @@ fn drag_edge_scroll(
     time: Res<Time>,
     mut holds: Query<(Entity, &mut EdgeHold)>,
     mut parameters: bevy::ecs::system::ParamSet<(DisplayMoves, EdgeStrips)>,
-    placements: Query<(&LayoutPosition, &Bounds, Has<Maximized>), With<Window>>,
+    placements: Query<(&LayoutPosition, &Bounds), With<Window>>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -932,7 +938,7 @@ fn drag_edge_scroll(
             placements
                 .get(entity)
                 .ok()
-                .map(|(position, bounds, _)| (position.0, bounds.0))
+                .map(|(position, bounds)| (position.0, bounds.0))
         },
         &config,
     );
@@ -942,12 +948,7 @@ fn drag_edge_scroll(
         .iter()
         .map(|(_, display, _, _)| (display.id(), display.physical_bounds()))
         .collect();
-    let maximized = placements
-        .get(drag.window)
-        .is_ok_and(|(_, _, maximized)| maximized);
-    let edge = (!maximized || !on_own_display(&snapshot, drag.window, drag.pointer))
-        .then(|| held_edge(&snapshot, &physical_displays, drag.pointer))
-        .flatten();
+    let edge = held_edge(&snapshot, &physical_displays, drag.pointer);
     let mut current = None;
     for (entity, hold) in &mut holds {
         if edge == Some((hold.display, hold.side)) {
@@ -1093,15 +1094,7 @@ type WindowInfo<'w, 's> = Query<
         Has<FocusedMarker>,
     ),
 >;
-type Presented<'w, 's> = Query<
-    'w,
-    's,
-    (
-        &'static PresentedOrigin,
-        Option<&'static TopBarHeight>,
-        Has<Maximized>,
-    ),
->;
+type Presented<'w, 's> = Query<'w, 's, (&'static PresentedOrigin, Option<&'static TopBarHeight>)>;
 type Placements<'w, 's> =
     Query<'w, 's, (&'static mut LayoutPosition, &'static mut Bounds), With<Window>>;
 
@@ -1204,13 +1197,6 @@ pub(super) fn drag_events(
                         &config,
                     )
                 });
-                if presented
-                    .get(dragged)
-                    .is_ok_and(|(_, _, maximized)| maximized)
-                    && on_own_display(snapshot, dragged, pointer)
-                {
-                    return DropTarget::Home;
-                }
                 hit_test(snapshot, dragged, pointer, centre_dx, |id| {
                     stack_limit(snapshot, id, &config)
                 })
@@ -1225,15 +1211,6 @@ pub(super) fn drag_events(
         state.set_if_neq(next);
 
         for DragEffect::Drop { window, target } in effects {
-            // A maximized window dropped on its own display stays where the
-            // user put it.
-            if target == DropTarget::Home
-                && presented
-                    .get(window)
-                    .is_ok_and(|(_, _, maximized)| maximized)
-            {
-                continue;
-            }
             debug!("dropping {window} at {target:?}");
             let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
             undo.0 = undo_for(window, target, now, &moves, &placements, &presented);
@@ -1352,17 +1329,6 @@ fn screen_edges(frame: IRect, moves: &DisplayMoves) -> BVec2 {
         })
 }
 
-/// Whether `pointer` is off every managed display or on the one whose strip
-/// holds `dragged`. A maximized window dragged there only moves, so it has
-/// no drop target and does not scroll the strip.
-fn on_own_display(snapshot: &LayoutSnapshot, dragged: Entity, pointer: IVec2) -> bool {
-    snapshot
-        .managed_strip_displays
-        .iter()
-        .find(|display| display.bounds.contains(pointer))
-        .is_none_or(|display| display.columns.iter().any(|column| column.holds(dragged)))
-}
-
 /// The window a press at `point` landed on, given the window the window
 /// server reports on top there now.
 ///
@@ -1383,10 +1349,7 @@ fn pressed_window(
         .iter()
         .flat_map(|(_, strip, _, _, _)| {
             strip.all_windows().into_iter().filter_map(|entity| {
-                let (origin, top_bar, maximized) = presented.get(entity).ok()?;
-                if maximized {
-                    return None;
-                }
+                let (origin, top_bar) = presented.get(entity).ok()?;
                 // An app can resize its window after the layout placed it,
                 // so the size comes from the current bounds.
                 let (_, bounds) = placements.get(entity).ok()?;
@@ -1405,23 +1368,6 @@ fn pressed_window(
     };
 
     if let Some((entity, window, unmanaged, _)) = on_top {
-        // A maximized window is not in its slot, so its top bar is where the
-        // window is. Only a tiled one can go to another display's layout.
-        if let Ok((_, top_bar, true)) = presented.get(entity) {
-            let tiled = unmanaged.is_none()
-                && moves
-                    .strips
-                    .iter()
-                    .any(|(_, strip, _, _, _)| strip.contains(entity));
-            let frame = window.frame();
-            return tiled.then(|| PressedWindow {
-                entity,
-                frame,
-                top_bar_height: top_bar.map_or(FALLBACK_TOP_BAR_HEIGHT, |height| height.0),
-                tiled: true,
-                screen_edges: screen_edges(frame, moves),
-            });
-        }
         // Of the tiled windows whose slot holds the press, such as the tabs
         // of a group, the one on top is the one pressed.
         if let Some(slot) = slots.iter().find(|(slotted, _, _)| *slotted == entity) {
@@ -1458,7 +1404,6 @@ pub(super) fn drag_watchdog(
     mut placements: Placements,
     mut moves: DisplayMoves,
     mut native: ResMut<NativeMembership>,
-    maximized: Query<(), With<Maximized>>,
     mut commands: Commands,
 ) {
     let Some(window) = state.window() else {
@@ -1487,10 +1432,6 @@ pub(super) fn drag_watchdog(
     }
     state.set_if_neq(next);
     for DragEffect::Drop { window, target } in effects {
-        // As in `drag_events`, a maximized window's free move keeps its slot.
-        if target == DropTarget::Home && maximized.contains(window) {
-            continue;
-        }
         let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
         apply_drop(
             window,
@@ -1675,6 +1616,9 @@ fn snapshot_of(
                                 (vec![vec![*entity]], ColumnKind::Fullscreen)
                             }
                             Column::Tabs(tabs) => (vec![tabs.clone()], ColumnKind::Tiled),
+                            Column::Maximized(_) => {
+                                (vec![column.window_iter().collect()], ColumnKind::Maximized)
+                            }
                             Column::Stack(items) => (
                                 items
                                     .iter()

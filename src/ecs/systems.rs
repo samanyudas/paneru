@@ -30,7 +30,7 @@ use crate::ecs::drag::{
     DragOverlayHandle, NativeFrame, NativeResizeStart, TilingRestore, tiled_in,
 };
 use crate::ecs::layout::{Column, LayoutStrip};
-use crate::ecs::maximize::{FrameHold, Maximized};
+use crate::ecs::maximize::{FloatingMaximized, FrameHold};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
 use crate::ecs::{
@@ -74,7 +74,11 @@ type NativeFrameWindows<'w, 's> = Query<
             Option<&'static WidthLimits>,
         ),
     ),
-    (Without<LayoutStrip>, Without<Maximized>, Without<FrameHold>),
+    (
+        Without<LayoutStrip>,
+        Without<FloatingMaximized>,
+        Without<FrameHold>,
+    ),
 >;
 
 type ChangedWindowFrames<'w, 's> = Populated<
@@ -86,7 +90,10 @@ type ChangedWindowFrames<'w, 's> = Populated<
         Option<Ref<'static, Bounds>>,
         Option<&'static mut WidthRatio>,
     ),
-    (Or<(Changed<Position>, Changed<Bounds>)>, Without<Maximized>),
+    (
+        Or<(Changed<Position>, Changed<Bounds>)>,
+        Without<FloatingMaximized>,
+    ),
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
@@ -1395,7 +1402,7 @@ pub(super) fn commit_window_frame(
 pub(super) fn verify_window_position(
     mut windows: Populated<
         (Entity, &mut Window, &Position, &mut VerifyWindowPosition),
-        Without<Maximized>,
+        Without<FloatingMaximized>,
     >,
     mut commands: Commands,
 ) {
@@ -1766,7 +1773,9 @@ pub(crate) fn regroup_stray_native_tabs(
         .columns()
         .filter_map(|column| match column {
             Column::Single(entity) => Some(*entity),
-            Column::Stack(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
+            Column::Stack(_) | Column::Tabs(_) | Column::Fullscren(_) | Column::Maximized(_) => {
+                None
+            }
         })
         .collect::<Vec<_>>();
     // One accessibility round trip per app, not per window: this runs on a timer

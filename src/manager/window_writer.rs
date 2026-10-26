@@ -480,6 +480,12 @@ impl<S: WriteSink> FrameWrites<S> {
         self.frame
     }
 
+    /// Takes `frame` as the frame last asked for, after the mapping to the
+    /// window's shown frame changed under it.
+    pub fn track(&mut self, frame: IRect) {
+        self.frame = frame;
+    }
+
     pub fn reposition(
         &mut self,
         pid: Option<Pid>,

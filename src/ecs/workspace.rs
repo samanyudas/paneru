@@ -667,6 +667,10 @@ fn handle_virtual_window_moves(
         });
 
         // Must be captured before strip.remove below.
+        let maximized = workspaces
+            .get(source_entity)
+            .ok()
+            .and_then(|(_, strip, _, _, _)| strip.maximized(window_entity).cloned());
         let source_neighbour =
             workspaces
                 .get(source_entity)
@@ -710,6 +714,9 @@ fn handle_virtual_window_moves(
             );
             let mut new_strip = LayoutStrip::new(workspace_id, target_idx);
             new_strip.append_tab_group(&moving_entities);
+            if let Some(before) = maximized.clone() {
+                new_strip.adopt_maximized(window_entity, before);
+            }
 
             let mut spawned = commands.spawn_layout_strip(new_strip, origin, display_entity, false);
             if stay {
@@ -743,6 +750,9 @@ fn handle_virtual_window_moves(
                 match mid_placement {
                     Some((slot, _)) => strip.insert_tab_group_at(slot, &moving_entities),
                     None => strip.append_tab_group(&moving_entities),
+                }
+                if let Some(before) = maximized.clone() {
+                    strip.adopt_maximized(window_entity, before);
                 }
             } else {
                 for moving_entity in &moving_entities {

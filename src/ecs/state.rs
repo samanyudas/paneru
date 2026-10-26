@@ -240,6 +240,19 @@ impl PaneruState {
                     }
                     Column::Fullscren(entity) => SavedWindow::from_entity(*entity, windows, apps)
                         .map(SavedColumn::Fullscreen),
+                    // The session does not keep maximize yet: the window
+                    // comes back as a column of its own.
+                    Column::Maximized(_) => {
+                        let saved: Vec<_> = col
+                            .window_iter()
+                            .filter_map(|e| SavedWindow::from_entity(e, windows, apps))
+                            .collect();
+                        match <[SavedWindow; 1]>::try_from(saved) {
+                            Ok([window]) => Some(SavedColumn::Single(window)),
+                            Err(tabs) if tabs.is_empty() => None,
+                            Err(tabs) => Some(SavedColumn::Tabs(tabs)),
+                        }
+                    }
                 };
 
                 if let Some(sc) = saved_col {
@@ -616,7 +629,8 @@ impl QueryStateParams<'_, '_> {
 fn column_kind(column: &Column) -> crate::types::windowset::ColumnKind {
     use crate::types::windowset::ColumnKind;
     match column {
-        Column::Single(_) => ColumnKind::Single,
+        Column::Maximized(_) if column.window_iter().nth(1).is_some() => ColumnKind::Tabs,
+        Column::Single(_) | Column::Maximized(_) => ColumnKind::Single,
         Column::Stack(_) => ColumnKind::Stack,
         Column::Tabs(_) => ColumnKind::Tabs,
         Column::Fullscren(_) => ColumnKind::Fullscreen,

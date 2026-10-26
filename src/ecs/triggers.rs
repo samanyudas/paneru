@@ -26,7 +26,7 @@ use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, ExposeFocusedSurvivorAfterRemoval, LayoutStrip, anchored_origin};
 use crate::ecs::maximize::EDGE_RELEASE;
-use crate::ecs::maximize::Maximized;
+use crate::ecs::maximize::FloatingMaximized;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::tile_overrides::TileOverrides;
@@ -64,7 +64,7 @@ type SizeCheckReady = (
     Without<ResizeMarker>,
     Without<RepositionMarker>,
     Without<AwaitingHandle>,
-    Without<Maximized>,
+    Without<FloatingMaximized>,
 );
 
 type AddedWindowDefaults<'w, 's> = Populated<
@@ -1690,7 +1690,7 @@ type NativeSizeWindows<'w, 's> = Query<
         Ref<'static, Position>,
         &'static mut Bounds,
     ),
-    Without<Maximized>,
+    Without<FloatingMaximized>,
 >;
 
 #[derive(SystemParam)]
@@ -1731,6 +1731,14 @@ pub(super) fn window_resize_verifier(
             }
             continue;
         };
+        // A maximized window takes the viewport whatever size it shows, and a
+        // limit read while it fills the edge padding would be off by the gaps.
+        if window.fill().is_some() {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<VerifyWindowSize>();
+            }
+            continue;
+        }
         // Checked once the engine's own write has landed, without spending
         // an attempt on the frame the window is leaving.
         if position.is_changed() || bounds.is_changed() || window.write_pending() {

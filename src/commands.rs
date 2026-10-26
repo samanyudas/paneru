@@ -24,7 +24,7 @@ use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, anchored_origin, clamp_origin_to_viewport,
     effective_stack_limit, hold_minimum_heights, strip_signature,
 };
-use crate::ecs::maximize::Maximized;
+use crate::ecs::maximize::FloatingMaximized;
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowCtx, Windows};
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::{
@@ -182,7 +182,9 @@ pub(crate) fn get_window_in_direction(
         Direction::Nth(index) => strip.get(*index).ok().and_then(|column| column.top()),
 
         Direction::North => match strip.get(index).ok()? {
-            Column::Single(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
+            Column::Single(_) | Column::Tabs(_) | Column::Fullscren(_) | Column::Maximized(_) => {
+                None
+            }
             Column::Stack(stack) => stack
                 .iter()
                 .enumerate()
@@ -192,7 +194,9 @@ pub(crate) fn get_window_in_direction(
         },
 
         Direction::South => match strip.get(index).ok()? {
-            Column::Single(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
+            Column::Single(_) | Column::Tabs(_) | Column::Fullscren(_) | Column::Maximized(_) => {
+                None
+            }
             Column::Stack(stack) => stack
                 .iter()
                 .enumerate()
@@ -858,7 +862,7 @@ type WidthWork<'w, 's> = Query<
 #[allow(clippy::too_many_lines)]
 fn resize_window(
     mut messages: MessageReader<Event>,
-    mut ctx: ParamSet<(WindowCtx, Query<&mut Window, Without<Maximized>>)>,
+    mut ctx: ParamSet<(WindowCtx, Query<&mut Window, Without<FloatingMaximized>>)>,
     engine_work: WidthWork,
     runs: Query<&WidthRun>,
     interrupted: Res<WidthBatchInterrupted>,
@@ -878,6 +882,11 @@ fn resize_window(
     let Some(entity) = ctx.p0().windows.focused().map(|(_, entity)| entity) else {
         return;
     };
+    // A maximized column is as wide as the viewport whatever its window's
+    // width, so a width change has nothing to act on until it is restored.
+    if active_display.active_strip().maximized(entity).is_some() {
+        return;
+    }
     let (native_resize, verifying, settling) = engine_work.get(entity).unwrap_or_default();
     // A write still on its way to the app counts as pending engine work: its
     // frame is the one the engine asked for, and reading the app's frame
@@ -1494,9 +1503,6 @@ fn to_next_display(
         }
     } else {
         commands.reposition_entity(entity, origin);
-    }
-    for member in &arrival.members {
-        crate::ecs::maximize::fill_display(&mut commands, *member, target_id);
     }
     native.placed(arrival.members);
     if matches!(move_focus, MoveFocus::Follow) && config.mouse_follows_focus() {
