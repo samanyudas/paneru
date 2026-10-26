@@ -21,7 +21,7 @@ use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
 use crate::config::Config;
-use crate::ecs::layout::{Column, LayoutStrip, PARKED_STRIP_SLIVER};
+use crate::ecs::layout::{Before, Column, LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, EnsureVisibleMarker, FocusedMarker,
@@ -55,6 +55,9 @@ pub(crate) struct DisplayMove {
     pub left_behind: Option<Entity>,
     /// The moved window and the native tabs grouped with it.
     pub members: Vec<Entity>,
+    /// What a maximized window that joined no strip returns to. The strip a
+    /// native report later adds it to keeps it maximized.
+    pub maximized: Option<Before>,
 }
 
 type MovableStrips<'w, 's> = Query<
@@ -189,7 +192,7 @@ impl DisplayMoves<'_, '_> {
             .filter(|neighbour| !members.contains(neighbour));
         // A maximized window stays maximized in a column of its own. One
         // dropped into a column joins it as an ordinary window.
-        let maximized = source_strip
+        let mut maximized = source_strip
             .maximized(entity)
             .filter(|_| !matches!(placement, Placement::Into(..)))
             .cloned();
@@ -228,7 +231,7 @@ impl DisplayMoves<'_, '_> {
                     _ = target_strip.join_column(group, column, slot);
                 }
             }
-            if let Some(before) = maximized {
+            if let Some(before) = maximized.take() {
                 target_strip.adopt_maximized(entity, before);
             }
         }
@@ -237,6 +240,7 @@ impl DisplayMoves<'_, '_> {
             display_bounds,
             left_behind,
             members,
+            maximized,
         })
     }
 }

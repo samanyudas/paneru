@@ -1504,7 +1504,7 @@ fn to_next_display(
     } else {
         commands.reposition_entity(entity, origin);
     }
-    native.placed(arrival.members);
+    native.placed(arrival.members, arrival.maximized);
     if matches!(move_focus, MoveFocus::Follow) && config.mouse_follows_focus() {
         window_manager.warp_mouse(bounds.center());
     }

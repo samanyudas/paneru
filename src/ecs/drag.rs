@@ -1833,7 +1833,7 @@ fn apply_drop(
         if let Some(transfer) = transfer {
             tiling::supersede_native_resize(&transfer.members, commands);
             restore_drop_members(&transfer.members, placements);
-            native.placed(transfer.members);
+            native.placed(transfer.members, transfer.maximized);
         } else if let Some((_, strip, _, _, _)) = moves
             .strips
             .iter()
@@ -1841,7 +1841,7 @@ fn apply_drop(
         {
             let members = strip.tab_group(window).unwrap_or_else(|| vec![window]);
             restore_drop_members(&members, placements);
-            native.placed(members);
+            native.placed(members, None);
         }
         commands.ensure_visible(window);
         commands.focus_entity(window, false);
@@ -1892,7 +1892,7 @@ fn apply_drop(
     // The user's drag left the window where it was released. Marking its
     // slot changed sends it there, even when the slot did not move.
     restore_drop_members(&members, placements);
-    native.placed(members);
+    native.placed(members, None);
     commands.ensure_visible(window);
     if !focused {
         commands.focus_entity(window, false);
