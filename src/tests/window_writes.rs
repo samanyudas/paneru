@@ -22,9 +22,9 @@ const OTHER_APP: Pid = 2;
 const WINDOW_WIDTH: i32 = 700;
 /// How long each of the slow app's writes takes, like Helium mid-swipe.
 const SLOW_WRITE: Duration = Duration::from_millis(200);
-/// Under one slow write and under the wait for a pending write, yet far over
-/// an engine frame, so tests running in parallel do not push a frame past it.
-const FRAME_BUDGET: Duration = Duration::from_millis(150);
+/// How long the other app's write may take to land while the slow app is
+/// stuck, under the second a held app stays stuck.
+const OTHER_APP_LANDING: Duration = Duration::from_millis(500);
 /// Simulated time per frame, as the harness runs it.
 const FRAME: Duration = Duration::from_millis(20);
 const FLUSH: Duration = Duration::from_secs(5);
@@ -94,16 +94,10 @@ fn position_writes(mock_state: &MockState, id: WinID) -> usize {
     writes
 }
 
-/// Runs `frames` engine frames and returns the slowest one, in wall time.
-fn run_frames(harness: &mut TestHarness, frames: usize) -> Duration {
-    (0..frames)
-        .map(|_| {
-            let started = Instant::now();
-            harness.advance(FRAME);
-            started.elapsed()
-        })
-        .max()
-        .unwrap_or_default()
+fn run_frames(harness: &mut TestHarness, frames: usize) {
+    for _ in 0..frames {
+        harness.advance(FRAME);
+    }
 }
 
 /// Waits up to `timeout` for `done`, polling.
@@ -130,16 +124,12 @@ fn a_slow_app_does_not_hold_up_the_engine_frame() {
     let before = engine_frame(harness.world(), 0);
 
     swipe(&mut harness);
-    let slowest = run_frames(&mut harness, 15);
+    assert_no_frame_waited(&mut harness, 15);
 
     assert_ne!(
         engine_frame(harness.world(), 0),
         before,
         "the swipe moved the slow app's window"
-    );
-    assert!(
-        slowest < FRAME_BUDGET,
-        "an engine frame waited {slowest:?} on the slow app"
     );
     assert!(harness.mock_state.flush_writes(FLUSH));
     for id in 0..3 {
@@ -163,7 +153,9 @@ fn other_apps_get_their_writes_while_one_app_is_stuck() {
     run_frames(&mut harness, 3);
 
     let other = engine_frame(harness.world(), 1);
-    let landed = eventually(FRAME_BUDGET, || harness.mock_state.ax_frame(1) == other);
+    let landed = eventually(OTHER_APP_LANDING, || {
+        harness.mock_state.ax_frame(1) == other
+    });
     let slow_app_frame = harness.mock_state.ax_frame(0);
     harness.mock_state.release_writes(SLOW_APP);
 
@@ -284,11 +276,15 @@ fn release_slow_app(harness: &mut TestHarness) {
     assert!(harness.mock_state.flush_writes(FLUSH));
 }
 
+/// Counts the engine's waits on an app's writer instead of timing frames, as
+/// a loaded machine can stall a frame that never waited.
 fn assert_no_frame_waited(harness: &mut TestHarness, frames: usize) {
-    let slowest = run_frames(harness, frames);
-    assert!(
-        slowest < FRAME_BUDGET,
-        "an engine frame waited {slowest:?} on a pending write"
+    let before = harness.mock_state.engine_waits();
+    run_frames(harness, frames);
+    assert_eq!(
+        harness.mock_state.engine_waits() - before,
+        0,
+        "engine waits on an app's writer"
     );
 }
 
