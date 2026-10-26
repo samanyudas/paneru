@@ -1420,7 +1420,16 @@ fn mouse_in_bottom_right_corner_does_not_change_focus() {
         },
     ];
 
+    let config: Config = (
+        MainOptions {
+            focus_follows_mouse: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
     TestHarness::new()
+        .with_config(config)
         .with_windows(3)
         .on_iteration(2, |world, _state| {
             // After MouseMoved into corner dead zone: focus should remain on window 2
@@ -1453,11 +1462,42 @@ fn mouse_outside_corner_still_changes_focus() {
         },
     ];
 
+    let config: Config = (
+        MainOptions {
+            focus_follows_mouse: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
     TestHarness::new()
+        .with_config(config)
         .with_windows(3)
         .on_iteration(2, |world, _state| {
             // After MouseMoved outside corner: FFM should have fired and changed focus.
             assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+/// By default, moving the pointer over another window does not focus it.
+#[test]
+fn mouse_movement_does_not_change_focus_by_default() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::West)),
+        },
+        Event::MouseMoved {
+            point: CGPoint { x: 500.0, y: 400.0 },
+            modifiers: Modifiers::empty(),
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 0);
         })
         .run(commands);
 }

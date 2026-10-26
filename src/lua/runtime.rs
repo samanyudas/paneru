@@ -1139,7 +1139,7 @@ mod tests {
             .expect("script should load");
 
         let globals = runtime.lua.globals();
-        assert!(globals.get::<bool>("ffm").unwrap());
+        assert!(!globals.get::<bool>("ffm").unwrap());
         assert_eq!(globals.get::<i32>("sliver").unwrap(), 5);
         assert_eq!(globals.get::<usize>("presets_len").unwrap(), 8);
         assert_eq!(globals.get::<i32>("pad_top").unwrap(), 0);
@@ -1156,7 +1156,7 @@ mod tests {
                 paneru.setup {
                   default_workspaces = 4,
                   options = {
-                    focus_follows_mouse = false,
+                    focus_follows_mouse = true,
                     preset_column_widths = { 0.5, 1.0 },
                     custom_tag = "user_data",
                   },
@@ -1174,7 +1174,7 @@ mod tests {
                 menu_enabled = paneru.config.decorations.menu.enabled
 
                 paneru.bind("alt - x", function()
-                  if not paneru.config.options.focus_follows_mouse and paneru.config.padding.top == 12 then
+                  if paneru.config.options.focus_follows_mouse and paneru.config.padding.top == 12 then
                     paneru.run("window balance")
                   end
                 end)
@@ -1183,7 +1183,7 @@ mod tests {
             .expect("script should load");
 
         let globals = runtime.lua.globals();
-        assert!(!globals.get::<bool>("ffm").unwrap());
+        assert!(globals.get::<bool>("ffm").unwrap());
         assert_eq!(globals.get::<i32>("sliver").unwrap(), 5);
         assert_eq!(globals.get::<usize>("presets_len").unwrap(), 2);
         assert_eq!(globals.get::<String>("custom").unwrap(), "user_data");

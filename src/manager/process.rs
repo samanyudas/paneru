@@ -8,10 +8,13 @@ use objc2_foundation::{
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
+use stdext::function_name;
 use tracing::debug;
 
 use crate::ecs::BProcess;
+use crate::errors::Result;
 use crate::platform::{OSStatus, Pid, ProcessSerialNumber, WorkspaceObserver};
+use crate::util::MacResult;
 
 unsafe extern "C" {
     /// Get a copy of the name of a process.
@@ -66,6 +69,19 @@ unsafe extern "C" {
     /// # Original signature:
     /// `OSStatus` GetProcessPID(const `ProcessSerialNumber` *psn, `pid_t` *pid);
     fn GetProcessPID(psn: *const ProcessSerialNumber, pid: *mut Pid) -> OSStatus;
+
+    /// Get the process serial number corresponding to a UNIX process ID.
+    ///
+    /// # Original signature:
+    /// `OSStatus GetProcessForPID(pid_t pid, ProcessSerialNumber *psn);`
+    fn GetProcessForPID(pid: Pid, psn: *mut ProcessSerialNumber) -> OSStatus;
+}
+
+/// The process serial number of the process with `pid`.
+pub(super) fn psn_for_pid(pid: Pid) -> Result<ProcessSerialNumber> {
+    let mut psn = ProcessSerialNumber::default();
+    unsafe { GetProcessForPID(pid, &raw mut psn) }.to_result(function_name!())?;
+    Ok(psn)
 }
 
 /// Defines the interface for interacting with a macOS process, abstracting OS-specific details.

@@ -321,7 +321,18 @@ fn test_mouse_to_next_display() {
     // harness
     //     .mock_state
     //     .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 100, frame);
+    // Pointer-follows-focus places the pointer on window 100 first, so the
+    // pointer starts inside one display.
+    let config: Config = (
+        MainOptions {
+            mouse_follows_focus: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
     TestHarness::new()
+        .with_config(config)
         .with_display(EXT_DISPLAY_ID, display_bounds, vec![EXT_WORKSPACE_ID])
         .with_window(100, |data| {
             data.pid = TEST_PROCESS_ID;
@@ -1131,21 +1142,63 @@ fn harness_with_display_above() -> TestHarness {
         })
 }
 
-/// Focus moves to the display in the pressed direction and nowhere else.
+/// A display with no window gets its desktop focused, which makes it the
+/// active display without moving the pointer.
+#[test]
+fn test_focus_display_without_a_window_focuses_its_desktop() {
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID])
+        .on_iteration(1, move |world, state| {
+            let target = world
+                .query::<&Display>()
+                .iter(world)
+                .find(|display| display.id() == EXT_DISPLAY_ID)
+                .map(Display::bounds)
+                .expect("the target display should exist");
+            assert_eq!(state.focused_desktop(), Some(target));
+            assert_eq!(state.cursor_position(), Origin::ZERO);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::FocusDisplay(Direction::North)),
+        ]);
+}
+
+/// Centre column and moving a window to another display leave the pointer
+/// where it is.
+#[test]
+fn test_center_and_move_to_display_keep_the_pointer() {
+    harness_with_display_above()
+        .on_iteration(2, |_world, state| {
+            assert_eq!(state.cursor_position(), Origin::ZERO);
+        })
+        .on_iteration(3, |world, state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_eq!(state.cursor_position(), Origin::ZERO);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::Center),
+            window_command(Operation::MoveToDisplay(Direction::North)),
+        ]);
+}
+
+/// Focus moves to the display in the pressed direction and nowhere else,
+/// and the pointer stays where it is.
 #[test]
 fn test_focus_display_follows_the_physical_arrangement() {
-    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
     harness_with_display_above()
-        .on_iteration(2, move |world, state| {
+        .on_iteration(2, |world, state| {
             assert_focused!(world, 0);
-            assert!(
-                !ext_bounds.contains(state.cursor_position()),
-                "no display lies below the built-in one"
-            );
+            assert_eq!(state.cursor_position(), Origin::ZERO);
         })
-        .on_iteration(3, move |world, state| {
+        .on_iteration(3, |world, state| {
             assert_focused!(world, 100);
-            assert!(ext_bounds.contains(state.cursor_position()));
+            assert_eq!(state.cursor_position(), Origin::ZERO);
+            assert_eq!(state.focused_desktop(), None);
         })
         .run(vec![
             Event::MenuOpened { window_id: 0 },
@@ -2218,11 +2271,10 @@ fn test_move_to_display_stops_waiting_for_an_ax_element_that_never_comes() {
 /// Only the display commands cross to another display.
 #[test]
 fn test_vertical_focus_and_swap_stay_on_the_display_at_a_column_edge() {
-    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
     harness_with_display_above()
-        .on_iteration(2, move |world, state| {
+        .on_iteration(2, |world, state| {
             assert_focused!(world, 0);
-            assert!(!ext_bounds.contains(state.cursor_position()));
+            assert_eq!(state.cursor_position(), Origin::ZERO);
         })
         .on_iteration(3, |world, _state| {
             assert_focused!(world, 0);
