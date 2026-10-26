@@ -1097,6 +1097,45 @@ fn a_padding_reload_refits_a_maximized_window_on_another_display() {
     assert_eq!(os_frame(&harness, 1), ext);
 }
 
+/// Windows 1 and 2 maximized on the built-in display, window 2 in view.
+fn two_maximized(mut harness: TestHarness) -> TestHarness {
+    focus(&mut harness, Direction::East);
+    assert_focused!(harness.world(), 2);
+    double_click_title_bar(&mut harness, 2);
+    let area = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    assert_eq!(os_frame(&harness, 2), area);
+    harness
+}
+
+/// A padding reload that changes only the right padding narrows the first
+/// of two maximized columns, which moves the second. The second still fills
+/// the usable area.
+#[test]
+fn a_padding_reload_refits_a_maximized_window_after_another() {
+    let mut harness = three_windows_one_focused();
+    double_click_title_bar(&mut harness, 1);
+    let mut harness = two_maximized(harness);
+    let area = usable_area(&mut harness);
+
+    reload_options(&mut harness, "padding_right = 16\n");
+    assert_eq!(os_frame(&harness, 2), area);
+}
+
+/// The same holds on a display without the focus, where the strip is
+/// aligned on its most visible column.
+#[test]
+fn a_padding_reload_refits_a_maximized_window_after_another_on_another_display() {
+    let mut harness = two_maximized(maximized_beside(EAST_EXT_BOUNDS));
+    let area = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    harness.mock_state.focus_window(100);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 100);
+    assert_eq!(os_frame(&harness, 2), area);
+
+    reload_options(&mut harness, "padding_left = 4\npadding_right = 16\n");
+    assert_eq!(os_frame(&harness, 2), area);
+}
+
 /// Repeated toggles with scrolling in between end where they started.
 #[test]
 fn repeated_toggles_with_scrolling_do_not_drift() {

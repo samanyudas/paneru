@@ -2401,8 +2401,8 @@ pub(super) fn layout_strip_changed(
 /// Lays every strip out again when the display edge padding changes, as a
 /// config reload can do: the viewport, and with it every maximized window,
 /// depends on it. Each strip in view on any display moves with its viewport,
-/// so it keeps where the user scrolled it and a maximized column at the
-/// viewport's edge fills the new viewport.
+/// so it keeps where the user scrolled it, unless the column the user sees
+/// there is maximized: then that column is placed to fill the new viewport.
 #[allow(clippy::type_complexity)]
 fn relayout_on_edge_padding_change(
     config: Res<Config>,
@@ -2410,12 +2410,15 @@ fn relayout_on_edge_padding_change(
     mut strips: Query<(
         Entity,
         &mut LayoutStrip,
+        &ChildOf,
         &Position,
         Option<&RepositionMarker>,
         Option<&Scrolling>,
         Has<SelectedVirtualMarker>,
         Has<PreviousStripPosition>,
     )>,
+    displays: DisplayViewports,
+    windows: Windows,
     mut commands: Commands,
 ) {
     let padding = config.edge_padding();
@@ -2425,15 +2428,68 @@ fn relayout_on_edge_padding_change(
     let (top, _, _, left) = padding;
     let (old_top, _, _, old_left) = old;
     let shift = IVec2::new(left - old_left, top - old_top);
-    for (entity, mut strip, position, reposition, scrolling, selected, parked) in &mut strips {
+    let focused = windows.focused().map(|(_, entity)| entity);
+    for (entity, mut strip, child, position, reposition, scrolling, selected, parked) in &mut strips
+    {
         strip.set_changed();
-        if selected && !parked && shift != IVec2::ZERO {
-            commands.reposition_entity(
-                entity,
-                strip_destination(position, reposition, scrolling) + shift,
-            );
+        if !selected || parked {
+            continue;
+        }
+        let destination = strip_destination(position, reposition, scrolling);
+        let target = displays
+            .get(child.parent())
+            .ok()
+            .and_then(|(display, dock)| {
+                let viewport = display.actual_display_bounds(dock, &config);
+                origin_filling_viewport(
+                    &strip,
+                    destination,
+                    display.bounds(),
+                    viewport,
+                    focused,
+                    &windows,
+                )
+            })
+            .unwrap_or(destination + shift);
+        if target != destination {
+            commands.reposition_entity(entity, target);
         }
     }
+}
+
+/// The origin that puts the column the user sees in `strip` at the origin
+/// of `viewport`, if that column is maximized. The column seen is the one
+/// with the focused window, or else the one most on `display` with the strip
+/// at `destination`. Columns are placed at the width of `viewport`, since a
+/// maximized column before the one seen changes its place.
+fn origin_filling_viewport(
+    strip: &LayoutStrip,
+    destination: Origin,
+    display: IRect,
+    viewport: IRect,
+    focused: Option<Entity>,
+    windows: &Windows,
+) -> Option<Origin> {
+    let frame = |entity| windows.moving_frame(entity);
+    let anchor = focused
+        .filter(|entity| strip.contains(*entity))
+        .or_else(|| {
+            strip
+                .columns()
+                .filter_map(Column::top)
+                .filter_map(|entity| {
+                    let min = windows.layout_position(entity)?.0 + destination;
+                    let size = frame(entity)?.size();
+                    let shown = IRect::from_corners(min, min + size).intersect(display);
+                    (shown.width() > 0).then_some((entity, shown.width()))
+                })
+                .max_by_key(|(_, shown)| *shown)
+                .map(|(entity, _)| entity)
+        })?;
+    let (column, x) = strip
+        .column_positions(&frame, viewport.width())
+        .find(|(column, _)| column.position_of(anchor).is_some())?;
+    matches!(column, Column::Maximized(_)).then(|| Origin::new(viewport.min.x - x, viewport.min.y))
 }
 
 /// Has every window of a maximized column fill the display's edge padding,
