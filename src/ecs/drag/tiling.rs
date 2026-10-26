@@ -261,6 +261,10 @@ impl NativeResizeStart {
             })
     }
 
+    pub(crate) fn misses_only_height(&self, frame: IRect) -> bool {
+        frame.min == self.origin && frame.width() == self.size.x && frame.height() != self.size.y
+    }
+
     /// The restore to start again while the hold lasts: `frame` is a tile,
     /// or shows the size of the tile the window was restored from.
     fn again(self, tile: bool, frame: IRect, now: Duration) -> Option<Self> {
@@ -437,6 +441,7 @@ impl TilingRestore<'_, '_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn observe(
         &self,
         entity: Entity,
@@ -516,7 +521,9 @@ impl TilingRestore<'_, '_> {
         }
         match settlement {
             Some(Settlement::Refused) => {
-                if Self::blocks(&start, now, resize, reposition, verifying) {
+                if Self::blocks(&start, now, resize, reposition, verifying)
+                    || (verifying && start.misses_only_height(frame))
+                {
                     return NativeFrame::Deferred;
                 }
                 let tile = tile || start.tile == Some(frame.size());

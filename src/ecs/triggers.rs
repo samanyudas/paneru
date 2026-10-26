@@ -1742,36 +1742,32 @@ pub(super) fn window_resize_verifier(
         if step_release(&mut request, &mut window, bounds.0, now) {
             continue;
         }
-        // macOS puts a tile frame back while a restored slot holds, so a
-        // readback then is not the app refusing the size.
         if let Ok(start) = verification.native_resizes.get(entity)
-            && start.held_size(verification.time.elapsed()).is_some()
+            && let frame = window.update_frame().ok()
+            && !frame.is_some_and(|frame| start.misses_only_height(frame))
         {
-            // An app that never reports its resize shows here that it took
-            // the restored size.
-            let seen = window
-                .update_frame()
-                .ok()
-                .and_then(|frame| start.seen(frame.size()));
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<VerifyWindowSize>();
-                if let Some(seen) = seen {
-                    entity_commands.try_insert(seen);
+            // macOS puts a tile frame back while a restored slot holds, so a
+            // readback then is not the app refusing the size.
+            if start.held_size(now).is_some() {
+                // An app that never reports its resize shows here that it
+                // took the restored size.
+                let seen = frame.and_then(|frame| start.seen(frame.size()));
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<VerifyWindowSize>();
+                    if let Some(seen) = seen {
+                        entity_commands.try_insert(seen);
+                    }
                 }
+                continue;
             }
-            continue;
-        }
-        // After the hold, the tile restore decides whether a window that
-        // took its restored size has had a tile put back.
-        if verification
-            .native_resizes
-            .get(entity)
-            .is_ok_and(crate::ecs::drag::NativeResizeStart::reached)
-        {
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<VerifyWindowSize>();
+            // After the hold, the tile restore decides whether a window that
+            // took its restored size has had a tile put back.
+            if start.reached() {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<VerifyWindowSize>();
+                }
+                continue;
             }
-            continue;
         }
         if request
             .mismatched_since
