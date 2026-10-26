@@ -378,9 +378,15 @@ fn reconcile(world: &mut World) {
                 members: native.group(world, window),
             });
         }
-        native
-            .stripless
-            .retain(|group| group.members.iter().all(|member| stripless(world, *member)));
+        for group in &mut native.stripless {
+            group
+                .members
+                .retain(|member| world.get::<Window>(*member).is_some());
+        }
+        native.stripless.retain(|group| {
+            !group.members.is_empty()
+                && group.members.iter().all(|member| stripless(world, *member))
+        });
         let spaces = live_spaces(world);
         let live = |space: &WorkspaceId| spaces.iter().any(|(live, _)| live == space);
         if native.dirty.keys().any(|space| !live(space)) {
@@ -712,9 +718,10 @@ fn observe_placements(world: &mut World) {
         let mut moving = world.query_filtered::<(), Moving>();
         let mut ended = false;
         for mut placing in std::mem::take(&mut native.placing) {
-            let gone = placing.members.iter().any(|member| {
-                world.get::<Window>(*member).is_none() || world.get::<Unmanaged>(*member).is_some()
+            placing.members.retain(|member| {
+                world.get::<Window>(*member).is_some() && world.get::<Unmanaged>(*member).is_none()
             });
+            let gone = placing.members.is_empty();
             let targets = layout_frames(world, &placing.members);
             let settled = targets == placing.targets
                 && !placing

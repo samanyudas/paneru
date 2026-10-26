@@ -10,7 +10,7 @@ use crate::commands::{Command, Direction, Operation, Side};
 use crate::config::{Config, MainOptions};
 use crate::ecs::drag::{DragFeedback, DragState, OverlayShape};
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::{DockPosition, SelectedVirtualMarker};
+use crate::ecs::{DockPosition, SelectedVirtualMarker, SpawnWindowTrigger};
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::{Modifiers, WinID, WorkspaceId};
@@ -508,6 +508,88 @@ fn a_maximized_window_moved_to_a_display_without_a_strip_stays_maximized() {
         "restored to its earlier share of the viewport: {restored:?}"
     );
     assert_eq!(restored.height(), ext.height());
+}
+
+/// A maximized native tab group moved to a display that shows no strip
+/// waits there for macOS to report its space. Closing one tab while it waits
+/// leaves the other tab maximized once the strip appears.
+fn a_tab_closed_on_the_way_to_a_display_without_a_strip(settled: bool) {
+    let mut harness = TestHarness::new().with_windows(3).with_display(
+        EXT_DISPLAY_ID,
+        EAST_EXT_BOUNDS,
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+    ]);
+    harness.advance(SETTLE);
+    let frame = os_frame(&harness, 1);
+    let tab = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 3, frame);
+    harness.mock_state.window_visible(1, false);
+    harness.world().trigger(SpawnWindowTrigger(vec![tab]));
+    harness.advance(SETTLE);
+    let before = os_frame(&harness, 3);
+    let test = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    let ext = usable_area_of(&mut harness, EXT_DISPLAY_ID);
+    double_click_title_bar(&mut harness, 3);
+    assert_eq!(os_frame(&harness, 3), test);
+
+    let world = harness.world();
+    let strips: Vec<_> = world
+        .query::<(Entity, &LayoutStrip)>()
+        .iter(world)
+        .filter_map(|(entity, strip)| (strip.id() == EXT_WORKSPACE_ID).then_some(entity))
+        .collect();
+    for strip in strips {
+        harness.world().despawn(strip);
+    }
+    harness
+        .world()
+        .write_message(command(Operation::MoveToDisplay(Direction::East)));
+    if settled {
+        harness.advance(SETTLE);
+    }
+    harness.mock_state.os_close_window(3);
+    harness.mock_state.window_visible(1, true);
+    harness.advance(SETTLE);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(SETTLE);
+    harness.world().write_message(Event::SpaceCreated {
+        space_id: EXT_WORKSPACE_ID,
+    });
+    harness.advance(SETTLE);
+    harness.mock_state.os_activate_display(TEST_DISPLAY_ID);
+    harness.advance(SETTLE);
+    harness
+        .mock_state
+        .update_window(1, |window| window.workspace_id = EXT_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(SETTLE);
+    assert_eq!(layout_on(&mut harness, EXT_WORKSPACE_ID), vec![vec![1]]);
+    assert_eq!(os_frame(&harness, 1), ext);
+
+    double_click_title_bar(&mut harness, 1);
+    let share = f64::from(before.width()) / f64::from(test.width());
+    let restored = os_frame(&harness, 1);
+    assert_eq!(
+        restored.width(),
+        crate::util::round_px(share * f64::from(ext.width())),
+        "restored to its earlier share of the viewport: {restored:?}"
+    );
+}
+
+#[test]
+fn a_tab_closed_while_its_group_moves_leaves_the_other_maximized() {
+    a_tab_closed_on_the_way_to_a_display_without_a_strip(false);
+}
+
+#[test]
+fn a_tab_closed_while_its_group_waits_leaves_the_other_maximized() {
+    a_tab_closed_on_the_way_to_a_display_without_a_strip(true);
 }
 
 /// The windows of the shown strip on `workspace`, column by column.
