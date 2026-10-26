@@ -8,9 +8,9 @@ use objc2_core_foundation::CGPoint;
 use crate::assert_focused;
 use crate::commands::{Command, Direction, Operation, Side};
 use crate::config::MainOptions;
-use crate::ecs::drag::{DragFeedback, OverlayShape};
+use crate::ecs::drag::{DragFeedback, DragState, OverlayShape};
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::{DockPosition, SelectedVirtualMarker};
+use crate::ecs::{DockPosition, Position, SelectedVirtualMarker};
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::{Modifiers, WinID, WorkspaceId};
@@ -516,6 +516,45 @@ fn drag_steps(harness: &mut TestHarness, from: Origin, to: Origin) -> Vec<Option
         .collect()
 }
 
+/// Presses the left button at `point` on window 1's title bar.
+fn press_title_bar(harness: &mut TestHarness, point: Origin) {
+    harness.mock_state.set_left_button_down(true);
+    harness.world().write_message(Event::MouseDown {
+        point: CGPoint::new(point.x.into(), point.y.into()),
+        modifiers: Modifiers::empty(),
+        button: MouseButton::Left,
+        window_id: Some(1),
+        clicks: 1,
+    });
+    harness.advance(Duration::from_millis(16));
+}
+
+/// Releases the left button at `point`, with macOS reporting window 1 in
+/// `space`, and lets the layout settle.
+fn release_at(harness: &mut TestHarness, point: Origin, space: WorkspaceId) {
+    harness.mock_state.set_left_button_down(false);
+    harness.world().write_message(Event::MouseUp {
+        point: CGPoint::new(point.x.into(), point.y.into()),
+        modifiers: Modifiers::empty(),
+        button: MouseButton::Left,
+    });
+    harness
+        .mock_state
+        .update_window(1, |window| window.workspace_id = space);
+    harness.advance(SETTLE);
+}
+
+/// The position of the shown strip on `workspace`.
+fn strip_position(harness: &mut TestHarness, workspace: WorkspaceId) -> IVec2 {
+    let world = harness.world();
+    world
+        .query_filtered::<(&LayoutStrip, &Position), With<SelectedVirtualMarker>>()
+        .iter(world)
+        .find(|(strip, _)| strip.id() == workspace)
+        .map(|(_, position)| position.0)
+        .expect("a strip for the workspace")
+}
+
 /// A maximized window dragged by its title bar shows no drop line over its
 /// own display, and the usual line over another one. Dropped there, it
 /// joins that display's layout at the line, fills the display, and keeps
@@ -527,15 +566,7 @@ fn a_maximized_window_dragged_to_another_display_joins_its_layout() {
     let within = Origin::new(700, 200);
     let across = Origin::new(700, -600);
 
-    harness.mock_state.set_left_button_down(true);
-    harness.world().write_message(Event::MouseDown {
-        point: CGPoint::new(press.x.into(), press.y.into()),
-        modifiers: Modifiers::empty(),
-        button: MouseButton::Left,
-        window_id: Some(1),
-        clicks: 1,
-    });
-    harness.advance(Duration::from_millis(16));
+    press_title_bar(&mut harness, press);
     let own = drag_steps(&mut harness, press, within);
     assert_eq!(own, vec![None; 3], "no line over its own display");
     let other = drag_steps(&mut harness, within, across);
@@ -544,16 +575,7 @@ fn a_maximized_window_dragged_to_another_display_joins_its_layout() {
         "a line over the other display: {other:?}"
     );
 
-    harness.mock_state.set_left_button_down(false);
-    harness.world().write_message(Event::MouseUp {
-        point: CGPoint::new(across.x.into(), across.y.into()),
-        modifiers: Modifiers::empty(),
-        button: MouseButton::Left,
-    });
-    harness.mock_state.update_window(1, |window| {
-        window.workspace_id = EXT_WORKSPACE_ID;
-    });
-    harness.advance(SETTLE);
+    release_at(&mut harness, across, EXT_WORKSPACE_ID);
 
     assert_eq!(
         layout_on(&mut harness, EXT_WORKSPACE_ID),
@@ -576,4 +598,73 @@ fn a_maximized_window_dragged_to_another_display_joins_its_layout() {
         restored.width() < area.width(),
         "back in a slot: {restored:?}"
     );
+}
+
+/// The engine stops reading a maximized window's moves. An app that moves
+/// the window afterwards does not stop a drag from its title bar where it is
+/// now.
+#[test]
+fn a_maximized_window_an_app_moved_still_drags_to_another_display() {
+    let mut harness = maximized_below_a_larger_display();
+    harness.mock_state.os_move_window(1, Origin::new(0, 200));
+    harness.advance(SETTLE);
+    let press = Origin::new(500, 210);
+    let across = Origin::new(700, -600);
+
+    press_title_bar(&mut harness, press);
+    let shapes = drag_steps(&mut harness, press, across);
+    assert!(
+        matches!(shapes.last(), Some(Some(OverlayShape::Line(_)))),
+        "a line over the other display: {shapes:?}"
+    );
+    release_at(&mut harness, across, EXT_WORKSPACE_ID);
+
+    assert_eq!(
+        layout_on(&mut harness, EXT_WORKSPACE_ID),
+        vec![vec![100], vec![1]]
+    );
+    let area = usable_area_of(&mut harness, EXT_DISPLAY_ID);
+    assert_eq!(os_frame(&harness, 1), area);
+}
+
+/// A drag of a maximized window within its display whose release never
+/// reaches the engine ends when the button reads up. The window stays where
+/// it was let go, and the strip behind it does not scroll to its slot.
+#[test]
+fn a_lost_release_of_a_maximized_window_on_its_display_keeps_the_strip() {
+    let mut harness = maximized_below_a_larger_display();
+    // Scroll the strip so window 1's slot is off the display.
+    let world = harness.world();
+    let strip = world
+        .query_filtered::<(Entity, &LayoutStrip), With<SelectedVirtualMarker>>()
+        .iter(world)
+        .find(|(_, strip)| strip.id() == TEST_WORKSPACE_ID)
+        .map(|(entity, _)| entity)
+        .expect("a strip");
+    world
+        .entity_mut(strip)
+        .get_mut::<Position>()
+        .expect("a position")
+        .0
+        .x -= 2000;
+    harness.advance(SETTLE);
+    let scrolled = strip_position(&mut harness, TEST_WORKSPACE_ID);
+    let press = Origin::new(500, 30);
+    let within = Origin::new(600, 200);
+
+    press_title_bar(&mut harness, press);
+    drag_steps(&mut harness, press, within);
+    assert!(
+        matches!(
+            harness.world().resource::<DragState>(),
+            DragState::Dragging(_)
+        ),
+        "a drag"
+    );
+    harness.mock_state.set_left_button_down(false);
+    harness.advance(SETTLE);
+
+    assert!(!harness.world().resource::<DragState>().holds_window());
+    assert_eq!(strip_position(&mut harness, TEST_WORKSPACE_ID), scrolled);
+    assert_eq!(os_frame(&harness, 1).min, Origin::new(100, 190));
 }

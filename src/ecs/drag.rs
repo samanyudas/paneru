@@ -1458,6 +1458,7 @@ pub(super) fn drag_watchdog(
     mut placements: Placements,
     mut moves: DisplayMoves,
     mut native: ResMut<NativeMembership>,
+    maximized: Query<(), With<Maximized>>,
     mut commands: Commands,
 ) {
     let Some(window) = state.window() else {
@@ -1486,6 +1487,10 @@ pub(super) fn drag_watchdog(
     }
     state.set_if_neq(next);
     for DragEffect::Drop { window, target } in effects {
+        // As in `drag_events`, a maximized window's free move keeps its slot.
+        if target == DropTarget::Home && maximized.contains(window) {
+            continue;
+        }
         let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
         apply_drop(
             window,

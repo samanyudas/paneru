@@ -214,6 +214,9 @@ fn fill(window: &mut Window, maximized: &mut Maximized, visible: IRect) -> bool 
     true
 }
 
+/// Reads the frame of a maximized window when it is pressed, so the drag
+/// that may follow starts from where the window is.
+///
 /// A maximized window dropped on another display after a title-bar drag
 /// fills that display's usable area. A drop on its own display leaves it
 /// where the user put it.
@@ -242,9 +245,17 @@ fn fill_drop_display(
                 let window_id =
                     window_id.or_else(|| window_manager.find_window_at_point(point).ok());
                 *pressed = windows
-                    .iter()
+                    .iter_mut()
                     .find(|(_, window, _)| Some(window.id()) == window_id)
-                    .map(|(entity, _, _)| entity);
+                    .map(|(entity, mut window, _)| {
+                        // The engine stops reading a maximized window's
+                        // moves, so an app may have moved it since. A drag
+                        // starts from where the window is now.
+                        if !window.write_pending() {
+                            _ = window.update_frame();
+                        }
+                        entity
+                    });
             }
             Event::MouseUp {
                 point,
