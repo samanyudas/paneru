@@ -1465,3 +1465,53 @@ fn a_small_shrink_at_the_screen_bottom_is_not_a_minimum() {
         "{frames:?}"
     );
 }
+
+/// The same when the app applies the growth back to the asked height late,
+/// as Chromium-based apps do. The check waits for it instead of taking the
+/// lowered height as the window's size.
+#[test]
+fn a_late_regrowth_after_a_release_keeps_the_asked_height() {
+    const SHORTER: i32 = TALL - 16;
+    const ASKED: i32 = SHORTER - TEST_MENUBAR_HEIGHT;
+    let mut harness = tall_harness();
+    harness.advance(SETTLE);
+    harness.mock_state.update_window(0, |window| {
+        window.sticky_bottom = Some(TALL);
+    });
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, SHORTER),
+    );
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayConfigured {
+            display_id: TEST_DISPLAY_ID,
+        });
+    // Drops the growth back once the lowered height has landed.
+    let mut lowered = false;
+    for _ in 0..200 {
+        harness.advance(Duration::from_millis(16));
+        if harness.mock_state.create_window(0).frame().height() < ASKED {
+            harness.mock_state.update_window(0, |window| {
+                window.dropped_resizes = 1;
+            });
+            lowered = true;
+            break;
+        }
+    }
+    assert!(lowered, "the window is lowered first");
+    for _ in 0..25 {
+        harness.advance(Duration::from_millis(16));
+        let world = harness.world();
+        let entity = find_window_entity(0, world);
+        let bounds = world.entity(entity).get::<crate::ecs::Bounds>().unwrap().0;
+        assert_eq!(bounds.y, ASKED, "kept while the growth is late");
+    }
+    harness.mock_state.os_apply_late_resizes(0);
+    harness.advance(SETTLE);
+
+    let native = harness.mock_state.create_window(0).frame();
+    assert_eq!(native.height(), ASKED, "{native:?}");
+    let engine = frame(harness.world(), 0);
+    assert_eq!(engine.height(), ASKED, "{engine:?}");
+}
