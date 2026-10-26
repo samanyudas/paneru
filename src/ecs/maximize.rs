@@ -30,7 +30,6 @@ use tracing::debug;
 
 use crate::ecs::drag::tiling::supersede_native_resize;
 use crate::ecs::layout::{FALLBACK_TOP_BAR_HEIGHT, LayoutStrip};
-use crate::ecs::systems::unpadded;
 use crate::ecs::{Bounds, DockPosition, Position, TopBarHeight, Unmanaged, UpdateSet};
 use crate::events::{Event, InputEvent, MouseButton};
 use crate::manager::{Display, Origin, Window, WindowManager, origin_from};
@@ -320,10 +319,7 @@ pub(crate) fn fill_display(commands: &mut Commands, entity: Entity, display: CGD
 /// Whether `point` is in the window's top bar: its title bar, toolbar, or
 /// navigation bar.
 fn in_top_bar(window: &Window, top_bar: Option<&TopBarHeight>, point: Origin) -> bool {
-    let frame = unpadded(
-        window.frame(),
-        (window.horizontal_padding(), window.vertical_padding()),
-    );
+    let frame = window.shown_frame();
     let height = top_bar.map_or_else(
         || {
             window

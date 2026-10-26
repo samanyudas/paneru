@@ -13,13 +13,12 @@ use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 
 use crate::ecs::layout::{Column, LayoutStrip};
-use crate::ecs::systems::unpadded;
 use crate::ecs::{
     Bounds, DockPosition, PresentedOrigin, RepositionMarker, ResizeMarker, SpawnCommandsExt,
     Unmanaged, VerifyWindowSize,
 };
 use crate::events::{Event, MouseButton};
-use crate::manager::{Display, Origin, Window, WindowManager, origin_from};
+use crate::manager::{Display, Margins, Origin, Window, WindowManager, origin_from};
 
 const EDGE_TOLERANCE: i32 = 6;
 const TILE_TOLERANCE: i32 = 2;
@@ -89,10 +88,9 @@ pub(super) fn track_resize_gesture(
                 let mut edges: Vec<_> = windows
                     .iter()
                     .filter(|(_, window, presented, bounds)| {
-                        let frame = unpadded(
-                            IRect::from_corners(presented.0, presented.0 + bounds.0),
-                            (window.horizontal_padding(), window.vertical_padding()),
-                        );
+                        let frame = window
+                            .margins()
+                            .shown(IRect::from_corners(presented.0, presented.0 + bounds.0));
                         frame.inflate(EDGE_TOLERANCE).contains(point)
                             && !frame.inflate(-EDGE_TOLERANCE).contains(point)
                     })
@@ -448,7 +446,7 @@ impl TilingRestore<'_, '_> {
         frame: IRect,
         managed: IRect,
         strip_x: Option<i32>,
-        padding: (i32, i32),
+        margins: Margins,
         commands: &mut Commands,
     ) -> NativeFrame {
         let now = self.time.elapsed();
@@ -465,7 +463,7 @@ impl TilingRestore<'_, '_> {
             return NativeFrame::Ordinary;
         }
         let tile = self.displays.iter().any(|(display, dock)| {
-            is_macos_tile(unpadded(frame, padding), display.visible_bounds(dock))
+            is_macos_tile(margins.shown(frame), display.visible_bounds(dock))
         });
         let engine = resize.is_some() || verifying;
         if let Some(refused) = start.and_then(NativeResizeStart::refused) {

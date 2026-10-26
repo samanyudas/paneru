@@ -11,8 +11,8 @@ use crate::events::{DestroySource, Event, MouseButton};
 use crate::manager::app::MockApplicationApi;
 use crate::manager::window_writer::{FrameWrites, WindowWriters, WriteSink};
 use crate::manager::{
-    Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
-    Window, WindowPadding, origin_from, origin_to,
+    Application, Display, Margins, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin,
+    Size, Window, WindowPadding, origin_from, origin_to,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::util::AXUIWrapper;
@@ -1373,6 +1373,16 @@ impl MockState {
                 .windows
                 .get(&id)
                 .map(|w| w.vertical_padding)
+                .unwrap_or_default()
+        });
+
+        let s = self.clone();
+        mw.expect_margins().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| Margins::padding(IVec2::new(w.horizontal_padding, w.vertical_padding)))
                 .unwrap_or_default()
         });
 
