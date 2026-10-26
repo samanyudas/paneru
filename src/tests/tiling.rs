@@ -2156,3 +2156,173 @@ fn floating_waits_for_the_window_macos_has_focused() {
     harness.run(vec![manage]);
     assert!(floating(&mut harness), "the focused window floats");
 }
+
+fn slot_near_the_screen_bottom() -> (TestHarness, IRect) {
+    let config = Config::try_from(
+        r#"
+[padding]
+top = 4
+right = 4
+bottom = 4
+left = 4
+
+[windows.gaps]
+title = ".*"
+horizontal_padding = 4
+vertical_padding = 4
+"#,
+    )
+    .expect("config parses");
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_secs(2));
+    let slot = os_frame(&harness);
+    (harness, slot)
+}
+
+fn os_frame(harness: &TestHarness) -> IRect {
+    let mut frame = None;
+    harness
+        .mock_state
+        .update_window(1, |window| frame = Some(window.frame));
+    frame.expect("window 1")
+}
+
+fn stick_to_the_screen_bottom(harness: &TestHarness) {
+    harness.mock_state.update_window(1, |window| {
+        window.sticky_bottom = Some(TEST_DISPLAY_HEIGHT);
+    });
+}
+
+fn macos_tile(harness: &TestHarness, frame: IRect) {
+    harness.mock_state.os_move_window(1, frame.min);
+    harness.mock_state.os_resize_window(1, frame.size());
+}
+
+const FILL: IRect = IRect {
+    min: IVec2::new(0, TEST_MENUBAR_HEIGHT),
+    max: IVec2::new(TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+};
+
+#[test]
+fn macos_fill_returns_a_tiled_window_to_its_slot_near_the_screen_bottom() {
+    let (mut harness, slot) = slot_near_the_screen_bottom();
+    stick_to_the_screen_bottom(&harness);
+
+    macos_tile(&harness, FILL);
+    harness.advance(Duration::from_secs(3));
+
+    assert_eq!(os_frame(&harness), slot);
+}
+
+#[test]
+fn macos_right_half_tile_returns_a_window_to_its_slot_near_the_screen_bottom() {
+    let (mut harness, slot) = slot_near_the_screen_bottom();
+    stick_to_the_screen_bottom(&harness);
+
+    macos_tile(
+        &harness,
+        IRect::new(
+            TEST_DISPLAY_WIDTH / 2,
+            TEST_MENUBAR_HEIGHT,
+            TEST_DISPLAY_WIDTH,
+            TEST_DISPLAY_HEIGHT,
+        ),
+    );
+    harness.advance(Duration::from_secs(3));
+
+    assert_eq!(os_frame(&harness), slot);
+}
+
+#[test]
+fn a_late_lowering_after_a_tile_still_returns_the_window_to_its_slot() {
+    let (mut harness, slot) = slot_near_the_screen_bottom();
+    stick_to_the_screen_bottom(&harness);
+    harness.mock_state.update_window(1, |window| {
+        window.late_height = Some(slot.height() - crate::ecs::maximize::EDGE_RELEASE);
+    });
+
+    macos_tile(&harness, FILL);
+    let mut delayed = false;
+    for _ in 0..200 {
+        harness.advance(Duration::from_millis(16));
+        harness
+            .mock_state
+            .update_window(1, |window| delayed = !window.late_resizes.is_empty());
+        if delayed {
+            break;
+        }
+    }
+    assert!(delayed, "the lowering is delayed");
+    harness.advance(Duration::from_millis(1200));
+    harness.mock_state.os_apply_late_resizes(1);
+    harness.advance(Duration::from_secs(3));
+
+    assert_eq!(os_frame(&harness), slot);
+    let world = harness.world();
+    let entity = find_window_entity(1, world);
+    assert!(
+        !world.entity(entity).contains::<crate::ecs::MinimumHeight>(),
+        "the late lowering is not kept as the app's minimum height"
+    );
+}
+
+#[test]
+fn macos_fill_again_after_the_slot_returns_the_window_to_its_slot_again() {
+    let (mut harness, slot) = slot_near_the_screen_bottom();
+    stick_to_the_screen_bottom(&harness);
+
+    macos_tile(&harness, FILL);
+    let mut reached = false;
+    for _ in 0..60 {
+        harness.advance(Duration::from_millis(16));
+        reached = os_frame(&harness) == slot && restore_reached(&mut harness);
+        if reached {
+            break;
+        }
+    }
+    assert!(reached, "the window returns to its slot within the hold");
+    macos_tile(&harness, FILL);
+    harness.advance(Duration::from_secs(3));
+
+    assert_eq!(os_frame(&harness), slot);
+}
+
+fn restore_reached(harness: &mut TestHarness) -> bool {
+    let world = harness.world();
+    let entity = find_window_entity(1, world);
+    world
+        .get::<crate::ecs::drag::NativeResizeStart>(entity)
+        .is_some_and(crate::ecs::drag::NativeResizeStart::reached)
+}
+
+#[test]
+fn a_minimum_height_taller_than_the_slot_is_kept_after_a_tile() {
+    let (mut harness, slot) = slot_near_the_screen_bottom();
+    let minimum = slot.height() + 4;
+    harness.mock_state.update_window(1, |window| {
+        window.minimum_size = Some(crate::manager::Size::new(0, minimum));
+    });
+
+    macos_tile(&harness, FILL);
+    harness.advance(Duration::from_secs(3));
+
+    assert_eq!(
+        os_frame(&harness),
+        IRect::new(slot.min.x, slot.min.y, slot.max.x, slot.min.y + minimum)
+    );
+    let resize_writes = |harness: &TestHarness| {
+        let mut writes = 0;
+        harness
+            .mock_state
+            .update_window(1, |window| writes = window.resize_writes);
+        writes
+    };
+    let settled = resize_writes(&harness);
+    harness.advance(Duration::from_secs(2));
+    assert_eq!(
+        resize_writes(&harness),
+        settled,
+        "no size writes after settling"
+    );
+}
