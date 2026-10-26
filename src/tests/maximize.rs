@@ -7,7 +7,7 @@ use objc2_core_foundation::CGPoint;
 
 use crate::assert_focused;
 use crate::commands::{Command, Direction, Operation, Side};
-use crate::config::MainOptions;
+use crate::config::{Config, MainOptions};
 use crate::ecs::drag::{DragFeedback, DragState, OverlayShape};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{DockPosition, Position, SelectedVirtualMarker};
@@ -667,4 +667,326 @@ fn a_lost_release_of_a_maximized_window_on_its_display_keeps_the_strip() {
     assert!(!harness.world().resource::<DragState>().holds_window());
     assert_eq!(strip_position(&mut harness, TEST_WORKSPACE_ID), scrolled);
     assert_eq!(os_frame(&harness, 1).min, Origin::new(100, 190));
+}
+
+/// The frame the engine has the window show, padding applied.
+fn shown(harness: &mut TestHarness, id: WinID) -> IRect {
+    let entity = find_window_entity(id, harness.world());
+    harness
+        .world()
+        .get::<Window>(entity)
+        .expect("a window")
+        .shown_frame()
+}
+
+fn sliver(harness: &mut TestHarness) -> i32 {
+    harness.world().resource::<Config>().sliver_width()
+}
+
+/// No window in `others` shows over the part of maximized window `id` that
+/// is on the display, except a parked sliver at the display's edge.
+fn assert_nothing_covers(harness: &mut TestHarness, id: WinID, others: &[WinID]) {
+    let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+    let visible = os_frame(harness, id).intersect(display);
+    let sliver = sliver(harness);
+    for other in others {
+        let overlap = shown(harness, *other).intersect(visible);
+        assert!(
+            overlap.is_empty() || overlap.width() <= sliver,
+            "window {other} at {:?} covers {overlap:?} of window {id} at {visible:?}",
+            shown(harness, *other),
+        );
+    }
+}
+
+fn focus(harness: &mut TestHarness, direction: Direction) {
+    harness.run(vec![command(Operation::Focus(direction))]);
+    harness.advance(SETTLE);
+}
+
+/// [`three_windows`] with window 1 focused, as a click on it leaves it.
+fn three_windows_one_focused() -> TestHarness {
+    let mut harness = three_windows();
+    harness.mock_state.focus_window(1);
+    harness.advance(SETTLE);
+    harness
+}
+
+/// Focus moves scroll the strip past a maximized window. It slides away
+/// beside its neighbours, stays maximized, and fills the usable area again
+/// when it comes back.
+#[test]
+fn focus_east_and_west_scroll_past_a_maximized_window() {
+    let mut harness = three_windows_one_focused();
+    double_click_title_bar(&mut harness, 1);
+    let area = usable_area(&mut harness);
+    assert_eq!(os_frame(&harness, 1), area);
+
+    focus(&mut harness, Direction::East);
+    assert_focused!(harness.world(), 2);
+    let shown_two = os_frame(&harness, 2);
+    assert!(
+        area.contains(shown_two.min) && area.contains(shown_two.max),
+        "window 2 is in view: {shown_two:?}"
+    );
+    assert!(
+        os_frame(&harness, 1).max.x <= shown_two.min.x,
+        "window 1 slid away to the west: {:?}",
+        os_frame(&harness, 1)
+    );
+    assert_eq!(os_frame(&harness, 1).size(), area.size(), "still maximized");
+
+    focus(&mut harness, Direction::West);
+    assert_focused!(harness.world(), 1);
+    assert_eq!(os_frame(&harness, 1), area);
+
+    focus(&mut harness, Direction::West);
+    assert_focused!(harness.world(), 0);
+    assert!(
+        os_frame(&harness, 1).min.x >= os_frame(&harness, 0).max.x,
+        "window 1 slid away to the east: {:?}",
+        os_frame(&harness, 1)
+    );
+
+    focus(&mut harness, Direction::East);
+    assert_eq!(os_frame(&harness, 1), area);
+    assert_nothing_covers(&mut harness, 1, &[0, 2]);
+}
+
+/// A swipe scrolls the strip past a maximized window, and no neighbour is
+/// drawn over it on the way there or back.
+#[test]
+fn a_swipe_scrolls_past_a_maximized_window() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.mock_state.focus_window(1);
+    harness.advance(SETTLE);
+    double_click_title_bar(&mut harness, 1);
+    let area = usable_area(&mut harness);
+    assert_eq!(os_frame(&harness, 1), area);
+
+    let swipe = |harness: &mut TestHarness, delta: f64| {
+        for _ in 0..10 {
+            harness
+                .world()
+                .write_message(Event::Swipe { delta, fingers: 3 });
+            harness.advance(Duration::from_millis(20));
+            assert_eq!(os_frame(harness, 1).size(), area.size(), "still maximized");
+            assert_nothing_covers(harness, 1, &[0, 2]);
+        }
+        harness.advance(SETTLE);
+    };
+    swipe(&mut harness, 0.1);
+    assert_ne!(os_frame(&harness, 1), area, "the swipe moved window 1");
+    assert_eq!(os_frame(&harness, 1).size(), area.size(), "still maximized");
+    assert_nothing_covers(&mut harness, 1, &[0, 2]);
+
+    swipe(&mut harness, -0.1);
+    assert_eq!(os_frame(&harness, 1).size(), area.size(), "still maximized");
+    assert_nothing_covers(&mut harness, 1, &[0, 2]);
+}
+
+/// With Miri's default gaps (outer 8 and inner 8, so an edge padding of 4
+/// and a window padding of 4), a maximized window fills the usable area
+/// exactly, and no neighbour shows over it.
+#[test]
+fn no_neighbor_covers_a_maximized_window_with_gaps() {
+    let options = MainOptions {
+        padding_top: Some(4),
+        padding_right: Some(4),
+        padding_bottom: Some(4),
+        padding_left: Some(4),
+        ..MainOptions::default()
+    };
+    let mut harness = TestHarness::new()
+        .with_config((options, vec![]).into())
+        .with_windows(3);
+    for id in 0..3 {
+        harness.mock_state.update_window(id, |window| {
+            window.horizontal_padding = 4;
+            window.vertical_padding = 4;
+        });
+    }
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.mock_state.focus_window(1);
+    harness.advance(SETTLE);
+
+    double_click_title_bar(&mut harness, 1);
+    let area = usable_area(&mut harness);
+    assert_eq!(os_frame(&harness, 1), area, "no edge or window padding");
+    assert_nothing_covers(&mut harness, 1, &[0, 2]);
+
+    focus(&mut harness, Direction::East);
+    assert_nothing_covers(&mut harness, 1, &[0, 2]);
+    focus(&mut harness, Direction::West);
+    assert_eq!(os_frame(&harness, 1), area);
+    assert_nothing_covers(&mut harness, 1, &[0, 2]);
+}
+
+/// Restore gives the window the width it had before it was maximized, after
+/// the strip scrolled past it, and its neighbours keep their sizes.
+#[test]
+fn restore_returns_the_earlier_width_and_neighbors_keep_theirs() {
+    let mut harness = three_windows_one_focused();
+    harness.run(vec![command(Operation::SetWidth(0.6))]);
+    harness.advance(SETTLE);
+    let before = frames(&harness, &[0, 1, 2]);
+    assert_ne!(before[1].width(), before[0].width(), "a width of its own");
+
+    double_click_title_bar(&mut harness, 1);
+    focus(&mut harness, Direction::East);
+    focus(&mut harness, Direction::West);
+    double_click_title_bar(&mut harness, 1);
+
+    let after = frames(&harness, &[0, 1, 2]);
+    let sizes = |frames: &[IRect]| frames.iter().map(IRect::size).collect::<Vec<_>>();
+    assert_eq!(sizes(&after), sizes(&before));
+}
+
+/// A stacked window leaves its stack for a column of its own to the right of
+/// the stack, and goes back to its place in the stack when restored.
+#[test]
+fn a_stacked_window_pops_out_right_and_returns_to_its_slot() {
+    let mut harness = stacked();
+    let before = frames(&harness, &[0, 1, 2]);
+    assert_eq!(
+        layout_on(&mut harness, TEST_WORKSPACE_ID),
+        vec![vec![0, 1], vec![2]]
+    );
+
+    double_click_title_bar(&mut harness, 1);
+    assert_eq!(
+        layout_on(&mut harness, TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    assert_eq!(os_frame(&harness, 1), usable_area(&mut harness));
+
+    double_click_title_bar(&mut harness, 1);
+    assert_eq!(
+        layout_on(&mut harness, TEST_WORKSPACE_ID),
+        vec![vec![0, 1], vec![2]]
+    );
+    assert_eq!(frames(&harness, &[0, 1, 2]), before);
+}
+
+/// A maximized window moved to another display stays a maximized column of
+/// that display's strip: focus scrolls past it there too.
+#[test]
+fn a_display_move_keeps_a_maximized_window_in_the_new_row() {
+    let mut harness = maximized_below_a_larger_display();
+    move_to_display(
+        &mut harness,
+        Direction::North,
+        EXT_DISPLAY_ID,
+        EXT_WORKSPACE_ID,
+    );
+    let area = usable_area_of(&mut harness, EXT_DISPLAY_ID);
+    assert_eq!(os_frame(&harness, 1), area);
+
+    focus(&mut harness, Direction::West);
+    assert_focused!(harness.world(), 100);
+    assert!(
+        os_frame(&harness, 1).min.x >= os_frame(&harness, 100).max.x,
+        "window 1 slid away to the east: {:?}",
+        os_frame(&harness, 1)
+    );
+    focus(&mut harness, Direction::East);
+    assert_eq!(os_frame(&harness, 1), area);
+}
+
+/// A maximized window moved to another workspace and back stays maximized,
+/// fills the usable area, and focus still scrolls past it.
+#[test]
+fn a_workspace_move_keeps_a_window_maximized() {
+    let mut harness = three_windows_one_focused();
+    double_click_title_bar(&mut harness, 1);
+    let area = usable_area(&mut harness);
+
+    harness.run(vec![command(Operation::VirtualMove(
+        Direction::East,
+        crate::commands::MoveFocus::Follow,
+    ))]);
+    harness.advance(SETTLE);
+    assert_eq!(os_frame(&harness, 1), area);
+
+    harness.run(vec![command(Operation::VirtualMove(
+        Direction::West,
+        crate::commands::MoveFocus::Follow,
+    ))]);
+    harness.advance(SETTLE);
+    assert_eq!(os_frame(&harness, 1), area);
+
+    focus(&mut harness, Direction::West);
+    assert_focused!(harness.world(), 2);
+    assert!(
+        os_frame(&harness, 1).min.x >= os_frame(&harness, 2).max.x,
+        "window 1 slid away to the east: {:?}",
+        os_frame(&harness, 1)
+    );
+    focus(&mut harness, Direction::East);
+    assert_eq!(os_frame(&harness, 1), area);
+}
+
+/// A config reload that changes the gaps fits a maximized window to the
+/// usable area again.
+#[test]
+fn a_padding_reload_refits_a_maximized_window() {
+    let mut harness = three_windows_one_focused();
+    double_click_title_bar(&mut harness, 1);
+    let area = usable_area(&mut harness);
+
+    // Outer and inner gaps of 16: an edge padding of 8 and a window padding
+    // of 8.
+    for id in 0..3 {
+        harness.mock_state.update_window(id, |window| {
+            window.horizontal_padding = 8;
+            window.vertical_padding = 8;
+        });
+    }
+    let path = std::env::temp_dir().join(format!(
+        "paneru-maximize-reload-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        "[options]\npadding_top = 8\npadding_right = 8\npadding_bottom = 8\npadding_left = 8\n",
+    )
+    .expect("writing the new config");
+    let reloaded = harness
+        .world()
+        .resource_mut::<Config>()
+        .reload_config(&path);
+    std::fs::remove_file(&path).expect("removing the new config");
+    reloaded.expect("reloading the config");
+    harness.advance(SETTLE);
+    assert_eq!(os_frame(&harness, 1), area);
+
+    focus(&mut harness, Direction::East);
+    assert_nothing_covers(&mut harness, 1, &[0, 2]);
+    focus(&mut harness, Direction::West);
+    assert_eq!(os_frame(&harness, 1), area);
+    assert_nothing_covers(&mut harness, 1, &[0, 2]);
+}
+
+/// Repeated toggles with scrolling in between end where they started.
+#[test]
+fn repeated_toggles_with_scrolling_do_not_drift() {
+    let mut harness = three_windows_one_focused();
+    let before = frames(&harness, &[0, 1, 2]);
+    for _ in 0..3 {
+        double_click_title_bar(&mut harness, 1);
+        focus(&mut harness, Direction::East);
+        focus(&mut harness, Direction::West);
+        double_click_title_bar(&mut harness, 1);
+    }
+    let sizes = |frames: &[IRect]| frames.iter().map(IRect::size).collect::<Vec<_>>();
+    assert_eq!(sizes(&frames(&harness, &[0, 1, 2])), sizes(&before));
 }
