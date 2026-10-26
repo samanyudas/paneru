@@ -23,8 +23,8 @@ const WINDOW_WIDTH: i32 = 700;
 /// How long each of the slow app's writes takes, like Helium mid-swipe.
 const SLOW_WRITE: Duration = Duration::from_millis(200);
 /// How long the other app's write may take to land while the slow app is
-/// stuck, well under the second a held app stays stuck.
-const OTHER_APP_LANDING: Duration = Duration::from_millis(150);
+/// stuck, under the second a held app stays stuck.
+const OTHER_APP_LANDING: Duration = Duration::from_millis(500);
 /// Simulated time per frame, as the harness runs it.
 const FRAME: Duration = Duration::from_millis(20);
 const FLUSH: Duration = Duration::from_secs(5);

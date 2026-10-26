@@ -1156,9 +1156,8 @@ impl MockState {
         self.holds.released.notify_all();
     }
 
-    /// How many times the engine read a window's frame or flushed the
-    /// writes while a queued write had yet to land, and so waited on an
-    /// app's writer.
+    /// How many times the engine started a frame read or a flush while a
+    /// queued write had yet to land, each of which waits on an app's writer.
     pub fn engine_waits(&self) -> usize {
         self.engine_waits.load(Ordering::Relaxed)
     }
