@@ -1032,16 +1032,23 @@ fn reload_with_gaps(harness: &mut TestHarness, ids: &[WinID]) {
             window.vertical_padding = 8;
         });
     }
+    reload_options(harness, EDGE_PADDING_8);
+}
+
+const EDGE_PADDING_8: &str =
+    "padding_top = 8\npadding_right = 8\npadding_bottom = 8\npadding_left = 8\n";
+
+/// Reloads the config with `options` as its `[options]` table.
+fn reload_options(harness: &mut TestHarness, options: &str) {
+    let test = std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .replace("::", "-");
     let path = std::env::temp_dir().join(format!(
-        "paneru-maximize-reload-{}-{}.toml",
+        "paneru-maximize-reload-{}-{test}.toml",
         std::process::id(),
-        ids.len()
     ));
-    std::fs::write(
-        &path,
-        "[options]\npadding_top = 8\npadding_right = 8\npadding_bottom = 8\npadding_left = 8\n",
-    )
-    .expect("writing the new config");
+    std::fs::write(&path, format!("[options]\n{options}")).expect("writing the new config");
     let reloaded = harness
         .world()
         .resource_mut::<Config>()
@@ -1132,4 +1139,44 @@ fn a_full_width_window_fills_the_usable_area_when_maximized() {
     assert_eq!(os_frame(&harness, 1), area);
     double_click_title_bar(&mut harness, 1);
     assert_eq!(os_frame(&harness, 1).width(), area.width() - 8);
+}
+
+/// With `auto_center`, a padding reload keeps a strip with no maximized
+/// window where the user swiped it, moved only as far as its viewport moved,
+/// instead of centering its widest window again.
+#[test]
+fn a_padding_reload_keeps_a_swiped_strip_where_it_was() {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(true),
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.mock_state.focus_window(1);
+    harness.advance(SETTLE);
+    let centered = os_frame(&harness, 1);
+    for _ in 0..5 {
+        harness.world().write_message(Event::Swipe {
+            delta: 0.05,
+            fingers: 3,
+        });
+        harness.advance(Duration::from_millis(20));
+    }
+    harness.advance(SETTLE);
+    let swiped = frames(&harness, &[1, 2]);
+    assert_ne!(swiped[0], centered, "the swipe moved window 1");
+
+    reload_options(
+        &mut harness,
+        &format!("auto_center = true\nswipe_gesture_fingers = 3\n{EDGE_PADDING_8}"),
+    );
+    let after = frames(&harness, &[1, 2]);
+    let lefts = |frames: &[IRect]| frames.iter().map(|frame| frame.min.x).collect::<Vec<_>>();
+    let moved: Vec<_> = lefts(&swiped).iter().map(|x| x + 8).collect();
+    assert_eq!(lefts(&after), moved, "moved by the left padding of 8 only");
 }

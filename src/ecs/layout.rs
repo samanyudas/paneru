@@ -2400,50 +2400,38 @@ pub(super) fn layout_strip_changed(
 
 /// Lays every strip out again when the display edge padding changes, as a
 /// config reload can do: the viewport, and with it every maximized window,
-/// depends on it. Each strip in view on any display is placed in its new
-/// viewport around the window the user sees there: the focused window, or
-/// on a display without the focus, the window most on its display.
+/// depends on it. Each strip in view on any display moves with its viewport,
+/// so it keeps where the user scrolled it and a maximized column at the
+/// viewport's edge fills the new viewport.
+#[allow(clippy::type_complexity)]
 fn relayout_on_edge_padding_change(
     config: Res<Config>,
     mut last: Local<Option<(i32, i32, i32, i32)>>,
     mut strips: Query<(
+        Entity,
         &mut LayoutStrip,
-        &ChildOf,
+        &Position,
+        Option<&RepositionMarker>,
+        Option<&Scrolling>,
         Has<SelectedVirtualMarker>,
         Has<PreviousStripPosition>,
     )>,
-    displays: Query<&Display>,
-    windows: Windows,
     mut commands: Commands,
 ) {
     let padding = config.edge_padding();
-    if last.replace(padding).is_none_or(|last| last == padding) {
+    let Some(old) = last.replace(padding).filter(|old| *old != padding) else {
         return;
-    }
-    let focused = windows.focused().map(|(_, entity)| entity);
-    for (mut strip, child, selected, parked) in &mut strips {
+    };
+    let (top, _, _, left) = padding;
+    let (old_top, _, _, old_left) = old;
+    let shift = IVec2::new(left - old_left, top - old_top);
+    for (entity, mut strip, position, reposition, scrolling, selected, parked) in &mut strips {
         strip.set_changed();
-        if !selected || parked {
-            continue;
-        }
-        let Ok(bounds) = displays.get(child.parent()).map(Display::bounds) else {
-            continue;
-        };
-        let anchor = focused
-            .filter(|entity| strip.contains(*entity))
-            .or_else(|| {
-                strip
-                    .columns()
-                    .filter_map(Column::top)
-                    .filter_map(|entity| {
-                        let shown = windows.frame(entity)?.intersect(bounds).width();
-                        (shown > 0).then_some((entity, shown))
-                    })
-                    .max_by_key(|(_, shown)| *shown)
-                    .map(|(entity, _)| entity)
-            });
-        if let Some(anchor) = anchor {
-            commands.reshuffle_around(anchor);
+        if selected && !parked && shift != IVec2::ZERO {
+            commands.reposition_entity(
+                entity,
+                strip_destination(position, reposition, scrolling) + shift,
+            );
         }
     }
 }
