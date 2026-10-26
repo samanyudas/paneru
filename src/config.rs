@@ -1830,12 +1830,22 @@ fn resolve_keybinding_str(input: &str, virtual_keys: &[(String, u8)]) -> Result<
 }
 
 fn keycode_for_key_name(key: &str, virtual_keys: &[(String, u8)]) -> Option<u8> {
-    virtual_keys
-        .iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, c)| *c)
+    // A keypad key yields to the US position of the same name. On AZERTY only
+    // the keypad types digits, and "1" must still bind the top-row key.
+    let typed_by = |keypad: bool| {
+        virtual_keys
+            .iter()
+            .find(|(k, c)| k == key && is_keypad(*c) == keypad)
+            .map(|(_, c)| *c)
+    };
+    typed_by(false)
         .or_else(|| virtual_keycode().find(|(k, _)| *k == key).map(|(_, c)| *c))
+        .or_else(|| typed_by(true))
         .or_else(|| literal_keycode().find(|(k, _)| *k == key).map(|(_, c)| *c))
+}
+
+fn is_keypad(code: u8) -> bool {
+    virtual_keycode().any(|(name, c)| *c == code && name.starts_with("keypad"))
 }
 
 /// Parses a string containing modifier names (e.g., "alt", "shift", "cmd", "ctrl") separated by "+", and returns their combined bitmask.
