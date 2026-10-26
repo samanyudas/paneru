@@ -1147,6 +1147,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
 
 pub(crate) struct WindowProperties {
     params: Vec<WindowParams>,
+    resizable: bool,
 }
 
 impl WindowProperties {
@@ -1160,14 +1161,19 @@ impl WindowProperties {
         let subrole = window.subrole().ok();
         let params =
             config.find_window_properties(&title, &bundle_id, role.as_deref(), subrole.as_deref());
-        Self { params }
+        Self {
+            params,
+            resizable: window.is_resizable(),
+        }
     }
 
+    /// Whether the window floats automatically: a rule decides, and without
+    /// one a window that cannot be resized floats.
     pub fn floating(&self) -> bool {
         self.params
             .iter()
             .find_map(|props| props.floating)
-            .unwrap_or(false)
+            .unwrap_or(!self.resizable)
     }
 
     pub fn insertion(&self) -> Option<usize> {

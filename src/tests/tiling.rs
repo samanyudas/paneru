@@ -1208,6 +1208,32 @@ fn test_rule_floated_window_does_not_hold_a_slot_in_the_strip() {
         .run(commands);
 }
 
+/// A window that opens floating takes focus like a tiled one, so the float
+/// toggle acts on it. macOS reports the focus before the engine tracks it.
+#[test]
+fn a_new_floating_window_takes_focus() {
+    let mut harness = TestHarness::new().with_windows(1).with_focused_window(0);
+    harness.advance(Duration::from_millis(500));
+    let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 1, frame);
+    harness
+        .mock_state
+        .update_window(1, |window| window.fixed_size = true);
+    harness.mock_state.focus_window_unreported(1);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_millis(500));
+
+    let world = harness.world();
+    let entity = find_window_entity(1, world);
+    assert!(matches!(
+        world.entity(entity).get::<crate::ecs::Unmanaged>(),
+        Some(crate::ecs::Unmanaged::Floating)
+    ));
+    crate::assert_focused!(world, 1);
+}
+
 /// Closing a window while its application stays alive must free its slot in
 /// the strip. The AX element of such a window often keeps answering queries
 /// after the window is gone, which used to make `window_destroyed_trigger`

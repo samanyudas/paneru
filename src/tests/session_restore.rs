@@ -1246,10 +1246,27 @@ fn saved_window(window_id: i32) -> SavedWindow {
 /// A harness whose floating rule matches window 1, with both windows saved as
 /// tiled, as an engine restart finds them.
 fn restarted_with_floating_rule(overrides: TileOverrides) -> TestHarness {
+    restarted_with_window_one(Some(true), false, overrides)
+}
+
+/// A harness whose window 1 cannot be resized, with both windows saved as
+/// tiled. `rule` is what a rule for window 1 says about floating, if any.
+fn restarted_with_fixed_size_window(rule: Option<bool>, overrides: TileOverrides) -> TestHarness {
+    restarted_with_window_one(rule, true, overrides)
+}
+
+fn restarted_with_window_one(
+    floating: Option<bool>,
+    fixed_size: bool,
+    overrides: TileOverrides,
+) -> TestHarness {
     let mut params = WindowParams::new("^Window 1$", Some("test".to_string()));
-    params.floating = Some(true);
+    params.floating = floating;
     let config: Config = (MainOptions::default(), vec![params]).into();
-    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_window(1, |window| window.fixed_size = fixed_size);
     let world = harness.app.world_mut();
     world.insert_resource(overrides);
     world.insert_resource(state_with_strips(vec![SavedStrip {
@@ -1341,4 +1358,32 @@ fn closing_a_window_ends_its_override() {
 
     let mut restarted = restarted_with_floating_rule(overrides);
     assert!(floats(&mut restarted, 1));
+}
+
+/// A window that cannot be resized floats, even where a saved session placed
+/// it in the strip.
+#[test]
+fn a_fixed_size_window_floats() {
+    let mut harness = restarted_with_fixed_size_window(None, TileOverrides::default());
+    assert!(floats(&mut harness, 1));
+    assert!(!floats(&mut harness, 0));
+}
+
+/// A rule that says a window does not float wins over its fixed size.
+#[test]
+fn a_rule_can_tile_a_fixed_size_window() {
+    let mut harness = restarted_with_fixed_size_window(Some(false), TileOverrides::default());
+    assert!(!floats(&mut harness, 1));
+}
+
+/// Tiling a fixed-size window with the toggle lasts across an engine restart
+/// while the window stays open.
+#[test]
+fn a_fixed_size_window_tiled_by_the_user_stays_tiled_after_a_restart() {
+    let mut harness = restarted_with_fixed_size_window(None, TileOverrides::default());
+    let overrides = toggle_window_one(&mut harness, 1);
+    assert!(!floats(&mut harness, 1), "the toggle tiles the window");
+
+    let mut restarted = restarted_with_fixed_size_window(None, overrides);
+    assert!(!floats(&mut restarted, 1));
 }

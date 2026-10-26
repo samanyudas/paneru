@@ -71,6 +71,8 @@ pub(crate) struct MockWindowData {
     pub(crate) subrole: String,
     pub(crate) identifier: String,
     pub(crate) is_full_screen: bool,
+    /// The app does not let the window's size change.
+    pub(crate) fixed_size: bool,
     pub(crate) border_radius: Option<f64>,
     /// What Accessibility reports as the window's top bar height. `None`
     /// models a window whose top bar cannot be measured.
@@ -144,6 +146,7 @@ impl Default for MockWindowData {
             subrole: "AXStandardWindow".to_string(),
             identifier: "testid".to_string(),
             is_full_screen: false,
+            fixed_size: false,
             border_radius: None,
             top_bar_height: None,
             top_bar_unreadable: false,
@@ -651,6 +654,17 @@ impl MockState {
                     .event_queue
                     .push_back(Event::WindowFocused { window_id: id });
             }
+        }
+    }
+
+    /// Focuses window `id` in its app without reporting it, as when macOS
+    /// reported the focus before the engine tracked the window.
+    pub fn focus_window_unreported(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        if let Some(pid) = inner.windows.get(&id).map(|win| win.pid)
+            && let Some(app) = inner.apps.get_mut(&pid)
+        {
+            app.focused_window_id = Some(id);
         }
     }
 
@@ -1353,6 +1367,15 @@ impl MockState {
                 .windows
                 .get(&id)
                 .is_some_and(|w| w.is_full_screen)
+        });
+
+        let s = self.clone();
+        mw.expect_is_resizable().returning(move || {
+            !s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .is_some_and(|w| w.fixed_size)
         });
 
         let s = self.clone();

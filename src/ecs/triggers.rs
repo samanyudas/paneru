@@ -1440,6 +1440,14 @@ pub(super) fn apply_window_positions(
                 // Avoid managing window if it's floating.
                 entity_commands.try_insert(Unmanaged::Floating);
             }
+            // macOS reported the new window's focus before it was tracked, so
+            // it takes focus here, as a tiled window does below.
+            if initializing.is_none() && !properties.dont_focus() {
+                ctx.commands
+                    .trigger(SendMessageTrigger(Event::WindowFocused {
+                        window_id: window.id(),
+                    }));
+            }
             continue;
         }
 
