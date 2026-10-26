@@ -1335,6 +1335,9 @@ fn test_move_to_display_round_trip_refits_source_strip_without_continuous_swipe(
     assert_display_round_trip_refits_source_strip(false);
 }
 
+/// Windows 1 to 3 on the main display below and window 0 on the display
+/// above. The arrival tests focus window 3 before they leave the main
+/// display, so window 0 arrives after that last column.
 fn display_round_trip_harness(
     options: MainOptions,
     origin_x: i32,
@@ -1461,7 +1464,7 @@ fn assert_display_round_trip_refits_source_strip(continuous_swipe: bool) {
         })
         .run(vec![
             Event::MenuOpened { window_id: 1 },
-            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::Focus(Direction::Last)),
             window_command(Operation::FocusDisplay(Direction::North)),
             Event::Command {
                 command: Command::PrintState,
@@ -1485,7 +1488,7 @@ fn source_strip_after_arrival(
     let mut harness = display_round_trip_harness(options, origin_x, middle_width);
     harness.run(vec![
         Event::MenuOpened { window_id: 1 },
-        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::Focus(Direction::Last)),
         window_command(Operation::FocusDisplay(Direction::North)),
     ]);
     harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
@@ -1561,7 +1564,7 @@ fn begin_display_arrival(harness: TestHarness) -> TestHarness {
 fn prepare_display_arrival(mut harness: TestHarness) -> TestHarness {
     harness.run(vec![
         Event::MenuOpened { window_id: 1 },
-        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::Focus(Direction::Last)),
         window_command(Operation::FocusDisplay(Direction::North)),
     ]);
     harness.mock_state.os_activate_display(EXT_DISPLAY_ID);

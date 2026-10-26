@@ -191,6 +191,24 @@ impl Side {
             Side::East => "east",
         }
     }
+
+    /// The compass direction of this side.
+    #[must_use]
+    pub fn direction(self) -> Direction {
+        match self {
+            Side::West => Direction::West,
+            Side::East => Direction::East,
+        }
+    }
+
+    /// The end of a strip on this side: its first or last column.
+    #[must_use]
+    pub fn end(self) -> Direction {
+        match self {
+            Side::West => Direction::First,
+            Side::East => Direction::Last,
+        }
+    }
 }
 
 /// Direction used when cycling preset resize widths and heights.
@@ -285,14 +303,22 @@ pub enum Operation {
     /// a double-click on its title bar does. `full_width` is its older name.
     #[serde(alias = "full_width")]
     Maximize,
-    /// Moves the focused window to the next available display.
+    /// Moves the focused window's whole column to the next available display.
     ToNextDisplay(MoveFocus),
     /// Focuses the display that lies north, south, west, or east of the active
     /// display in the physical arrangement.
     FocusDisplay(Direction),
-    /// Moves the focused window to the display that lies north, south, west,
-    /// or east of the active display, and follows it there.
+    /// Moves the focused window's whole column to the display that lies
+    /// north, south, west, or east of the active display, and follows it there.
     MoveToDisplay(Direction),
+    /// Focuses the first (`West`) or last (`East`) column of the active strip.
+    /// When that column already has focus, or the strip has no column, focuses
+    /// the display on that side instead, as `FocusDisplay` does.
+    FocusEdge(Side),
+    /// Moves the focused window's whole column to the first (`West`) or last
+    /// (`East`) position of its strip. When it is already there, moves the
+    /// column on to the display on that side instead, as `MoveToDisplay` does.
+    MoveEdge(Side),
     /// Distributes heights equally among windows in the focused stack.
     Equalize,
     /// Makes all columns in the active strip the same width as the focused window.

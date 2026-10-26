@@ -17,7 +17,7 @@ mod query;
 
 use crate::config::Config;
 use crate::config::snippet::{RuleSubject, SnippetDialect, window_rule_snippet};
-use crate::ecs::display::{DisplayMoves, FloatingLayer, Placement};
+use crate::ecs::display::{DisplayMoves, FloatingLayer};
 use crate::ecs::drag::NativeResizeStart;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{
@@ -636,27 +636,7 @@ fn command_swap_focus(
     let active_strip = active_display.active_strip();
     let mut handler = || {
         let (_, current) = windows.focused()?;
-        let index = active_strip.index_of(current).ok()?;
-        let other_window = get_window_in_direction(direction, current, active_strip)?;
-        let new_index = active_strip.index_of(other_window).ok()?;
-        debug!(
-            "swap {direction:?}: current={current} idx={index}, other={other_window} idx={new_index}, strip_len={}",
-            active_strip.len()
-        );
-
-        if index == new_index
-            && let Some(Column::Stack(stack)) = active_strip.get_column_mut(index)
-        {
-            let pos_a = stack.iter().position(|i| i.contains(current))?;
-            let pos_b = stack.iter().position(|i| i.contains(other_window))?;
-            stack.swap(pos_a, pos_b);
-        } else if index < new_index {
-            (index..new_index).for_each(|idx| active_strip.swap(idx, idx + 1));
-        } else {
-            (new_index..index)
-                .rev()
-                .for_each(|idx| active_strip.swap(idx, idx + 1));
-        }
+        swap_in_strip(active_strip, current, direction)?;
         Some(current)
     };
 
@@ -674,6 +654,96 @@ fn command_swap_focus(
             active_strip.len()
         );
     }
+}
+
+/// Moves `current` in `direction` within `strip`, as `window_swap_*` does.
+/// Toward another column, the whole column moves past every column between
+/// the two. Within a stack, the window trades places with the item in
+/// `direction`. Returns `None`, changing nothing, when nothing lies in
+/// `direction`.
+fn swap_in_strip(strip: &mut LayoutStrip, current: Entity, direction: &Direction) -> Option<()> {
+    let index = strip.index_of(current).ok()?;
+    let other_window = get_window_in_direction(direction, current, strip)?;
+    let new_index = strip.index_of(other_window).ok()?;
+    debug!(
+        "swap {direction:?}: current={current} idx={index}, other={other_window} idx={new_index}, strip_len={}",
+        strip.len()
+    );
+
+    if index == new_index
+        && let Some(Column::Stack(stack)) = strip.get_column_mut(index)
+    {
+        let pos_a = stack.iter().position(|i| i.contains(current))?;
+        let pos_b = stack.iter().position(|i| i.contains(other_window))?;
+        stack.swap(pos_a, pos_b);
+    } else if index < new_index {
+        (index..new_index).for_each(|idx| strip.swap(idx, idx + 1));
+    } else {
+        (new_index..index)
+            .rev()
+            .for_each(|idx| strip.swap(idx, idx + 1));
+    }
+    Some(())
+}
+
+/// What an edge command does from the window `focused` in `strip`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeStep {
+    /// Reach the strip's end column, at this index.
+    Column(usize),
+    /// Cross to the display beyond the strip's end.
+    Display,
+}
+
+/// Where an edge command toward `side` goes: to the strip's end column on
+/// that side, unless `focused` is already in it or the strip has no column.
+/// Then it goes to the display on that side.
+fn edge_step(strip: &LayoutStrip, focused: Option<Entity>, side: Side) -> EdgeStep {
+    let Some(last) = strip.len().checked_sub(1) else {
+        return EdgeStep::Display;
+    };
+    let edge = match side {
+        Side::West => 0,
+        Side::East => last,
+    };
+    match focused.and_then(|entity| strip.index_of(entity).ok()) {
+        Some(index) if index == edge => EdgeStep::Display,
+        _ => EdgeStep::Column(edge),
+    }
+}
+
+/// The window display `bounds` shows as active in `strip`: the window that
+/// last had focus there when it is visible, otherwise the most visible window.
+/// A native tab behind another counts as hidden. Returns the window with its
+/// visible part.
+fn active_window_on_display(
+    strip: &LayoutStrip,
+    bounds: IRect,
+    focus_history: &FocusHistory,
+    frame_of: impl Fn(Entity) -> Option<IRect>,
+) -> Option<(Entity, IRect)> {
+    let visible = |entity: Entity| {
+        if strip
+            .tab_group(entity)
+            .is_some_and(|tabs| tabs.first() != Some(&entity))
+        {
+            return None;
+        }
+        frame_of(entity)
+            .map(|frame| bounds.intersect(frame))
+            .filter(|visible| !visible.is_empty())
+    };
+    focus_history
+        .last_managed(strip.id())
+        .filter(|entity| strip.contains(*entity))
+        .and_then(|entity| Some((entity, visible(entity)?)))
+        .or_else(|| {
+            strip
+                .all_windows()
+                .into_iter()
+                .filter_map(|entity| Some((entity, visible(entity)?)))
+                .max_by_key(|(_, visible)| visible.width())
+        })
 }
 
 /// Records that the user placed this strip's offset by hand, so
@@ -1401,26 +1471,77 @@ fn copy_window_rule(
     }
 }
 
+/// Whether `operation` moves the focused window `entity` to a display, with
+/// the focus rule and the direction of that display, `None` for the next one.
+/// An edge move away from its strip's end takes the column to that end
+/// instead, and returns `None`, as for anything else that crosses no display.
+fn display_move(
+    operation: Operation,
+    entity: Entity,
+    moves: &mut DisplayMoves,
+    commands: &mut Commands,
+) -> Option<(MoveFocus, Option<Direction>)> {
+    match operation {
+        Operation::ToNextDisplay(move_focus) => Some((move_focus, None)),
+        Operation::MoveToDisplay(direction) => Some((MoveFocus::Follow, Some(direction))),
+        Operation::MoveEdge(side) => {
+            let (_, mut strip, _, _, _) = moves
+                .strips
+                .iter_mut()
+                .find(|(_, strip, _, _, _)| strip.contains(entity))?;
+            if let EdgeStep::Column(_) = edge_step(&strip, Some(entity), side) {
+                if swap_in_strip(&mut strip, entity, &side.end()).is_some() {
+                    commands.ensure_visible(entity);
+                }
+                return None;
+            }
+            Some((MoveFocus::Follow, Some(side.direction())))
+        }
+        _ => None,
+    }
+}
+
+/// The gap a column arriving in `strip`, shown on display `bounds`, takes:
+/// right after the active column, the one `focus_display` would focus. An
+/// empty strip takes it as its first column. `None` puts it after the last
+/// column, when no column is active.
+fn arrival_index(
+    strip: &LayoutStrip,
+    bounds: IRect,
+    focus_history: &FocusHistory,
+    frame_of: impl Fn(Entity) -> Option<IRect>,
+) -> Option<usize> {
+    if strip.len() == 0 {
+        return Some(0);
+    }
+    let (active, _) = active_window_on_display(strip, bounds, focus_history, frame_of)?;
+    strip.index_of(active).ok().map(|index| index + 1)
+}
+
+/// Moves the focused window's whole column to another display: the next one,
+/// or the one in a compass direction. An edge move first takes the column to
+/// its strip's end on that side, and crosses only from there. The column
+/// lands right after the destination's active column, the window
+/// `focus_display` would focus there.
+#[allow(clippy::too_many_arguments)]
 fn to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut moves: DisplayMoves,
+    focus_history: Res<FocusHistory>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut native: ResMut<crate::ecs::native_membership::NativeMembership>,
     mut commands: Commands,
 ) {
-    let Some((move_focus, direction)) = filter_window_operations(&mut messages, |op| {
+    let Some(operation) = filter_window_operations(&mut messages, |op| {
         matches!(
             op,
-            Operation::ToNextDisplay(_) | Operation::MoveToDisplay(_)
+            Operation::ToNextDisplay(_) | Operation::MoveToDisplay(_) | Operation::MoveEdge(_)
         )
     })
-    .find_map(|op| match op {
-        Operation::ToNextDisplay(move_focus) => Some((*move_focus, None)),
-        Operation::MoveToDisplay(direction) => Some((MoveFocus::Follow, Some(direction.clone()))),
-        _ => None,
-    }) else {
+    .next()
+    .cloned() else {
         return;
     };
 
@@ -1434,31 +1555,60 @@ fn to_next_display(
         return;
     }
 
+    let Some((move_focus, direction)) = display_move(operation, entity, &mut moves, &mut commands)
+    else {
+        return;
+    };
+
     let Some(source_bounds) = moves.active_display().map(Display::bounds) else {
         return;
     };
-    let target_id = match &direction {
-        None => moves.other_displays().next().map(Display::id),
+    let target = match &direction {
+        None => moves.other_displays().next(),
         Some(direction) => display_in_direction(
             direction,
             source_bounds,
             moves
                 .other_displays()
-                .map(|display| (display.id(), display.bounds())),
+                .map(|display| (display, display.bounds())),
         ),
     };
-    let Some(target_id) = target_id else {
+    let Some((target_id, target_bounds)) = target.map(|display| (display.id(), display.bounds()))
+    else {
         debug!("no display to move window to ({direction:?}).");
         return;
     };
     let Some(size) = windows.size(entity) else {
         return;
     };
+    // The destination's active column is chosen before anything moves.
+    let shown = moves
+        .shown_strip(target_id)
+        .and_then(|strip| moves.strips.get(strip).ok())
+        .map(|(_, strip, _, _, _)| strip);
+    if shown.is_none()
+        && moves
+            .strips
+            .iter()
+            .find_map(|(_, strip, _, _, _)| strip.get(strip.index_of(entity).ok()?).ok())
+            .is_some_and(|column| matches!(column, Column::Stack(_)))
+    {
+        commands.flash_message(
+            "Stack not moved: the other display shows no window strip".to_owned(),
+            2.0,
+        );
+        return;
+    }
+    let index = shown.and_then(|strip| {
+        arrival_index(strip, target_bounds, &focus_history, |entity| {
+            windows.frame(entity)
+        })
+    });
     let window_id = window.id();
-    let Some(arrival) = moves.move_to_display(
+    let Some(arrival) = moves.move_column_to_display(
         entity,
         target_id,
-        Placement::Append,
+        index,
         size,
         |entity| windows.frame(entity),
         &mut commands,
@@ -1466,7 +1616,7 @@ fn to_next_display(
         debug!("window {window_id} ({entity}) can not move to display {target_id}.");
         return;
     };
-    debug!("moved window (id {window_id}, {entity}) to display {target_id}.");
+    debug!("moved the column of window (id {window_id}, {entity}) to display {target_id}.");
 
     let bounds = arrival.display_bounds;
     let origin = bounds.min.with_x(bounds.center().x - size.x / 2);
@@ -1496,6 +1646,10 @@ fn to_next_display(
 /// visible window. A display without one gets its desktop focused instead, so
 /// it becomes the active display. The pointer moves only with
 /// `mouse_follows_focus`.
+///
+/// An edge focus first focuses its strip's end column on that side, as
+/// `window_focus_first` and `_last` do, and crosses only from there. From a
+/// window outside the strip, such as a floating one, it focuses the end column.
 #[allow(clippy::too_many_arguments)]
 fn focus_display(
     mut messages: MessageReader<Event>,
@@ -1507,15 +1661,36 @@ fn focus_display(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let Some(Operation::FocusDisplay(direction)) =
-        filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusDisplay(_)))
-            .next()
-    else {
+    let Some(operation) = filter_window_operations(&mut messages, |op| {
+        matches!(op, Operation::FocusDisplay(_) | Operation::FocusEdge(_))
+    })
+    .next()
+    .cloned() else {
         return;
+    };
+    let direction = match operation {
+        Operation::FocusDisplay(direction) => direction,
+        Operation::FocusEdge(side) => {
+            let strip = active_display.active_strip();
+            let focused = windows.focused().map(|(_, entity)| entity);
+            if let EdgeStep::Column(index) = edge_step(strip, focused, side) {
+                if let Some(entity) = strip
+                    .get(index)
+                    .ok()
+                    .and_then(|column| focus_history.last_focused_in(&column))
+                {
+                    focus_with_verification(entity, focused, &mut commands);
+                    commands.reshuffle_around(entity);
+                }
+                return;
+            }
+            side.direction()
+        }
+        _ => return,
     };
 
     let Some(target) = display_in_direction(
-        direction,
+        &direction,
         active_display.bounds(),
         active_display
             .other()
@@ -1530,33 +1705,11 @@ fn focus_display(
         .active_display_space(target.id())
         .ok()
         .and_then(|id| layout_strips.iter().find(|strip| strip.id() == id));
-    let visible = |entity: Entity| {
-        if strip?
-            .tab_group(entity)
-            .is_some_and(|tabs| tabs.first() != Some(&entity))
-        {
-            return None;
-        }
-        windows
-            .frame(entity)
-            .map(|frame| target_bounds.intersect(frame))
-            .filter(|visible| !visible.is_empty())
-    };
-    let entity = strip.and_then(|strip| {
-        focus_history
-            .last_managed(strip.id())
-            .filter(|entity| strip.contains(*entity) && visible(*entity).is_some())
-            .or_else(|| {
-                strip
-                    .all_windows()
-                    .into_iter()
-                    .filter_map(|entity| Some((entity, visible(entity)?.width())))
-                    .max_by_key(|(_, width)| *width)
-                    .map(|(entity, _)| entity)
-            })
-    });
-
-    if let Some((entity, frame)) = entity.and_then(|entity| Some((entity, visible(entity)?))) {
+    if let Some((entity, frame)) = strip.and_then(|strip| {
+        active_window_on_display(strip, target_bounds, &focus_history, |entity| {
+            windows.frame(entity)
+        })
+    }) {
         if config.mouse_follows_focus() {
             window_manager.warp_mouse(frame.center());
         }
@@ -2044,6 +2197,47 @@ mod tests {
         strip.stack(entities[1], Side::West).unwrap(); // Stack e1 onto e0
 
         (world, strip, entities)
+    }
+
+    #[test]
+    fn edge_step_reaches_the_end_column_before_the_display() {
+        let (mut world, strip, entities) = setup_world_with_layout();
+        let (e0, e1, e2, e3) = (entities[0], entities[1], entities[2], entities[3]);
+
+        // [e0, e1] is the first column, e3 the last.
+        assert_eq!(edge_step(&strip, Some(e2), Side::West), EdgeStep::Column(0));
+        assert_eq!(edge_step(&strip, Some(e2), Side::East), EdgeStep::Column(2));
+        assert_eq!(edge_step(&strip, Some(e1), Side::West), EdgeStep::Display);
+        assert_eq!(edge_step(&strip, Some(e0), Side::West), EdgeStep::Display);
+        assert_eq!(edge_step(&strip, Some(e3), Side::East), EdgeStep::Display);
+        assert_eq!(edge_step(&strip, Some(e1), Side::East), EdgeStep::Column(2));
+        // A window outside the strip, or none, reaches the end column first.
+        let floating = world.spawn_empty().id();
+        assert_eq!(
+            edge_step(&strip, Some(floating), Side::West),
+            EdgeStep::Column(0)
+        );
+        assert_eq!(edge_step(&strip, None, Side::East), EdgeStep::Column(2));
+        // An empty strip has no column to reach.
+        let empty = LayoutStrip::default();
+        assert_eq!(edge_step(&empty, Some(e0), Side::West), EdgeStep::Display);
+        assert_eq!(edge_step(&empty, None, Side::East), EdgeStep::Display);
+    }
+
+    #[test]
+    fn swap_to_an_end_moves_the_whole_stack() {
+        let (_world, mut strip, entities) = setup_world_with_layout();
+        let (e0, e1, e3) = (entities[0], entities[1], entities[3]);
+
+        assert_eq!(swap_in_strip(&mut strip, e1, &Direction::Last), Some(()));
+        assert_eq!(strip.index_of(e0).ok(), Some(2));
+        assert_eq!(strip.index_of(e1).ok(), Some(2));
+        assert_eq!(
+            strip.first().ok().and_then(|column| column.top()),
+            Some(entities[2])
+        );
+        assert!(matches!(strip.last(), Ok(Column::Stack(items)) if items.len() == 2));
+        assert_eq!(strip.index_of(e3).ok(), Some(1));
     }
 
     #[test]
