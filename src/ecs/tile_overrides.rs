@@ -103,6 +103,20 @@ impl TileOverrides {
         }
     }
 
+    /// Ends the overrides of every window of the process `pid`, which quit.
+    pub fn forget_process(&mut self, pid: Pid) {
+        let before = self.windows.len();
+        self.windows.retain(|window| window.pid != pid);
+        if self.windows.len() != before {
+            self.save();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.windows.is_empty()
+    }
+
     fn save(&self) {
         if let Some(path) = &self.path {
             match self.write(path) {

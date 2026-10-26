@@ -1442,3 +1442,22 @@ fn a_fixed_size_window_minimized_at_start_floats_when_restored() {
     let mut strips = world.query::<&LayoutStrip>();
     assert!(!strips.iter(world).any(|strip| strip.contains(entity)));
 }
+
+/// Quitting the app ends the override of its windows, as closing them does.
+#[test]
+fn quitting_the_app_ends_its_overrides() {
+    let mut harness = restarted_with_floating_rule(TileOverrides::default());
+    toggle(&mut harness, 1);
+    assert!(!floats(&mut harness, 1));
+    harness.run(vec![Event::ApplicationTerminated {
+        psn: ProcessSerialNumber {
+            high: 0,
+            low: TEST_PROCESS_ID.cast_unsigned(),
+        },
+    }]);
+    let overrides = harness
+        .world()
+        .remove_resource::<TileOverrides>()
+        .expect("overrides");
+    assert!(overrides.is_empty());
+}

@@ -510,6 +510,7 @@ pub(super) fn mission_control_trigger(
 pub(super) fn application_event_trigger(
     mut messages: MessageReader<Event>,
     processes: Query<(&BProcess, Entity)>,
+    mut overrides: ResMut<TileOverrides>,
     mut commands: Commands,
 ) {
     const PROCESS_READY_TIMEOUT_SEC: u64 = 5;
@@ -541,6 +542,8 @@ pub(super) fn application_event_trigger(
             Event::ApplicationTerminated { psn } => {
                 if let Some((BProcess(process), entity)) = find_process(*psn) {
                     forget_enhanced_ui_state(process.pid());
+                    // Its windows despawn with it, without a destroy event.
+                    overrides.forget_process(process.pid());
                     if let Ok(mut entity_commands) = commands.get_entity(entity) {
                         entity_commands.try_despawn();
                     }
