@@ -3405,3 +3405,37 @@ fn test_move_to_display_leaves_a_window_too_wide_to_fit_reachable() {
     assert!(frame.min.x <= 4 && frame.max.x >= 2044, "{frame:?}");
     assert_focused!(harness.world(), 0);
 }
+
+/// A window that refuses the narrower width its move to a smaller display asks
+/// for keeps its own width, and the strip still shows all of it.
+#[test]
+fn test_move_to_display_keeps_a_window_that_refused_its_width_visible() {
+    let viewport = 4..=2044;
+    for (fixed, width) in [(false, 1100), (true, 600)] {
+        let mut harness = display_round_trip_harness(MainOptions::default(), 0, 890);
+        harness.mock_state.update_window(0, |window| {
+            window.frame = IRect::new(996, 20, 996 + width, 1440);
+            window.minimum_size = Some(Size::new(width, 0));
+        });
+        harness.run(vec![
+            Event::MenuOpened { window_id: 1 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::FocusDisplay(Direction::North)),
+        ]);
+        // Set once tiled, as a window the user tiled although it cannot be
+        // resized: such a window floats when it appears.
+        if fixed {
+            harness.mock_state.update_window(0, |window| {
+                window.fixed_size = true;
+                window.maximum_size = Some(Size::new(width, i32::MAX));
+            });
+        }
+        let frame = move_and_settle(&mut harness, 0, Direction::South);
+        assert_eq!(frame.width(), width, "fixed: {fixed}");
+        assert!(
+            viewport.contains(&frame.min.x) && viewport.contains(&frame.max.x),
+            "fixed: {fixed}, the focused window {frame:?} must lie inside the viewport {viewport:?}"
+        );
+        assert_focused!(harness.world(), 0);
+    }
+}

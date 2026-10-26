@@ -33,9 +33,9 @@ use crate::ecs::state::PaneruState;
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LaunchWindows, LayoutPosition,
-    MaximumHeight, MinimumHeight, PendingWidthSettlement, Position, PreLaunchFrame, Release,
-    RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
+    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LaunchWindows,
+    LayoutPosition, MaximumHeight, MinimumHeight, PendingWidthSettlement, Position, PreLaunchFrame,
+    Release, RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
     SpawnCommandsExt, StepPartners, VerifyWindowPosition, VerifyWindowSize, WidthLimits,
     WidthRatio, WidthRun, WidthSettlementPhase, WindowProperties,
 };
@@ -1976,6 +1976,14 @@ pub(crate) fn adopt_refused_size(
             let mut limits = window_limits.unwrap_or_default();
             if width_ord == Ordering::Less {
                 limits.min = Some(actual_size.x);
+                // The strip scrolled for the narrower width. Only the focused
+                // window pulls the view along, so another window's refusal
+                // leaves what the user looks at alone.
+                entity_commands.queue(|mut entity: EntityWorldMut| {
+                    if entity.contains::<FocusedMarker>() {
+                        entity.insert(EnsureVisibleMarker { snap: false });
+                    }
+                });
             } else {
                 limits.max = Some(actual_size.x);
             }
