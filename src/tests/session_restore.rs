@@ -1240,6 +1240,7 @@ fn saved_window(window_id: i32) -> SavedWindow {
         identifier: String::new(),
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
+        maximized: None,
     }
 }
 

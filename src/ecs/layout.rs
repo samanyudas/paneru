@@ -11,6 +11,7 @@ use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res};
 use bevy::math::{IRect, IVec2};
 use bevy::time::{Time, Timer, TimerMode};
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -460,7 +461,7 @@ impl DoubleEndedIterator for StackItemIter<'_> {
 
 /// A length as a share of the same length of the strip viewport, so it
 /// carries over to a viewport of another size.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ViewportShare(f64);
 
 impl ViewportShare {
@@ -475,7 +476,7 @@ impl ViewportShare {
 
 /// Where a column stood in the viewport: flush against one of its edges, or
 /// around a point.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum ViewportAnchor {
     Left,
     Right,
@@ -539,6 +540,29 @@ impl Before {
     pub(crate) fn width(&self) -> ViewportShare {
         self.width
     }
+
+    pub(crate) fn height(&self) -> ViewportShare {
+        self.height
+    }
+
+    pub(crate) fn anchor(&self) -> ViewportAnchor {
+        self.anchor
+    }
+
+    /// The windows that stayed in the stack the window left, top to bottom,
+    /// and its place among them.
+    pub(crate) fn stack_home(&self) -> Option<(&[Entity], usize)> {
+        self.home
+            .as_ref()
+            .map(|home| (home.mates.as_slice(), home.slot))
+    }
+
+    /// The same, returning to its place `slot` among stack `mates`. Without
+    /// a mate it returns to a column of its own.
+    pub(crate) fn with_stack_home(mut self, mates: Vec<Entity>, slot: usize) -> Self {
+        self.home = StackHome::new(mates, slot);
+        self
+    }
 }
 
 /// Where a window goes when it is restored.
@@ -579,6 +603,12 @@ impl StackHome {
 pub struct MaximizedColumn {
     item: StackItem,
     before: Before,
+}
+
+impl MaximizedColumn {
+    pub(crate) fn before(&self) -> &Before {
+        &self.before
+    }
 }
 
 /// The size a restored window takes, as shares of the strip viewport: its

@@ -453,6 +453,12 @@ The saved session includes:
 - layout structure: singles, stacks, tabs, and fullscreen strips
 - display/screen association
 - window identity for matching across restarts
+- maximized tiled windows, with the width, height, and stack each one returns
+  to when restored. A maximized window that comes back on another display
+  fills that display.
+
+Paneru saves the session every 5 minutes, when it exits, and when a window is
+maximized or restored.
 
 Matched startup windows use the saved session before static `[windows]` rules.
 That means saved layout, virtual workspace, display, and managed/floating state

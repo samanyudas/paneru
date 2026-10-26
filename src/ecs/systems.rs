@@ -32,6 +32,7 @@ use crate::ecs::drag::{
 use crate::ecs::layout::{Column, LayoutStrip, RestoreTo};
 use crate::ecs::maximize::{FloatingMaximized, FrameHold};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
+use crate::ecs::state::SaveSession;
 use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
@@ -962,6 +963,7 @@ pub(crate) fn window_frame_update(
                             .find(|(strip, _)| strip.maximized(entity).is_some())
                     {
                         strip.unmaximize(entity, RestoreTo::Here);
+                        commands.write_message(SaveSession);
                     }
                     adopt_native_size(
                         entity,

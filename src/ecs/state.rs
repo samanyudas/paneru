@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bevy::app::AppExit;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::message::MessageReader;
+use bevy::ecs::message::{Message, MessageReader};
 use bevy::ecs::query::Has;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Query, Res, SystemParam};
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
-use crate::ecs::layout::{Column, LayoutStrip, StackItem};
+use crate::ecs::layout::{Before, Column, LayoutStrip, StackItem, ViewportAnchor, ViewportShare};
 use crate::ecs::params::Windows;
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker, Unmanaged};
 use crate::manager::{Application, Display, WindowManager};
@@ -93,7 +93,45 @@ pub struct SavedWindow {
     pub identifier: String,
     pub role: String,
     pub subrole: String,
+
+    /// What the window returns to when it is restored, while it is
+    /// maximized. On the top window of a maximized column only. An engine
+    /// that does not know the field loads the window as a plain column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximized: Option<SavedMaximize>,
 }
+
+/// A maximized window's size and place before it was maximized, as the
+/// layout keeps it: lengths are shares of the strip viewport, so they carry
+/// over to another display.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SavedMaximize {
+    pub width: ViewportShare,
+    pub height: ViewportShare,
+    pub anchor: ViewportAnchor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<SavedStackHome>,
+}
+
+/// The stack a maximized window left.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedStackHome {
+    /// The windows that stayed in the stack, top to bottom, by their
+    /// `window_id` in the same file.
+    pub mates: Vec<WinID>,
+    /// The window's place among them.
+    pub slot: usize,
+}
+
+/// Where the engine saves its session. The mock harness has none, so tests
+/// never write the user's file, unless a test sets one.
+#[derive(Clone, Debug, Resource)]
+pub struct StateFile(pub PathBuf);
+
+/// Saves the session now rather than at the next periodic save, after a
+/// change a crash should not lose.
+#[derive(Clone, Copy, Debug, Message)]
+pub struct SaveSession;
 
 // These wire-format types live in the shared `paneru_shared_types` crate;
 // aliased here to the names the rest of the daemon already uses.
@@ -134,6 +172,41 @@ impl From<IRect> for SavedRect {
     }
 }
 
+impl SavedMaximize {
+    /// `before` as saved, with each stack mate known by its window id.
+    fn of(before: &Before, windows: &Windows) -> Self {
+        Self {
+            width: before.width(),
+            height: before.height(),
+            anchor: before.anchor(),
+            stack: before
+                .stack_home()
+                .map(|(mates, slot)| SavedStackHome {
+                    mates: mates
+                        .iter()
+                        .filter_map(|&mate| windows.get(mate).map(|window| window.id()))
+                        .collect(),
+                    slot,
+                })
+                .filter(|home| !home.mates.is_empty()),
+        }
+    }
+
+    /// What the window returns to, with each stack mate that `entity` finds
+    /// by its saved window id. Without a mate it returns to a column of its
+    /// own.
+    pub(crate) fn before(&self, entity: impl Fn(WinID) -> Option<Entity>) -> Before {
+        let before = Before::new(self.width, self.height, self.anchor);
+        match &self.stack {
+            Some(home) => before.with_stack_home(
+                home.mates.iter().filter_map(|&mate| entity(mate)).collect(),
+                home.slot,
+            ),
+            None => before,
+        }
+    }
+}
+
 impl SavedWindow {
     pub fn from_entity(
         entity: Entity,
@@ -153,6 +226,7 @@ impl SavedWindow {
             identifier: window.identifier().unwrap_or_default(),
             role: window.role().unwrap_or_default(),
             subrole: window.subrole().unwrap_or_default(),
+            maximized: None,
         })
     }
 
@@ -240,13 +314,14 @@ impl PaneruState {
                     }
                     Column::Fullscren(entity) => SavedWindow::from_entity(*entity, windows, apps)
                         .map(SavedColumn::Fullscreen),
-                    // The session does not keep maximize yet: the window
-                    // comes back as a column of its own.
-                    Column::Maximized(_) => {
-                        let saved: Vec<_> = col
+                    Column::Maximized(maximized) => {
+                        let mut saved: Vec<_> = col
                             .window_iter()
                             .filter_map(|e| SavedWindow::from_entity(e, windows, apps))
                             .collect();
+                        if let Some(top) = saved.first_mut() {
+                            top.maximized = Some(SavedMaximize::of(maximized.before(), windows));
+                        }
                         match <[SavedWindow; 1]>::try_from(saved) {
                             Ok([window]) => Some(SavedColumn::Single(window)),
                             Err(tabs) if tabs.is_empty() => None,
@@ -815,14 +890,17 @@ fn now_timestamp() -> u64 {
 }
 
 pub fn periodic_state_save(
+    file: Option<Res<StateFile>>,
     workspaces: Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
 ) {
+    let Some(StateFile(path)) = file.as_deref() else {
+        return;
+    };
     let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
-    let path = PaneruState::default_state_file_path();
-    if let Err(e) = state.save_to_file(&path) {
+    if let Err(e) = state.save_to_file(path) {
         warn!("Failed to save state: {e}");
     } else {
         debug!("State saved to {}", path.display());
@@ -831,16 +909,18 @@ pub fn periodic_state_save(
 
 pub fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
+    file: Option<Res<StateFile>>,
     workspaces: Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
 ) {
-    if exit_events.read().next().is_some() {
+    if exit_events.read().next().is_some()
+        && let Some(StateFile(path)) = file.as_deref()
+    {
         info!("Exiting, saving state...");
         let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
-        let path = PaneruState::default_state_file_path();
-        if let Err(e) = state.save_to_file(&path) {
+        if let Err(e) = state.save_to_file(path) {
             error!("Failed to save state on exit: {e}");
         }
     }

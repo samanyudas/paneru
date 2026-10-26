@@ -41,6 +41,7 @@ use crate::ecs::layout::{
     Before, FALLBACK_TOP_BAR_HEIGHT, LayoutStrip, RestoreTo, ViewportAnchor, ViewportShare,
     effective_stack_limit,
 };
+use crate::ecs::state::SaveSession;
 use crate::ecs::systems::window_frame_update;
 use crate::ecs::{
     Bounds, DockPosition, FocusedMarker, Position, PreUpdateSet, ResizeMarker,
@@ -298,6 +299,7 @@ pub(crate) fn restore_tiled(
     let members = strip.tab_group(entity).unwrap_or_else(|| vec![entity]);
     let restored = strip.unmaximize(entity, to)?;
     debug!("restoring maximized window {entity}");
+    commands.write_message(SaveSession);
     let size = Size::new(
         restored.width.of_viewport(viewport.width()),
         restored.height.map_or(viewport.height(), |height| {
@@ -361,6 +363,7 @@ fn toggle_tiled(
         // A native resize the window was settling would otherwise adopt the
         // window's old size into the column it left.
         supersede_native_resize(&members, commands);
+        commands.write_message(SaveSession);
     }
     commands.reshuffle_around(entity);
 }
