@@ -463,6 +463,12 @@ pub trait WindowApi: Send + Sync {
     /// Picture-in-Picture video. Such a window floats unless a rule says
     /// otherwise. A failed read counts as an ordinary window.
     fn is_above_ordinary_windows(&self) -> bool;
+    /// Reads the window's level again and keeps the answer for
+    /// [`Self::is_above_ordinary_windows`]. Chrome shows its
+    /// Picture-in-Picture window at the normal level and raises it a few
+    /// tens of milliseconds later, so a read on arrival can miss the raise.
+    /// A failed read leaves the earlier answer.
+    fn refresh_above_ordinary_windows(&self) -> bool;
     fn reposition(&mut self, origin: Origin);
     fn resize(&mut self, size: Size);
     /// Moves and resizes the window in one write: the size at the old
@@ -945,8 +951,10 @@ pub struct WindowOS {
     /// a window keeps its style for its whole life.
     resizable: OnceLock<bool>,
     /// Whether the app keeps the window above ordinary windows, cached after
-    /// the first successful read: apps set the level before they show it.
-    above_ordinary: OnceLock<bool>,
+    /// the first successful read. An `RwLock` because an app can raise a
+    /// window just after it shows it, and
+    /// [`WindowApi::refresh_above_ordinary_windows`] then reads it again.
+    above_ordinary: RwLock<Option<bool>>,
 }
 
 impl WindowOS {
@@ -995,7 +1003,7 @@ impl WindowOS {
             role: OnceLock::new(),
             subrole: OnceLock::new(),
             resizable: OnceLock::new(),
-            above_ordinary: OnceLock::new(),
+            above_ordinary: RwLock::new(None),
         };
 
         let forced = window.is_forced_manage(config, bundle_id);
@@ -1213,14 +1221,18 @@ impl WindowApi for WindowOS {
     }
 
     fn is_above_ordinary_windows(&self) -> bool {
-        if let Some(above) = self.above_ordinary.get() {
-            return *above;
+        if let Some(above) = *self.above_ordinary.force_read() {
+            return above;
         }
+        self.refresh_above_ordinary_windows()
+    }
+
+    fn refresh_above_ordinary_windows(&self) -> bool {
         let Some(layer) = window_layer(self.id) else {
-            return false;
+            return self.above_ordinary.force_read().unwrap_or(false);
         };
         let above = layer > CGWindowLevelForKey(CGWindowLevelKey::NormalWindowLevelKey);
-        let _ = self.above_ordinary.set(above);
+        *self.above_ordinary.force_write() = Some(above);
         above
     }
 
