@@ -3420,6 +3420,40 @@ fn a_display_diagonally_below_right_is_no_neighbor_at_the_right_edge() {
     ));
 }
 
+/// The pointer, not the dragged window's centre, starts an edge hold. A
+/// window grabbed near its right end has the pointer at the edge and the
+/// centre well inside. Grabbed near its left end, the centre reaches the
+/// edge while the pointer stays clear of it.
+#[test]
+fn the_pointer_not_the_windows_centre_starts_an_edge_hold() {
+    let ext = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
+    );
+    for (grab_right, scrolls) in [(true, true), (false, false)] {
+        let mut harness = overflowing_right_with_display(ext);
+        let start = frame(harness.world(), 0);
+        let (press, to) = if grab_right {
+            let press = Origin::new(start.max.x - 5, start.min.y + 10);
+            (press, Origin::new(TEST_DISPLAY_WIDTH - 2, 500))
+        } else {
+            let press = Origin::new(start.min.x + 5, start.min.y + 10);
+            let centre_dx = start.center().x - press.x;
+            (press, Origin::new(TEST_DISPLAY_WIDTH - 2 - centre_dx, 500))
+        };
+        drag_from(&mut harness, 0, press, to);
+        let before = strip_x(harness.world(), TEST_WORKSPACE_ID);
+        harness.advance(ms(1200));
+        assert_eq!(
+            strip_x(harness.world(), TEST_WORKSPACE_ID) != before,
+            scrolls,
+            "grab_right={grab_right}"
+        );
+    }
+}
+
 #[test]
 fn a_display_beside_part_of_an_edge_is_a_neighbor_only_where_it_touches() {
     let ext = IRect::new(
