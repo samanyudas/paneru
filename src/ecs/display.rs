@@ -171,17 +171,8 @@ impl DisplayMoves<'_, '_> {
         if strip.is_none() && placement != Placement::Append {
             return None;
         }
-        let width = joined_width.unwrap_or_else(|| {
-            let ratio = (source_viewport.width() > 0)
-                .then(|| f64::from(size.x) / f64::from(source_viewport.width()));
-            // A window wider than its old viewport, such as one macOS filled,
-            // fills the new viewport instead of overflowing it.
-            ratio
-                .map_or(size.x, |ratio| {
-                    round_px(ratio * f64::from(target_viewport.width()))
-                })
-                .min(target_viewport.width())
-        });
+        let width = joined_width
+            .unwrap_or_else(|| new_column_width(size.x, source_viewport, target_viewport));
         let (_, mut source_strip, _, _, _) = self.strips.get_mut(source).ok()?;
         let members = source_strip
             .tab_group(entity)
@@ -197,18 +188,11 @@ impl DisplayMoves<'_, '_> {
             .filter(|_| !matches!(placement, Placement::Into(..)))
             .cloned();
         for member in &members {
-            // The destination layout sizes the window from `Bounds`. A resize
-            // animation toward the full height would outlive that layout: a
-            // window joining a stack keeps only its share, and the stale
-            // height would mislead every reader of the moving frame.
-            if let Ok(mut entity_commands) = commands.get_entity(*member) {
-                entity_commands
-                    .try_remove::<crate::ecs::ResizeMarker>()
-                    .try_insert((
-                        crate::ecs::Bounds(Size::new(width, target_viewport.height())),
-                        crate::ecs::VerifyWindowSize::default(),
-                    ));
-            }
+            size_for_arrival(
+                *member,
+                Size::new(width, target_viewport.height()),
+                commands,
+            );
             source_strip.remove(*member);
         }
         if let Some(neighbour) = left_behind {
@@ -237,6 +221,118 @@ impl DisplayMoves<'_, '_> {
             members,
             maximized,
         })
+    }
+
+    /// Moves the whole column holding `entity` from its strip to the strip
+    /// shown on display `target`, as a new column at gap `index`, or after
+    /// the last column for `None`. Every stack item moves in its order, with
+    /// its native tabs, and a tabbed or maximized column stays so.
+    ///
+    /// The column keeps the width it had relative to its old display, at
+    /// most the destination's width, as [`Self::move_to_display`] sizes a
+    /// new column. A stack's windows split the destination height evenly, as
+    /// after any change to a stack's membership. A stack taller than the
+    /// destination's stack limit arrives whole, and the layout overlaps it
+    /// as it does any stack that does not fit its column.
+    ///
+    /// A column of one window or native tab group moves as
+    /// [`Self::move_to_display`] moves it, which also handles a display that
+    /// shows no strip. A stack needs a strip to stay a stack.
+    ///
+    /// Returns `None`, changing nothing, when `entity` is in no strip, there
+    /// is no display `target`, the target strip is its own, or the column is
+    /// a stack and the display shows no strip.
+    pub(crate) fn move_column_to_display(
+        &mut self,
+        entity: Entity,
+        target: CGDirectDisplayID,
+        index: Option<usize>,
+        size: Size,
+        frame_of: impl Fn(Entity) -> Option<IRect>,
+        commands: &mut Commands,
+    ) -> Option<DisplayMove> {
+        let (source, source_display, column_index, stacked) =
+            self.strips
+                .iter()
+                .find_map(|(strip_entity, strip, _, child, _)| {
+                    let column_index = strip.index_of(entity).ok()?;
+                    let stacked = matches!(strip.get(column_index).ok()?, Column::Stack(_));
+                    Some((strip_entity, child.parent(), column_index, stacked))
+                })?;
+        let strip = self.shown_strip(target);
+        if !stacked {
+            let placement = match (strip, index) {
+                (Some(_), Some(index)) => Placement::Column(index),
+                _ => Placement::Append,
+            };
+            return self.move_to_display(entity, target, placement, size, frame_of, commands);
+        }
+        let strip = strip.filter(|strip| *strip != source)?;
+        let (target_display_entity, display_bounds) = self
+            .displays
+            .iter()
+            .find(|(_, display, _, _)| display.id() == target)
+            .map(|(display_entity, display, _, _)| (display_entity, display.bounds()))?;
+        let source_viewport = self.viewport(source_display)?;
+        let target_viewport = self.viewport(target_display_entity)?;
+        let width = new_column_width(size.x, source_viewport, target_viewport);
+
+        let [
+            (_, mut source_strip, _, _, _),
+            (_, mut target_strip, _, _, _),
+        ] = self.strips.get_many_mut([source, strip]).ok()?;
+        let left_behind = source_strip
+            .left_neighbour(entity)
+            .or_else(|| source_strip.right_neighbour(entity));
+        let column = source_strip.take_column(column_index)?;
+        let members = column.windows();
+        for member in &members {
+            size_for_arrival(
+                *member,
+                Size::new(width, target_viewport.height()),
+                commands,
+            );
+        }
+        if let Some(neighbour) = left_behind {
+            commands.refit_after_removal(neighbour);
+        }
+        let index = index.unwrap_or(target_strip.len());
+        target_strip.insert_column(index, column);
+        Some(DisplayMove {
+            strip: Some(strip),
+            display_bounds,
+            left_behind,
+            members,
+            maximized: None,
+        })
+    }
+}
+
+/// The width of a column that moves from `source` to `target`, both strip
+/// viewports: the share `width` had of the old viewport, at most the new
+/// viewport's width.
+fn new_column_width(width: i32, source: IRect, target: IRect) -> i32 {
+    let ratio = (source.width() > 0).then(|| f64::from(width) / f64::from(source.width()));
+    // A window wider than its old viewport, such as one macOS filled,
+    // fills the new viewport instead of overflowing it.
+    ratio
+        .map_or(width, |ratio| round_px(ratio * f64::from(target.width())))
+        .min(target.width())
+}
+
+/// Sizes `member`, which is moving to another display, for the layout there.
+fn size_for_arrival(member: Entity, bounds: Size, commands: &mut Commands) {
+    // The destination layout sizes the window from `Bounds`. A resize
+    // animation toward the full height would outlive that layout: a
+    // window joining a stack keeps only its share, and the stale
+    // height would mislead every reader of the moving frame.
+    if let Ok(mut entity_commands) = commands.get_entity(member) {
+        entity_commands
+            .try_remove::<crate::ecs::ResizeMarker>()
+            .try_insert((
+                crate::ecs::Bounds(bounds),
+                crate::ecs::VerifyWindowSize::default(),
+            ));
     }
 }
 

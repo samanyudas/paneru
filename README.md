@@ -287,10 +287,12 @@ $ paneru send-cmd <command> [args...]
 | `window balance`           | Make all columns match the focused window width  |
 | `window stack [west\|east]` | Move the focused window into the neighbouring column (default west) |
 | `window unstack [east\|west]` | Pop the focused window out of its stack into a new column (default east) |
-| `window nextdisplay`       | Move the focused window to the next display      |
-| `window nextdisplaysend`   | Move the window to the next display but stay here |
+| `window nextdisplay`       | Move the focused window's column to the next display |
+| `window nextdisplaysend`   | Move the window's column to the next display but stay here |
 | `window focusdisplay <direction>` | Focus the display north, south, west, or east |
-| `window movedisplay <direction>` | Move the window to the display in that direction |
+| `window movedisplay <direction>` | Move the window's column to the display in that direction |
+| `window focusedge <west\|east>` | Focus the first or last column, then the display on that side |
+| `window moveedge <west\|east>` | Move the column to the first or last position, then to the display on that side |
 | `window virtual <dir>`     | Switch to the previous/next virtual workspace     |
 | `window virtualnum <n>`    | Switch directly to numbered virtual workspace    |
 | `window virtualmove <dir>` | Move the window to a different virtual workspace  |

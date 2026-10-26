@@ -134,7 +134,8 @@ impl StateBroadcastIntent {
                         Command::Window(
                             Operation::VirtualMove(_, _)
                             | Operation::VirtualMoveNumber(_, _)
-                            | Operation::Swap(_),
+                            | Operation::Swap(_)
+                            | Operation::MoveEdge(_),
                         ),
                 } => intent.windows_changed = true,
                 Event::WindowFocused { .. } => intent.window_focused = true,

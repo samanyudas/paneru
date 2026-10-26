@@ -107,6 +107,8 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
         "focusdisplay" => Operation::FocusDisplay(Direction::parse_compass(argument()?)?),
         "movedisplay" => Operation::MoveToDisplay(Direction::parse_compass(argument()?)?),
+        "focusedge" => Operation::FocusEdge(Side::parse(argument()?)?),
+        "moveedge" => Operation::MoveEdge(Side::parse(argument()?)?),
         "snap" => Operation::Snap,
         "copyrule" => Operation::CopyRule,
         // The `virtual*` verbs take either a direction or a workspace number,
@@ -225,6 +227,8 @@ impl Operation {
             Operation::MoveToDisplay(direction) => {
                 vec!["movedisplay".to_string(), direction.token()]
             }
+            Operation::FocusEdge(side) => owned(&["focusedge", side.token()]),
+            Operation::MoveEdge(side) => owned(&["moveedge", side.token()]),
             Operation::Equalize => owned(&["equalize"]),
             Operation::Balance => owned(&["balance"]),
             Operation::Manage => owned(&["manage"]),
@@ -300,6 +304,36 @@ mod tests {
     }
 
     #[test]
+    fn binding_keys_name_the_edge_commands() {
+        let parse = |key: &str| parse_command(&key.split('_').collect::<Vec<_>>());
+        let window = |operation| Ok(Command::Window(operation));
+        assert_eq!(
+            parse("window_focusedge_west"),
+            window(Operation::FocusEdge(Side::West))
+        );
+        assert_eq!(
+            parse("window_focusedge_east"),
+            window(Operation::FocusEdge(Side::East))
+        );
+        assert_eq!(
+            parse("window_moveedge_west"),
+            window(Operation::MoveEdge(Side::West))
+        );
+        assert_eq!(
+            parse("window_moveedge_east"),
+            window(Operation::MoveEdge(Side::East))
+        );
+        for key in [
+            "window_focusedge",
+            "window_focusedge_north",
+            "window_moveedge_first",
+            "window_moveedge_2",
+        ] {
+            assert!(parse(key).is_err(), "{key} should not parse");
+        }
+    }
+
+    #[test]
     fn every_operation_round_trips_through_argv() {
         let operations = [
             Operation::Focus(Direction::East),
@@ -320,6 +354,10 @@ mod tests {
             Operation::FocusDisplay(Direction::West),
             Operation::MoveToDisplay(Direction::South),
             Operation::MoveToDisplay(Direction::East),
+            Operation::FocusEdge(Side::West),
+            Operation::FocusEdge(Side::East),
+            Operation::MoveEdge(Side::West),
+            Operation::MoveEdge(Side::East),
             Operation::Equalize,
             Operation::Balance,
             Operation::Manage,

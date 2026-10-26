@@ -760,6 +760,22 @@ impl Iterator for ColumnWindowIter<'_> {
     }
 }
 
+/// A column taken whole out of one strip by [`LayoutStrip::take_column`], to
+/// go into another with [`LayoutStrip::insert_column`]. It keeps its stack
+/// order, native tabs, maximized state, and tabbed display.
+#[derive(Debug)]
+pub(crate) struct DetachedColumn {
+    column: Column,
+    tabbed: bool,
+}
+
+impl DetachedColumn {
+    /// Every window of the column, top to bottom.
+    pub(crate) fn windows(&self) -> Vec<Entity> {
+        self.column.window_iter().collect()
+    }
+}
+
 /// `LayoutStrip` manages a horizontal strip of `Panel`s, where each panel can contain a single window or a stack of windows.
 /// It provides methods for manipulating the arrangement and access to windows within the pane.
 #[derive(Clone, Component, Debug, Default)]
@@ -1400,6 +1416,32 @@ impl LayoutStrip {
         };
         self.columns.insert(at.min(self.len()), item.into_column());
         Ok(())
+    }
+
+    /// Takes column `index` out of the strip whole. `None` when there is no
+    /// column `index`.
+    pub(crate) fn take_column(&mut self, index: usize) -> Option<DetachedColumn> {
+        let column = self.columns.remove(index)?;
+        let mut tabbed = false;
+        for entity in column.window_iter() {
+            tabbed |= self.tabbed_stacks.remove(&entity);
+            self.even_splits.remove(&entity);
+        }
+        Some(DetachedColumn { column, tabbed })
+    }
+
+    /// Puts `detached` into the strip as a new column at gap `index`, where
+    /// gap 0 is before the first column, clamped to the column count. A
+    /// stack splits its new height evenly, as after any change to its
+    /// membership.
+    pub(crate) fn insert_column(&mut self, index: usize, detached: DetachedColumn) {
+        let DetachedColumn { column, tabbed } = detached;
+        if tabbed {
+            self.tabbed_stacks.extend(column.window_iter());
+        }
+        self.even_splits.extend(column.top());
+        let index = index.min(self.len());
+        self.columns.insert(index, column);
     }
 
     /// Takes the stack item holding `entity` out of column `index`, and
@@ -2674,7 +2716,9 @@ pub(super) fn reshuffle_layout_strip(
         let content = strip_content_range(strip, &windows);
         if arrival.is_some_and(|arrival| arrival.destination == strip_entity)
             && !config.auto_center()
-            && matches!(strip.last(), Ok(Column::Single(last)) if last == entity)
+            && strip
+                .last()
+                .is_ok_and(|last| last.position_of(entity).is_some())
             && let Some(x) = content
                 .clone()
                 .and_then(|range| overflowing_arrival_x(range, display_bounds))

@@ -204,6 +204,14 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
             Operation::MoveToDisplay,
         )?,
     )?;
+    window.set(
+        "focus_edge",
+        side_directional(lua, dispatch, "window.focus_edge", Operation::FocusEdge)?,
+    )?;
+    window.set(
+        "move_edge",
+        side_directional(lua, dispatch, "window.move_edge", Operation::MoveEdge)?,
+    )?;
 
     for (name, operation) in [
         ("focus_managed", Operation::FocusManaged),
@@ -345,6 +353,28 @@ fn compass_directional(
                 mlua::Error::RuntimeError(format!("{what} expects north, south, west, or east")),
             ),
         }
+    })
+}
+
+/// An edge verb accepting only west or east.
+fn side_directional(
+    lua: &Lua,
+    dispatch: &Dispatch,
+    what: &'static str,
+    operation: impl Fn(Side) -> Operation + 'static,
+) -> Result<Function> {
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, opts: Value| {
+        let side = match Opts::read(lua, &opts)?.target(what)? {
+            Direction::West => Side::West,
+            Direction::East => Side::East,
+            _ => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "{what} expects west or east"
+                )));
+            }
+        };
+        dispatch(lua, Command::Window(operation(side)))
     })
 }
 
@@ -655,6 +685,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn edge_verbs_build_their_commands() {
+        let commands = run(r#"
+            paneru.window.focus_edge("west")
+            paneru.window.focus_edge({ direction = "east" })
+            paneru.window.move_edge("west")
+            paneru.window.move_edge({ direction = "east" })
+            paneru.run("window moveedge east")
+        "#)
+        .unwrap();
+
+        assert_eq!(
+            commands,
+            vec![
+                Command::Window(Operation::FocusEdge(Side::West)),
+                Command::Window(Operation::FocusEdge(Side::East)),
+                Command::Window(Operation::MoveEdge(Side::West)),
+                Command::Window(Operation::MoveEdge(Side::East)),
+                Command::Window(Operation::MoveEdge(Side::East)),
+            ]
+        );
+    }
+
+    #[test]
+    fn edge_verbs_reject_other_directions_before_dispatch() {
+        let commands = run(r#"
+            for _, verb in ipairs({ "focus_edge", "move_edge" }) do
+                for _, target in ipairs({ "north", "south", "first", "last", 1,
+                    { direction = "north" }, { number = 3 } }) do
+                    local ok, err = pcall(paneru.window[verb], target)
+                    assert(not ok, verb .. " accepted a direction other than west or east")
+                    assert(string.find(tostring(err), "west or east", 1, true), tostring(err))
+                end
+            end
+        "#)
+        .unwrap();
+
+        assert!(commands.is_empty(), "invalid edge calls must not dispatch");
     }
 
     #[test]
