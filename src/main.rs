@@ -22,6 +22,7 @@ mod manager;
 mod menubar;
 mod miri_ax_probe;
 mod overlay;
+mod parent_watch;
 mod pasteboard;
 mod platform;
 mod reader;
@@ -226,6 +227,7 @@ fn main() -> Result<()> {
                 let _ = sender_c.send(events::Event::Exit); // just drop the err. we are exiting anyway.
             })
             .expect("setting Ctrl-C handler should succeed");
+            parent_watch::exit_with_parent(sender.clone());
             CommandReader::new(sender.clone()).start()?;
             if !check_ax_privilege() && !wait_for_accessibility(sender.clone(), &receiver) {
                 return Ok(());
