@@ -9,6 +9,7 @@ use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::system::{
     Commands, NonSendMut, ParamSet, Populated, Query, Res, ResMut, Single, SystemParam,
 };
+use bevy::ecs::world::EntityWorldMut;
 use bevy::math::IRect;
 use bevy::time::{Time, Timer, TimerMode};
 use notify::event::{DataChange, MetadataKind, ModifyKind};
@@ -32,10 +33,10 @@ use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LaunchWindows, LayoutPosition,
-    MinimumHeight, PendingWidthSettlement, Position, PreLaunchFrame, RepositionMarker,
-    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    StepPartners, VerifyWindowPosition, VerifyWindowSize, WidthLimits, WidthRatio, WidthRun,
-    WidthSettlementPhase, WindowProperties,
+    MaximumHeight, MinimumHeight, PendingWidthSettlement, Position, PreLaunchFrame,
+    RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
+    SpawnCommandsExt, StepPartners, VerifyWindowPosition, VerifyWindowSize, WidthLimits,
+    WidthRatio, WidthRun, WidthSettlementPhase, WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -860,6 +861,19 @@ pub(super) fn window_managed_trigger(
             .and_then(|(_, _, parent)| apps.get(parent).ok())
     {
         let properties = WindowProperties::new(app, window, &ctx.config);
+
+        // A window that opened floating never got the padding that
+        // `apply_window_defaults` gives a tiled one.
+        let vertical = properties.vertical_padding().clamp(0, 50);
+        let horizontal = properties.horizontal_padding().clamp(0, 50);
+        ctx.commands
+            .entity(entity)
+            .queue_silenced(move |mut entity: EntityWorldMut| {
+                if let Some(mut window) = entity.get_mut::<Window>() {
+                    window.set_padding(WindowPadding::Vertical(vertical));
+                    window.set_padding(WindowPadding::Horizontal(horizontal));
+                }
+            });
 
         // Re-managing an existing window (e.g. after un-floating it) retains
         // its width under the dynamic rule. Fixed rules keep their old behavior.
@@ -1883,7 +1897,13 @@ pub(crate) fn adopt_refused_size(
     );
     bounds.0 = actual_size;
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        if height_ord == Ordering::Less {
+        // A window that cannot be resized has one height, whichever way it
+        // refused. Only such a window gets a maximum: a resizable one can
+        // come back shorter for a moment, such as at the screen's bottom edge.
+        if height_ord != Ordering::Equal && !window.is_resizable() {
+            entity_commands
+                .try_insert((MinimumHeight(actual_size.y), MaximumHeight(actual_size.y)));
+        } else if height_ord == Ordering::Less {
             entity_commands.try_insert(MinimumHeight(actual_size.y));
         }
         if width_ord != Ordering::Equal {

@@ -503,6 +503,11 @@ pub struct LaunchWindows(pub std::collections::HashSet<WinID>);
 #[derive(Component, Clone, Copy, Debug)]
 pub struct MinimumHeight(pub i32);
 
+/// The height of a window that cannot be resized, learned when it refused a
+/// taller one. Stack layout gives the rest of the column to the others.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct MaximumHeight(pub i32);
+
 /// The narrowest and widest widths a window has accepted, each learned when
 /// it refused a width past it. A column reserves the widest minimum among its
 /// members, and a member that cannot grow keeps its own width at the column's
