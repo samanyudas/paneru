@@ -76,6 +76,8 @@ pub(crate) struct MockWindowData {
     pub(crate) is_full_screen: bool,
     /// The app does not let the window's size change.
     pub(crate) fixed_size: bool,
+    /// The app keeps the window above ordinary windows.
+    pub(crate) above_ordinary: bool,
     pub(crate) border_radius: Option<f64>,
     /// What Accessibility reports as the window's top bar height. `None`
     /// models a window whose top bar cannot be measured.
@@ -154,6 +156,7 @@ impl Default for MockWindowData {
             identifier: "testid".to_string(),
             is_full_screen: false,
             fixed_size: false,
+            above_ordinary: false,
             border_radius: None,
             top_bar_height: None,
             top_bar_unreadable: false,
@@ -1389,6 +1392,15 @@ impl MockState {
                 .windows
                 .get(&id)
                 .is_some_and(|w| w.fixed_size)
+        });
+
+        let s = self.clone();
+        mw.expect_is_above_ordinary_windows().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .is_some_and(|w| w.above_ordinary)
         });
 
         let s = self.clone();

@@ -12,8 +12,12 @@ use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize, Type,
-    kCFBooleanFalse, kCFBooleanTrue,
+    CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect,
+    CGSize, Type, kCFBooleanFalse, kCFBooleanTrue,
+};
+use objc2_core_graphics::{
+    CGWindowLevelForKey, CGWindowLevelKey, CGWindowListCopyWindowInfo, CGWindowListOption,
+    kCGWindowLayer,
 };
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
@@ -426,6 +430,10 @@ pub trait WindowApi: Send + Sync {
     /// does not, such as a fixed-size panel, floats unless a rule says
     /// otherwise. A failed read counts as resizable.
     fn is_resizable(&self) -> bool;
+    /// Whether its app keeps the window above ordinary windows, as for a
+    /// Picture-in-Picture video. Such a window floats unless a rule says
+    /// otherwise. A failed read counts as an ordinary window.
+    fn is_above_ordinary_windows(&self) -> bool;
     fn reposition(&mut self, origin: Origin);
     fn resize(&mut self, size: Size);
     /// Moves and resizes the window in one write: the size at the old
@@ -536,6 +544,19 @@ pub fn try_ax_window_id(element_ref: AXUIElementRef) -> Option<WinID> {
         return None;
     }
     Some(window_id)
+}
+
+/// The window server layer of window `id`, or `None` when it lists no such
+/// window.
+fn window_layer(id: WinID) -> Option<i32> {
+    let id = u32::try_from(id).ok()?;
+    let info = CGWindowListCopyWindowInfo(CGWindowListOption::OptionIncludingWindow, id)?;
+    let array = unsafe { info.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+    let dict = array.iter().next()?;
+    dict.get(unsafe { kCGWindowLayer })?
+        .downcast::<CFNumber>()
+        .ok()?
+        .as_i32()
 }
 
 /// Reads an element's frame through Accessibility.
@@ -886,6 +907,9 @@ pub struct WindowOS {
     /// Whether the size can be set, cached after the first successful read:
     /// a window keeps its style for its whole life.
     resizable: OnceLock<bool>,
+    /// Whether the app keeps the window above ordinary windows, cached after
+    /// the first successful read: apps set the level before they show it.
+    above_ordinary: OnceLock<bool>,
 }
 
 impl WindowOS {
@@ -934,6 +958,7 @@ impl WindowOS {
             role: OnceLock::new(),
             subrole: OnceLock::new(),
             resizable: OnceLock::new(),
+            above_ordinary: OnceLock::new(),
         };
 
         let forced = window.is_forced_manage(config, bundle_id);
@@ -1148,6 +1173,18 @@ impl WindowApi for WindowOS {
         let resizable = settable != 0;
         let _ = self.resizable.set(resizable);
         resizable
+    }
+
+    fn is_above_ordinary_windows(&self) -> bool {
+        if let Some(above) = self.above_ordinary.get() {
+            return *above;
+        }
+        let Some(layer) = window_layer(self.id) else {
+            return false;
+        };
+        let above = layer > CGWindowLevelForKey(CGWindowLevelKey::NormalWindowLevelKey);
+        let _ = self.above_ordinary.set(above);
+        above
     }
 
     #[instrument(level = Level::TRACE)]

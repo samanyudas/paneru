@@ -1180,6 +1180,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
 pub(crate) struct WindowProperties {
     params: Vec<WindowParams>,
     resizable: bool,
+    above_ordinary: bool,
 }
 
 impl WindowProperties {
@@ -1196,16 +1197,24 @@ impl WindowProperties {
         Self {
             params,
             resizable: window.is_resizable(),
+            above_ordinary: window.is_above_ordinary_windows(),
         }
     }
 
     /// Whether the window floats automatically: a rule decides, and without
-    /// one a window that cannot be resized floats.
+    /// one a window that cannot be resized or that its app keeps above
+    /// ordinary windows floats.
     pub fn floating(&self) -> bool {
         self.params
             .iter()
             .find_map(|props| props.floating)
-            .unwrap_or(!self.resizable)
+            .unwrap_or(!self.resizable || self.above_ordinary)
+    }
+
+    /// Whether the app keeps the window above ordinary windows, as for a
+    /// Picture-in-Picture video.
+    pub fn above_ordinary(&self) -> bool {
+        self.above_ordinary
     }
 
     pub fn insertion(&self) -> Option<usize> {

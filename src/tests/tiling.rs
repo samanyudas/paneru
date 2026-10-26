@@ -1234,6 +1234,87 @@ fn a_new_floating_window_takes_focus() {
     crate::assert_focused!(world, 1);
 }
 
+/// Spawns window 3, which its app keeps above ordinary windows like a
+/// Picture-in-Picture video, next to the tiled windows 0 to 2 with 0 focused.
+/// The app does not focus it, as Chrome does not focus its video window.
+fn spawned_above_ordinary_window(config: Config) -> TestHarness {
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .with_focused_window(0);
+    harness.advance(Duration::from_millis(500));
+    let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 3, frame);
+    harness
+        .mock_state
+        .update_window(3, |window| window.above_ordinary = true);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_millis(500));
+    harness
+}
+
+/// A window its app keeps above ordinary windows, such as Picture-in-Picture,
+/// floats without a shortcut, takes focus once, and leaves the layout alone.
+#[test]
+fn a_window_above_ordinary_windows_floats_and_takes_focus() {
+    let mut harness = spawned_above_ordinary_window(Config::default());
+
+    let world = harness.world();
+    let entity = find_window_entity(3, world);
+    assert!(matches!(
+        world.entity(entity).get::<crate::ecs::Unmanaged>(),
+        Some(crate::ecs::Unmanaged::Floating)
+    ));
+    let mut query = world.query::<&LayoutStrip>();
+    assert!(
+        !query.iter(world).any(|strip| strip.contains(entity)),
+        "a window above ordinary windows must not join a column"
+    );
+    crate::assert_focused!(world, 3);
+    assert_eq!(window_x(world, 0), 0);
+    assert_eq!(window_x(world, 1), TEST_WINDOW_WIDTH);
+    assert_eq!(window_x(world, 2), TEST_WINDOW_WIDTH * 2);
+
+    // The user focuses another window, and the floating one does not take
+    // focus back.
+    harness.mock_state.focus_window(1);
+    harness.advance(Duration::from_secs(3));
+    crate::assert_focused!(harness.world(), 1);
+
+    // Closing the floating window leaves the tiled windows where they were.
+    harness.mock_state.os_close_window(3);
+    harness.advance(Duration::from_secs(2));
+    let world = harness.world();
+    let mut query = world.query::<&crate::manager::Window>();
+    assert!(query.iter(world).all(|window| window.id() != 3));
+    assert_eq!(window_x(world, 0), 0);
+    assert_eq!(window_x(world, 1), TEST_WINDOW_WIDTH);
+    assert_eq!(window_x(world, 2), TEST_WINDOW_WIDTH * 2);
+}
+
+/// A rule can still tile a window its app keeps above ordinary windows, and
+/// it still takes focus once.
+#[test]
+fn a_rule_can_tile_a_window_above_ordinary_windows() {
+    let mut params = WindowParams::new("^Window 3$", None);
+    params.floating = Some(false);
+    let mut harness = spawned_above_ordinary_window((MainOptions::default(), vec![params]).into());
+
+    let world = harness.world();
+    let entity = find_window_entity(3, world);
+    assert!(
+        world
+            .entity(entity)
+            .get::<crate::ecs::Unmanaged>()
+            .is_none()
+    );
+    let mut query = world.query::<&LayoutStrip>();
+    assert!(query.iter(world).any(|strip| strip.contains(entity)));
+    crate::assert_focused!(world, 3);
+}
+
 /// Closing a window while its application stays alive must free its slot in
 /// the strip. The AX element of such a window often keeps answering queries
 /// after the window is gone, which used to make `window_destroyed_trigger`
