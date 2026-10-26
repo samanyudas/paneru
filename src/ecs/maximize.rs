@@ -9,7 +9,9 @@
 //! stack.
 //!
 //! A maximized window moved to another display, by a display command or a
-//! title-bar drag, stays maximized and fills that display's usable area.
+//! title-bar drag, stays maximized and fills that display's usable area. A
+//! tiled one takes a place in that display's layout: at the end of the strip
+//! for a display command, and at the drop line for a drag.
 
 use std::time::Duration;
 
