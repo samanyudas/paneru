@@ -296,15 +296,30 @@ fn usable_area_of(harness: &mut TestHarness, id: u32) -> IRect {
         .expect("the display")
 }
 
+/// The larger display placed to the right of the built-in display.
+const EAST_EXT_BOUNDS: IRect = IRect {
+    min: IVec2::new(TEST_DISPLAY_WIDTH, 0),
+    max: IVec2::new(TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH, EXT_DISPLAY_HEIGHT),
+};
+
 /// Three tiled windows on the built-in display, with a larger display above
 /// it, and window 1 focused and maximized.
 fn maximized_below_a_larger_display() -> TestHarness {
+    maximized_beside(EXT_BOUNDS)
+}
+
+/// Three tiled windows on the built-in display, a larger display at
+/// `bounds` with one window, and window 1 focused and maximized.
+fn maximized_beside(bounds: IRect) -> TestHarness {
     let mut harness = TestHarness::new()
         .with_windows(3)
-        .with_display(EXT_DISPLAY_ID, EXT_BOUNDS, vec![EXT_WORKSPACE_ID])
+        .with_display(EXT_DISPLAY_ID, bounds, vec![EXT_WORKSPACE_ID])
         .with_window(100, |window| {
             window.workspace_id = EXT_WORKSPACE_ID;
-            window.frame = IRect::new(100, -1100, 900, -100);
+            window.frame = IRect::from_corners(
+                bounds.min + IVec2::new(100, 100),
+                bounds.min + IVec2::new(900, 1100),
+            );
         });
     harness.run(vec![
         Event::MenuOpened { window_id: 0 },
@@ -413,4 +428,47 @@ fn a_maximized_window_dragged_to_another_display_fills_it() {
         TEST_WORKSPACE_ID,
     );
     assert_eq!(os_frame(&harness, 1).min, Origin::new(50, 60));
+}
+
+/// With the larger display to the right, a maximized window moved by the
+/// display commands or dragged across fills each display it reaches.
+#[test]
+fn a_maximized_window_moved_between_side_by_side_displays_fills_them() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    let ext = usable_area_of(&mut harness, EXT_DISPLAY_ID);
+    let test = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+
+    move_to_display(
+        &mut harness,
+        Direction::East,
+        EXT_DISPLAY_ID,
+        EXT_WORKSPACE_ID,
+    );
+    assert_eq!(os_frame(&harness, 1), ext);
+    assert_focused!(harness.world(), 1);
+
+    move_to_display(
+        &mut harness,
+        Direction::West,
+        TEST_DISPLAY_ID,
+        TEST_WORKSPACE_ID,
+    );
+    assert_eq!(os_frame(&harness, 1), test);
+    assert_focused!(harness.world(), 1);
+
+    drag_to(
+        &mut harness,
+        Origin::new(1200, 40),
+        Origin::new(1700, 50),
+        EXT_WORKSPACE_ID,
+    );
+    assert_eq!(os_frame(&harness, 1), ext);
+
+    drag_to(
+        &mut harness,
+        Origin::new(-300, 40),
+        Origin::new(200, 50),
+        TEST_WORKSPACE_ID,
+    );
+    assert_eq!(os_frame(&harness, 1), test);
 }
