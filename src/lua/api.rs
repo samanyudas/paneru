@@ -969,4 +969,25 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn setup_table_sets_the_maximized_window_side() {
+        let lua = Lua::new();
+        let side = |source: &str| -> mlua::Result<String> {
+            let value = lua.load(source).eval()?;
+            let config = config_from_lua(&lua, value)?;
+            let options: Table = config_to_lua_table(&lua, &config)?.get("options")?;
+            options.get("maximized_window_side")
+        };
+        assert_eq!(side("return {}").unwrap(), "right");
+        assert_eq!(
+            side(r#"return { options = { maximized_window_side = "left" } }"#).unwrap(),
+            "left"
+        );
+        assert_eq!(
+            side(r#"return { options = { maximized_window_side = "right" } }"#).unwrap(),
+            "right"
+        );
+        assert!(side(r#"return { options = { maximized_window_side = "up" } }"#).is_err());
+    }
 }
