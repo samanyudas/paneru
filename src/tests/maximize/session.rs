@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::ecs::state::{PaneruState, SavedColumn, SavedMaximize, StateFile};
+use crate::ecs::state::{PaneruState, SavedColumn, SavedMaximize, SavedWindow, StateFile};
 
 use super::*;
 
@@ -20,7 +20,8 @@ fn save_session_of(harness: &mut TestHarness, name: &str) -> PathBuf {
 }
 
 /// The maximize saved in the session at `path` for window `id`.
-fn saved_maximize(path: &Path, id: WinID) -> Option<SavedMaximize> {
+/// Window `id` as the session at `path` saves it in a column of its own.
+fn saved_single(path: &Path, id: WinID) -> Option<SavedWindow> {
     let state = PaneruState::load_from_file(path)?;
     state
         .workspaces
@@ -28,10 +29,13 @@ fn saved_maximize(path: &Path, id: WinID) -> Option<SavedMaximize> {
         .flat_map(|workspace| &workspace.strips)
         .flat_map(|strip| &strip.columns)
         .find_map(|column| match column {
-            SavedColumn::Single(window) if window.window_id == id => Some(window),
+            SavedColumn::Single(window) if window.window_id == id => Some(window.clone()),
             _ => None,
         })
-        .and_then(|window| window.maximized.clone())
+}
+
+fn saved_maximize(path: &Path, id: WinID) -> Option<SavedMaximize> {
+    saved_single(path, id).and_then(|window| window.maximized)
 }
 
 /// Starts a new engine on windows `ids` at the frames `harness` left them
@@ -85,13 +89,10 @@ fn a_toggle_saves_the_session() {
 
     harness.run(vec![command(Operation::Maximize)]);
     harness.advance(SETTLE);
-    let saved = PaneruState::load_from_file(&path);
+    let restored = saved_single(&path, 1);
     _ = std::fs::remove_file(&path);
-    assert!(saved.is_some(), "the session is saved");
-    assert!(
-        saved_maximize(&path, 1).is_none(),
-        "restoring saves the session"
-    );
+    let restored = restored.expect("the session saves window 1 in a column of its own");
+    assert!(restored.maximized.is_none(), "restoring saves the session");
 }
 
 #[test]
