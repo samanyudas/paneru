@@ -35,7 +35,7 @@ use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MinimumHeight, MissionControlActive, Position, PreLaunchFrame,
+    LowPowerMode, MaximumHeight, MinimumHeight, MissionControlActive, Position, PreLaunchFrame,
     ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
     SystemTheme, Unmanaged, WidthLimits, WidthRatio, WindowProperties,
 };
@@ -68,7 +68,11 @@ type NativeFrameWindows<'w, 's> = Query<
         Option<&'static ResizeMarker>,
         Has<VerifyWindowSize>,
         Has<RepositionMarker>,
-        (Option<&'static MinimumHeight>, Option<&'static WidthLimits>),
+        (
+            Option<&'static MinimumHeight>,
+            Option<&'static MaximumHeight>,
+            Option<&'static WidthLimits>,
+        ),
     ),
     (Without<LayoutStrip>, Without<Maximized>, Without<FrameHold>),
 >;
@@ -1015,7 +1019,7 @@ fn adopt_native_size(
     workspaces: &mut Query<(&LayoutStrip, &mut Position)>,
     commands: &mut Commands,
 ) {
-    let Ok((_, _, position, mut bounds, .., (minimum_height, width_limits))) =
+    let Ok((_, _, position, mut bounds, .., (minimum_height, maximum_height, width_limits))) =
         windows.get_mut(entity)
     else {
         return;
@@ -1033,6 +1037,11 @@ fn adopt_native_size(
         && let Ok(mut entity_commands) = commands.get_entity(entity)
     {
         entity_commands.try_remove::<MinimumHeight>();
+    }
+    if maximum_height.is_some_and(|maximum| new_frame.height() > maximum.0)
+        && let Ok(mut entity_commands) = commands.get_entity(entity)
+    {
+        entity_commands.try_remove::<MaximumHeight>();
     }
     // Likewise for a width past either recorded limit.
     if let Some(limits) = width_limits
@@ -1108,7 +1117,7 @@ fn adopt_refused_frame(
     commands: &mut Commands,
 ) {
     let wider = windows.get_mut(entity).is_ok_and(
-        |(_, window, mut position, mut bounds, .., (_, limits))| {
+        |(_, window, mut position, mut bounds, .., (_, _, limits))| {
             if position.0 != new_frame.min {
                 position.0 = new_frame.min;
             }

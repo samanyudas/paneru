@@ -1335,3 +1335,71 @@ fn a_column_of_fixed_widths_reserves_the_widest() {
     let next = frame(harness.world(), 2);
     assert_eq!(next.min.x, frames[1].max.x, "{frames:?} then {next:?}");
 }
+
+/// Makes window `id` refuse every size but `size` once it is tiled, as a
+/// window the user tiled with the float toggle although it cannot be resized.
+fn fix_size(harness: &mut TestHarness, id: WinID, size: Size) {
+    harness.advance(SETTLE);
+    harness.mock_state.update_window(id, |window| {
+        window.fixed_size = true;
+        window.minimum_size = Some(size);
+        window.maximum_size = Some(size);
+    });
+}
+
+/// A window that cannot be resized keeps its own height in a stack, and the
+/// rest of the column goes to the window that can, with no gap between them.
+#[test]
+fn a_fixed_size_window_gives_its_spare_height_to_the_stack() {
+    let mut harness = tall_harness();
+    fix_size(&mut harness, 0, Size::new(TEST_WINDOW_WIDTH, 300));
+    stack_two(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1]);
+    assert_eq!(heights(&frames), vec![300, COLUMN - 300], "{frames:?}");
+}
+
+/// In a stack of windows that cannot be resized, each keeps its own height
+/// from the top of the column, and the rest stays empty below the last one.
+#[test]
+fn a_stack_of_fixed_sizes_leaves_the_rest_empty_below() {
+    let mut harness = tall_harness();
+    fix_size(&mut harness, 0, Size::new(TEST_WINDOW_WIDTH, 300));
+    fix_size(&mut harness, 1, Size::new(TEST_WINDOW_WIDTH, 400));
+    stack_two(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1]);
+    assert_eq!(heights(&frames), vec![300, 400], "{frames:?}");
+    assert_eq!(frames[0].min.y, TEST_MENUBAR_HEIGHT, "{frames:?}");
+}
+
+/// The same with the window that cannot be resized at the bottom.
+#[test]
+fn a_fixed_size_window_below_gives_its_spare_height_to_the_stack() {
+    let mut harness = tall_harness();
+    fix_size(&mut harness, 1, Size::new(TEST_WINDOW_WIDTH, 300));
+    stack_two(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1]);
+    assert_eq!(heights(&frames), vec![COLUMN - 300, 300], "{frames:?}");
+}
+
+/// The same when the engine still believes the fixed-size window has the
+/// full height it was asked for, as after it was tiled from floating.
+#[test]
+fn a_stale_fixed_size_window_below_gives_its_spare_height_to_the_stack() {
+    let mut harness = tall_harness();
+    fix_size(&mut harness, 1, Size::new(TEST_WINDOW_WIDTH, 300));
+    harness.mock_state.update_window(1, |window| {
+        window.frame = IRect::from_corners(
+            window.frame.min,
+            window.frame.min + IVec2::new(TEST_WINDOW_WIDTH, 300),
+        );
+    });
+    stack_two(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1]);
+    assert_eq!(heights(&frames), vec![COLUMN - 300, 300], "{frames:?}");
+    let native = harness.mock_state.create_window(0).frame();
+    assert_eq!(native.height(), COLUMN - 300, "{native:?}");
+}

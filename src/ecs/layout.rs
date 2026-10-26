@@ -24,10 +24,11 @@ use crate::ecs::params::Windows;
 use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
-    LayoutPosition, ManualStripOffset, MinimumHeight, MouseHeldMarker, PlaceAfterArrival, Position,
-    PresentedOrigin, RefitAfterRemoval, RepositionMarker, ReshuffleAroundMarker, ResizeMarker,
-    Scrolling, SelectedVirtualMarker, SkipReshuffle, SpawnCommandsExt, TopBarHeight, TopBarRetry,
-    Unmanaged, VerifyWindowSize, WidthAnchor, WidthLimits, WidthRun,
+    LayoutPosition, ManualStripOffset, MaximumHeight, MinimumHeight, MouseHeldMarker,
+    PlaceAfterArrival, Position, PresentedOrigin, RefitAfterRemoval, RepositionMarker,
+    ReshuffleAroundMarker, ResizeMarker, Scrolling, SelectedVirtualMarker, SkipReshuffle,
+    SpawnCommandsExt, TopBarHeight, TopBarRetry, Unmanaged, VerifyWindowSize, WidthAnchor,
+    WidthLimits, WidthRun,
 };
 use crate::errors::{Error, Result};
 use crate::events::Event;
@@ -1275,6 +1276,7 @@ impl LayoutStrip {
             layout_strip_height,
             get_window_frame,
             &|_| None,
+            &|_| None,
             &|_| FALLBACK_TOP_BAR_HEIGHT,
             &|_| WidthLimits::default(),
         )
@@ -1286,17 +1288,19 @@ impl LayoutStrip {
     /// `get_top_bar_height` the top bar a stack too tall for its column keeps
     /// visible. See [`overlapping_rows`].
     #[instrument(level = Level::TRACE, skip_all, fields(layout_strip_height))]
-    pub fn relative_positions_with_minimums<W, M, T, L>(
+    pub fn relative_positions_with_minimums<W, M, X, T, L>(
         &self,
         layout_strip_height: i32,
         get_window_frame: &W,
         get_minimum_height: &M,
+        get_maximum_height: &X,
         get_top_bar_height: &T,
         get_width_limits: &L,
     ) -> Vec<(Entity, IRect)>
     where
         W: Fn(Entity) -> Option<IRect>,
         M: Fn(Entity) -> Option<i32>,
+        X: Fn(Entity) -> Option<i32>,
         T: Fn(Entity) -> i32,
         L: Fn(Entity) -> WidthLimits,
     {
@@ -1381,6 +1385,11 @@ impl LayoutStrip {
                                 even_heights(current_heights.len(), layout_strip_height)
                             });
                     hold_minimum_heights(&mut heights, &minimums, layout_strip_height);
+                    let maximums = items
+                        .iter()
+                        .map(|item| item.top().and_then(get_maximum_height))
+                        .collect::<Vec<_>>();
+                    hold_maximum_heights(&mut heights, &maximums);
                     stacked_rows(&heights)
                 };
 
@@ -1776,6 +1785,30 @@ pub(crate) fn hold_minimum_heights(heights: &mut [i32], minimums: &[i32], total:
     }
 }
 
+/// Caps each height at its window's maximum and gives the spare height evenly
+/// to the windows without one, the last taking the rounding. With no such
+/// window, the spare height stays empty below the last window.
+fn hold_maximum_heights(heights: &mut [i32], maximums: &[Option<i32>]) {
+    let mut spare = 0;
+    for (height, maximum) in heights.iter_mut().zip(maximums) {
+        if let Some(maximum) = maximum
+            && *height > *maximum
+        {
+            spare += *height - maximum;
+            *height = *maximum;
+        }
+    }
+    let takers = (0..heights.len())
+        .filter(|index| maximums[*index].is_none())
+        .collect::<Vec<_>>();
+    if spare == 0 || takers.is_empty() {
+        return;
+    }
+    for (index, share) in takers.iter().zip(even_heights(takers.len(), spare)) {
+        heights[*index] += share;
+    }
+}
+
 /// Watches for size changes to windows and if they are changed, signals to the layout strip.
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn layout_sizes_changed(
@@ -1941,7 +1974,11 @@ fn refresh_top_bars(
 pub(super) fn layout_strip_changed(
     mut changed_strips: Populated<(&mut LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
     mut windows: WindowFrames,
-    size_limits: Query<(Option<&MinimumHeight>, Option<&WidthLimits>)>,
+    size_limits: Query<(
+        Option<&MinimumHeight>,
+        Option<&MaximumHeight>,
+        Option<&WidthLimits>,
+    )>,
     top_bars: Query<(&Window, Option<&TopBarHeight>, Has<TopBarRetry>)>,
     displays: DisplayViewports,
     config: Res<Config>,
@@ -1963,13 +2000,19 @@ pub(super) fn layout_strip_changed(
         size_limits
             .get(entity)
             .ok()
-            .and_then(|(minimum, _)| minimum.map(|m| m.0))
+            .and_then(|(minimum, _, _)| minimum.map(|m| m.0))
+    };
+    let get_maximum_height = |entity| {
+        size_limits
+            .get(entity)
+            .ok()
+            .and_then(|(_, maximum, _)| maximum.map(|m| m.0))
     };
     let get_width_limits = |entity| {
         size_limits
             .get(entity)
             .ok()
-            .and_then(|(_, limits)| limits.copied())
+            .and_then(|(_, _, limits)| limits.copied())
             .unwrap_or_default()
     };
     let measured = RefCell::new(Vec::new());
@@ -1997,6 +2040,7 @@ pub(super) fn layout_strip_changed(
             height,
             &get_window_frame,
             &get_minimum_height,
+            &get_maximum_height,
             &get_top_bar_height,
             &get_width_limits,
         ));

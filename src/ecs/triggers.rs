@@ -32,10 +32,10 @@ use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LaunchWindows, LayoutPosition,
-    MinimumHeight, PendingWidthSettlement, Position, PreLaunchFrame, RepositionMarker,
-    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    StepPartners, VerifyWindowPosition, VerifyWindowSize, WidthLimits, WidthRatio, WidthRun,
-    WidthSettlementPhase, WindowProperties,
+    MaximumHeight, MinimumHeight, PendingWidthSettlement, Position, PreLaunchFrame,
+    RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
+    SpawnCommandsExt, StepPartners, VerifyWindowPosition, VerifyWindowSize, WidthLimits,
+    WidthRatio, WidthRun, WidthSettlementPhase, WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -1885,6 +1885,11 @@ pub(crate) fn adopt_refused_size(
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         if height_ord == Ordering::Less {
             entity_commands.try_insert(MinimumHeight(actual_size.y));
+        }
+        // Only a window that cannot be resized: a resizable one can come
+        // back shorter for a moment, such as at the screen's bottom edge.
+        if height_ord == Ordering::Greater && !window.is_resizable() {
+            entity_commands.try_insert(MaximumHeight(actual_size.y));
         }
         if width_ord != Ordering::Equal {
             let mut limits = window_limits.unwrap_or_default();
