@@ -2138,6 +2138,60 @@ mod frame_commit_tests {
     }
 }
 
+#[cfg(test)]
+mod startup_tests {
+    use std::sync::mpsc::channel;
+
+    use bevy::prelude::*;
+
+    use super::gather_initial_processes;
+    use crate::config::Config;
+    use crate::events::Event;
+
+    /// A parent exit or Ctrl-C during startup arrives before `ProcessesLoaded`
+    /// ends the gathering. It must still stop the daemon.
+    #[test]
+    fn an_exit_during_startup_still_exits() {
+        let (sender, receiver) = channel();
+        sender
+            .send(Event::InitialConfig(
+                Config::defaults().expect("defaults should parse"),
+            ))
+            .expect("send initial config");
+        sender.send(Event::Exit).expect("send exit");
+        sender.send(Event::ProcessesLoaded).expect("send loaded");
+
+        let mut app = App::new();
+        app.insert_non_send(receiver);
+        app.add_systems(Update, gather_initial_processes);
+        app.update();
+
+        assert_eq!(app.should_exit(), Some(AppExit::Success));
+    }
+
+    /// Ctrl-C or the parent's exit can land before the startup config reaches
+    /// the ECS. The engine must still exit, without a frame missing `Config`.
+    #[test]
+    fn an_exit_before_the_startup_config_exits_without_a_panic() {
+        let (sender, receiver) = channel();
+        sender.send(Event::Exit).expect("send exit");
+        sender
+            .send(Event::InitialConfig(
+                Config::defaults().expect("defaults should parse"),
+            ))
+            .expect("send initial config");
+        sender.send(Event::ProcessesLoaded).expect("send loaded");
+
+        let mut app = App::new();
+        app.insert_non_send(receiver);
+        app.add_systems(Startup, gather_initial_processes);
+        app.add_systems(Update, |_: Res<Config>| {});
+        app.update();
+
+        assert_eq!(app.should_exit(), Some(AppExit::Success));
+    }
+}
+
 #[cfg(all(test, feature = "lua"))]
 mod tests {
     use std::sync::mpsc::channel;
@@ -2185,27 +2239,6 @@ mod tests {
             .abs()
                 < f64::EPSILON
         );
-    }
-
-    /// A parent exit or Ctrl-C during startup arrives before `ProcessesLoaded`
-    /// ends the gathering. It must still stop the daemon.
-    #[test]
-    fn an_exit_during_startup_still_exits() {
-        let (sender, receiver) = channel();
-        sender
-            .send(Event::InitialConfig(
-                Config::defaults().expect("defaults should parse"),
-            ))
-            .expect("send initial config");
-        sender.send(Event::Exit).expect("send exit");
-        sender.send(Event::ProcessesLoaded).expect("send loaded");
-
-        let mut app = App::new();
-        app.insert_non_send(receiver);
-        app.add_systems(Update, gather_initial_processes);
-        app.update();
-
-        assert_eq!(app.should_exit(), Some(AppExit::Success));
     }
 
     /// The input event tap keeps the handle it received on `InitialConfig` and
