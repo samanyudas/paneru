@@ -922,6 +922,7 @@ fn test_center_survives_display_round_trip() {
 #[test]
 fn focusing_another_display_without_switching_its_workspace_does_not_flash() {
     let mut harness = TestHarness::new()
+        .with_workspace_popup()
         .with_display(
             EXT_DISPLAY_ID,
             IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
@@ -974,6 +975,7 @@ fn focusing_another_display_without_switching_its_workspace_does_not_flash() {
 #[test]
 fn focus_display_south_does_not_flash() {
     let mut harness = TestHarness::new()
+        .with_workspace_popup()
         .with_display(
             EXT_DISPLAY_ID,
             IRect::new(

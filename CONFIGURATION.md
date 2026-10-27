@@ -109,12 +109,12 @@ Visual styling for workspaces, active and inactive windows.
 
 ### Virtual Workspace indicators
 
-Toggles display of the currently active virtual workspace in the menubar or in a brief status popup window. Both are enabled by default. `workspace_menu_status` controls only the workspace indicator; the descriptor and menu remain available.
+Toggles display of the currently active virtual workspace in the menubar or in a brief status popup window. The menubar indicator is enabled by default. Miri turns virtual workspaces off, so the popup is disabled by default. `workspace_menu_status` controls only the workspace indicator; the descriptor and menu remain available.
 
 **Example:**
 ```toml
 [decorations]
-# Both default to true
+# workspace_menu_status defaults to true, workspace_popup_status to false
 workspace_menu_status = false
 workspace_popup_status = true
 ```

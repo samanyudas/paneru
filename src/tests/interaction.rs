@@ -961,7 +961,7 @@ fn test_workspace_popup_uses_final_index_after_activation() {
 
 #[test]
 fn test_initial_workspace_does_not_flash() {
-    let mut harness = TestHarness::new().with_windows(1);
+    let mut harness = TestHarness::new().with_workspace_popup().with_windows(1);
     harness.advance(Duration::from_millis(20));
 
     let world = harness.world();

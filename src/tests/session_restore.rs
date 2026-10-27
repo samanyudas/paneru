@@ -664,7 +664,7 @@ enabled = false
 
 #[test]
 fn test_startup_restore_uses_first_restored_row_when_active_metadata_is_missing() {
-    let mut harness = TestHarness::new().with_windows(1);
+    let mut harness = TestHarness::new().with_workspace_popup().with_windows(1);
     let mut state = state_with_strips(vec![SavedStrip {
         virtual_index: 2,
         columns: vec![SavedColumn::Single(saved_window(0))],
