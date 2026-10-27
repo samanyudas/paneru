@@ -19,8 +19,8 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     AboveOrdinaryCheck, ActiveDisplayMarker, AwaitingHandle, BProcess, FloatsWhenRestored,
-    FocusedMarker, FreshMarker, MissionControlActive, PreviousManagedStrip, RetryFrontSwitch,
-    SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    FocusedMarker, FreshMarker, MissionControlActive, PreviousManagedStrip, Rejoin,
+    RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -709,6 +709,7 @@ pub(super) fn window_unmanaged_trigger(
     // leaving a gap that never closes on its own.
     for (mut strip, _) in &mut workspaces {
         if strip.contains(entity) {
+            remember_managed_strip(entity, &strip, Rejoin::VisibleRow, &mut ctx.commands);
             strip.remove(entity);
         }
     }
@@ -768,12 +769,18 @@ pub(super) fn window_unmanaged_trigger(
     }
 }
 
-fn remember_managed_strip(entity: Entity, strip: &LayoutStrip, commands: &mut Commands) {
+fn remember_managed_strip(
+    entity: Entity,
+    strip: &LayoutStrip,
+    rejoin: Rejoin,
+    commands: &mut Commands,
+) {
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         entity_commands.try_insert(PreviousManagedStrip {
             workspace_id: strip.id(),
             virtual_index: strip.virtual_index,
             index: strip.index_of(entity).unwrap_or(strip.len()),
+            rejoin,
         });
     }
 }
@@ -806,7 +813,7 @@ pub(super) fn window_minimized_trigger(
                 );
             }
             if strip.contains(entity) {
-                remember_managed_strip(entity, &strip, &mut commands);
+                remember_managed_strip(entity, &strip, Rejoin::AnyRow, &mut commands);
                 strip.remove(entity);
             }
         }
@@ -849,10 +856,17 @@ pub(super) fn window_managed_trigger(
     debug!("Entity {entity} is managed again.");
     let (display, dock) = *active_display;
     let display_bounds = display.actual_display_bounds(dock, &ctx.config);
-    let mut insert_at = previous_strips
+    let previous = previous_strips
         .get(entity)
         .ok()
-        .map(|previous| previous.index);
+        .copied()
+        .filter(|previous| {
+            previous.rejoin == Rejoin::AnyRow
+                || workspaces
+                    .iter()
+                    .any(|(_, strip, _, active)| active && previous.left(strip))
+        });
+    let mut insert_at = previous.map(|previous| previous.index);
 
     if let Some(window) = ctx.windows.get(entity)
         && let Some((_, app)) = ctx
@@ -888,7 +902,6 @@ pub(super) fn window_managed_trigger(
         insert_at = properties.insertion().or(insert_at);
     }
 
-    let previous = previous_strips.get(entity).ok().copied();
     for (_, mut strip, _, _) in &mut workspaces {
         strip.remove(entity);
     }
@@ -898,8 +911,7 @@ pub(super) fn window_managed_trigger(
     let mut landed_in = None;
     if let Some(previous) = previous {
         for (strip_entity, mut strip, _, active) in &mut workspaces {
-            if strip.id() == previous.workspace_id && strip.virtual_index == previous.virtual_index
-            {
+            if previous.left(&strip) {
                 strip.insert_at(insert_at.unwrap_or(previous.index), entity);
                 landed_in = Some((strip_entity, active));
                 break;
