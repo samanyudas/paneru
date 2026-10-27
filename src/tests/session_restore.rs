@@ -1530,6 +1530,18 @@ fn an_exit_during_startup_keeps_the_saved_session() {
     assert_eq!(after, "previous session");
 }
 
+/// Startup can still be discovering windows after it has gathered every
+/// process. An exit then must not save the half-built layout either.
+#[test]
+fn an_exit_before_startup_finishes_keeps_the_saved_session() {
+    let mut harness = TestHarness::new().with_windows(1);
+    let after = session_after_exit(&mut harness, "discovering", "previous session", |world| {
+        world.write_message(AppExit::Success);
+    });
+
+    assert_eq!(after, "previous session");
+}
+
 #[test]
 fn an_exit_after_startup_saves_the_session() {
     let mut harness = TestHarness::new().with_windows(1);
