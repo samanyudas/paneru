@@ -857,6 +857,7 @@ fn test_external_focus_reactivates_hidden_virtual_strip_when_marker_is_stale() {
 #[test]
 fn test_external_focus_switch_flashes_workspace_number() {
     TestHarness::new()
+        .with_workspace_popup()
         .with_windows(1)
         .on_iteration(1, |world, _state| {
             let mut messages = world.query::<&crate::ecs::FlashMessage>();
@@ -887,6 +888,7 @@ fn test_external_focus_switch_flashes_workspace_number() {
 fn test_native_space_switch_flashes_workspace_number() {
     let other_space = TEST_WORKSPACE_ID + 1;
     TestHarness::new()
+        .with_workspace_popup()
         .with_display(
             TEST_DISPLAY_ID,
             IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
@@ -913,6 +915,7 @@ fn test_native_space_switch_flashes_workspace_number() {
 #[test]
 fn test_workspace_popup_uses_final_index_after_activation() {
     TestHarness::new()
+        .with_workspace_popup()
         .with_windows(1)
         .on_iteration(0, |world, _state| {
             let display = world
@@ -958,7 +961,7 @@ fn test_workspace_popup_uses_final_index_after_activation() {
 
 #[test]
 fn test_initial_workspace_does_not_flash() {
-    let mut harness = TestHarness::new().with_windows(1);
+    let mut harness = TestHarness::new().with_workspace_popup().with_windows(1);
     harness.advance(Duration::from_millis(20));
 
     let world = harness.world();
@@ -1020,6 +1023,33 @@ fn test_workspace_popup_setting_disables_native_space_switch_flash() {
             assert!(
                 messages.iter(world).next().is_none(),
                 "macOS Space switches should not flash while popups are disabled"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+        ]);
+}
+
+#[test]
+fn test_native_space_switch_does_not_flash_by_default() {
+    let other_space = TEST_WORKSPACE_ID + 1;
+    TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, other_space],
+        )
+        .on_iteration(0, move |_world, state| {
+            state.activate_workspace(TEST_DISPLAY_ID, other_space, false);
+        })
+        .on_iteration(1, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).next().is_none(),
+                "Miri hides virtual workspace numbers unless the popup is turned on"
             );
         })
         .run(vec![

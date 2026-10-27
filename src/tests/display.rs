@@ -922,6 +922,7 @@ fn test_center_survives_display_round_trip() {
 #[test]
 fn focusing_another_display_without_switching_its_workspace_does_not_flash() {
     let mut harness = TestHarness::new()
+        .with_workspace_popup()
         .with_display(
             EXT_DISPLAY_ID,
             IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
@@ -974,6 +975,7 @@ fn focusing_another_display_without_switching_its_workspace_does_not_flash() {
 #[test]
 fn focus_display_south_does_not_flash() {
     let mut harness = TestHarness::new()
+        .with_workspace_popup()
         .with_display(
             EXT_DISPLAY_ID,
             IRect::new(
@@ -1009,6 +1011,7 @@ fn focus_display_south_does_not_flash() {
 #[test]
 fn popup_waits_until_the_destination_display_is_active() {
     let mut harness = TestHarness::new()
+        .with_workspace_popup()
         .with_display(
             EXT_DISPLAY_ID,
             IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
@@ -2852,7 +2855,7 @@ fn test_attach_display_compacts_emptied_first_virtual_workspace() {
 }
 
 #[test]
-fn test_remove_display_appends_strip_as_next_virtual_workspace() {
+fn test_remove_display_appends_windows_to_surviving_strip() {
     let mut harness = TestHarness::new()
         .with_display(
             EXT_DISPLAY_ID,
@@ -2898,8 +2901,8 @@ fn test_remove_display_appends_strip_as_next_virtual_workspace() {
             main_strips.sort_by_key(|(idx, _)| *idx);
             assert_eq!(
                 main_strips,
-                vec![(0, vec![win0, win1]), (1, vec![win100, win101])],
-                "windows from removed display must become the next virtual workspace (v1) on surviving display, not merged into v0"
+                vec![(0, vec![win0, win1, win100, win101])],
+                "windows from the removed display must join the end of the surviving Space's strip in order"
             );
 
             let leftover_ext = world
@@ -2965,25 +2968,72 @@ fn test_remove_display_populates_empty_first_workspace_on_surviving_display() {
         .run(commands);
 }
 
+/// Mission Control can drag a window to an inactive Space without telling the
+/// engine. When a display topology read finds it there first, the window must
+/// join that Space's one strip, not a hidden extra row (#89).
 #[test]
-fn test_remove_focused_display_activates_migrated_strip() {
+fn test_topology_read_appends_window_moved_to_inactive_space_into_its_strip() {
+    use crate::ecs::NativeFullscreenMarker;
+
+    let inactive_space = TEST_WORKSPACE_ID + 1;
+    let mut harness = TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, inactive_space],
+        )
+        .with_windows(2)
+        .with_workspace_window(100, inactive_space, |_| {});
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness
+        .mock_state
+        .update_window(1, |window| window.workspace_id = inactive_space);
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(1, 0, TEST_DISPLAY_WIDTH + 1, TEST_DISPLAY_HEIGHT),
+    );
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayConfigured {
+            display_id: TEST_DISPLAY_ID,
+        });
+    harness.advance(Duration::from_secs(2));
+
+    let world = harness.world();
+    let moved = find_window_entity(1, world);
+    let resident = find_window_entity(100, world);
+    let strips: Vec<(u32, Vec<Entity>)> = world
+        .query::<(&LayoutStrip, Has<NativeFullscreenMarker>)>()
+        .iter(world)
+        .filter(|(strip, fullscreen)| !fullscreen && strip.id() == inactive_space)
+        .map(|(strip, _)| (strip.virtual_index, strip.all_windows()))
+        .collect();
+    assert_eq!(
+        strips,
+        vec![(0, vec![resident, moved])],
+        "the moved window must be the last column of the Space's only strip"
+    );
+}
+
+#[test]
+fn test_remove_focused_display_appends_and_shows_migrated_window() {
     assert_removed_display_follows_focus(true, 0);
 }
 
 #[test]
-fn test_remove_focused_display_parks_selected_second_destination_strip() {
+fn test_remove_focused_display_joins_selected_second_destination_strip() {
     assert_removed_display_follows_focus(true, 1);
 }
 
 #[test]
-fn test_remove_inactive_display_keeps_migrated_strip_parked() {
+fn test_remove_inactive_display_appends_migrated_window_without_scrolling() {
     assert_removed_display_follows_focus(false, 0);
 }
 
 struct RemovedDisplayFixture {
     harness: TestHarness,
     destination_selected: Entity,
-    destination_origin: IVec2,
     destination_frame: IRect,
 }
 
@@ -3023,17 +3073,6 @@ fn removed_display_fixture(
         .query_filtered::<Entity, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>()
         .single(harness.world())
         .unwrap();
-    let destination_display = harness
-        .world()
-        .get::<ChildOf>(destination_selected)
-        .unwrap()
-        .parent();
-    let destination_origin = harness
-        .world()
-        .get::<Display>(destination_display)
-        .unwrap()
-        .bounds()
-        .min;
     let destination_frame = harness.mock_state.create_window(0).frame();
 
     if removed_display_focused {
@@ -3060,12 +3099,13 @@ fn removed_display_fixture(
     RemovedDisplayFixture {
         harness,
         destination_selected,
-        destination_origin,
         destination_frame,
     }
 }
 
-fn sample_removed_display_frames(harness: &mut TestHarness) -> Vec<(u32, IRect, IRect, Entity)> {
+/// The strip of the surviving Space that holds window 100, at each frame
+/// after the removal, from the first frame it holds it.
+fn sample_migrated_strips(harness: &mut TestHarness) -> Vec<(u32, Entity)> {
     let mut samples = Vec::new();
     for tick in 1..=175 {
         harness.advance(Duration::from_millis(20));
@@ -3079,113 +3119,81 @@ fn sample_removed_display_frames(harness: &mut TestHarness) -> Vec<(u32, IRect, 
                     .then_some(entity)
             });
         if let Some(migrated_strip) = migrated_strip {
-            samples.push((
-                tick,
-                harness.mock_state.create_window(0).frame(),
-                harness.mock_state.create_window(100).frame(),
-                migrated_strip,
-            ));
+            samples.push((tick, migrated_strip));
         }
     }
     samples
 }
 
+/// A removed display's window joins the end of the surviving Space's selected
+/// strip and adds no row. It takes the view only if it had focus.
 fn assert_removed_display_follows_focus(
     removed_display_focused: bool,
     destination_virtual_index: u32,
 ) {
-    use crate::ecs::workspace::PreviousStripPosition;
-    use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker, SelectedVirtualMarker};
+    use crate::ecs::{ActiveWorkspaceMarker, SelectedVirtualMarker};
 
     let RemovedDisplayFixture {
         mut harness,
         destination_selected,
-        destination_origin,
         destination_frame,
     } = removed_display_fixture(removed_display_focused, destination_virtual_index);
-    let samples = sample_removed_display_frames(&mut harness);
+    let samples = sample_migrated_strips(&mut harness);
     assert!(
         !samples.is_empty(),
         "the removed display's window must migrate"
     );
-    let (_, _, _, migrated_strip) = *samples.last().unwrap();
-    let migrated_window = find_window_entity(100, harness.world());
-    let parked_origin = IVec2::new(
-        TEST_DISPLAY_WIDTH - PARKED_STRIP_SLIVER,
-        TEST_DISPLAY_HEIGHT - PARKED_STRIP_SLIVER,
-    );
-    for (tick, destination_frame, migrated_frame, _) in &samples {
-        let parked_frame = if removed_display_focused {
-            destination_frame
-        } else {
-            migrated_frame
-        };
+    for (tick, migrated_strip) in &samples {
         assert_eq!(
-            parked_frame.min, parked_origin,
-            "only the selected row may be visible after migration at {tick} frames; destination: {destination_frame:?}, migrated: {migrated_frame:?}"
+            *migrated_strip, destination_selected,
+            "the migrated window must join the selected strip at {tick} frames"
         );
     }
 
-    let (visible_strip, hidden_strip) = if removed_display_focused {
-        (migrated_strip, destination_selected)
-    } else {
-        (destination_selected, migrated_strip)
-    };
     let world = harness.world();
-    assert!(world.get::<SelectedVirtualMarker>(visible_strip).is_some());
-    assert!(world.get::<ActiveWorkspaceMarker>(visible_strip).is_some());
-    assert!(world.get::<PreviousStripPosition>(visible_strip).is_none());
-    assert!(world.get::<SelectedVirtualMarker>(hidden_strip).is_none());
-    assert!(world.get::<ActiveWorkspaceMarker>(hidden_strip).is_none());
-    let previous = world.get::<PreviousStripPosition>(hidden_strip).unwrap();
-    assert_eq!(previous.origin, destination_origin);
+    let migrated_window = find_window_entity(100, world);
+    let strip = world.get::<LayoutStrip>(destination_selected).unwrap();
+    assert_eq!(strip.virtual_index, destination_virtual_index);
+    assert_eq!(
+        strip.all_windows().last(),
+        Some(&migrated_window),
+        "the migrated window must be the strip's last column"
+    );
+    let rows = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .count();
+    assert_eq!(
+        rows,
+        destination_virtual_index as usize + 1,
+        "the migration must not add a row"
+    );
+    assert!(
+        world
+            .get::<SelectedVirtualMarker>(destination_selected)
+            .is_some()
+    );
+    assert!(
+        world
+            .get::<ActiveWorkspaceMarker>(destination_selected)
+            .is_some()
+    );
     if removed_display_focused {
         assert_focused!(world, 100);
-        assert!(
-            world
-                .get::<LayoutStrip>(visible_strip)
-                .unwrap()
-                .contains(migrated_window)
-        );
+        let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+        let frame = harness.mock_state.create_window(100).frame();
         assert_eq!(
-            harness.mock_state.create_window(100).frame().min,
-            destination_origin
+            frame.intersect(display),
+            frame,
+            "the focused migrated window must be in view"
         );
-        let commands = vec![window_command(Operation::VirtualNumber(
-            destination_virtual_index,
-        ))];
-        harness = harness.on_iteration(0, move |world, state| {
-            let focused = world
-                .query_filtered::<Entity, With<FocusedMarker>>()
-                .single(world)
-                .unwrap();
-            assert!(
-                world
-                    .get::<LayoutStrip>(destination_selected)
-                    .unwrap()
-                    .contains(focused),
-                "switching back must focus a window in the destination's restored row"
-            );
-            assert_eq!(state.create_window(0).frame(), destination_frame);
-            assert_eq!(state.create_window(100).frame().min, parked_origin);
-            assert!(
-                world
-                    .get::<SelectedVirtualMarker>(destination_selected)
-                    .is_some()
-            );
-            assert!(
-                world
-                    .get::<ActiveWorkspaceMarker>(destination_selected)
-                    .is_some()
-            );
-            assert!(world.get::<PreviousStripPosition>(migrated_strip).is_some());
-        });
-        harness.run(commands);
     } else {
-        assert_eq!(previous.focus, Some(migrated_window));
+        assert_focused!(world, 0);
         assert_eq!(
             harness.mock_state.create_window(0).frame(),
-            destination_frame
+            destination_frame,
+            "a background migration must not scroll the strip"
         );
     }
 }
