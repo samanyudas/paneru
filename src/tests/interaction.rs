@@ -1030,6 +1030,33 @@ fn test_workspace_popup_setting_disables_native_space_switch_flash() {
         ]);
 }
 
+#[test]
+fn test_native_space_switch_does_not_flash_by_default() {
+    let other_space = TEST_WORKSPACE_ID + 1;
+    TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, other_space],
+        )
+        .on_iteration(0, move |_world, state| {
+            state.activate_workspace(TEST_DISPLAY_ID, other_space, false);
+        })
+        .on_iteration(1, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).next().is_none(),
+                "Miri hides virtual workspace numbers unless the popup is turned on"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+        ]);
+}
+
 // When the focused window leaves the active strip (e.g. it just became
 // floating, or the OS handed focus to an off-strip window), window_focus
 // east/west must enter the strip from the appropriate side rather than
