@@ -1143,6 +1143,41 @@ fn test_floating_window_does_not_hold_a_slot_in_the_strip() {
         .run(commands);
 }
 
+fn strip_order(world: &mut World) -> Vec<Entity> {
+    let mut query = world.query_filtered::<&LayoutStrip, With<crate::ecs::ActiveWorkspaceMarker>>();
+    query
+        .single(world)
+        .expect("an active workspace")
+        .all_columns()
+}
+
+#[test]
+fn a_retiled_window_returns_to_its_slot() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+    ]);
+    harness.advance(Duration::from_millis(100));
+    let world = harness.app.world_mut();
+    let slots: Vec<Entity> = (0..3).map(|id| find_window_entity(id, world)).collect();
+    assert_eq!(strip_order(world), slots);
+
+    for _ in 0..2 {
+        harness.run(vec![Event::Command {
+            command: Command::Window(Operation::Manage),
+        }]);
+        harness.advance(Duration::from_millis(100));
+    }
+
+    assert_eq!(strip_order(harness.app.world_mut()), slots);
+}
+
 #[test]
 fn test_unordered_window_releases_its_layout_space() {
     let mut harness = TestHarness::new().with_windows(3);
