@@ -189,6 +189,13 @@ impl TestHarness {
         self
     }
 
+    pub(crate) fn with_workspace_popup(self) -> Self {
+        self.with_config(
+            Config::try_from("[decorations]\nworkspace_popup_status = true\n[bindings]\n")
+                .expect("config should parse"),
+        )
+    }
+
     pub(crate) fn with_state(mut self, state: PaneruState) -> Self {
         self.app.world_mut().insert_resource(state);
         self

@@ -857,6 +857,7 @@ fn test_external_focus_reactivates_hidden_virtual_strip_when_marker_is_stale() {
 #[test]
 fn test_external_focus_switch_flashes_workspace_number() {
     TestHarness::new()
+        .with_workspace_popup()
         .with_windows(1)
         .on_iteration(1, |world, _state| {
             let mut messages = world.query::<&crate::ecs::FlashMessage>();
@@ -887,6 +888,7 @@ fn test_external_focus_switch_flashes_workspace_number() {
 fn test_native_space_switch_flashes_workspace_number() {
     let other_space = TEST_WORKSPACE_ID + 1;
     TestHarness::new()
+        .with_workspace_popup()
         .with_display(
             TEST_DISPLAY_ID,
             IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
@@ -913,6 +915,7 @@ fn test_native_space_switch_flashes_workspace_number() {
 #[test]
 fn test_workspace_popup_uses_final_index_after_activation() {
     TestHarness::new()
+        .with_workspace_popup()
         .with_windows(1)
         .on_iteration(0, |world, _state| {
             let display = world

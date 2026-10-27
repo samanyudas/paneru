@@ -746,7 +746,7 @@ fn test_startup_floating_rule_wins_over_saved_tiled_placement() {
 
 #[test]
 fn test_late_startup_window_restores_during_grace_period() {
-    let mut harness = TestHarness::new();
+    let mut harness = TestHarness::new().with_workspace_popup();
     harness
         .app
         .world_mut()

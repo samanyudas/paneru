@@ -897,12 +897,14 @@ impl Config {
             .is_none_or(|enabled| enabled)
     }
 
+    /// Returns `true` if switching strips flashes the virtual workspace number.
+    /// Miri turns virtual workspaces off, so it defaults to `false`.
     pub fn workspace_popup_status(&self) -> bool {
         self.inner()
             .decorations
             .as_ref()
             .and_then(|decorations| decorations.workspace_popup_status)
-            .is_none_or(|enabled| enabled)
+            .is_some_and(|enabled| enabled)
     }
 
     pub fn virtual_workspace_animations(&self) -> bool {

@@ -1009,6 +1009,7 @@ fn focus_display_south_does_not_flash() {
 #[test]
 fn popup_waits_until_the_destination_display_is_active() {
     let mut harness = TestHarness::new()
+        .with_workspace_popup()
         .with_display(
             EXT_DISPLAY_ID,
             IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
