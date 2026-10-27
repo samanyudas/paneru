@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::commands::Command;
-use crate::config::Config;
 use crate::ecs::state::StateQueryKind;
 use crate::errors::Result;
 use crate::platform::{
@@ -68,8 +67,6 @@ pub enum Event {
     /// Indicates that the initial set of processes has been loaded.
     ProcessesLoaded,
 
-    /// Announces the initialy loaded configuration
-    InitialConfig(Config),
     /// Signals that the configuration should be reloaded.
     ConfigRefresh(notify::Event),
 

@@ -32,7 +32,7 @@ use crate::ecs::drag::{
 use crate::ecs::layout::{Column, LayoutStrip, RestoreTo};
 use crate::ecs::maximize::{FloatingMaximized, FrameHold};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
-use crate::ecs::state::SaveSession;
+use crate::ecs::state::{SaveSession, StateFile};
 use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
@@ -1205,7 +1205,7 @@ fn adopt_refused_frame(
 
 pub(crate) fn gather_initial_processes(
     receiver: Option<NonSendMut<Receiver<Event>>>,
-    existing_config: Option<Res<Config>>,
+    config: Res<Config>,
     mut displays: Query<&mut Display>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
@@ -1215,11 +1215,13 @@ pub(crate) fn gather_initial_processes(
         return;
     };
     let mut initial_processes: Vec<BProcess> = Vec::new();
-    let mut toml_config = None;
     loop {
         match receiver.recv().expect("error reading initial processes") {
             Event::ProcessesLoaded => break,
             Event::Exit => {
+                // This run never saw the whole layout, so it must not write
+                // the session that the next start restores.
+                commands.remove_resource::<StateFile>();
                 exit.write(AppExit::Success);
                 break;
             }
@@ -1231,32 +1233,17 @@ pub(crate) fn gather_initial_processes(
                     debug!("Skipping process with PID 0 (likely kernel_task).");
                 }
             }
-            Event::InitialConfig(config) => {
-                toml_config = Some(config);
-            }
             event => warn!("Stray event during initial process gathering: {event:?}"),
         }
     }
 
-    // A Lua `paneru.setup{...}` config is inserted at build time and wins; the
-    // TOML config drained from the channel is only the fallback. Use whichever
-    // is authoritative for the force-manage and menubar decisions below.
-    let effective = existing_config
-        .as_deref()
-        .cloned()
-        .or_else(|| toml_config.clone());
-
-    if let Some(config) = &effective {
-        let height = config.menubar_height();
-        for mut display in &mut displays {
-            display.set_menubar_height_override(height);
-        }
+    let height = config.menubar_height();
+    for mut display in &mut displays {
+        display.set_menubar_height_override(height);
     }
 
     while let Some(mut process) = initial_processes.pop() {
-        let forced = effective
-            .as_ref()
-            .is_some_and(|c| c.should_force_manage_process(&**process));
+        let forced = config.should_force_manage_process(&**process);
 
         if process.is_observable() || forced {
             if forced {
@@ -1277,21 +1264,6 @@ pub(crate) fn gather_initial_processes(
             let watch = launch_watch(process.name(), &mut commands);
             commands.spawn((watch, process));
         }
-    }
-
-    // The input event tap holds its own clone of the `Config` handle from
-    // `InitialConfig` and reads swipe/scroll settings off it per event. A Lua
-    // `paneru.setup{...}` builds a fresh handle, so its settings must be
-    // published into the tap's existing handle rather than replacing it, or
-    // gestures would keep reading stale settings.
-    match (existing_config.as_deref(), toml_config) {
-        #[cfg(feature = "lua")]
-        (Some(lua_config), Some(shared)) => {
-            shared.replace_inner_from(lua_config);
-            commands.insert_resource(shared);
-        }
-        (None, Some(config)) => commands.insert_resource(config),
-        _ => {}
     }
 }
 
@@ -2164,14 +2136,40 @@ mod frame_commit_tests {
     }
 }
 
-#[cfg(all(test, feature = "lua"))]
-mod tests {
+#[cfg(test)]
+mod startup_tests {
     use std::sync::mpsc::channel;
 
     use bevy::prelude::*;
 
     use super::gather_initial_processes;
     use crate::config::Config;
+    use crate::events::Event;
+
+    /// Ctrl-C or the parent's exit can arrive while startup gathers processes.
+    /// The engine must still exit, and the frame that runs first must have the
+    /// `Config` that `setup_bevy_app` inserts.
+    #[test]
+    fn an_exit_during_startup_exits_without_a_panic() {
+        let (sender, receiver) = channel();
+        sender.send(Event::Exit).expect("send exit");
+        sender.send(Event::ProcessesLoaded).expect("send loaded");
+
+        let mut app = App::new();
+        app.insert_resource(Config::defaults().expect("defaults should parse"));
+        app.insert_non_send(receiver);
+        app.add_systems(Startup, gather_initial_processes);
+        app.add_systems(Update, |_: Res<Config>| {});
+        app.update();
+
+        assert_eq!(app.should_exit(), Some(AppExit::Success));
+    }
+}
+
+#[cfg(all(test, feature = "lua"))]
+mod tests {
+    use bevy::prelude::*;
+
     use crate::events::Event;
 
     #[test]
@@ -2211,52 +2209,5 @@ mod tests {
             .abs()
                 < f64::EPSILON
         );
-    }
-
-    /// A parent exit or Ctrl-C during startup arrives before `ProcessesLoaded`
-    /// ends the gathering. It must still stop the daemon.
-    #[test]
-    fn an_exit_during_startup_still_exits() {
-        let (sender, receiver) = channel();
-        sender
-            .send(Event::InitialConfig(
-                Config::defaults().expect("defaults should parse"),
-            ))
-            .expect("send initial config");
-        sender.send(Event::Exit).expect("send exit");
-        sender.send(Event::ProcessesLoaded).expect("send loaded");
-
-        let mut app = App::new();
-        app.insert_non_send(receiver);
-        app.add_systems(Update, gather_initial_processes);
-        app.update();
-
-        assert_eq!(app.should_exit(), Some(AppExit::Success));
-    }
-
-    /// The input event tap keeps the handle it received on `InitialConfig` and
-    /// reads swipe settings off it per event, so the Lua config must land in
-    /// *that* handle rather than in a fresh one only the ECS can see.
-    #[test]
-    fn lua_config_reaches_the_handle_the_event_tap_holds() {
-        let lua_config: Config = "[options]\n[swipe.gesture]\nfingers_count = 3\n"
-            .try_into()
-            .expect("config should parse");
-        let tap_config = Config::defaults().expect("defaults should parse");
-        assert_eq!(tap_config.swipe_gesture_fingers(), None);
-
-        let (sender, receiver) = channel();
-        sender
-            .send(Event::InitialConfig(tap_config.clone()))
-            .expect("send initial config");
-        sender.send(Event::ProcessesLoaded).expect("send loaded");
-
-        let mut app = App::new();
-        app.insert_resource(lua_config);
-        app.insert_non_send(receiver);
-        app.add_systems(Update, gather_initial_processes);
-        app.update();
-
-        assert_eq!(tap_config.swipe_gesture_fingers(), Some(3));
     }
 }

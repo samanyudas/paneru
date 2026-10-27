@@ -90,18 +90,8 @@ pub fn load_menu_bar_preference(app: &mut bevy::app::App) {
     }
 }
 
-pub fn setup_menu_bar(
-    app: &mut bevy::app::App,
-    mtm: MainThreadMarker,
-    events: EventSender,
-    initial_config: &Config,
-) {
-    // Prefer Lua setup when present; otherwise reuse the configuration already
-    // loaded for the event tap rather than reading it again.
-    let config = app
-        .world()
-        .get_resource::<Config>()
-        .unwrap_or(initial_config);
+pub fn setup_menu_bar(app: &mut bevy::app::App, mtm: MainThreadMarker, events: EventSender) {
+    let config = app.world().resource::<Config>();
     let visible = app.world().resource::<MenuBarVisibility>().enabled(config);
     app.insert_non_send(MenuBarManager::new(mtm, events, visible));
 }
