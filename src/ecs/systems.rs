@@ -35,7 +35,8 @@ use crate::ecs::{
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
-    Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
+    Application, Display, Origin, Process, Size, Window, WindowManager, WindowOS,
+    bruteforce_windows,
 };
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::input::TapHealth;
@@ -94,6 +95,24 @@ const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
 const LOOP_MAX_TIMEOUT_MS: u32 = 500;
 const TAP_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const LOOP_TIMEOUT_STEP: u32 = 1;
+
+/// Backs the pump's poll timeout off after a quiet pass.
+///
+/// Grows by half of the current value (at least [`LOOP_TIMEOUT_STEP`]) up to
+/// `limit`. A fixed +1 ms step took ~500 passes, about two minutes, to climb
+/// from a reset to [`LOOP_MAX_TIMEOUT_MS`], and any event resets it, so on a
+/// normal desktop the cap was never reached: a window title changing once a
+/// second was enough to keep the whole schedule running ~30 times a second.
+/// Growing by half reaches the cap in 16 passes (~1.4 s) while keeping each
+/// wait to at most about half the time already spent idle, so the short
+/// free-running timers that fire shortly after an event are not pushed back by
+/// much.
+fn next_pump_timeout(timeout: u32, limit: u32) -> u32 {
+    let timeout = timeout.min(limit);
+    timeout
+        .saturating_add((timeout / 2).max(LOOP_TIMEOUT_STEP))
+        .min(limit)
+}
 
 /// How long [`pump_events`] may spend draining the incoming channel before it
 /// has to hand the frame back, and how many events it may take in one go.
@@ -297,6 +316,9 @@ pub(crate) fn finish_setup(
 
     let mut focused_managed_window = false;
     for (mut strip, active_strip, _) in &mut workspaces {
+        if strip.virtual_index != 0 {
+            continue;
+        }
         debug!("space {}: before refresh {strip:?}", strip.id());
         let workspace_windows = window_manager
             .windows_in_workspace(strip.id())
@@ -771,7 +793,7 @@ pub(crate) fn pump_events(
         } else {
             LOOP_MAX_TIMEOUT_MS
         };
-        *timeout = timeout.min(timeout_limit) + LOOP_TIMEOUT_STEP;
+        *timeout = next_pump_timeout(*timeout, timeout_limit);
     } else {
         // Still backed up: come straight back rather than sleeping on it.
         *timeout = LOOP_TIMEOUT_STEP;
@@ -1341,6 +1363,26 @@ fn app_shows_window(ax_window_ids: &[WinID], on_screen: &[WinID], window_id: Win
         && (ax_window_ids.is_empty() || ax_window_ids.contains(&window_id))
 }
 
+/// One settled column top on the active strip, collected before any OS/AX queries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ColumnTopCandidate {
+    entity: Entity,
+    window_id: WinID,
+    position: Origin,
+    bounds: Size,
+    app: Entity,
+    is_single: bool,
+}
+
+impl ColumnTopCandidate {
+    fn shares_frame_with(&self, other: &Self) -> bool {
+        self.entity != other.entity
+            && self.app == other.app
+            && self.position.chebyshev_distance(other.position) <= 1
+            && self.bounds.chebyshev_distance(other.bounds) <= 1
+    }
+}
+
 /// Folds a background native tab that ended up in a column of its own back into
 /// the column of the tab that is actually showing.
 ///
@@ -1361,6 +1403,7 @@ pub(crate) fn regroup_stray_native_tabs(
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     window_manager: Res<WindowManager>,
     mission_control: Res<MissionControlActive>,
+    mut last_snapshot: Local<Vec<ColumnTopCandidate>>,
     mut commands: Commands,
 ) {
     if mission_control.0 {
@@ -1372,81 +1415,99 @@ pub(crate) fn regroup_stray_native_tabs(
     else {
         return;
     };
+
+    // Column tops only: a window sharing a column is already grouped, and
+    // stacked siblings never share a frame. Only a column of its own can be a
+    // stray: pulling a window out of a stack or an existing tab group would
+    // break a grouping the user set up.
+    let candidates = strip
+        .columns()
+        .filter_map(|column| {
+            let is_single = matches!(column, Column::Single(_));
+            let entity = column.top()?;
+            let (_, window, Position(position), Bounds(bounds), child) =
+                windows.get(entity).ok()?;
+            Some(ColumnTopCandidate {
+                entity,
+                window_id: window.id(),
+                position: *position,
+                bounds: *bounds,
+                app: child.parent(),
+                is_single,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if *last_snapshot == candidates {
+        return;
+    }
+
+    // Pre-filter in pure ECS before making any WindowServer or Accessibility IPC
+    // calls: only apps that actually have a `Column::Single` sharing its frame
+    // with another column top of the same app can possibly have a stray tab.
+    let has_overlapping_stray = candidates.iter().any(|stray| {
+        stray.is_single
+            && candidates
+                .iter()
+                .any(|other| stray.shares_frame_with(other))
+    });
+    last_snapshot.clone_from(&candidates);
+    if !has_overlapping_stray {
+        return;
+    }
+
     let Some(on_screen) = window_manager.windows_on_screen() else {
         return;
     };
 
-    // Column tops only: a window sharing a column is already grouped, and
-    // stacked siblings never share a frame.
-    let tops = strip.all_columns();
-    // Only a column of its own can be a stray: pulling a window out of a stack
-    // or an existing tab group would break a grouping the user set up.
-    let strays = strip
-        .columns()
-        .filter_map(|column| match column {
-            Column::Single(entity) => Some(*entity),
-            Column::Stack(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
-        })
-        .collect::<Vec<_>>();
-    // One accessibility round trip per app, not per window: this runs on a timer
-    // and the call crosses into the app.
+    // One accessibility round trip per candidate app, not for every app on the
+    // strip: this runs on a timer and the call crosses into the app.
     let mut ax_windows: EntityHashMap<Vec<WinID>> = EntityHashMap::default();
-    let columns = tops
-        .into_iter()
-        .filter_map(|entity| windows.get(entity).ok())
-        .map(
-            |(entity, window, Position(position), Bounds(bounds), child)| {
-                let app = child.parent();
-                let ax_window_ids = ax_windows.entry(app).or_insert_with(|| {
-                    apps.get(app)
-                        .map(|app| app.ax_window_ids())
-                        .unwrap_or_default()
-                });
-                (
-                    entity,
-                    app_shows_window(ax_window_ids, &on_screen, window.id()),
-                    *position,
-                    *bounds,
-                    app,
-                )
-            },
-        )
+    let showing = candidates
+        .iter()
+        .map(|candidate| {
+            let has_overlap = candidates
+                .iter()
+                .any(|other| candidate.shares_frame_with(other));
+            if !has_overlap {
+                return false;
+            }
+            let ax_window_ids = ax_windows.entry(candidate.app).or_insert_with(|| {
+                apps.get(candidate.app)
+                    .map(|app| app.ax_window_ids())
+                    .unwrap_or_default()
+            });
+            app_shows_window(ax_window_ids, &on_screen, candidate.window_id)
+        })
         .collect::<Vec<_>>();
 
     let mut regrouped = Vec::new();
-    for (hidden, showing, position, bounds, app) in &columns {
-        if *showing || regrouped.contains(hidden) || !strays.contains(hidden) {
+    for (idx, hidden) in candidates.iter().enumerate() {
+        if showing[idx] || regrouped.contains(&hidden.entity) || !hidden.is_single {
             continue;
         }
-        let Some((leader, ..)) = columns.iter().find(
-            |(
-                candidate,
-                candidate_showing,
-                candidate_position,
-                candidate_bounds,
-                candidate_app,
-            )| {
-                *candidate_showing
-                    && candidate != hidden
-                    && candidate_app == app
-                    && candidate_position.chebyshev_distance(*position) <= 1
-                    && candidate_bounds.chebyshev_distance(*bounds) <= 1
-            },
-        ) else {
+        let Some((leader_idx, _)) = candidates.iter().enumerate().find(|(cand_idx, candidate)| {
+            showing[*cand_idx] && hidden.shares_frame_with(candidate)
+        }) else {
             continue;
         };
+        let leader = candidates[leader_idx].entity;
 
-        debug!("stray native tab {hidden} folded into the column of {leader}");
+        debug!(
+            "stray native tab {} folded into the column of {leader}",
+            hidden.entity
+        );
         if strip
-            .convert_to_tabs(*leader, *hidden)
+            .convert_to_tabs(leader, hidden.entity)
             .inspect_err(|err| error!("Failed to convert to tabs: {err}"))
             .is_ok()
         {
-            regrouped.push(*hidden);
+            regrouped.push(hidden.entity);
         }
     }
 
     if let Some(leader) = regrouped.first() {
+        last_snapshot.clear();
         commands.reshuffle_around(*leader);
     }
 }
@@ -1631,5 +1692,81 @@ mod tests {
         app.update();
 
         assert_eq!(tap_config.swipe_gesture_fingers(), Some(3));
+    }
+}
+
+#[cfg(test)]
+mod pump_timeout_tests {
+    use super::{
+        LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, LOOP_MAX_TIMEOUT_LOWPOWER_MS, LOOP_MAX_TIMEOUT_MS,
+        LOOP_TIMEOUT_STEP, next_pump_timeout,
+    };
+
+    /// Quiet passes from a reset until the timeout sits at `limit`.
+    fn passes_to_reach(limit: u32) -> usize {
+        let mut timeout = LOOP_TIMEOUT_STEP;
+        let mut passes = 0;
+        while timeout < limit {
+            timeout = next_pump_timeout(timeout, limit);
+            passes += 1;
+            assert!(passes < 100, "timeout never reached {limit}");
+        }
+        passes
+    }
+
+    #[test]
+    fn reaches_the_idle_cap_within_a_couple_of_seconds() {
+        assert_eq!(passes_to_reach(LOOP_MAX_TIMEOUT_MS), 16);
+        let mut timeout = LOOP_TIMEOUT_STEP;
+        let mut waited = 0;
+        while timeout < LOOP_MAX_TIMEOUT_MS {
+            waited += timeout;
+            timeout = next_pump_timeout(timeout, LOOP_MAX_TIMEOUT_MS);
+        }
+        assert!(waited < 2000, "took {waited} ms to reach the cap");
+    }
+
+    #[test]
+    fn reaches_the_low_power_cap() {
+        assert!(passes_to_reach(LOOP_MAX_TIMEOUT_LOWPOWER_MS) < 25);
+    }
+
+    #[test]
+    fn holds_at_the_cap() {
+        assert_eq!(
+            next_pump_timeout(LOOP_MAX_TIMEOUT_MS, LOOP_MAX_TIMEOUT_MS),
+            LOOP_MAX_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn clamps_to_a_lower_limit_when_a_frame_starts() {
+        assert_eq!(
+            next_pump_timeout(LOOP_MAX_TIMEOUT_MS, LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS),
+            LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
+        );
+    }
+
+    #[test]
+    fn always_grows_by_at_least_one_step_below_the_cap() {
+        for timeout in 0..LOOP_MAX_TIMEOUT_MS {
+            assert!(next_pump_timeout(timeout, LOOP_MAX_TIMEOUT_MS) > timeout);
+        }
+    }
+
+    /// The wait after a quiet stretch stays a bounded fraction of the time
+    /// already spent idle, so a timer armed by the event that reset the pump
+    /// fires at most about half its delay late.
+    #[test]
+    fn wait_stays_proportional_to_idle_time() {
+        let mut timeout = LOOP_TIMEOUT_STEP;
+        let mut idle = 0;
+        while timeout < LOOP_MAX_TIMEOUT_MS {
+            idle += timeout;
+            timeout = next_pump_timeout(timeout, LOOP_MAX_TIMEOUT_MS);
+            if idle >= 10 {
+                assert!(timeout <= idle, "waiting {timeout} ms after {idle} ms idle");
+            }
+        }
     }
 }

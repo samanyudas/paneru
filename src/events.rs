@@ -139,7 +139,12 @@ pub enum Event {
     },
 
     /// A swipe gesture has been detected.
-    Swipe { delta: f64, fingers: usize },
+    Swipe {
+        delta: f64,
+        fingers: usize,
+        /// Signed mean horizontal finger travel in centimeters.
+        distance_cm: f64,
+    },
 
     /// A vertical trackpad gesture (accumulates delta to threshold before firing).
     VerticalSwipe { delta: f64, fingers: usize },
