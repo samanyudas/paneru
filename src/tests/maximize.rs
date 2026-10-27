@@ -501,6 +501,49 @@ fn a_maximized_window_moved_to_another_display_fills_it() {
     assert_focused!(harness.world(), 1);
 }
 
+/// A maximized window whose display is unplugged stays maximized on the
+/// display that takes its space, and the toggle still restores it there.
+#[test]
+fn a_maximized_window_on_an_unplugged_display_stays_restorable() {
+    let mut harness = maximized_below_a_larger_display();
+    move_to_display(
+        &mut harness,
+        Direction::North,
+        EXT_DISPLAY_ID,
+        EXT_WORKSPACE_ID,
+    );
+    assert_eq!(
+        os_frame(&harness, 1),
+        usable_area_of(&mut harness, EXT_DISPLAY_ID)
+    );
+
+    harness.mock_state.remove_display(EXT_DISPLAY_ID);
+    harness.mock_state.add_display(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+        vec![TEST_WORKSPACE_ID, EXT_WORKSPACE_ID],
+    );
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayRemoved {
+            display_id: EXT_DISPLAY_ID,
+        });
+    harness.advance(SETTLE);
+    let area = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    assert_eq!(os_frame(&harness, 1), area, "fills the remaining display");
+
+    run_window_verb(&mut harness, "maximize");
+    let restored = os_frame(&harness, 1);
+    assert!(
+        restored.width() < area.width(),
+        "restored from maximized: {restored:?}"
+    );
+    assert!(
+        area.contains(restored.min) && area.contains(restored.max - IVec2::ONE),
+        "restored on the remaining display: {restored:?} in {area:?}"
+    );
+}
+
 /// A maximized window dragged by its title bar to another display fills
 /// that display's usable area, in both directions. A drag within its own
 /// display leaves it maximized in its row, filling the display.
