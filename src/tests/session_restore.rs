@@ -1485,3 +1485,59 @@ fn a_window_tiled_from_floating_gets_its_padding() {
         .update_window(1, |window| set = window.padding_set);
     assert_eq!(set, (Some(4), Some(4)));
 }
+
+/// Gives the harness a session file holding `saved`, runs `exit`, then the
+/// exit save, and returns what the file holds afterwards.
+fn session_after_exit(
+    harness: &mut TestHarness,
+    name: &str,
+    saved: &str,
+    exit: impl FnOnce(&mut World),
+) -> String {
+    use bevy::ecs::system::RunSystemOnce;
+
+    let path = std::env::temp_dir().join(format!("paneru-exit-{name}-{}.json", std::process::id()));
+    std::fs::write(&path, saved).expect("writing the saved session");
+    harness
+        .world()
+        .insert_resource(crate::ecs::state::StateFile(path.clone()));
+    exit(harness.world());
+    harness
+        .world()
+        .run_system_once(crate::ecs::state::cleanup_on_exit)
+        .expect("running the exit save");
+    let after = std::fs::read_to_string(&path).expect("reading the session");
+    _ = std::fs::remove_file(&path);
+    after
+}
+
+/// An exit while startup gathers processes leaves an empty or partial
+/// layout. Saving it would replace the session that the next start restores.
+#[test]
+fn an_exit_during_startup_keeps_the_saved_session() {
+    use bevy::ecs::system::RunSystemOnce;
+
+    let mut harness = TestHarness::new().with_windows(1);
+    let after = session_after_exit(&mut harness, "startup", "previous session", |world| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Event::Exit).expect("send exit");
+        world.insert_non_send(receiver);
+        world
+            .run_system_once(crate::ecs::systems::gather_initial_processes)
+            .expect("gathering the initial processes");
+    });
+
+    assert_eq!(after, "previous session");
+}
+
+#[test]
+fn an_exit_after_startup_saves_the_session() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    let after = session_after_exit(&mut harness, "running", "previous session", |world| {
+        world.write_message(AppExit::Success);
+    });
+
+    assert_ne!(after, "previous session");
+}
