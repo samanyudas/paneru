@@ -1153,7 +1153,19 @@ fn strip_order(world: &mut World) -> Vec<Entity> {
 
 #[test]
 fn a_retiled_window_returns_to_its_slot() {
-    let mut harness = TestHarness::new().with_windows(3);
+    retile_middle_window(Config::default());
+}
+
+/// A rule's `index` places a new window, not one that left its slot to float.
+#[test]
+fn a_retiled_window_returns_to_its_slot_despite_an_insertion_rule() {
+    let mut params = WindowParams::new(".*", None);
+    params.index = Some(0);
+    retile_middle_window((MainOptions::default(), vec![params]).into());
+}
+
+fn retile_middle_window(config: Config) {
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
     harness.run(vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
