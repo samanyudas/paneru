@@ -255,8 +255,7 @@ impl TryFrom<&Event> for LuaEvent {
 
             // Non-marshallable payloads (AppKit handles, sockets, the config) or
             // internal plumbing.
-            Event::InitialConfig(_)
-            | Event::ConfigRefresh(_)
+            Event::ConfigRefresh(_)
             | Event::ApplicationLaunched { .. }
             | Event::ApplicationTerminated { .. }
             | Event::ApplicationFrontSwitched { .. }

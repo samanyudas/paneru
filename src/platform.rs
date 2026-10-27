@@ -324,7 +324,6 @@ impl PlatformCallbacks {
         }
 
         let config = Config::load(CONFIGURATION_FILE.as_deref())?;
-        self.events.send(Event::InitialConfig(config.clone()))?;
         self.event_handler = Some(InputHandler::new(self.events.clone(), config.clone()).start()?);
 
         self.notify_handler = Some(NotifyHandler::new(self.events.clone()).start()?);

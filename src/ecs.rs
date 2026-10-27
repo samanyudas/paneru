@@ -1140,7 +1140,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     crate::menubar::load_menu_bar_preference(&mut app);
     let menu_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
-    let initial_config = platform_callbacks.setup_handlers()?;
+    let config = platform_callbacks.setup_handlers()?;
     let mtm = platform_callbacks.main_thread_marker;
     let overlay_manager = OverlayManager::new(mtm);
     let flash_message_manager = FlashMessageManager::new(mtm);
@@ -1191,19 +1191,21 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
             .resource::<script_state::ScriptStateStore>()
             .revision_handle();
         let worker = lua::LuaWorker::spawn(lua::LuaSource::Path(path.clone()), revision);
-        // A script that called `paneru.setup{...}` is authoritative: insert its
-        // config now, before `app.run()`, so it exists ahead of the Startup
-        // schedule and wins over the TOML `InitialConfig` (see
-        // `gather_initial_processes`). Without `setup`, the TOML config is used.
-        if let Some(config) = worker.built_config() {
-            app.insert_resource(config);
+        // A script that called `paneru.setup{...}` is authoritative. The input
+        // tap reads swipe settings off the handle `setup_handlers` returned, so
+        // the script's settings go into that handle instead of a new one.
+        if let Some(script_config) = worker.built_config() {
+            config.replace_inner_from(&script_config);
         }
         app.insert_resource(worker);
         app.insert_resource(lua::LuaScriptPath(path));
         app.add_plugins(lua::LuaPlugin {});
     }
 
-    crate::menubar::setup_menu_bar(&mut app, mtm, menu_events, &initial_config);
+    // Inserted here rather than sent through the event channel: an exit that
+    // arrives during startup must not leave the first frame without a config.
+    app.insert_resource(config);
+    crate::menubar::setup_menu_bar(&mut app, mtm, menu_events);
 
     Ok(app)
 }
