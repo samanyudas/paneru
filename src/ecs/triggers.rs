@@ -820,6 +820,7 @@ pub(super) fn window_minimized_trigger(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_managed_trigger(
     trigger: On<Remove, Unmanaged>,
@@ -899,7 +900,10 @@ pub(super) fn window_managed_trigger(
             ctx.commands.resize_entity(entity, Size::new(width, height));
         }
 
-        insert_at = properties.insertion().or(insert_at);
+        // A rule's index places a new window, not a floated one that left a slot.
+        if previous.is_none_or(|previous| previous.rejoin == Rejoin::AnyRow) {
+            insert_at = properties.insertion().or(insert_at);
+        }
     }
 
     for (_, mut strip, _, _) in &mut workspaces {
