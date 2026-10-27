@@ -829,10 +829,16 @@ fn existing_application_window_list(
     space_window_list_for_connection(cid, spaces, app.connection(), true)
 }
 
-/// Wall-clock ceiling on a single application's brute-force scan: generous
-/// next to a healthy scan, but short enough that an app which never resolves
-/// cannot hold up initialisation, which waits on these tasks.
-const BRUTEFORCE_BUDGET: Duration = Duration::from_millis(250);
+/// Wall-clock ceiling on a single application's brute-force scan. A scan
+/// normally ends sooner, once it passes the app's newest element, so this only
+/// stops an app with an unusually large accessibility tree from holding up
+/// initialisation, which waits on these tasks.
+const BRUTEFORCE_BUDGET: Duration = Duration::from_secs(2);
+
+/// How many element ids in a row may hold no window's element before the scan
+/// decides it has passed the app's newest element. Closed tabs leave gaps: a
+/// Helium with about 70 tabs had a gap of 8768 ids below its newest window.
+const BRUTEFORCE_TRAILING_GAP: u64 = 0x4000;
 
 /// How many applications may run [`bruteforce_windows`] at the same time.
 ///
@@ -898,7 +904,6 @@ pub fn bruteforce_windows(
 ) -> Vec<Window> {
     const MAGIC: u32 = 0x636f_636f;
     const BUFSIZE: isize = 0x14;
-    let mut found_windows = Vec::new();
     debug!("{pid} has unresolved window on other desktops, bruteforcing them.");
 
     // Blocks until fewer than `MAX_CONCURRENT_BRUTEFORCE` apps are scanning.
@@ -913,7 +918,7 @@ pub fn bruteforce_windows(
 
     let Some(data_ref) = CFMutableData::new(None, BUFSIZE) else {
         error!("error creating mutable data");
-        return found_windows;
+        return Vec::new();
     };
     CFMutableData::increase_length(data_ref.deref().into(), BUFSIZE);
 
@@ -928,53 +933,95 @@ pub fn bruteforce_windows(
     let bytes = MAGIC.to_ne_bytes();
     data[0x8..0x8 + bytes.len()].copy_from_slice(&bytes);
 
-    // A window SkyLight lists but that never resolves to an AX element (a
-    // panel, helper, anything non-AX) never clears from `window_list`, so
-    // without this deadline the scan would run all 0x7fff round trips every
-    // time that app starts.
     let deadline = Instant::now() + BRUTEFORCE_BUDGET;
 
     // `bruteforce_windows` runs on `AsyncComputeTaskPool` worker threads, which
     // have no CFRunLoop to drain a thread-local `NSAutoreleasePool`.
     objc2::rc::autoreleasepool(|_| {
-        for element_id in 0..0x7fffu64 {
-            // Every iteration is a synchronous cross-process AX round trip.
-            if window_list.is_empty() {
-                break;
-            }
-            // Checked periodically only: `Instant::now` can itself be a syscall.
-            if element_id.is_multiple_of(256) && Instant::now() >= deadline {
-                warn!(
-                    "{pid}: giving up the brute-force scan at element {element_id} with {} window(s) \
-                     unresolved: {window_list:?}",
-                    window_list.len()
-                );
-                break;
-            }
-
-            let bytes = element_id.to_ne_bytes();
-            data[0xc..0xc + bytes.len()].copy_from_slice(&bytes);
-
-            let Ok(element_ref) = AXUIWrapper::from_retained(unsafe {
-                _AXUIElementCreateWithRemoteToken(data_ref.as_ref())
-            }) else {
-                continue;
-            };
-            let Some(window_id) = try_ax_window_id(element_ref.as_ptr()) else {
-                continue;
-            };
-
-            if let Some(window) = claim_unresolved_window(&mut window_list, window_id, || {
+        let (windows, end) = scan_elements(
+            &mut window_list,
+            deadline,
+            |element_id| {
+                // Every call is a synchronous cross-process AX round trip.
+                let bytes = element_id.to_ne_bytes();
+                data[0xc..0xc + bytes.len()].copy_from_slice(&bytes);
+                let element_ref = AXUIWrapper::from_retained(unsafe {
+                    _AXUIElementCreateWithRemoteToken(data_ref.as_ref())
+                })
+                .ok()?;
+                let window_id = try_ax_window_id(element_ref.as_ptr())?;
+                Some((window_id, element_ref))
+            },
+            |element_ref| {
                 WindowOS::new_with_config(&element_ref, config, bundle_id)
                     .inspect_err(|err| warn!("{err}"))
                     .ok()
-            }) {
+                    .map(|window| Window::new(Box::new(window)))
+            },
+        );
+        if end != ScanEnd::Resolved {
+            warn!(
+                "{pid}: giving up the brute-force scan ({end:?}) with {} window(s) unresolved: \
+                 {window_list:?}",
+                window_list.len()
+            );
+        }
+        windows
+    })
+}
+
+/// Why [`scan_elements`] stopped.
+#[derive(Debug, PartialEq, Eq)]
+enum ScanEnd {
+    /// Every listed window resolved.
+    Resolved,
+    /// The scan passed the app's newest element before reaching this id.
+    PastLastElement(u64),
+    /// [`BRUTEFORCE_BUDGET`] ran out at this id.
+    Deadline(u64),
+}
+
+/// Walks element ids upward from 0 and claims each element that `accept` takes
+/// for a window still in `window_list`.
+///
+/// An app numbers its elements in creation order, so a window opened late can
+/// sit far above the app's other windows, and above 0x7fff. The walk ends when
+/// every window resolves, or [`BRUTEFORCE_TRAILING_GAP`] ids after the last
+/// element that belongs to any window. A window `SkyLight` lists but that never
+/// resolves to an AX element (a panel, helper, anything non-AX) so costs only
+/// the app's own elements plus the gap.
+fn scan_elements<E, T>(
+    window_list: &mut Vec<WinID>,
+    deadline: Instant,
+    mut element_at: impl FnMut(u64) -> Option<(WinID, E)>,
+    mut accept: impl FnMut(E) -> Option<T>,
+) -> (Vec<T>, ScanEnd) {
+    let mut found = Vec::new();
+    let mut last_live = 0;
+    let mut element_id = 0;
+    let end = loop {
+        if window_list.is_empty() {
+            break ScanEnd::Resolved;
+        }
+        if element_id - last_live > BRUTEFORCE_TRAILING_GAP {
+            break ScanEnd::PastLastElement(element_id);
+        }
+        // Checked periodically only: `Instant::now` can itself be a syscall.
+        if element_id.is_multiple_of(256) && Instant::now() >= deadline {
+            break ScanEnd::Deadline(element_id);
+        }
+        if let Some((window_id, element)) = element_at(element_id) {
+            last_live = element_id;
+            if let Some(window) =
+                claim_unresolved_window(window_list, window_id, || accept(element))
+            {
                 debug!("Found window {window_id:?}");
-                found_windows.push(Window::new(Box::new(window)));
+                found.push(window);
             }
         }
-    });
-    found_windows
+        element_id += 1;
+    };
+    (found, end)
 }
 
 /// Removes `window_id` from `window_list` only once `accept` takes the element,
@@ -1098,7 +1145,13 @@ mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use objc2_foundation::NSBundle;
 
-    use super::{accessibility_reset_command, claim_unresolved_window, irect_from};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        BRUTEFORCE_TRAILING_GAP, ScanEnd, accessibility_reset_command, claim_unresolved_window,
+        irect_from, scan_elements,
+    };
+    use crate::platform::WinID;
 
     #[test]
     fn accessibility_reset_targets_embedded_bundle_identity() {
@@ -1137,6 +1190,68 @@ mod tests {
         let window = claim_unresolved_window(&mut window_list, 40966, || Some("AXWindow"));
         assert_eq!(window, Some("AXWindow"));
         assert_eq!(window_list, vec![100]);
+    }
+
+    /// Element ids and window ids from a Helium with about 70 tabs on
+    /// 27 October 2026, where the newest window sat above 0x7fff.
+    fn helium_element(element_id: u64) -> Option<(WinID, WinID)> {
+        let window_id = match element_id {
+            44 => 339,
+            45..=19077 if element_id.is_multiple_of(97) => 339,
+            27845 => 55561,
+            32890 => 62288,
+            _ => return None,
+        };
+        Some((window_id, window_id))
+    }
+
+    #[test]
+    fn scan_finds_windows_past_a_gap_and_above_0x7fff() {
+        let mut window_list = vec![62288, 55561];
+
+        let (found, end) = scan_elements(&mut window_list, far_deadline(), helium_element, Some);
+
+        assert_eq!(found, vec![55561, 62288]);
+        assert_eq!(end, ScanEnd::Resolved);
+        assert!(window_list.is_empty());
+    }
+
+    #[test]
+    fn scan_of_a_window_that_never_resolves_stops_after_the_apps_last_element() {
+        let mut window_list = vec![41068];
+        let mut calls = 0;
+
+        let (found, end) = scan_elements(
+            &mut window_list,
+            far_deadline(),
+            |element_id| {
+                calls += 1;
+                (element_id <= 58).then_some((41068, ()))
+            },
+            |()| None::<()>,
+        );
+
+        assert!(found.is_empty());
+        assert_eq!(
+            end,
+            ScanEnd::PastLastElement(58 + BRUTEFORCE_TRAILING_GAP + 1)
+        );
+        assert_eq!(calls, 58 + BRUTEFORCE_TRAILING_GAP + 1);
+        assert_eq!(window_list, vec![41068]);
+    }
+
+    #[test]
+    fn scan_stops_at_the_deadline() {
+        let mut window_list = vec![62288];
+
+        let (found, end) = scan_elements(&mut window_list, Instant::now(), helium_element, Some);
+
+        assert!(found.is_empty());
+        assert_eq!(end, ScanEnd::Deadline(0));
+    }
+
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(60)
     }
 
     #[test]
