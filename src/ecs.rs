@@ -238,6 +238,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
         Update,
         (
             systems::add_launched_process.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
+            systems::await_accessibility,
             systems::add_launched_application.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
             (
                 systems::add_existing_process,
@@ -695,6 +696,22 @@ pub struct AboveOrdinaryCheck {
 
 #[derive(Component)]
 pub struct BruteforceWindows(Task<Vec<Window>>);
+
+/// A launched process whose app did not answer Accessibility in time when the
+/// engine registered its observers, so it has no `Application` yet. Until the
+/// app answers a probe on a worker thread, the main loop makes no AX call to
+/// it. Then the process gets a fresh launch watch.
+#[derive(Component)]
+pub enum AwaitingAccessibility {
+    Resting(Timer),
+    Probing(Task<bool>),
+}
+
+impl AwaitingAccessibility {
+    pub fn probe_now() -> Self {
+        Self::Resting(Timer::new(Duration::ZERO, bevy::time::TimerMode::Once))
+    }
+}
 
 #[derive(Component, Debug)]
 pub enum DockPosition {

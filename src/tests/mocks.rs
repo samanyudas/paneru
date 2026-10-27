@@ -1711,6 +1711,18 @@ impl MockState {
             .returning(move |process| Ok(s.create_application(process.pid())));
 
         let s = self.clone();
+        wm.expect_probe_accessibility().returning(move |pid| {
+            let s = s.clone();
+            bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+                !s.inner
+                    .force_read()
+                    .apps
+                    .get(&pid)
+                    .is_some_and(|a| a.ax_busy)
+            })
+        });
+
+        let s = self.clone();
         wm.expect_window_ordered_in().returning(move |window_id| {
             let inner = s.inner.force_read();
             Ok(inner.windows.contains_key(&window_id)

@@ -1,13 +1,13 @@
 use accessibility_sys::{
     AXObserverRef, AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementRef,
-    AXUIElementSetMessagingTimeout, kAXErrorSuccess,
+    AXUIElementSetMessagingTimeout, kAXErrorCannotComplete, kAXErrorSuccess, kAXRoleAttribute,
 };
 use bevy::ecs::component::Component;
 use core::ptr::NonNull;
 use crossbeam_channel::Sender;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
-use objc2_core_foundation::{CFRetained, CFString, kCFRunLoopCommonModes};
+use objc2_core_foundation::{CFRetained, CFString, CFType, kCFRunLoopCommonModes};
 use std::ffi::c_void;
 use std::pin::Pin;
 use std::ptr::null_mut;
@@ -19,7 +19,7 @@ use stdext::function_name;
 use tracing::{debug, error};
 
 use super::skylight::_SLPSGetFrontProcess;
-use super::{ProcessApi, Window, WindowOS, ax_window_id};
+use super::{AXUIElementCopyAttributeValue, ProcessApi, Window, WindowOS, ax_window_id};
 use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::events::{DestroySource, Event, EventSender};
@@ -47,6 +47,27 @@ pub(crate) fn bound_ax_messaging_timeout() -> Result<()> {
     let system_wide = AXUIWrapper::from_retained(unsafe { AXUIElementCreateSystemWide() })?;
     unsafe { AXUIElementSetMessagingTimeout(system_wide.as_ptr(), AX_MESSAGING_TIMEOUT_SEC) }
         .to_result(function_name!())
+}
+
+/// Whether the app with `pid` answers an Accessibility question within
+/// [`AX_MESSAGING_TIMEOUT_SEC`]. Blocks for up to that long, so it runs on a
+/// worker thread, as `bruteforce_windows` does.
+pub(crate) fn answers_accessibility(pid: Pid) -> bool {
+    objc2::rc::autoreleasepool(|_| {
+        let Ok(element) = AXUIWrapper::from_retained(unsafe { AXUIElementCreateApplication(pid) })
+        else {
+            // Not a busy app, so let the launch path report the real error.
+            return true;
+        };
+        unsafe { AXUIElementSetMessagingTimeout(element.as_ptr(), AX_MESSAGING_TIMEOUT_SEC) };
+        let role = CFString::from_static_str(kAXRoleAttribute);
+        let mut value: *mut CFType = null_mut();
+        let result = unsafe { AXUIElementCopyAttributeValue(element.as_ptr(), &role, &mut value) };
+        if let Some(value) = NonNull::new(value) {
+            drop(unsafe { CFRetained::from_raw(value) });
+        }
+        result != kAXErrorCannotComplete
+    })
 }
 
 /// A static `LazyLock` that holds a list of `AXNotification` strings to be observed for application-level events.
@@ -113,9 +134,14 @@ pub trait ApplicationApi: Send + Sync {
     fn ax_window_ids(&self) -> Vec<WinID>;
     /// Starts observing application-level accessibility notifications.
     ///
+    /// Returns `Ok(true)` when every notification is registered, and
+    /// `Ok(false)` when the app did not answer in time, as when its main
+    /// thread is busy, so a later call can succeed.
+    ///
     /// # Errors
     ///
-    /// Returns an `Error` if observers cannot be registered.
+    /// Returns an `Error` if the app refused every registration, so calling
+    /// again will not help.
     fn observe(&mut self) -> Result<bool>;
     /// Starts observing window-specific accessibility notifications for a given window.
     ///
@@ -325,10 +351,6 @@ impl ApplicationApi for ApplicationOS {
     }
 
     /// Registers observers for general application-level accessibility notifications (e.g., `kAXCreatedNotification`).
-    ///
-    /// # Returns
-    ///
-    /// `Ok(bool)` where `true` means all observers were successfully registered and `retry` list is empty, otherwise `Err(Error)`.
     fn observe(&mut self) -> Result<bool> {
         self.handler
             .add_observer(&self.element, &AX_NOTIFICATIONS, ObserverType::Application)
@@ -652,7 +674,8 @@ impl AxObserverHandler {
     ///
     /// # Returns
     ///
-    /// `Ok(Vec<&str>)` containing a list of notifications that could not be registered (retries), otherwise `Err(Error)`.
+    /// `Ok(Vec<&str>)` with the notifications the app did not answer in time, which a later call can register.
+    /// `Err(Error)` when the app refused every notification.
     pub fn add_observer(
         &mut self,
         element: &AXUIWrapper,
@@ -690,7 +713,7 @@ impl AxObserverHandler {
                 }
             })
             .collect::<Vec<_>>();
-        if added.is_empty() {
+        if added.is_empty() && retry.is_empty() {
             Err(Error::PermissionDenied(format!(
                 "{}: unable to register any observers!",
                 function_name!()

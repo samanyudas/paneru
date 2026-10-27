@@ -11,7 +11,7 @@ use bevy::ecs::system::{
 use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
-use bevy::time::Time;
+use bevy::time::{Time, Timer, TimerMode};
 use objc2_foundation::NSPoint;
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, ExistingMarker, FreshMarker, RepositionMarker, ResizeMarker,
-    RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition, VerifyWindowSize,
+    ActiveDisplayMarker, AwaitingAccessibility, BProcess, ExistingMarker, FreshMarker,
+    RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
+    VerifyWindowPosition, VerifyWindowSize,
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
@@ -452,14 +453,71 @@ pub(super) fn add_launched_process(
             return;
         };
 
-        if app.observe().is_ok_and(|good| good) {
-            // An app too busy to list its windows in time stays managed, so a
-            // window of it that is created or focused later still enters the
-            // layout.
-            let timeout = Timeout::for_component::<FreshMarker>(APP_OBSERVABLE_TIMEOUT);
-            commands.spawn((app, FreshMarker, timeout, ChildOf(entity)));
-        } else {
-            debug!("failed to register some observers {}", process.name());
+        match app.observe() {
+            Ok(true) => {
+                // An app too busy to list its windows in time stays managed, so a
+                // window of it that is created or focused later still enters the
+                // layout.
+                let timeout = Timeout::for_component::<FreshMarker>(APP_OBSERVABLE_TIMEOUT);
+                commands.spawn((app, FreshMarker, timeout, ChildOf(entity)));
+            }
+            Ok(false) => {
+                // Each call to a busy app blocks the main loop for the AX
+                // timeout, so wait for it off the main thread instead of
+                // retrying every tick until the launch watch ends.
+                debug!(
+                    "'{}' is too busy to observe; waiting for it",
+                    process.name()
+                );
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands
+                        .try_remove::<FreshMarker>()
+                        .try_insert(AwaitingAccessibility::probe_now());
+                }
+            }
+            Err(err) => debug!("failed to register observers {}: {err}", process.name()),
+        }
+    }
+}
+
+/// Probes each process that was too busy to observe, off the main thread, and
+/// gives it a fresh launch watch once its app answers.
+pub(super) fn await_accessibility(
+    waiting: Populated<(Entity, &BProcess, &mut AwaitingAccessibility)>,
+    window_manager: Res<WindowManager>,
+    clock: Res<Time>,
+    mut commands: Commands,
+) {
+    const PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+    for (entity, process, mut state) in waiting {
+        let answered = match &mut *state {
+            AwaitingAccessibility::Resting(timer) => {
+                if timer.tick(clock.delta()).is_finished() {
+                    *state = AwaitingAccessibility::Probing(
+                        window_manager.probe_accessibility(process.pid()),
+                    );
+                }
+                false
+            }
+            AwaitingAccessibility::Probing(task) => match future::block_on(future::poll_once(task))
+            {
+                Some(true) => true,
+                Some(false) => {
+                    *state =
+                        AwaitingAccessibility::Resting(Timer::new(PROBE_INTERVAL, TimerMode::Once));
+                    false
+                }
+                None => false,
+            },
+        };
+        if answered {
+            let watch = launch_watch(process.name(), &mut commands);
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands
+                    .try_remove::<AwaitingAccessibility>()
+                    .try_insert(watch);
+            }
         }
     }
 }
