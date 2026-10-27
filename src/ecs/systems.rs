@@ -32,7 +32,7 @@ use crate::ecs::drag::{
 use crate::ecs::layout::{Column, LayoutStrip, RestoreTo};
 use crate::ecs::maximize::{FloatingMaximized, FrameHold};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
-use crate::ecs::state::SaveSession;
+use crate::ecs::state::{SaveSession, StateFile};
 use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
@@ -1195,6 +1195,9 @@ pub(crate) fn gather_initial_processes(
         match receiver.recv().expect("error reading initial processes") {
             Event::ProcessesLoaded => break,
             Event::Exit => {
+                // This run never saw the whole layout, so it must not write
+                // the session that the next start restores.
+                commands.remove_resource::<StateFile>();
                 exit.write(AppExit::Success);
                 break;
             }
