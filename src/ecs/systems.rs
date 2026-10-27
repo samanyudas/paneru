@@ -380,16 +380,23 @@ pub(crate) fn finish_setup(
 const PROCESS_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The components that make `add_launched_process` poll a process until it
-/// can be managed.
+/// can be managed. When the poll ends, the process entity stays, so its
+/// observers can send a new launch event when it finishes launching or
+/// becomes a regular app.
 pub(crate) fn launch_watch(name: &str, commands: &mut Commands) -> (FreshMarker, Timeout) {
-    let timeout = Timeout::new(
-        PROCESS_READY_TIMEOUT,
-        Some(format!(
-            "Process '{name}' did not become ready in {}s.",
-            PROCESS_READY_TIMEOUT.as_secs()
-        )),
-        commands,
-    );
+    let timeout = Timeout {
+        on_expire: Some(|entity_commands| {
+            entity_commands.try_remove::<(Timeout, FreshMarker)>();
+        }),
+        ..Timeout::new(
+            PROCESS_READY_TIMEOUT,
+            Some(format!(
+                "Process '{name}' did not become ready in {}s.",
+                PROCESS_READY_TIMEOUT.as_secs()
+            )),
+            commands,
+        )
+    };
     (FreshMarker, timeout)
 }
 
@@ -1264,9 +1271,11 @@ pub(crate) fn gather_initial_processes(
             commands.spawn((ExistingMarker, process));
         } else {
             debug!(
-                "Existing application '{}' is not observable, ignoring it.",
+                "Existing application '{}' is not observable, watching it.",
                 process.name(),
             );
+            let watch = launch_watch(process.name(), &mut commands);
+            commands.spawn((watch, process));
         }
     }
 

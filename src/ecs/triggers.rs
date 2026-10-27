@@ -511,18 +511,27 @@ pub(super) fn mission_control_trigger(
 /// * `commands` - Bevy commands to spawn or despawn entities.
 pub(super) fn application_event_trigger(
     mut messages: MessageReader<Event>,
-    processes: Query<(&BProcess, Entity)>,
+    processes: Query<(&BProcess, Entity, Has<Children>)>,
     mut overrides: ResMut<TileOverrides>,
     mut commands: Commands,
 ) {
     let find_process = |psn| {
         processes
             .iter()
-            .find(|(BProcess(process), _)| process.psn() == psn)
+            .find(|(BProcess(process), ..)| process.psn() == psn)
     };
 
     for event in messages.read() {
         match event {
+            Event::ApplicationLaunched { psn, .. }
+                if let Some((BProcess(process), entity, false)) = find_process(*psn) =>
+            {
+                // The observers of a process that was not ready sent this.
+                let watch = launch_watch(process.name(), &mut commands);
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(watch);
+                }
+            }
             Event::ApplicationLaunched { psn, observer } if find_process(*psn).is_none() => {
                 let process: BProcess = Process::new(psn, observer.clone()).into();
                 if process.pid() == 0 {
@@ -534,7 +543,7 @@ pub(super) fn application_event_trigger(
             }
 
             Event::ApplicationTerminated { psn } => {
-                if let Some((BProcess(process), entity)) = find_process(*psn) {
+                if let Some((BProcess(process), entity, _)) = find_process(*psn) {
                     forget_enhanced_ui_state(process.pid());
                     // Its windows despawn with it, without a destroy event.
                     overrides.forget_process(process.pid());
