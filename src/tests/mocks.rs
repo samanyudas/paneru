@@ -41,6 +41,9 @@ pub(crate) struct MockAppData {
     /// The app does not answer Accessibility in time, like an app whose main
     /// thread is blocked restoring tabs. Registration and window reads time out.
     pub(crate) ax_busy: bool,
+    /// While `ax_busy`, the app still answers the engine's one-question probe,
+    /// like an app whose main thread is free only briefly between long blocks.
+    pub(crate) answers_probes: bool,
 }
 
 /// Data for a mocked window.
@@ -506,6 +509,7 @@ impl MockState {
                 write_delay: std::time::Duration::ZERO,
                 regular: true,
                 ax_busy: false,
+                answers_probes: false,
             },
         );
     }
@@ -1718,7 +1722,7 @@ impl MockState {
                     .force_read()
                     .apps
                     .get(&pid)
-                    .is_some_and(|a| a.ax_busy)
+                    .is_some_and(|a| a.ax_busy && !a.answers_probes)
             })
         });
 

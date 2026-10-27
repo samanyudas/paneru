@@ -112,3 +112,46 @@ fn an_app_busy_past_the_launch_watch_is_tiled_once_it_answers() {
         "the window is tiled once the app answers"
     );
 }
+
+/// An app that blocks its main thread for most of every second, with short
+/// free gaps, can answer the engine's probe in a gap and then time out the
+/// observer registration in its next block. The engine asks it from its main
+/// loop less and less often, so a busy app does not keep blocking the main
+/// loop, and its window is still tiled once the app stops being busy. (#63)
+#[test]
+fn an_app_that_answers_probes_but_stays_busy_is_asked_less_often() {
+    let mut harness = TestHarness::new().with_windows(1);
+    let state = harness.mock_state.clone();
+    state.spawn_app(BUSY_APP, "com.example.busy", "Busy");
+    state.update_app(BUSY_APP, |app| {
+        app.ax_busy = true;
+        app.answers_probes = true;
+    });
+    state.spawn_window(
+        BUSY_APP,
+        TEST_WORKSPACE_ID,
+        RESTORED,
+        IRect::new(200, 100, 900, 600),
+    );
+
+    let world = harness.world();
+    let mut commands = world.commands();
+    let watch = launch_watch("Busy", &mut commands);
+    commands.spawn((watch, BProcess(Box::new(state.create_process(BUSY_APP)))));
+    world.flush();
+
+    harness.advance(Duration::from_secs(60));
+    assert!(!tiled(&mut harness, RESTORED), "a busy app is not tiled");
+    let calls = state.observe_calls(BUSY_APP);
+    assert!(
+        calls <= 7,
+        "the main loop asked a busy app {calls} times in 60 s, at most 7 expected"
+    );
+
+    state.update_app(BUSY_APP, |app| app.ax_busy = false);
+    harness.advance(Duration::from_secs(32));
+    assert!(
+        tiled(&mut harness, RESTORED),
+        "the window is tiled once the app answers"
+    );
+}
