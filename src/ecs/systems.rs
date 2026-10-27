@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, AwaitingAccessibility, BProcess, ExistingMarker, FreshMarker,
-    RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
+    AccessibilityProbe, ActiveDisplayMarker, AwaitingAccessibility, BProcess, ExistingMarker,
+    FreshMarker, RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
     VerifyWindowPosition, VerifyWindowSize,
 };
 
@@ -401,6 +401,13 @@ pub(crate) fn launch_watch(name: &str, commands: &mut Commands) -> (FreshMarker,
     (FreshMarker, timeout)
 }
 
+type FreshProcess = (
+    Entity,
+    &'static mut BProcess,
+    Has<Children>,
+    Option<&'static mut AwaitingAccessibility>,
+);
+
 /// Handles the event when a new application is launched. It creates a `Process` and `Application` object,
 /// observes the application for events, and adds its windows to the manager.
 /// This system processes `BProcess` entities marked with `FreshMarker`.
@@ -414,14 +421,14 @@ pub(crate) fn launch_watch(name: &str, commands: &mut Commands) -> (FreshMarker,
 /// * `commands` - Bevy commands to spawn entities and manage components.
 pub(super) fn add_launched_process(
     window_manager: Res<WindowManager>,
-    fresh_processes: Populated<(Entity, &mut BProcess, Has<Children>), With<FreshMarker>>,
+    fresh_processes: Populated<FreshProcess, With<FreshMarker>>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
     const APP_OBSERVABLE_TIMEOUT: Duration = Duration::from_secs(10);
     let mut already_seen = HashSet::new();
 
-    for (entity, mut process, children) in fresh_processes {
+    for (entity, mut process, children, awaiting) in fresh_processes {
         let process = &mut *process.0;
 
         if !already_seen.insert(process.psn()) {
@@ -460,6 +467,9 @@ pub(super) fn add_launched_process(
                 // layout.
                 let timeout = Timeout::for_component::<FreshMarker>(APP_OBSERVABLE_TIMEOUT);
                 commands.spawn((app, FreshMarker, timeout, ChildOf(entity)));
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<AwaitingAccessibility>();
+                }
             }
             Ok(false) => {
                 // Each call to a busy app blocks the main loop for the AX
@@ -469,10 +479,15 @@ pub(super) fn add_launched_process(
                     "'{}' is too busy to observe; waiting for it",
                     process.name()
                 );
-                if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands
-                        .try_remove::<FreshMarker>()
-                        .try_insert(AwaitingAccessibility::probe_now());
+                let Ok(mut entity_commands) = commands.get_entity(entity) else {
+                    continue;
+                };
+                entity_commands.try_remove::<FreshMarker>();
+                match awaiting {
+                    Some(mut awaiting) => awaiting.missed(),
+                    None => {
+                        entity_commands.try_insert(AwaitingAccessibility::probe_now());
+                    }
                 }
             }
             Err(err) => debug!("failed to register observers {}: {err}", process.name()),
@@ -491,33 +506,30 @@ pub(super) fn await_accessibility(
     const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
     for (entity, process, mut state) in waiting {
-        let answered = match &mut *state {
-            AwaitingAccessibility::Resting(timer) => {
+        let phase = &mut state.phase;
+        match phase {
+            AccessibilityProbe::Resting(timer) => {
                 if timer.tick(clock.delta()).is_finished() {
-                    *state = AwaitingAccessibility::Probing(
+                    *phase = AccessibilityProbe::Probing(
                         window_manager.probe_accessibility(process.pid()),
                     );
                 }
-                false
             }
-            AwaitingAccessibility::Probing(task) => match future::block_on(future::poll_once(task))
-            {
-                Some(true) => true,
-                Some(false) => {
-                    *state =
-                        AwaitingAccessibility::Resting(Timer::new(PROBE_INTERVAL, TimerMode::Once));
-                    false
+            AccessibilityProbe::Probing(task) => match future::block_on(future::poll_once(task)) {
+                Some(true) => {
+                    *phase = AccessibilityProbe::Answered;
+                    let watch = launch_watch(process.name(), &mut commands);
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_insert(watch);
+                    }
                 }
-                None => false,
+                Some(false) => {
+                    *phase =
+                        AccessibilityProbe::Resting(Timer::new(PROBE_INTERVAL, TimerMode::Once));
+                }
+                None => {}
             },
-        };
-        if answered {
-            let watch = launch_watch(process.name(), &mut commands);
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands
-                    .try_remove::<AwaitingAccessibility>()
-                    .try_insert(watch);
-            }
+            AccessibilityProbe::Answered => {}
         }
     }
 }

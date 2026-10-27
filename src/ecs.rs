@@ -702,14 +702,36 @@ pub struct BruteforceWindows(Task<Vec<Window>>);
 /// app answers a probe on a worker thread, the main loop makes no AX call to
 /// it. Then the process gets a fresh launch watch.
 #[derive(Component)]
-pub enum AwaitingAccessibility {
+pub struct AwaitingAccessibility {
+    /// How many times the app answered a probe and then was still too busy
+    /// to observe.
+    misses: u32,
+    phase: AccessibilityProbe,
+}
+
+pub enum AccessibilityProbe {
     Resting(Timer),
     Probing(Task<bool>),
+    Answered,
 }
 
 impl AwaitingAccessibility {
     pub fn probe_now() -> Self {
-        Self::Resting(Timer::new(Duration::ZERO, bevy::time::TimerMode::Once))
+        Self {
+            misses: 0,
+            phase: AccessibilityProbe::Resting(Timer::new(
+                Duration::ZERO,
+                bevy::time::TimerMode::Once,
+            )),
+        }
+    }
+
+    /// Rests longer after each miss, up to 30 s, so an app that is free only
+    /// briefly between long blocks cannot keep blocking the main loop.
+    pub fn missed(&mut self) {
+        self.misses += 1;
+        let rest = Duration::from_secs(1 << (self.misses - 1).min(5)).min(Duration::from_secs(30));
+        self.phase = AccessibilityProbe::Resting(Timer::new(rest, bevy::time::TimerMode::Once));
     }
 }
 
