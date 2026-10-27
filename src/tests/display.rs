@@ -2965,6 +2965,54 @@ fn test_remove_display_populates_empty_first_workspace_on_surviving_display() {
         .run(commands);
 }
 
+/// Mission Control can drag a window to an inactive Space without telling the
+/// engine. When a display topology read finds it there first, the window must
+/// join that Space's one strip, not a hidden extra row (#89).
+#[test]
+fn test_topology_read_appends_window_moved_to_inactive_space_into_its_strip() {
+    use crate::ecs::NativeFullscreenMarker;
+
+    let inactive_space = TEST_WORKSPACE_ID + 1;
+    let mut harness = TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, inactive_space],
+        )
+        .with_windows(2)
+        .with_workspace_window(100, inactive_space, |_| {});
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness
+        .mock_state
+        .update_window(1, |window| window.workspace_id = inactive_space);
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(1, 0, TEST_DISPLAY_WIDTH + 1, TEST_DISPLAY_HEIGHT),
+    );
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayConfigured {
+            display_id: TEST_DISPLAY_ID,
+        });
+    harness.advance(Duration::from_secs(2));
+
+    let world = harness.world();
+    let moved = find_window_entity(1, world);
+    let resident = find_window_entity(100, world);
+    let strips: Vec<(u32, Vec<Entity>)> = world
+        .query::<(&LayoutStrip, Has<NativeFullscreenMarker>)>()
+        .iter(world)
+        .filter(|(strip, fullscreen)| !fullscreen && strip.id() == inactive_space)
+        .map(|(strip, _)| (strip.virtual_index, strip.all_windows()))
+        .collect();
+    assert_eq!(
+        strips,
+        vec![(0, vec![resident, moved])],
+        "the moved window must be the last column of the Space's only strip"
+    );
+}
+
 #[test]
 fn test_remove_focused_display_activates_migrated_strip() {
     assert_removed_display_follows_focus(true, 0);
