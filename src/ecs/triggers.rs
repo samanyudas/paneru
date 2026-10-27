@@ -19,8 +19,8 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     AboveOrdinaryCheck, ActiveDisplayMarker, AwaitingHandle, BProcess, FloatsWhenRestored,
-    FocusedMarker, FreshMarker, MissionControlActive, PreviousManagedStrip, Rejoin,
-    RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    FocusedMarker, MissionControlActive, PreviousManagedStrip, Rejoin, RetryFrontSwitch,
+    SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -29,6 +29,7 @@ use crate::ecs::maximize::EDGE_RELEASE;
 use crate::ecs::maximize::FloatingMaximized;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
+use crate::ecs::systems::launch_watch;
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
@@ -514,7 +515,6 @@ pub(super) fn application_event_trigger(
     mut overrides: ResMut<TileOverrides>,
     mut commands: Commands,
 ) {
-    const PROCESS_READY_TIMEOUT_SEC: u64 = 5;
     let find_process = |psn| {
         processes
             .iter()
@@ -529,15 +529,8 @@ pub(super) fn application_event_trigger(
                     debug!("Skipping process with PID 0 (likely kernel_task).");
                     continue;
                 }
-                let timeout = Timeout::new(
-                    Duration::from_secs(PROCESS_READY_TIMEOUT_SEC),
-                    Some(format!(
-                        "Process '{}' did not become ready in {PROCESS_READY_TIMEOUT_SEC}s.",
-                        process.name()
-                    )),
-                    &mut commands,
-                );
-                commands.spawn((FreshMarker, timeout, process));
+                let watch = launch_watch(process.name(), &mut commands);
+                commands.spawn((watch, process));
             }
 
             Event::ApplicationTerminated { psn } => {

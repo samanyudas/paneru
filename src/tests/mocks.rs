@@ -34,6 +34,9 @@ pub(crate) struct MockAppData {
     pub(crate) queued_writes: bool,
     /// How long each queued position or size write takes, like a busy app.
     pub(crate) write_delay: std::time::Duration,
+    /// macOS reports a regular activation policy, as for an app with a Dock
+    /// icon. A menu-bar-only app reports another policy.
+    pub(crate) regular: bool,
 }
 
 /// Data for a mocked window.
@@ -495,6 +498,7 @@ impl MockState {
                 connection: Some(0),
                 queued_writes: false,
                 write_delay: std::time::Duration::ZERO,
+                regular: true,
             },
         );
     }
@@ -1677,6 +1681,10 @@ impl MockState {
         wm.expect_dim_windows().returning(|_, _| ());
 
         let s = self.clone();
+        wm.expect_new_application()
+            .returning(move |process| Ok(s.create_application(process.pid())));
+
+        let s = self.clone();
         wm.expect_window_ordered_in().returning(move |window_id| {
             let inner = s.inner.force_read();
             Ok(inner.windows.contains_key(&window_id)
@@ -1840,9 +1848,18 @@ impl MockState {
         mp.expect_pid().return_const(pid);
         mp.expect_psn()
             .returning(move || s.inner.force_read().apps.get(&pid).map(|a| a.psn).unwrap());
-        mp.expect_is_observable().returning(|| true);
+        let regular = move |s: &MockState| {
+            s.inner
+                .force_read()
+                .apps
+                .get(&pid)
+                .is_some_and(|a| a.regular)
+        };
+        let s = self.clone();
+        mp.expect_is_observable().returning(move || regular(&s));
         mp.expect_application().return_const(None);
-        mp.expect_ready().return_const(true);
+        let s = self.clone();
+        mp.expect_ready().returning(move || regular(&s));
         mp.expect_force_manage().return_const(());
 
         mp

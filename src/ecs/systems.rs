@@ -376,6 +376,23 @@ pub(crate) fn finish_setup(
     commands.trigger(RestoreWindowState);
 }
 
+/// How long `add_launched_process` polls a process that is not ready.
+const PROCESS_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The components that make `add_launched_process` poll a process until it
+/// can be managed.
+pub(crate) fn launch_watch(name: &str, commands: &mut Commands) -> (FreshMarker, Timeout) {
+    let timeout = Timeout::new(
+        PROCESS_READY_TIMEOUT,
+        Some(format!(
+            "Process '{name}' did not become ready in {}s.",
+            PROCESS_READY_TIMEOUT.as_secs()
+        )),
+        commands,
+    );
+    (FreshMarker, timeout)
+}
+
 /// Handles the event when a new application is launched. It creates a `Process` and `Application` object,
 /// observes the application for events, and adds its windows to the manager.
 /// This system processes `BProcess` entities marked with `FreshMarker`.

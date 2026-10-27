@@ -254,7 +254,7 @@ impl WorkspaceObserver {
     /// # Returns
     ///
     /// A `Retained<Self>` containing the new `WorkspaceObserver` instance.
-    pub(super) fn new(events: EventSender) -> Retained<Self> {
+    pub(crate) fn new(events: EventSender) -> Retained<Self> {
         // Initialize instance variables.
         let this = Self::alloc().set_ivars(Ivars { events });
         // Call `NSObject`'s `init` method.
