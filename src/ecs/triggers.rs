@@ -19,8 +19,8 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     AboveOrdinaryCheck, ActiveDisplayMarker, AwaitingHandle, BProcess, FloatsWhenRestored,
-    FocusedMarker, FreshMarker, MissionControlActive, PreviousManagedStrip, Rejoin,
-    RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    FocusedMarker, MissionControlActive, PreviousManagedStrip, Rejoin, RetryFrontSwitch,
+    SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -29,6 +29,7 @@ use crate::ecs::maximize::EDGE_RELEASE;
 use crate::ecs::maximize::FloatingMaximized;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
+use crate::ecs::systems::launch_watch;
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
@@ -510,38 +511,39 @@ pub(super) fn mission_control_trigger(
 /// * `commands` - Bevy commands to spawn or despawn entities.
 pub(super) fn application_event_trigger(
     mut messages: MessageReader<Event>,
-    processes: Query<(&BProcess, Entity)>,
+    processes: Query<(&BProcess, Entity, Has<Children>)>,
     mut overrides: ResMut<TileOverrides>,
     mut commands: Commands,
 ) {
-    const PROCESS_READY_TIMEOUT_SEC: u64 = 5;
     let find_process = |psn| {
         processes
             .iter()
-            .find(|(BProcess(process), _)| process.psn() == psn)
+            .find(|(BProcess(process), ..)| process.psn() == psn)
     };
 
     for event in messages.read() {
         match event {
+            Event::ApplicationLaunched { psn, .. }
+                if let Some((BProcess(process), entity, false)) = find_process(*psn) =>
+            {
+                // The observers of a process that was not ready sent this.
+                let watch = launch_watch(process.name(), &mut commands);
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(watch);
+                }
+            }
             Event::ApplicationLaunched { psn, observer } if find_process(*psn).is_none() => {
                 let process: BProcess = Process::new(psn, observer.clone()).into();
                 if process.pid() == 0 {
                     debug!("Skipping process with PID 0 (likely kernel_task).");
                     continue;
                 }
-                let timeout = Timeout::new(
-                    Duration::from_secs(PROCESS_READY_TIMEOUT_SEC),
-                    Some(format!(
-                        "Process '{}' did not become ready in {PROCESS_READY_TIMEOUT_SEC}s.",
-                        process.name()
-                    )),
-                    &mut commands,
-                );
-                commands.spawn((FreshMarker, timeout, process));
+                let watch = launch_watch(process.name(), &mut commands);
+                commands.spawn((watch, process));
             }
 
             Event::ApplicationTerminated { psn } => {
-                if let Some((BProcess(process), entity)) = find_process(*psn) {
+                if let Some((BProcess(process), entity, _)) = find_process(*psn) {
                     forget_enhanced_ui_state(process.pid());
                     // Its windows despawn with it, without a destroy event.
                     overrides.forget_process(process.pid());

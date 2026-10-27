@@ -4,6 +4,7 @@ mod drag;
 mod focus_or_virtual;
 mod harness;
 mod interaction;
+mod launch;
 mod maximize;
 mod mocks;
 mod mouse_focus;
