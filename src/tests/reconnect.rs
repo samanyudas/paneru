@@ -308,3 +308,220 @@ fn a_window_opened_while_unplugged_stays_on_the_builtin_display() {
         &[vec![50], vec![51, 52]],
     );
 }
+
+fn swap_columns(harness: &mut TestHarness, space: WorkspaceId, left: usize, right: usize) {
+    let world = harness.world();
+    let mut strips = world.query_filtered::<&mut LayoutStrip, With<SelectedVirtualMarker>>();
+    strips
+        .iter_mut(world)
+        .find(|strip| strip.id() == space)
+        .expect("the shown strip of the Space")
+        .swap(left, right);
+}
+
+fn widths(harness: &TestHarness, ids: &[WinID]) -> Vec<i32> {
+    ids.iter()
+        .map(|id| harness.mock_state.ax_frame(*id).width())
+        .collect()
+}
+
+/// A strip as its Space, virtual row, display, and columns of window IDs.
+type StripLayout = (WorkspaceId, u32, Option<u32>, Vec<Vec<WinID>>);
+
+fn every_strip(world: &mut World) -> Vec<StripLayout> {
+    let ids = world
+        .query::<(Entity, &Window)>()
+        .iter(world)
+        .map(|(entity, window)| (entity, window.id()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let displays = world
+        .query::<(Entity, &Display)>()
+        .iter(world)
+        .map(|(entity, display)| (entity, display.id()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut strips = world
+        .query::<(&LayoutStrip, Option<&ChildOf>)>()
+        .iter(world)
+        .map(|(strip, parent)| {
+            let columns = strip
+                .columns()
+                .map(|column| column.window_iter().map(|entity| ids[&entity]).collect())
+                .collect();
+            let display = parent.and_then(|parent| displays.get(&parent.parent()).copied());
+            (strip.id(), strip.virtual_index, display, columns)
+        })
+        .collect::<Vec<_>>();
+    strips.sort();
+    strips
+}
+
+#[test]
+fn three_unplug_and_replug_cycles_leave_the_same_layout_and_widths() {
+    const ALL: [WinID; 7] = [10, 11, 12, 50, 51, 52, 53];
+    let mut harness = two_displays();
+    let before = widths(&harness, &ALL);
+    let mut builtin_space = BUILTIN_SPACE;
+    // The Spaces macOS keeps handing the external display after each replug.
+    let mut ext_spaces = vec![EXT_SPACE];
+
+    for new_space in [
+        NEW_BUILTIN_SPACE,
+        NEW_BUILTIN_SPACE + 1,
+        NEW_BUILTIN_SPACE + 2,
+    ] {
+        ext_spaces.push(builtin_space);
+        harness
+            .world()
+            .write_message(Event::DisplayConfigured { display_id: EXT });
+        harness.advance(Duration::from_millis(20));
+        harness.mock_state.remove_display(EXT);
+        carry(&harness, &ALL[3..], ext_bounds(), builtin_alone_bounds());
+        carry(
+            &harness,
+            &ALL[..3],
+            builtin_bounds(),
+            builtin_alone_bounds(),
+        );
+        harness
+            .mock_state
+            .add_display(BUILTIN, builtin_alone_bounds(), ext_spaces.clone());
+        harness.world().write_message(Event::SpaceDestroyed {
+            space_id: BUILTIN_EMPTY_SPACE,
+        });
+        harness
+            .world()
+            .write_message(Event::DisplayRemoved { display_id: EXT });
+        harness.advance(SETTLE);
+
+        harness
+            .world()
+            .write_message(Event::DisplayConfigured { display_id: EXT });
+        harness.advance(Duration::from_millis(20));
+        harness
+            .mock_state
+            .add_display(EXT, ext_bounds(), ext_spaces.clone());
+        harness
+            .mock_state
+            .add_display(BUILTIN, builtin_bounds(), vec![new_space]);
+        carry(&harness, &ALL, builtin_alone_bounds(), ext_bounds());
+        harness.world().write_message(Event::SpaceCreated {
+            space_id: new_space,
+        });
+        harness
+            .world()
+            .write_message(Event::DisplayAdded { display_id: EXT });
+        harness.advance(Duration::from_millis(100));
+        harness.mock_state.os_activate_display(EXT);
+        harness.advance(SETTLE);
+        builtin_space = new_space;
+
+        assert_eq!(
+            layout_on(harness.world(), builtin_space),
+            (BUILTIN, vec![vec![10], vec![11, 12]]),
+            "cycle into Space {new_space}"
+        );
+        assert_eq!(
+            layout_on(harness.world(), EXT_SPACE),
+            (EXT, vec![vec![50], vec![51, 52], vec![53]]),
+            "cycle into Space {new_space}"
+        );
+        for id in &ALL[..3] {
+            assert_eq!(
+                harness.mock_state.space_of(*id),
+                builtin_space,
+                "window {id}"
+            );
+        }
+        for (id, (now, was)) in ALL.iter().zip(widths(&harness, &ALL).iter().zip(&before)) {
+            assert!(
+                (now - was).abs() <= 2,
+                "window {id} is {now} wide, was {was}, after the cycle into Space {new_space}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_reorder_while_unplugged_is_dropped_for_windows_that_return() {
+    let mut harness = two_displays();
+    unplug_external(&mut harness, BuiltinSpace::Survives);
+    swap_columns(&mut harness, EXT_SPACE, 0, 2);
+    harness.advance(Duration::from_secs(1));
+    assert_eq!(
+        layout_on(harness.world(), EXT_SPACE),
+        (BUILTIN, vec![vec![53], vec![51, 52], vec![50]])
+    );
+
+    replug_external(
+        &mut harness,
+        BuiltinSpace::Survives,
+        &[10, 11, 12, 50, 51, 52, 53],
+    );
+
+    assert_back_home(
+        &mut harness,
+        &[vec![10], vec![11, 12]],
+        &[vec![50], vec![51, 52], vec![53]],
+    );
+}
+
+/// This event order is modeled on the unplug, not observed: macOS moves the
+/// closed built-in display's Space to the external display, and on opening
+/// gives the built-in display a new empty Space.
+#[test]
+fn closing_and_opening_the_lid_returns_the_builtin_windows_and_keeps_the_external_reorder() {
+    let mut harness = two_displays();
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: BUILTIN,
+    });
+    harness.advance(Duration::from_millis(20));
+    harness.mock_state.remove_display(BUILTIN);
+    harness
+        .mock_state
+        .add_display(EXT, ext_bounds(), vec![EXT_SPACE, BUILTIN_SPACE]);
+    carry(&harness, &[10, 11, 12], builtin_bounds(), ext_bounds());
+    harness.world().write_message(Event::SpaceDestroyed {
+        space_id: BUILTIN_EMPTY_SPACE,
+    });
+    harness.world().write_message(Event::DisplayRemoved {
+        display_id: BUILTIN,
+    });
+    harness.advance(SETTLE);
+
+    swap_columns(&mut harness, EXT_SPACE, 0, 2);
+    harness.advance(Duration::from_secs(1));
+
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: BUILTIN,
+    });
+    harness.advance(Duration::from_millis(20));
+    harness
+        .mock_state
+        .add_display(BUILTIN, builtin_bounds(), vec![NEW_BUILTIN_SPACE]);
+    harness.world().write_message(Event::SpaceCreated {
+        space_id: NEW_BUILTIN_SPACE,
+    });
+    harness.world().write_message(Event::DisplayAdded {
+        display_id: BUILTIN,
+    });
+    harness.advance(SETTLE);
+
+    assert_back_home(
+        &mut harness,
+        &[vec![10], vec![11, 12]],
+        &[vec![53], vec![51, 52], vec![50]],
+    );
+}
+
+#[test]
+fn a_burst_that_moves_no_space_changes_no_strip() {
+    let mut harness = two_displays();
+    let before = every_strip(harness.world());
+
+    harness
+        .world()
+        .write_message(Event::DisplayConfigured { display_id: EXT });
+    harness.advance(SETTLE);
+
+    assert_eq!(every_strip(harness.world()), before);
+}
