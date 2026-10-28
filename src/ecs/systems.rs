@@ -1849,6 +1849,29 @@ mod startup_tests {
 
         assert_eq!(app.should_exit(), Some(AppExit::Success));
     }
+
+    /// Ctrl-C or SIGTERM can land in the startup queue before the startup
+    /// config. The daemon must still stop, without running a frame that has no
+    /// `Config`.
+    #[test]
+    fn an_exit_before_the_startup_config_stops_without_a_panic() {
+        let (sender, receiver) = channel();
+        sender.send(Event::Exit).expect("send exit");
+        sender
+            .send(Event::InitialConfig(
+                Config::defaults().expect("defaults should parse"),
+            ))
+            .expect("send initial config");
+        sender.send(Event::ProcessesLoaded).expect("send loaded");
+
+        let mut app = App::new();
+        app.insert_non_send(receiver);
+        app.add_systems(Startup, gather_initial_processes);
+        app.add_systems(Update, |_: Res<Config>| {});
+        app.update();
+
+        assert_eq!(app.should_exit(), Some(AppExit::Success));
+    }
 }
 
 #[cfg(all(test, feature = "lua"))]
