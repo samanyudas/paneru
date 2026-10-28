@@ -1063,9 +1063,11 @@ pub(crate) fn gather_initial_processes(
     loop {
         match receiver.recv().expect("error reading initial processes") {
             Event::ProcessesLoaded => break,
+            // `setup_handlers` queues everything up to `ProcessesLoaded` before
+            // the app runs, so reading on cannot block, and it still picks up
+            // the `InitialConfig` that an exit may have overtaken.
             Event::Exit => {
                 exit.write(AppExit::Success);
-                break;
             }
             Event::ApplicationLaunched { psn, observer } => {
                 let process: BProcess = Process::new(&psn, observer.clone()).into();
