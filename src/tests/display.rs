@@ -1659,3 +1659,86 @@ fn test_a_window_keeps_its_share_of_its_own_display() {
         })
         .run(commands);
 }
+
+/// How much of window `id` shows on the built-in display, in points across.
+fn shown_width(world: &mut World, id: WinID) -> i32 {
+    let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+    world
+        .query::<&Window>()
+        .iter(world)
+        .find(|window| window.id() == id)
+        .map_or(0, |window| window.frame().intersect(display).width())
+}
+
+fn shown_windows(world: &mut World) -> Vec<WinID> {
+    (0..5)
+        .filter(|&id| shown_width(world, id) > PARKED_STRIP_SLIVER)
+        .collect()
+}
+
+fn harness_with_display_above() -> TestHarness {
+    TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(5)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |data| {
+            data.frame = IRect::new(100, -EXT_DISPLAY_HEIGHT + 100, 900, -100);
+        })
+}
+
+fn close_shown_windows_after_focusing_the_display_above() -> Vec<Event> {
+    vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToNextDisplay),
+        }, // 2: close the shown windows
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        }, // 4
+    ]
+}
+
+/// Closing every window shown on a display whose strip overflows, while focus
+/// is on another display, must not leave that display showing only slivers.
+#[test]
+fn test_closing_the_shown_windows_of_an_unfocused_display_shows_another() {
+    use crate::assert_focused;
+
+    let closed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let recorded = closed.clone();
+    harness_with_display_above()
+        .on_iteration(2, move |world, state| {
+            assert_focused!(world, 100);
+            let shown = shown_windows(world);
+            assert!(
+                !shown.is_empty() && shown.len() < 5,
+                "the strip overflows: {shown:?}"
+            );
+            for &id in &shown {
+                state.os_close_window(id);
+            }
+            *recorded.borrow_mut() = shown;
+        })
+        .on_iteration(4, move |world, _state| {
+            assert_focused!(world, 100);
+            let closed = closed.borrow();
+            let widths = (0..5)
+                .filter(|id| !closed.contains(id))
+                .map(|id| (id, shown_width(world, id)))
+                .collect::<Vec<_>>();
+            assert!(
+                widths.iter().any(|&(_, width)| width > PARKED_STRIP_SLIVER),
+                "a remaining window must show on the display: {widths:?}"
+            );
+        })
+        .run(close_shown_windows_after_focusing_the_display_above());
+}
