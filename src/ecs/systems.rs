@@ -1814,6 +1814,38 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
     }
 }
 
+#[cfg(test)]
+mod startup_tests {
+    use std::sync::mpsc::channel;
+
+    use bevy::prelude::*;
+
+    use super::gather_initial_processes;
+    use crate::config::Config;
+    use crate::events::Event;
+
+    /// Ctrl-C or SIGTERM while startup gathers processes reaches the startup
+    /// queue ahead of `ProcessesLoaded`. It must still stop the daemon.
+    #[test]
+    fn an_exit_during_startup_stops_the_daemon() {
+        let (sender, receiver) = channel();
+        sender
+            .send(Event::InitialConfig(
+                Config::defaults().expect("defaults should parse"),
+            ))
+            .expect("send initial config");
+        sender.send(Event::Exit).expect("send exit");
+        sender.send(Event::ProcessesLoaded).expect("send loaded");
+
+        let mut app = App::new();
+        app.insert_non_send(receiver);
+        app.add_systems(Startup, gather_initial_processes);
+        app.update();
+
+        assert_eq!(app.should_exit(), Some(AppExit::Success));
+    }
+}
+
 #[cfg(all(test, feature = "lua"))]
 mod tests {
     use std::sync::mpsc::channel;
