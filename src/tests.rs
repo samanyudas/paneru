@@ -8,6 +8,7 @@ mod launch;
 mod maximize;
 mod mocks;
 mod mouse_focus;
+mod reconnect;
 mod session_restore;
 mod settling;
 mod stacks;
