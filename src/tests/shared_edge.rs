@@ -9,7 +9,9 @@ use bevy::prelude::World;
 use super::*;
 use crate::commands::{Command, Direction, Operation, Side};
 use crate::config::MainOptions;
-use crate::ecs::shared_edge::{EdgeSlice, showing_edge_slices};
+use crate::ecs::SpawnWindowTrigger;
+use crate::ecs::layout::LayoutStrip;
+use crate::ecs::shared_edge::{EdgeSlice, showing_edge_slices, showing_may_change};
 use crate::platform::WinID;
 
 const SETTLE: Duration = Duration::from_secs(2);
@@ -399,5 +401,70 @@ fn a_hidden_tabbed_stack_shows_only_the_tab_it_shows_last() {
     assert_eq!(
         (slices[0].1.on_screen, slices[0].1.in_window),
         sliver(&mut below, 1)
+    );
+}
+
+#[test]
+fn switching_the_front_tab_of_a_hidden_tab_group_shows_the_new_front_tab() {
+    let mut harness = focused(&[RIGHT], 4, None);
+    let tab = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        4,
+        os_frame(&harness, 3),
+    );
+    harness.mock_state.update_window(4, |window| {
+        window.horizontal_padding = PAD;
+        window.vertical_padding = PAD;
+    });
+    harness.mock_state.window_visible(3, false);
+    harness.world().trigger(SpawnWindowTrigger(vec![tab]));
+    harness.advance(SETTLE);
+    harness.run(vec![command(Operation::Focus(Direction::First))]);
+    harness.advance(SETTLE);
+
+    let (front, back) = match showing_ids(harness.world()).as_slice() {
+        [4] => (4, 3),
+        [3] => (3, 4),
+        ids => panic!("one tab of the group shows: {ids:?}"),
+    };
+    let geometry = |world: &mut World| [slice_of(world, 3), slice_of(world, 4)];
+    let before = geometry(harness.world());
+    assert!(before[0].is_some() && before[0] == before[1], "{before:?}");
+    harness
+        .world()
+        .run_system_cached(showing_may_change)
+        .expect("the condition runs");
+
+    let back_entity = find_window_entity(back, harness.world());
+    let world = harness.world();
+    let mut strips = world.query::<&mut LayoutStrip>();
+    for mut strip in strips.iter_mut(world) {
+        if let Ok(index) = strip.index_of(back_entity) {
+            let column = strip.get_column_mut(index).expect("the tab group");
+            assert!(
+                column.move_to_front(back_entity),
+                "{back} comes to the front"
+            );
+        }
+    }
+    harness.advance(SETTLE);
+
+    assert_eq!(
+        geometry(harness.world()),
+        before,
+        "the tabs keep their slices"
+    );
+    assert!(
+        harness
+            .world()
+            .run_system_cached(showing_may_change)
+            .expect("the condition runs"),
+        "the showing set is due for a refresh"
+    );
+    assert_eq!(
+        showing_ids(harness.world()),
+        vec![back],
+        "{front} went back"
     );
 }

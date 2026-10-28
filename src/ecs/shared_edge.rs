@@ -179,10 +179,12 @@ pub(crate) fn showing_edge_slices(
 }
 
 /// Whether the showing slices may have changed: a slice moved, appeared, or
-/// went, a display switched strips, or macOS switched a Space.
+/// went, a strip reordered its columns or tabs, a display switched strips, or
+/// macOS switched a Space.
 pub(crate) fn showing_may_change(
     changed: Query<(), Changed<EdgeSlice>>,
     removed: RemovedComponents<EdgeSlice>,
+    strips: Query<(), Changed<LayoutStrip>>,
     selected: Query<(), Added<SelectedVirtualMarker>>,
     mut messages: MessageReader<Event>,
 ) -> bool {
@@ -191,7 +193,11 @@ pub(crate) fn showing_may_change(
         .filter(|event| matches!(event, Event::SpaceChanged))
         .count()
         > 0;
-    space_changed || !changed.is_empty() || !removed.is_empty() || !selected.is_empty()
+    space_changed
+        || !changed.is_empty()
+        || !removed.is_empty()
+        || !strips.is_empty()
+        || !selected.is_empty()
 }
 
 pub(crate) fn log_showing_edge_slices(
