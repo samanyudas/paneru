@@ -13,10 +13,11 @@ use super::slice_photos::{ScreenLog, painted_beside_with, painted_west_with};
 use super::*;
 use crate::config::{Config, MainOptions};
 use crate::ecs::FocusedMarker;
-use crate::ecs::slice_input::GIVE_UP;
 use crate::events::MouseButton;
 use crate::manager::WindowManager;
-use crate::platform::slice_tap::{Mouse, Pointer, SlicePanel, SlicePress, SliceTap, Verdict};
+use crate::platform::slice_tap::{
+    GIVE_UP, Mouse, Pointer, SlicePanel, SlicePress, SliceTap, Verdict,
+};
 use crate::platform::{Modifiers, WinID};
 use crate::types::commands::Side;
 
@@ -407,6 +408,80 @@ fn a_press_whose_window_never_arrives_gives_up_and_keeps_focus() {
     assert!(desk.posted.is_empty(), "nothing after giving up");
     assert!(desk.reached.is_empty(), "{:?}", desk.reached);
     assert_eq!(desk.focused(), vec![3]);
+}
+
+#[test]
+fn a_second_press_before_the_first_arrives_reaches_no_window() {
+    let mut desk = Desk::new(false);
+    let pressed = desk.on_panel();
+    let elsewhere = CGPoint::new(pressed.x - 300.0, pressed.y);
+    let dragged = CGPoint::new(elsewhere.x - 10.0, elsewhere.y);
+    assert!(desk.panel_at(elsewhere).is_none());
+
+    desk.user(Mouse::Down(LEFT), pressed);
+    desk.user(Mouse::Up(LEFT), pressed);
+    desk.user(Mouse::Down(LEFT), elsewhere);
+    desk.user(Mouse::Dragged(LEFT), dragged);
+    desk.user(Mouse::Up(LEFT), dragged);
+    desk.wait(SLIDE);
+
+    let target = desk.pressed_in_view(pressed);
+    assert_eq!(
+        desk.reached,
+        vec![
+            (Mouse::Down(LEFT), target, true),
+            (Mouse::Up(LEFT), target, true)
+        ]
+    );
+}
+
+#[test]
+fn a_double_click_on_a_panel_reaches_the_app_as_one_click() {
+    let mut desk = Desk::new(false);
+    let pressed = desk.on_panel();
+
+    desk.user(Mouse::Down(LEFT), pressed);
+    desk.user(Mouse::Up(LEFT), pressed);
+    desk.user(Mouse::Down(LEFT), pressed);
+    desk.wait(SLIDE);
+    desk.user(Mouse::Up(LEFT), pressed);
+
+    let target = desk.pressed_in_view(pressed);
+    assert_eq!(
+        desk.reached,
+        vec![
+            (Mouse::Down(LEFT), target, true),
+            (Mouse::Up(LEFT), target, true)
+        ]
+    );
+}
+
+#[test]
+fn after_a_held_press_expires_the_next_press_reaches_the_app() {
+    let mut desk = Desk::new(false);
+    let pressed = desk.on_panel();
+    desk.harness
+        .mock_state
+        .update_window(3, |window| window.dropped_positions = u16::MAX);
+
+    desk.user(Mouse::Down(LEFT), pressed);
+    desk.wait(GIVE_UP + SLIDE);
+    let dragged = CGPoint::new(pressed.x - 10.0, pressed.y);
+    desk.user(Mouse::Dragged(LEFT), dragged);
+    desk.user(Mouse::Up(LEFT), dragged);
+    assert!(desk.reached.is_empty(), "{:?}", desk.reached);
+
+    let elsewhere = CGPoint::new(pressed.x - 300.0, pressed.y);
+    desk.user(Mouse::Down(LEFT), elsewhere);
+    desk.user(Mouse::Up(LEFT), elsewhere);
+    assert!(desk.posted.is_empty(), "{:?}", desk.posted);
+    assert_eq!(
+        desk.reached,
+        vec![
+            (Mouse::Down(LEFT), elsewhere, false),
+            (Mouse::Up(LEFT), elsewhere, false)
+        ]
+    );
 }
 
 #[test]

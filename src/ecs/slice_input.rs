@@ -16,11 +16,7 @@ use crate::ecs::params::Windows;
 use crate::ecs::{PostUpdateSet, RepositionMarker, ResizeMarker, SpawnCommandsExt as _, UpdateSet};
 use crate::events::Event;
 use crate::manager::{Display, Window, WindowManager, origin_from};
-use crate::platform::slice_tap::SlicePress;
-
-/// How long a press waits for its window to reach the pressed point. Focus
-/// and the scroll stay when it gives up.
-pub(crate) const GIVE_UP: Duration = Duration::from_millis(1500);
+use crate::platform::slice_tap::{GIVE_UP, SlicePress};
 
 #[derive(Resource, Debug)]
 pub(crate) struct PendingPress {

@@ -33,6 +33,10 @@ const TAG_MASK: i64 = !0xffff_ffff;
 /// double click stretches the window.
 const EDGE_INSET: f64 = 12.0;
 
+/// How long a held press waits for its window to reach the pressed point,
+/// in the tap and in the engine. Focus and the scroll stay when it gives up.
+pub(crate) const GIVE_UP: Duration = Duration::from_millis(1500);
+
 /// A painted slice panel, and the slice of the window it shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SlicePanel {
@@ -212,20 +216,22 @@ pub(crate) enum Verdict {
 enum Gesture {
     #[default]
     Idle,
-    /// The tap holds `button` back until the engine posts press `id`, and
-    /// notes whether the user dragged it meanwhile. The user pressed at
-    /// `pressed` on the screen.
+    /// The tap holds `button` back until the engine posts press `id` or
+    /// `deadline` passes, and notes whether the user dragged it meanwhile.
+    /// The user pressed at `pressed` on the screen.
     Holding {
         id: u32,
         button: MouseButton,
         dragged: bool,
         pressed: CGPoint,
+        deadline: Duration,
     },
     /// As `Holding`, after the user released the button.
     Released {
         id: u32,
         button: MouseButton,
         dragged: bool,
+        deadline: Duration,
     },
     /// The posted press went through, and the user's drags and release of
     /// its button now reach the app.
@@ -247,14 +253,32 @@ struct Passed {
 pub(crate) struct SliceTap {
     gesture: Gesture,
     presses: u32,
+    /// The button of a press the tap dropped, whose drags and release it
+    /// drops too.
+    dropped: Option<MouseButton>,
 }
 
 impl SliceTap {
     pub fn handle(&mut self, pointer: &Pointer) -> Verdict {
+        self.expire(pointer.time);
         if let Some(id) = pointer.tag {
             return self.posted(pointer, id);
         }
         match (pointer.mouse, self.gesture) {
+            (Mouse::Down(button), Gesture::Holding { id, .. } | Gesture::Released { id, .. }) => {
+                debug!(
+                    "edge slice press dropped: pressed at ({:.0}, {:.0}) while press {id} waits for its window",
+                    pointer.point.x, pointer.point.y
+                );
+                self.dropped = Some(button);
+                Verdict::Swallow
+            }
+            (Mouse::Dragged(button) | Mouse::Up(button), _) if self.dropped == Some(button) => {
+                if let Mouse::Up(_) = pointer.mouse {
+                    self.dropped = None;
+                }
+                Verdict::Swallow
+            }
             (Mouse::Down(button), _) => self.press(pointer, button),
             (
                 Mouse::Dragged(dragged),
@@ -262,6 +286,7 @@ impl SliceTap {
                     id,
                     button,
                     pressed,
+                    deadline,
                     ..
                 },
             ) if dragged == button => {
@@ -270,6 +295,7 @@ impl SliceTap {
                     button,
                     dragged: true,
                     pressed,
+                    deadline,
                 };
                 Verdict::Swallow
             }
@@ -279,6 +305,7 @@ impl SliceTap {
                     id,
                     button,
                     dragged,
+                    deadline,
                     ..
                 },
             ) if released == button => {
@@ -286,6 +313,7 @@ impl SliceTap {
                     id,
                     button,
                     dragged,
+                    deadline,
                 };
                 Verdict::Swallow
             }
@@ -298,6 +326,24 @@ impl SliceTap {
             (Mouse::Scrolled, _) if pointer.panel.is_some() => Verdict::Swallow,
             _ => Verdict::Pass,
         }
+    }
+
+    /// Lets go of a held press whose window has not arrived by its deadline.
+    /// The tap drops the rest of a press the user still holds.
+    fn expire(&mut self, now: Duration) {
+        let (Gesture::Holding { id, deadline, .. } | Gesture::Released { id, deadline, .. }) =
+            self.gesture
+        else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        if let Gesture::Holding { button, .. } = self.gesture {
+            self.dropped = Some(button);
+        }
+        debug!("edge slice press expired: press {id} waited {GIVE_UP:?} for its window");
+        self.gesture = Gesture::Idle;
     }
 
     /// A press of the user's: held back on a panel, let through elsewhere.
@@ -314,6 +360,7 @@ impl SliceTap {
             button,
             dragged: false,
             pressed: pointer.point,
+            deadline: pointer.time + GIVE_UP,
         };
         debug!(
             "edge slice press swallowed: press {id} window {} at ({x:.0}, {y:.0})",
@@ -394,6 +441,7 @@ impl SliceTap {
                 id,
                 button,
                 dragged: true,
+                ..
             } if id == tag && button == posted => {
                 debug!(
                     "edge slice press dropped: press {id} was a drag that ended before its window arrived"
@@ -419,6 +467,7 @@ impl SliceTap {
     /// have missed events.
     pub fn reset(&mut self) {
         self.gesture = Gesture::Idle;
+        self.dropped = None;
     }
 }
 
