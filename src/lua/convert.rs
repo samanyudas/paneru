@@ -265,6 +265,7 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::StateQuery { .. }
             | Event::WindowSetQuery { .. }
             | Event::StateSubscribe { .. }
+            | Event::SlicePhoto { .. }
             | Event::ScriptState { .. } => return Err(NotMarshallable),
         })
     }
