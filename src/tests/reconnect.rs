@@ -44,8 +44,8 @@ fn builtin_alone_bounds() -> IRect {
 }
 
 fn spawn_row(harness: &TestHarness, space: WorkspaceId, ids: &[WinID], bounds: IRect) {
-    for (i, &id) in ids.iter().enumerate() {
-        let x = bounds.min.x + i as i32 * WIDTH;
+    for (i, &id) in (0..).zip(ids) {
+        let x = bounds.min.x + i * WIDTH;
         let y = bounds.min.y + TEST_MENUBAR_HEIGHT;
         harness.mock_state.spawn_window(
             TEST_PROCESS_ID,

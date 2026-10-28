@@ -195,6 +195,7 @@ struct MockDisplayData {
 }
 
 /// The internal state of our "Virtual macOS".
+#[allow(clippy::struct_excessive_bools)]
 struct MockStateInner {
     apps: HashMap<Pid, MockAppData>,
     windows: HashMap<WinID, MockWindowData>,
