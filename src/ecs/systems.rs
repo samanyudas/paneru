@@ -1052,6 +1052,7 @@ pub(crate) fn gather_initial_processes(
     existing_config: Option<Res<Config>>,
     mut displays: Query<&mut Display>,
     mut commands: Commands,
+    mut exit: MessageWriter<AppExit>,
 ) {
     let Some(receiver) = receiver else {
         // Probably running in a mock environment, ignore.
@@ -1061,7 +1062,11 @@ pub(crate) fn gather_initial_processes(
     let mut toml_config = None;
     loop {
         match receiver.recv().expect("error reading initial processes") {
-            Event::ProcessesLoaded | Event::Exit => break,
+            Event::ProcessesLoaded => break,
+            Event::Exit => {
+                exit.write(AppExit::Success);
+                break;
+            }
             Event::ApplicationLaunched { psn, observer } => {
                 let process: BProcess = Process::new(&psn, observer.clone()).into();
                 if process.pid() != 0 {
