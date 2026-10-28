@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::ptr::NonNull;
+use std::sync::{Arc, OnceLock};
 
 use bevy::math::IRect;
 use block2::RcBlock;
@@ -25,7 +26,7 @@ use objc2_screen_capture_kit::{
 use tracing::debug;
 
 use crate::ecs::shared_edge::EdgeSlice;
-use crate::ecs::slice_photos::{Digest, Photo, PhotoError, SliceScreen, Ticket};
+use crate::ecs::slice_photos::{Digest, Lookup, Photo, PhotoError, SliceScreen, Ticket};
 use crate::events::{Event, EventSender};
 use crate::overlay::{cg_abs_to_cocoa, primary_screen_height};
 use crate::platform::WinID;
@@ -34,7 +35,17 @@ pub struct SliceScreenOS {
     mtm: MainThreadMarker,
     events: EventSender,
     panels: HashMap<WinID, Panel>,
+    /// The filter of each placed window's last lookup, once it arrives.
+    filters: HashMap<WinID, Arc<OnceLock<Filter>>>,
 }
+
+/// A filter that `ScreenCaptureKit`'s queue makes and the main thread reuses.
+struct Filter(Retained<SCContentFilter>);
+
+// SAFETY: no one changes a filter after making it, and Apple's own samples
+// share one filter across queues.
+unsafe impl Send for Filter {}
+unsafe impl Sync for Filter {}
 
 struct Panel {
     window: Retained<NSPanel>,
@@ -48,6 +59,7 @@ impl SliceScreenOS {
             mtm,
             events,
             panels: HashMap::new(),
+            filters: HashMap::new(),
         }
     }
 
@@ -117,6 +129,8 @@ impl SliceScreen for SliceScreenOS {
     }
 
     fn place(&mut self, slices: &[(WinID, EdgeSlice)]) {
+        self.filters
+            .retain(|id, _| slices.iter().any(|(showing, _)| showing == id));
         self.panels.retain(|id, panel| {
             let keep = slices.iter().any(|(showing, _)| showing == id);
             if !keep {
@@ -153,7 +167,14 @@ impl SliceScreen for SliceScreenOS {
         }
     }
 
-    fn photograph(&mut self, window: WinID, slice: &EdgeSlice, generation: u32, ticket: Ticket) {
+    fn photograph(
+        &mut self,
+        window: WinID,
+        slice: &EdgeSlice,
+        generation: u32,
+        ticket: Ticket,
+        lookup: Lookup,
+    ) {
         let reply = Reply {
             events: self.events.clone(),
             window,
@@ -161,6 +182,15 @@ impl SliceScreen for SliceScreenOS {
         };
         let crop = slice.in_window;
         let scale = self.scale_at(slice.on_screen);
+        if lookup == Lookup::Reuse
+            && let Some(filter) = self.filters.get(&window).and_then(|found| found.get())
+        {
+            capture(&filter.0, crop, scale, reply);
+            return;
+        }
+        debug!("edge slice window looked up: window {window} generation {generation}");
+        let filter = Arc::new(OnceLock::new());
+        self.filters.insert(window, filter.clone());
         let found = RcBlock::new(
             move |content: *mut SCShareableContent, error: *mut NSError| {
                 // SAFETY: ScreenCaptureKit passes a valid content object or null.
@@ -175,37 +205,19 @@ impl SliceScreen for SliceScreenOS {
                     reply.send(Err(PhotoError::WindowGone));
                     return;
                 };
-                let filter = unsafe {
-                    SCContentFilter::initWithDesktopIndependentWindow(
-                        SCContentFilter::alloc(),
-                        &target,
-                    )
-                };
-                let configuration = configuration(crop, scale);
                 if ticket.called_off() {
                     debug!("edge slice photo called off: window {window} generation {generation}");
                     return;
                 }
-                let reply = reply.clone();
-                let taken = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
-                    let Some(image) = NonNull::new(image) else {
-                        reply.fail(error);
-                        return;
-                    };
-                    // SAFETY: a non-null image that ScreenCaptureKit lends to this call.
-                    let image = unsafe { CFRetained::retain(image) };
-                    reply.send(Ok(Photo {
-                        digest: digest(&image),
-                        image,
-                    }));
+                let filter = filter.get_or_init(|| {
+                    Filter(unsafe {
+                        SCContentFilter::initWithDesktopIndependentWindow(
+                            SCContentFilter::alloc(),
+                            &target,
+                        )
+                    })
                 });
-                unsafe {
-                    SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
-                        &filter,
-                        &configuration,
-                        Some(&taken),
-                    );
-                }
+                capture(&filter.0, crop, scale, reply.clone());
             },
         );
         unsafe {
@@ -272,6 +284,30 @@ impl Reply {
         } else {
             PhotoError::Failed
         }));
+    }
+}
+
+/// Photographs the window of `filter`, sending the photo to `reply`.
+fn capture(filter: &SCContentFilter, crop: IRect, scale: f64, reply: Reply) {
+    let configuration = configuration(crop, scale);
+    let taken = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
+        let Some(image) = NonNull::new(image) else {
+            reply.fail(error);
+            return;
+        };
+        // SAFETY: a non-null image that ScreenCaptureKit lends to this call.
+        let image = unsafe { CFRetained::retain(image) };
+        reply.send(Ok(Photo {
+            digest: digest(&image),
+            image,
+        }));
+    });
+    unsafe {
+        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+            filter,
+            &configuration,
+            Some(&taken),
+        );
     }
 }
 

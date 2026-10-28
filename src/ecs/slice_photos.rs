@@ -87,6 +87,16 @@ impl Drop for Wanted {
     }
 }
 
+/// How a photo finds the window it photographs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lookup {
+    /// Looks the window up among the windows macOS can photograph, which
+    /// costs more than the photo itself.
+    Fresh,
+    /// Reuses the window's last lookup, and looks up only when it has none.
+    Reuse,
+}
+
 /// Shows the slice panels and photographs the windows behind them.
 /// [`SliceScreenOS`](crate::slice_screen::SliceScreenOS) does it on screen,
 /// and tests record the calls.
@@ -99,8 +109,16 @@ pub(crate) trait SliceScreen {
     fn place(&mut self, slices: &[(WinID, EdgeSlice)]);
     /// Starts a photo of the slice of `window`, unless `ticket` is called off
     /// before the capture. The result arrives as [`Event::SlicePhoto`]
-    /// carrying `generation`.
-    fn photograph(&mut self, window: WinID, slice: &EdgeSlice, generation: u32, ticket: Ticket);
+    /// carrying `generation`. `place` forgets the lookups of windows it gets
+    /// no slice for.
+    fn photograph(
+        &mut self,
+        window: WinID,
+        slice: &EdgeSlice,
+        generation: u32,
+        ticket: Ticket,
+        lookup: Lookup,
+    );
     /// Shows `photo` in the panel of `window`.
     fn paint(&mut self, window: WinID, photo: &Photo);
     /// Whether anyone can see the panel of `window` now.
@@ -175,10 +193,11 @@ fn ask(
     window: WinID,
     slice: &EdgeSlice,
     last: Option<Digest>,
+    lookup: Lookup,
 ) -> SlicePhoto {
     *generation = generation.wrapping_add(1);
     let ticket = Ticket::default();
-    screen.photograph(window, slice, *generation, ticket.clone());
+    screen.photograph(window, slice, *generation, ticket.clone(), lookup);
     debug!("edge slice photo asked: window {window} generation {generation}");
     SlicePhoto::Asked {
         generation: *generation,
@@ -208,7 +227,7 @@ fn update_access(
 }
 
 /// Gives each showing slice a panel, photographs the slices that are new or
-/// moved, and closes the panels of slices that stopped showing. A moved
+/// moved after looking their windows up, and closes the panels of slices that stopped showing. A moved
 /// slice whose painted panel no one can see waits for the next refresh that
 /// sees it. A panel never painted is out of sight, so its first photo never
 /// waits.
@@ -239,7 +258,14 @@ fn present_slices(
                     debug!("edge slice photo deferred, panel unseen: window {id}");
                     SlicePhoto::Shown { digest }
                 }
-                last => ask(screen.0.as_mut(), generation, id, &slice, last),
+                last => ask(
+                    screen.0.as_mut(),
+                    generation,
+                    id,
+                    &slice,
+                    last,
+                    Lookup::Fresh,
+                ),
             },
         };
         shown.insert(id, (slice, photo));
@@ -247,7 +273,8 @@ fn present_slices(
     screen.0.place(&slices.placed());
 }
 
-/// Photographs each shown slice again, unless no one can see its panel.
+/// Photographs each shown slice again with its last lookup, unless no one
+/// can see its panel.
 fn refresh_slices(mut slices: ResMut<Slices>, screen: Option<NonSendMut<SliceScreenHandle>>) {
     let Some(mut screen) = screen else {
         return;
@@ -264,7 +291,14 @@ fn refresh_slices(mut slices: ResMut<Slices>, screen: Option<NonSendMut<SliceScr
             debug!("edge slice photo skipped, panel unseen: window {id}");
             continue;
         }
-        *photo = ask(screen.0.as_mut(), generation, *id, slice, Some(digest));
+        *photo = ask(
+            screen.0.as_mut(),
+            generation,
+            *id,
+            slice,
+            Some(digest),
+            Lookup::Reuse,
+        );
     }
 }
 

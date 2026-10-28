@@ -18,7 +18,7 @@ use crate::commands::{Command, Direction, Operation, Side};
 use crate::config::{Config, MainOptions};
 use crate::ecs::shared_edge::{EdgeSlice, showing_edge_slices};
 use crate::ecs::slice_photos::{
-    Digest, Photo, PhotoError, REFRESH, SliceScreen, SliceScreenHandle, Ticket,
+    Digest, Lookup, Photo, PhotoError, REFRESH, SliceScreen, SliceScreenHandle, Ticket,
 };
 use crate::platform::WinID;
 
@@ -40,6 +40,7 @@ struct Screen {
     placed: Vec<(WinID, EdgeSlice)>,
     asked: Vec<(WinID, IRect, u32)>,
     tickets: BTreeMap<u32, Ticket>,
+    lookups: Vec<WinID>,
     painted: Vec<(WinID, Digest)>,
 }
 
@@ -56,10 +57,20 @@ impl SliceScreen for RecordingScreen {
         self.0.borrow_mut().placed = slices.to_vec();
     }
 
-    fn photograph(&mut self, window: WinID, slice: &EdgeSlice, generation: u32, ticket: Ticket) {
+    fn photograph(
+        &mut self,
+        window: WinID,
+        slice: &EdgeSlice,
+        generation: u32,
+        ticket: Ticket,
+        lookup: Lookup,
+    ) {
         let mut screen = self.0.borrow_mut();
         screen.asked.push((window, slice.in_window, generation));
         screen.tickets.insert(generation, ticket);
+        if lookup == Lookup::Fresh {
+            screen.lookups.push(window);
+        }
     }
 
     fn paint(&mut self, window: WinID, photo: &Photo) {
@@ -160,6 +171,14 @@ fn last_ask(log: &ScreenLog, window: WinID) -> u32 {
     *asks_for(log, window)
         .last()
         .unwrap_or_else(|| panic!("window {window} was photographed"))
+}
+
+fn lookups_for(log: &ScreenLog, window: WinID) -> usize {
+    log.borrow()
+        .lookups
+        .iter()
+        .filter(|id| **id == window)
+        .count()
 }
 
 /// Whether the engine called off the photo of ask `generation`, so its
@@ -473,5 +492,25 @@ fn a_slice_that_moves_while_no_one_can_see_its_panel_waits_to_be_seen() {
         log.borrow().asked.last().map(|(id, crop, _)| (*id, *crop)),
         Some((3, moved.in_window)),
         "seen again, a photo of the moved slice"
+    );
+}
+
+#[test]
+fn a_slice_looks_its_window_up_once_until_it_moves() {
+    let (mut harness, log) = stacked_beside();
+    let (asks, lookups) = (asks_for(&log, 3).len(), lookups_for(&log, 3));
+    arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(7)));
+    for digest in 8..11 {
+        harness.advance(REFRESH);
+        arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(digest)));
+    }
+    assert_eq!(asks_for(&log, 3).len(), asks + 3, "three refreshes");
+    assert_eq!(lookups_for(&log, 3), lookups, "no lookup for a refresh");
+
+    close_four(&mut harness);
+    assert_eq!(
+        lookups_for(&log, 3),
+        lookups + 1,
+        "a lookup for the moved slice"
     );
 }
