@@ -208,7 +208,10 @@ fn update_access(
 }
 
 /// Gives each showing slice a panel, photographs the slices that are new or
-/// moved, and closes the panels of slices that stopped showing.
+/// moved, and closes the panels of slices that stopped showing. A moved
+/// slice whose painted panel no one can see waits for the next refresh that
+/// sees it. A panel never painted is out of sight, so its first photo never
+/// waits.
 fn present_slices(
     In(showing): In<Vec<(WinID, EdgeSlice)>>,
     access: Res<SliceAccess>,
@@ -231,10 +234,13 @@ fn present_slices(
     for (id, slice) in showing {
         let photo = match before.remove(&id) {
             Some((was, photo)) if was == slice || matches!(photo, SlicePhoto::Ended) => photo,
-            was => {
-                let last = was.and_then(|(_, photo)| photo.shown());
-                ask(screen.0.as_mut(), generation, id, &slice, last)
-            }
+            was => match was.and_then(|(_, photo)| photo.shown()) {
+                Some(digest) if !screen.0.seen(id) => {
+                    debug!("edge slice photo deferred, panel unseen: window {id}");
+                    SlicePhoto::Shown { digest }
+                }
+                last => ask(screen.0.as_mut(), generation, id, &slice, last),
+            },
         };
         shown.insert(id, (slice, photo));
     }

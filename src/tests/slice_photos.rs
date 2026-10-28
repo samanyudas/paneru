@@ -168,24 +168,30 @@ fn called_off(log: &ScreenLog, generation: u32) -> bool {
     log.borrow().tickets[&generation].called_off()
 }
 
-/// Window 3 shows a slice on the edge shared with the display to the right,
-/// with window 4 hidden beyond it.
-fn two_hidden(screen: Screen) -> (TestHarness, ScreenLog) {
-    laid_out(switch(true), screen, &[RIGHT], 5, None)
-}
-
-/// Stacks window 4 under window 3, which halves the slice of window 3.
-fn stack_last_two(harness: &mut TestHarness) {
-    let before = showing(harness.world());
+/// Windows 3 and 4 stacked in the column on the edge shared with the
+/// display to the right, each showing half a slice.
+fn stacked_beside() -> (TestHarness, ScreenLog) {
+    let (mut harness, log) = laid_out(switch(true), Screen::default(), &[RIGHT], 5, None);
     harness.run(vec![
         command(Operation::Focus(Direction::Last)),
         command(Operation::Stack(Side::West)),
         command(Operation::Focus(Direction::First)),
     ]);
     harness.advance(SETTLE);
+    assert_eq!(placed_ids(&log), vec![3, 4]);
+    (harness, log)
+}
+
+/// Closes window 4, which grows the slice of window 3 without hiding it.
+fn close_four(harness: &mut TestHarness) {
+    let before = showing(harness.world());
+    harness.mock_state.os_close_window(4);
+    harness.run(vec![]);
+    harness.advance(SETTLE);
     let after = showing(harness.world());
-    assert_eq!(after.first().map(|(id, _)| *id), Some(3), "{after:?}");
-    assert_ne!(after[0], before[0], "window 3's slice moved");
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_eq!(after[0].0, 3);
+    assert_ne!(after[0], before[0], "window 3's slice grew");
 }
 
 /// A one-pixel image, standing in for a photo's pixels.
@@ -438,13 +444,34 @@ fn a_slice_that_stops_showing_calls_off_its_photo_on_its_way() {
 
 #[test]
 fn a_newer_ask_calls_off_the_one_before() {
-    let (mut harness, log) = two_hidden(Screen::default());
+    let (mut harness, log) = stacked_beside();
     let earlier = last_ask(&log, 3);
 
-    stack_last_two(&mut harness);
+    close_four(&mut harness);
     let latest = last_ask(&log, 3);
 
     assert_ne!(earlier, latest);
     assert!(called_off(&log, earlier));
     assert!(!called_off(&log, latest), "the newer ask stays wanted");
+}
+
+#[test]
+fn a_slice_that_moves_while_no_one_can_see_its_panel_waits_to_be_seen() {
+    let (mut harness, log) = stacked_beside();
+    arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(7)));
+    let asks = asks_for(&log, 3).len();
+
+    log.borrow_mut().unseen.insert(3);
+    close_four(&mut harness);
+    harness.advance(REFRESH * 2);
+    assert_eq!(asks_for(&log, 3).len(), asks, "unseen");
+
+    log.borrow_mut().unseen.clear();
+    harness.advance(REFRESH);
+    let moved = showing(harness.world())[0].1;
+    assert_eq!(
+        log.borrow().asked.last().map(|(id, crop, _)| (*id, *crop)),
+        Some((3, moved.in_window)),
+        "seen again, a photo of the moved slice"
+    );
 }
