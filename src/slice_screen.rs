@@ -30,6 +30,7 @@ use crate::ecs::slice_photos::{Digest, Lookup, Photo, PhotoError, SliceScreen, T
 use crate::events::{Event, EventSender};
 use crate::overlay::{cg_abs_to_cocoa, primary_screen_height};
 use crate::platform::WinID;
+use crate::platform::slice_tap::{SlicePanel, set_slice_panels};
 
 pub struct SliceScreenOS {
     mtm: MainThreadMarker,
@@ -49,7 +50,7 @@ unsafe impl Sync for Filter {}
 
 struct Panel {
     window: Retained<NSPanel>,
-    on_screen: IRect,
+    slice: EdgeSlice,
     painted: bool,
 }
 
@@ -71,6 +72,25 @@ impl SliceScreenOS {
             ),
             primary_screen_height(self.mtm),
         )
+    }
+
+    /// Tells the event tap and the window lookups where the painted panels
+    /// are.
+    fn publish_panels(&self) {
+        set_slice_panels(
+            self.panels
+                .iter()
+                .filter(|(_, panel)| panel.painted)
+                .filter_map(|(window, panel)| {
+                    Some(SlicePanel {
+                        panel: WinID::try_from(panel.window.windowNumber()).ok()?,
+                        window: *window,
+                        on_screen: panel.slice.on_screen,
+                        in_window: panel.slice.in_window,
+                    })
+                })
+                .collect(),
+        );
     }
 
     /// The backing scale of the screen that shows `on_screen`.
@@ -142,10 +162,13 @@ impl SliceScreen for SliceScreenOS {
         for (id, slice) in slices {
             let frame = self.cocoa_frame(slice.on_screen);
             match self.panels.get_mut(id) {
-                Some(panel) if panel.on_screen == slice.on_screen => continue,
+                Some(panel) if panel.slice.on_screen == slice.on_screen => {
+                    panel.slice = *slice;
+                    continue;
+                }
                 Some(panel) => {
                     panel.window.setFrame_display(frame, panel.painted);
-                    panel.on_screen = slice.on_screen;
+                    panel.slice = *slice;
                 }
                 None => {
                     let window = self.make_panel(frame);
@@ -153,7 +176,7 @@ impl SliceScreen for SliceScreenOS {
                         *id,
                         Panel {
                             window,
-                            on_screen: slice.on_screen,
+                            slice: *slice,
                             painted: false,
                         },
                     );
@@ -165,6 +188,7 @@ impl SliceScreen for SliceScreenOS {
                 on.min.x, on.min.y, on.max.x, on.max.y
             );
         }
+        self.publish_panels();
     }
 
     fn photograph(
@@ -240,6 +264,7 @@ impl SliceScreen for SliceScreenOS {
             panel.window.orderFrontRegardless();
             panel.painted = true;
             debug!("edge slice panel shown: window {window}");
+            self.publish_panels();
         }
     }
 

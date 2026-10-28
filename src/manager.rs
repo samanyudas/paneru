@@ -32,6 +32,7 @@ use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
 use crate::manager::skylight::SLSSetWindowListBrightness;
+use crate::platform::slice_tap;
 use crate::platform::{ConnID, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::util::{AXUIWrapper, MacResult, create_array, round_px, symlink_target};
 use app::ApplicationOS;
@@ -549,6 +550,11 @@ impl WindowManagerApi for WindowManagerOS {
         }
         .to_result(function_name!())?;
         if self.main_cid == window_conn_id {
+            if slice_tap::is_slice_panel(window_id) {
+                return Err(Error::invalid_window(&format!(
+                    "a slice panel covers {point:?}"
+                )));
+            }
             unsafe {
                 SLSFindWindowAndOwner(
                     self.main_cid,

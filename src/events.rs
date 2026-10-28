@@ -146,6 +146,11 @@ pub enum Event {
         /// click, 2 for the second press of a double-click.
         clicks: i64,
     },
+    /// The tap held back a press on an edge slice panel, for the engine to
+    /// post again once the window is in view.
+    SlicePress {
+        press: crate::platform::slice_tap::SlicePress,
+    },
     /// A mouse up event has occurred.
     MouseUp {
         point: CGPoint,
