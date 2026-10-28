@@ -2786,6 +2786,83 @@ window_grow = "alt - minus"
     ));
 }
 
+#[test]
+fn test_digit_names_bind_the_top_row_when_only_the_keypad_types_digits() {
+    // The characters French AZERTY types without Shift.
+    let azerty = [
+        (0x00, "q"),
+        (0x06, "w"),
+        (0x0c, "a"),
+        (0x0d, "z"),
+        (0x12, "&"),
+        (0x13, "é"),
+        (0x14, "\""),
+        (0x15, "'"),
+        (0x16, "§"),
+        (0x17, "("),
+        (0x19, "ç"),
+        (0x1a, "è"),
+        (0x1c, "!"),
+        (0x1d, "à"),
+        (0x43, "*"),
+        (0x52, "0"),
+        (0x53, "1"),
+        (0x54, "2"),
+        (0x55, "3"),
+        (0x56, "4"),
+        (0x57, "5"),
+        (0x58, "6"),
+        (0x59, "7"),
+        (0x5b, "8"),
+        (0x5c, "9"),
+    ];
+    let virtual_keys = test_virtual_keymap()
+        .into_iter()
+        .map(
+            |(name, code)| match azerty.iter().find(|(c, _)| *c == code) {
+                Some((_, character)) => ((*character).to_string(), code),
+                None => (name, code),
+            },
+        )
+        .collect::<Vec<_>>();
+    let keycode = |name: &str| keycode_for_key_name(name, &virtual_keys);
+
+    for (digit, top_row) in [
+        ("1", 0x12),
+        ("2", 0x13),
+        ("3", 0x14),
+        ("4", 0x15),
+        ("5", 0x17),
+        ("6", 0x16),
+        ("7", 0x1a),
+        ("8", 0x1c),
+        ("9", 0x19),
+        ("0", 0x1d),
+    ] {
+        assert_eq!(
+            keycode(digit),
+            Some(top_row),
+            "{digit} must bind the top-row key"
+        );
+    }
+    assert_eq!(keycode("&"), Some(0x12));
+    assert_eq!(
+        keycode("a"),
+        Some(0x0c),
+        "a letter must bind the key that types it, not its US position"
+    );
+    assert_eq!(
+        keycode("keypad1"),
+        Some(0x53),
+        "keypad names must still bind the keypad"
+    );
+    assert_eq!(
+        keycode("*"),
+        Some(0x43),
+        "a character that only a keypad key types must still bind that key"
+    );
+}
+
 #[cfg(all(test, feature = "lua"))]
 mod lua_setup_tests {
     use super::*;
