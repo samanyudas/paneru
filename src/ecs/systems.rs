@@ -45,7 +45,7 @@ use crate::events::{Event, InputEvent};
 use crate::manager::{
     Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
 };
-use crate::overlay::{FlashMessageManager, OverlayManager};
+use crate::overlay::{EdgeCueManager, FlashMessageManager, OverlayManager};
 use crate::platform::input::TapHealth;
 use crate::platform::{PlatformCallbacks, WinID};
 
@@ -2280,4 +2280,26 @@ mod tests {
                 < f64::EPSILON
         );
     }
+}
+
+/// Paints one line per display edge that hidden columns tucked away from.
+pub(super) fn update_edge_cues(
+    cues: Query<&crate::ecs::layout::EdgeCue>,
+    manager: Option<NonSendMut<EdgeCueManager>>,
+) {
+    let Some(mut manager) = manager else {
+        return;
+    };
+    let mut edges: Vec<IRect> = Vec::new();
+    for cue in &cues {
+        match edges
+            .iter_mut()
+            .find(|edge| edge.min.x == cue.0.min.x && edge.max.x == cue.0.max.x)
+        {
+            Some(edge) => *edge = edge.union(cue.0),
+            None => edges.push(cue.0),
+        }
+    }
+    edges.sort_by_key(|edge| (edge.min.x, edge.min.y));
+    manager.show(&edges);
 }
