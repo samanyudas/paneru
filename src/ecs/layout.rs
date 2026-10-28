@@ -3327,10 +3327,12 @@ fn keep_on_own_display(
     }
 }
 
-/// `frame` tucked below the bottom edge of `own`, against the side it hangs
-/// past, with `sliver` points of the window showing. It hangs past that
-/// corner when no other display is there, and otherwise shows flush inside the
-/// side. `None` when a display below `own` takes most of either.
+/// `frame` tucked below the bottom edge of `own`, with `sliver` points of the
+/// window showing above that edge. It hangs past the first free bottom
+/// corner of `own` with 1 point showing, trying the side it hangs past
+/// first. A corner is free when no other display is there. With neither
+/// corner free it shows flush inside the side it hangs past. `None` when a
+/// display below `own` takes most of that flush frame.
 fn bottom_tuck(
     frame: IRect,
     own: IRect,
