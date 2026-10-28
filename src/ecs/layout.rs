@@ -3193,6 +3193,8 @@ fn position_layout_windows(
             frame.max.y = park_row + height;
         }
 
+        let frame = keep_on_own_display(frame, display, &displays, offscreen_sliver_width, margins);
+
         if resize.is_none() && bounds.0 != frame.size() {
             bounds.0 = frame.size();
         }
@@ -3238,6 +3240,73 @@ fn position_layout_windows(
             }
         }
     }
+}
+
+fn overlap_area(a: IRect, b: IRect) -> i64 {
+    let shared = a.intersect(b);
+    if shared.is_empty() {
+        0
+    } else {
+        i64::from(shared.width()) * i64::from(shared.height())
+    }
+}
+
+/// Whether more of `frame` lies on another display than on `own`. macOS then
+/// moves the window into that display's space and draws it there.
+fn lies_mostly_elsewhere(frame: IRect, own: IRect, others: &[IRect]) -> bool {
+    let home = overlap_area(frame, own);
+    others
+        .iter()
+        .any(|other| overlap_area(frame, *other) > home)
+}
+
+/// `frame`, or its bottom tuck when more of it lies on another of `displays`
+/// than on `display`.
+fn keep_on_own_display(
+    frame: IRect,
+    display: &Display,
+    displays: &DisplayViewports,
+    sliver: i32,
+    margins: Margins,
+) -> IRect {
+    let own = display.bounds();
+    let others: Vec<IRect> = displays
+        .iter()
+        .map(|(other, _)| other.bounds())
+        .filter(|other| *other != own)
+        .collect();
+    if lies_mostly_elsewhere(frame, own, &others) {
+        bottom_tuck(frame, own, sliver, margins, &others).unwrap_or(frame)
+    } else {
+        frame
+    }
+}
+
+/// `frame` tucked below the bottom edge of `own`, against the side it hangs
+/// past, with `sliver` points of the window showing. It hangs past that
+/// corner when no other display is there, and otherwise sits flush inside the
+/// side. `None` when a display below `own` takes most of either.
+fn bottom_tuck(
+    frame: IRect,
+    own: IRect,
+    sliver: i32,
+    margins: Margins,
+    others: &[IRect],
+) -> Option<IRect> {
+    let size = frame.size();
+    let y = own.max.y - sliver - margins.min.y;
+    let (corner, flush) = if frame.center().x < own.center().x {
+        (own.min.x - size.x + sliver + margins.max.x, own.min.x)
+    } else {
+        (own.max.x - sliver - margins.min.x, own.max.x - size.x)
+    };
+    let at = |x: i32| IRect::from_corners(IVec2::new(x, y), IVec2::new(x, y) + size);
+    let corner = at(corner);
+    if others.iter().all(|other| overlap_area(corner, *other) == 0) {
+        return Some(corner);
+    }
+    let flush = at(flush);
+    (!lies_mostly_elsewhere(flush, own, others)).then_some(flush)
 }
 
 /// Where a column of `size` goes for `anchor`, kept inside `viewport`.
