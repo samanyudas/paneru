@@ -1464,6 +1464,22 @@ fn test_window_resize_pressed_again_while_refused_starts_from_the_kept_width() {
 }
 
 #[test]
+fn test_window_step_resize_pressed_again_while_refused_leaves_the_strip_in_place() {
+    let mut harness = focused_middle_window_with_min_width(400);
+
+    harness.run(vec![binding("window_step_shrink")]);
+    harness.advance(Duration::from_millis(300));
+    harness.run(vec![binding("window_step_shrink")]);
+    harness.advance(Duration::from_secs(2));
+
+    let world = harness.world();
+    assert_window_size!(world, 1, 400, 748);
+    assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+    assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
+    assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
+}
+
+#[test]
 fn test_window_resize_refused_with_a_late_resize_notification_leaves_the_strip_in_place() {
     let mut harness = focused_middle_window_with_min_width(400);
 
