@@ -58,6 +58,21 @@ impl Direction {
         })
     }
 
+    /// Parses `north`, `south`, `west`, or `east`, the directions that name a
+    /// neighbouring display.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if `name` is not one of the four compass directions.
+    pub fn parse_compass(name: &str) -> Result<Self, ParseError> {
+        match Direction::parse(name)? {
+            Direction::First | Direction::Last | Direction::Nth(_) => Err(ParseError::new(
+                format!("'{name}' is not north, south, west, or east"),
+            )),
+            direction => Ok(direction),
+        }
+    }
+
     /// Parses a direction name or a 1-based position (`"3"` → `Nth(2)`).
     ///
     /// # Errors
@@ -234,6 +249,12 @@ pub enum Operation {
     FullWidth,
     /// Moves the focused window to the next available display.
     ToNextDisplay(MoveFocus),
+    /// Focuses the display north, south, west, or east of the active one in
+    /// the physical arrangement.
+    FocusDisplay(Direction),
+    /// Moves the focused window to the display north, south, west, or east of
+    /// the active one, and follows it there.
+    MoveToDisplay(Direction),
     /// Distributes heights equally among windows in the focused stack.
     Equalize,
     /// Makes all columns in the active strip the same width as the focused window.

@@ -251,6 +251,8 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_balance` | Make all columns in the strip the same width as the focused window. |
 | `window_nextdisplay` | Move focused window to the next monitor and follow it. |
 | `window_nextdisplaysend` | Move focused window to the next monitor but stay on current. |
+| `window_focusdisplay_north` / `_south` / `_west` / `_east` | Focus the most visible window on the monitor in that direction in the macOS display arrangement, and move the mouse cursor onto it. If that monitor's current workspace has no windows, only move the mouse cursor to the monitor's center. Does nothing if no monitor lies that way. |
+| `window_movedisplay_north` / `_south` / `_west` / `_east` | Move focused window to the monitor in that direction in the macOS display arrangement and follow it. Does nothing if no monitor lies that way. |
 | `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
 | `window_snap` | Snap an overflowing window into the viewport. |
 | `window_raise_floating` | Make the floating windows layer visible on the current workspace. |

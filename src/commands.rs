@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::time::Duration;
 
 use bevy::app::{PostUpdate, PreUpdate};
@@ -138,7 +139,11 @@ pub fn register_commands(app: &mut bevy::app::App) {
     app.init_resource::<SnippetDialect>();
     app.add_systems(
         PreUpdate,
-        (copy_window_rule, toggle_tabbed_display_handler)
+        (
+            copy_window_rule,
+            toggle_tabbed_display_handler,
+            focus_display,
+        )
             .in_set(crate::ecs::PreUpdateSet::Dispatch),
     );
     app.add_systems(
@@ -319,6 +324,41 @@ fn pick_nearest_in_direction(
         })
         .min_by_key(|(_, dist_sq)| *dist_sq)
         .map(|(entity, _)| entity)
+}
+
+/// The display that lies in `direction` from the display bounded by `from` in
+/// the physical arrangement, or `None` for `First`, `Last`, and `Nth`.
+///
+/// Candidates lie wholly on that side. One that shares an edge range with
+/// `from` beats one that is only diagonal. Then the nearest by edge gap wins,
+/// so a display behind another is never picked over it. Then the longest shared
+/// edge, the nearest center, and the lowest `display` value, so ties do not
+/// depend on query order.
+fn display_in_direction<T: Ord + Copy>(
+    direction: &Direction,
+    from: IRect,
+    displays: impl IntoIterator<Item = (T, IRect)>,
+) -> Option<T> {
+    let shared = |a: (i32, i32), b: (i32, i32)| (a.1.min(b.1) - a.0.max(b.0)).max(0);
+    displays
+        .into_iter()
+        .filter_map(|(display, bounds)| {
+            let horizontal = shared((bounds.min.x, bounds.max.x), (from.min.x, from.max.x));
+            let vertical = shared((bounds.min.y, bounds.max.y), (from.min.y, from.max.y));
+            let (gap, edge) = match direction {
+                Direction::East => (bounds.min.x - from.max.x, vertical),
+                Direction::West => (from.min.x - bounds.max.x, vertical),
+                Direction::North => (from.min.y - bounds.max.y, horizontal),
+                Direction::South => (bounds.min.y - from.max.y, horizontal),
+                Direction::First | Direction::Last | Direction::Nth(_) => return None,
+            };
+            let distance = (bounds.center() - from.center())
+                .as_i64vec2()
+                .length_squared();
+            (gap >= 0).then_some((edge == 0, gap, Reverse(edge), distance, display))
+        })
+        .min()
+        .map(|(.., display)| display)
 }
 
 /// Floating windows of `workspace_id` that are on `display_bounds`.
@@ -1290,8 +1330,9 @@ fn copy_window_rule(
     }
 }
 
-/// Moves the focused window to the next available display.
-/// The window will be repositioned to the center of the new display.
+/// Moves the focused window to the next available display, or to the display
+/// in a compass direction. The window will be repositioned to the center of
+/// the new display.
 ///
 /// # Arguments
 ///
@@ -1308,12 +1349,17 @@ fn to_next_display(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let Some(Operation::ToNextDisplay(move_focus)) =
-        filter_window_operations(&mut messages, |op| {
-            matches!(op, Operation::ToNextDisplay(_))
-        })
-        .next()
-    else {
+    let Some((move_focus, direction)) = filter_window_operations(&mut messages, |op| {
+        matches!(
+            op,
+            Operation::ToNextDisplay(_) | Operation::MoveToDisplay(_)
+        )
+    })
+    .find_map(|op| match op {
+        Operation::ToNextDisplay(move_focus) => Some((*move_focus, None)),
+        Operation::MoveToDisplay(direction) => Some((MoveFocus::Follow, Some(direction.clone()))),
+        _ => None,
+    }) else {
         return;
     };
 
@@ -1334,8 +1380,20 @@ fn to_next_display(
     // for on both the source and target displays.
     let source_viewport_width = active_display.actual_bounds(&config).width();
 
-    let Some(other) = active_display.other().next() else {
-        debug!("no other display to move window to.");
+    let target_id = match &direction {
+        None => active_display.other().next().map(|display| display.id()),
+        Some(direction) => display_in_direction(
+            direction,
+            active_display.bounds(),
+            active_display
+                .other()
+                .map(|display| (display.id(), display.bounds())),
+        ),
+    };
+    let Some(other) =
+        target_id.and_then(|id| active_display.other().find(|display| display.id() == id))
+    else {
+        debug!("no other display to move window to ({direction:?}).");
         return;
     };
 
@@ -1414,12 +1472,15 @@ fn to_next_display(
     }
 }
 
+type StripsWithSelection<'w, 's> =
+    Query<'w, 's, (&'static LayoutStrip, Entity, Has<SelectedVirtualMarker>)>;
+
 /// Moves the mouse pointer to the next available display.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn mouse_to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    layout_strips: Query<(&LayoutStrip, Entity, Has<SelectedVirtualMarker>)>,
+    layout_strips: StripsWithSelection,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
@@ -1445,8 +1506,64 @@ fn mouse_to_next_display(
         debug!("no other display to move mouse to.");
         return;
     };
+    focus_on_display(
+        other,
+        &windows,
+        &layout_strips,
+        &window_manager,
+        &mut commands,
+    );
+}
+
+/// Focuses the display north, south, west, or east of the active one.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn focus_display(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    layout_strips: StripsWithSelection,
+    active_display: ActiveDisplay,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    let Some(Operation::FocusDisplay(direction)) =
+        filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusDisplay(_)))
+            .next()
+    else {
+        return;
+    };
+
+    let Some(other) = display_in_direction(
+        direction,
+        active_display.bounds(),
+        active_display
+            .other()
+            .map(|display| (display.id(), display.bounds())),
+    )
+    .and_then(|id| active_display.other().find(|display| display.id() == id)) else {
+        debug!("no display {direction:?} of the active one.");
+        return;
+    };
+    focus_on_display(
+        other,
+        &windows,
+        &layout_strips,
+        &window_manager,
+        &mut commands,
+    );
+}
+
+/// Focuses the most visible window of the selected virtual workspace on
+/// `display` and moves the mouse pointer onto it, or onto the display's
+/// center when that workspace has no windows.
+fn focus_on_display(
+    display: &Display,
+    windows: &Windows,
+    layout_strips: &StripsWithSelection,
+    window_manager: &WindowManager,
+    commands: &mut Commands,
+) {
     let Some((other_strip, _)) = window_manager
-        .active_display_space(other.id())
+        .active_display_space(display.id())
         .ok()
         .and_then(|id| {
             layout_strips
@@ -1459,7 +1576,7 @@ fn mouse_to_next_display(
         return;
     };
 
-    let visible_width = |frame: IRect| other.bounds().intersect(frame).width();
+    let visible_width = |frame: IRect| display.bounds().intersect(frame).width();
     let Some((frame, entity)) = other_strip
         .all_windows()
         .iter()
@@ -1473,11 +1590,11 @@ fn mouse_to_next_display(
         })
     else {
         debug!("no suitable windows on the other display to move the mouse.");
-        window_manager.warp_mouse(other.bounds().center());
+        window_manager.warp_mouse(display.bounds().center());
         return;
     };
 
-    let visible_frame = other.bounds().intersect(frame);
+    let visible_frame = display.bounds().intersect(frame);
     debug!("warping mouse to {visible_frame:?}",);
     window_manager.warp_mouse(visible_frame.center());
 
@@ -2033,6 +2150,97 @@ mod tests {
         assert_eq!(
             pick_nearest_in_direction(&Direction::East, focused, candidates),
             None,
+        );
+    }
+
+    #[test]
+    fn display_in_direction_follows_a_horizontal_arrangement() {
+        let laptop = IRect::new(0, 0, 1512, 982);
+        let right = IRect::new(1512, -200, 1512 + 2560, 1240);
+
+        assert_eq!(
+            display_in_direction(&Direction::East, laptop, [(2, right)]),
+            Some(2)
+        );
+        assert_eq!(
+            display_in_direction(&Direction::West, right, [(1, laptop)]),
+            Some(1)
+        );
+        for direction in [Direction::West, Direction::North, Direction::South] {
+            assert_eq!(display_in_direction(&direction, laptop, [(2, right)]), None);
+        }
+    }
+
+    #[test]
+    fn display_in_direction_follows_a_vertical_arrangement() {
+        let laptop = IRect::new(0, 0, 1512, 982);
+        let above = IRect::new(-500, -1440, 2060, 0);
+
+        assert_eq!(
+            display_in_direction(&Direction::North, laptop, [(2, above)]),
+            Some(2)
+        );
+        assert_eq!(
+            display_in_direction(&Direction::South, above, [(1, laptop)]),
+            Some(1)
+        );
+        for direction in [Direction::South, Direction::West, Direction::East] {
+            assert_eq!(display_in_direction(&direction, laptop, [(2, above)]), None);
+        }
+    }
+
+    #[test]
+    fn display_in_direction_prefers_a_side_by_side_display_then_the_nearest() {
+        let center = IRect::new(0, 0, 1000, 800);
+        let far = IRect::new(3000, 0, 4000, 800);
+        let diagonal = IRect::new(1000, -900, 2000, -100);
+        let near = IRect::new(1000, 100, 2000, 900);
+
+        assert_eq!(
+            display_in_direction(&Direction::East, center, [(1, diagonal), (2, far)]),
+            Some(2),
+            "a display beside this one wins over a closer diagonal one"
+        );
+        assert_eq!(
+            display_in_direction(&Direction::East, center, [(2, far), (3, near)]),
+            Some(3)
+        );
+        assert_eq!(
+            display_in_direction(&Direction::East, center, [(1, diagonal)]),
+            Some(1),
+            "a diagonal display is still reachable when it is the only one"
+        );
+        for direction in [Direction::First, Direction::Last, Direction::Nth(0)] {
+            assert_eq!(display_in_direction(&direction, center, [(3, near)]), None);
+        }
+    }
+
+    #[test]
+    fn display_in_direction_breaks_a_tie_by_display_id() {
+        let center = IRect::new(0, 0, 1000, 800);
+        let upper = IRect::new(1000, -400, 2000, 400);
+        let lower = IRect::new(1000, 400, 2000, 1200);
+
+        assert_eq!(
+            display_in_direction(&Direction::East, center, [(7, upper), (4, lower)]),
+            Some(4)
+        );
+        assert_eq!(
+            display_in_direction(&Direction::East, center, [(4, lower), (7, upper)]),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn display_in_direction_prefers_the_longest_shared_edge() {
+        let center = IRect::new(0, 0, 1000, 800);
+        let sliver = IRect::new(1000, 799, 2000, 1599);
+        let broad = IRect::new(1000, -50, 2600, 750);
+
+        assert_eq!(
+            display_in_direction(&Direction::East, center, [(1, sliver), (2, broad)]),
+            Some(2),
+            "750 px of shared edge wins over 1 px even with a farther center"
         );
     }
 
