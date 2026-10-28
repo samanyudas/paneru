@@ -881,6 +881,10 @@ impl Config {
             .is_some_and(|reap| reap)
     }
 
+    pub fn shared_edge_slices(&self) -> bool {
+        self.options().shared_edge_slices.unwrap_or(false)
+    }
+
     pub fn native_tabs_enabled(&self) -> bool {
         // Default is enabled.
         !self
@@ -1385,6 +1389,11 @@ pub struct MainOptions {
     /// If a non-enumerated (e.g. South) gesture or window movement would target a nonexistent
     /// virtual workspace, create the workspace automatically.
     pub create_virtual_workspace_automatically: Option<bool>,
+
+    /// Show a photo of the nearest hidden column on each display edge shared
+    /// with another display. Needs the Screen Recording permission, which
+    /// the engine never asks for. Default: false.
+    pub shared_edge_slices: Option<bool>,
 }
 
 /// Returns a default set of column widths.
