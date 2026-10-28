@@ -67,6 +67,7 @@ type RecoverableApplications<'w, 's> = Populated<
     (
         Entity,
         Option<&'static Application>,
+        Option<&'static BProcess>,
         Option<&'static ChildOf>,
         Option<&'static mut PendingWindowRecovery>,
         Has<PendingApplicationObservation>,
@@ -582,12 +583,14 @@ pub(super) fn retry_application_observers(
 // cannot replay that event. Retry newly launched applications with no managed
 // children at one-second intervals for a bounded recovery window, and despawn
 // headless or permanently unobservable processes once that window expires.
+// Keep menu-bar apps: their activationPolicy observer reports when they turn
+// regular, which can happen any time after launch.
 pub(super) fn recover_windowless_applications(
     mut apps: RecoverableApplications,
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    for (entity, app, child_of, recovery, pending_observation) in &mut apps {
+    for (entity, app, process, child_of, recovery, pending_observation) in &mut apps {
         if let Some(app) = app {
             let windows = app.window_list(&config);
             if !windows.is_empty() {
@@ -601,7 +604,7 @@ pub(super) fn recover_windowless_applications(
                 continue;
             }
             let despawn_target = if app.is_none() {
-                Some(entity)
+                (!process.is_some_and(|process| process.is_accessory())).then_some(entity)
             } else if pending_observation {
                 Some(child_of.map_or(entity, ChildOf::parent))
             } else {
@@ -1108,6 +1111,14 @@ pub(crate) fn gather_initial_processes(
                 debug!("Adding existing process {}", process.name());
             }
             commands.spawn((ExistingMarker, process));
+        } else if process.is_accessory() {
+            debug!(
+                "Existing application '{}' is a menu-bar app, watching it.",
+                process.name(),
+            );
+            // Subscribes to its activationPolicy changes.
+            process.ready();
+            commands.spawn(process);
         } else {
             debug!(
                 "Existing application '{}' is not observable, ignoring it.",

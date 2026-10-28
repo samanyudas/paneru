@@ -78,6 +78,10 @@ pub trait ProcessApi: Send + Sync {
     ///
     /// `true` if the process is observable, `false` otherwise.
     fn is_observable(&mut self) -> bool;
+    /// Checks if the application has the accessory activation policy, like a
+    /// menu-bar app. Such an app can turn regular at any time, for example
+    /// when it opens its main window.
+    fn is_accessory(&self) -> bool;
     /// Returns the name of the process.
     fn name(&self) -> &str;
     /// Returns the process ID (`Pid`) of the process.
@@ -119,6 +123,11 @@ impl ProcessApi for ProcessOS {
     /// Delegates the `is_observable` call to the inner `Process`.
     fn is_observable(&mut self) -> bool {
         self.inner.is_observable()
+    }
+
+    /// Delegates the `is_accessory` call to the inner `Process`.
+    fn is_accessory(&self) -> bool {
+        self.inner.is_accessory()
     }
 
     /// Returns the name of the inner `Process`.
@@ -246,6 +255,13 @@ impl Process {
             self.policy = NSApplicationActivationPolicy::Prohibited;
             false
         }
+    }
+
+    /// Checks if the application has the accessory activation policy.
+    pub fn is_accessory(&self) -> bool {
+        self.application
+            .as_ref()
+            .is_some_and(|app| app.activationPolicy() == NSApplicationActivationPolicy::Accessory)
     }
 
     /// Forces the process to be treated as manageable regardless of its activation policy.

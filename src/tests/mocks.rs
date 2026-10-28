@@ -949,6 +949,8 @@ impl MockState {
         };
         let s = self.clone();
         mp.expect_is_observable().returning(move || regular(&s));
+        let s = self.clone();
+        mp.expect_is_accessory().returning(move || !regular(&s));
         mp.expect_application().return_const(None);
         let s = self.clone();
         mp.expect_ready().returning(move || regular(&s));

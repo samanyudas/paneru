@@ -428,6 +428,7 @@ mod delayed_readiness_tests {
             .expect_name()
             .return_const("headless-helper".to_string());
         process.expect_ready().returning(|| false);
+        process.expect_is_accessory().return_const(false);
         harness.world().spawn((
             BProcess(Box::new(process)),
             crate::ecs::systems::PendingWindowRecovery::default(),
