@@ -915,7 +915,9 @@ enum ScanEnd {
 
 /// Walks element ids upward from 0. `element_at` looks up the window an
 /// element belongs to, and each element of a window still in `window_list` is
-/// removed from the list and handed to `accept`.
+/// handed to `accept`. A window leaves the list only once `accept` takes one
+/// of its elements, because an app can list a child element with the window's
+/// id before the window itself.
 fn scan_elements<E, T>(
     window_list: &mut Vec<WinID>,
     deadline: Instant,
@@ -934,12 +936,12 @@ fn scan_elements<E, T>(
         let Some((window_id, element)) = element_at(element_id) else {
             continue;
         };
-        if let Some(index) = window_list.iter().position(|&id| id == window_id) {
+        if let Some(index) = window_list.iter().position(|&id| id == window_id)
+            && let Some(window) = accept(element)
+        {
             window_list.remove(index);
             debug!("Found window {window_id:?}");
-            if let Some(window) = accept(element) {
-                found.push(window);
-            }
+            found.push(window);
         }
     }
     let end = if window_list.is_empty() {
