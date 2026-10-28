@@ -270,7 +270,7 @@ $ paneru send-cmd <command> [args...]
 
 | Command                    | Description                                      |
 | -------------------------- | ------------------------------------------------ |
-| `window focus <direction\|number\|managed\|unmanaged>` | Move focus by direction, column number, managed or unmanaged |
+| `window focus <direction\|number\|managed\|unmanaged>` | Move focus by direction, column number, managed or unmanaged. A first, last, or numbered jump focuses the last-focused window of that column |
 | `window swap <direction>`  | Swap the focused window with a neighbour         |
 | `window center`            | Center the focused window on screen              |
 | `window resize`            | Cycle through `preset_column_widths`             |

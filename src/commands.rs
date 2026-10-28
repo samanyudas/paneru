@@ -407,19 +407,26 @@ fn active_focus_candidate(
     focused_entity: Entity,
     active_strip: &LayoutStrip,
     workspaces: &Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
+    focus_history: &FocusHistory,
 ) -> Option<Entity> {
+    let column_jump = match direction {
+        Direction::First => Some(active_strip.first()),
+        Direction::Last => Some(active_strip.last()),
+        Direction::Nth(index) => Some(active_strip.get(*index)),
+        Direction::East | Direction::West | Direction::North | Direction::South => None,
+    };
+    if let Some(column) = column_jump {
+        return column
+            .ok()
+            .and_then(|column| focus_history.last_focused_in(&column));
+    }
+
     // Enter the active strip from the appropriate side when focus is outside it.
     if !active_strip.contains(focused_entity) {
         return match direction {
-            Direction::East | Direction::First => {
-                active_strip.first().ok().and_then(|col| col.top())
-            }
-            Direction::West | Direction::Last => active_strip.last().ok().and_then(|col| col.top()),
-            Direction::Nth(index) => active_strip
-                .get(*index)
-                .ok()
-                .and_then(|column| column.top()),
-            Direction::North | Direction::South => None,
+            Direction::East => active_strip.first().ok().and_then(|col| col.top()),
+            Direction::West => active_strip.last().ok().and_then(|col| col.top()),
+            _ => None,
         };
     }
 
@@ -439,12 +446,14 @@ fn active_focus_candidate(
     })
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn command_move_focus(
     mut messages: MessageReader<Event>,
     windows: Windows,
     workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
+    focus_history: Res<FocusHistory>,
     mut paging: PagingFocusParams,
     mut commands: Commands,
 ) {
@@ -526,7 +535,13 @@ fn command_move_focus(
         return;
     }
 
-    let candidate = active_focus_candidate(direction, focused_entity, active_strip, &workspaces);
+    let candidate = active_focus_candidate(
+        direction,
+        focused_entity,
+        active_strip,
+        &workspaces,
+        &focus_history,
+    );
 
     if let Some(entity) = candidate {
         focus_with_verification(
