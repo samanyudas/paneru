@@ -453,4 +453,55 @@ mod delayed_readiness_tests {
             "headless process must be despawned once the recovery window expires"
         );
     }
+
+    /// Docker Desktop runs as a menu-bar app, with no Dock icon, until its
+    /// dashboard opens. Its activation-policy observer must still be alive
+    /// when that happens, however long after launch it is.
+    #[test]
+    fn menu_bar_app_that_turns_regular_after_recovery_window_is_managed() {
+        const MENU_BAR_APP: i32 = 46;
+        const DASHBOARD: crate::platform::WinID = 46;
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.advance(Duration::from_secs(1));
+        let state = harness.mock_state.clone();
+        state.spawn_app(MENU_BAR_APP, "com.docker.docker", "Docker Desktop");
+        state.update_app(MENU_BAR_APP, |app| app.regular = false);
+        let mut wm = state.create_window_manager();
+        let app_state = state.clone();
+        wm.expect_new_application()
+            .returning(move |process| Ok(app_state.create_application(process.pid())));
+        harness.world().insert_resource(WindowManager(Box::new(wm)));
+        // The 5s launch poll has expired, as in the tests above.
+        harness.world().spawn((
+            BProcess(Box::new(state.create_process(MENU_BAR_APP))),
+            crate::ecs::systems::PendingWindowRecovery::default(),
+        ));
+        harness.advance(Duration::from_secs(65));
+
+        state.update_app(MENU_BAR_APP, |app| app.regular = true);
+        state.spawn_window(
+            MENU_BAR_APP,
+            TEST_WORKSPACE_ID,
+            DASHBOARD,
+            bevy::math::IRect::new(200, 100, 900, 600),
+        );
+        // The activationPolicy KVO observer reports the change.
+        let psn = crate::manager::ProcessApi::psn(&state.create_process(MENU_BAR_APP));
+        let (events, _receiver) = crate::events::EventSender::new();
+        let observer = WorkspaceObserver::new(events);
+        harness
+            .world()
+            .write_message(crate::events::Event::ApplicationLaunched { psn, observer });
+        harness.advance(Duration::from_secs(2));
+
+        let world = harness.world();
+        assert!(
+            world
+                .query::<&Application>()
+                .iter(world)
+                .any(|app| app.pid() == MENU_BAR_APP),
+            "an app that turns regular late must be managed"
+        );
+        crate::tests::find_window_entity(DASHBOARD, harness.world());
+    }
 }

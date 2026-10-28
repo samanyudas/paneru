@@ -25,6 +25,9 @@ pub(crate) struct MockAppData {
     pub(crate) focused_window_id: Option<WinID>,
     pub(crate) is_frontmost: bool,
     pub(crate) connection: Option<crate::platform::ConnID>,
+    /// macOS reports a regular activation policy, as for an app with a Dock
+    /// icon. A menu-bar-only app reports another policy.
+    pub(crate) regular: bool,
 }
 
 /// Data for a mocked window.
@@ -187,6 +190,7 @@ impl MockState {
                 focused_window_id: None,
                 is_frontmost: true,
                 connection: Some(0),
+                regular: true,
             },
         );
     }
@@ -936,9 +940,18 @@ impl MockState {
         mp.expect_pid().return_const(pid);
         mp.expect_psn()
             .returning(move || s.inner.force_read().apps.get(&pid).map(|a| a.psn).unwrap());
-        mp.expect_is_observable().returning(|| true);
+        let regular = move |s: &MockState| {
+            s.inner
+                .force_read()
+                .apps
+                .get(&pid)
+                .is_some_and(|a| a.regular)
+        };
+        let s = self.clone();
+        mp.expect_is_observable().returning(move || regular(&s));
         mp.expect_application().return_const(None);
-        mp.expect_ready().return_const(true);
+        let s = self.clone();
+        mp.expect_ready().returning(move || regular(&s));
         mp.expect_force_manage().return_const(());
 
         mp

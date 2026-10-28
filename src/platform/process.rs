@@ -444,3 +444,55 @@ impl ProcessHandler {
         .inspect_err(|err| error!("error sending event: {err}"));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ecs::BProcess;
+    use crate::manager::Process;
+    use bevy::app::{App, Update};
+    use objc2_app_kit::NSApplicationActivationPolicy;
+
+    /// An app already running as a menu-bar app when the engine starts, such
+    /// as Docker Desktop with its dashboard closed, must stay watched so its
+    /// windows are managed once it turns regular.
+    #[test]
+    fn running_menu_bar_app_is_kept_at_startup() {
+        let (events, _receiver) = EventSender::new();
+        let observer = WorkspaceObserver::new(events);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut psn = ProcessSerialNumber::default();
+        let mut menu_bar_app = None;
+        while unsafe { GetNextProcess(&raw mut psn) }
+            .to_result(function_name!())
+            .is_ok()
+        {
+            let process = Process::new(&psn, observer.clone());
+            if process.application.as_ref().is_some_and(|app| {
+                app.activationPolicy() == NSApplicationActivationPolicy::Accessory
+            }) {
+                menu_bar_app = Some(process.pid);
+                break;
+            }
+        }
+        let pid = menu_bar_app.expect("a menu-bar app must be running");
+        sender
+            .send(Event::ApplicationLaunched { psn, observer })
+            .expect("send launch");
+        sender.send(Event::ProcessesLoaded).expect("send loaded");
+
+        let mut app = App::new();
+        app.insert_non_send(receiver);
+        app.add_systems(Update, crate::ecs::systems::gather_initial_processes);
+        app.update();
+
+        let world = app.world_mut();
+        assert!(
+            world
+                .query::<&BProcess>()
+                .iter(world)
+                .any(|process| process.pid() == pid),
+            "the menu-bar app must keep a process that observes its activation policy"
+        );
+    }
+}
