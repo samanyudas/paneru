@@ -22,6 +22,7 @@ use crate::config::{Config, StackLimit};
 use crate::ecs::drag::DragState;
 use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::params::Windows;
+use crate::ecs::shared_edge::EdgeSlice;
 use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
@@ -3200,13 +3201,24 @@ fn position_layout_windows(
             frame.max.y = park_row + height;
         }
 
-        let frame = keep_on_own_display(frame, display, &displays, offscreen_sliver_width, margins);
+        let (frame, slice) = keep_on_own_display(
+            frame,
+            display,
+            context.display_entity,
+            &displays,
+            offscreen_sliver_width,
+            margins,
+        );
 
         if resize.is_none() && bounds.0 != frame.size() {
             bounds.0 = frame.size();
         }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(PresentedOrigin(frame.min));
+            match slice {
+                Some(slice) => entity_commands.try_insert(slice),
+                None => entity_commands.try_remove::<EdgeSlice>(),
+            };
         }
 
         if position.0 != frame.min {
@@ -3319,24 +3331,28 @@ fn lies_mostly_elsewhere(shown: IRect, own: IRect, others: &[IRect]) -> bool {
 }
 
 /// `frame`, or its bottom tuck when more of it lies on another of `displays`
-/// than on `display`.
+/// than on `display`. A tuck also returns the slice `frame` would show.
 fn keep_on_own_display(
     frame: IRect,
     display: &Display,
+    display_entity: Entity,
     displays: &DisplayViewports,
     sliver: i32,
     margins: Margins,
-) -> IRect {
+) -> (IRect, Option<EdgeSlice>) {
     let own = display.bounds();
     let others: Vec<IRect> = displays
         .iter()
         .map(|(other, _)| other.bounds())
         .filter(|other| *other != own)
         .collect();
-    if lies_mostly_elsewhere(margins.shown(frame), own, &others) {
-        bottom_tuck(frame, own, sliver, margins, &others).unwrap_or(frame)
-    } else {
-        frame
+    let shown = margins.shown(frame);
+    if !lies_mostly_elsewhere(shown, own, &others) {
+        return (frame, None);
+    }
+    match bottom_tuck(frame, own, sliver, margins, &others) {
+        Some(tucked) => (tucked, EdgeSlice::new(shown, own, display_entity)),
+        None => (frame, None),
     }
 }
 
