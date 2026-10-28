@@ -321,7 +321,7 @@ fn new_column_width(width: i32, source: IRect, target: IRect) -> i32 {
 }
 
 /// Sizes `member`, which is moving to another display, for the layout there.
-fn size_for_arrival(member: Entity, bounds: Size, commands: &mut Commands) {
+pub(crate) fn size_for_arrival(member: Entity, bounds: Size, commands: &mut Commands) {
     // The destination layout sizes the window from `Bounds`. A resize
     // animation toward the full height would outlive that layout: a
     // window joining a stack keeps only its share, and the stale
