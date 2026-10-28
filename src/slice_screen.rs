@@ -25,7 +25,7 @@ use objc2_screen_capture_kit::{
 use tracing::debug;
 
 use crate::ecs::shared_edge::EdgeSlice;
-use crate::ecs::slice_photos::{Digest, Photo, PhotoError, SliceScreen};
+use crate::ecs::slice_photos::{Digest, Photo, PhotoError, SliceScreen, Ticket};
 use crate::events::{Event, EventSender};
 use crate::overlay::{cg_abs_to_cocoa, primary_screen_height};
 use crate::platform::WinID;
@@ -153,7 +153,7 @@ impl SliceScreen for SliceScreenOS {
         }
     }
 
-    fn photograph(&mut self, window: WinID, slice: &EdgeSlice, generation: u32) {
+    fn photograph(&mut self, window: WinID, slice: &EdgeSlice, generation: u32, ticket: Ticket) {
         let reply = Reply {
             events: self.events.clone(),
             window,
@@ -182,6 +182,10 @@ impl SliceScreen for SliceScreenOS {
                     )
                 };
                 let configuration = configuration(crop, scale);
+                if ticket.called_off() {
+                    debug!("edge slice photo called off: window {window} generation {generation}");
+                    return;
+                }
                 let reply = reply.clone();
                 let taken = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
                     let Some(image) = NonNull::new(image) else {

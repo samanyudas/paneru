@@ -2,7 +2,7 @@
 //! engine photographs the windows behind them, and when it repaints.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -14,11 +14,11 @@ use objc2_core_graphics::{
 };
 
 use super::*;
-use crate::commands::{Command, Direction, Operation};
+use crate::commands::{Command, Direction, Operation, Side};
 use crate::config::{Config, MainOptions};
 use crate::ecs::shared_edge::{EdgeSlice, showing_edge_slices};
 use crate::ecs::slice_photos::{
-    Digest, Photo, PhotoError, REFRESH, SliceScreen, SliceScreenHandle,
+    Digest, Photo, PhotoError, REFRESH, SliceScreen, SliceScreenHandle, Ticket,
 };
 use crate::platform::WinID;
 
@@ -39,6 +39,7 @@ struct Screen {
     unseen: HashSet<WinID>,
     placed: Vec<(WinID, EdgeSlice)>,
     asked: Vec<(WinID, IRect, u32)>,
+    tickets: BTreeMap<u32, Ticket>,
     painted: Vec<(WinID, Digest)>,
 }
 
@@ -55,11 +56,10 @@ impl SliceScreen for RecordingScreen {
         self.0.borrow_mut().placed = slices.to_vec();
     }
 
-    fn photograph(&mut self, window: WinID, slice: &EdgeSlice, generation: u32) {
-        self.0
-            .borrow_mut()
-            .asked
-            .push((window, slice.in_window, generation));
+    fn photograph(&mut self, window: WinID, slice: &EdgeSlice, generation: u32, ticket: Ticket) {
+        let mut screen = self.0.borrow_mut();
+        screen.asked.push((window, slice.in_window, generation));
+        screen.tickets.insert(generation, ticket);
     }
 
     fn paint(&mut self, window: WinID, photo: &Photo) {
@@ -160,6 +160,32 @@ fn last_ask(log: &ScreenLog, window: WinID) -> u32 {
     *asks_for(log, window)
         .last()
         .unwrap_or_else(|| panic!("window {window} was photographed"))
+}
+
+/// Whether the engine called off the photo of ask `generation`, so its
+/// capture never starts.
+fn called_off(log: &ScreenLog, generation: u32) -> bool {
+    log.borrow().tickets[&generation].called_off()
+}
+
+/// Window 3 shows a slice on the edge shared with the display to the right,
+/// with window 4 hidden beyond it.
+fn two_hidden(screen: Screen) -> (TestHarness, ScreenLog) {
+    laid_out(switch(true), screen, &[RIGHT], 5, None)
+}
+
+/// Stacks window 4 under window 3, which halves the slice of window 3.
+fn stack_last_two(harness: &mut TestHarness) {
+    let before = showing(harness.world());
+    harness.run(vec![
+        command(Operation::Focus(Direction::Last)),
+        command(Operation::Stack(Side::West)),
+        command(Operation::Focus(Direction::First)),
+    ]);
+    harness.advance(SETTLE);
+    let after = showing(harness.world());
+    assert_eq!(after.first().map(|(id, _)| *id), Some(3), "{after:?}");
+    assert_ne!(after[0], before[0], "window 3's slice moved");
 }
 
 /// A one-pixel image, standing in for a photo's pixels.
@@ -384,4 +410,41 @@ fn a_refused_photo_closes_every_panel_until_the_config_changes() {
         asks + 2,
         "both photographed again"
     );
+}
+
+#[test]
+fn turning_the_switch_off_calls_off_a_photo_on_its_way() {
+    let (mut harness, log) = beside(switch(true), Screen::default());
+    let asked = last_ask(&log, 3);
+    assert!(!called_off(&log, asked), "wanted while the switch is on");
+
+    harness.world().insert_resource(switch(false));
+    harness.app.update();
+
+    assert!(called_off(&log, asked));
+}
+
+#[test]
+fn a_slice_that_stops_showing_calls_off_its_photo_on_its_way() {
+    let (mut harness, log) = beside(switch(true), Screen::default());
+    let asked = last_ask(&log, 3);
+
+    harness.run(vec![command(Operation::Focus(Direction::Last))]);
+    harness.advance(SETTLE);
+
+    assert!(showing(harness.world()).is_empty());
+    assert!(called_off(&log, asked));
+}
+
+#[test]
+fn a_newer_ask_calls_off_the_one_before() {
+    let (mut harness, log) = two_hidden(Screen::default());
+    let earlier = last_ask(&log, 3);
+
+    stack_last_two(&mut harness);
+    let latest = last_ask(&log, 3);
+
+    assert_ne!(earlier, latest);
+    assert!(called_off(&log, earlier));
+    assert!(!called_off(&log, latest), "the newer ask stays wanted");
 }

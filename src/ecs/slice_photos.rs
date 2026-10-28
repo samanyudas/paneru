@@ -3,6 +3,8 @@
 //! shows, and one every [`REFRESH`] while someone can see it.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bevy::app::{App, PostUpdate};
@@ -64,6 +66,27 @@ pub(crate) enum PhotoError {
     Failed,
 }
 
+/// Tells the capture of one photo whether the engine still wants it. The
+/// engine calls the photo off when it stops waiting for it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Ticket(Arc<AtomicBool>);
+
+impl Ticket {
+    pub fn called_off(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// The engine's hold on a photo on its way. Dropping it calls the photo off.
+#[derive(Debug)]
+struct Wanted(Ticket);
+
+impl Drop for Wanted {
+    fn drop(&mut self) {
+        self.0.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Shows the slice panels and photographs the windows behind them.
 /// [`SliceScreenOS`](crate::slice_screen::SliceScreenOS) does it on screen,
 /// and tests record the calls.
@@ -74,9 +97,10 @@ pub(crate) trait SliceScreen {
     /// Gives each of `slices` a panel at its place on screen and closes every
     /// other panel. A panel stays out of sight until its first paint.
     fn place(&mut self, slices: &[(WinID, EdgeSlice)]);
-    /// Starts a photo of the slice of `window`. The result arrives as
-    /// [`Event::SlicePhoto`] carrying `generation`.
-    fn photograph(&mut self, window: WinID, slice: &EdgeSlice, generation: u32);
+    /// Starts a photo of the slice of `window`, unless `ticket` is called off
+    /// before the capture. The result arrives as [`Event::SlicePhoto`]
+    /// carrying `generation`.
+    fn photograph(&mut self, window: WinID, slice: &EdgeSlice, generation: u32, ticket: Ticket);
     /// Shows `photo` in the panel of `window`.
     fn paint(&mut self, window: WinID, photo: &Photo);
     /// Whether anyone can see the panel of `window` now.
@@ -101,12 +125,13 @@ enum SliceAccess {
 }
 
 /// The photo of one slice with a panel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum SlicePhoto {
     /// A photo is on its way. `last` is the photo the panel shows now.
     Asked {
         generation: u32,
         last: Option<Digest>,
+        _wanted: Wanted,
     },
     /// The panel shows the photo with this digest.
     Shown { digest: Digest },
@@ -116,8 +141,8 @@ enum SlicePhoto {
 }
 
 impl SlicePhoto {
-    fn shown(self) -> Option<Digest> {
-        match self {
+    fn shown(&self) -> Option<Digest> {
+        match *self {
             SlicePhoto::Asked { last, .. } => last,
             SlicePhoto::Shown { digest } => Some(digest),
             SlicePhoto::Ended => None,
@@ -138,7 +163,7 @@ impl Slices {
     fn placed(&self) -> Vec<(WinID, EdgeSlice)> {
         self.showing
             .iter()
-            .filter(|(_, (_, photo))| *photo != SlicePhoto::Ended)
+            .filter(|(_, (_, photo))| !matches!(photo, SlicePhoto::Ended))
             .map(|(id, (slice, _))| (*id, *slice))
             .collect()
     }
@@ -152,11 +177,13 @@ fn ask(
     last: Option<Digest>,
 ) -> SlicePhoto {
     *generation = generation.wrapping_add(1);
-    screen.photograph(window, slice, *generation);
+    let ticket = Ticket::default();
+    screen.photograph(window, slice, *generation, ticket.clone());
     debug!("edge slice photo asked: window {window} generation {generation}");
     SlicePhoto::Asked {
         generation: *generation,
         last,
+        _wanted: Wanted(ticket),
     }
 }
 
@@ -203,7 +230,7 @@ fn present_slices(
     let mut before = std::mem::take(shown);
     for (id, slice) in showing {
         let photo = match before.remove(&id) {
-            Some((was, photo)) if was == slice || photo == SlicePhoto::Ended => photo,
+            Some((was, photo)) if was == slice || matches!(photo, SlicePhoto::Ended) => photo,
             was => {
                 let last = was.and_then(|(_, photo)| photo.shown());
                 ask(screen.0.as_mut(), generation, id, &slice, last)
@@ -263,6 +290,7 @@ fn receive_photos(
                 SlicePhoto::Asked {
                     generation: asked,
                     last,
+                    ..
                 } if asked == *generation => Some((photo, last)),
                 _ => None,
             });
