@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
@@ -82,6 +83,25 @@ struct MockDisplayData {
     workspaces: Vec<WorkspaceId>,
 }
 
+/// Whether a mocked app is answering window writes, to model one that is
+/// stuck.
+#[derive(Default)]
+struct WriteHold {
+    held: bool,
+    /// Holds that ran out with nobody releasing them.
+    expired_holds: usize,
+}
+
+/// A held write gives up after this long, so a test that waits on one fails
+/// instead of hanging.
+const WRITE_HOLD_LIMIT: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct WriteHolds {
+    apps: Mutex<HashMap<Pid, WriteHold>>,
+    released: Condvar,
+}
+
 /// The internal state of our "Virtual macOS".
 struct MockStateInner {
     apps: HashMap<Pid, MockAppData>,
@@ -109,6 +129,9 @@ struct MockStateInner {
 #[derive(Clone)]
 pub struct MockState {
     inner: Arc<RwLock<MockStateInner>>,
+    /// Kept outside `inner` so a slow write never holds the lock every other
+    /// mock call needs.
+    write_holds: Arc<WriteHolds>,
 }
 
 impl MockState {
@@ -128,6 +151,118 @@ impl MockState {
                 raised: Vec::new(),
                 app_reads: HashMap::new(),
             })),
+            write_holds: Arc::default(),
+        }
+    }
+
+    /// Makes `pid`'s window writes wait until [`Self::release_writes`], or
+    /// until [`WRITE_HOLD_LIMIT`] runs out.
+    pub fn hold_writes(&self, pid: Pid) {
+        self.write_holds
+            .apps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(pid)
+            .or_default()
+            .held = true;
+    }
+
+    pub fn release_writes(&self, pid: Pid) {
+        if let Some(app) = self
+            .write_holds
+            .apps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&pid)
+        {
+            app.held = false;
+        }
+        self.write_holds.released.notify_all();
+    }
+
+    /// How many of `pid`'s held writes waited out [`WRITE_HOLD_LIMIT`].
+    pub fn expired_write_holds(&self, pid: Pid) -> usize {
+        self.write_holds
+            .apps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&pid)
+            .map_or(0, |app| app.expired_holds)
+    }
+
+    /// Where the app has the window, which lags what the engine asked for
+    /// while a write is still on its way.
+    pub fn window_frame(&self, window_id: WinID) -> IRect {
+        self.inner
+            .force_read()
+            .windows
+            .get(&window_id)
+            .map(|w| w.frame)
+            .expect("finding window")
+    }
+
+    /// Blocks while `pid` is held, and returns whether `pid` was ever held.
+    fn answer_write(&self, pid: Pid) -> bool {
+        let holds = &self.write_holds;
+        let mut apps = holds.apps.lock().unwrap_or_else(PoisonError::into_inner);
+        if !apps.contains_key(&pid) {
+            return false;
+        }
+        let deadline = Instant::now() + WRITE_HOLD_LIMIT;
+        while let Some(app) = apps.get_mut(&pid)
+            && app.held
+        {
+            let now = Instant::now();
+            if now >= deadline {
+                app.held = false;
+                app.expired_holds += 1;
+                break;
+            }
+            apps = holds
+                .released
+                .wait_timeout(apps, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+
+    /// Writes a window's position, then its size, the way the app would. An
+    /// app that was ever held also reports each change back, as real apps do.
+    fn write_frame(&self, id: WinID, origin: Option<Origin>, size: Option<Size>) {
+        let Some(pid) = self.inner.force_read().windows.get(&id).map(|w| w.pid) else {
+            return;
+        };
+        let echo = self.answer_write(pid);
+        let mut inner = self.inner.force_write();
+        let Some(w) = inner.windows.get_mut(&id) else {
+            return;
+        };
+        if let Some(origin) = origin {
+            let size = w.frame.size();
+            w.frame.min = origin;
+            w.frame.max = origin + size;
+        }
+        if let Some(size) = size {
+            let max_width = if w.max_width > 0 {
+                w.max_width
+            } else {
+                i32::MAX
+            };
+            let width = size.x.max(w.min_width).min(max_width);
+            w.frame.max = w.frame.min + size.with_x(width);
+        }
+        if echo {
+            if origin.is_some() {
+                inner
+                    .event_queue
+                    .push_back(Event::WindowMoved { window_id: id });
+            }
+            if size.is_some() {
+                inner
+                    .event_queue
+                    .push_back(Event::WindowResized { window_id: id });
+            }
         }
     }
 
@@ -487,28 +622,12 @@ impl MockState {
         });
 
         let s = self.clone();
-        mw.expect_resize().returning(move |size| {
-            let mut inner = s.inner.force_write();
-            if let Some(w) = inner.windows.get_mut(&id) {
-                let max_width = if w.max_width > 0 {
-                    w.max_width
-                } else {
-                    i32::MAX
-                };
-                let width = size.x.max(w.min_width).min(max_width);
-                w.frame.max = w.frame.min + size.with_x(width);
-            }
-        });
+        mw.expect_resize()
+            .returning(move |size| s.write_frame(id, None, Some(size)));
 
-        let s_move = self.clone();
-        mw.expect_reposition().returning(move |origin| {
-            let mut inner = s_move.inner.force_write();
-            if let Some(w) = inner.windows.get_mut(&id) {
-                let size = w.frame.size();
-                w.frame.min = origin;
-                w.frame.max = origin + size;
-            }
-        });
+        let s = self.clone();
+        mw.expect_reposition()
+            .returning(move |origin| s.write_frame(id, Some(origin), None));
 
         let s = self.clone();
         mw.expect_focus_with_raise().returning(move |_psn| {
