@@ -108,11 +108,16 @@ fn test_focus_south_cycles_tabbed_stack_without_leaving_the_column() {
     commands.push(Event::Command {
         command: Command::Window(Operation::ToggleTabbedDisplay),
     });
-    // Start from a known tab: `Direction::First` focuses the leftmost
-    // column's `top()`, which is window 0 regardless of tabbed state.
+    // Start from a known tab. `Direction::First` returns to window 2, which
+    // had focus last in the column, so step up twice to window 0.
     commands.push(Event::Command {
         command: Command::Window(Operation::Focus(Direction::First)),
     });
+    for _ in 0..2 {
+        commands.push(Event::Command {
+            command: Command::Window(Operation::Focus(Direction::North)),
+        });
+    }
     let after_first = commands.len() - 1;
     commands.push(Event::Command {
         command: Command::Window(Operation::Focus(Direction::South)),
