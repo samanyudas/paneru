@@ -276,3 +276,30 @@ fn scrolling_a_hidden_column_into_view_removes_its_slice() {
     );
     assert_eq!(showing(harness.world()), vec![]);
 }
+
+#[test]
+fn closing_a_hidden_stack_member_resizes_the_slices_of_the_rest() {
+    let mut beside = stacked_first(&[LEFT], 6);
+    let mut below = stacked_first(&[BELOW], 6);
+
+    for harness in [&mut beside, &mut below] {
+        harness.mock_state.os_close_window(2);
+        harness.run(vec![]);
+        harness.advance(SETTLE);
+    }
+
+    let slices = showing(beside.world());
+    assert_eq!(
+        slices.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    let twins = [0, 1].map(|id| sliver(&mut below, id));
+    assert_eq!(
+        slices
+            .iter()
+            .map(|(_, slice)| (slice.on_screen, slice.in_window))
+            .collect::<Vec<_>>(),
+        twins.to_vec(),
+        "each slice is the sliver its window shows with the display below"
+    );
+}

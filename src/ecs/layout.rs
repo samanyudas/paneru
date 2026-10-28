@@ -162,8 +162,8 @@ type WindowFrames<'w, 's> = Query<
     (Without<LayoutStrip>, With<Window>),
 >;
 
-/// Windows the layout just assigned a new slot to, with the frame fields that
-/// slot has to be translated into.
+/// Windows the layout just assigned a new slot or size to, with the frame
+/// fields that slot has to be translated into.
 type RepositionedWindows<'w, 's> = Populated<
     'w,
     's,
@@ -175,7 +175,11 @@ type RepositionedWindows<'w, 's> = Populated<
         &'static mut Bounds,
         Option<&'static ResizeMarker>,
     ),
-    (Changed<LayoutPosition>, With<Window>, Without<LayoutStrip>),
+    (
+        Or<(Changed<LayoutPosition>, Changed<Bounds>)>,
+        With<Window>,
+        Without<LayoutStrip>,
+    ),
 >;
 
 /// Strips whose position or target offset changed this tick.
