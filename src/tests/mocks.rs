@@ -649,6 +649,15 @@ impl MockState {
         });
 
         let s = self.clone();
+        mw.expect_is_resizable().returning(move || {
+            !s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .is_some_and(|w| w.fixed_size)
+        });
+
+        let s = self.clone();
         mw.expect_border_radius().returning(move || {
             s.inner
                 .force_read()
