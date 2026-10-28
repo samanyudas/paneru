@@ -20,11 +20,17 @@ use tracing::{debug, warn};
 use crate::events::MouseButton;
 use crate::overlay::primary_screen_height;
 use crate::platform::WinID;
+use crate::types::commands::Side;
 
 /// Marks the user data of the events the engine posts, with the press id in
 /// the low 32 bits.
 const TAG: i64 = 0x6d69_7269 << 32;
 const TAG_MASK: i64 = !0xffff_ffff;
+
+/// How far inside the edge its slice shows a press lands. The outer points
+/// of a window are its resize border, where a press reaches no view and a
+/// double click stretches the window.
+const EDGE_INSET: f64 = 12.0;
 
 /// A painted slice panel, and the slice of the window it shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +41,7 @@ pub(crate) struct SlicePanel {
     /// `on_screen` in the window's points, from the top left corner of its
     /// shown frame.
     pub in_window: IRect,
+    pub side: Side,
 }
 
 impl SlicePanel {
@@ -83,8 +90,25 @@ pub(crate) struct SlicePress {
     /// The pressed point in the window, from the top left corner of its
     /// shown frame.
     pub at: CGPoint,
+    pub side: Side,
     pub button: MouseButton,
     pub flags: CGEventFlags,
+}
+
+impl SlicePress {
+    /// Where the press lands in its window once the window shows `shown`:
+    /// on the pressed row, at least [`EDGE_INSET`] inside the edge the slice
+    /// showed, or in the middle of a narrower window.
+    pub fn point_in(&self, shown: IRect) -> CGPoint {
+        let (min, max) = (f64::from(shown.min.x), f64::from(shown.max.x));
+        let inset = EDGE_INSET.min((max - min) / 2.0);
+        let x = min + self.at.x;
+        let x = match self.side {
+            Side::West => x.min(max - inset),
+            Side::East => x.max(min + inset),
+        };
+        CGPoint::new(x, f64::from(shown.min.y) + self.at.y)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,6 +227,7 @@ impl SliceTap {
                         x - f64::from(panel.on_screen.min.x) + f64::from(panel.in_window.min.x),
                         y - f64::from(panel.on_screen.min.y) + f64::from(panel.in_window.min.y),
                     ),
+                    side: panel.side,
                     button,
                     flags: pointer.flags,
                 })

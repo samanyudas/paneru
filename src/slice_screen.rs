@@ -87,6 +87,7 @@ impl SliceScreenOS {
                         window: *window,
                         on_screen: panel.slice.on_screen,
                         in_window: panel.slice.in_window,
+                        side: panel.slice.side,
                     })
                 })
                 .collect(),

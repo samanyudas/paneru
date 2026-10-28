@@ -262,10 +262,23 @@ fn painted_beside() -> (TestHarness, ScreenLog) {
 
 /// `painted_beside` with `config`, which turns slices on.
 pub(super) fn painted_beside_with(config: Config) -> (TestHarness, ScreenLog) {
-    let (mut harness, log) = beside(config, Screen::default());
-    let first = last_ask(&log, 3);
-    arrive(&mut harness, 3, first, Ok(photo(7)));
-    assert_eq!(log.borrow().painted, vec![(3, Digest(7))]);
+    painted(beside(config, Screen::default()), 3)
+}
+
+/// Window 0 shows a slice on the edge shared with the display to the left,
+/// with its first photo painted, under `config`, which turns slices on.
+pub(super) fn painted_west_with(config: Config) -> (TestHarness, ScreenLog) {
+    let laid_out = laid_out(config, Screen::default(), &[LEFT], 4, Some(Direction::Last));
+    painted(laid_out, 0)
+}
+
+fn painted(
+    (mut harness, log): (TestHarness, ScreenLog),
+    window: WinID,
+) -> (TestHarness, ScreenLog) {
+    let first = last_ask(&log, window);
+    arrive(&mut harness, window, first, Ok(photo(7)));
+    assert_eq!(log.borrow().painted, vec![(window, Digest(7))]);
     (harness, log)
 }
 

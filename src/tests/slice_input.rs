@@ -9,7 +9,7 @@ use bevy::prelude::With;
 use objc2_core_foundation::CGPoint;
 use objc2_core_graphics::CGEventFlags;
 
-use super::slice_photos::{ScreenLog, painted_beside_with};
+use super::slice_photos::{ScreenLog, painted_beside_with, painted_west_with};
 use super::*;
 use crate::config::{Config, MainOptions};
 use crate::ecs::FocusedMarker;
@@ -18,6 +18,7 @@ use crate::events::MouseButton;
 use crate::manager::WindowManager;
 use crate::platform::slice_tap::{Mouse, Pointer, SlicePanel, SlicePress, SliceTap, Verdict};
 use crate::platform::{Modifiers, WinID};
+use crate::types::commands::Side;
 
 const LEFT: MouseButton = MouseButton::Left;
 const SLIDE: Duration = Duration::from_secs(1);
@@ -32,7 +33,7 @@ type Reached = Vec<(Mouse, CGPoint, bool)>;
 struct Desk {
     harness: TestHarness,
     log: ScreenLog,
-    /// The panel of window 3 as the user first sees it, the only one.
+    /// The only panel, as the user first sees it.
     panel: SlicePanel,
     tap: SliceTap,
     reached: Reached,
@@ -40,29 +41,31 @@ struct Desk {
 }
 
 impl Desk {
+    /// Window 3 shows the panel, on the east edge.
     fn new(focus_follows_mouse: bool) -> Self {
-        let config: Config = (
-            MainOptions {
-                shared_edge_slices: Some(true),
-                focus_follows_mouse: Some(focus_follows_mouse),
-                ..MainOptions::default()
-            },
-            vec![],
-        )
-            .into();
-        let (harness, log) = painted_beside_with(config);
+        Self::of(painted_beside_with(config(focus_follows_mouse)), 3)
+    }
+
+    /// Window 0 shows the panel, on the west edge.
+    fn west() -> Self {
+        Self::of(painted_west_with(config(false)), 0)
+    }
+
+    fn of((harness, log): (TestHarness, ScreenLog), window: WinID) -> Self {
         let placed = log.borrow().placed.clone();
-        let [(3, slice)] = placed[..] else {
-            panic!("only window 3 has a panel: {placed:?}");
+        let [(shown, slice)] = placed[..] else {
+            panic!("only window {window} has a panel: {placed:?}");
         };
+        assert_eq!(shown, window, "{placed:?}");
         Self {
             harness,
             log,
             panel: SlicePanel {
-                panel: 1003,
-                window: 3,
+                panel: 1000 + window,
+                window,
                 on_screen: slice.on_screen,
                 in_window: slice.in_window,
+                side: slice.side,
             },
             tap: SliceTap::default(),
             reached: Vec::new(),
@@ -78,9 +81,10 @@ impl Desk {
         )
     }
 
-    /// The panel under `point`, while window 3 still has one there.
+    /// The panel under `point`, while its window still has one there.
     fn panel_at(&self, point: CGPoint) -> Option<SlicePanel> {
-        let showing = self.log.borrow().placed.iter().any(|(id, _)| *id == 3);
+        let window = self.panel.window;
+        let showing = self.log.borrow().placed.iter().any(|(id, _)| *id == window);
         Some(self.panel).filter(|panel| showing && panel.contains(point))
     }
 
@@ -185,15 +189,32 @@ impl Desk {
             .ok()
     }
 
-    /// Where the pressed point of window 3 lies once it is in view.
+    /// Where a press on the panel at `pressed` lands once the window is in
+    /// view: on the pressed row, 12 points inside the edge the panel shows.
     fn pressed_in_view(&self, pressed: CGPoint) -> CGPoint {
         let panel = self.panel;
-        let frame = self.frame(3);
+        let frame = self.frame(panel.window);
+        let x = match panel.side {
+            Side::West => frame.max.x - 12,
+            Side::East => frame.min.x + 12,
+        };
         CGPoint::new(
-            f64::from(frame.min.x + panel.in_window.min.x - panel.on_screen.min.x) + pressed.x,
+            f64::from(x),
             f64::from(frame.min.y + panel.in_window.min.y - panel.on_screen.min.y) + pressed.y,
         )
     }
+}
+
+fn config(focus_follows_mouse: bool) -> Config {
+    (
+        MainOptions {
+            shared_edge_slices: Some(true),
+            focus_follows_mouse: Some(focus_follows_mouse),
+            ..MainOptions::default()
+        },
+        vec![],
+    )
+        .into()
 }
 
 fn on_display(frame: IRect) -> bool {
@@ -216,7 +237,7 @@ fn a_press_on_a_panel_focuses_and_reveals_its_window_and_posts_nothing_before_it
 }
 
 #[test]
-fn a_held_press_arrives_as_one_posted_press_at_the_pressed_point() {
+fn a_held_press_arrives_as_one_posted_press() {
     let mut desk = Desk::new(false);
     let pressed = desk.on_panel();
 
@@ -228,6 +249,29 @@ fn a_held_press_arrives_as_one_posted_press_at_the_pressed_point() {
     assert_eq!(desk.posted.len(), 1, "{:?}", desk.posted);
     assert_eq!((desk.posted[0].0.button, desk.posted[0].1), (LEFT, target));
     assert_eq!(desk.reached, vec![(Mouse::Down(LEFT), target, true)]);
+}
+
+#[test]
+fn a_press_lands_on_its_row_12_points_inside_the_edge_its_panel_shows() {
+    for mut desk in [Desk::new(false), Desk::west()] {
+        let pressed = desk.on_panel();
+
+        desk.user(Mouse::Down(LEFT), pressed);
+        desk.user(Mouse::Up(LEFT), pressed);
+        desk.wait(SLIDE);
+
+        let landed = desk
+            .posted
+            .iter()
+            .map(|(_, point)| *point)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            landed,
+            vec![desk.pressed_in_view(pressed)],
+            "{:?} panel",
+            desk.panel.side
+        );
+    }
 }
 
 #[test]
@@ -384,6 +428,7 @@ fn the_tap_lets_through_only_the_posted_press_it_waits_for() {
         window: 42,
         on_screen: IRect::new(1019, 20, 1024, 200),
         in_window: IRect::new(395, 0, 400, 180),
+        side: Side::West,
     };
     let user = |mouse, x, y, panel| Pointer {
         mouse,

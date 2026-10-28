@@ -1,6 +1,6 @@
 //! A press on an edge slice panel: the engine focuses the window the panel
-//! shows and scrolls it into view, then posts the press again at the pressed
-//! point once the window is there.
+//! shows and scrolls it into view, then posts the press again on the pressed
+//! row once the window is there.
 
 use std::time::Duration;
 
@@ -9,7 +9,6 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_exists};
 use bevy::prelude::{Commands, Entity, Has, Query, Res, Resource, Time};
-use objc2_core_foundation::CGPoint;
 use tracing::debug;
 
 use crate::commands::focus_with_verification;
@@ -80,7 +79,7 @@ fn reveal_pressed(
 }
 
 /// Posts the press once its window rests on a display where the window
-/// server sends a press at the pressed point to it.
+/// server sends the press to it.
 fn deliver_press(
     pending: Res<PendingPress>,
     windows: Query<(&Window, Has<RepositionMarker>, Has<ResizeMarker>)>,
@@ -109,11 +108,7 @@ fn deliver_press(
     if moving || resizing || window.write_pending() {
         return;
     }
-    let origin = window.margins().shown(window.frame()).min;
-    let point = CGPoint::new(
-        f64::from(origin.x) + press.at.x,
-        f64::from(origin.y) + press.at.y,
-    );
+    let point = press.point_in(window.shown_frame());
     let on_display = displays
         .iter()
         .any(|display| display.bounds().contains(origin_from(point)));
