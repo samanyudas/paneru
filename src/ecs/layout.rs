@@ -3251,13 +3251,14 @@ fn overlap_area(a: IRect, b: IRect) -> i64 {
     }
 }
 
-/// Whether more of `frame` lies on another display than on `own`. macOS then
-/// moves the window into that display's space and draws it there.
-fn lies_mostly_elsewhere(frame: IRect, own: IRect, others: &[IRect]) -> bool {
-    let home = overlap_area(frame, own);
+/// Whether `shown`, the frame a window shows, has its center or more of
+/// itself on another display than on `own`. macOS then moves the window into
+/// that display's space and draws it there.
+fn lies_mostly_elsewhere(shown: IRect, own: IRect, others: &[IRect]) -> bool {
+    let home = overlap_area(shown, own);
     others
         .iter()
-        .any(|other| overlap_area(frame, *other) > home)
+        .any(|other| other.contains(shown.center()) || overlap_area(shown, *other) > home)
 }
 
 /// `frame`, or its bottom tuck when more of it lies on another of `displays`
@@ -3275,7 +3276,7 @@ fn keep_on_own_display(
         .map(|(other, _)| other.bounds())
         .filter(|other| *other != own)
         .collect();
-    if lies_mostly_elsewhere(frame, own, &others) {
+    if lies_mostly_elsewhere(margins.shown(frame), own, &others) {
         bottom_tuck(frame, own, sliver, margins, &others).unwrap_or(frame)
     } else {
         frame
@@ -3302,11 +3303,14 @@ fn bottom_tuck(
     };
     let at = |x: i32| IRect::from_corners(IVec2::new(x, y), IVec2::new(x, y) + size);
     let corner = at(corner);
-    if others.iter().all(|other| overlap_area(corner, *other) == 0) {
+    if others
+        .iter()
+        .all(|other| overlap_area(margins.shown(corner), *other) == 0)
+    {
         return Some(corner);
     }
     let flush = at(flush);
-    (!lies_mostly_elsewhere(flush, own, others)).then_some(flush)
+    (!lies_mostly_elsewhere(margins.shown(flush), own, others)).then_some(flush)
 }
 
 /// Where a column of `size` goes for `anchor`, kept inside `viewport`.

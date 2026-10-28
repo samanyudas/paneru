@@ -170,3 +170,35 @@ fn moving_a_display_beside_a_parked_column_keeps_the_column_in_its_strip() {
         vec![vec![100]]
     );
 }
+
+#[test]
+fn a_column_centered_past_a_shared_edge_tucks() {
+    // Window 1 spans 724 to 1354: its center is on the shorter display beside,
+    // while the area on each display is the same.
+    let ext = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        700,
+    );
+    let mut harness = TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
+        .with_window(0, |window| {
+            window.frame = IRect::new(0, 0, 724, TEST_WINDOW_HEIGHT);
+        })
+        .with_window(1, |window| {
+            window.frame = IRect::new(0, 0, 630, TEST_WINDOW_HEIGHT);
+        });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(SETTLE);
+    assert_eq!(
+        frame(harness.world(), 0).min.x,
+        0,
+        "window 0 starts the strip"
+    );
+    let past = frame(harness.world(), 1);
+    assert!(
+        !ext.contains(past.center()) && area(past.intersect(ext)) <= area(past.intersect(OWN)),
+        "window 1 lies on the display beside: {past:?}"
+    );
+}
