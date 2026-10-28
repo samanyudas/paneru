@@ -95,6 +95,8 @@ struct MockStateInner {
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
     unordered_windows: HashSet<WinID>,
+    /// Windows still on screen whose app does not answer AX requests for them.
+    unresponsive_windows: HashSet<WinID>,
     /// Windows the app keeps out of its accessibility window list while the
     /// window server still reports them on screen: a background native tab.
     background_tabs: HashSet<WinID>,
@@ -124,6 +126,7 @@ impl MockState {
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
+                unresponsive_windows: HashSet::new(),
                 background_tabs: HashSet::new(),
                 raised: Vec::new(),
                 app_reads: HashMap::new(),
@@ -403,6 +406,23 @@ impl MockState {
         inner.unordered_windows.insert(id);
     }
 
+    /// Stops the app answering AX requests for a window it keeps on screen,
+    /// as apps do for a moment while macOS moves their windows to another
+    /// display or Space. Only the SLS space notification reports it.
+    pub fn os_stall_window(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        inner.unresponsive_windows.insert(id);
+        inner.event_queue.push_back(Event::WindowDestroyed {
+            window_id: id,
+            source: DestroySource::SpaceNotification,
+        });
+    }
+
+    /// Lets the app answer AX requests for a stalled window again.
+    pub fn os_resume_window(&self, id: WinID) {
+        self.inner.force_write().unresponsive_windows.remove(&id);
+    }
+
     /// Lets the app's window list catch up with reality after a close.
     #[allow(unused)]
     pub fn os_settle_window_list(&self) {
@@ -579,8 +599,10 @@ impl MockState {
         });
 
         let s = self.clone();
-        mw.expect_is_alive()
-            .returning(move || s.inner.force_read().windows.contains_key(&id));
+        mw.expect_is_alive().returning(move || {
+            let inner = s.inner.force_read();
+            inner.windows.contains_key(&id) && !inner.unresponsive_windows.contains(&id)
+        });
 
         let s = self.clone();
         // An empty subrole models a window without an `AXSubrole` attribute,
