@@ -27,8 +27,9 @@ use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, AwaitResize, Bounds, DockPosition, Initializing, LayoutPosition,
-    Position, RepositionMarker, ResizeAnchor, ResizeMarker, RestoreWindowState, Scrolling,
-    SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, WidthRatio, WindowProperties,
+    Position, RepositionMarker, ResizeAnchor, ResizeMarker, ResizeRun, RestoreWindowState,
+    Scrolling, SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, WidthRatio,
+    WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -1601,6 +1602,7 @@ type UnanchoredWindows<'w, 's> = Query<
         Option<&'static RepositionMarker>,
         &'static Bounds,
         Option<&'static AwaitResize>,
+        Option<&'static ResizeRun>,
     ),
     Without<ResizeAnchor>,
 >;
@@ -1630,26 +1632,27 @@ type RefusedResizes<'w, 's> = Populated<
 >;
 
 /// Records the center a window resizes around. A resize that starts while an
-/// earlier one waits on the app, with the window still in place, keeps the
-/// earlier center.
+/// earlier one waits on the app, or while a run of width commands holds, with
+/// the window still in place, keeps the earlier center.
 pub(super) fn record_resize_anchor(
     trigger: On<Insert, ResizeMarker>,
     windows: UnanchoredWindows,
     mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
-    let Ok((position, reposition, bounds, waiting)) = windows.get(entity) else {
+    let Ok((position, reposition, bounds, waiting, run)) = windows.get(entity) else {
         return;
     };
     let x = destination_x(position, reposition);
-    let center = waiting.filter(|waiting| waiting.x == x).map_or_else(
-        || {
+    let center = waiting
+        .filter(|waiting| waiting.x == x)
+        .map(|waiting| x + waiting.anchor_offset)
+        .or_else(|| run.filter(|run| run.x == x).map(|run| run.center))
+        .unwrap_or_else(|| {
             IRect::from_corners(position.0, position.0 + bounds.0)
                 .center()
                 .x
-        },
-        |waiting| x + waiting.anchor_offset,
-    );
+        });
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         entity_commands.try_insert(ResizeAnchor(center));
         entity_commands.try_remove::<AwaitResize>();

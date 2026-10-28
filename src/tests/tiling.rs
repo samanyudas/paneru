@@ -7,9 +7,11 @@ use crate::config::{
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{ActiveWorkspaceMarker, SpawnWindowTrigger};
 use crate::events::{DestroySource, Event};
+use crate::platform::Modifiers;
 use crate::{assert_focused, assert_window_at, assert_window_size};
 use bevy::math::IRect;
 use bevy::prelude::*;
+use objc2_core_foundation::CGPoint;
 
 use super::*;
 
@@ -1842,6 +1844,7 @@ fn focused_last_column_short_of_the_edge() -> TestHarness {
         MainOptions {
             auto_center: Some(false),
             preset_column_widths: vec![0.25, 0.5, 0.75],
+            mouse_resize_modifier: Some(Modifiers::ALT),
             ..Default::default()
         },
         vec![params],
@@ -1878,6 +1881,99 @@ fn test_window_resize_preset_cycle_returns_a_clamped_last_column_to_its_center()
     harness.advance(Duration::from_secs(1));
     assert_window_size!(harness.world(), 1, 256, 748);
     assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
+}
+
+#[test]
+fn test_window_resize_after_a_focus_change_uses_a_fresh_center() {
+    let mut harness = focused_last_column_short_of_the_edge();
+
+    harness.world().write_message::<Event>(grow());
+    harness.advance(Duration::from_secs(1));
+    assert_window_at!(harness.world(), 1, 256, TEST_MENUBAR_HEIGHT);
+    for direction in [Direction::First, Direction::Last] {
+        harness.world().write_message::<Event>(Event::Command {
+            command: Command::Window(Operation::Focus(direction)),
+        });
+        harness.advance(Duration::from_secs(1));
+    }
+    harness.world().write_message::<Event>(grow());
+    harness.advance(Duration::from_secs(1));
+
+    assert_window_size!(harness.world(), 1, 256, 748);
+    assert_window_at!(harness.world(), 1, 512, TEST_MENUBAR_HEIGHT);
+}
+
+#[test]
+fn test_window_resize_after_a_neighbour_closes_uses_a_fresh_center() {
+    let mut harness = focused_last_column_short_of_the_edge();
+
+    harness.world().write_message::<Event>(grow());
+    harness.advance(Duration::from_secs(1));
+    assert_window_at!(harness.world(), 1, 256, TEST_MENUBAR_HEIGHT);
+    harness.mock_state.os_close_window(0);
+    harness.advance(Duration::from_secs(2));
+    assert_window_at!(harness.world(), 1, -205, TEST_MENUBAR_HEIGHT);
+    harness.world().write_message::<Event>(grow());
+    harness.advance(Duration::from_secs(1));
+
+    // Centered on x = 179, where the window stands after the close.
+    assert_window_size!(harness.world(), 1, 256, 748);
+    assert_window_at!(harness.world(), 1, 51, TEST_MENUBAR_HEIGHT);
+}
+
+#[test]
+fn test_window_resize_after_the_display_moves_uses_a_fresh_center() {
+    let mut harness = focused_last_column_short_of_the_edge();
+
+    harness.world().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Resize(ResizeDirection::Shrink)),
+    });
+    harness.advance(Duration::from_secs(1));
+    assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(120, 0, TEST_DISPLAY_WIDTH + 120, TEST_DISPLAY_HEIGHT - 100),
+    );
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayConfigured {
+            display_id: TEST_DISPLAY_ID,
+        });
+    harness.advance(Duration::from_secs(2));
+    assert_window_at!(harness.world(), 1, 683, TEST_MENUBAR_HEIGHT);
+    harness.world().write_message::<Event>(grow());
+    harness.advance(Duration::from_secs(1));
+
+    // Centered on x = 811, where the window stands after the display moved.
+    assert_window_size!(harness.world(), 1, 512, 648);
+    assert_window_at!(harness.world(), 1, 555, TEST_MENUBAR_HEIGHT);
+}
+
+#[test]
+fn test_window_resize_after_a_mouse_drag_uses_a_fresh_center() {
+    let mut harness = focused_last_column_short_of_the_edge();
+
+    harness.world().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Resize(ResizeDirection::Shrink)),
+    });
+    harness.advance(Duration::from_secs(1));
+    assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
+    for x in [750.0, 760.0] {
+        harness.world().write_message::<Event>(Event::MouseMoved {
+            point: CGPoint { x, y: 400.0 },
+            modifiers: Modifiers::LALT,
+        });
+        harness.advance(Duration::from_millis(100));
+    }
+    harness.advance(Duration::from_secs(1));
+    assert_window_size!(harness.world(), 1, 306, 748);
+    assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
+    harness.world().write_message::<Event>(grow());
+    harness.advance(Duration::from_secs(1));
+
+    // Centered on x = 716, where the window stands after the drag.
+    assert_window_size!(harness.world(), 1, 512, 748);
+    assert_window_at!(harness.world(), 1, 460, TEST_MENUBAR_HEIGHT);
 }
 
 #[test]

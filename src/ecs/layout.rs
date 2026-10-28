@@ -18,7 +18,7 @@ use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
     ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, ResizeAnchor,
-    ResizeMarker, Scrolling, SpawnCommandsExt,
+    ResizeMarker, ResizeRun, Scrolling, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -1340,6 +1340,7 @@ pub(super) fn reshuffle_layout_strip(
     strips: StripPlacements,
     manual_offsets: Query<&ManualStripOffset>,
     anchors: Query<&ResizeAnchor>,
+    mut runs: Query<&mut ResizeRun>,
     displays: DisplayViewports,
     windows: Windows,
     config: Res<Config>,
@@ -1470,6 +1471,11 @@ pub(super) fn reshuffle_layout_strip(
             }
         }
 
+        // The next width press keeps the run's center only if nothing else
+        // moves the window from here.
+        if resizing && let Ok(mut run) = runs.get_mut(entity) {
+            run.x = strip_position.x + layout_position.0.x;
+        }
         trace!("reshuffle_layout_strip: triggered for entity {entity}, offset {strip_position}");
         commands.reposition_entity(ctx.strip_entity, strip_position);
     });

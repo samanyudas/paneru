@@ -15,7 +15,7 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{GlobalState, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, RepositionMarker,
-    Scrolling, SpawnCommandsExt, UpdateSet,
+    ResizeRun, Scrolling, SpawnCommandsExt, UpdateSet,
 };
 use bevy::ecs::schedule::common_conditions::on_message;
 
@@ -372,6 +372,9 @@ fn mouse_resize_trigger(
             frame.min.x += dx;
         } else {
             frame.max.x += dx;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<ResizeRun>();
         }
         commands.resize_entity(entity, frame.size());
     }

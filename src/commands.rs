@@ -28,8 +28,8 @@ use crate::ecs::scroll::{PageFocusRequest, PageGestureState, PageInFlight};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, AwaitResize, Bounds, DockPosition, FocusedMarker,
     FullWidthMarker, ManualStripOffset, NativeFullscreenMarker, Position, RaiseWindow,
-    RepositionMarker, ResizeAnchor, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt,
-    Timeout, Unmanaged,
+    RepositionMarker, ResizeAnchor, ResizeRun, SelectedVirtualMarker, SendMessageTrigger,
+    SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -151,6 +151,8 @@ pub fn register_commands(app: &mut bevy::app::App) {
 }
 
 type ResizeIntents<'w, 's> = Query<'w, 's, Entity, Or<(With<ResizeAnchor>, With<AwaitResize>)>>;
+type ResizeIntentsAndRuns<'w, 's> =
+    Query<'w, 's, Entity, Or<(With<ResizeAnchor>, With<AwaitResize>, With<ResizeRun>)>>;
 
 fn cancel_resize_intent(
     mut messages: MessageReader<Event>,
@@ -214,12 +216,12 @@ fn cancel_resize_intent(
 
 fn cancel_resize_intent_on_focus(
     _trigger: On<Add, FocusedMarker>,
-    intents: ResizeIntents,
+    intents: ResizeIntentsAndRuns,
     mut commands: Commands,
 ) {
     for entity in intents {
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_remove::<(ResizeAnchor, AwaitResize)>();
+            entity_commands.try_remove::<(ResizeAnchor, AwaitResize, ResizeRun)>();
         }
     }
 }
@@ -942,6 +944,7 @@ fn command_center_window(
 fn resize_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
+    runs: Query<&ResizeRun>,
     active_display: ActiveDisplay,
     config: Res<Config>,
     mut commands: Commands,
@@ -1017,6 +1020,17 @@ fn resize_window(
         }
     }
 
+    let x = windows
+        .moving_frame(entity)
+        .map_or(frame.min.x, |frame| frame.min.x);
+    let center = runs
+        .get(entity)
+        .ok()
+        .filter(|run| run.x == x)
+        .map_or(frame.center().x, |run| run.center);
+    if let Ok(mut cmds) = commands.get_entity(entity) {
+        cmds.try_insert(ResizeRun { center, x });
+    }
     commands.resize_entity(entity, size);
     commands.reshuffle_around(entity);
 }
