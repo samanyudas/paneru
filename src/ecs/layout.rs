@@ -3285,7 +3285,7 @@ fn keep_on_own_display(
 
 /// `frame` tucked below the bottom edge of `own`, against the side it hangs
 /// past, with `sliver` points of the window showing. It hangs past that
-/// corner when no other display is there, and otherwise sits flush inside the
+/// corner when no other display is there, and otherwise shows flush inside the
 /// side. `None` when a display below `own` takes most of either.
 fn bottom_tuck(
     frame: IRect,
@@ -3297,9 +3297,15 @@ fn bottom_tuck(
     let size = frame.size();
     let y = own.max.y - sliver - margins.min.y;
     let (corner, flush) = if frame.center().x < own.center().x {
-        (own.min.x - size.x + sliver + margins.max.x, own.min.x)
+        (
+            own.min.x - size.x + sliver + margins.max.x,
+            own.min.x - margins.min.x,
+        )
     } else {
-        (own.max.x - sliver - margins.min.x, own.max.x - size.x)
+        (
+            own.max.x - sliver - margins.min.x,
+            own.max.x - size.x + margins.max.x,
+        )
     };
     let at = |x: i32| IRect::from_corners(IVec2::new(x, y), IVec2::new(x, y) + size);
     let corner = at(corner);
