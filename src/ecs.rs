@@ -427,6 +427,16 @@ pub struct AwaitResize {
 #[derive(Component, Debug)]
 pub struct ResizeAnchor(pub i32);
 
+/// The center a run of width commands resizes the window around. The run
+/// holds only while the window stays at `x`, where the run last placed its
+/// left edge. Once anything else moves the window, the next resize starts a
+/// new run from where the window stands.
+#[derive(Component, Debug)]
+pub struct ResizeRun {
+    pub center: i32,
+    pub x: i32,
+}
+
 /// Marker component indicating that windows around the marked entity need to be reshuffled.
 #[derive(Component)]
 pub struct ReshuffleAroundMarker;
