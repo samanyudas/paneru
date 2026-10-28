@@ -1028,11 +1028,13 @@ impl WindowProperties {
         Self { params }
     }
 
-    pub fn floating(&self) -> bool {
+    /// Whether `window` floats on its own. A rule decides first. Without one,
+    /// a window that cannot be resized floats, since it cannot fill a column.
+    pub fn floating(&self, window: &Window) -> bool {
         self.params
             .iter()
             .find_map(|props| props.floating)
-            .unwrap_or(false)
+            .unwrap_or_else(|| !window.is_resizable())
     }
 
     pub fn insertion(&self) -> Option<usize> {
