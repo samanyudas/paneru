@@ -2548,6 +2548,116 @@ fn test_first_launch_creates_parseable_config_without_overwriting_it() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(test)]
+const STARTUP_LOOKUP_CHILD: &str = "PANERU_TEST_STARTUP_LOOKUP_CHILD";
+
+/// Child half of [`startup_config_lookup`]. The guard keeps an
+/// `--include-ignored` run from reading the real environment.
+#[test]
+#[ignore = "run by startup_config_lookup in a child process"]
+fn startup_config_lookup_child() {
+    if env::var_os(STARTUP_LOOKUP_CHILD).is_none() {
+        return;
+    }
+    // Same order as `setup_bevy_app`.
+    #[cfg(feature = "lua")]
+    ensure_lua_file().unwrap();
+    let found = CONFIGURATION_FILE
+        .as_deref()
+        .map(|path| path.display().to_string());
+    println!("{STARTUP_LOOKUP_CHILD}={}", found.unwrap_or_default());
+}
+
+/// Resolves the startup configuration in a child test process whose `HOME`,
+/// XDG directories, and `$PANERU_CONFIG` all point into `root`. The lookup
+/// reads process-wide state (the environment and a `LazyLock`), so it cannot
+/// run in this shared test process.
+#[cfg(test)]
+fn startup_config_lookup(root: &Path, explicit: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new(env::current_exe().unwrap())
+        .args([
+            "config::startup_config_lookup_child",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(STARTUP_LOOKUP_CHILD, "1")
+        .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env("XDG_CONFIG_DIRS", root.join("xdg-dirs"))
+        .env("PANERU_CONFIG", explicit)
+        .env_remove("PANERU_LUA")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "child lookup failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let found = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{STARTUP_LOOKUP_CHILD}=")))
+        .unwrap_or_else(|| panic!("child lookup did not run:\n{stdout}"));
+    (!found.is_empty()).then(|| PathBuf::from(found))
+}
+
+#[cfg(test)]
+fn scratch_config_root(name: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "paneru-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    create_dir_all(root.join("home")).unwrap();
+    root
+}
+
+#[test]
+fn test_explicit_config_path_wins_over_a_config_in_home() {
+    let root = scratch_config_root("explicit-over-home");
+    let standalone = root.join("home").join(".paneru.toml");
+    let custom = "[options]\nauto_center = false\n\n[bindings]\n";
+    std::fs::write(&standalone, custom).unwrap();
+    let explicit = root.join("app").join("paneru.toml");
+
+    assert_eq!(
+        startup_config_lookup(&root, &explicit),
+        Some(explicit.clone())
+    );
+    assert_eq!(
+        std::fs::read_to_string(&explicit).unwrap(),
+        DEFAULT_CONFIGURATION
+    );
+    assert_eq!(std::fs::read_to_string(&standalone).unwrap(), custom);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn test_missing_explicit_config_is_created_at_that_path() {
+    let root = scratch_config_root("explicit-missing");
+    let explicit = root.join("app").join("paneru.toml");
+
+    assert_eq!(
+        startup_config_lookup(&root, &explicit),
+        Some(explicit.clone())
+    );
+    assert_eq!(
+        std::fs::read_to_string(&explicit).unwrap(),
+        DEFAULT_CONFIGURATION
+    );
+    assert!(
+        !root.join("xdg").exists(),
+        "nothing should be created in the XDG configuration directory"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn defaults_config_matches_the_generated_stub() {
     let stub = InnerConfig::new(DEFAULT_CONFIGURATION).expect("the stub should parse");
