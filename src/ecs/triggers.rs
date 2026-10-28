@@ -1,5 +1,5 @@
-use bevy::ecs::change_detection::DetectChangesMut;
-use bevy::ecs::entity::Entity;
+use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut};
+use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::lifecycle::{Add, Insert, Remove, RemovedComponents};
 use bevy::ecs::message::{MessageReader, MessageWriter};
@@ -17,7 +17,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 use super::{
     ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive, OpenedFrom,
     PreviousManagedStrip, RetryFrontSwitch, SelectedVirtualMarker, SpawnWindowTrigger,
-    StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    StrayFocusEvent, SystemTheme, Timeout, Unmanaged, UnresponsiveWindow,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -953,6 +953,8 @@ pub(super) fn window_managed_trigger(
 /// * `focus_history` - Per-workspace record of what was focused last.
 /// * `windows` - A query for all windows with their parent.
 /// * `openers` - The window each window was opened from, if any.
+/// * `unresponsive` - Windows already waiting for their app to answer AX.
+/// * `window_manager` - Tells whether the window server still has a window on screen.
 /// * `commands` - Bevy commands to despawn entities and trigger events.
 #[instrument(level = Level::DEBUG, skip_all)]
 #[allow(clippy::too_many_arguments)]
@@ -964,8 +966,11 @@ pub(super) fn window_destroyed_trigger(
     mut focus_history: ResMut<FocusHistory>,
     windows: Windows,
     openers: Query<&OpenedFrom>,
+    unresponsive: Query<(), With<UnresponsiveWindow>>,
+    window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
+    let mut confirmed = EntityHashSet::new();
     for event in messages.read() {
         let Event::WindowDestroyed { window_id, source } = event else {
             continue;
@@ -984,12 +989,31 @@ pub(super) fn window_destroyed_trigger(
         // the app's AX window list is still warm for a moment after the close. Re-checking them
         // raced the window back to life, leaving the entity in the strip and a permanent gap where
         // the window had been.
-        if matches!(source, DestroySource::SpaceNotification) && window.is_alive() {
-            debug!(
-                "Window {} still present, this was SLS workspace change.",
-                window.id()
-            );
-            continue;
+        if matches!(source, DestroySource::SpaceNotification) {
+            // Asking a stalled app again would block for another AX timeout. A window that
+            // left several spaces gets one notification per space in the same frame.
+            if unresponsive.contains(entity) || !confirmed.insert(entity) {
+                continue;
+            }
+            if window.is_alive() {
+                debug!(
+                    "Window {} still present, this was SLS workspace change.",
+                    window.id()
+                );
+                continue;
+            }
+            // A failed read can also be an app that is busy while macOS moves its window to
+            // another display or Space. A window the window server still shows is not closed.
+            if !window_manager.window_is_unordered(*window_id) {
+                debug!("Window {window_id} is on screen but its app does not answer; waiting.");
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert_if_new(UnresponsiveWindow {
+                        waited: Duration::ZERO,
+                        reads_left: UNRESPONSIVE_WINDOW_READS,
+                    });
+                }
+                continue;
+            }
         }
 
         let Ok(mut app) = apps.get_mut(parent) else {
@@ -1016,6 +1040,81 @@ pub(super) fn window_destroyed_trigger(
 
         // The window entity will be removed from the layout strip in the On<Remove> trigger.
     }
+}
+
+/// A stalled app blocks the main thread for one AX timeout per read, so a
+/// waiting window is read once per interval, not on every frame.
+const UNRESPONSIVE_WINDOW_READ_INTERVAL: Duration = Duration::from_secs(1);
+/// Three reads, the last 3 s into the wait. After a lid open, an AX call to
+/// Helium still timed out about 1.9 s after the first failed read.
+const UNRESPONSIVE_WINDOW_READS: u32 = 3;
+
+/// Reads the most overdue [`UnresponsiveWindow`] again and keeps it as soon as
+/// its app answers. Closes a waiting window at once if the window server stops
+/// showing it, and after its last read if its app still does not answer.
+///
+/// At most one window is read per frame, so a frame blocks on at most one AX
+/// timeout however many apps are stalled. The others stay due for later frames.
+pub(super) fn confirm_unresponsive_windows(
+    mut waiting: Populated<(Entity, &Window, &mut UnresponsiveWindow)>,
+    window_manager: Res<WindowManager>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    let mut most_overdue: Option<(Entity, Duration)> = None;
+    for (entity, window, mut wait) in &mut waiting {
+        // The frame that started the wait also ran the failed AX reads. This
+        // frame's delta includes that blocked time, which the app never had.
+        if wait.is_added() {
+            continue;
+        }
+        if window_manager.window_is_unordered(window.id()) {
+            debug!(
+                "Window {} left the screen while its app did not answer; removing it.",
+                window.id()
+            );
+            close_unresponsive_window(entity, window.id(), &mut commands);
+            continue;
+        }
+        wait.waited += time.delta();
+        if wait.waited >= UNRESPONSIVE_WINDOW_READ_INTERVAL
+            && most_overdue.is_none_or(|(_, waited)| wait.waited > waited)
+        {
+            most_overdue = Some((entity, wait.waited));
+        }
+    }
+
+    let Some((entity, _)) = most_overdue else {
+        return;
+    };
+    let Ok((_, window, mut wait)) = waiting.get_mut(entity) else {
+        return;
+    };
+    if window.is_alive() {
+        debug!("Window {} answers again; keeping it.", window.id());
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<UnresponsiveWindow>();
+        }
+        return;
+    }
+    // Counting from when the read was due, not when it ran, keeps a read that
+    // waited its turn from pushing back the window's later reads.
+    wait.waited -= UNRESPONSIVE_WINDOW_READ_INTERVAL;
+    wait.reads_left = wait.reads_left.saturating_sub(1);
+    if wait.reads_left == 0 {
+        debug!("Window {} still does not answer; removing it.", window.id());
+        close_unresponsive_window(entity, window.id(), &mut commands);
+    }
+}
+
+fn close_unresponsive_window(entity: Entity, window_id: WinID, commands: &mut Commands) {
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<UnresponsiveWindow>();
+    }
+    commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
+        window_id,
+        source: DestroySource::Accessibility,
+    }));
 }
 
 /// Drops a window's cached title when its app reports the title changed.

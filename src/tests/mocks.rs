@@ -106,6 +106,9 @@ struct MockStateInner {
     /// How many times each app has been asked for its focused window or its
     /// window list, so a test can check who a lookup bothers.
     app_reads: HashMap<Pid, usize>,
+    /// AX liveness reads per window, so tests can bound how often a stalled
+    /// app is asked.
+    alive_reads: HashMap<WinID, usize>,
 }
 
 #[derive(Clone)]
@@ -130,6 +133,7 @@ impl MockState {
                 background_tabs: HashSet::new(),
                 raised: Vec::new(),
                 app_reads: HashMap::new(),
+                alive_reads: HashMap::new(),
             })),
         }
     }
@@ -153,6 +157,16 @@ impl MockState {
     /// list since this was last called.
     pub fn take_app_reads(&self, pid: Pid) -> usize {
         self.inner.force_write().app_reads.remove(&pid).unwrap_or(0)
+    }
+
+    /// How many times `window_id` has been checked with `is_alive` since this
+    /// was last called.
+    pub fn take_alive_reads(&self, window_id: WinID) -> usize {
+        self.inner
+            .force_write()
+            .alive_reads
+            .remove(&window_id)
+            .unwrap_or(0)
     }
 
     /// Makes `window_id` a background native tab: on screen as far as the
@@ -600,7 +614,8 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_is_alive().returning(move || {
-            let inner = s.inner.force_read();
+            let mut inner = s.inner.force_write();
+            *inner.alive_reads.entry(id).or_default() += 1;
             inner.windows.contains_key(&id) && !inner.unresponsive_windows.contains(&id)
         });
 

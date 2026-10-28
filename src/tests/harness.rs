@@ -208,6 +208,16 @@ impl TestHarness {
         }
     }
 
+    /// Runs one frame whose delta is `delta`, as when the frame before it
+    /// blocked the main thread that long, for example on AX timeouts.
+    pub(crate) fn advance_after_blocked_frame(&mut self, delta: Duration) {
+        self.app
+            .insert_resource(TimeUpdateStrategy::ManualDuration(delta));
+        self.advance(FRAME);
+        self.app
+            .insert_resource(TimeUpdateStrategy::ManualDuration(FRAME));
+    }
+
     pub(crate) fn run(&mut self, commands: Vec<Event>) {
         let unreached: Vec<usize> = self
             .verifiers
@@ -281,6 +291,9 @@ fn setup_world() -> App {
         .add_plugins((register_triggers, register_systems, register_commands));
 
     bevy_app.insert_resource(TimeUpdateStrategy::ManualDuration(FRAME));
+    // Production's cap. Bevy's default of 250 ms would shorten a frame that
+    // follows a long block on the main thread.
+    bevy_app.insert_resource(Time::<Virtual>::from_max_delta(Duration::from_secs(10)));
 
     bevy_app
 }

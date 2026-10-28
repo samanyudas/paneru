@@ -349,6 +349,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::application_event_trigger,
             triggers::dispatch_application_messages,
             triggers::window_destroyed_trigger,
+            triggers::confirm_unresponsive_windows,
             triggers::invalidate_window_title,
             triggers::refresh_configuration_trigger,
             triggers::theme_change_trigger,
@@ -612,6 +613,20 @@ pub struct RetryFrontSwitch(pub Entity);
 #[derive(Component, Default)]
 pub struct VerifyFocus {
     pub asked_again: bool,
+}
+
+/// Holds a window that SLS reported leaving a space while its app did not
+/// answer AX for it and the window server still had it on screen. Apps do this
+/// for a few seconds while macOS moves their windows to another display or
+/// Space. The window is read again each time `waited` reaches the read
+/// interval, and closed if the window server stops showing it or no read is
+/// left.
+#[derive(Component)]
+pub struct UnresponsiveWindow {
+    /// Time since the wait began or the previous read was due, so the most
+    /// overdue window can be read first.
+    pub waited: Duration,
+    pub reads_left: u32,
 }
 
 #[derive(Component)]
