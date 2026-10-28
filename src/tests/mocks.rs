@@ -15,6 +15,7 @@ use crate::manager::{
     Application, Display, Margins, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin,
     Size, Window, WindowPadding, origin_from, origin_to,
 };
+use crate::platform::slice_tap::SlicePress;
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::util::AXUIWrapper;
 
@@ -211,6 +212,8 @@ struct MockStateInner {
     focused_desktop: Option<IRect>,
     /// Whether the window server sees the left mouse button down.
     left_button_down: bool,
+    /// The presses the engine posted, oldest first, each where it posted it.
+    posted_presses: Vec<(SlicePress, CGPoint)>,
     /// Windows raised above the rest, bottom to top. Windows not in it sit
     /// below, the lowest ID on top, so overlapping windows resolve the same
     /// way on every run.
@@ -449,6 +452,7 @@ impl MockState {
             cursor_position: Origin::ZERO,
             focused_desktop: None,
             left_button_down: false,
+            posted_presses: Vec::new(),
             raised: Vec::new(),
             event_queue: VecDeque::new(),
             stale_window_ids: HashMap::new(),
@@ -1166,6 +1170,11 @@ impl MockState {
 
     pub fn cursor_position(&self) -> IVec2 {
         self.inner.force_read().cursor_position
+    }
+
+    /// Takes the presses the engine posted since the last call.
+    pub fn take_posted_presses(&self) -> Vec<(SlicePress, CGPoint)> {
+        std::mem::take(&mut self.inner.force_write().posted_presses)
     }
 
     pub fn focused_desktop(&self) -> Option<IRect> {
@@ -1897,6 +1906,11 @@ impl MockState {
                 s.engine_waits.fetch_add(1, Ordering::Relaxed);
             }
             s.flush_writes(timeout)
+        });
+
+        let s = self.clone();
+        wm.expect_post_press().returning(move |press, point| {
+            s.inner.force_write().posted_presses.push((*press, point));
         });
 
         let s = self.clone();
