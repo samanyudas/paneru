@@ -325,6 +325,24 @@ fn a_drag_from_a_panel_goes_on_in_the_app_once_the_press_arrives() {
 }
 
 #[test]
+fn a_drag_released_before_it_arrives_reveals_its_window_and_reaches_no_app() {
+    let mut desk = Desk::new(false);
+    let pressed = desk.on_panel();
+
+    desk.user(Mouse::Down(LEFT), pressed);
+    desk.user(
+        Mouse::Dragged(LEFT),
+        CGPoint::new(pressed.x - 10.0, pressed.y),
+    );
+    desk.user(Mouse::Up(LEFT), CGPoint::new(pressed.x - 20.0, pressed.y));
+    desk.wait(SLIDE);
+
+    assert!(desk.reached.is_empty(), "{:?}", desk.reached);
+    assert!(on_display(desk.frame(3)), "{:?} in view", desk.frame(3));
+    assert_eq!(desk.focused(), vec![3]);
+}
+
+#[test]
 fn a_press_whose_window_never_arrives_gives_up_and_keeps_focus() {
     let mut desk = Desk::new(false);
     let pressed = desk.on_panel();

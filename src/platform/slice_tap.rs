@@ -186,10 +186,19 @@ pub(crate) enum Verdict {
 enum Gesture {
     #[default]
     Idle,
-    /// The tap holds `button` back until the engine posts press `id`.
-    Holding { id: u32, button: MouseButton },
+    /// The tap holds `button` back until the engine posts press `id`, and
+    /// notes whether the user dragged it meanwhile.
+    Holding {
+        id: u32,
+        button: MouseButton,
+        dragged: bool,
+    },
     /// As `Holding`, after the user released the button.
-    Released { id: u32, button: MouseButton },
+    Released {
+        id: u32,
+        button: MouseButton,
+        dragged: bool,
+    },
     /// The posted press went through, and the user's drags and release of
     /// `button` now reach the app.
     Passing { button: MouseButton, drags: u32 },
@@ -215,7 +224,11 @@ impl SliceTap {
                 };
                 self.presses = self.presses.wrapping_add(1);
                 let id = self.presses;
-                self.gesture = Gesture::Holding { id, button };
+                self.gesture = Gesture::Holding {
+                    id,
+                    button,
+                    dragged: false,
+                };
                 debug!(
                     "edge slice press swallowed: press {id} window {} at ({x:.0}, {y:.0})",
                     panel.window
@@ -232,11 +245,27 @@ impl SliceTap {
                     flags: pointer.flags,
                 })
             }
-            (Mouse::Dragged(dragged), Gesture::Holding { button, .. }) if dragged == button => {
+            (Mouse::Dragged(dragged), Gesture::Holding { id, button, .. }) if dragged == button => {
+                self.gesture = Gesture::Holding {
+                    id,
+                    button,
+                    dragged: true,
+                };
                 Verdict::Swallow
             }
-            (Mouse::Up(released), Gesture::Holding { id, button }) if released == button => {
-                self.gesture = Gesture::Released { id, button };
+            (
+                Mouse::Up(released),
+                Gesture::Holding {
+                    id,
+                    button,
+                    dragged,
+                },
+            ) if released == button => {
+                self.gesture = Gesture::Released {
+                    id,
+                    button,
+                    dragged,
+                };
                 Verdict::Swallow
             }
             (Mouse::Dragged(dragged), Gesture::Passing { button, drags }) if dragged == button => {
@@ -268,12 +297,23 @@ impl SliceTap {
         };
         let (x, y) = (point.x, point.y);
         match self.gesture {
-            Gesture::Holding { id, button } if id == tag && button == posted => {
+            Gesture::Holding { id, button, .. } if id == tag && button == posted => {
                 debug!("edge slice press delivered: press {id} at ({x:.0}, {y:.0}), button held");
                 self.gesture = Gesture::Passing { button, drags: 0 };
                 Verdict::Pass
             }
-            Gesture::Released { id, button } if id == tag && button == posted => {
+            Gesture::Released {
+                id,
+                button,
+                dragged: true,
+            } if id == tag && button == posted => {
+                debug!(
+                    "edge slice press dropped: press {id} was a drag that ended before its window arrived"
+                );
+                self.gesture = Gesture::Idle;
+                Verdict::Swallow
+            }
+            Gesture::Released { id, button, .. } if id == tag && button == posted => {
                 debug!(
                     "edge slice press delivered: press {id} at ({x:.0}, {y:.0}), with its release"
                 );
