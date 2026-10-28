@@ -3193,18 +3193,13 @@ fn position_layout_windows(
             frame.max.y = park_row + height;
         }
 
-        let (frame, cue) =
-            keep_on_own_display(frame, display, &displays, offscreen_sliver_width, margins);
+        let frame = keep_on_own_display(frame, display, &displays, offscreen_sliver_width, margins);
 
         if resize.is_none() && bounds.0 != frame.size() {
             bounds.0 = frame.size();
         }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(PresentedOrigin(frame.min));
-            match cue {
-                Some(cue) => entity_commands.try_insert(EdgeCue(cue)),
-                None => entity_commands.try_remove::<EdgeCue>(),
-            };
         }
 
         if position.0 != frame.min {
@@ -3266,45 +3261,26 @@ fn lies_mostly_elsewhere(shown: IRect, own: IRect, others: &[IRect]) -> bool {
         .any(|other| other.contains(shown.center()) || overlap_area(shown, *other) > home)
 }
 
-/// The strip of its display's side edge that a column tucked below the
-/// display marks in place of the sliver it would have shown there.
-#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct EdgeCue(pub(crate) IRect);
-
 /// `frame`, or its bottom tuck when more of it lies on another of `displays`
-/// than on `display`. A tuck also returns the edge strip it marks.
+/// than on `display`.
 fn keep_on_own_display(
     frame: IRect,
     display: &Display,
     displays: &DisplayViewports,
     sliver: i32,
     margins: Margins,
-) -> (IRect, Option<IRect>) {
+) -> IRect {
     let own = display.bounds();
     let others: Vec<IRect> = displays
         .iter()
         .map(|(other, _)| other.bounds())
         .filter(|other| *other != own)
         .collect();
-    if !lies_mostly_elsewhere(margins.shown(frame), own, &others) {
-        return (frame, None);
-    }
-    let Some(tucked) = bottom_tuck(frame, own, sliver, margins, &others) else {
-        return (frame, None);
-    };
-    let shown = margins.shown(frame);
-    let (left, right) = if frame.center().x < own.center().x {
-        (own.min.x, own.min.x + sliver)
+    if lies_mostly_elsewhere(margins.shown(frame), own, &others) {
+        bottom_tuck(frame, own, sliver, margins, &others).unwrap_or(frame)
     } else {
-        (own.max.x - sliver, own.max.x)
-    };
-    let cue = IRect::new(
-        left,
-        shown.min.y.max(own.min.y),
-        right,
-        shown.max.y.min(own.max.y),
-    );
-    (tucked, Some(cue))
+        frame
+    }
 }
 
 /// `frame` tucked below the bottom edge of `own`, against the side it hangs
