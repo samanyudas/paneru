@@ -513,6 +513,58 @@ fn closing_and_opening_the_lid_returns_the_builtin_windows_and_keeps_the_externa
     );
 }
 
+/// As seen on 28 October with the built-in display turned off in software:
+/// macOS destroys the built-in display's Space and moves its windows into the
+/// external display's Space, where a native read admits them one by one.
+#[test]
+fn closing_the_lid_returns_the_windows_of_its_destroyed_space_with_their_stack() {
+    let mut harness = two_displays();
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: BUILTIN,
+    });
+    harness.advance(Duration::from_millis(20));
+    harness.mock_state.remove_display(BUILTIN);
+    harness
+        .mock_state
+        .add_display(EXT, ext_bounds(), vec![EXT_SPACE]);
+    carry(&harness, &[10, 11, 12], builtin_bounds(), ext_bounds());
+    for id in [10, 11, 12] {
+        harness
+            .mock_state
+            .update_window(id, |window| window.workspace_id = EXT_SPACE);
+    }
+    for space_id in [BUILTIN_SPACE, BUILTIN_EMPTY_SPACE] {
+        harness
+            .world()
+            .write_message(Event::SpaceDestroyed { space_id });
+    }
+    harness.world().write_message(Event::DisplayRemoved {
+        display_id: BUILTIN,
+    });
+    harness.advance(SETTLE);
+
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: BUILTIN,
+    });
+    harness.advance(Duration::from_millis(20));
+    harness
+        .mock_state
+        .add_display(BUILTIN, builtin_bounds(), vec![NEW_BUILTIN_SPACE]);
+    harness.world().write_message(Event::SpaceCreated {
+        space_id: NEW_BUILTIN_SPACE,
+    });
+    harness.world().write_message(Event::DisplayAdded {
+        display_id: BUILTIN,
+    });
+    harness.advance(SETTLE);
+
+    assert_back_home(
+        &mut harness,
+        &[vec![10], vec![11, 12]],
+        &[vec![50], vec![51, 52], vec![53]],
+    );
+}
+
 #[test]
 fn a_burst_that_moves_no_space_changes_no_strip() {
     let mut harness = two_displays();
