@@ -3135,7 +3135,6 @@ fn position_layout_windows(
     mut commands: Commands,
 ) {
     let offscreen_sliver_width = config.sliver_width();
-    let (_, pad_right, _, pad_left) = config.edge_padding();
     let mut strip_contexts = EntityHashMap::default();
     for (strip_entity, layout_strip, Position(strip_position), reposition, swiping, child_of) in
         &workspaces
@@ -3180,49 +3179,13 @@ fn position_layout_windows(
             continue;
         };
 
-        // The window shows inside its frame by its margins, so they are
-        // taken off here for the window to land exactly sliver_width pixels
-        // from the screen edge.
         let margins = window.margins();
         let target_size = resize.map_or(bounds.0, |resize| bounds.0.with_x(resize.0.x));
         let mut frame = IRect::from_corners(layout_position.0, layout_position.0 + target_size);
-        let width = frame.width();
         frame.min += context.strip_position;
         frame.max += context.strip_position;
 
-        let mut offscreen = false;
-        if frame.max.x <= viewport.min.x + margins.max.x {
-            // Window hidden to the left — position so exactly
-            // sliver_width CG pixels are visible from the real
-            // display edge. The right margin can leave a window just
-            // inside the viewport edge while its CG frame is fully
-            // past it.
-            frame.min.x =
-                viewport.min.x - width + offscreen_sliver_width - pad_left + margins.max.x;
-            offscreen = true;
-        } else if frame.min.x >= viewport.max.x - margins.min.x {
-            // Window hidden to the right — mirror of above.
-            frame.min.x = viewport.max.x - offscreen_sliver_width + pad_right - margins.min.x;
-            offscreen = true;
-        }
-        frame.max.x = frame.min.x + width;
-
-        // During swipe, keep full height. The vertical sliver inset only
-        // applies to horizontally off-screen windows, so they expose just
-        // a `sliver_height` fraction of their height at the viewport's
-        // vertical center.
-        if !context.swiping && offscreen {
-            // Don't compress stacked windows vertically when off-screen.
-            // The height reduction corrupts their proportions: when the
-            // column scrolls back on-screen, binpack_heights makes the
-            // last window absorb all remaining space.
-            if !context.stacked {
-                let inset =
-                    round_px(f64::from(viewport.height()) * (1.0 - config.sliver_height()) / 2.0);
-                frame.min.y += inset;
-                frame.max.y += inset;
-            }
-        }
+        let mut frame = hidden_frame(frame, viewport, margins, context, &config);
 
         // Keep the window anchored to its own display. The parked strip origin
         // only accounts for the first window: everything sitting below it in a
@@ -3284,6 +3247,56 @@ fn position_layout_windows(
             }
         }
     }
+}
+
+/// `frame` placed to show its sliver at the side of `viewport` it is hidden
+/// past, or `frame` when it is not hidden.
+fn hidden_frame(
+    mut frame: IRect,
+    viewport: IRect,
+    margins: Margins,
+    context: &StripWindowContext,
+    config: &Config,
+) -> IRect {
+    // The window shows inside its frame by its margins, so they are
+    // taken off here for the window to land exactly sliver_width pixels
+    // from the screen edge.
+    let sliver = config.sliver_width();
+    let (_, pad_right, _, pad_left) = config.edge_padding();
+    let width = frame.width();
+    let mut offscreen = false;
+    if frame.max.x <= viewport.min.x + margins.max.x {
+        // Window hidden to the left — position so exactly
+        // sliver_width CG pixels are visible from the real
+        // display edge. The right margin can leave a window just
+        // inside the viewport edge while its CG frame is fully
+        // past it.
+        frame.min.x = viewport.min.x - width + sliver - pad_left + margins.max.x;
+        offscreen = true;
+    } else if frame.min.x >= viewport.max.x - margins.min.x {
+        // Window hidden to the right — mirror of above.
+        frame.min.x = viewport.max.x - sliver + pad_right - margins.min.x;
+        offscreen = true;
+    }
+    frame.max.x = frame.min.x + width;
+
+    // During swipe, keep full height. The vertical sliver inset only
+    // applies to horizontally off-screen windows, so they expose just
+    // a `sliver_height` fraction of their height at the viewport's
+    // vertical center.
+    if !context.swiping && offscreen {
+        // Don't compress stacked windows vertically when off-screen.
+        // The height reduction corrupts their proportions: when the
+        // column scrolls back on-screen, binpack_heights makes the
+        // last window absorb all remaining space.
+        if !context.stacked {
+            let inset =
+                round_px(f64::from(viewport.height()) * (1.0 - config.sliver_height()) / 2.0);
+            frame.min.y += inset;
+            frame.max.y += inset;
+        }
+    }
+    frame
 }
 
 fn overlap_area(a: IRect, b: IRect) -> i64 {
