@@ -19,10 +19,10 @@ use crate::ecs::state::{
 };
 use crate::ecs::workspace::{PreviousStripPosition, RestoredActivation};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Position, RestoreWindowState,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, Position, RestoreWindowState,
     SelectedVirtualMarker, SpawnCommandsExt, Unmanaged,
 };
-use crate::manager::{Application, Display, Window};
+use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{Pid, WinID, WorkspaceId};
 
 #[derive(Debug, Resource)]
@@ -405,7 +405,7 @@ pub(crate) fn matches_startup_restore_state(
     saved_windows_in_state(state).any(|saved| saved.hard_match(window.id(), pid, &bundle_id))
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn restore_window_state(
     _: On<RestoreWindowState>,
@@ -416,7 +416,9 @@ pub(super) fn restore_window_state(
         Has<ActiveWorkspaceMarker>,
     )>,
     displays: Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
+    docks: Query<&DockPosition>,
     apps: Query<&Application>,
+    window_manager: Res<WindowManager>,
     session: Option<Res<SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
     mut ctx: WindowCtx,
@@ -548,8 +550,16 @@ pub(super) fn restore_window_state(
             .get(&planned.workspace_id)
             .is_some_and(|active| *active == planned.virtual_index);
         let is_global_active = is_active && active_workspace_ids.contains(&planned.workspace_id);
-        let origin = if is_global_active {
-            display.bounds().min
+        // Only the focused display's strip is globally active, but the
+        // selected row of another display's current Space is on screen too.
+        let is_shown = is_global_active
+            || is_active
+                && window_manager
+                    .active_display_space(display.id())
+                    .is_ok_and(|space| space == planned.workspace_id);
+        let viewport = display.actual_display_bounds(docks.get(display_entity).ok(), &ctx.config);
+        let origin = if is_shown {
+            viewport.min
         } else {
             display.bounds().max - PARKED_STRIP_SLIVER
         };
@@ -561,7 +571,7 @@ pub(super) fn restore_window_state(
                     && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
                 {
                     let existing_previous = PreviousStripPosition {
-                        origin: display.bounds().min,
+                        origin: viewport.min,
                         focus: strip.all_windows().first().copied(),
                     };
                     entity_commands
@@ -573,9 +583,18 @@ pub(super) fn restore_window_state(
         }
 
         let previous = PreviousStripPosition {
-            origin: display.bounds().min,
+            origin: viewport.min,
             focus: strip.all_windows().first().copied(),
         };
+
+        // The strip is rebuilt scrolled to its first column, which can leave
+        // the focused window off screen.
+        if let Some((_, entity)) = ctx.windows.focused()
+            && is_shown
+            && strip.contains(entity)
+        {
+            ctx.commands.ensure_visible(entity);
+        }
 
         let mut spawned =
             ctx.commands
@@ -589,7 +608,9 @@ pub(super) fn restore_window_state(
             } else {
                 spawned.remove::<SelectedVirtualMarker>();
             }
-            spawned.insert(previous);
+            if !is_shown {
+                spawned.insert(previous);
+            }
         }
         restored_strips += 1;
     }
