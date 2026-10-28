@@ -253,9 +253,9 @@ struct Passed {
 pub(crate) struct SliceTap {
     gesture: Gesture,
     presses: u32,
-    /// The button of a press the tap dropped, whose drags and release it
-    /// drops too.
-    dropped: Option<MouseButton>,
+    /// The buttons of the presses the tap dropped, whose drags and releases
+    /// it drops too.
+    dropped: Vec<MouseButton>,
     /// When the last held press stopped waiting for its window. The user's
     /// presses made before then can reach the tap after it.
     waited_until: Duration,
@@ -276,12 +276,12 @@ impl SliceTap {
                     "edge slice press dropped: pressed at ({:.0}, {:.0}) while a press waits for its window",
                     pointer.point.x, pointer.point.y
                 );
-                self.dropped = Some(button);
+                self.dropped.push(button);
                 Verdict::Swallow
             }
-            (Mouse::Dragged(button) | Mouse::Up(button), _) if self.dropped == Some(button) => {
+            (Mouse::Dragged(button) | Mouse::Up(button), _) if self.dropped.contains(&button) => {
                 if let Mouse::Up(_) = pointer.mouse {
-                    self.dropped = None;
+                    self.dropped.retain(|dropped| *dropped != button);
                 }
                 Verdict::Swallow
             }
@@ -346,7 +346,7 @@ impl SliceTap {
             return;
         }
         if let Gesture::Holding { button, .. } = self.gesture {
-            self.dropped = Some(button);
+            self.dropped.push(button);
         }
         debug!("edge slice press expired: press {id} waited {GIVE_UP:?} for its window");
         self.gesture = Gesture::Idle;
@@ -476,7 +476,7 @@ impl SliceTap {
     /// have missed events.
     pub fn reset(&mut self) {
         self.gesture = Gesture::Idle;
-        self.dropped = None;
+        self.dropped.clear();
     }
 }
 

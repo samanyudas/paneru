@@ -515,6 +515,34 @@ fn after_a_held_press_expires_the_next_press_reaches_the_app() {
 }
 
 #[test]
+fn a_press_of_the_other_button_stays_dropped_when_the_held_press_expires() {
+    let mut desk = Desk::new(false);
+    let pressed = desk.on_panel();
+    let elsewhere = CGPoint::new(pressed.x - 300.0, pressed.y);
+    desk.harness
+        .mock_state
+        .update_window(3, |window| window.dropped_positions = u16::MAX);
+
+    desk.user(Mouse::Down(LEFT), pressed);
+    desk.user(Mouse::Down(MouseButton::Right), pressed);
+    desk.wait(GIVE_UP + SLIDE);
+    desk.user(Mouse::Dragged(MouseButton::Right), elsewhere);
+    desk.user(Mouse::Up(MouseButton::Right), elsewhere);
+    desk.user(Mouse::Up(LEFT), elsewhere);
+    assert!(desk.reached.is_empty(), "{:?}", desk.reached);
+
+    desk.user(Mouse::Down(MouseButton::Right), elsewhere);
+    desk.user(Mouse::Up(MouseButton::Right), elsewhere);
+    assert_eq!(
+        desk.reached,
+        vec![
+            (Mouse::Down(MouseButton::Right), elsewhere, false),
+            (Mouse::Up(MouseButton::Right), elsewhere, false)
+        ]
+    );
+}
+
+#[test]
 fn a_press_on_a_panel_never_focuses_the_window_beneath() {
     let mut desk = Desk::new(true);
     let pressed = desk.on_panel();
