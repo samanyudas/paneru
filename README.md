@@ -159,8 +159,13 @@ Paneru checks for configuration in following locations:
 - `$XDG_CONFIG_HOME/paneru/paneru.toml`
 
 Additionally it allows overriding the location with `$PANERU_CONFIG` environment variable.
-If none of these files exists, Paneru creates
-`$XDG_CONFIG_HOME/paneru/paneru.toml` with the built-in defaults on first launch.
+When it is set, Paneru uses only that path.
+If that file and a Lua script do not exist, Paneru creates the file with the
+built-in defaults on first launch.
+Without `$PANERU_CONFIG`, if no configuration file or Lua script exists, Paneru
+creates `$XDG_CONFIG_HOME/paneru/init.lua` on first launch.
+Builds without the `lua` feature create `$XDG_CONFIG_HOME/paneru/paneru.toml`
+instead.
 
 A Lua script (`$XDG_CONFIG_HOME/paneru/init.lua`, `$HOME/.paneru.lua`, or
 `$PANERU_LUA`) replaces the TOML rather than layering on top of it: when one

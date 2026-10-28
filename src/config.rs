@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 use stdext::function_name;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use self::decorations::{
     BorderRadiusOption, DescriptorStyle, IndicatorFormat, IndicatorStyle, MenubarOrientation,
@@ -41,10 +41,10 @@ pub mod snippet;
 pub mod swipe;
 
 /// A `LazyLock` that determines the path to the application's configuration file.
-/// It checks the `PANERU_CONFIG` environment variable first, then standard XDG locations and user home directory.
-/// If no configuration file is found, a minimal one is created in the user's
-/// XDG configuration directory so a fresh app installation can start with the
-/// built-in defaults.
+/// When `PANERU_CONFIG` is set, it uses only that path. Otherwise it checks the user home directory, then standard XDG locations.
+/// If no configuration file is found, a minimal one is created at
+/// `$PANERU_CONFIG`, or else in the user's XDG configuration directory, so a
+/// fresh app installation can start with the built-in defaults.
 /// The TOML configuration file, if there is one to use. `None` when an
 /// `init.lua` exists, since a script disables the TOML entirely (see
 /// [`Config::defaults`]).
@@ -72,6 +72,9 @@ pub static CONFIGURATION_FILE: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 const DEFAULT_CONFIGURATION: &str = "# Paneru configuration\n\n[options]\n\n[bindings]\n";
 
 fn default_configuration_file() -> std::io::Result<PathBuf> {
+    if let Some(path) = explicit_configuration_file() {
+        return Ok(path);
+    }
     let config_home = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
@@ -109,19 +112,18 @@ fn create_configuration_file_at(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+fn explicit_configuration_file() -> Option<PathBuf> {
+    env::var_os("PANERU_CONFIG")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Finds the first existing configuration file from supported locations.
 /// Unlike [`CONFIGURATION_FILE`], this does not panic when no file is found.
+/// When `$PANERU_CONFIG` is set, only that path is checked.
 pub fn discover_configuration_file() -> Option<PathBuf> {
-    if let Ok(path_str) = env::var("PANERU_CONFIG") {
-        let path = PathBuf::from(path_str);
-        if path.exists() {
-            return Some(path);
-        }
-        warn!(
-            "{}: $PANERU_CONFIG is set to {}, but the file does not exist. Falling back to default locations.",
-            function_name!(),
-            path.display()
-        );
+    if let Some(path) = explicit_configuration_file() {
+        return path.exists().then_some(path);
     }
 
     let standard_paths = [
@@ -188,7 +190,7 @@ pub fn discover_lua_file() -> Option<PathBuf> {
         if path.exists() {
             return Some(path);
         }
-        warn!(
+        tracing::warn!(
             "{}: $PANERU_LUA is set to {}, but the file does not exist. Falling back to default locations.",
             function_name!(),
             path.display()
@@ -212,15 +214,15 @@ pub fn discover_lua_file() -> Option<PathBuf> {
 /// Returns the path to the Lua init script, creating a default one at the XDG
 /// location if none exists.
 ///
-/// Returns `Ok(None)` instead if a `paneru.toml` already exists: planting a
-/// script beside an existing TOML would silently override it (see
-/// [`CONFIGURATION_FILE`]).
+/// Returns `Ok(None)` instead if a `paneru.toml` already exists or
+/// `$PANERU_CONFIG` names one: planting a script beside a TOML would silently
+/// override it (see [`CONFIGURATION_FILE`]).
 #[cfg(feature = "lua")]
 pub fn ensure_lua_file() -> std::io::Result<Option<PathBuf>> {
     if let Some(path) = discover_lua_file() {
         return Ok(Some(path));
     }
-    if let Some(toml) = discover_configuration_file() {
+    if let Some(toml) = discover_configuration_file().or_else(explicit_configuration_file) {
         info!(
             "{}: {} is the active configuration; not creating a default init.lua",
             function_name!(),
