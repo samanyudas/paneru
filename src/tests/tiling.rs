@@ -923,6 +923,82 @@ fn test_space_notification_for_dead_window_removes_it() {
     );
 }
 
+/// An app can stop answering AX for a moment while macOS moves its window to
+/// another display or Space. The SLS space notification for that move is not a
+/// close: the window keeps its entity, its place in the strip, and focus.
+#[test]
+fn test_space_notification_while_app_is_unresponsive_keeps_the_window() {
+    let stalled = std::rc::Rc::new(std::cell::Cell::new(None));
+    let (recorded, waiting) = (stalled.clone(), stalled.clone());
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        }, // 1
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        }, // 3
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .with_focused_window(0)
+        .on_iteration(0, move |world, state| {
+            assert_focused!(world, 0);
+            recorded.set(Some(find_window_entity(0, world)));
+            state.os_stall_window(0);
+        })
+        .on_iteration(1, move |world, state| {
+            assert!(
+                window_exists(world, 0),
+                "a space notification for an unresponsive window must not close it"
+            );
+            assert_eq!(Some(find_window_entity(0, world)), waiting.get());
+            state.os_resume_window(0);
+        })
+        .on_iteration(3, move |world, _state| {
+            assert_eq!(
+                Some(find_window_entity(0, world)),
+                stalled.get(),
+                "the window must keep its entity once its app answers again"
+            );
+            assert_eq!(strip_column(world, 0), Some(0));
+            assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
+/// Some apps stay silent for longer than a second. After a lid open, Helium
+/// did not answer AX for its window for about two seconds while the window
+/// stayed on screen. That window is kept too.
+#[test]
+fn test_window_whose_app_answers_after_two_seconds_is_kept() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    assert_focused!(harness.world(), 0);
+    let entity = find_window_entity(0, harness.world());
+
+    harness.mock_state.os_stall_window(0);
+    harness.advance(Duration::from_millis(2500));
+    assert!(
+        window_exists(harness.world(), 0),
+        "a window the window server still shows must not be closed while its app is silent"
+    );
+
+    harness.mock_state.os_resume_window(0);
+    harness.advance(Duration::from_secs(5));
+    assert_eq!(
+        find_window_entity(0, harness.world()),
+        entity,
+        "the window must keep its entity once its app answers again"
+    );
+    assert_eq!(strip_column(harness.world(), 0), Some(0));
+    assert_focused!(harness.world(), 0);
+}
+
 /// Closing a floating window despawns it, which removes its `Unmanaged` marker.
 /// That removal must not put the dying window back into the layout strip.
 #[test]
