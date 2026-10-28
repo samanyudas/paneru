@@ -38,6 +38,8 @@ struct Desk {
     tap: SliceTap,
     reached: Reached,
     posted: Vec<(SlicePress, CGPoint)>,
+    /// The time of the events the tap sees, which [`Desk::wait`] moves on.
+    clock: Duration,
 }
 
 impl Desk {
@@ -70,6 +72,7 @@ impl Desk {
             tap: SliceTap::default(),
             reached: Vec::new(),
             posted: Vec::new(),
+            clock: Duration::ZERO,
         }
     }
 
@@ -89,10 +92,17 @@ impl Desk {
     }
 
     fn user(&mut self, mouse: Mouse, point: CGPoint) {
+        self.user_at(mouse, point, self.clock);
+    }
+
+    /// The user's `mouse` that the user made at `time`, which reaches the
+    /// tap only now.
+    fn user_at(&mut self, mouse: Mouse, point: CGPoint, time: Duration) {
         let pointer = Pointer {
             mouse,
             point,
             flags: CGEventFlags::empty(),
+            time,
             tag: None,
             panel: matches!(mouse, Mouse::Down(_) | Mouse::Moved | Mouse::Scrolled)
                 .then(|| self.panel_at(point))
@@ -100,6 +110,7 @@ impl Desk {
         };
         match self.tap.handle(&pointer) {
             Verdict::Pass => self.reach(mouse, point, false),
+            Verdict::Move(to) => self.reach(mouse, to, false),
             Verdict::Quiet | Verdict::Swallow => {}
             Verdict::Hold(press) => {
                 self.harness
@@ -116,12 +127,14 @@ impl Desk {
     fn wait(&mut self, duration: Duration) {
         for _ in 0..duration.as_millis().div_ceil(20) {
             self.harness.advance(Duration::from_millis(20));
+            self.clock += Duration::from_millis(20);
             for (press, point) in self.harness.mock_state.take_posted_presses() {
                 self.posted.push((press, point));
                 let pointer = Pointer {
                     mouse: Mouse::Down(press.button),
                     point,
                     flags: press.flags,
+                    time: self.clock,
                     tag: Some(press.id),
                     panel: self.panel_at(point),
                 };
@@ -137,7 +150,7 @@ impl Desk {
                         assert_eq!(self.tap.handle(&release), Verdict::Pass);
                         self.reach(release.mouse, point, true);
                     }
-                    Verdict::Quiet | Verdict::Swallow | Verdict::Hold(_) => {}
+                    Verdict::Quiet | Verdict::Swallow | Verdict::Move(_) | Verdict::Hold(_) => {}
                 }
             }
         }
@@ -291,6 +304,27 @@ fn a_click_released_before_it_arrives_reaches_the_app_with_its_release() {
         vec![
             (Mouse::Down(LEFT), target, true),
             (Mouse::Up(LEFT), target, true)
+        ]
+    );
+}
+
+#[test]
+fn a_release_made_before_its_press_arrives_but_seen_after_it_lands_with_the_press() {
+    let mut desk = Desk::new(false);
+    let pressed = desk.on_panel();
+
+    desk.user(Mouse::Down(LEFT), pressed);
+    let released_at = desk.clock;
+    desk.wait(SLIDE);
+    assert_eq!(desk.posted.len(), 1, "{:?}", desk.posted);
+    desk.user_at(Mouse::Up(LEFT), pressed, released_at);
+
+    let target = desk.pressed_in_view(pressed);
+    assert_eq!(
+        desk.reached,
+        vec![
+            (Mouse::Down(LEFT), target, true),
+            (Mouse::Up(LEFT), target, false)
         ]
     );
 }
@@ -452,6 +486,7 @@ fn the_tap_lets_through_only_the_posted_press_it_waits_for() {
         mouse,
         point: CGPoint::new(x, y),
         flags: CGEventFlags::MaskCommand,
+        time: Duration::ZERO,
         tag: None,
         panel,
     };
@@ -467,6 +502,7 @@ fn the_tap_lets_through_only_the_posted_press_it_waits_for() {
         mouse,
         point: CGPoint::new(500.0, 100.0),
         flags: CGEventFlags::MaskCommand,
+        time: Duration::ZERO,
         tag: Some(id),
         panel: Some(panel),
     };

@@ -430,6 +430,7 @@ impl InputHandler {
                 Verdict::Pass => {}
                 Verdict::Quiet => return false,
                 Verdict::Swallow => return true,
+                Verdict::Move(to) => CGEvent::set_location(Some(event), to),
                 Verdict::Hold(press) => {
                     if let Err(err) = events.send(Event::SlicePress { press }) {
                         error!("error sending event: {err}");

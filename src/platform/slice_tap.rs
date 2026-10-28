@@ -5,12 +5,13 @@
 //! gesture through.
 
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bevy::math::IRect;
 use objc2::MainThreadMarker;
 use objc2_app_kit::NSWindow;
-use objc2_core_foundation::CGPoint;
+use objc2_core_foundation::{CGPoint, CGVector};
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton,
 };
@@ -141,6 +142,9 @@ pub(crate) struct Pointer {
     pub mouse: Mouse,
     pub point: CGPoint,
     pub flags: CGEventFlags,
+    /// When the user made the event, or when the tap read one the engine
+    /// posted, since startup.
+    pub time: Duration,
     /// The press id of an event the engine posted. `None` for the user's.
     pub tag: Option<u32>,
     /// The panel under a press, move, or scroll of the user's.
@@ -156,14 +160,33 @@ impl Pointer {
             .flatten();
         let hit_tested =
             tag.is_none() && matches!(mouse, Mouse::Down(_) | Mouse::Moved | Mouse::Scrolled);
+        let time = if tag.is_some() {
+            uptime()
+        } else {
+            Duration::from_nanos(CGEvent::timestamp(Some(event)))
+        };
         Self {
             mouse,
             point,
             flags: CGEvent::flags(Some(event)),
+            time,
             tag,
             panel: hit_tested.then(|| panel_at(point)).flatten(),
         }
     }
+}
+
+/// The clock of the user's event timestamps.
+fn uptime() -> Duration {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &raw mut now) };
+    Duration::new(
+        u64::try_from(now.tv_sec).unwrap_or_default(),
+        u32::try_from(now.tv_nsec).unwrap_or_default(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -174,6 +197,9 @@ pub(crate) enum Verdict {
     Quiet,
     /// Drops the event, and tells the engine nothing.
     Swallow,
+    /// Lets the event through at another point, and tells the engine as
+    /// usual.
+    Move(CGPoint),
     /// Drops the press, and sends it to the engine to post again.
     Hold(SlicePress),
     /// Lets the posted press through and tells the engine as usual, then
@@ -182,16 +208,18 @@ pub(crate) enum Verdict {
 }
 
 /// Where the gesture that began on a panel is. Only the tap changes it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum Gesture {
     #[default]
     Idle,
     /// The tap holds `button` back until the engine posts press `id`, and
-    /// notes whether the user dragged it meanwhile.
+    /// notes whether the user dragged it meanwhile. The user pressed at
+    /// `pressed` on the screen.
     Holding {
         id: u32,
         button: MouseButton,
         dragged: bool,
+        pressed: CGPoint,
     },
     /// As `Holding`, after the user released the button.
     Released {
@@ -200,8 +228,19 @@ enum Gesture {
         dragged: bool,
     },
     /// The posted press went through, and the user's drags and release of
-    /// `button` now reach the app.
-    Passing { button: MouseButton, drags: u32 },
+    /// its button now reach the app.
+    Passing(Passed),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Passed {
+    button: MouseButton,
+    drags: u32,
+    /// When the posted press went through. The drags and release the user
+    /// made before then, with the pointer still on the panel, reach the app
+    /// moved `by` as far as the press.
+    posted_at: Duration,
+    by: CGVector,
 }
 
 #[derive(Debug, Default)]
@@ -213,43 +252,24 @@ pub(crate) struct SliceTap {
 impl SliceTap {
     pub fn handle(&mut self, pointer: &Pointer) -> Verdict {
         if let Some(id) = pointer.tag {
-            return self.posted(pointer.mouse, id, pointer.point);
+            return self.posted(pointer, id);
         }
-        let (x, y) = (pointer.point.x, pointer.point.y);
         match (pointer.mouse, self.gesture) {
-            (Mouse::Down(button), _) => {
-                let Some(panel) = pointer.panel else {
-                    self.gesture = Gesture::Idle;
-                    return Verdict::Pass;
-                };
-                self.presses = self.presses.wrapping_add(1);
-                let id = self.presses;
-                self.gesture = Gesture::Holding {
+            (Mouse::Down(button), _) => self.press(pointer, button),
+            (
+                Mouse::Dragged(dragged),
+                Gesture::Holding {
                     id,
                     button,
-                    dragged: false,
-                };
-                debug!(
-                    "edge slice press swallowed: press {id} window {} at ({x:.0}, {y:.0})",
-                    panel.window
-                );
-                Verdict::Hold(SlicePress {
-                    id,
-                    window_id: panel.window,
-                    at: CGPoint::new(
-                        x - f64::from(panel.on_screen.min.x) + f64::from(panel.in_window.min.x),
-                        y - f64::from(panel.on_screen.min.y) + f64::from(panel.in_window.min.y),
-                    ),
-                    side: panel.side,
-                    button,
-                    flags: pointer.flags,
-                })
-            }
-            (Mouse::Dragged(dragged), Gesture::Holding { id, button, .. }) if dragged == button => {
+                    pressed,
+                    ..
+                },
+            ) if dragged == button => {
                 self.gesture = Gesture::Holding {
                     id,
                     button,
                     dragged: true,
+                    pressed,
                 };
                 Verdict::Swallow
             }
@@ -259,6 +279,7 @@ impl SliceTap {
                     id,
                     button,
                     dragged,
+                    ..
                 },
             ) if released == button => {
                 self.gesture = Gesture::Released {
@@ -268,19 +289,10 @@ impl SliceTap {
                 };
                 Verdict::Swallow
             }
-            (Mouse::Dragged(dragged), Gesture::Passing { button, drags }) if dragged == button => {
-                self.gesture = Gesture::Passing {
-                    button,
-                    drags: drags.saturating_add(1),
-                };
-                Verdict::Pass
-            }
-            (Mouse::Up(released), Gesture::Passing { button, drags }) if released == button => {
-                debug!(
-                    "edge slice gesture passed through: {drags} drags, released at ({x:.0}, {y:.0})"
-                );
-                self.gesture = Gesture::Idle;
-                Verdict::Pass
+            (Mouse::Dragged(moved) | Mouse::Up(moved), Gesture::Passing(passed))
+                if moved == passed.button =>
+            {
+                self.passing(pointer, passed)
             }
             (Mouse::Moved, _) if pointer.panel.is_some() => Verdict::Quiet,
             (Mouse::Scrolled, _) if pointer.panel.is_some() => Verdict::Swallow,
@@ -288,18 +300,94 @@ impl SliceTap {
         }
     }
 
+    /// A press of the user's: held back on a panel, let through elsewhere.
+    fn press(&mut self, pointer: &Pointer, button: MouseButton) -> Verdict {
+        let (x, y) = (pointer.point.x, pointer.point.y);
+        let Some(panel) = pointer.panel else {
+            self.gesture = Gesture::Idle;
+            return Verdict::Pass;
+        };
+        self.presses = self.presses.wrapping_add(1);
+        let id = self.presses;
+        self.gesture = Gesture::Holding {
+            id,
+            button,
+            dragged: false,
+            pressed: pointer.point,
+        };
+        debug!(
+            "edge slice press swallowed: press {id} window {} at ({x:.0}, {y:.0})",
+            panel.window
+        );
+        Verdict::Hold(SlicePress {
+            id,
+            window_id: panel.window,
+            at: CGPoint::new(
+                x - f64::from(panel.on_screen.min.x) + f64::from(panel.in_window.min.x),
+                y - f64::from(panel.on_screen.min.y) + f64::from(panel.in_window.min.y),
+            ),
+            side: panel.side,
+            button,
+            flags: pointer.flags,
+        })
+    }
+
+    /// A drag or release of the posted press.
+    fn passing(&mut self, pointer: &Pointer, passed: Passed) -> Verdict {
+        let (x, y) = (pointer.point.x, pointer.point.y);
+        let early = pointer.time < passed.posted_at;
+        let to = if early {
+            CGPoint::new(x + passed.by.dx, y + passed.by.dy)
+        } else {
+            pointer.point
+        };
+        if let Mouse::Up(_) = pointer.mouse {
+            if early {
+                debug!(
+                    "edge slice release moved with its press: made {:?} before it, at ({x:.0}, {y:.0})",
+                    passed.posted_at.saturating_sub(pointer.time)
+                );
+            }
+            debug!(
+                "edge slice gesture passed through: {} drags, released at ({:.0}, {:.0})",
+                passed.drags, to.x, to.y
+            );
+            self.gesture = Gesture::Idle;
+        } else {
+            self.gesture = Gesture::Passing(Passed {
+                drags: passed.drags.saturating_add(1),
+                ..passed
+            });
+        }
+        if early {
+            Verdict::Move(to)
+        } else {
+            Verdict::Pass
+        }
+    }
+
     /// An event the engine posted. Only the press the tap waits for gets
     /// through: a press it no longer waits for would reach the app with no
     /// release to follow.
-    fn posted(&mut self, mouse: Mouse, tag: u32, point: CGPoint) -> Verdict {
-        let Mouse::Down(posted) = mouse else {
+    fn posted(&mut self, pointer: &Pointer, tag: u32) -> Verdict {
+        let Mouse::Down(posted) = pointer.mouse else {
             return Verdict::Pass;
         };
-        let (x, y) = (point.x, point.y);
+        let (x, y) = (pointer.point.x, pointer.point.y);
         match self.gesture {
-            Gesture::Holding { id, button, .. } if id == tag && button == posted => {
+            Gesture::Holding {
+                id,
+                button,
+                pressed,
+                ..
+            } if id == tag && button == posted => {
                 debug!("edge slice press delivered: press {id} at ({x:.0}, {y:.0}), button held");
-                self.gesture = Gesture::Passing { button, drags: 0 };
+                self.gesture = Gesture::Passing(Passed {
+                    button,
+                    drags: 0,
+                    posted_at: pointer.time,
+                    by: CGVector::new(x - pressed.x, y - pressed.y),
+                });
                 Verdict::Pass
             }
             Gesture::Released {
