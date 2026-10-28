@@ -315,7 +315,9 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         });
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // The fixture starts this test binary twice. Under a full parallel
+        // test run that took over 10 s, though it takes about 1 s alone.
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
                 assert!(status.success(), "daemon fixture failed: {status}");
