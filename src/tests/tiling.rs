@@ -1833,3 +1833,68 @@ fn new_window_on_active_space_keeps_after_focus_placement() {
             },
         ]);
 }
+
+/// Two columns that end short of the right edge, with the last one focused.
+fn focused_last_column_short_of_the_edge() -> TestHarness {
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Ratio(0.45));
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(false),
+            preset_column_widths: vec![0.25, 0.5, 0.75],
+            ..Default::default()
+        },
+        vec![params],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    harness.advance(Duration::from_secs(1));
+    assert_window_at!(harness.world(), 1, 461, TEST_MENUBAR_HEIGHT);
+    harness
+}
+
+fn grow() -> Event {
+    Event::Command {
+        command: Command::Window(Operation::Resize(ResizeDirection::Grow)),
+    }
+}
+
+#[test]
+fn test_window_resize_preset_cycle_returns_a_clamped_last_column_to_its_center() {
+    let mut harness = focused_last_column_short_of_the_edge();
+
+    harness.world().write_message::<Event>(grow());
+    harness.advance(Duration::from_secs(1));
+    assert_window_size!(harness.world(), 1, 768, 748);
+    assert_window_at!(harness.world(), 1, 256, TEST_MENUBAR_HEIGHT);
+
+    harness.world().write_message::<Event>(grow());
+    harness.advance(Duration::from_secs(1));
+    assert_window_size!(harness.world(), 1, 256, 748);
+    assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
+}
+
+#[test]
+fn test_window_resize_preset_cycle_after_a_refused_width_keeps_the_first_center() {
+    let mut harness = focused_last_column_short_of_the_edge();
+    harness
+        .mock_state
+        .update_window(1, |window| window.max_width = 750);
+
+    harness.world().write_message::<Event>(grow());
+    harness.advance(Duration::from_secs(2));
+    assert_window_size!(harness.world(), 1, 750, 748);
+    assert_window_at!(harness.world(), 1, 274, TEST_MENUBAR_HEIGHT);
+
+    harness.world().write_message::<Event>(grow());
+    harness.advance(Duration::from_secs(2));
+
+    assert_window_size!(harness.world(), 1, 256, 748);
+    assert_window_at!(harness.world(), 1, 563, TEST_MENUBAR_HEIGHT);
+}
