@@ -1902,7 +1902,7 @@ fn an_ignored_native_window_is_checked_again_after_a_while() {
 }
 
 #[test]
-fn a_stale_report_for_the_display_a_parked_column_overhangs_changes_nothing() {
+fn a_stale_report_for_the_display_beside_a_parked_column_changes_nothing() {
     let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
     let mut harness = TestHarness::new()
         .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
@@ -1914,8 +1914,8 @@ fn a_stale_report_for_the_display_a_parked_column_overhangs_changes_nothing() {
     harness.advance(SETTLE);
     let parked = frame(harness.world(), 3);
     assert!(
-        parked.min.x < TEST_DISPLAY_WIDTH && ext.contains(parked.center()),
-        "window 3 parks as a sliver at the edge toward the external display: {parked:?}"
+        parked.min.y >= TEST_DISPLAY_HEIGHT - 10 && parked.intersect(ext).is_empty(),
+        "window 3 tucks below its display, off the external display: {parked:?}"
     );
     let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
     assert!(source.iter().flatten().any(|id| *id == 3));
@@ -2037,7 +2037,7 @@ fn a_warm_listed_closed_window_asks_only_its_own_app() {
 }
 
 #[test]
-fn a_stale_report_during_an_engine_animation_changes_nothing() {
+fn a_stale_report_while_a_tucked_column_scrolls_home_changes_nothing() {
     let config = crate::config::Config::try_from("[options]\nanimation_speed = 12.0\n").unwrap();
     let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
     let mut harness = TestHarness::new()
@@ -2050,10 +2050,10 @@ fn a_stale_report_during_an_engine_animation_changes_nothing() {
     harness.run(vec![Event::MenuOpened { window_id: 0 }]);
     harness.advance(SETTLE);
     let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
-    assert!(ext.contains(frame(harness.world(), 3).center()));
+    assert!(frame(harness.world(), 3).intersect(ext).is_empty());
 
     // macOS lists window 3 in the external space without moving it, and the
-    // report arrives while a scroll animates the window back onto its display.
+    // report arrives while a scroll brings the window back onto its display.
     harness
         .mock_state
         .update_window(3, |window| window.workspace_id = EXT_WORKSPACE_ID);
@@ -2062,15 +2062,8 @@ fn a_stale_report_during_an_engine_animation_changes_nothing() {
     });
     harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
     harness.advance(FRAME);
-    let entity = window_entity(&mut harness, 3);
-    let presented = harness
-        .world()
-        .get::<crate::ecs::PresentedOrigin>(entity)
-        .unwrap()
-        .0;
     let moving = frame(harness.world(), 3);
-    assert_ne!(moving.min, presented, "window 3 is still animating");
-    assert!(ext.contains(moving.center()), "{moving:?}");
+    assert!(moving.intersect(ext).is_empty(), "{moving:?}");
     harness.advance(SETTLE);
     assert_eq!(layout_on(harness.world(), TEST_WORKSPACE_ID), source);
     assert_eq!(

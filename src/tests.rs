@@ -11,6 +11,7 @@ mod mouse_focus;
 mod reconnect;
 mod session_restore;
 mod settling;
+mod side_by_side;
 mod stacks;
 mod state;
 mod tabbed_display;

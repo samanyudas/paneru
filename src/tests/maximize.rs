@@ -1401,3 +1401,51 @@ fn a_padding_reload_keeps_a_swiped_strip_where_it_was() {
     let moved: Vec<_> = lefts(&swiped).iter().map(|x| x + 8).collect();
     assert_eq!(lefts(&after), moved, "moved by the left padding of 8 only");
 }
+
+/// A maximized window shows over the edge padding, so its frame reaches past
+/// the frame the engine tracks. Hidden toward a taller display beside its
+/// own, it still keeps off that display.
+#[test]
+fn a_hidden_maximized_window_stays_off_a_taller_display_beside() {
+    let options = MainOptions {
+        padding_top: Some(8),
+        padding_right: Some(8),
+        padding_bottom: Some(8),
+        padding_left: Some(8),
+        ..MainOptions::default()
+    };
+    let ext = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        2160,
+    );
+    let mut harness = TestHarness::new()
+        .with_config((options, vec![]).into())
+        .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
+        .with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.mock_state.focus_window(2);
+    harness.advance(SETTLE);
+    double_click_title_bar(&mut harness, 2);
+    focus(&mut harness, Direction::First);
+
+    let own = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+    let area = |rect: IRect| {
+        if rect.is_empty() {
+            0
+        } else {
+            i64::from(rect.width()) * i64::from(rect.height())
+        }
+    };
+    let hidden = os_frame(&harness, 2);
+    assert!(
+        hidden.min.y >= TEST_DISPLAY_HEIGHT - 10,
+        "window 2 tucks below its display: {hidden:?}"
+    );
+    assert!(
+        !ext.contains(hidden.center())
+            && area(hidden.intersect(ext)) <= area(hidden.intersect(own)),
+        "window 2 lies on the display beside: {hidden:?}"
+    );
+}
