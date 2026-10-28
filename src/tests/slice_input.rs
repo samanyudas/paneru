@@ -436,6 +436,36 @@ fn a_second_press_before_the_first_arrives_reaches_no_window() {
 }
 
 #[test]
+fn a_second_press_made_before_the_first_arrives_but_seen_after_it_reaches_no_window() {
+    let mut desk = Desk::new(false);
+    let pressed = desk.on_panel();
+    let elsewhere = CGPoint::new(pressed.x - 300.0, pressed.y);
+    let dragged = CGPoint::new(elsewhere.x - 10.0, elsewhere.y);
+
+    desk.user(Mouse::Down(LEFT), pressed);
+    desk.user(Mouse::Up(LEFT), pressed);
+    let second_at = desk.clock;
+    desk.wait(SLIDE);
+    assert_eq!(desk.posted.len(), 1, "{:?}", desk.posted);
+    desk.user_at(Mouse::Down(LEFT), elsewhere, second_at);
+    desk.user_at(Mouse::Dragged(LEFT), dragged, second_at);
+    desk.user(Mouse::Up(LEFT), dragged);
+    desk.user(Mouse::Down(LEFT), elsewhere);
+    desk.user(Mouse::Up(LEFT), elsewhere);
+
+    let target = desk.pressed_in_view(pressed);
+    assert_eq!(
+        desk.reached,
+        vec![
+            (Mouse::Down(LEFT), target, true),
+            (Mouse::Up(LEFT), target, true),
+            (Mouse::Down(LEFT), elsewhere, false),
+            (Mouse::Up(LEFT), elsewhere, false)
+        ]
+    );
+}
+
+#[test]
 fn a_double_click_on_a_panel_reaches_the_app_as_one_click() {
     let mut desk = Desk::new(false);
     let pressed = desk.on_panel();

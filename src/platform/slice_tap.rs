@@ -256,6 +256,9 @@ pub(crate) struct SliceTap {
     /// The button of a press the tap dropped, whose drags and release it
     /// drops too.
     dropped: Option<MouseButton>,
+    /// When the last held press stopped waiting for its window. The user's
+    /// presses made before then can reach the tap after it.
+    waited_until: Duration,
 }
 
 impl SliceTap {
@@ -265,9 +268,12 @@ impl SliceTap {
             return self.posted(pointer, id);
         }
         match (pointer.mouse, self.gesture) {
-            (Mouse::Down(button), Gesture::Holding { id, .. } | Gesture::Released { id, .. }) => {
+            (Mouse::Down(button), gesture)
+                if pointer.time < self.waited_until
+                    || matches!(gesture, Gesture::Holding { .. } | Gesture::Released { .. }) =>
+            {
                 debug!(
-                    "edge slice press dropped: pressed at ({:.0}, {:.0}) while press {id} waits for its window",
+                    "edge slice press dropped: pressed at ({:.0}, {:.0}) while a press waits for its window",
                     pointer.point.x, pointer.point.y
                 );
                 self.dropped = Some(button);
@@ -429,6 +435,7 @@ impl SliceTap {
                 ..
             } if id == tag && button == posted => {
                 debug!("edge slice press delivered: press {id} at ({x:.0}, {y:.0}), button held");
+                self.waited_until = pointer.time;
                 self.gesture = Gesture::Passing(Passed {
                     button,
                     drags: 0,
@@ -446,6 +453,7 @@ impl SliceTap {
                 debug!(
                     "edge slice press dropped: press {id} was a drag that ended before its window arrived"
                 );
+                self.waited_until = pointer.time;
                 self.gesture = Gesture::Idle;
                 Verdict::Swallow
             }
@@ -453,6 +461,7 @@ impl SliceTap {
                 debug!(
                     "edge slice press delivered: press {id} at ({x:.0}, {y:.0}), with its release"
                 );
+                self.waited_until = pointer.time;
                 self.gesture = Gesture::Idle;
                 Verdict::PassAndRelease { id, button }
             }
