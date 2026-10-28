@@ -3320,23 +3320,19 @@ fn bottom_tuck(
 ) -> Option<IRect> {
     let size = frame.size();
     let y = own.max.y - sliver - margins.min.y;
-    let (corner, flush) = if frame.center().x < own.center().x {
-        (
-            own.min.x - size.x + sliver + margins.max.x,
-            own.min.x - margins.min.x,
-        )
+    let past_left = own.min.x - size.x + 1 + margins.max.x;
+    let past_right = own.max.x - 1 - margins.min.x;
+    let (corners, flush) = if frame.center().x < own.center().x {
+        ([past_left, past_right], own.min.x - margins.min.x)
     } else {
-        (
-            own.max.x - sliver - margins.min.x,
-            own.max.x - size.x + margins.max.x,
-        )
+        ([past_right, past_left], own.max.x - size.x + margins.max.x)
     };
     let at = |x: i32| IRect::from_corners(IVec2::new(x, y), IVec2::new(x, y) + size);
-    let corner = at(corner);
-    if others
-        .iter()
-        .all(|other| overlap_area(margins.shown(corner), *other) == 0)
-    {
+    if let Some(corner) = corners.into_iter().map(at).find(|corner| {
+        others
+            .iter()
+            .all(|other| overlap_area(margins.shown(*corner), *other) == 0)
+    }) {
         return Some(corner);
     }
     let flush = at(flush);
