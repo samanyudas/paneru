@@ -17,7 +17,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 use super::{
     ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive, OpenedFrom,
     PreviousManagedStrip, RetryFrontSwitch, SelectedVirtualMarker, SpawnWindowTrigger,
-    StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    StrayFocusEvent, SystemTheme, Timeout, Unmanaged, WindowRemovedMarker,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -1555,16 +1555,23 @@ pub(super) fn refresh_configuration_trigger(
 
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
-    mut workspaces: Query<&mut LayoutStrip>,
+    mut workspaces: Query<(Entity, &mut LayoutStrip)>,
+    mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
 
-    if let Some(mut strip) = workspaces.iter_mut().find(|strip| strip.contains(entity)) {
+    if let Some((strip_entity, mut strip)) = workspaces
+        .iter_mut()
+        .find(|(_, strip)| strip.contains(entity))
+    {
         debug!(
             "Removing despawned entity {entity} from strip {}",
             strip.id()
         );
         strip.remove(entity);
+        if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+            entity_commands.try_insert(WindowRemovedMarker);
+        }
     }
 }
 

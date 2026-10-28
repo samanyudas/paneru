@@ -384,6 +384,11 @@ pub struct ActiveWorkspaceMarker;
 #[derive(Component)]
 pub struct SelectedVirtualMarker;
 
+/// The strip lost a window. Checked once its layout settles, so that its
+/// display is not left showing only slivers.
+#[derive(Component)]
+pub struct WindowRemovedMarker;
+
 #[derive(Component)]
 pub struct FlashMessage(pub String);
 
