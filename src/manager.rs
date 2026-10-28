@@ -950,6 +950,54 @@ fn scan_elements<E, T>(
     (found, end)
 }
 
+#[cfg(test)]
+mod scan_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{ScanEnd, scan_elements};
+    use crate::platform::WinID;
+
+    /// Element layout of a browser with about 70 tabs open. Window 339's
+    /// elements are spread over the low ids. Two newer windows sit far above
+    /// them, past a run of ids that closed tabs left empty.
+    fn browser_element(element_id: u64) -> Option<(WinID, WinID)> {
+        let window_id = match element_id {
+            44 => 339,
+            45..=19077 if element_id.is_multiple_of(97) => 339,
+            27845 => 55561,
+            32890 => 62288,
+            _ => return None,
+        };
+        Some((window_id, window_id))
+    }
+
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn scan_finds_a_window_above_element_0x7fff() {
+        let mut window_list = vec![62288, 55561];
+
+        let (found, end) = scan_elements(&mut window_list, far_deadline(), browser_element, Some);
+
+        assert_eq!(found, vec![55561, 62288]);
+        assert_eq!(end, ScanEnd::Resolved);
+        assert_eq!(window_list, Vec::<WinID>::new());
+    }
+
+    #[test]
+    fn scan_stops_at_the_deadline() {
+        let mut window_list = vec![62288];
+
+        let (found, end) = scan_elements(&mut window_list, Instant::now(), browser_element, Some);
+
+        assert_eq!(found, Vec::<WinID>::new());
+        assert_eq!(end, ScanEnd::Deadline(0));
+        assert_eq!(window_list, vec![62288]);
+    }
+}
+
 /// Checks if the application has Accessibility privileges without showing UI.
 ///
 /// # Returns
