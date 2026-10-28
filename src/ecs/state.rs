@@ -18,7 +18,9 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use crate::ecs::layout::{Before, Column, LayoutStrip, StackItem, ViewportAnchor, ViewportShare};
 use crate::ecs::params::Windows;
-use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker, Unmanaged};
+use crate::ecs::{
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Initializing, SelectedVirtualMarker, Unmanaged,
+};
 use crate::manager::{Application, Display, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::types::windowset::WindowSet;
@@ -910,14 +912,22 @@ pub fn periodic_state_save(
 pub fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
     file: Option<Res<StateFile>>,
+    initializing: Option<Res<Initializing>>,
     workspaces: Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
 ) {
-    if exit_events.read().next().is_some()
-        && let Some(StateFile(path)) = file.as_deref()
-    {
+    if exit_events.read().next().is_none() {
+        return;
+    }
+    if initializing.is_some() {
+        // Startup has not placed the windows it is still discovering, so this
+        // layout would replace the session that the next start restores.
+        info!("Exiting before startup finished, keeping the saved session");
+        return;
+    }
+    if let Some(StateFile(path)) = file.as_deref() {
         info!("Exiting, saving state...");
         let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
         if let Err(e) = state.save_to_file(path) {
