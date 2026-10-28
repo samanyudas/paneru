@@ -349,6 +349,7 @@ impl SliceTap {
             self.dropped.push(button);
         }
         debug!("edge slice press expired: press {id} waited {GIVE_UP:?} for its window");
+        self.waited_until = deadline;
         self.gesture = Gesture::Idle;
     }
 

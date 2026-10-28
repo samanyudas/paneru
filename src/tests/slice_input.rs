@@ -515,6 +515,50 @@ fn after_a_held_press_expires_the_next_press_reaches_the_app() {
 }
 
 #[test]
+fn a_press_made_before_a_held_press_expires_but_seen_after_it_reaches_no_window() {
+    for release_first in [false, true] {
+        let mut desk = Desk::new(false);
+        let pressed = desk.on_panel();
+        desk.harness
+            .mock_state
+            .update_window(3, |window| window.dropped_positions = u16::MAX);
+        let elsewhere = CGPoint::new(pressed.x - 300.0, pressed.y);
+        let button = if release_first {
+            LEFT
+        } else {
+            MouseButton::Right
+        };
+
+        desk.user(Mouse::Down(LEFT), pressed);
+        if release_first {
+            desk.user(Mouse::Up(LEFT), pressed);
+        }
+        let second_at = desk.clock + GIVE_UP.saturating_sub(Duration::from_millis(20));
+        desk.wait(GIVE_UP + SLIDE);
+        desk.user(Mouse::Moved, elsewhere);
+        desk.reached.clear();
+        desk.user_at(Mouse::Down(button), elsewhere, second_at);
+        desk.user(Mouse::Up(button), elsewhere);
+        assert!(
+            desk.reached.is_empty(),
+            "released first: {release_first}: {:?}",
+            desk.reached
+        );
+
+        desk.user(Mouse::Down(button), elsewhere);
+        desk.user(Mouse::Up(button), elsewhere);
+        assert_eq!(
+            desk.reached,
+            vec![
+                (Mouse::Down(button), elsewhere, false),
+                (Mouse::Up(button), elsewhere, false)
+            ],
+            "released first: {release_first}"
+        );
+    }
+}
+
+#[test]
 fn a_press_of_the_other_button_stays_dropped_when_the_held_press_expires() {
     let mut desk = Desk::new(false);
     let pressed = desk.on_panel();
