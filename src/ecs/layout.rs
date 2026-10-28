@@ -18,10 +18,10 @@ use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
     ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, ResizeAnchor,
-    ResizeMarker, Scrolling, SpawnCommandsExt,
+    ResizeMarker, Scrolling, SelectedVirtualMarker, SpawnCommandsExt, WindowRemovedMarker,
 };
 use crate::errors::{Error, Result};
-use crate::manager::{Display, Origin, Size, Window};
+use crate::manager::{Display, Origin, Size, Window, WindowManager};
 use crate::platform::WorkspaceId;
 use crate::util::round_px;
 
@@ -185,6 +185,7 @@ impl Plugin for LayoutEventsPlugin {
                     layout_sizes_changed,
                     layout_strip_changed,
                     reshuffle_layout_strip,
+                    show_a_column_after_removal,
                     ensure_visible_in_strip,
                     position_layout_strips,
                     position_layout_windows,
@@ -1473,6 +1474,80 @@ pub(super) fn reshuffle_layout_strip(
         trace!("reshuffle_layout_strip: triggered for entity {entity}, offset {strip_position}");
         commands.reposition_entity(ctx.strip_entity, strip_position);
     });
+}
+
+/// Only the strip holding focus scrolls to expose a window. When closes leave
+/// a display showing nothing but slivers while focus is elsewhere, such as on
+/// another display, the column nearest the viewport is scrolled into view.
+/// Focus does not move.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn show_a_column_after_removal(
+    pending: Populated<
+        (Entity, &LayoutStrip, &ChildOf, Has<SelectedVirtualMarker>),
+        With<WindowRemovedMarker>,
+    >,
+    strips: StripPlacements,
+    displays: DisplayViewports,
+    windows: Windows,
+    config: Res<Config>,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    for (strip_entity, strip, child, selected) in &pending {
+        if let Ok(mut cmd) = commands.get_entity(strip_entity) {
+            cmd.try_remove::<WindowRemovedMarker>();
+        }
+        let holds_focus = windows
+            .focused()
+            .is_some_and(|(_, focused)| strip.contains(focused));
+        if !selected || holds_focus {
+            continue;
+        }
+        // A Space's selected strip is not on screen while its display shows
+        // another Space.
+        let Ok((display, _)) = displays.get(child.parent()) else {
+            continue;
+        };
+        if window_manager.active_display_space(display.id()).ok() != Some(strip.id()) {
+            continue;
+        }
+        if let Some(column) = column_to_show(strip, &strips, &displays, &windows, &config) {
+            commands.ensure_visible(column);
+        }
+    }
+}
+
+/// The column of `strip` nearest its viewport, when no column shows more than
+/// a sliver once the strip reaches its target offset. `None` while any does.
+fn column_to_show(
+    strip: &LayoutStrip,
+    strips: &StripPlacements,
+    displays: &DisplayViewports,
+    windows: &Windows,
+    config: &Config,
+) -> Option<Entity> {
+    let columns = strip.all_columns();
+    let ctx = resolve_strip_scroll_context(*columns.first()?, strips, displays, config)?;
+    let viewport = ctx.display_bounds.min.x..ctx.display_bounds.max.x;
+    let mut nearest = None;
+    for column in columns {
+        let (Some(layout), Some(frame)) = (
+            windows.layout_position(column),
+            windows.moving_frame(column),
+        ) else {
+            continue;
+        };
+        let start = layout.x + ctx.strip_target.x;
+        let end = start + frame.width();
+        if end.min(viewport.end) - start.max(viewport.start) > config.sliver_width() {
+            return None;
+        }
+        let distance = (viewport.start - end).max(start - viewport.end);
+        if nearest.is_none_or(|(_, best)| distance < best) {
+            nearest = Some((column, distance));
+        }
+    }
+    nearest.map(|(column, _)| column)
 }
 
 /// Scrolls the strip the minimum amount needed to keep `EnsureVisibleMarker`
