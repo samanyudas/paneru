@@ -2197,6 +2197,10 @@ mod tests {
 
         let out = binpack_heights(&heights, MIN_HEIGHT, 390);
         assert_eq!(out, None);
+
+        // Not even the first window keeps its height.
+        let out = binpack_heights(&[500, 300, 300, 300], MIN_HEIGHT, 390);
+        assert_eq!(out, None);
     }
 
     #[test]
