@@ -21,6 +21,7 @@ use crate::util::AXUIWrapper;
 use super::*;
 
 /// Data for a mocked application.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct MockAppData {
     pub(crate) psn: ProcessSerialNumber,
     pub(crate) bundle_id: String,
@@ -37,6 +38,12 @@ pub(crate) struct MockAppData {
     /// macOS reports a regular activation policy, as for an app with a Dock
     /// icon. A menu-bar-only app reports another policy.
     pub(crate) regular: bool,
+    /// The app does not answer Accessibility in time, like an app whose main
+    /// thread is blocked restoring tabs. Registration and window reads time out.
+    pub(crate) ax_busy: bool,
+    /// While `ax_busy`, the app still answers the engine's one-question probe,
+    /// like an app whose main thread is free only briefly between long blocks.
+    pub(crate) answers_probes: bool,
 }
 
 /// Data for a mocked window.
@@ -196,6 +203,7 @@ struct MockStateInner {
     membership_failures: HashMap<WorkspaceId, u16>,
     membership_reads: HashMap<WorkspaceId, usize>,
     window_list_reads: HashMap<Pid, usize>,
+    observe_calls: HashMap<Pid, usize>,
     active_display_id: u32,
     cursor_position: Origin,
     /// The display bounds whose desktop the engine last focused.
@@ -414,6 +422,7 @@ impl MockState {
             membership_failures: HashMap::new(),
             membership_reads: HashMap::new(),
             window_list_reads: HashMap::new(),
+            observe_calls: HashMap::new(),
             active_display_id: 0,
             cursor_position: Origin::ZERO,
             focused_desktop: None,
@@ -499,6 +508,8 @@ impl MockState {
                 queued_writes: false,
                 write_delay: std::time::Duration::ZERO,
                 regular: true,
+                ax_busy: false,
+                answers_probes: false,
             },
         );
     }
@@ -1107,6 +1118,16 @@ impl MockState {
             .unwrap_or(0)
     }
 
+    /// How many times the engine tried to register app `pid`'s observers.
+    pub fn observe_calls(&self, pid: Pid) -> usize {
+        self.inner
+            .force_read()
+            .observe_calls
+            .get(&pid)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Sets whether the window server sees the left mouse button down. Only
     /// the button state changes: no mouse event is sent.
     pub fn set_left_button_down(&self, down: bool) {
@@ -1564,6 +1585,7 @@ impl MockState {
         Window::new(Box::new(mw))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn create_application(&self, pid: Pid) -> Application {
         let mut ma = MockApplicationApi::new();
         let s = self.clone();
@@ -1631,7 +1653,12 @@ impl MockState {
                 .and_then(|a| a.connection)
         });
 
-        ma.expect_observe().returning(|| Ok(true));
+        let s = self.clone();
+        ma.expect_observe().returning(move || {
+            let mut inner = s.inner.force_write();
+            *inner.observe_calls.entry(pid).or_default() += 1;
+            Ok(!inner.apps.get(&pid).is_some_and(|a| a.ax_busy))
+        });
         ma.expect_observe_window().returning(|_| Ok(true));
         ma.expect_unobserve_window().return_const(());
         let s = self.clone();
@@ -1654,11 +1681,14 @@ impl MockState {
 
         let (s, ids) = (self.clone(), window_ids.clone());
         ma.expect_window_list().returning(move |_| {
-            *s.inner
-                .force_write()
-                .window_list_reads
-                .entry(pid)
-                .or_default() += 1;
+            let busy = {
+                let mut inner = s.inner.force_write();
+                *inner.window_list_reads.entry(pid).or_default() += 1;
+                inner.apps.get(&pid).is_some_and(|a| a.ax_busy)
+            };
+            if busy {
+                return Vec::new();
+            }
             ids().into_iter().map(|id| s.create_window(id)).collect()
         });
 
@@ -1683,6 +1713,18 @@ impl MockState {
         let s = self.clone();
         wm.expect_new_application()
             .returning(move |process| Ok(s.create_application(process.pid())));
+
+        let s = self.clone();
+        wm.expect_probe_accessibility().returning(move |pid| {
+            let s = s.clone();
+            bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+                !s.inner
+                    .force_read()
+                    .apps
+                    .get(&pid)
+                    .is_some_and(|a| a.ax_busy && !a.answers_probes)
+            })
+        });
 
         let s = self.clone();
         wm.expect_window_ordered_in().returning(move |window_id| {

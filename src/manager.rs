@@ -3,6 +3,7 @@ use accessibility_sys::{
 };
 use bevy::ecs::resource::Resource;
 use bevy::math::{IRect, IVec2};
+use bevy::tasks::{AsyncComputeTaskPool, Task};
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
@@ -110,6 +111,11 @@ pub trait WindowManagerApi: Send + Sync {
     ///
     /// `Ok(Application)` if the application is successfully created, otherwise `Err(Error)`.
     fn new_application(&self, process: &dyn ProcessApi) -> Result<Application>;
+    /// Asks the app with `pid` one Accessibility question on a worker thread.
+    /// The task resolves to `false` when the app did not answer in time, as
+    /// when its main thread is busy. Returns a task so the main loop never
+    /// waits on a busy app.
+    fn probe_accessibility(&self, pid: Pid) -> Task<bool>;
     /// Retrieves a list of window IDs associated with a parent window.
     ///
     /// # Arguments
@@ -372,6 +378,10 @@ impl WindowManagerApi for WindowManagerOS {
             self.resolver.sender(),
         )
         .map(|app| Application::new(Box::new(app)))
+    }
+
+    fn probe_accessibility(&self, pid: Pid) -> Task<bool> {
+        AsyncComputeTaskPool::get().spawn(async move { app::answers_accessibility(pid) })
     }
 
     /// Returns child windows of the main window.

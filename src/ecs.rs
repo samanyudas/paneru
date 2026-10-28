@@ -238,6 +238,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
         Update,
         (
             systems::add_launched_process.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
+            systems::await_accessibility,
             systems::add_launched_application.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
             (
                 systems::add_existing_process,
@@ -695,6 +696,44 @@ pub struct AboveOrdinaryCheck {
 
 #[derive(Component)]
 pub struct BruteforceWindows(Task<Vec<Window>>);
+
+/// A launched process whose app did not answer Accessibility in time when the
+/// engine registered its observers, so it has no `Application` yet. Until the
+/// app answers a probe on a worker thread, the main loop makes no AX call to
+/// it. Then the process gets a fresh launch watch.
+#[derive(Component)]
+pub struct AwaitingAccessibility {
+    /// How many times the app answered a probe and then was still too busy
+    /// to observe.
+    misses: u32,
+    phase: AccessibilityProbe,
+}
+
+pub enum AccessibilityProbe {
+    Resting(Timer),
+    Probing(Task<bool>),
+    Answered,
+}
+
+impl AwaitingAccessibility {
+    pub fn probe_now() -> Self {
+        Self {
+            misses: 0,
+            phase: AccessibilityProbe::Resting(Timer::new(
+                Duration::ZERO,
+                bevy::time::TimerMode::Once,
+            )),
+        }
+    }
+
+    /// Rests longer after each miss, up to 30 s, so an app that is free only
+    /// briefly between long blocks cannot keep blocking the main loop.
+    pub fn missed(&mut self) {
+        self.misses += 1;
+        let rest = Duration::from_secs(1 << (self.misses - 1).min(5)).min(Duration::from_secs(30));
+        self.phase = AccessibilityProbe::Resting(Timer::new(rest, bevy::time::TimerMode::Once));
+    }
+}
 
 #[derive(Component, Debug)]
 pub enum DockPosition {
