@@ -114,7 +114,7 @@ pub fn menu_bar_command_handler(
         if let Event::Command {
             command: Command::MenuBar(enabled),
         } = event
-            && visibility.enabled != Some(*enabled)
+            && (visibility.enabled != Some(*enabled) || visibility.dirty)
         {
             visibility.enabled = Some(*enabled);
             visibility.dirty = true;
