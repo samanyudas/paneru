@@ -763,10 +763,16 @@ fn existing_application_window_list(
     space_window_list_for_connection(cid, spaces, app.connection(), true)
 }
 
-/// Wall-clock ceiling on a single application's brute-force scan: generous
-/// next to a healthy scan, but short enough that an app which never resolves
-/// cannot hold up initialisation, which waits on these tasks.
-const BRUTEFORCE_BUDGET: Duration = Duration::from_millis(250);
+/// Wall-clock ceiling on a single application's brute-force scan. A scan
+/// normally ends sooner, once it passes the app's newest element, so this only
+/// stops an app with a very large accessibility tree from holding up
+/// initialisation, which waits on these tasks.
+const BRUTEFORCE_BUDGET: Duration = Duration::from_secs(2);
+
+/// How many element ids in a row may belong to no window before the scan
+/// decides it has passed the app's newest element. Closed tabs leave long
+/// runs of dead ids below a newer window.
+const BRUTEFORCE_TRAILING_GAP: u64 = 0x4000;
 
 /// How many applications may run [`bruteforce_windows`] at the same time.
 ///
@@ -861,10 +867,6 @@ pub fn bruteforce_windows(
     let bytes = MAGIC.to_ne_bytes();
     data[0x8..0x8 + bytes.len()].copy_from_slice(&bytes);
 
-    // A window SkyLight lists but that never resolves to an AX element (a
-    // panel, helper, anything non-AX) never clears from `window_list`, so
-    // without this deadline the scan would run all 0x7fff round trips every
-    // time that app starts.
     let deadline = Instant::now() + BRUTEFORCE_BUDGET;
 
     // `bruteforce_windows` runs on `AsyncComputeTaskPool` worker threads, which
@@ -907,8 +909,8 @@ pub fn bruteforce_windows(
 enum ScanEnd {
     /// Every listed window resolved.
     Resolved,
-    /// The scan tried every element id below 0x7fff.
-    Exhausted,
+    /// The scan passed the app's newest element before reaching this id.
+    PastLastElement(u64),
     /// [`BRUTEFORCE_BUDGET`] ran out at this element id.
     Deadline(u64),
 }
@@ -916,6 +918,14 @@ enum ScanEnd {
 /// Walks element ids upward from 0. `element_at` looks up the window an
 /// element belongs to, and each element of a window still in `window_list` is
 /// removed from the list and handed to `accept`.
+///
+/// An app numbers its elements in creation order, so a window opened late can
+/// sit far above the app's other windows, and above 0x7fff. The walk has no
+/// fixed upper id. It ends when every window resolves, or
+/// [`BRUTEFORCE_TRAILING_GAP`] ids after the last element that belongs to any
+/// window. A window `SkyLight` lists but that never resolves to an AX element
+/// (a panel, helper, anything non-AX) so costs only the app's own elements
+/// plus the gap.
 fn scan_elements<E, T>(
     window_list: &mut Vec<WinID>,
     deadline: Instant,
@@ -923,43 +933,43 @@ fn scan_elements<E, T>(
     mut accept: impl FnMut(E) -> Option<T>,
 ) -> (Vec<T>, ScanEnd) {
     let mut found = Vec::new();
-    for element_id in 0..0x7fffu64 {
+    let mut last_live = 0;
+    let mut element_id = 0;
+    loop {
         if window_list.is_empty() {
             return (found, ScanEnd::Resolved);
+        }
+        if element_id - last_live > BRUTEFORCE_TRAILING_GAP {
+            return (found, ScanEnd::PastLastElement(element_id));
         }
         // Checked periodically only: `Instant::now` can itself be a syscall.
         if element_id.is_multiple_of(256) && Instant::now() >= deadline {
             return (found, ScanEnd::Deadline(element_id));
         }
-        let Some((window_id, element)) = element_at(element_id) else {
-            continue;
-        };
-        if let Some(index) = window_list.iter().position(|&id| id == window_id) {
-            window_list.remove(index);
-            debug!("Found window {window_id:?}");
-            if let Some(window) = accept(element) {
-                found.push(window);
+        if let Some((window_id, element)) = element_at(element_id) {
+            last_live = element_id;
+            if let Some(index) = window_list.iter().position(|&id| id == window_id) {
+                window_list.remove(index);
+                debug!("Found window {window_id:?}");
+                if let Some(window) = accept(element) {
+                    found.push(window);
+                }
             }
         }
+        element_id += 1;
     }
-    let end = if window_list.is_empty() {
-        ScanEnd::Resolved
-    } else {
-        ScanEnd::Exhausted
-    };
-    (found, end)
 }
 
 #[cfg(test)]
 mod scan_tests {
     use std::time::{Duration, Instant};
 
-    use super::{ScanEnd, scan_elements};
+    use super::{BRUTEFORCE_TRAILING_GAP, ScanEnd, scan_elements};
     use crate::platform::WinID;
 
-    /// Element layout of a browser with about 70 tabs open. Window 339's
-    /// elements are spread over the low ids. Two newer windows sit far above
-    /// them, past a run of ids that closed tabs left empty.
+    /// Modelled on the element ids of a browser with about 70 tabs open.
+    /// Window 339's elements are spread over the low ids. Two newer windows sit
+    /// far above them, past a run of ids that closed tabs left empty.
     fn browser_element(element_id: u64) -> Option<(WinID, WinID)> {
         let window_id = match element_id {
             44 => 339,
@@ -984,6 +994,30 @@ mod scan_tests {
         assert_eq!(found, vec![55561, 62288]);
         assert_eq!(end, ScanEnd::Resolved);
         assert_eq!(window_list, Vec::<WinID>::new());
+    }
+
+    #[test]
+    fn scan_for_a_window_that_never_resolves_stops_after_the_apps_last_element() {
+        let mut window_list = vec![41068];
+        let mut lookups = 0;
+
+        let (found, end) = scan_elements(
+            &mut window_list,
+            far_deadline(),
+            |element_id| {
+                lookups += 1;
+                (element_id <= 58).then_some((339, 339))
+            },
+            Some,
+        );
+
+        assert_eq!(found, Vec::<WinID>::new());
+        assert_eq!(window_list, vec![41068]);
+        assert_eq!(
+            end,
+            ScanEnd::PastLastElement(58 + BRUTEFORCE_TRAILING_GAP + 1)
+        );
+        assert_eq!(lookups, 58 + BRUTEFORCE_TRAILING_GAP + 1);
     }
 
     #[test]
