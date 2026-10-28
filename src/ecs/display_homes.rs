@@ -343,16 +343,21 @@ impl Topology {
         }
     }
 
-    /// Whether `window` is still managed, and in `space` or in no strip.
+    /// Whether `window` is still managed, and in `space`, in no strip, or
+    /// anywhere once macOS destroyed `space` and moved its windows elsewhere.
     fn still_in(&self, window: Entity, space: WorkspaceId) -> bool {
+        let destroyed = !self.strips.values().any(|strip| strip.space == space);
         self.windows
             .get(&window)
             .is_some_and(|now| match now.strip {
                 None => true,
-                Some(strip) => self
-                    .strips
-                    .get(&strip)
-                    .is_some_and(|strip| strip.space == space),
+                Some(strip) => {
+                    destroyed
+                        || self
+                            .strips
+                            .get(&strip)
+                            .is_some_and(|strip| strip.space == space)
+                }
             })
     }
 
@@ -405,7 +410,8 @@ pub(crate) struct Arrival {
 ///
 /// The restore undoes what macOS does to Spaces in a burst: it moves them to
 /// another display, or destroys them. A window that moved into another Space
-/// was moved on purpose, by macOS or the user, and stays there.
+/// while its own Space still exists was moved on purpose, by macOS or the
+/// user, and stays there.
 ///
 /// A frame write moves a window only into the Space its display shows. So a
 /// column still on its display stays in its Space, and a column whose Space
