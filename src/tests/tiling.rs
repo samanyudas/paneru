@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::commands::{Command, Direction, Operation, ResizeDirection};
@@ -5,7 +6,7 @@ use crate::config::{
     Config, InitialWindowWidth, InitialWindowWidthMode, MainOptions, WindowParams,
 };
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::{ActiveWorkspaceMarker, SpawnWindowTrigger};
+use crate::ecs::{ActiveWorkspaceMarker, SpawnWindowTrigger, UnresponsiveWindow};
 use crate::events::{DestroySource, Event};
 use crate::{assert_focused, assert_window_at, assert_window_size};
 use bevy::math::IRect;
@@ -967,6 +968,10 @@ fn test_space_notification_while_app_is_unresponsive_keeps_the_window() {
             );
             assert_eq!(strip_column(world, 0), Some(0));
             assert_focused!(world, 0);
+            assert!(
+                !is_waiting(world, 0),
+                "a window whose app answers must stop waiting"
+            );
         })
         .run(commands);
 }
@@ -997,6 +1002,245 @@ fn test_window_whose_app_answers_after_two_seconds_is_kept() {
     );
     assert_eq!(strip_column(harness.world(), 0), Some(0));
     assert_focused!(harness.world(), 0);
+    assert!(
+        !is_waiting(harness.world(), 0),
+        "a window whose app answers must stop waiting"
+    );
+}
+
+/// A window whose app never answers again is closed when the wait ends, not
+/// before, and repeated space notifications do not extend the wait.
+#[test]
+fn test_window_whose_app_never_answers_is_closed_when_the_wait_ends() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.mock_state.os_stall_window(0);
+    harness.advance(Duration::from_millis(1500));
+    harness.mock_state.os_stall_window(0);
+    harness.advance(Duration::from_millis(1400));
+    assert!(
+        window_exists(harness.world(), 0),
+        "the window must not be closed before the wait ends"
+    );
+
+    harness.advance(Duration::from_millis(300));
+    assert!(
+        !window_exists(harness.world(), 0),
+        "a window whose app never answers must be closed when the wait ends"
+    );
+    assert_focused!(harness.world(), 1);
+}
+
+/// The frame that finds an app silent blocks the main thread for one AX
+/// timeout per stalled window. That blocked time is not time the app had to
+/// answer, so it must not shorten the wait.
+#[test]
+fn test_time_blocked_on_the_failed_reads_does_not_shorten_the_wait() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.mock_state.os_stall_window(0);
+    harness.advance(Duration::from_millis(40));
+    assert!(is_waiting(harness.world(), 0), "the wait must have started");
+
+    harness.advance_after_blocked_frame(Duration::from_secs(2));
+    harness.advance(Duration::from_millis(2800));
+    assert!(
+        window_exists(harness.world(), 0),
+        "the wait must not count the blocked frame"
+    );
+    harness.advance(Duration::from_millis(400));
+    assert!(
+        !window_exists(harness.world(), 0),
+        "the window must still be closed when the wait ends"
+    );
+}
+
+/// A window that the window server stops showing while its app is silent is
+/// closed at once, without waiting for the next AX read. The two windows leave
+/// half a second apart, so the once-a-second unordered sweep can close at most
+/// one of them in time.
+#[test]
+fn test_unresponsive_window_that_leaves_the_screen_is_closed_at_once() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.mock_state.os_stall_window(0);
+    harness.mock_state.os_stall_window(1);
+    harness.advance(Duration::from_millis(300));
+    for id in [0, 1] {
+        assert!(
+            window_exists(harness.world(), id),
+            "the first AX read is not due yet"
+        );
+        harness.mock_state.set_window_unordered(id, true);
+        harness.advance(Duration::from_millis(100));
+        assert!(
+            !window_exists(harness.world(), id),
+            "a window the window server no longer shows must be closed at once"
+        );
+        harness.advance(Duration::from_millis(400));
+    }
+    assert!(window_exists(harness.world(), 2));
+}
+
+/// Closing a window while it waits for its app removes it at once: the AX
+/// teardown is authoritative and does not wait.
+#[test]
+fn test_closing_an_unresponsive_window_removes_it_at_once() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        }, // 2
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .with_focused_window(0)
+        .on_iteration(0, |_world, state| state.os_stall_window(0))
+        .on_iteration(1, |world, state| {
+            assert!(window_exists(world, 0), "the wait has not ended yet");
+            state.os_close_window(0);
+        })
+        .on_iteration(2, |world, _state| {
+            assert!(
+                !window_exists(world, 0),
+                "a closed window must be removed before the wait ends"
+            );
+            assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+/// A stalled app makes every AX read of its window block for a timeout. A
+/// window that leaves several spaces gets one space notification per space in
+/// the same frame, and a window that is already waiting can get more later.
+/// None of these may read the window again.
+#[test]
+fn test_repeated_space_notifications_read_a_stalled_window_once() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.mock_state.take_alive_reads(0);
+
+    harness.mock_state.os_stall_window(0);
+    harness.mock_state.os_stall_window(0);
+    harness.advance(Duration::from_millis(100));
+    assert!(is_waiting(harness.world(), 0), "the wait must have started");
+    assert_eq!(
+        harness.mock_state.take_alive_reads(0),
+        1,
+        "two notifications in one frame must cost one AX read"
+    );
+
+    harness.mock_state.os_stall_window(0);
+    harness.advance(Duration::from_millis(100));
+    assert_eq!(
+        harness.mock_state.take_alive_reads(0),
+        0,
+        "a notification for a window that is already waiting must not read it"
+    );
+}
+
+/// Several apps can stall at once, as after a wake. Each failed read blocks the
+/// main thread for an AX timeout, so the waiting windows are read one per frame.
+/// The harness models that block: a frame that reads N stalled windows makes
+/// the next frame N timeouts longer.
+///
+/// Each window still ends its wait, kept or closed, by the 3 s bound plus one
+/// timeout and one frame (0.27 s) for each other stalled window, plus a frame.
+/// When one round of reads takes longer than the 1 s interval, the reads run
+/// back to back, and the last window ends by 1 s plus 0.27 s for each other
+/// read, plus a frame. That is 3.56 s for 3 windows and 5.61 s for 6.
+#[test]
+fn test_stalled_windows_are_read_one_per_frame() {
+    for stalled in [3, 6] {
+        stalled_windows_are_read_one_per_frame(stalled);
+    }
+}
+
+fn stalled_windows_are_read_one_per_frame(stalled: i32) {
+    const AX_TIMEOUT: Duration = Duration::from_millis(250);
+    const FRAME: Duration = Duration::from_millis(20);
+    const INTERVAL: Duration = Duration::from_secs(1);
+    const READS: u32 = 3;
+    let read_step = AX_TIMEOUT + FRAME;
+    let others = u32::try_from(stalled - 1).unwrap();
+    let all_reads = READS * u32::try_from(stalled).unwrap();
+    let bound =
+        (READS * INTERVAL + others * read_step).max(INTERVAL + (all_reads - 1) * read_step) + FRAME;
+    let answers = 1;
+
+    let mut harness = TestHarness::new()
+        .with_windows(stalled + 1)
+        .with_focused_window(stalled);
+    harness.run(vec![Event::MenuOpened { window_id: stalled }]);
+    let ids: Vec<i32> = (0..stalled).collect();
+    for &id in &ids {
+        harness.mock_state.take_alive_reads(id);
+        harness.mock_state.os_stall_window(id);
+    }
+
+    let mut blocked = Duration::ZERO;
+    let mut now = Duration::ZERO;
+    let mut notified = false;
+    let mut started = None;
+    let mut ended = HashMap::new();
+    while ended.len() < ids.len() && now < Duration::from_secs(20) {
+        harness.advance_after_blocked_frame(FRAME + blocked);
+        now += FRAME + blocked;
+        let reads: usize = ids
+            .iter()
+            .map(|&id| harness.mock_state.take_alive_reads(id))
+            .sum();
+        blocked = AX_TIMEOUT * u32::try_from(reads).unwrap();
+        let waiting: Vec<i32> = ids
+            .iter()
+            .copied()
+            .filter(|&id| is_waiting(harness.world(), id))
+            .collect();
+        // The notification frame reads every window once, as on `testing`.
+        // The wait starts after the next frame, whose delta holds the time
+        // blocked on those reads.
+        if !notified {
+            notified = waiting.len() == ids.len();
+            continue;
+        }
+        let elapsed = now.saturating_sub(*started.get_or_insert(now));
+        assert!(
+            reads <= 1,
+            "{stalled} stalled windows: a frame {elapsed:?} into the wait read {reads} of them"
+        );
+        if elapsed >= Duration::from_millis(1500) {
+            harness.mock_state.os_resume_window(answers);
+        }
+        for &id in &ids {
+            if !waiting.contains(&id) {
+                ended.entry(id).or_insert(elapsed);
+            }
+        }
+    }
+
+    // A closed window is despawned when its destroy message is handled.
+    harness.advance(Duration::from_millis(100));
+    for &id in &ids {
+        let ended = ended
+            .get(&id)
+            .unwrap_or_else(|| panic!("{stalled} stalled windows: window {id} never ended"));
+        assert!(
+            *ended <= bound,
+            "{stalled} stalled windows: window {id} ended {ended:?} into the wait, after {bound:?}"
+        );
+        assert_eq!(
+            window_exists(harness.world(), id),
+            id == answers,
+            "{stalled} stalled windows: only the window whose app answered is kept"
+        );
+    }
 }
 
 /// Closing a floating window despawns it, which removes its `Unmanaged` marker.
@@ -1098,6 +1342,13 @@ fn strip_column(world: &mut World, id: i32) -> Option<usize> {
 fn window_exists(world: &mut World, id: i32) -> bool {
     let mut query = world.query::<&crate::manager::Window>();
     query.iter(world).any(|window| window.id() == id)
+}
+
+fn is_waiting(world: &mut World, id: i32) -> bool {
+    world
+        .query_filtered::<&crate::manager::Window, With<UnresponsiveWindow>>()
+        .iter(world)
+        .any(|window| window.id() == id)
 }
 
 /// A `subrole` window rule applies its effects only to windows reporting that
