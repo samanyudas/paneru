@@ -950,6 +950,34 @@ fn scan_elements<E, T>(
     (found, end)
 }
 
+#[cfg(test)]
+mod scan_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{ScanEnd, scan_elements};
+    use crate::platform::WinID;
+
+    #[test]
+    fn scan_keeps_looking_for_a_window_after_an_element_it_rejects() {
+        let mut window_list = vec![40966];
+
+        let (found, end) = scan_elements(
+            &mut window_list,
+            Instant::now() + Duration::from_secs(60),
+            |element_id| match element_id {
+                10 => Some((40966, "AXOutline")),
+                12 => Some((40966, "AXWindow")),
+                _ => None,
+            },
+            |role| (role == "AXWindow").then_some(role),
+        );
+
+        assert_eq!(found, vec!["AXWindow"]);
+        assert_eq!(end, ScanEnd::Resolved);
+        assert_eq!(window_list, Vec::<WinID>::new());
+    }
+}
+
 /// Checks if the application has Accessibility privileges without showing UI.
 ///
 /// # Returns
