@@ -622,7 +622,7 @@ pub(crate) struct Restored {
 }
 
 /// Represents a single panel within a `LayoutStrip`, which can either hold a single window, a stack of items, or a group of tabs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Column {
     /// A panel containing a single window, identified by its `Entity`.
     Single(Entity),
@@ -760,10 +760,11 @@ impl Iterator for ColumnWindowIter<'_> {
     }
 }
 
-/// A column taken whole out of one strip by [`LayoutStrip::take_column`], to
-/// go into another with [`LayoutStrip::insert_column`]. It keeps its stack
-/// order, native tabs, maximized state, and tabbed display.
-#[derive(Debug)]
+/// A column taken whole out of one strip by [`LayoutStrip::take_column`], or
+/// copied by [`LayoutStrip::copy_column`], to go into another with
+/// [`LayoutStrip::insert_column`]. It keeps its stack order, native tabs,
+/// maximized state, and tabbed display.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DetachedColumn {
     column: Column,
     tabbed: bool,
@@ -773,6 +774,28 @@ impl DetachedColumn {
     /// Every window of the column, top to bottom.
     pub(crate) fn windows(&self) -> Vec<Entity> {
         self.column.window_iter().collect()
+    }
+
+    /// The top window, whose frame stands for the column's width.
+    pub(crate) fn top(&self) -> Option<Entity> {
+        self.column.top()
+    }
+
+    /// The column with only the windows `keep` accepts, collapsed as
+    /// [`LayoutStrip::remove`] collapses a column that loses those windows.
+    /// `None` when no window is kept.
+    pub(crate) fn retain(self, keep: impl Fn(Entity) -> bool) -> Option<Self> {
+        let dropped = self
+            .column
+            .window_iter()
+            .filter(|window| !keep(*window))
+            .collect::<Vec<_>>();
+        let mut strip = LayoutStrip::default();
+        strip.insert_column(0, self);
+        for window in dropped {
+            strip.remove(window);
+        }
+        strip.take_column(0)
     }
 }
 
@@ -1428,6 +1451,27 @@ impl LayoutStrip {
             self.even_splits.remove(&entity);
         }
         Some(DetachedColumn { column, tabbed })
+    }
+
+    /// A copy of column `index`, as [`Self::take_column`] would detach it,
+    /// leaving the strip unchanged. `None` when there is no column `index`,
+    /// and for a native fullscreen column, which macOS owns.
+    pub(crate) fn copy_column(&self, index: usize) -> Option<DetachedColumn> {
+        let column = self
+            .columns
+            .get(index)
+            .filter(|column| !matches!(column, Column::Fullscren(_)))?
+            .clone();
+        let tabbed = column
+            .window_iter()
+            .any(|entity| self.tabbed_stacks.contains(&entity));
+        Some(DetachedColumn { column, tabbed })
+    }
+
+    /// Whether column `index` is exactly `column`: the same windows in the
+    /// same order, with the same tabs, maximized state, and tabbed display.
+    pub(crate) fn column_is(&self, index: usize, column: &DetachedColumn) -> bool {
+        self.copy_column(index).as_ref() == Some(column)
     }
 
     /// Puts `detached` into the strip as a new column at gap `index`, where
@@ -3799,6 +3843,99 @@ mod tests {
 
         strip.stack(e[2], Side::West).unwrap();
         assert_eq!(render(&strip, &e), "[A, {D C}] | B");
+    }
+
+    /// A strip holding only `column`.
+    fn strip_with(column: DetachedColumn) -> LayoutStrip {
+        let mut strip = LayoutStrip::default();
+        strip.insert_column(0, column);
+        strip
+    }
+
+    #[test]
+    fn a_copied_column_arrives_as_a_taken_one_would() {
+        let (_world, mut strip, e) = strip_of(3);
+        strip.stack(e[2], Side::West).unwrap();
+        strip.toggle_tabbed_display(e[1]);
+
+        let copy = strip.copy_column(1).unwrap();
+        assert_eq!(render(&strip, &e), "A | [B, C]", "the source is unchanged");
+        assert!(strip.column_is(1, &copy));
+
+        let arrived = strip_with(copy);
+        assert_eq!(render(&arrived, &e), "[B, C]");
+        assert!(arrived.is_tabbed_display(e[1]));
+        assert!(arrived.is_tabbed_display(e[2]));
+    }
+
+    #[test]
+    fn a_column_is_its_copy_only_while_unchanged() {
+        let (_world, mut strip, e) = strip_of(3);
+        strip.stack(e[2], Side::West).unwrap();
+        let copy = strip.copy_column(1).unwrap();
+
+        assert!(!strip.column_is(0, &copy));
+        assert!(!strip.column_is(2, &copy), "no column 2");
+        strip.toggle_tabbed_display(e[1]);
+        assert!(!strip.column_is(1, &copy), "now tabbed");
+        strip.toggle_tabbed_display(e[1]);
+        strip.insert_into_column(e[2], 1, 0).unwrap();
+        assert_eq!(render(&strip, &e), "A | [C, B]");
+        assert!(!strip.column_is(1, &copy), "reordered");
+    }
+
+    #[test]
+    fn a_fullscreen_column_has_no_copy() {
+        let mut world = World::new();
+        let window = world.spawn_empty().id();
+        assert!(LayoutStrip::fullscreen(1, window).copy_column(0).is_none());
+    }
+
+    #[test]
+    fn a_stack_that_keeps_one_window_becomes_its_column() {
+        let (_world, mut strip, e) = strip_of(2);
+        strip.stack(e[1], Side::West).unwrap();
+        strip.toggle_tabbed_display(e[0]);
+        let column = strip.copy_column(0).unwrap();
+
+        let kept = strip_with(column.retain(|window| window == e[0]).unwrap());
+        assert_eq!(render(&kept, &e), "A");
+        assert!(!kept.is_tabbed_display(e[0]));
+    }
+
+    #[test]
+    fn a_kept_stack_keeps_its_order_and_native_tabs() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[1], Side::West).unwrap();
+        strip.stack(e[2], Side::West).unwrap();
+        strip.convert_to_tabs(e[2], e[3]).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B, {D C}]");
+        let column = strip.copy_column(0).unwrap();
+
+        let without_top = column.clone().retain(|window| window != e[0]).unwrap();
+        assert_eq!(render(&strip_with(without_top), &e), "[B, {D C}]");
+
+        let without_tab = column.retain(|window| window != e[2]).unwrap();
+        strip.remove(e[2]);
+        assert_eq!(
+            render(&strip_with(without_tab), &e),
+            render(&strip, &e),
+            "a closed tab leaves the copy as it leaves the strip"
+        );
+    }
+
+    #[test]
+    fn a_maximized_column_stays_maximized_while_it_keeps_a_window() {
+        let (_world, mut strip, e) = strip_of(2);
+        strip.convert_to_tabs(e[0], e[1]).unwrap();
+        strip.maximize(e[0], Side::East, half()).unwrap();
+        let column = strip.copy_column(0).unwrap();
+        assert_eq!(render(&strip_with(column.clone()), &e), "^{B A}");
+
+        let kept = strip_with(column.clone().retain(|window| window == e[0]).unwrap());
+        assert_eq!(render(&kept, &e), "^A");
+        assert_eq!(kept.maximized(e[0]), Some(&half()));
+        assert!(column.retain(|_| false).is_none());
     }
 
     #[test]
