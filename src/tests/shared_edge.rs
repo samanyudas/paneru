@@ -78,10 +78,8 @@ fn focused(others: &[IRect], count: i32, focus: Option<Direction>) -> TestHarnes
     harness
 }
 
-/// Windows 0 to 2 stacked in the first of `count` columns, with focus on
-/// the last column.
-fn stacked_first(others: &[IRect], count: i32) -> TestHarness {
-    let mut harness = arranged(others, count);
+/// Stacks windows 0 to 2 in the first column, with focus on window 2.
+fn stack_first_three(harness: &mut TestHarness) {
     harness.run(vec![
         Event::MenuOpened { window_id: 0 },
         command(Operation::Focus(Direction::First)),
@@ -94,8 +92,47 @@ fn stacked_first(others: &[IRect], count: i32) -> TestHarness {
         command(Operation::Stack(Side::West)),
     ]);
     harness.advance(SETTLE);
+}
+
+fn focus_last(harness: &mut TestHarness) {
     harness.run(vec![command(Operation::Focus(Direction::Last))]);
     harness.advance(SETTLE);
+}
+
+/// Windows 0 to 2 stacked in the first of `count` columns, with focus on
+/// the last column.
+fn stacked_first(others: &[IRect], count: i32) -> TestHarness {
+    let mut harness = arranged(others, count);
+    stack_first_three(&mut harness);
+    focus_last(&mut harness);
+    harness
+}
+
+/// `stacked_first` with six windows, each stacked window refusing less than
+/// `minimum` points of height.
+fn stacked_first_refusing(others: &[IRect], minimum: i32) -> TestHarness {
+    let mut harness = arranged(others, 6);
+    for id in 0..3 {
+        harness.mock_state.update_window(id, |window| {
+            window.minimum_size = Some(crate::manager::Size::new(0, minimum));
+        });
+    }
+    stack_first_three(&mut harness);
+    focus_last(&mut harness);
+    harness
+}
+
+/// Windows 0 to 2 stacked as tabs in the first of six columns, window 1
+/// focused last among them, with focus on the last column.
+fn tabbed_first(others: &[IRect]) -> TestHarness {
+    let mut harness = arranged(others, 6);
+    stack_first_three(&mut harness);
+    harness.run(vec![
+        command(Operation::ToggleTabbedDisplay),
+        command(Operation::Focus(Direction::North)),
+    ]);
+    harness.advance(SETTLE);
+    focus_last(&mut harness);
     harness
 }
 
@@ -301,5 +338,66 @@ fn closing_a_hidden_stack_member_resizes_the_slices_of_the_rest() {
             .collect::<Vec<_>>(),
         twins.to_vec(),
         "each slice is the sliver its window shows with the display below"
+    );
+}
+
+#[test]
+fn an_overflowing_hidden_stack_shows_what_each_window_shows_of_itself() {
+    let mut beside = stacked_first_refusing(&[LEFT], 300);
+    let mut below = stacked_first_refusing(&[BELOW], 300);
+
+    let twins = [0, 1, 2].map(|id| sliver(&mut below, id));
+    for pair in twins.windows(2) {
+        assert!(
+            !pair[0].0.intersect(pair[1].0).is_empty(),
+            "the stack overlaps with the display below: {twins:?}"
+        );
+    }
+    let union = twins
+        .iter()
+        .fold(twins[0].0, |union, (on_screen, _)| union.union(*on_screen));
+
+    let slices = showing(beside.world());
+    assert!(!slices.is_empty());
+    for (index, (id, slice)) in slices.iter().enumerate() {
+        let (twin, twin_in_window) = twins[usize::try_from(*id).expect("a stacked window")];
+        assert_eq!(
+            slice.in_window.min - slice.on_screen.min,
+            twin_in_window.min - twin.min,
+            "window {id} crops its slice where its sliver is"
+        );
+        assert_eq!(slice.in_window.size(), slice.on_screen.size());
+        assert_eq!(slice.on_screen.intersect(twin), slice.on_screen);
+        for (other, later) in &slices[index + 1..] {
+            assert!(
+                slice.on_screen.intersect(later.on_screen).is_empty(),
+                "windows {id} and {other} overlap: {slices:?}"
+            );
+        }
+    }
+    let area = |rect: IRect| rect.width() * rect.height();
+    assert_eq!(
+        slices
+            .iter()
+            .map(|(_, slice)| area(slice.on_screen))
+            .sum::<i32>(),
+        area(union),
+        "the slices cover the stack's sliver: {slices:?} {union:?}"
+    );
+}
+
+#[test]
+fn a_hidden_tabbed_stack_shows_only_the_tab_it_shows_last() {
+    let mut beside = tabbed_first(&[LEFT]);
+    let mut below = tabbed_first(&[BELOW]);
+
+    let slices = showing(beside.world());
+    assert_eq!(
+        slices.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        (slices[0].1.on_screen, slices[0].1.in_window),
+        sliver(&mut below, 1)
     );
 }

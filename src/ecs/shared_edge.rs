@@ -10,6 +10,7 @@ use bevy::ecs::system::{In, IntoSystem as _, Local, Query, Res};
 use bevy::math::IRect;
 use tracing::debug;
 
+use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::{PostUpdateSet, SelectedVirtualMarker};
 use crate::events::Event;
@@ -67,18 +68,22 @@ impl EdgeSlice {
 }
 
 /// The windows of `strip` that show a slice: on each side, every window of
-/// the hidden column nearest the edge in strip order, and no other. A native
-/// tab group shows its front tab.
+/// the hidden column nearest the edge in strip order, and no other, each with
+/// the part of its slice no window in front of it covers. A native tab group
+/// shows its front tab, and a tabbed stack the tab focused last.
 pub(crate) fn showing(
     strip: &LayoutStrip,
     slice_of: impl Fn(Entity) -> Option<EdgeSlice>,
+    history: &FocusHistory,
 ) -> Vec<(Entity, EdgeSlice)> {
     let on_side = |column: &Column, side: Side| {
-        front_windows(column)
-            .into_iter()
-            .filter_map(|entity| Some((entity, slice_of(entity)?)))
-            .filter(|(_, slice)| slice.side == side)
-            .collect::<Vec<_>>()
+        uncovered(
+            back_to_front(strip, column, history)
+                .into_iter()
+                .filter_map(|entity| Some((entity, slice_of(entity)?)))
+                .filter(|(_, slice)| slice.side == side)
+                .collect(),
+        )
     };
     let west = strip
         .columns()
@@ -92,11 +97,49 @@ pub(crate) fn showing(
     west.into_iter().chain(east).flatten().collect()
 }
 
-fn front_windows(column: &Column) -> Vec<Entity> {
-    match column {
-        Column::Stack(items) => items.iter().filter_map(StackItem::top).collect(),
-        _ => column.top().into_iter().collect(),
+/// The windows `column` shows, ordered as the stack orders them on screen:
+/// each lower window in front of the one above, and in a tabbed stack the
+/// tab focused last in front of the rest.
+fn back_to_front(strip: &LayoutStrip, column: &Column, history: &FocusHistory) -> Vec<Entity> {
+    let Column::Stack(items) = column else {
+        return column.top().into_iter().collect();
+    };
+    let mut order = items.iter().filter_map(StackItem::top).collect::<Vec<_>>();
+    if order.iter().any(|top| strip.is_tabbed_display(*top))
+        && let Some(front) = history
+            .last_focused_in(column)
+            .and_then(|focused| items.iter().find(|item| item.contains(focused)))
+            .and_then(StackItem::top)
+    {
+        order.retain(|top| *top != front);
+        order.push(front);
     }
+    order
+}
+
+/// `back_to_front` with each slice cut where a window in front of it begins,
+/// and without the slices that leaves empty. A window in front covers its
+/// slice from its top down, as each one reaches the column bottom.
+fn uncovered(back_to_front: Vec<(Entity, EdgeSlice)>) -> Vec<(Entity, EdgeSlice)> {
+    let mut shown: Vec<(Entity, EdgeSlice)> = Vec::new();
+    for (entity, mut slice) in back_to_front.into_iter().rev() {
+        let covered_from = shown
+            .iter()
+            .map(|(_, front)| front.on_screen)
+            .filter(|front| !front.intersect(slice.on_screen).is_empty())
+            .map(|front| front.min.y)
+            .min();
+        if let Some(top) = covered_from {
+            slice.on_screen.max.y = slice.on_screen.max.y.min(top);
+        }
+        if slice.on_screen.height() <= 0 {
+            continue;
+        }
+        slice.in_window.max.y = slice.in_window.min.y + slice.on_screen.height();
+        shown.push((entity, slice));
+    }
+    shown.reverse();
+    shown
 }
 
 /// The slices that show on every display now, from the strip each display
@@ -106,6 +149,7 @@ pub(crate) fn showing_edge_slices(
     displays: Query<&Display>,
     windows: Query<(&Window, Option<&EdgeSlice>)>,
     window_manager: Res<WindowManager>,
+    history: Res<FocusHistory>,
 ) -> Vec<(WinID, EdgeSlice)> {
     let mut slices: Vec<(WinID, EdgeSlice)> = strips
         .iter()
@@ -117,12 +161,16 @@ pub(crate) fn showing_edge_slices(
             })
         })
         .flat_map(|(strip, _)| {
-            showing(strip, |entity| {
-                windows
-                    .get(entity)
-                    .ok()
-                    .and_then(|(_, slice)| slice.copied())
-            })
+            showing(
+                strip,
+                |entity| {
+                    windows
+                        .get(entity)
+                        .ok()
+                        .and_then(|(_, slice)| slice.copied())
+                },
+                &history,
+            )
         })
         .filter_map(|(entity, slice)| Some((windows.get(entity).ok()?.0.id(), slice)))
         .collect();
