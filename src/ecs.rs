@@ -56,6 +56,7 @@ pub(crate) mod restore;
 pub mod script_state;
 pub mod scroll;
 pub(crate) mod shared_edge;
+pub(crate) mod slice_input;
 pub(crate) mod slice_photos;
 pub mod state;
 pub(crate) mod systems;
@@ -140,6 +141,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     native_membership::register(app);
     shared_edge::register(app);
     slice_photos::register(app);
+    slice_input::register(app);
 
     let overlays_dirty =
         |config: Option<Res<Config>>,

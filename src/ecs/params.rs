@@ -210,6 +210,7 @@ pub struct FrameActivity<'w, 's> {
     pointer_resize: Option<Res<'w, crate::ecs::drag::PointerResize>>,
     drag_edges: Query<'w, 's, (), With<crate::ecs::drag::EdgeHold>>,
     native_resizes: Query<'w, 's, &'static crate::ecs::drag::NativeResizeStart>,
+    slice_press: Option<Res<'w, crate::ecs::slice_input::PendingPress>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -224,6 +225,7 @@ impl FrameActivity<'_, '_> {
             || !self.level_checks.is_empty()
             || !self.width_settlements.is_empty()
             || !self.drag_edges.is_empty()
+            || self.slice_press.is_some()
             || self
                 .native_resizes
                 .iter()
