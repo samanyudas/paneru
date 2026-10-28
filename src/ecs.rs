@@ -42,6 +42,7 @@ use crate::overlay::{DragOverlay, FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
 pub mod display;
+mod display_homes;
 pub mod drag;
 pub mod focus;
 pub mod layout;

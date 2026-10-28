@@ -21,6 +21,7 @@ use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
 use crate::config::Config;
+use crate::ecs::display_homes::{DisplayHomes, Pass};
 use crate::ecs::layout::{Before, Column, LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
@@ -321,7 +322,7 @@ fn new_column_width(width: i32, source: IRect, target: IRect) -> i32 {
 }
 
 /// Sizes `member`, which is moving to another display, for the layout there.
-fn size_for_arrival(member: Entity, bounds: Size, commands: &mut Commands) {
+pub(crate) fn size_for_arrival(member: Entity, bounds: Size, commands: &mut Commands) {
     // The destination layout sizes the window from `Bounds`. A resize
     // animation toward the full height would outlive that layout: a
     // window joining a stack keeps only its share, and the stale
@@ -353,6 +354,27 @@ impl DisplayReconcileState {
     pub(crate) fn is_settling(&self) -> bool {
         self.pending.is_some() && self.verify_again
     }
+
+    /// Starts a burst, or restarts the settle delay of the one in progress.
+    fn restart(&mut self, commands: &mut Commands) {
+        // Every later event of the burst only restarts the timer, so the
+        // homes are taken before macOS moves or destroys any Space.
+        if self.pending.is_none() {
+            commands.queue(DisplayHomes::freeze);
+        }
+        self.pending = Some(Timer::new(DISPLAY_SETTLE_DELAY, TimerMode::Once));
+        self.retries_left = DISPLAY_RETRIES;
+        self.verify_again = true;
+    }
+
+    /// The pass that applies now.
+    fn pass(&self) -> Pass {
+        if self.verify_again {
+            Pass::First
+        } else {
+            Pass::Final
+        }
+    }
 }
 
 pub struct DisplayEventsPlugin;
@@ -360,6 +382,7 @@ pub struct DisplayEventsPlugin;
 impl Plugin for DisplayEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DisplayReconcileState>()
+            .init_resource::<DisplayHomes>()
             .add_systems(
                 PreUpdate,
                 (display_change_handler, reconcile_displays)
@@ -456,9 +479,7 @@ pub(crate) fn reconcile_displays(
             )
     });
     if needs_reconcile {
-        state.pending = Some(Timer::new(DISPLAY_SETTLE_DELAY, TimerMode::Once));
-        state.retries_left = DISPLAY_RETRIES;
-        state.verify_again = true;
+        state.restart(&mut commands);
         return;
     }
 
@@ -546,7 +567,9 @@ pub(crate) fn reconcile_displays(
         );
     }
 
+    let pass = state.pass();
     commands.queue(move |world: &mut World| {
+        DisplayHomes::settle(world, pass);
         world
             .resource_mut::<super::native_membership::NativeMembership>()
             .request(super::native_membership::NativeScope::DisplayTopology);

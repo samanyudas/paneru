@@ -195,6 +195,7 @@ struct MockDisplayData {
 }
 
 /// The internal state of our "Virtual macOS".
+#[allow(clippy::struct_excessive_bools)]
 struct MockStateInner {
     apps: HashMap<Pid, MockAppData>,
     windows: HashMap<WinID, MockWindowData>,
@@ -238,6 +239,9 @@ struct MockStateInner {
     activated: Vec<WinID>,
     /// Raises sent to apps in the background and not yet shown, oldest first.
     pending_raises: Vec<WinID>,
+    /// Whether a position write that puts a window's center on another display
+    /// moves it into that display's current Space, as macOS does.
+    spaces_follow_frames: bool,
 }
 
 /// The window on top at `point`: raised windows first, then the lowest ID.
@@ -390,6 +394,24 @@ fn mock_reposition(inner: &RwLock<MockStateInner>, id: WinID, ax_generation: u32
         w.frame.min = origin;
         w.frame.max = origin + size;
     }
+    if !inner.spaces_follow_frames {
+        return;
+    }
+    let Some((center, space)) = inner
+        .windows
+        .get(&id)
+        .map(|w| (w.frame.center(), w.workspace_id))
+    else {
+        return;
+    };
+    let current = inner
+        .displays
+        .values()
+        .find(|display| display.bounds.contains(center) && !display.workspaces.contains(&space))
+        .and_then(|display| display.workspaces.first().copied());
+    if let (Some(current), Some(w)) = (current, inner.windows.get_mut(&id)) {
+        w.workspace_id = current;
+    }
 }
 
 /// Reads window `id`'s frame, as Accessibility would.
@@ -438,6 +460,7 @@ impl MockState {
             pending_activations: Vec::new(),
             activated: Vec::new(),
             pending_raises: Vec::new(),
+            spaces_follow_frames: false,
         }));
         let holds = Arc::new(WriteHolds::default());
         let writers = {
@@ -631,6 +654,13 @@ impl MockState {
     /// does for a window of the frontmost app.
     pub fn set_raise_takes_focus(&self, takes_focus: bool) {
         self.inner.force_write().raise_takes_focus = takes_focus;
+    }
+
+    /// Makes a position write that puts a window's center on another display
+    /// move the window into that display's current Space, as macOS does, even
+    /// for a window in a hidden Space.
+    pub fn set_spaces_follow_frames(&self, follow: bool) {
+        self.inner.force_write().spaces_follow_frames = follow;
     }
 
     fn show_latest_raise(&self) {
@@ -1196,6 +1226,11 @@ impl MockState {
     /// lag the frame the engine asked for.
     pub fn ax_frame(&self, id: WinID) -> IRect {
         self.inner.force_read().windows[&id].frame
+    }
+
+    /// The Space the window server has window `id` in.
+    pub fn space_of(&self, id: WinID) -> WorkspaceId {
+        self.inner.force_read().windows[&id].workspace_id
     }
 
     /// Frame expectations for a window whose app applies each write before
