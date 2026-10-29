@@ -21,6 +21,7 @@ use crate::commands::{
     Direction, MoveFocus, Operation, filter_window_operations, get_window_in_direction,
 };
 use crate::config::Config;
+use crate::ecs::drag::DragPlacements;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, origin_exposing};
 use crate::ecs::params::{ActiveDisplay, WindowCtx, Windows};
@@ -354,6 +355,7 @@ fn workspace_change_handler(
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn detect_moved_windows(
     activated_workspace: Single<Entity, Added<ActiveWorkspaceMarker>>,
@@ -367,6 +369,7 @@ fn detect_moved_windows(
     window_manager: Res<WindowManager>,
     reconcile_state: Option<Res<crate::ecs::display::DisplayReconcileState>>,
     mut ignored_windows: Local<HashSet<WinID>>,
+    drags: DragPlacements,
     mut ctx: WindowCtx,
 ) {
     let Ok((workspace_id, target_display)) = workspaces
@@ -442,6 +445,13 @@ fn detect_moved_windows(
             !workspaces
                 .iter()
                 .any(|(strip, _, fullscreen, _)| fullscreen && strip.contains(entity))
+        })
+        .filter(|&entity| {
+            let strip = workspaces
+                .iter()
+                .find(|(strip, ..)| strip.contains(entity))
+                .and_then(|(strip, _, _, child)| Some((strip, child?.parent())));
+            !drags.keeps(entity, ctx.windows.frame(entity), target_display, strip)
         })
         .collect();
     if moved_set.is_empty() {

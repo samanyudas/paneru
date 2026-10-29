@@ -1,6 +1,9 @@
 //! Title-bar drags that drop a window onto another display.
 
+use std::time::Duration;
+
 use super::*;
+use crate::ecs::drag::DragReturnedFrom;
 use crate::platform::WorkspaceId;
 
 /// Window 2's title bar, where each drag of it starts. Its centre is under
@@ -49,6 +52,14 @@ fn columns_on(world: &mut World, workspace: WorkspaceId) -> Vec<Vec<WinID>> {
         .columns()
         .map(|column| column.window_iter().map(|entity| ids[&entity]).collect())
         .collect()
+}
+
+fn entity_of(world: &mut World, id: WinID) -> Entity {
+    world
+        .query::<(Entity, &Window)>()
+        .iter(world)
+        .find_map(|(entity, window)| (window.id() == id).then_some(entity))
+        .expect("window exists")
 }
 
 fn on_main(world: &mut World) -> Vec<Vec<WinID>> {
@@ -112,6 +123,10 @@ fn a_window_dropped_on_another_display_joins_a_column_there() {
             assert_eq!(on_main(world), vec![vec![0], vec![1], vec![2]]);
             assert_eq!(on_ext(world), vec![vec![100]]);
             assert_eq!(frame(world, 100), IRect::new(1024, 20, 1824, 1200));
+            let window = entity_of(world, 2);
+            world
+                .entity_mut(window)
+                .insert(crate::ecs::FullWidthMarker { width_ratio: 1.0 });
         })
         .on_iteration(2, move |_, _| {
             assert_eq!(
@@ -126,6 +141,11 @@ fn a_window_dropped_on_another_display_joins_a_column_there() {
             assert_eq!(frame(world, 2), IRect::new(1024, 610, 1824, 1200));
             assert_focused!(world, 2);
             assert_eq!(last_call(&log), Some(OverlayCall::Hide));
+            let window = entity_of(world, 2);
+            assert!(
+                world.get::<crate::ecs::FullWidthMarker>(window).is_none(),
+                "a window that joins a column takes its width"
+            );
         })
         .run(commands);
 }
@@ -694,6 +714,369 @@ fn without_the_option_a_window_macos_moves_to_another_display_joins_its_strip() 
         .on_iteration(5, |world, _| {
             assert_eq!(on_ext(world), vec![vec![100], vec![2]]);
             assert_eq!(on_main(world), vec![vec![0], vec![1]]);
+            assert_eq!(returned_guards(world), vec![]);
+        })
+        .run(commands);
+}
+
+fn returned_guards(world: &mut World) -> Vec<(WinID, u32)> {
+    let ids = world
+        .query::<(Entity, &Window)>()
+        .iter(world)
+        .map(|(entity, window)| (entity, window.id()))
+        .collect::<std::collections::HashMap<_, _>>();
+    world
+        .query::<&DragReturnedFrom>()
+        .iter(world)
+        .map(|guard| (ids[&guard.window], guard.display))
+        .collect()
+}
+
+/// A refused drop from the external display guards window 2 against macOS
+/// listing it there. A new title-bar press of the window ends the guard, and
+/// so does its timeout.
+#[test]
+fn a_returned_windows_guard_ends_at_a_new_title_bar_press_or_its_timeout() {
+    for press_again in [false, true] {
+        let to = Origin::new(1424, 200);
+        let mut commands = vec![
+            Event::MenuOpened { window_id: 0 },
+            press(FROM, 2),
+            drag_to(to),
+            release(to),
+            settle(),
+        ];
+        if press_again {
+            let title_bar = Origin::new(TEST_DISPLAY_WIDTH - 200, 30);
+            commands.extend([press(title_bar, 2), release(title_bar), settle()]);
+        }
+
+        let mut harness =
+            window_follows(two_displays(300), 1, 2, to - FROM).on_iteration(4, |world, _| {
+                assert_back_on_main(world);
+                assert_eq!(returned_guards(world), vec![(2, EXT_DISPLAY_ID)]);
+            });
+        harness.run(commands);
+        if press_again {
+            assert_eq!(returned_guards(harness.world()), vec![]);
+        } else {
+            harness.advance(Duration::from_secs(9));
+            assert_eq!(returned_guards(harness.world()).len(), 1, "within 10 s");
+            harness.advance(Duration::from_secs(1));
+            assert_eq!(returned_guards(harness.world()), vec![], "after 10 s");
+        }
+    }
+}
+
+/// A refused drop from the external display guards window 2. Closing the
+/// window ends its guard well before the timeout.
+#[test]
+fn a_returned_windows_guard_ends_when_its_window_closes() {
+    let to = Origin::new(1424, 200);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(FROM, 2),
+        drag_to(to),
+        release(to),
+        settle(),
+        settle(),
+    ];
+
+    window_follows(two_displays(300), 1, 2, to - FROM)
+        .on_iteration(4, |world, state| {
+            assert_eq!(returned_guards(world), vec![(2, EXT_DISPLAY_ID)]);
+            state.os_close_window(2);
+        })
+        .on_iteration(5, |world, _| {
+            let guards = world.query::<&DragReturnedFrom>().iter(world).count();
+            assert_eq!(guards, 0);
+        })
+        .run(commands);
+}
+
+/// The checks before a move onto another display: a column the target strip
+/// does not have, or a fullscreen one, takes no window, and neither strip
+/// changes.
+#[test]
+fn a_move_onto_a_column_that_cannot_take_it_changes_neither_strip() {
+    use bevy::ecs::change_detection::Ref;
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    use crate::ecs::display::{Placement, move_to_display};
+    use crate::ecs::layout::Column;
+
+    let commands = vec![Event::MenuOpened { window_id: 0 }];
+    two_displays(EXT_DISPLAY_HEIGHT)
+        .on_iteration(0, |world, _| {
+            let strips = world
+                .query::<(Entity, &LayoutStrip)>()
+                .iter(world)
+                .map(|(entity, strip)| (strip.id(), entity))
+                .collect::<std::collections::HashMap<_, _>>();
+            let [source, target] = [strips[&TEST_WORKSPACE_ID], strips[&EXT_WORKSPACE_ID]];
+            let layout = |world: &mut World| {
+                world
+                    .query::<Ref<LayoutStrip>>()
+                    .iter_many(world, [source, target])
+                    .map(|strip| {
+                        (
+                            format!("{:?}", strip.columns().collect::<Vec<_>>()),
+                            strip.last_changed(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let window = world
+                .query::<(Entity, &Window)>()
+                .iter(world)
+                .find_map(|(entity, window)| (window.id() == 2).then_some(entity))
+                .expect("window 2");
+            let fullscreen = world
+                .query::<(Entity, &Window)>()
+                .iter(world)
+                .find_map(|(entity, window)| (window.id() == 100).then_some(entity))
+                .expect("window 100");
+
+            world
+                .run_system_once(move |mut strips: Query<&mut LayoutStrip>| {
+                    *strips
+                        .get_mut(target)
+                        .expect("target strip")
+                        .bypass_change_detection()
+                        .get_column_mut(0)
+                        .expect("column 0") = Column::Fullscren(fullscreen);
+                })
+                .expect("the column becomes fullscreen");
+            let before = layout(world);
+            for column in [0, 7] {
+                let moved = world
+                    .run_system_once(
+                        move |mut strips: Query<&mut LayoutStrip>,
+                              mut windows: Query<
+                            (&mut crate::ecs::LayoutPosition, &mut crate::ecs::Bounds),
+                            With<Window>,
+                        >,
+                              mut commands: Commands| {
+                            let pair = strips.get_many_mut([source, target]).expect("two strips");
+                            move_to_display(
+                                window,
+                                pair,
+                                [ext(EXT_DISPLAY_HEIGHT); 2],
+                                Placement::Join { column, slot: 0 },
+                                &mut windows,
+                                &mut commands,
+                            )
+                            .is_ok()
+                        },
+                    )
+                    .expect("move_to_display runs");
+                assert!(!moved, "column {column}");
+                assert_eq!(layout(world), before, "column {column}");
+            }
+        })
+        .run(commands);
+}
+
+/// A display showing a native fullscreen space takes no window, so a drop
+/// there, even beside the fullscreen window, sends window 2 back.
+#[test]
+fn a_display_showing_a_native_fullscreen_space_takes_no_drop() {
+    const FULLSCREEN_SPACE: WorkspaceId = EXT_WORKSPACE_ID + 100;
+    let to = Origin::new(2900, 600);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        settle(),
+        Event::SpaceChanged,
+        settle(),
+        press(FROM, 2),
+        drag_to(to),
+        release(to),
+        settle(),
+    ];
+
+    let fullscreen_strip = |world: &mut World| {
+        let ids = world
+            .query::<(Entity, &Window)>()
+            .iter(world)
+            .map(|(entity, window)| (entity, window.id()))
+            .collect::<std::collections::HashMap<_, _>>();
+        world
+            .query_filtered::<&LayoutStrip, With<crate::ecs::NativeFullscreenMarker>>()
+            .iter(world)
+            .find(|strip| strip.id() == FULLSCREEN_SPACE)
+            .map(|strip| {
+                strip
+                    .all_windows()
+                    .into_iter()
+                    .map(|entity| ids[&entity])
+                    .collect::<Vec<_>>()
+            })
+    };
+    window_follows(two_displays(EXT_DISPLAY_HEIGHT), 4, 2, to - FROM)
+        .on_iteration(0, |_, state| state.activate_display(EXT_DISPLAY_ID))
+        .on_iteration(1, |_, state| {
+            state.update_window(100, |window| {
+                window.workspace_id = FULLSCREEN_SPACE;
+                window.is_full_screen = true;
+            });
+            state.activate_workspace(EXT_DISPLAY_ID, FULLSCREEN_SPACE, true);
+        })
+        .on_iteration(2, move |world, state| {
+            assert_eq!(fullscreen_strip(world), Some(vec![100]));
+            state.activate_display(TEST_DISPLAY_ID);
+        })
+        .on_iteration(7, move |world, _| {
+            assert_eq!(on_main(world), vec![vec![0], vec![1], vec![2]]);
+            assert_eq!(fullscreen_strip(world), Some(vec![100]));
+        })
+        .run(commands);
+}
+
+/// Window 2's app keeps it at most 600 points wide. A new column on the
+/// external display asks for 750, and the engine reads back the 600 the app
+/// took, so the layout works with the window's real width.
+#[test]
+fn a_window_whose_app_refuses_its_new_width_keeps_the_width_it_took() {
+    let (harness, commands) =
+        drag_2_to_ext(two_displays(EXT_DISPLAY_HEIGHT), Origin::new(1804, 600));
+
+    harness
+        .on_iteration(0, |_, state| {
+            state.update_window(2, |window| window.max_width = 600);
+        })
+        .on_iteration(5, |world, _| {
+            assert_eq!(on_ext(world), vec![vec![100], vec![2]]);
+            assert_eq!(frame(world, 2), IRect::new(1824, 20, 1824 + 600, 1200));
+            let bounds = world
+                .query::<(&Window, &crate::ecs::Bounds)>()
+                .iter(world)
+                .find_map(|(window, bounds)| (window.id() == 2).then_some(bounds.0));
+            assert_eq!(bounds, Some(Size::new(600, 1180)));
+        })
+        .run(commands);
+}
+
+/// macOS switches the external display to another space while the drag
+/// waits there. The overlay and the drop follow the strip that display shows
+/// now, which is empty.
+#[test]
+fn a_space_switch_on_the_other_display_moves_the_drop_to_the_strip_it_shows() {
+    const OTHER_SPACE: WorkspaceId = EXT_WORKSPACE_ID + 1;
+    let to = Origin::new(1424, 900);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(FROM, 2),
+        drag_to(to),
+        settle(),
+        release(to),
+        settle(),
+    ];
+
+    let ext = ext(EXT_DISPLAY_HEIGHT);
+    let mut harness = holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID, OTHER_SPACE])
+            .with_windows(3)
+            .with_workspace_window(100, EXT_WORKSPACE_ID, move |window| {
+                window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
+            }),
+    );
+    let log = record_overlay(&mut harness);
+    let shown = log.clone();
+    window_follows(harness, 1, 2, to - FROM)
+        .on_iteration(2, move |world, state| {
+            assert_eq!(
+                last_call(&shown),
+                Some(OverlayCall::Line(IRect::new(1024, 1197, 1824, 1200), WHITE))
+            );
+            state.activate_workspace(EXT_DISPLAY_ID, OTHER_SPACE, false);
+            world.write_message(Event::SpaceChanged);
+        })
+        .on_iteration(3, move |_, state| {
+            assert_eq!(
+                last_call(&log),
+                Some(OverlayCall::Line(IRect::new(1024, 20, 1027, 1200), WHITE))
+            );
+            state.update_window(2, |window| window.workspace_id = OTHER_SPACE);
+        })
+        .on_iteration(5, |world, _| {
+            assert_eq!(columns_on(world, OTHER_SPACE), vec![vec![2]]);
+            assert_eq!(on_ext(world), vec![vec![100]]);
+            assert_eq!(on_main(world), vec![vec![0], vec![1]]);
+        })
+        .run(commands);
+}
+
+/// The strip is scrolled to show window 3, so window 0 is parked past the
+/// left edge.
+/// Window 1 leaves for the external display, and the strip scrolls to show
+/// window 0, the window beside it, as a keyboard move to the next display
+/// does.
+#[test]
+fn the_window_left_beside_a_moved_window_is_scrolled_into_view() {
+    let from = Origin::new(100, 30);
+    let to = Origin::new(1500, 900);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::Last)),
+        press(from, 1),
+        drag_to(to),
+        release(to),
+        settle(),
+    ];
+
+    let ext = ext(EXT_DISPLAY_HEIGHT);
+    let harness = holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
+            .with_windows(4)
+            .with_workspace_window(100, EXT_WORKSPACE_ID, move |window| {
+                window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
+            }),
+    );
+    window_follows(harness, 2, 1, to - from)
+        .on_iteration(1, |world, _| {
+            assert_eq!(frame(world, 1).min.x, -176);
+            assert!(frame(world, 0).min.x < 0, "{:?}", frame(world, 0));
+        })
+        .on_iteration(5, |world, _| {
+            assert_eq!(on_ext(world), vec![vec![100, 1]]);
+            assert_eq!(on_main(world), vec![vec![0], vec![2], vec![3]]);
+            let frame = frame(world, 0);
+            assert!(frame.min.x >= 0, "{frame:?}");
+        })
+        .run(commands);
+}
+
+/// Window 2 has a resize in flight when it drops onto the external display.
+/// The move gives it a new size, so the old target does not outlast it, and
+/// the stack it joins splits evenly.
+#[test]
+fn a_resize_in_flight_does_not_outlast_a_move_to_another_display() {
+    let to = Origin::new(1424, 100);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(FROM, 2),
+        drag_to(to),
+        settle(),
+        settle(),
+    ];
+
+    window_follows(two_displays(EXT_DISPLAY_HEIGHT), 1, 2, to - FROM)
+        .on_iteration(2, move |world, _| {
+            let window = entity_of(world, 2);
+            world
+                .entity_mut(window)
+                .insert(crate::ecs::ResizeMarker(Size::new(400, 300)));
+            world.write_message(release(to));
+        })
+        .on_iteration(3, |_, state| macos_moves_to_ext(&state, &[2]))
+        .on_iteration(4, |world, _| {
+            assert_eq!(on_ext(world), vec![vec![2, 100]]);
+            assert_eq!(frame(world, 2), IRect::new(1024, 20, 1824, 610));
+            assert_eq!(frame(world, 100), IRect::new(1024, 610, 1824, 1200));
         })
         .run(commands);
 }

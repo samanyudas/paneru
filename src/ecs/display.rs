@@ -1,5 +1,5 @@
 use bevy::app::{App, Plugin, PreUpdate};
-use bevy::ecs::change_detection::DetectChangesMut;
+use bevy::ecs::change_detection::{DetectChangesMut, Mut};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
@@ -18,19 +18,21 @@ use objc2_core_graphics::CGDirectDisplayID;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::Duration;
+use stdext::function_name;
 use tracing::{Level, debug, error, instrument, warn};
 
 use crate::config::Config;
-use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
+use crate::ecs::layout::{Column, LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, EnsureVisibleMarker, FocusedMarker, LayoutPosition,
-    ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties, RepositionMarker,
-    SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
-    VerifyWindowSize,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, EnsureVisibleMarker, FocusedMarker,
+    FullWidthMarker, LayoutPosition, ManualStripOffset, NativeFullscreenMarker, Position,
+    ReadDisplayProperties, RepositionMarker, ResizeMarker, SelectedVirtualMarker,
+    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged, VerifyWindowSize,
 };
+use crate::errors::{Error, Result};
 use crate::events::Event;
-use crate::manager::{Display, Window, WindowManager, irect_from};
+use crate::manager::{Display, Size, Window, WindowManager, irect_from};
 use crate::platform::{PlatformCallbacks, WinID, WorkspaceId};
 use crate::util::{read_screen_property, round_px};
 use bevy::ecs::entity::EntityHashSet;
@@ -259,6 +261,123 @@ pub(crate) fn reconcile_displays(
         state.verify_again = false;
         state.pending = Some(Timer::new(DISPLAY_VERIFY_DELAY, TimerMode::Once));
     }
+}
+
+/// Where a window dropped onto another display goes in the strip shown there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// Into column `column`, `slot` items from the top.
+    Join { column: usize, slot: usize },
+    /// Into a new column at gap `index`, where gap 0 is before the first
+    /// column.
+    Column(usize),
+}
+
+/// Moves `entity`, with the native tabs grouped with it, from the strip
+/// `source` to `placement` in `target`, the strip of another display. The
+/// viewports are the parts of the two displays their layouts use. A
+/// title-bar drop onto another display moves a window this way.
+///
+/// The window takes the width of the column it joins, or in a new column the
+/// share of the viewport's width it had on its old display. It starts at the
+/// new viewport's height, and the layout gives it its share of a stack. The
+/// window it leaves beside it is reshuffled into view. The moved windows
+/// read their size back when next focused, because an app may not take the
+/// new one.
+///
+/// # Errors
+///
+/// Returns `Err(Error)`, with nothing changed, if `entity` is not in
+/// `source`, its column is fullscreen, or `placement` names a column `target`
+/// does not have or that is fullscreen.
+pub(crate) fn move_to_display(
+    entity: Entity,
+    [mut source, mut target]: [Mut<LayoutStrip>; 2],
+    [source_viewport, target_viewport]: [IRect; 2],
+    placement: Placement,
+    windows: &mut Query<(&mut LayoutPosition, &mut Bounds), With<Window>>,
+    commands: &mut Commands,
+) -> Result<()> {
+    let index = source.index_of(entity)?;
+    if matches!(source.get(index)?, Column::Fullscren(_)) {
+        return Err(Error::InvalidInput(format!(
+            "{}: fullscreen window {entity} can not move.",
+            function_name!()
+        )));
+    }
+    let joined = match placement {
+        Placement::Join { column, .. } => match target.get(column) {
+            Ok(Column::Fullscren(_)) | Err(_) => {
+                return Err(Error::InvalidInput(format!(
+                    "{}: column {column} can not take another window",
+                    function_name!()
+                )));
+            }
+            Ok(column) => Some(column),
+        },
+        Placement::Column(_) => None,
+    };
+    let size = windows
+        .get(entity)
+        .map(|(_, bounds)| bounds.0)
+        .map_err(|_| Error::InvalidWindow)?;
+
+    let frame_of = |entity| {
+        windows
+            .get(entity)
+            .ok()
+            .map(|(position, bounds)| IRect::from_corners(position.0, position.0 + bounds.0))
+    };
+    let width = joined
+        .as_ref()
+        .and_then(|column| column.width(&frame_of))
+        .unwrap_or_else(|| {
+            if source_viewport.width() > 0 {
+                let share = f64::from(size.x) / f64::from(source_viewport.width());
+                round_px(share * f64::from(target_viewport.width()))
+            } else {
+                size.x
+            }
+        });
+    let members = source.tab_group(entity).unwrap_or_else(|| vec![entity]);
+    let neighbour = source
+        .left_neighbour(entity)
+        .or_else(|| source.right_neighbour(entity))
+        .filter(|neighbour| !members.contains(neighbour));
+
+    for member in &members {
+        source.remove(*member);
+    }
+    match placement {
+        Placement::Join { column, slot } => {
+            target.insert_tab_group_at(column, &members);
+            // Checked above, so this cannot fail. If it did, the window
+            // would stay in a column of its own beside the one it joins.
+            if let Err(err) = target.insert_into_column(entity, column + 1, slot) {
+                warn!("window {entity} stays in a column of its own: {err}");
+            }
+        }
+        Placement::Column(index) => target.insert_tab_group_at(index, &members),
+    }
+
+    for member in &members {
+        if let Ok((_, mut bounds)) = windows.get_mut(*member) {
+            bounds.0 = Size::new(width, target_viewport.height());
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(*member) {
+            // A resize in flight would outlive the new size.
+            entity_commands
+                .try_remove::<ResizeMarker>()
+                .try_insert(VerifyWindowSize);
+            if joined.is_some() {
+                entity_commands.try_remove::<FullWidthMarker>();
+            }
+        }
+    }
+    if let Some(neighbour) = neighbour {
+        commands.reshuffle_around(neighbour);
+    }
+    Ok(())
 }
 
 /// Reconciles virtual workspaces when displays are added or removed:
