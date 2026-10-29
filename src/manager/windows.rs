@@ -277,6 +277,95 @@ fn resize_staging_origin(
     })
 }
 
+/// How much lower than the asked height [`bottom_edge_release`] asks for first.
+const BOTTOM_EDGE_RELEASE: i32 = 100;
+
+/// macOS can ignore a small AX shrink of a window whose bottom edge is at the
+/// bottom of the display. On a live display, Spotify ignored a shrink from
+/// 1410 to 1394 points, took a shrink to 1000 points, and then grew back to
+/// 1394 points. So a window that kept a taller height there is asked for a
+/// clearly lower height first, and then for the asked height again.
+///
+/// Returns that lower height. A window whose app refuses the asked height
+/// costs two more size writes and one more read, and ends at the height it
+/// kept.
+fn bottom_edge_release(actual_frame: IRect, size: Size, display_bottom: i32) -> Option<i32> {
+    (actual_frame.height() > size.y && actual_frame.max.y >= display_bottom)
+        .then(|| size.y - BOTTOM_EDGE_RELEASE.min(size.y / 2))
+}
+
+/// The AX writes and reads that one [`WindowApi::resize`] makes. [`WindowOS`]
+/// sends them to the window's app. The test harness sends them to a model of
+/// one.
+pub(crate) trait AxFrame {
+    /// The frame as last written or read.
+    fn frame(&self) -> IRect;
+    fn set_position(&mut self, origin: Origin);
+    fn set_size(&mut self, size: Size);
+    fn read_frame(&mut self) -> Result<IRect>;
+}
+
+/// Asks a window for `size`, which it does not have yet. A bounded number of
+/// retries cover the ways macOS is known to apply only part of an AX resize,
+/// which [`resize_staging_origin`] and [`bottom_edge_release`] describe.
+/// `display_bottom` is the bottom edge of the display the window is laid out
+/// on.
+pub(crate) fn resize_frame(window: &mut impl AxFrame, size: Size, display_bottom: i32) {
+    let previous_frame = window.frame();
+    let target_origin = previous_frame.min;
+    window.set_size(size);
+
+    let mut previous_observed_frame = previous_frame;
+    let mut observed_frame = None;
+    let mut staged = false;
+    for attempt in 1..=3 {
+        let Ok(actual_frame) = window.read_frame() else {
+            break;
+        };
+        observed_frame = Some(actual_frame);
+        let Some(staging_origin) =
+            resize_staging_origin(previous_observed_frame, actual_frame, size.x)
+        else {
+            break;
+        };
+        debug!(
+            attempt,
+            requested_width = size.x,
+            actual_width = actual_frame.width(),
+            staging_x = staging_origin.x,
+            "retrying partially constrained AX resize from an offscreen origin"
+        );
+        staged = true;
+        previous_observed_frame = actual_frame;
+        window.set_position(staging_origin);
+        window.set_size(size);
+    }
+
+    if staged {
+        if let Ok(final_frame) = window.read_frame() {
+            debug!(
+                requested_width = size.x,
+                actual_width = final_frame.width(),
+                "completed staged AX resize"
+            );
+        }
+        window.set_position(target_origin);
+    }
+
+    if let Some(lower_height) =
+        observed_frame.and_then(|frame| bottom_edge_release(frame, size, display_bottom))
+    {
+        debug!(
+            requested_height = size.y,
+            lower_height, "retrying an AX shrink ignored at the bottom of the display"
+        );
+        window.set_size(size.with_y(lower_height));
+        window.set_size(size);
+        // So `frame()` reports the height the app kept, not the one asked for.
+        _ = window.read_frame();
+    }
+}
+
 #[derive(Debug)]
 pub enum WindowPadding {
     Vertical(i32),
@@ -304,7 +393,9 @@ pub trait WindowApi: Send + Sync {
     fn is_minimized(&self) -> bool;
     fn is_full_screen(&self) -> bool;
     fn reposition(&mut self, origin: Origin);
-    fn resize(&mut self, size: Size);
+    /// Resizes the window, keeping its top-left corner. `display_bottom` is
+    /// the bottom edge of the display the window is laid out on.
+    fn resize(&mut self, size: Size, display_bottom: i32);
     fn update_frame(&mut self) -> Result<IRect>;
     fn focus_without_raise(
         &self,
@@ -671,6 +762,24 @@ impl WindowOS {
     }
 }
 
+impl AxFrame for WindowOS {
+    fn frame(&self) -> IRect {
+        self.frame
+    }
+
+    fn set_position(&mut self, origin: Origin) {
+        self.set_ax_position(origin);
+    }
+
+    fn set_size(&mut self, size: Size) {
+        self.set_ax_size(size);
+    }
+
+    fn read_frame(&mut self) -> Result<IRect> {
+        self.update_frame()
+    }
+}
+
 impl WindowApi for WindowOS {
     /// Returns the ID of the window.
     ///
@@ -791,50 +900,13 @@ impl WindowApi for WindowOS {
     }
 
     #[instrument(level = Level::TRACE)]
-    fn resize(&mut self, size: Size) {
+    fn resize(&mut self, size: Size, display_bottom: i32) {
         if self.frame.size() == size {
             trace!("already correct size.");
             return;
         }
-        let previous_frame = self.frame;
-        let target_origin = previous_frame.min;
         let _enhanced_ui = self.disable_enhanced_ui();
-        self.set_ax_size(size);
-
-        let mut previous_observed_frame = previous_frame;
-        let mut staged = false;
-        for attempt in 1..=3 {
-            let Ok(actual_frame) = self.update_frame() else {
-                break;
-            };
-            let Some(staging_origin) =
-                resize_staging_origin(previous_observed_frame, actual_frame, size.x)
-            else {
-                break;
-            };
-            debug!(
-                attempt,
-                requested_width = size.x,
-                actual_width = actual_frame.width(),
-                staging_x = staging_origin.x,
-                "retrying partially constrained AX resize from an offscreen origin"
-            );
-            staged = true;
-            previous_observed_frame = actual_frame;
-            self.set_ax_position(staging_origin);
-            self.set_ax_size(size);
-        }
-
-        if staged {
-            if let Ok(final_frame) = self.update_frame() {
-                debug!(
-                    requested_width = size.x,
-                    actual_width = final_frame.width(),
-                    "completed staged AX resize"
-                );
-            }
-            self.set_ax_position(target_origin);
-        }
+        resize_frame(self, size, display_bottom);
     }
 
     /// Updates the internal `frame` of the window by querying its current position and size from the Accessibility API.
@@ -1519,6 +1591,94 @@ mod tests {
             resize_staging_origin(actual, nearly_complete, 4112),
             Some(Origin::new(-2096, 40))
         );
+    }
+
+    /// A window whose right edge macOS stops at `right_limit` while it grows,
+    /// the way it applies part of a width increase far past the display.
+    struct EdgeLimitedWindow {
+        frame: IRect,
+        right_limit: i32,
+        size_writes: usize,
+    }
+
+    impl AxFrame for EdgeLimitedWindow {
+        fn frame(&self) -> IRect {
+            self.frame
+        }
+
+        fn set_position(&mut self, origin: Origin) {
+            let size = self.frame.size();
+            self.frame = IRect::from_corners(origin, origin + size);
+        }
+
+        fn set_size(&mut self, size: Size) {
+            self.size_writes += 1;
+            let room = (self.right_limit - self.frame.min.x).max(self.frame.width());
+            self.frame.max = self.frame.min + size.with_x(size.x.min(room));
+        }
+
+        fn read_frame(&mut self) -> Result<IRect> {
+            Ok(self.frame)
+        }
+    }
+
+    #[test]
+    fn resize_stages_a_partially_applied_width_growth_at_the_display_bottom() {
+        let mut window = EdgeLimitedWindow {
+            frame: IRect::new(-400, 40, 400, 640),
+            right_limit: 2416,
+            size_writes: 0,
+        };
+
+        resize_frame(&mut window, Size::new(4112, 600), 640);
+
+        assert_eq!(window.frame, IRect::new(-400, 40, 3712, 640));
+        assert_eq!(window.size_writes, 2);
+    }
+
+    /// A window whose app keeps its height whatever it is asked. Like
+    /// [`WindowOS`], it reports the size last asked for until it is read again.
+    struct HeightRefusingWindow {
+        reported: IRect,
+        actual: IRect,
+        size_writes: usize,
+    }
+
+    impl AxFrame for HeightRefusingWindow {
+        fn frame(&self) -> IRect {
+            self.reported
+        }
+
+        fn set_position(&mut self, origin: Origin) {
+            self.actual = IRect::from_corners(origin, origin + self.actual.size());
+            self.reported = IRect::from_corners(origin, origin + self.reported.size());
+        }
+
+        fn set_size(&mut self, size: Size) {
+            self.size_writes += 1;
+            self.actual.max.x = self.actual.min.x + size.x;
+            self.reported.max = self.reported.min + size;
+        }
+
+        fn read_frame(&mut self) -> Result<IRect> {
+            self.reported = self.actual;
+            Ok(self.actual)
+        }
+    }
+
+    #[test]
+    fn resize_reports_the_height_kept_at_the_display_bottom() {
+        let kept = IRect::new(0, 20, 400, 768);
+        let mut window = HeightRefusingWindow {
+            reported: kept,
+            actual: kept,
+            size_writes: 0,
+        };
+
+        resize_frame(&mut window, Size::new(400, 732), 752);
+
+        assert_eq!(window.frame(), kept);
+        assert_eq!(window.size_writes, 3);
     }
 
     #[test]

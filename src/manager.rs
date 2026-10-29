@@ -52,6 +52,8 @@ pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_
 pub use process::MockProcessApi;
 #[cfg(test)]
 pub use windows::MockWindowApi;
+#[cfg(test)]
+pub(crate) use windows::{AxFrame, resize_frame};
 
 pub(crate) mod app;
 mod display;

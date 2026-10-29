@@ -1295,7 +1295,7 @@ pub(super) fn verify_window_position(
 /// share of the display its strip is on: a strip on the display without
 /// focus is sized for its own, and a share of the other would grow or shrink
 /// the window wherever it went next. A window in no strip is of the active
-/// display.
+/// display. Each window is also told where that display's bottom edge is.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_size(
     active_display: ActiveDisplay,
@@ -1306,24 +1306,24 @@ pub(super) fn commit_window_size(
         Changed<Bounds>,
     >,
 ) {
-    let fallback = active_display.bounds().width();
-    let widths: EntityHashMap<i32> = resized_windows
+    let fallback = active_display.bounds();
+    let display_bounds: EntityHashMap<IRect> = resized_windows
         .iter()
         .map(|(entity, ..)| {
-            let width = strips
+            let bounds = strips
                 .iter()
                 .find(|(strip, _)| strip.contains(entity))
                 .and_then(|(_, parent)| displays.get(parent.parent()).ok())
-                .map_or(fallback, |display| display.bounds().width());
-            (entity, width)
+                .map_or(fallback, Display::bounds);
+            (entity, bounds)
         })
         .collect();
     resized_windows
         .par_iter_mut()
         .for_each(|(entity, mut window, size, mut width_ratio)| {
-            let width = widths.get(&entity).copied().unwrap_or(fallback);
-            width_ratio.0 = f64::from(size.0.x) / f64::from(width);
-            objc2::rc::autoreleasepool(|_| window.resize(size.0));
+            let bounds = display_bounds.get(&entity).copied().unwrap_or(fallback);
+            width_ratio.0 = f64::from(size.0.x) / f64::from(bounds.width());
+            objc2::rc::autoreleasepool(|_| window.resize(size.0, bounds.max.y));
         });
 }
 
@@ -1371,7 +1371,7 @@ pub(super) fn cleanup_on_exit(
                     size.x.min(bounds.width() * 9 / 10),
                     size.y.min(bounds.height() * 9 / 10),
                 );
-                window.resize(new_size);
+                window.resize(new_size, bounds.max.y);
                 size = new_size;
             }
 

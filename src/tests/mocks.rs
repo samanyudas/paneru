@@ -10,8 +10,8 @@ use crate::errors::Error;
 use crate::events::{DestroySource, Event};
 use crate::manager::app::MockApplicationApi;
 use crate::manager::{
-    Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
-    Window, origin_from, origin_to,
+    Application, AxFrame, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin,
+    Size, Window, origin_from, origin_to, resize_frame,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 
@@ -154,6 +154,46 @@ impl MockStateInner {
             height = w.frame.height();
         }
         w.frame.max = w.frame.min + Size::new(width, height);
+    }
+}
+
+/// Mocked window `id` as [`resize_frame`] sees a real one.
+struct MockAxFrame {
+    state: MockState,
+    id: WinID,
+}
+
+impl AxFrame for MockAxFrame {
+    fn frame(&self) -> IRect {
+        self.state
+            .inner
+            .force_read()
+            .windows
+            .get(&self.id)
+            .map(|w| w.frame)
+            .unwrap_or_default()
+    }
+
+    fn set_position(&mut self, origin: Origin) {
+        if let Some(w) = self.state.inner.force_write().windows.get_mut(&self.id) {
+            let size = w.frame.size();
+            w.frame.min = origin;
+            w.frame.max = origin + size;
+        }
+    }
+
+    fn set_size(&mut self, size: Size) {
+        self.state.inner.force_write().write_size(self.id, size);
+    }
+
+    fn read_frame(&mut self) -> Result<IRect, Error> {
+        self.state
+            .inner
+            .force_read()
+            .windows
+            .get(&self.id)
+            .map(|w| w.frame)
+            .ok_or(Error::InvalidWindow)
     }
 }
 
@@ -543,15 +583,14 @@ impl MockState {
         });
 
         let s = self.clone();
-        mw.expect_resize().returning(move |size| {
-            let mut inner = s.inner.force_write();
+        mw.expect_resize().returning(move |size, display_bottom| {
+            let mut window = MockAxFrame {
+                state: s.clone(),
+                id,
+            };
             // `Window::resize` sends nothing for the size the window has.
-            if inner
-                .windows
-                .get(&id)
-                .is_some_and(|w| w.frame.size() != size)
-            {
-                inner.write_size(id, size);
+            if window.frame().size() != size {
+                resize_frame(&mut window, size, display_bottom);
             }
         });
 
