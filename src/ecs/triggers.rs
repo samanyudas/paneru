@@ -1252,7 +1252,7 @@ pub(super) fn apply_window_defaults(
                 let w = round_px(f64::from(bounds.width()) * rw);
                 let h = round_px(f64::from(bounds.height()) * rh);
                 window.reposition(Origin::new(x, y));
-                window.resize(Size::new(w, h));
+                window.resize(Size::new(w, h), active_display.bounds().max.y);
             }
             continue;
         }
@@ -1274,7 +1274,7 @@ pub(super) fn apply_window_defaults(
         if let Some(width) = properties.width_ratio(focused_ratio) {
             let new_width = round_px(display_width * width);
             let height = window.frame().height();
-            window.resize(Size::new(new_width, height));
+            window.resize(Size::new(new_width, height), active_display.bounds().max.y);
             // Re-read the actual OS size: the app may enforce a minimum width
             // that differs from our request.
             if let Ok(frame) = window.update_frame().inspect_err(|err| error!("{err}")) {
