@@ -11,6 +11,10 @@
 //! for while an earlier write is still in flight replace each other, so a
 //! slow app skips positions it could not keep up with instead of replaying
 //! them late.
+//!
+//! A writer begins its app before the first batch of a motion and finishes
+//! it only once no write has come for a settle time, so the frames of one
+//! motion do not each pay for the begin and finish.
 
 use bevy::math::IRect;
 use std::collections::hash_map::Entry;
@@ -35,12 +39,13 @@ pub(crate) const LANDING_TIMEOUT: Duration = Duration::from_millis(250);
 pub(crate) trait WriteSink: Send + 'static {
     /// What the sink needs to address one window.
     type Window: Send + 'static;
-    /// Runs before each batch of writes.
+    /// Runs before the first batch of writes after the sink finished.
     fn begin(&mut self);
     fn set_position(&mut self, window: &Self::Window, origin: Origin);
     fn set_size(&mut self, window: &Self::Window, size: Size);
     fn read_frame(&mut self, window: &Self::Window) -> Option<IRect>;
-    /// Runs after each batch of writes.
+    /// Runs once no write has come for the writer's settle time, or when a
+    /// flush asks for it.
     fn finish(&mut self);
 }
 
@@ -204,6 +209,7 @@ struct Shared<S: WriteSink> {
     writers: Mutex<HashMap<Pid, Arc<Mailbox<S::Window>>>>,
     open_sink: Box<dyn Fn(Option<Pid>) -> S + Send + Sync>,
     idle: Duration,
+    settle: Duration,
 }
 
 struct Mailbox<W> {
@@ -217,6 +223,10 @@ struct Mailbox<W> {
 struct Queue<W> {
     pending: HashMap<WriteKey, PendingWrite<W>>,
     in_flight: HashSet<WriteKey>,
+    /// The writer called its sink's `begin` and not yet `finish`.
+    begun: bool,
+    /// A flush waits for the writer to finish its sink.
+    finish_now: bool,
 }
 
 impl<W> Queue<W> {
@@ -227,6 +237,23 @@ impl<W> Queue<W> {
     fn is_empty(&self) -> bool {
         self.pending.is_empty() && self.in_flight.is_empty()
     }
+
+    fn is_finished(&self) -> bool {
+        self.is_empty() && !self.begun
+    }
+}
+
+/// What a writer does next.
+enum Next<W> {
+    /// Writes a batch, after beginning the sink if `begin`.
+    Write {
+        batch: HashMap<WriteKey, PendingWrite<W>>,
+        begin: bool,
+    },
+    /// Finishes the sink.
+    Finish,
+    /// Leaves, as nothing came for the idle time.
+    Leave,
 }
 
 impl<W> Mailbox<W> {
@@ -235,34 +262,67 @@ impl<W> Mailbox<W> {
             queue: Mutex::new(Queue {
                 pending: HashMap::new(),
                 in_flight: HashSet::new(),
+                begun: false,
+                finish_now: false,
             }),
             work: Condvar::new(),
             landed: Condvar::new(),
         }
     }
 
-    /// Takes every queued write, or `None` once nothing has arrived for
-    /// `idle`.
-    fn next_batch(&self, idle: Duration) -> Option<HashMap<WriteKey, PendingWrite<W>>> {
+    /// Takes every queued write. With none, waits `settle` and then
+    /// finishes a begun sink, or waits `idle` and then leaves.
+    fn next(&self, idle: Duration, settle: Duration) -> Next<W> {
         let mut queue = lock(&self.queue);
-        while queue.pending.is_empty() {
-            let (guard, wait) = self
-                .work
-                .wait_timeout(queue, idle)
-                .unwrap_or_else(PoisonError::into_inner);
-            queue = guard;
-            if wait.timed_out() && queue.pending.is_empty() {
-                return None;
+        let deadline = Instant::now() + if queue.begun { settle } else { idle };
+        loop {
+            if !queue.pending.is_empty() {
+                let batch = std::mem::take(&mut queue.pending);
+                queue.in_flight.extend(batch.keys().copied());
+                let begin = !queue.begun;
+                queue.begun = true;
+                return Next::Write { batch, begin };
             }
+            if queue.begun && queue.finish_now {
+                return Next::Finish;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return if queue.begun {
+                    Next::Finish
+                } else {
+                    Next::Leave
+                };
+            }
+            queue = self
+                .work
+                .wait_timeout(queue, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
-        let batch = std::mem::take(&mut queue.pending);
-        queue.in_flight.extend(batch.keys().copied());
-        Some(batch)
     }
 
     fn land(&self) {
         lock(&self.queue).in_flight.clear();
         self.landed.notify_all();
+    }
+
+    fn finished(&self) {
+        let mut queue = lock(&self.queue);
+        queue.begun = false;
+        queue.finish_now = false;
+        drop(queue);
+        self.landed.notify_all();
+    }
+
+    /// Asks the writer to finish its sink once nothing is queued.
+    fn finish_soon(&self) {
+        let mut queue = lock(&self.queue);
+        if queue.begun || !queue.pending.is_empty() {
+            queue.finish_now = true;
+            drop(queue);
+            self.work.notify_one();
+        }
     }
 
     fn wait_until(&self, deadline: Instant, done: impl Fn(&Queue<W>) -> bool) -> bool {
@@ -327,28 +387,39 @@ impl<S: WriteSink> Shared<S> {
     fn run(&self, pid: Pid, mailbox: &Arc<Mailbox<S::Window>>) {
         let mut sink = (self.open_sink)(Some(pid));
         loop {
-            let Some(batch) = mailbox.next_batch(self.idle) else {
-                if self.retire(pid, mailbox) {
-                    debug!("window writer for pid {pid} exits after idling");
-                    return;
+            match mailbox.next(self.idle, self.settle) {
+                Next::Write { batch, begin } => {
+                    objc2::rc::autoreleasepool(|_| {
+                        if begin {
+                            sink.begin();
+                        }
+                        for write in batch.into_values() {
+                            Self::write(&mut sink, write);
+                        }
+                    });
+                    mailbox.land();
                 }
-                continue;
-            };
-            objc2::rc::autoreleasepool(|_| {
-                sink.begin();
-                for write in batch.into_values() {
-                    Self::write(&mut sink, write);
+                Next::Finish => {
+                    objc2::rc::autoreleasepool(|_| sink.finish());
+                    mailbox.finished();
                 }
-                sink.finish();
-            });
-            mailbox.land();
+                Next::Leave => {
+                    if self.retire(pid, mailbox) {
+                        debug!("window writer for pid {pid} exits after idling");
+                        return;
+                    }
+                }
+            }
         }
     }
 }
 
 impl<S: WriteSink> WindowWriters<S> {
+    /// Each writer finishes its sink once no write has come for `settle`,
+    /// and leaves once nothing has come for `idle` after that.
     pub fn new(
         idle: Duration,
+        settle: Duration,
         open_sink: impl Fn(Option<Pid>) -> S + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -356,6 +427,7 @@ impl<S: WriteSink> WindowWriters<S> {
                 writers: Mutex::new(HashMap::new()),
                 open_sink: Box::new(open_sink),
                 idle,
+                settle,
             }),
         }
     }
@@ -421,16 +493,19 @@ impl<S: WriteSink> WindowWriters<S> {
     }
 
     /// Waits up to `timeout` until every writer has written everything queued
-    /// so far. Returns whether that happened.
+    /// so far and finished its sink. Returns whether that happened.
     pub fn flush(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mailboxes = lock(&self.shared.writers)
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        for mailbox in &mailboxes {
+            mailbox.finish_soon();
+        }
         mailboxes
             .iter()
-            .all(|mailbox| mailbox.wait_until(deadline, Queue::is_empty))
+            .all(|mailbox| mailbox.wait_until(deadline, Queue::is_finished))
     }
 
     /// How many writer threads are running.
@@ -796,9 +871,11 @@ mod tests {
         let start = IRect::new(640, 735, 1280, 1440);
         let app = Arc::new(Mutex::new((start, Vec::new())));
         let sink = app.clone();
-        let writers = Arc::new(WindowWriters::new(Duration::from_secs(1), move |_| {
-            Shelf(sink.clone())
-        }));
+        let writers = Arc::new(WindowWriters::new(
+            Duration::from_secs(1),
+            Duration::ZERO,
+            move |_| Shelf(sink.clone()),
+        ));
         let mut window = FrameWrites::new(writers.clone()).starting_at(start);
         for y in [500, 250, 30] {
             window.place(Some(1), || (), IRect::new(640, y, 1280, y + 1410));
@@ -862,6 +939,8 @@ mod writer_tests {
     /// waits on the caller's thread fails the test instead of hanging it.
     const HOLD_LIMIT: Duration = Duration::from_secs(1);
     const SECOND: Duration = Duration::from_secs(1);
+    /// Longer than any test runs, so only a flush finishes an app.
+    const SETTLE: Duration = Duration::from_secs(10);
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Op {
@@ -960,9 +1039,9 @@ mod writer_tests {
         }
     }
 
-    fn writers(probe: &Arc<Probe>, idle: Duration) -> WindowWriters<FakeApp> {
+    fn writers(probe: &Arc<Probe>, idle: Duration, settle: Duration) -> WindowWriters<FakeApp> {
         let probe = probe.clone();
-        WindowWriters::new(idle, move |pid| {
+        WindowWriters::new(idle, settle, move |pid| {
             probe.opened.fetch_add(1, Ordering::SeqCst);
             FakeApp {
                 pid: pid.unwrap_or_default(),
@@ -1006,7 +1085,7 @@ mod writer_tests {
     #[test]
     fn a_push_does_not_wait_for_a_hung_app() {
         let (probe, entered) = Probe::new();
-        let writers = writers(&probe, SECOND);
+        let writers = writers(&probe, SECOND, SETTLE);
         probe.hold(1);
         writers.push(1, key(7), moved(7, 10));
         assert_eq!(entered.recv_timeout(SECOND), Ok(1));
@@ -1025,13 +1104,12 @@ mod writer_tests {
         probe.release(1);
         assert!(writers.wait_landed(1, key(7), SECOND));
         assert!(!writers.is_pending(1, key(7)));
+        assert!(writers.flush(SECOND));
         assert_eq!(
             probe.log(1),
             vec![
                 Op::Begin,
                 Op::Position(7, Origin::new(10, 0)),
-                Op::Finish,
-                Op::Begin,
                 Op::Position(7, Origin::new(20, 0)),
                 Op::Finish,
             ]
@@ -1041,7 +1119,7 @@ mod writer_tests {
     #[test]
     fn a_hung_app_does_not_hold_up_another_app() {
         let (probe, entered) = Probe::new();
-        let writers = writers(&probe, SECOND);
+        let writers = writers(&probe, SECOND, SETTLE);
         probe.hold(1);
         writers.push(1, key(7), moved(7, 10));
         assert_eq!(entered.recv_timeout(SECOND), Ok(1));
@@ -1063,10 +1141,7 @@ mod writer_tests {
             vec![
                 Op::Begin,
                 Op::Position(8, Origin::new(40, 0)),
-                Op::Finish,
-                Op::Begin,
                 Op::Position(8, Origin::new(50, 0)),
-                Op::Finish,
             ]
         );
         assert_eq!(probe.log(1), vec![Op::Begin]);
@@ -1086,20 +1161,63 @@ mod writer_tests {
     #[test]
     fn an_app_stays_begun_between_the_frames_of_one_motion() {
         let (probe, _entered) = Probe::new();
-        let writers = writers(&probe, SECOND);
+        let writers = writers(&probe, SECOND, SETTLE);
         for x in [10, 20, 30] {
             writers.push(1, key(7), moved(7, x));
             assert!(writers.wait_landed(1, key(7), SECOND));
         }
+        assert!(writers.flush(SECOND));
         assert_eq!(
-            probe.log(1)[..4],
-            [
+            probe.log(1),
+            vec![
                 Op::Begin,
                 Op::Position(7, Origin::new(10, 0)),
                 Op::Position(7, Origin::new(20, 0)),
                 Op::Position(7, Origin::new(30, 0)),
+                Op::Finish,
             ]
         );
+    }
+
+    /// The writer finishes its app once writes stop for the settle time,
+    /// without leaving, and begins it again for the next write.
+    #[test]
+    fn an_app_finishes_once_writes_stop_for_the_settle_time() {
+        let (probe, _entered) = Probe::new();
+        let writers = writers(&probe, SECOND, Duration::from_millis(50));
+        writers.push(1, key(7), moved(7, 10));
+        let deadline = Instant::now() + SECOND;
+        while probe.log(1).last() != Some(&Op::Finish) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(writers.writers(), 1);
+
+        writers.push(1, key(7), moved(7, 20));
+        assert!(writers.flush(SECOND));
+        assert_eq!(
+            probe.log(1),
+            vec![
+                Op::Begin,
+                Op::Position(7, Origin::new(10, 0)),
+                Op::Finish,
+                Op::Begin,
+                Op::Position(7, Origin::new(20, 0)),
+                Op::Finish,
+            ]
+        );
+    }
+
+    /// The engine exits once a flush returns, so a flush finishes every app
+    /// at once, also one whose write it caught before the writer took it.
+    #[test]
+    fn a_flush_does_not_wait_out_the_settle_time() {
+        let (probe, _entered) = Probe::new();
+        let writers = writers(&probe, SECOND, SETTLE);
+        for x in 0..50 {
+            writers.push(1, key(7), moved(7, x));
+            assert!(writers.flush(SECOND), "flush {x} timed out");
+        }
+        assert_eq!(probe.log(1).last(), Some(&Op::Finish));
     }
 
     /// Frames asked for while an earlier write is in flight replace each
@@ -1108,7 +1226,7 @@ mod writer_tests {
     #[test]
     fn requests_queued_behind_a_hung_write_collapse_to_the_newest() {
         let (probe, entered) = Probe::new();
-        let writers = writers(&probe, SECOND);
+        let writers = writers(&probe, SECOND, SETTLE);
         probe.hold(1);
         writers.push(1, key(7), moved(7, 10));
         assert_eq!(entered.recv_timeout(SECOND), Ok(1));
@@ -1125,8 +1243,6 @@ mod writer_tests {
             vec![
                 Op::Begin,
                 Op::Position(7, Origin::new(10, 0)),
-                Op::Finish,
-                Op::Begin,
                 Op::Size(7, Size::new(200, 100)),
                 Op::Position(7, Origin::new(40, 0)),
                 Op::Finish,
@@ -1137,7 +1253,7 @@ mod writer_tests {
     #[test]
     fn flush_waits_for_the_write_in_flight() {
         let (probe, entered) = Probe::new();
-        let writers = writers(&probe, SECOND);
+        let writers = writers(&probe, SECOND, SETTLE);
         probe.hold(1);
         writers.push(1, key(7), moved(7, 10));
         assert_eq!(entered.recv_timeout(SECOND), Ok(1));
@@ -1162,7 +1278,7 @@ mod writer_tests {
     #[test]
     fn an_idle_writer_exits_and_comes_back_on_demand() {
         let (probe, _entered) = Probe::new();
-        let writers = writers(&probe, Duration::from_millis(20));
+        let writers = writers(&probe, Duration::from_millis(20), SETTLE);
         writers.push(1, key(7), moved(7, 10));
         assert!(writers.flush(SECOND));
         assert_eq!(writers.writers(), 1);
@@ -1197,7 +1313,7 @@ mod writer_tests {
     fn a_push_racing_an_idle_exit_is_never_lost() {
         const PUSHES: u32 = 20_000;
         let (probe, _entered) = Probe::new();
-        let writers = writers(&probe, Duration::ZERO);
+        let writers = writers(&probe, Duration::ZERO, Duration::ZERO);
         let keys: Vec<_> = (0..PUSHES).map(|_| WriteKey::next()).collect();
         for (window, key) in (0..PUSHES).zip(&keys) {
             writers.push(1, *key, moved(window, window.cast_signed()));

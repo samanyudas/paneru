@@ -1569,7 +1569,7 @@ pub(crate) fn cleanup_on_exit(
             let Some(target) =
                 exit_frame(window.shown_frame(), pre_launch.map(|f| f.0), candidates)
             else {
-                return;
+                break;
             };
             info!(
                 "exit cleanup: window {} -> origin {:?}, size {:?}",

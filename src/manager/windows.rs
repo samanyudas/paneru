@@ -259,13 +259,19 @@ fn set_enhanced_ui(app_element: &CFRetained<AXUIWrapper>, enabled: bool, pid: Pi
 
 /// Every window move and resize, carried to the window's app.
 static WRITERS: LazyLock<Arc<WindowWriters<AxApp>>> =
-    LazyLock::new(|| Arc::new(WindowWriters::new(WRITER_IDLE, AxApp::new)));
+    LazyLock::new(|| Arc::new(WindowWriters::new(WRITER_IDLE, WRITER_SETTLE, AxApp::new)));
 
 /// How long an app's writer outlives its last write.
 const WRITER_IDLE: Duration = Duration::from_secs(5);
 
+/// How long an app keeps `AXEnhancedUserInterface` off after its last write.
+/// Chromium takes 10 to 360 ms to turn it back on, longer than a frame, and
+/// a second spans the pauses between key presses in a burst.
+const WRITER_SETTLE: Duration = Duration::from_secs(1);
+
 /// Waits up to `timeout` for every window move and resize asked for so far
-/// to reach its app. Returns whether all of them did.
+/// to reach its app, and for each app to get its `AXEnhancedUserInterface`
+/// back. Returns whether all of them did.
 pub(super) fn flush_window_writes(timeout: Duration) -> bool {
     WRITERS.flush(timeout)
 }
@@ -277,7 +283,7 @@ struct AxApp {
     pid: Option<Pid>,
     app: Option<CFRetained<AXUIWrapper>>,
     /// Held from [`WriteSink::begin`] to [`WriteSink::finish`], so the app
-    /// keeps `AXEnhancedUserInterface` off for a whole batch of writes.
+    /// keeps `AXEnhancedUserInterface` off for a whole motion of writes.
     enhanced_ui: Option<EnhancedUiGuard<RestoreEnhancedUi>>,
 }
 
