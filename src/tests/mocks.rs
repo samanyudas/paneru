@@ -7,7 +7,7 @@ use objc2_core_graphics::CGDirectDisplayID;
 use stdext::prelude::RwLockExt;
 
 use crate::errors::Error;
-use crate::events::{DestroySource, Event};
+use crate::events::{DestroySource, Event, MouseButton};
 use crate::manager::app::MockApplicationApi;
 use crate::manager::{
     Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
@@ -90,6 +90,12 @@ struct MockStateInner {
     fullscreen_spaces: HashSet<WorkspaceId>,
     active_display_id: u32,
     cursor_position: Origin,
+    /// Whether the window server sees the left mouse button down.
+    left_button_down: bool,
+    /// Windows brought to the front, bottom to top. Windows not in it sit
+    /// below, the lowest ID on top, so overlapping windows resolve the same
+    /// way on every run.
+    stacking: Vec<WinID>,
     event_queue: VecDeque<Event>,
     /// Windows that are gone but which the app's AX window list still reports,
     /// modelling the lag real apps show right after a window closes.
@@ -104,6 +110,26 @@ struct MockStateInner {
     /// How many times each app has been asked for its focused window or its
     /// window list, so a test can check who a lookup bothers.
     app_reads: HashMap<Pid, usize>,
+}
+
+impl MockStateInner {
+    /// The window on top at `point`: windows brought to the front first, then
+    /// the lowest ID.
+    fn top_window_at(&self, point: Origin) -> Option<WinID> {
+        self.windows
+            .iter()
+            .filter(|(_, window)| window.frame.contains(point))
+            .map(|(id, _)| *id)
+            .max_by_key(|id| {
+                let front = self.stacking.iter().position(|raised| raised == id);
+                (front, std::cmp::Reverse(*id))
+            })
+    }
+
+    fn bring_to_front(&mut self, id: WinID) {
+        self.stacking.retain(|raised| *raised != id);
+        self.stacking.push(id);
+    }
 }
 
 #[derive(Clone)]
@@ -121,6 +147,8 @@ impl MockState {
                 fullscreen_spaces: HashSet::new(),
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
+                left_button_down: false,
+                stacking: Vec::new(),
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
@@ -411,17 +439,28 @@ impl MockState {
 
     // --- Interaction Helpers ---
 
+    /// The window on top at `point`, as the window server would name it in
+    /// a press event.
+    #[allow(unused)]
+    pub fn window_at(&self, point: Origin) -> Option<WinID> {
+        self.inner.force_read().top_window_at(point)
+    }
+
     #[allow(unused)]
     pub fn simulate_click(&self, point: Origin) {
         let mut inner = self.inner.force_write();
+        let window_id = inner.top_window_at(point);
         let point = CGPoint::new(point.x.into(), point.y.into());
         inner.event_queue.push_back(Event::MouseDown {
             point,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+            window_id,
         });
         inner.event_queue.push_back(Event::MouseUp {
             point,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
         });
     }
 
@@ -440,18 +479,30 @@ impl MockState {
         let mut inner = self.inner.force_write();
         let start_p = CGPoint::new(start.x.into(), start.y.into());
         let end_p = CGPoint::new(end.x.into(), end.y.into());
+        let window_id = inner.top_window_at(start);
         inner.event_queue.push_back(Event::MouseDown {
             point: start_p,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+            window_id,
         });
         inner.event_queue.push_back(Event::MouseDragged {
             point: end_p,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
         });
         inner.event_queue.push_back(Event::MouseUp {
             point: end_p,
             modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
         });
+    }
+
+    /// Sets whether the window server sees the left mouse button down. Only
+    /// the button state changes: no mouse event is sent.
+    #[allow(unused)]
+    pub fn set_left_button_down(&self, down: bool) {
+        self.inner.force_write().left_button_down = down;
     }
 
     pub fn cursor_position(&self) -> IVec2 {
@@ -512,6 +563,7 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_focus_with_raise().returning(move |_psn| {
+            s.inner.force_write().bring_to_front(id);
             s.focus_window(id);
         });
 
@@ -656,8 +708,11 @@ impl MockState {
         // Fill in remaining defaults
         mw.expect_element().return_const(None);
         let s = self.clone();
-        mw.expect_raise_without_focus()
-            .returning(move || s.inner.force_write().raised.push(id));
+        mw.expect_raise_without_focus().returning(move || {
+            let mut inner = s.inner.force_write();
+            inner.raised.push(id);
+            inner.bring_to_front(id);
+        });
 
         // Focusing without raising still moves the OS focus, it just leaves the
         // window order alone. Only the app's idea of its focused window changes
@@ -903,6 +958,10 @@ impl MockState {
         wm.expect_cursor_position()
             .returning(move || Some(origin_to(s.inner.force_read().cursor_position)));
 
+        let s = self.clone();
+        wm.expect_left_button_down()
+            .returning(move || s.inner.force_read().left_button_down);
+
         wm.expect_get_associated_windows().return_const(vec![]);
 
         let s = self.clone();
@@ -910,11 +969,8 @@ impl MockState {
             let point = origin_from(*at_point);
             s.inner
                 .force_read()
-                .windows
-                .iter()
-                .find_map(|(id, window)| window.frame.contains(point).then_some(id))
+                .top_window_at(point)
                 .ok_or(Error::NotFound(format!("no window found at point {point}")))
-                .copied()
         });
 
         wm
