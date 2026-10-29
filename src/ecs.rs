@@ -315,6 +315,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             (
                 systems::animate_resize_entities,
                 systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
+                systems::record_minimum_height.run_if(not(resource_exists::<Initializing>)),
             )
                 .chain(),
         )
@@ -420,6 +421,12 @@ pub struct AwaitResize {
     /// The window's `ResizeAnchor`, relative to `x`.
     pub anchor_offset: i32,
 }
+
+/// The smallest height a window's app accepted when the layout asked for less.
+/// Stack layout never gives the window less, so it cannot cover the window
+/// below it. Dropped once the window is seen shorter.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct MinimumHeight(pub i32);
 
 /// The horizontal center a window had before its current run of resizes. The
 /// layout keeps a resizing window centered on it, so a size the app refuses
