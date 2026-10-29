@@ -268,6 +268,46 @@ fn test_startup_windows() {
         .run(commands);
 }
 
+/// A resize keeps the window's center. Pressed while Center is still sliding
+/// the strip, it must keep the center the window is sliding to, so the result
+/// matches a resize pressed after the strip settles.
+#[test]
+fn test_resize_during_center_animation_keeps_the_centered_position() {
+    for center_duration in [Duration::from_secs(3), Duration::from_millis(40)] {
+        let config: Config = (
+            MainOptions {
+                preset_column_widths: vec![0.25, 0.5, 0.75],
+                animation_speed: Some(8.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(3);
+        harness.run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Window(Operation::Focus(Direction::First)),
+            },
+        ]);
+        harness.world().write_message(Event::Command {
+            command: Command::Window(Operation::Center),
+        });
+        harness.advance(center_duration);
+        harness.world().write_message(Event::Command {
+            command: Command::Window(Operation::Resize(ResizeDirection::Grow)),
+        });
+        harness.advance(Duration::from_secs(3));
+
+        let frame = harness.mock_state.create_window(0).frame();
+        assert_eq!(
+            (frame.min.x, frame.max.x),
+            (256, 768),
+            "resize {center_duration:?} into the Center animation"
+        );
+    }
+}
+
 #[test]
 fn test_window_resize_grow_and_shrink_cycle() {
     let commands = vec![

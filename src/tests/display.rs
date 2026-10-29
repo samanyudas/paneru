@@ -246,6 +246,63 @@ fn test_next_display_inserts_into_target_strip() {
         .run(commands);
 }
 
+/// Moving a window to another display resizes it to the new display a moment
+/// later. A Center pressed before that resize must still leave the window
+/// centered once the resize lands.
+#[test]
+fn test_center_right_after_next_display_survives_the_delayed_resize() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(8.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_workspace_window(0, TEST_WORKSPACE_ID, |window| {
+            window.frame = IRect::new(0, 0, TEST_DISPLAY_WIDTH / 2, 700);
+        });
+    for id in [1, 2] {
+        harness = harness.with_workspace_window(id, EXT_WORKSPACE_ID, |window| {
+            window.frame = IRect::new(0, -EXT_DISPLAY_HEIGHT, 800, -100);
+        });
+    }
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.world().write_message(Event::Command {
+        command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+    });
+    harness.advance(Duration::from_millis(20));
+    // macOS reports the window on the other display's Space and that display
+    // as active once the move lands.
+    harness
+        .mock_state
+        .update_window(0, |window| window.workspace_id = EXT_WORKSPACE_ID);
+    harness.mock_state.activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(60));
+    harness.world().write_message(Event::Command {
+        command: Command::Window(Operation::Center),
+    });
+    harness.advance(Duration::from_secs(3));
+
+    // Half of the 1024 px display is half of the 1920 px display.
+    let width = EXT_DISPLAY_WIDTH / 2;
+    let left = (EXT_DISPLAY_WIDTH - width) / 2;
+    let frame = harness.mock_state.create_window(0).frame();
+    assert_eq!(
+        (frame.min.x, frame.max.x),
+        (left, left + width),
+        "the window must stay centered after the delayed resize, got {frame:?}"
+    );
+}
+
 #[test]
 fn test_send_next_display_stays_on_source() {
     let mut harness = TestHarness::new();
