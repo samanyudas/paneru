@@ -16,9 +16,9 @@ use crate::config::Config;
 use crate::ecs::params::Windows;
 use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, ResizeAnchor,
-    ResizeMarker, Scrolling, SpawnCommandsExt,
+    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, KeptHeight,
+    KeptHeightReread, KeptHold, LayoutPosition, ManualStripOffset, Position, RepositionMarker,
+    ReshuffleAroundMarker, ResizeAnchor, ResizeMarker, Scrolling, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -229,6 +229,20 @@ impl StackItem {
             StackItem::Single(entity) => StackItemIter::Single(std::iter::once(*entity)),
             StackItem::Tabs(tabs) => StackItemIter::Tabs(tabs.iter().copied()),
         }
+    }
+
+    /// How the stack layout holds this item. Native tabs share one frame, so
+    /// the tallest height any of them kept holds it.
+    pub fn kept_hold<K>(&self, get_kept_hold: &K) -> Option<KeptHold>
+    where
+        K: Fn(Entity) -> Option<KeptHold>,
+    {
+        self.window_iter()
+            .filter_map(get_kept_hold)
+            .max_by_key(|hold| match hold {
+                KeptHold::Kept { kept, .. } => *kept,
+                KeptHold::Released => 0,
+            })
     }
 }
 
@@ -917,13 +931,15 @@ impl LayoutStrip {
     }
 
     #[instrument(level = Level::TRACE, skip_all, fields(layout_strip_height))]
-    pub fn relative_positions<W>(
+    pub fn relative_positions<W, K>(
         &self,
         layout_strip_height: i32,
         get_window_frame: &W,
+        get_kept_hold: &K,
     ) -> impl Iterator<Item = (Entity, IRect)>
     where
         W: Fn(Entity) -> Option<IRect>,
+        K: Fn(Entity) -> Option<KeptHold>,
     {
         self.column_positions(get_window_frame)
             .filter_map(move |(column, position)| {
@@ -947,21 +963,32 @@ impl LayoutStrip {
                         .flat_map(StackItem::window_iter)
                         .any(|e| self.tabbed_stacks.contains(&e));
 
-                let splits_evenly = items
-                    .iter()
-                    .flat_map(StackItem::window_iter)
-                    .any(|entity| self.even_splits.contains(&entity));
-
                 let heights = if is_tabbed_column {
                     vec![layout_strip_height; items.len()]
-                } else if splits_evenly {
+                } else if self.splits_evenly(column) {
+                    // A window joining or leaving is a new resize intent, so
+                    // every app is asked for its share again.
                     even_heights(items.len(), layout_strip_height)
                 } else {
-                    let current_heights = items
+                    let (mut current_heights, holds): (Vec<_>, Vec<_>) = items
                         .iter()
-                        .filter_map(|item| item.top().and_then(get_window_frame))
-                        .map(|frame| frame.height())
-                        .collect::<Vec<_>>();
+                        .filter_map(|item| {
+                            let frame = item.top().and_then(get_window_frame)?;
+                            Some((frame.height(), item.kept_hold(get_kept_hold)))
+                        })
+                        .unzip();
+                    if !fit_kept_heights(&mut current_heights, &holds, layout_strip_height) {
+                        // No split keeps every window whole and on screen, so
+                        // the column is laid out from the heights it asked
+                        // for, as if no app had kept more.
+                        for (height, hold) in current_heights.iter_mut().zip(&holds) {
+                            if let Some(KeptHold::Kept { asked, kept }) = hold
+                                && *height >= kept - 1
+                            {
+                                *height = *asked;
+                            }
+                        }
+                    }
                     // When binpack gives up, for example on a column too short
                     // for every window's minimum, an even split still places
                     // every window rather than leaving the column out.
@@ -1139,6 +1166,20 @@ impl LayoutStrip {
         self.even_splits.clear();
     }
 
+    fn splits_evenly(&self, column: &Column) -> bool {
+        column
+            .window_iter()
+            .any(|entity| self.even_splits.contains(&entity))
+    }
+
+    /// The windows in every column waiting for an even split.
+    pub fn even_split_windows(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.columns
+            .iter()
+            .filter(|column| self.splits_evenly(column))
+            .flat_map(Column::window_iter)
+    }
+
     /// Whether `entity` belongs to a `Column::Stack` currently displayed as
     /// tabs. Independent of `tabbed()` (native-OS-tab detection).
     pub fn is_tabbed_display(&self, entity: Entity) -> bool {
@@ -1240,6 +1281,61 @@ fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Optio
     Some(output)
 }
 
+/// Fits the heights of a column around the heights apps kept. A kept height
+/// is a floor: the window gets no less, and the extra comes from the windows
+/// with the most room above their own floor or `MIN_WINDOW_HEIGHT`. When a
+/// window is released, the room it frees goes to the windows with no hold,
+/// the ones that made room for it. Returns `false`, with the heights
+/// untouched, when the floors cannot all fit in `total_height`.
+pub(crate) fn fit_kept_heights(
+    heights: &mut [i32],
+    holds: &[Option<KeptHold>],
+    total_height: i32,
+) -> bool {
+    let floor = |index: usize| match holds[index] {
+        Some(KeptHold::Kept { kept, .. }) => kept.max(MIN_WINDOW_HEIGHT),
+        _ => MIN_WINDOW_HEIGHT,
+    };
+    if holds.iter().all(Option::is_none) {
+        return true;
+    }
+    if (0..heights.len()).map(floor).sum::<i32>() > total_height {
+        return false;
+    }
+    for (index, height) in heights.iter_mut().enumerate() {
+        *height = (*height).max(floor(index));
+    }
+    let mut excess = heights.iter().sum::<i32>() - total_height;
+    // One pixel at a time from whichever window has the most room above its
+    // floor, which levels the givers instead of leaving rounding steps.
+    while excess > 0 {
+        let Some(giver) = (0..heights.len())
+            .filter(|&index| heights[index] > floor(index))
+            .max_by_key(|&index| (heights[index] - floor(index), std::cmp::Reverse(index)))
+        else {
+            break;
+        };
+        heights[giver] -= 1;
+        excess -= 1;
+    }
+    if holds.contains(&Some(KeptHold::Released)) {
+        // And back to the shortest window with no hold, so a slow app that
+        // catches up leaves the split it was asked for, not a gap that
+        // binpack would hand to the last window.
+        while excess < 0 {
+            let Some(taker) = (0..heights.len())
+                .filter(|&index| holds[index].is_none())
+                .min_by_key(|&index| (heights[index], std::cmp::Reverse(index)))
+            else {
+                break;
+            };
+            heights[taker] += 1;
+            excess += 1;
+        }
+    }
+    true
+}
+
 /// `total_height` split into `count` heights that sum to it exactly.
 fn even_heights(count: usize, total_height: i32) -> Vec<i32> {
     let Ok(count) = i32::try_from(count) else {
@@ -1298,8 +1394,10 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
 pub(super) fn layout_strip_changed(
     mut changed_strips: Populated<(&mut LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
     mut windows: WindowFrames,
+    kept_heights: Query<(&KeptHeight, &Window)>,
     displays: DisplayViewports,
     config: Res<Config>,
+    mut commands: Commands,
 ) {
     let get_window_frame = |entity| {
         windows
@@ -1310,17 +1408,40 @@ pub(super) fn layout_strip_changed(
             })
             .ok()
     };
+    // The frame `Window::resize` or the last resize notice read, not
+    // `Bounds`: a window the layout asked for less still shows what it kept.
+    let get_kept_hold = |entity| {
+        kept_heights
+            .get(entity)
+            .ok()
+            .map(|(kept, window)| kept.hold(window.frame().height()))
+    };
 
     let mut changed = Vec::new();
+    let mut ended = Vec::new();
     for (mut layout_strip, child_of) in &mut changed_strips {
         let Ok((display, dock)) = displays.get(child_of.parent()) else {
             continue;
         };
         let height = display.actual_display_bounds(dock, &config).height();
-        changed.extend(layout_strip.relative_positions(height, &get_window_frame));
+        changed.extend(layout_strip.relative_positions(height, &get_window_frame, &get_kept_hold));
+        ended.extend(layout_strip.even_split_windows());
         // Later layouts keep the heights this one sets. Clearing the record
         // is bookkeeping, not a layout change.
         layout_strip.bypass_change_detection().clear_even_splits();
+    }
+    ended.extend(
+        changed
+            .iter()
+            .map(|(entity, _)| *entity)
+            .filter(|entity| get_kept_hold(*entity) == Some(KeptHold::Released)),
+    );
+    for entity in ended {
+        if kept_heights.contains(entity)
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<(KeptHeight, KeptHeightReread)>();
+        }
     }
 
     for (entity, frame) in changed {
@@ -2246,6 +2367,88 @@ mod tests {
     }
 
     #[test]
+    fn test_fit_kept_heights() {
+        let kept = |asked, kept| Some(KeptHold::Kept { asked, kept });
+
+        // The last window too: the others make room, not the remainder.
+        let mut heights = vec![423, 423, 424];
+        assert!(fit_kept_heights(
+            &mut heights,
+            &[None, None, kept(424, 500)],
+            1270
+        ));
+        assert_eq!(heights, vec![385, 385, 500]);
+
+        // A window already at the floor gives nothing.
+        let mut heights = vec![200, 500, 570];
+        assert!(fit_kept_heights(
+            &mut heights,
+            &[None, None, kept(570, 700)],
+            1270
+        ));
+        assert_eq!(heights, vec![200, 370, 700]);
+
+        // Released: the room goes back to the windows that made it.
+        let mut heights = vec![423, 385, 385];
+        assert!(fit_kept_heights(
+            &mut heights,
+            &[Some(KeptHold::Released), None, None],
+            1270
+        ));
+        assert_eq!(heights, vec![423, 423, 424]);
+
+        // Kept heights that cannot all fit leave the heights alone.
+        let mut heights = vec![400, 400];
+        assert!(!fit_kept_heights(
+            &mut heights,
+            &[kept(374, 600), kept(374, 600)],
+            800
+        ));
+        assert_eq!(heights, vec![400, 400]);
+
+        let mut heights = vec![300, 500];
+        assert!(fit_kept_heights(&mut heights, &[None, None], 800));
+        assert_eq!(heights, vec![300, 500]);
+    }
+
+    /// A window that kept 500 px of the 423 px it was asked for is held there
+    /// and the others share the rest. A column too short for it is laid out
+    /// from the height it was asked for.
+    #[test]
+    fn test_layout_holds_kept_heights() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::default();
+        for &entity in &entities {
+            strip.append(entity);
+        }
+        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[2]).unwrap();
+        strip.clear_even_splits();
+        let heights = |strip: &LayoutStrip, current: [i32; 3], asked: i32, column: i32| {
+            let get_window_frame = |entity| {
+                let index = entities.iter().position(|e| *e == entity)?;
+                Some(IRect::new(0, 0, 300, current[index]))
+            };
+            let get_kept_hold =
+                |entity| (entity == entities[1]).then_some(KeptHold::Kept { asked, kept: 500 });
+            strip
+                .relative_positions(column, &get_window_frame, &get_kept_hold)
+                .map(|(_, frame)| frame.height())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            heights(&strip, [423, 500, 424], 423, 1270),
+            vec![385, 500, 385]
+        );
+        assert_eq!(
+            heights(&strip, [249, 500, 250], 249, 748),
+            vec![249, 249, 250]
+        );
+    }
+
+    #[test]
     fn test_even_heights() {
         assert_eq!(even_heights(3, 1000), vec![333, 333, 334]);
         assert_eq!(even_heights(4, 748), vec![187, 187, 187, 187]);
@@ -2274,7 +2477,7 @@ mod tests {
         _ = strip.stack(entities[2]);
         let get_window_frame = |_| Some(sizes[0]);
         let out = strip
-            .relative_positions(500, &get_window_frame)
+            .relative_positions(500, &get_window_frame, &|_| None)
             .collect::<Vec<_>>();
 
         let xpos = out.iter().map(|(_, frame)| frame.min.x).collect::<Vec<_>>();
@@ -2300,7 +2503,9 @@ mod tests {
         }
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 400));
-        let out: Vec<_> = strip.relative_positions(800, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(800, &get_window_frame, &|_| None)
+            .collect();
 
         assert_eq!(out.len(), 3);
         for (_, f) in &out {
@@ -2341,7 +2546,9 @@ mod tests {
             }
         };
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(600, &get_window_frame, &|_| None)
+            .collect();
         assert_eq!(out.len(), 4);
 
         // Every window in the stacked column must adopt the master's width.
@@ -2431,7 +2638,9 @@ mod tests {
         strip.toggle_tabbed_display(entities[1]);
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 400, 300));
-        let out: Vec<_> = strip.relative_positions(700, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(700, &get_window_frame, &|_| None)
+            .collect();
 
         assert_eq!(out.len(), 3);
         for (_, frame) in &out {
@@ -2465,7 +2674,9 @@ mod tests {
         strip.toggle_tabbed_display(entities[1]);
         strip.toggle_tabbed_display(entities[1]);
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(600, &get_window_frame, &|_| None)
+            .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(
             heights.iter().sum::<i32>(),
@@ -2614,7 +2825,9 @@ mod tests {
 
         // relative_positions should yield e1, e4 (same frame) and e2
         let get_window_frame = |_| Some(IRect::new(0, 0, 100, 100));
-        let out: Vec<_> = strip.relative_positions(400, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(400, &get_window_frame, &|_| None)
+            .collect();
 
         // We expect e1, e4, e2 from the first column, and e3 from the second.
         assert_eq!(out.len(), 4);
@@ -2643,7 +2856,9 @@ mod tests {
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 250));
 
         // Before unstack: e0 and e1 share 500px height.
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(500, &get_window_frame, &|_| None)
+            .collect();
         let e1_height = out
             .iter()
             .find(|(e, _)| *e == entities[1])
@@ -2656,7 +2871,9 @@ mod tests {
         strip.unstack(entities[1]).unwrap();
         assert_eq!(strip.len(), 3);
 
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(500, &get_window_frame, &|_| None)
+            .collect();
         for (_, f) in &out {
             assert_eq!(
                 f.height(),
@@ -2680,21 +2897,27 @@ mod tests {
 
         // Stack: [Stack(e0, e1)]
         strip.stack(entities[1]).unwrap();
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(500, &get_window_frame, &|_| None)
+            .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(heights.iter().sum::<i32>(), 500);
         assert_eq!(heights.len(), 2);
 
         // Unstack: [Single(e0), Single(e1)]
         strip.unstack(entities[1]).unwrap();
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(500, &get_window_frame, &|_| None)
+            .collect();
         for (_, f) in &out {
             assert_eq!(f.height(), 500);
         }
 
         // Re-stack: [Stack(e0, e1)] — e1 stacks onto left neighbor e0
         strip.stack(entities[1]).unwrap();
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(500, &get_window_frame, &|_| None)
+            .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(heights.iter().sum::<i32>(), 500);
         assert_eq!(heights.len(), 2);
@@ -2733,7 +2956,9 @@ mod tests {
             }
         };
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(600, &get_window_frame, &|_| None)
+            .collect();
         assert_eq!(out.len(), 3);
 
         // Columns must be edge-to-edge: each column starts where the previous ends.
@@ -2769,7 +2994,9 @@ mod tests {
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 600));
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(600, &get_window_frame, &|_| None)
+            .collect();
         let xs: Vec<_> = out.iter().map(|(_, f)| f.min.x).collect();
         assert_eq!(xs, vec![0, 300, 600]);
 
@@ -2909,7 +3136,7 @@ mod tests {
         };
 
         let out = strip
-            .relative_positions(600, &get_window_frame)
+            .relative_positions(600, &get_window_frame, &|_| None)
             .collect::<Vec<_>>();
 
         assert_eq!(out.len(), 2);

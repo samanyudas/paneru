@@ -51,6 +51,10 @@ pub(crate) struct MockWindowData {
     pub(crate) max_width: i32,
     /// The shortest height the app accepts, like an `NSWindow.minSize`.
     pub(crate) min_height: i32,
+    /// Size writes the app has not applied yet, oldest first, like an app
+    /// that applies a size after the call returns. See
+    /// [`MockState::os_apply_late_resize`].
+    pub(crate) late_resizes: Option<VecDeque<Size>>,
     pub(crate) resize_writes: usize,
 }
 
@@ -90,6 +94,7 @@ impl Default for MockWindowData {
             min_width: 0,
             max_width: 0,
             min_height: 0,
+            late_resizes: None,
             resize_writes: 0,
         }
     }
@@ -379,6 +384,32 @@ impl MockState {
         self.inner.force_read().windows[&id].resize_writes
     }
 
+    /// How many size writes window `id`'s app holds.
+    pub fn late_resize_count(&self, id: WinID) -> usize {
+        self.inner.force_read().windows[&id]
+            .late_resizes
+            .as_ref()
+            .map_or(0, VecDeque::len)
+    }
+
+    /// Applies the oldest size write window `id`'s app holds, with a resize
+    /// notice, or with none when `notify` is false, as macOS sometimes does.
+    pub fn os_apply_late_resize(&self, id: WinID, notify: bool) {
+        let mut inner = self.inner.force_write();
+        let Some(w) = inner.windows.get_mut(&id) else {
+            return;
+        };
+        let Some(size) = w.late_resizes.as_mut().and_then(VecDeque::pop_front) else {
+            return;
+        };
+        w.frame.max = w.frame.min + w.accepted_size(size);
+        if notify {
+            inner
+                .event_queue
+                .push_back(Event::WindowResized { window_id: id });
+        }
+    }
+
     #[allow(unused)]
     pub fn os_minimize_window(&self, id: WinID, minimized: bool) {
         let mut inner = self.inner.force_write();
@@ -518,7 +549,11 @@ impl MockState {
                 && w.frame.size() != size
             {
                 w.resize_writes += 1;
-                w.frame.max = w.frame.min + w.accepted_size(size);
+                if let Some(late) = &mut w.late_resizes {
+                    late.push_back(size);
+                } else {
+                    w.frame.max = w.frame.min + w.accepted_size(size);
+                }
             }
         });
 

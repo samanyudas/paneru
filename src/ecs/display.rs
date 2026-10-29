@@ -24,10 +24,10 @@ use crate::config::Config;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, EnsureVisibleMarker, FocusedMarker, LayoutPosition,
-    ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties, RepositionMarker,
-    SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
-    VerifyWindowSize,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, EnsureVisibleMarker, FocusedMarker, KeptHeight,
+    KeptHeightReread, LayoutPosition, ManualStripOffset, NativeFullscreenMarker, Position,
+    ReadDisplayProperties, RepositionMarker, SelectedVirtualMarker, SendMessageTrigger,
+    SpawnCommandsExt, Timeout, Unmanaged, VerifyWindowSize,
 };
 use crate::events::Event;
 use crate::manager::{Display, Window, WindowManager, irect_from};
@@ -105,9 +105,12 @@ fn display_change_handler(
         return;
     }
 
+    // A new display geometry is a new resize intent: the next ask goes to
+    // each app again.
     for window in windows {
         if let Ok(mut cmd) = commands.get_entity(window) {
-            cmd.try_insert(VerifyWindowSize);
+            cmd.try_insert(VerifyWindowSize)
+                .try_remove::<(KeptHeight, KeptHeightReread)>();
         }
     }
 
