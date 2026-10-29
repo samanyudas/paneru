@@ -37,7 +37,7 @@ use crate::lua;
 use crate::manager::{
     Application, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi, WindowManagerOS,
 };
-use crate::overlay::{FlashMessageManager, OverlayManager};
+use crate::overlay::{DragOverlay, FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
 pub mod display;
@@ -960,6 +960,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     app.insert_non_send(platform_callbacks)
         .insert_non_send(overlay_manager)
         .insert_non_send(flash_message_manager)
+        .insert_non_send(drag::DragOverlayHandle(Box::new(DragOverlay::new(mtm))))
         .insert_non_send(receiver);
 
     // `CONFIGURATION_FILE` is `None` exactly when an `init.lua` took the TOML

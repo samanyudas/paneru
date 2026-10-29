@@ -1,15 +1,20 @@
+use std::cell::Cell;
+
+use bevy::math::IRect;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSBackingStoreType, NSBezierPath, NSColor, NSCompositingOperation, NSFloatingWindowLevel,
-    NSFont, NSGraphicsContext, NSParagraphStyle, NSScreen, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSFont, NSFontWeightSemibold, NSGraphicsContext, NSImage, NSImageSymbolConfiguration,
+    NSParagraphStyle, NSScreen, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableCopying, NSPoint, NSRect, NSSize, NSString,
 };
+
+use crate::ecs::drag::{DragOverlayApi, REFUSAL_SYMBOL};
 
 #[derive(Clone, PartialEq)]
 pub struct BorderParams {
@@ -344,6 +349,184 @@ impl OverlayManager {
         }
         self.hidden = true;
     }
+}
+
+// ── DragOverlay ─────────────────────────────────────────────────────────
+
+/// What one display's drag overlay draws, in that display's local, flipped
+/// coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DragMark {
+    Line {
+        rect: NSRect,
+        color: (f64, f64, f64),
+    },
+    Refusal(NSRect),
+}
+
+#[derive(Debug)]
+struct DragViewIvars {
+    mark: Cell<Option<DragMark>>,
+    symbol: Option<Retained<NSImage>>,
+}
+
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "PaneruDragView"]
+    #[ivars = DragViewIvars]
+    #[derive(Debug)]
+    struct DragView;
+
+    impl DragView {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty_rect: NSRect) {
+            let ivars = self.ivars();
+            match ivars.mark.get() {
+                Some(DragMark::Line { rect, color }) => {
+                    NSColor::colorWithSRGBRed_green_blue_alpha(color.0, color.1, color.2, 1.0)
+                        .setFill();
+                    let radius = rect.size.width.min(rect.size.height) / 2.0;
+                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, radius, radius)
+                        .fill();
+                }
+                Some(DragMark::Refusal(rect)) => {
+                    if let Some(symbol) = &ivars.symbol {
+                        symbol.drawInRect(rect);
+                    }
+                }
+                None => {}
+            }
+        }
+
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+    }
+);
+
+impl DragView {
+    fn new(
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        symbol: Option<Retained<NSImage>>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(DragViewIvars {
+            mark: Cell::new(None),
+            symbol,
+        });
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+}
+
+/// The drop feedback drawn while a tiled window is dragged by its title bar:
+/// an insertion line where a release would put it, or the `nosign` symbol
+/// beside the pointer where a release would be refused.
+///
+/// Like [`OverlayManager`], it keeps one click-through window per display,
+/// and each draws only the part of the shape on its display. It makes no
+/// window until a drag first shows something.
+pub struct DragOverlay {
+    mtm: MainThreadMarker,
+    /// Indexed in lockstep with `NSScreen::screens`.
+    overlays: Vec<(Retained<NSWindow>, Retained<DragView>)>,
+}
+
+impl DragOverlay {
+    pub fn new(mtm: MainThreadMarker) -> Self {
+        Self {
+            mtm,
+            overlays: Vec::new(),
+        }
+    }
+
+    /// Draws `mark` over `shape`, in screen points, on each display it
+    /// touches, and hides the overlay on every other display.
+    fn show(&mut self, shape: IRect, mark: impl Fn(NSRect) -> DragMark) {
+        let screens = NSScreen::screens(self.mtm);
+        // A display was added or removed, so build the windows again.
+        if self.overlays.len() != screens.len() {
+            self.remove();
+        }
+        let cocoa = cg_abs_to_cocoa(
+            NSRect::new(
+                NSPoint::new(f64::from(shape.min.x), f64::from(shape.min.y)),
+                NSSize::new(f64::from(shape.width()), f64::from(shape.height())),
+            ),
+            primary_screen_height(self.mtm),
+        );
+
+        for (i, screen) in (&screens).into_iter().enumerate() {
+            let frame = screen.frame();
+            if i == self.overlays.len() {
+                let window = make_overlay_window(self.mtm, frame);
+                let view = DragView::new(self.mtm, frame, refusal_symbol());
+                window.setContentView(Some(&view));
+                self.overlays.push((window, view));
+            }
+            let (window, view) = &self.overlays[i];
+            if window.frame() != frame {
+                window.setFrame_display(frame, false);
+            }
+            if !rects_intersect(cocoa, frame) {
+                view.ivars().mark.set(None);
+                window.orderOut(None::<&AnyObject>);
+                continue;
+            }
+            let local = NSRect::new(
+                NSPoint::new(
+                    cocoa.origin.x - frame.origin.x,
+                    (frame.origin.y + frame.size.height) - (cocoa.origin.y + cocoa.size.height),
+                ),
+                cocoa.size,
+            );
+            view.ivars().mark.set(Some(mark(local)));
+            view.setNeedsDisplay(true);
+            window.orderFront(None::<&AnyObject>);
+        }
+    }
+}
+
+impl DragOverlayApi for DragOverlay {
+    fn show_line(&mut self, line: IRect, color: (f64, f64, f64)) {
+        self.show(line, |rect| DragMark::Line { rect, color });
+    }
+
+    fn show_refusal(&mut self, square: IRect) {
+        self.show(square, DragMark::Refusal);
+    }
+
+    fn hide(&mut self) {
+        for (window, view) in &self.overlays {
+            view.ivars().mark.set(None);
+            window.orderOut(None::<&AnyObject>);
+        }
+    }
+
+    fn remove(&mut self) {
+        for (window, _) in self.overlays.drain(..) {
+            window.orderOut(None::<&AnyObject>);
+        }
+    }
+}
+
+/// The `nosign` SF Symbol, sized for the refusal square, in the system red.
+fn refusal_symbol() -> Option<Retained<NSImage>> {
+    let symbol = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str("nosign"),
+        Some(&NSString::from_str("Drop refused")),
+    )?;
+    // SAFETY: an AppKit constant, read-only for the life of the process.
+    let weight = unsafe { NSFontWeightSemibold };
+    let configuration = NSImageSymbolConfiguration::configurationWithPointSize_weight(
+        f64::from(REFUSAL_SYMBOL),
+        weight,
+    )
+    .configurationByApplyingConfiguration(
+        &NSImageSymbolConfiguration::configurationWithHierarchicalColor(&NSColor::systemRedColor()),
+    );
+    symbol.imageWithSymbolConfiguration(&configuration)
 }
 
 // ── FlashMessage ────────────────────────────────────────────────────────
