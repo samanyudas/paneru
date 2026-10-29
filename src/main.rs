@@ -26,6 +26,7 @@ mod parent_watch;
 mod pasteboard;
 mod platform;
 mod reader;
+mod slice_screen;
 mod util;
 
 pub use paneru::types;

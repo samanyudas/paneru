@@ -47,6 +47,7 @@ General behavior settings for the window manager.
 | `virtual_workspace_animations` | Boolean | `false` | If enabled, Paneru will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
 | `insert_windows_mid_strip` | Boolean | `false` | When moving a window to another virtual workspace, insert it at the column matching its current on-screen position (keeping it where you see it and shifting the rest) instead of appending it to the end of the destination strip. |
 | `create_virtual_workspace_automatically` | Boolean | `false` | Automatically creates a new virtual workspace when using `window_virtual_south `or Southward gesture controls. |
+| `shared_edge_slices` | Boolean | `false` | On each display edge shared with another display, shows a photo of the nearest hidden column's windows where a stacked arrangement would show their slivers. The photos refresh every 2 seconds while the edge is visible. Needs the Screen Recording permission, which Paneru never asks for. Without it, the edges show nothing. |
 
 ---
 

@@ -178,7 +178,7 @@ impl DimView {
 
 /// Convert an absolute CG screen frame (origin top-left, y-down) to Cocoa
 /// screen coordinates (origin bottom-left of primary screen, y-up).
-fn cg_abs_to_cocoa(frame: NSRect, primary_screen_height: f64) -> NSRect {
+pub(crate) fn cg_abs_to_cocoa(frame: NSRect, primary_screen_height: f64) -> NSRect {
     let cocoa_y = primary_screen_height - frame.origin.y - frame.size.height;
     NSRect::new(NSPoint::new(frame.origin.x, cocoa_y), frame.size)
 }
@@ -188,7 +188,7 @@ fn cg_abs_to_cocoa(frame: NSRect, primary_screen_height: f64) -> NSRect {
 /// so it must be *that* screen — `NSScreen::screens()[0]` is NOT reliably the
 /// main display, and using the wrong one offsets the overlay (and, when
 /// displays are stacked, lands it on the wrong monitor).
-fn primary_screen_height(mtm: MainThreadMarker) -> f64 {
+pub(crate) fn primary_screen_height(mtm: MainThreadMarker) -> f64 {
     let screens = NSScreen::screens(mtm);
     let mut fallback = 0.0;
     let mut first = true;

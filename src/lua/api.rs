@@ -676,6 +676,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         virtual_workspace_animations: _,
         insert_windows_mid_strip: _,
         create_virtual_workspace_automatically: _,
+        shared_edge_slices: _,
     } = &raw_opts;
 
     options.set("focus_follows_mouse", config.focus_follows_mouse())?;
@@ -723,6 +724,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         "create_virtual_workspace_automatically",
         config.create_workspace_automatically(),
     )?;
+    options.set("shared_edge_slices", config.shared_edge_slices())?;
     root.set("options", options)?;
 
     let PaddingOptions {

@@ -246,6 +246,17 @@ pub enum Event {
         subscriber: Arc<crate::types::wire::Subscriber>,
     },
 
+    /// A photo of a window's slice on a shared display edge arrived, or
+    /// failed. `generation` names the ask it answers.
+    SlicePhoto {
+        window_id: WinID,
+        generation: u32,
+        result: std::result::Result<
+            crate::ecs::slice_photos::Photo,
+            crate::ecs::slice_photos::PhotoError,
+        >,
+    },
+
     /// A client has read or written the script state store. Answered
     /// from the same store the embedded Lua runtime uses, so the two see each
     /// other's writes.

@@ -56,6 +56,7 @@ pub(crate) mod restore;
 pub mod script_state;
 pub mod scroll;
 pub(crate) mod shared_edge;
+pub(crate) mod slice_photos;
 pub mod state;
 pub(crate) mod systems;
 pub mod tile_overrides;
@@ -138,6 +139,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
 
     native_membership::register(app);
     shared_edge::register(app);
+    slice_photos::register(app);
 
     let overlays_dirty =
         |config: Option<Res<Config>>,
@@ -1181,6 +1183,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
 
     crate::menubar::load_menu_bar_preference(&mut app);
     let menu_events = sender.clone();
+    let slice_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
     let config = platform_callbacks.setup_handlers()?;
     let mtm = platform_callbacks.main_thread_marker;
@@ -1190,6 +1193,9 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_non_send(overlay_manager)
         .insert_non_send(flash_message_manager)
         .insert_non_send(drag::DragOverlayHandle(Box::new(DragOverlay::new(mtm))))
+        .insert_non_send(slice_photos::SliceScreenHandle(Box::new(
+            crate::slice_screen::SliceScreenOS::new(mtm, slice_events),
+        )))
         .insert_non_send(receiver);
 
     // `CONFIGURATION_FILE` is `None` exactly when an `init.lua` took the TOML
