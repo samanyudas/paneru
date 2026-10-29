@@ -113,6 +113,8 @@ struct MockStateInner {
     /// How many times any window's frame was read from its app over AX, so a
     /// test can check what asks apps for their frames.
     ax_frame_reads: usize,
+    /// How many times any window's frame was read from the window server.
+    bounds_reads: usize,
 }
 
 impl MockStateInner {
@@ -159,6 +161,7 @@ impl MockState {
                 raised: Vec::new(),
                 app_reads: HashMap::new(),
                 ax_frame_reads: 0,
+                bounds_reads: 0,
             })),
         }
     }
@@ -188,6 +191,12 @@ impl MockState {
     /// was last called.
     pub fn take_ax_frame_reads(&self) -> usize {
         std::mem::take(&mut self.inner.force_write().ax_frame_reads)
+    }
+
+    /// How many window frames were read from the window server since this
+    /// was last called.
+    pub fn take_bounds_reads(&self) -> usize {
+        std::mem::take(&mut self.inner.force_write().bounds_reads)
     }
 
     /// Makes `window_id` a background native tab: on screen as far as the
@@ -968,6 +977,22 @@ impl MockState {
         let s = self.clone();
         wm.expect_cursor_position()
             .returning(move || Some(origin_to(s.inner.force_read().cursor_position)));
+
+        let s = self.clone();
+        wm.expect_window_bounds().returning(move |window_id| {
+            let mut inner = s.inner.force_write();
+            inner.bounds_reads += 1;
+            // The window server has the frame without the padding the engine
+            // adds to it.
+            inner
+                .windows
+                .get(&window_id)
+                .map(|w| {
+                    let padding = IVec2::new(w.horizontal_padding, w.vertical_padding);
+                    IRect::from_corners(w.frame.min + padding, w.frame.max - padding)
+                })
+                .ok_or(Error::InvalidWindow)
+        });
 
         let s = self.clone();
         wm.expect_left_button_down()

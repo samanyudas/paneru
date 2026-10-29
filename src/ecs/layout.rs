@@ -1802,16 +1802,17 @@ fn insert_stack_item_window_contexts(
     }
 }
 
-/// The window a title-bar drag holds, with its native tabs. They follow the
-/// pointer, so the layout leaves them alone until the drop.
-fn dragged_windows(drag: Option<&DragState>, strips: &StripsForWindowPositioning) -> Vec<Entity> {
-    let Some(dragged) = drag.and_then(DragState::dragged) else {
+/// The window a title-bar press or drag holds, with its native tabs. macOS
+/// may be moving them with the pointer, so the layout leaves them alone
+/// until the press or drag ends.
+fn held_windows(drag: Option<&DragState>, strips: &StripsForWindowPositioning) -> Vec<Entity> {
+    let Some(held) = drag.and_then(DragState::held) else {
         return Vec::new();
     };
     strips
         .iter()
-        .find_map(|(_, strip, ..)| strip.tab_group(dragged))
-        .unwrap_or_else(|| vec![dragged])
+        .find_map(|(_, strip, ..)| strip.tab_group(held))
+        .unwrap_or_else(|| vec![held])
 }
 
 /// Reacts to changes of logical window layout in the strip and any have been changed, reposition
@@ -1844,11 +1845,11 @@ fn position_layout_windows(
         );
     }
 
-    let dragged = dragged_windows(drag.as_deref(), &workspaces);
+    let held = held_windows(drag.as_deref(), &workspaces);
     for (entity, window, layout_position, mut position, mut bounds, resize, presented) in
         positioned_windows
     {
-        if dragged.contains(&entity) {
+        if held.contains(&entity) {
             continue;
         }
         let Some(context) = strip_contexts.get(&entity) else {
