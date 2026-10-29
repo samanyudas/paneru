@@ -12,7 +12,7 @@ use crate::ecs::{
     NativeFullscreenMarker, Position, Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
-use crate::events::Event;
+use crate::events::{Event, MouseButton};
 use crate::manager::{Origin, Size, Window};
 use crate::platform::{Modifiers, Pid, WinID};
 use crate::{assert_focused, assert_window_at, assert_window_size};
@@ -4273,4 +4273,42 @@ fn observer_registration_recovery(all_failed: bool) {
         settled_calls,
         "successful registration must stop retrying"
     );
+}
+
+#[test]
+fn a_click_on_a_partly_hidden_window_reshuffles_it_into_view_on_release() {
+    let press = CGPoint::new(900.0, 100.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: press,
+            modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+            window_id: Some(2),
+        },
+        Event::MouseUp {
+            point: press,
+            modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(1, |world, _| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(2, |world, _| {
+            assert_window_at!(world, 0, -176, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 224, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(
+                world,
+                2,
+                TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH,
+                TEST_MENUBAR_HEIGHT
+            );
+        })
+        .run(commands);
 }

@@ -1252,4 +1252,22 @@ mod tests {
         swipe.reset();
         assert_eq!(swipe.sample(three_fingers(0.0006), |a, b| a == b), None);
     }
+
+    #[test]
+    fn mouse_events_carry_the_button_that_made_them() {
+        for event_type in [
+            CGEventType::LeftMouseDown,
+            CGEventType::LeftMouseUp,
+            CGEventType::LeftMouseDragged,
+        ] {
+            assert_eq!(mouse_button(event_type), MouseButton::Left);
+        }
+        for event_type in [
+            CGEventType::RightMouseDown,
+            CGEventType::RightMouseUp,
+            CGEventType::RightMouseDragged,
+        ] {
+            assert_eq!(mouse_button(event_type), MouseButton::Right);
+        }
+    }
 }

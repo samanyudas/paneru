@@ -1993,6 +1993,76 @@ mod tests {
     }
 
     #[test]
+    fn the_layout_records_where_it_presents_each_window_and_rewrites_only_a_change() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use bevy::ecs::change_detection::DetectChangesMut;
+        use bevy::ecs::change_detection::Tick;
+
+        use crate::commands::Command;
+        use crate::events::Event;
+        use crate::platform::WinID;
+        use crate::tests::{TEST_DISPLAY_WIDTH, TestHarness};
+
+        fn presented(world: &mut World) -> Vec<(WinID, Origin, Origin, Tick)> {
+            let mut query = world.query::<(&Window, Ref<PresentedOrigin>)>();
+            let mut placed = query
+                .iter(world)
+                .map(|(window, origin)| {
+                    (
+                        window.id(),
+                        window.frame().min,
+                        origin.0,
+                        origin.last_changed(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            placed.sort_by_key(|(id, ..)| *id);
+            placed
+        }
+
+        let commands = vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ];
+        let first_writes = Rc::new(RefCell::new(Vec::new()));
+        let recorded = first_writes.clone();
+        TestHarness::new()
+            .with_windows(4)
+            .on_iteration(0, move |world, _| {
+                let placed = presented(world);
+                assert_eq!(placed.len(), 4);
+                for (id, frame, origin, _) in &placed {
+                    assert_eq!(origin, frame, "window {id} is where the layout put it");
+                }
+                assert_eq!(
+                    placed[3].1.x,
+                    TEST_DISPLAY_WIDTH - 5,
+                    "window 3 is parked as a sliver"
+                );
+                *recorded.borrow_mut() = placed.iter().map(|(.., tick)| *tick).collect();
+                for mut position in world.query::<&mut LayoutPosition>().iter_mut(world) {
+                    position.set_changed();
+                }
+            })
+            .on_iteration(1, move |world, _| {
+                let ticks = presented(world)
+                    .into_iter()
+                    .map(|(.., tick)| tick)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ticks,
+                    *first_writes.borrow(),
+                    "a layout pass that moves nothing leaves PresentedOrigin unchanged"
+                );
+            })
+            .run(commands);
+    }
+
+    #[test]
     fn signature_tolerates_pixel_drift_but_not_a_reshape() {
         let mut world = World::new();
         let first = world.spawn_empty().id();
@@ -2939,5 +3009,217 @@ mod tests {
         }
         assert_eq!(strip.right_neighbour(leader), Some(b));
         assert_eq!(strip.right_neighbour(follower), Some(b));
+    }
+
+    /// Renders the strip with each window named by its letter in `names`:
+    /// `A | [B, {C D}] | !E`, where `[..]` is a stack, `{..}` native tabs and
+    /// `!` a fullscreen column.
+    fn render(strip: &LayoutStrip, names: &[Entity]) -> String {
+        let name = |entity: &Entity| {
+            let index = names.iter().position(|e| e == entity).unwrap();
+            char::from(b'A' + u8::try_from(index).unwrap()).to_string()
+        };
+        let tabs = |tabs: &[Entity]| {
+            format!(
+                "{{{}}}",
+                tabs.iter().map(name).collect::<Vec<_>>().join(" ")
+            )
+        };
+        strip
+            .columns()
+            .map(|column| match column {
+                Column::Single(entity) => name(entity),
+                Column::Fullscren(entity) => format!("!{}", name(entity)),
+                Column::Tabs(entities) => tabs(entities),
+                Column::Stack(items) => format!(
+                    "[{}]",
+                    items
+                        .iter()
+                        .map(|item| match item {
+                            StackItem::Single(entity) => name(entity),
+                            StackItem::Tabs(entities) => tabs(entities),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    fn strip_of(count: usize) -> (World, LayoutStrip, Vec<Entity>) {
+        let mut world = World::new();
+        let entities = world
+            .spawn_batch(std::iter::repeat_n((), count))
+            .collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::default();
+        for entity in &entities {
+            strip.append(*entity);
+        }
+        (world, strip, entities)
+    }
+
+    #[test]
+    fn a_drop_into_a_column_lands_at_the_slot() {
+        let (_world, mut strip, e) = strip_of(4);
+
+        strip.insert_into_column(e[3], 0, 0).unwrap();
+        assert_eq!(render(&strip, &e), "[D, A] | B | C");
+        strip.insert_into_column(e[2], 0, 1).unwrap();
+        assert_eq!(render(&strip, &e), "[D, C, A] | B");
+        strip.insert_into_column(e[1], 0, 3).unwrap();
+        assert_eq!(render(&strip, &e), "[D, C, A, B]");
+    }
+
+    #[test]
+    fn a_drop_into_a_column_right_of_a_vanishing_column_finds_it() {
+        let (_world, mut strip, e) = strip_of(3);
+
+        strip.insert_into_column(e[0], 2, 0).unwrap();
+        assert_eq!(render(&strip, &e), "B | [A, C]");
+    }
+
+    #[test]
+    fn a_slot_past_the_bottom_makes_the_bottom_window() {
+        let (_world, mut strip, e) = strip_of(3);
+
+        strip.insert_into_column(e[2], 0, 9).unwrap();
+        assert_eq!(render(&strip, &e), "[A, C] | B");
+    }
+
+    #[test]
+    fn a_drop_into_its_own_stack_reorders_it() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[1]).unwrap();
+        strip.stack(e[2]).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B, C] | D");
+
+        strip.insert_into_column(e[0], 0, 2).unwrap();
+        assert_eq!(render(&strip, &e), "[B, C, A] | D");
+        strip.insert_into_column(e[0], 0, 0).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B, C] | D");
+        strip.insert_into_column(e[2], 0, 1).unwrap();
+        assert_eq!(render(&strip, &e), "[A, C, B] | D");
+    }
+
+    #[test]
+    fn a_drop_out_of_a_stack_leaves_the_rest_in_place() {
+        let (_world, mut strip, e) = strip_of(3);
+        strip.stack(e[1]).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B] | C");
+
+        strip.insert_into_column(e[1], 1, 0).unwrap();
+        assert_eq!(render(&strip, &e), "A | [B, C]");
+    }
+
+    #[test]
+    fn a_dropped_native_tab_moves_its_whole_tab_group() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[2]).unwrap();
+        strip.convert_to_tabs(e[2], e[3]).unwrap();
+        assert_eq!(render(&strip, &e), "A | [B, {D C}]");
+
+        strip.insert_into_column(e[2], 0, 0).unwrap();
+        assert_eq!(render(&strip, &e), "[{D C}, A] | B");
+    }
+
+    #[test]
+    fn a_fullscreen_column_takes_no_drop() {
+        let (_world, mut strip, e) = strip_of(3);
+        *strip.get_column_mut(1).unwrap() = Column::Fullscren(e[1]);
+
+        assert!(strip.insert_into_column(e[0], 1, 0).is_err());
+        assert_eq!(render(&strip, &e), "A | !B | C");
+        assert!(strip.insert_into_column(e[1], 0, 0).is_err());
+        assert_eq!(render(&strip, &e), "A | !B | C");
+        assert!(strip.insert_as_column(e[1], 0).is_err());
+        assert_eq!(render(&strip, &e), "A | !B | C");
+    }
+
+    #[test]
+    fn a_drop_past_the_last_column_or_of_a_stranger_changes_nothing() {
+        let (mut world, mut strip, e) = strip_of(3);
+        let stranger = world.spawn_empty().id();
+
+        assert!(strip.insert_into_column(e[0], 3, 0).is_err());
+        assert_eq!(render(&strip, &e), "A | B | C");
+        assert!(strip.insert_into_column(stranger, 0, 0).is_err());
+        assert!(strip.insert_as_column(stranger, 0).is_err());
+        assert_eq!(render(&strip, &e), "A | B | C");
+    }
+
+    #[test]
+    fn a_drop_into_its_own_lone_column_changes_nothing() {
+        let (_world, mut strip, e) = strip_of(3);
+
+        strip.insert_into_column(e[1], 1, 0).unwrap();
+        assert_eq!(render(&strip, &e), "A | B | C");
+    }
+
+    #[test]
+    fn a_drop_into_a_tabbed_stack_joins_its_tabs() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[2]).unwrap();
+        assert_eq!(strip.toggle_tabbed_display(e[1]), Some(true));
+
+        strip.insert_into_column(e[3], 1, 1).unwrap();
+        assert_eq!(render(&strip, &e), "A | [B, D, C]");
+        assert!(strip.is_tabbed_display(e[3]));
+    }
+
+    #[test]
+    fn reordering_a_tabbed_stack_of_two_keeps_it_tabbed() {
+        let (_world, mut strip, e) = strip_of(2);
+        strip.stack(e[1]).unwrap();
+        assert_eq!(strip.toggle_tabbed_display(e[0]), Some(true));
+
+        strip.insert_into_column(e[1], 0, 0).unwrap();
+        assert_eq!(render(&strip, &e), "[B, A]");
+        assert!(strip.is_tabbed_display(e[0]));
+        assert!(strip.is_tabbed_display(e[1]));
+    }
+
+    #[test]
+    fn a_window_dropped_out_of_a_tabbed_stack_is_no_longer_tabbed() {
+        let (_world, mut strip, e) = strip_of(3);
+        strip.stack(e[1]).unwrap();
+        strip.stack(e[2]).unwrap();
+        assert_eq!(strip.toggle_tabbed_display(e[0]), Some(true));
+
+        strip.insert_as_column(e[2], 1).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B] | C");
+        assert!(strip.is_tabbed_display(e[0]));
+        assert!(strip.is_tabbed_display(e[1]));
+        assert!(!strip.is_tabbed_display(e[2]));
+    }
+
+    #[test]
+    fn a_drop_between_columns_opens_a_column_there() {
+        let (_world, mut strip, e) = strip_of(3);
+
+        strip.insert_as_column(e[0], 3).unwrap();
+        assert_eq!(render(&strip, &e), "B | C | A");
+        strip.insert_as_column(e[0], 0).unwrap();
+        assert_eq!(render(&strip, &e), "A | B | C");
+        strip.insert_as_column(e[0], 2).unwrap();
+        assert_eq!(render(&strip, &e), "B | A | C");
+    }
+
+    #[test]
+    fn a_drop_between_columns_takes_a_window_out_of_its_stack() {
+        let (_world, mut strip, e) = strip_of(4);
+        strip.stack(e[1]).unwrap();
+        strip.convert_to_tabs(e[2], e[3]).unwrap();
+        assert_eq!(render(&strip, &e), "[A, B] | {D C}");
+
+        strip.insert_as_column(e[1], 0).unwrap();
+        assert_eq!(render(&strip, &e), "B | A | {D C}");
+
+        strip.stack(e[0]).unwrap();
+        strip.insert_as_column(e[0], 2).unwrap();
+        assert_eq!(render(&strip, &e), "B | {D C} | A");
+
+        strip.insert_as_column(e[2], 0).unwrap();
+        assert_eq!(render(&strip, &e), "{D C} | B | A");
     }
 }
