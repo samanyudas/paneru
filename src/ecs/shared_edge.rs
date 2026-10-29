@@ -144,10 +144,11 @@ impl Hold {
 pub(crate) enum Slide {
     /// The window leaves its tuck, where it showed `from`.
     Moving { at: IVec2, from: Hold },
-    /// The window has moved to where the photo rests. The photo stays over
-    /// it, held at `from` like the slide that brought it, until macOS has
-    /// taken the move, or until the engine time `until`.
-    Landing { from: Hold, until: Duration },
+    /// The window has moved to where the photo rests, and holds there under
+    /// the photo until macOS has taken the move, or until the engine time
+    /// `until`. Then the photo closes and the window moves on to where
+    /// layout puts it.
+    Landing { until: Duration },
     /// The window heads for a tuck that shows `slice`, at its place `to`
     /// in the row, and its photo is on its way. The window shows itself at
     /// `at`, as far toward `to` as it stays mostly on its display. It waits

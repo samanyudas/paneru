@@ -3315,8 +3315,8 @@ impl RowPlace {
 /// its display now, slides out, one that leaves its tuck `tucked` slides in,
 /// and a tucked one whose slice moves slides to it. Each starts from its
 /// place in the `row`. A slide in progress keeps going, or turns back.
-/// Returns whether the slide moves the window, which leaves its `Position`
-/// to the slide.
+/// Returns whether the slide moves or holds the window, which leaves its
+/// `Position` to the slide.
 fn present_tuck(
     entity_commands: &mut EntityCommands,
     slice: Option<Hold>,
@@ -3370,8 +3370,7 @@ fn present_tuck(
         return false;
     }
     let moving = match (sliding.copied(), tucked) {
-        (Some(Slide::Moving { .. }), _) => return true,
-        (Some(Slide::Landing { .. }), _) => return false,
+        (Some(Slide::Moving { .. } | Slide::Landing { .. }), _) => return true,
         (Some(Slide::Tucking { at, hold, .. }), Some(_)) => Slide::Moving { at, from: hold },
         (None, Some(tucked)) => Slide::Moving {
             at: row.start(tucked),

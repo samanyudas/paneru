@@ -470,9 +470,9 @@ type Sliding<'w, 's> = Query<
 /// Moves each sliding photo one step of the row's ease toward where layout
 /// puts its window. Once the photo arrives, the window moves there under it,
 /// and the photo closes when macOS has taken the move, or after
-/// [`LANDING_TIMEOUT`] if the app does not answer. Until then the photo
-/// stays over the window wherever layout moves it on. A window whose photo
-/// does not show moves at once.
+/// [`LANDING_TIMEOUT`] if the app does not answer. Until then the window
+/// holds under the photo, and then it moves on to where layout puts it. A
+/// window whose photo does not show moves at once.
 fn slide_photos(
     mut sliding: Sliding,
     displays: Query<&Display>,
@@ -507,7 +507,6 @@ fn slide_photos(
                     position.0 = presented.0;
                     entity_commands.try_remove::<RepositionMarker>();
                     *slide = Slide::Landing {
-                        from,
                         until: time.elapsed() + LANDING_TIMEOUT,
                     };
                     debug!(
@@ -525,18 +524,12 @@ fn slide_photos(
             Slide::Landing { .. } if !tucked => {
                 entity_commands.try_remove::<Slide>();
             }
-            Slide::Landing { until, .. } if !window.write_pending() || time.elapsed() >= until => {
+            Slide::Landing { until } if !window.write_pending() || time.elapsed() >= until => {
                 entity_commands.try_remove::<EdgeSlice>();
-                debug!("edge slice photo handed over: window {id}");
-            }
-            Slide::Landing { from, .. } if position.is_changed() => {
-                if let Some(moved) = displays
-                    .get(from.slice.display)
-                    .ok()
-                    .and_then(|own| from.photo(position.0, own.bounds()))
-                {
-                    entity_commands.try_insert(moved);
+                if position.0 != presented.0 {
+                    entity_commands.try_insert(RepositionMarker(presented.0));
                 }
+                debug!("edge slice photo handed over: window {id}");
             }
             Slide::Landing { .. } | Slide::Leaving { .. } | Slide::Tucking { .. } => {}
         }

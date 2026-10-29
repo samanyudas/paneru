@@ -1612,3 +1612,71 @@ fn frames_stay_active_until_a_revealed_photo_hands_over() {
     );
     assert!(!mid_frame(&mut harness), "frames go idle at rest");
 }
+
+/// Sam presses again just as the photo of a revealed window comes to rest,
+/// and its app takes each move a while after the engine asks for it, so a
+/// move can land while a later one still waits. Every frame the window
+/// either has yet to show or shows exactly under its photo, and the photo
+/// hands over where the window is.
+#[test]
+fn a_press_while_a_revealed_photo_waits_never_shows_its_window_beside_it() {
+    const WRITE: Duration = Duration::from_millis(10);
+    let (mut harness, log) = painted_late_beside();
+    let rested = reveal_late(&mut harness, &log, |_| {});
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Nth(1))));
+    queued_frame(&mut harness, false);
+    harness.mock_state.set_write_delay(TEST_PROCESS_ID, WRITE);
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    let mut seen = Vec::new();
+    for _ in 0..50 {
+        // Real time keeps pace with engine time, so the app answers before
+        // the landing times out.
+        std::thread::sleep(Duration::from_millis(20));
+        queued_frame(&mut harness, false);
+        seen.push(Seen {
+            window: harness.mock_state.ax_frame(3),
+            photo: photo_of_three(&log),
+        });
+    }
+    harness
+        .mock_state
+        .set_write_delay(TEST_PROCESS_ID, Duration::ZERO);
+    for _ in 0..40 {
+        queued_frame(&mut harness, true);
+    }
+
+    for (step, frame) in seen.iter().enumerate() {
+        assert!(
+            in_view(frame.window) || frame.photo.is_some(),
+            "window 3 or its photo shows after step {step}: window at {:?}",
+            frame.window
+        );
+        assert!(
+            frame
+                .photo
+                .is_none_or(|photo| !in_view(frame.window) || photo == frame.window),
+            "window 3 never shows beside its photo, after step {step}: photo at {:?}, window at {:?}",
+            frame.photo,
+            frame.window
+        );
+    }
+    let handover = seen
+        .windows(2)
+        .position(|pair| pair[0].photo.is_some() && pair[1].photo.is_none())
+        .expect("the photo of window 3 hands over while the app is slow");
+    assert_eq!(
+        Some(seen[handover + 1].window),
+        seen[handover].photo,
+        "window 3 takes over exactly where its photo was, after step {}",
+        handover + 1
+    );
+    let rest = harness.mock_state.ax_frame(3);
+    assert!(
+        in_view(rest) && rest.min.x > rested.min.x,
+        "window 3 rests in view, moved on toward the edge, at {rest:?}"
+    );
+    assert_eq!(photo_of_three(&log), None, "the photo handed over");
+}
