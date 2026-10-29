@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
+use bevy::ecs::system::RunSystemOnce as _;
 use bevy::math::{IRect, IVec2};
 use bevy::prelude::World;
 use objc2_core_foundation::CFRetained;
@@ -1444,4 +1445,170 @@ fn rapid_east_presses_that_tuck_two_columns_leave_no_wallpaper_at_the_edge() {
         vec![1],
         "at rest window 1 shows its slice"
     );
+}
+
+/// One frame, after which the app takes every move asked of it if `lands`.
+fn queued_frame(harness: &mut TestHarness, lands: bool) {
+    harness.advance(Duration::from_millis(20));
+    if lands {
+        assert!(harness.mock_state.flush_writes(Duration::from_secs(1)));
+    }
+}
+
+/// The whole frame of window 3 as its panel shows it, if the panel shows a
+/// photo.
+fn photo_of_three(log: &ScreenLog) -> Option<IRect> {
+    let screen = log.borrow();
+    screen
+        .placed
+        .iter()
+        .find(|(id, _)| *id == 3 && screen.showing_photo.contains(id))
+        .map(|(_, slice)| slice.shown())
+}
+
+/// `beside` with window 3's photo painted, from an app that takes each move
+/// some time after the engine asks for it.
+fn painted_late_beside() -> (TestHarness, ScreenLog) {
+    let log = Rc::new(RefCell::new(Screen::default()));
+    let harness = TestHarness::new().with_config(animated()).with_display(
+        EXT_DISPLAY_ID,
+        RIGHT,
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    let mut harness = harness.with_windows(4);
+    harness
+        .world()
+        .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    for _ in 0..100 {
+        queued_frame(&mut harness, true);
+    }
+    paint_asked(&mut harness, &log, &[3]);
+    assert!(photo_of_three(&log).is_some(), "window 3 shows its sliver");
+    (harness, log)
+}
+
+/// Reveals window 3, whose app stops taking moves just before its photo
+/// comes to rest, and returns where the photo rests. Calls `each` after
+/// each frame.
+fn reveal_late(
+    harness: &mut TestHarness,
+    log: &ScreenLog,
+    mut each: impl FnMut(&mut TestHarness),
+) -> IRect {
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Last)));
+    for _ in 0..60 {
+        let near_rest = photo_of_three(log)
+            .is_some_and(|photo| photo.max.x - TEST_DISPLAY_WIDTH <= TEST_WINDOW_WIDTH / 8);
+        if near_rest {
+            harness.mock_state.hold_writes(TEST_PROCESS_ID);
+        }
+        queued_frame(harness, !near_rest);
+        each(harness);
+        if let Some(photo) = photo_of_three(log).filter(|photo| photo.max.x == TEST_DISPLAY_WIDTH) {
+            assert!(
+                !in_view(harness.mock_state.ax_frame(3)),
+                "window 3 has yet to take its move"
+            );
+            return photo;
+        }
+    }
+    panic!("the photo of window 3 slides in to rest at the edge");
+}
+
+fn mid_frame(harness: &mut TestHarness) -> bool {
+    harness
+        .world()
+        .run_system_once(|activity: crate::ecs::params::FrameActivity| activity.mid_frame())
+        .expect("frame activity")
+}
+
+/// Sam presses again just as the photo of a revealed window comes to rest,
+/// while its app has yet to take the move there. The press moves the window
+/// on, still in view, and the app takes the moves a few frames later. The
+/// photo stays over the window until it hands over, and never shows it
+/// anywhere the window is not.
+#[test]
+fn a_press_while_a_revealed_photo_waits_for_its_window_keeps_the_photo_over_it() {
+    const LATE: usize = 4;
+    let (mut harness, log) = painted_late_beside();
+    let rested = reveal_late(&mut harness, &log, |_| {});
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Nth(1))));
+    let mut seen = Vec::new();
+    for step in 0..40 {
+        if step == LATE {
+            harness.mock_state.release_writes(TEST_PROCESS_ID);
+        }
+        queued_frame(&mut harness, step >= LATE);
+        seen.push(Seen {
+            window: harness.mock_state.ax_frame(3),
+            photo: photo_of_three(&log),
+        });
+    }
+    let rest = harness.mock_state.ax_frame(3);
+    assert!(
+        in_view(rest) && rest.min.x > rested.min.x,
+        "window 3 rests in view, moved on toward the edge, at {rest:?}"
+    );
+    assert_eq!(photo_of_three(&log), None, "the photo handed over");
+    let mut apparent = Vec::new();
+    for (step, frame) in seen.iter().enumerate() {
+        assert!(
+            in_view(frame.window) || frame.photo.is_some(),
+            "window 3 or its photo shows after step {step}: window at {:?}",
+            frame.window
+        );
+        assert!(
+            frame
+                .photo
+                .is_none_or(|photo| !in_view(frame.window) || photo == frame.window),
+            "the photo of window 3 shows it where it is after step {step}: photo at {:?}, window at {:?}",
+            frame.photo,
+            frame.window
+        );
+        apparent.push(frame.photo.unwrap_or(frame.window).min.x);
+    }
+    let largest_step = (rest.min.x - rested.min.x) / 3;
+    assert!(
+        apparent
+            .windows(2)
+            .all(|pair| (0..=largest_step).contains(&(pair[1] - pair[0]))),
+        "window 3 moves on toward its rest with no jump: {apparent:?}"
+    );
+}
+
+/// The engine keeps drawing frames while a photo slides in and waits for
+/// its window, though the row stops moving first, and stops once the
+/// window has taken over.
+#[test]
+fn frames_stay_active_until_a_revealed_photo_hands_over() {
+    let (mut harness, log) = painted_late_beside();
+    let mut frames = Vec::new();
+    reveal_late(&mut harness, &log, |harness| {
+        frames.push(mid_frame(harness));
+    });
+    while photo_of_three(&log).is_some() && frames.len() < 60 {
+        queued_frame(&mut harness, false);
+        frames.push(mid_frame(&mut harness));
+    }
+    assert_eq!(photo_of_three(&log), None, "the photo hands over");
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    for _ in 0..20 {
+        queued_frame(&mut harness, true);
+    }
+
+    assert!(
+        frames.iter().all(|active| *active),
+        "frames stay active while the photo of window 3 shows: {frames:?}"
+    );
+    assert!(!mid_frame(&mut harness), "frames go idle at rest");
 }
