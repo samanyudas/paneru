@@ -26,6 +26,7 @@ use super::{
 use crate::commands::visible_floating_entities;
 use crate::config::Config;
 use crate::ecs::display::FloatingLayer;
+use crate::ecs::drag::DragState;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::scroll::{PageGestureState, PageInFlight};
@@ -542,6 +543,7 @@ fn detect_focus_rejection(
 fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
+    drag: Option<Res<DragState>>,
     restored: Query<&RestoreFocusMarker>,
     global_state: GlobalState,
     active_display: ActiveDisplay,
@@ -557,6 +559,11 @@ fn autocenter_window_on_focus(
     }
 
     if global_state.skip_reshuffle() || global_state.initializing() || !mouse_held.is_empty() {
+        return;
+    }
+    // A dragged or just dropped window is where the drag put it, and its
+    // drop scrolls only as far as needed to show it.
+    if drag.is_some_and(|drag| drag.dragged() == Some(entity) || drag.settling() == Some(entity)) {
         return;
     }
     if active_display.active_strip().tabbed(entity) {

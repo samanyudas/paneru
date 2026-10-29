@@ -672,6 +672,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         disable_native_tabs: _,
         virtual_workspace_animations: _,
         insert_windows_mid_strip: _,
+        drag_to_reorder: _,
         create_virtual_workspace_automatically: _,
     } = &raw_opts;
 
@@ -705,6 +706,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         "insert_windows_mid_strip",
         config.insert_windows_mid_strip(),
     )?;
+    options.set("drag_to_reorder", config.drag_to_reorder())?;
     options.set(
         "create_virtual_workspace_automatically",
         config.create_workspace_automatically(),

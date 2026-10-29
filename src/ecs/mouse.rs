@@ -10,6 +10,7 @@ use tracing::{debug, trace, warn};
 
 use super::{MouseHeldMarker, Timeout};
 use crate::config::Config;
+use crate::ecs::drag::DragState;
 use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{GlobalState, Windows};
@@ -235,16 +236,25 @@ fn mouse_down_trigger(
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
-        let Event::MouseDown { point, .. } = event else {
+        let Event::MouseDown {
+            point, window_id, ..
+        } = event
+        else {
             continue;
         };
         trace!("{point:?}");
 
-        let Some((_, entity)) = window_manager
-            .find_window_at_point(point)
-            .ok()
-            .and_then(|window_id| windows.find(window_id))
-        else {
+        // With title-bar drags on, the window the tap saw under the press
+        // comes first: by now a dragged window may have moved off the point.
+        let tapped = window_id
+            .filter(|_| config.drag_to_reorder())
+            .and_then(|window_id| windows.find(window_id));
+        let Some((_, entity)) = tapped.or_else(|| {
+            window_manager
+                .find_window_at_point(point)
+                .ok()
+                .and_then(|window_id| windows.find(window_id))
+        }) else {
             continue;
         };
 
@@ -276,10 +286,12 @@ fn mouse_down_trigger(
 }
 
 /// Handles mouse-up events. Triggers the deferred reshuffle so the clicked
-/// window slides into view after the user releases the button.
+/// window slides into view after the user releases the button. A window
+/// released from a title-bar drag is placed by its drop instead.
 fn mouse_up_trigger(
     mut messages: MessageReader<InputEvent>,
     mouse_held: Query<(Entity, &MouseHeldMarker)>,
+    drag: Option<Res<DragState>>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -287,8 +299,11 @@ fn mouse_up_trigger(
             continue;
         }
 
+        let dragged = drag.as_ref().and_then(|drag| drag.dragged());
         for (held_entity, marker) in &mouse_held {
-            commands.reshuffle_around(marker.0);
+            if dragged != Some(marker.0) {
+                commands.reshuffle_around(marker.0);
+            }
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
             }

@@ -10,6 +10,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use crate::commands::register_commands;
 use crate::config::Config;
 use crate::ecs::display::DisplayEventsPlugin;
+use crate::ecs::drag::DragEventsPlugin;
 use crate::ecs::focus::FocusEventsPlugin;
 use crate::ecs::layout::LayoutEventsPlugin;
 use crate::ecs::mouse::MouseEventsPlugin;
@@ -273,6 +274,7 @@ fn setup_world() -> App {
         .insert_resource(Config::default())
         .insert_resource(Initializing)
         .add_plugins(MouseEventsPlugin)
+        .add_plugins(DragEventsPlugin)
         .add_plugins(ScrollEventsPlugin)
         .add_plugins(WorkspaceEventsPlugin)
         .add_plugins(LayoutEventsPlugin)

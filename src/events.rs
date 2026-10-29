@@ -129,26 +129,22 @@ pub enum Event {
     MouseDown {
         point: CGPoint,
         modifiers: Modifiers,
-        #[expect(dead_code, reason = "read by title-bar drags, added next")]
         button: MouseButton,
         /// The window under the pointer when the window server sent the
         /// press, if it named one. A lookup when the press is handled can
         /// find another window, because the pressed one may have moved.
-        #[expect(dead_code, reason = "read by title-bar drags, added next")]
         window_id: Option<WinID>,
     },
     /// A mouse up event has occurred.
     MouseUp {
         point: CGPoint,
         modifiers: Modifiers,
-        #[expect(dead_code, reason = "read by title-bar drags, added next")]
         button: MouseButton,
     },
     /// A mouse drag event has occurred.
     MouseDragged {
         point: CGPoint,
         modifiers: Modifiers,
-        #[expect(dead_code, reason = "read by title-bar drags, added next")]
         button: MouseButton,
     },
     /// A mouse move event has occurred.

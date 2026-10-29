@@ -13,6 +13,7 @@ use stdext::function_name;
 use tracing::{Level, instrument, trace};
 
 use crate::config::Config;
+use crate::ecs::drag::DragState;
 use crate::ecs::params::Windows;
 use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
@@ -879,10 +880,6 @@ impl LayoutStrip {
     /// Returns `Err(Error)`, with the strip unchanged, if the window is not in
     /// the strip, if there is no column `column`, or if either column is
     /// fullscreen.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "called by title-bar drags, added next")
-    )]
     pub fn insert_into_column(&mut self, entity: Entity, column: usize, slot: usize) -> Result<()> {
         let (source, item, fills_column) = self.movable_item(entity)?;
         let Some(target) = self
@@ -937,10 +934,6 @@ impl LayoutStrip {
     ///
     /// Returns `Err(Error)`, with the strip unchanged, if the window is not in
     /// the strip or its column is fullscreen.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "called by title-bar drags, added next")
-    )]
     pub fn insert_as_column(&mut self, entity: Entity, index: usize) -> Result<()> {
         let (source, item, fills_column) = self.movable_item(entity)?;
         let index = if fills_column && index > source {
@@ -1809,6 +1802,18 @@ fn insert_stack_item_window_contexts(
     }
 }
 
+/// The window a title-bar drag holds, with its native tabs. They follow the
+/// pointer, so the layout leaves them alone until the drop.
+fn dragged_windows(drag: Option<&DragState>, strips: &StripsForWindowPositioning) -> Vec<Entity> {
+    let Some(dragged) = drag.and_then(DragState::dragged) else {
+        return Vec::new();
+    };
+    strips
+        .iter()
+        .find_map(|(_, strip, ..)| strip.tab_group(dragged))
+        .unwrap_or_else(|| vec![dragged])
+}
+
 /// Reacts to changes of logical window layout in the strip and any have been changed, reposition
 /// the layout strip against the current display viewport.
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -1817,6 +1822,7 @@ fn position_layout_windows(
     workspaces: StripsForWindowPositioning,
     snap_guards: Query<&SnapStripMarker>,
     displays: DisplayViewports,
+    drag: Option<Res<DragState>>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -1838,9 +1844,13 @@ fn position_layout_windows(
         );
     }
 
+    let dragged = dragged_windows(drag.as_deref(), &workspaces);
     for (entity, window, layout_position, mut position, mut bounds, resize, presented) in
         positioned_windows
     {
+        if dragged.contains(&entity) {
+            continue;
+        }
         let Some(context) = strip_contexts.get(&entity) else {
             continue;
         };

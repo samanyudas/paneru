@@ -200,7 +200,6 @@ pub trait WindowManagerApi: Send + Sync {
 
     /// Whether the left mouse button is down right now, as the window
     /// server sees it, whatever events the tap did or did not deliver.
-    #[expect(dead_code, reason = "polled by title-bar drags, added next")]
     fn left_button_down(&self) -> bool;
 
     fn dim_windows(&self, windows: &[WinID], level: f32);
