@@ -7,21 +7,23 @@
 //!   pointer, and the dragged window's centre into a [`DropTarget`].
 //! - [`drag_events`] feeds platform events to [`step`] and applies its drops
 //!   to the [`LayoutStrip`].
+//! - [`overlay_shape`] is the pure drop feedback. [`drag_feedback`] keeps
+//!   [`DragFeedback`] on it, and [`show_drag_feedback`] draws it.
 
 use std::cell::OnceCell;
 use std::ops::Range;
 use std::time::Duration;
 
-use bevy::app::{App, Plugin, Update};
-use bevy::ecs::change_detection::DetectChangesMut as _;
+use bevy::app::{App, Plugin, PostUpdate, Update};
+use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Has, With};
+use bevy::ecs::query::{Changed, Has, Or, With};
 use bevy::ecs::resource::Resource;
-use bevy::ecs::schedule::common_conditions::{not, on_message, resource_exists};
+use bevy::ecs::schedule::common_conditions::{not, on_message, resource_changed, resource_exists};
 use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
-use bevy::ecs::system::{Commands, Query, Res, ResMut};
+use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
 use bevy::math::{BVec2, IRect, IVec2};
 use bevy::time::Time;
 use objc2_core_foundation::CGPoint;
@@ -32,7 +34,8 @@ use crate::ecs::layout::{Column, LayoutStrip, MIN_WINDOW_HEIGHT};
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
     Bounds, DockPosition, FocusedMarker, FullWidthMarker, Initializing, LayoutPosition,
-    MissionControlActive, Position, PresentedOrigin, SpawnCommandsExt, Unmanaged, UpdateSet,
+    MissionControlActive, Position, PostUpdateSet, PresentedOrigin, SpawnCommandsExt, SystemTheme,
+    Unmanaged, UpdateSet,
 };
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Window, WindowManager, origin_from};
@@ -244,6 +247,98 @@ fn gap_at(columns: &[ColumnSnap], x: i32) -> usize {
         )
 }
 
+/// How thick an insertion line is, in points.
+const INSERTION_LINE: i32 = 3;
+
+/// The size of the refusal symbol, in points.
+pub(crate) const REFUSAL_SYMBOL: i32 = 22;
+
+/// Where the refusal symbol sits from the pointer, down and to the right,
+/// like a cursor's badge.
+const REFUSAL_OFFSET: IVec2 = IVec2::new(14, 14);
+
+/// What the drag overlay draws, in screen points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayShape {
+    /// An insertion line where a release would put the window.
+    Line(IRect),
+    /// The `nosign` symbol in this square, beside the pointer, where a
+    /// release would be refused.
+    Refusal(IRect),
+}
+
+/// What the overlay shows for a drag of `dragged` with the pointer at
+/// `pointer`, whose release would land at `target`: an insertion line, the
+/// refusal symbol, or nothing when the window would go back to its slot.
+pub(crate) fn overlay_shape(
+    snapshot: &LayoutSnapshot,
+    dragged: Entity,
+    pointer: IVec2,
+    target: DropTarget,
+) -> Option<OverlayShape> {
+    let viewport = snapshot.viewport;
+    let column_at = |index| snapshot.columns.iter().find(|column| column.index == index);
+    match target {
+        DropTarget::IntoColumn { column, slot } => {
+            let column = column_at(column)?;
+            // The gap above the `slot`-th other item, or below the last.
+            let y = match column
+                .bands
+                .iter()
+                .filter(|band| !band.windows.contains(&dragged))
+                .nth(slot)
+            {
+                Some(band) => band.y.start,
+                None => column.bands.last()?.y.end,
+            };
+            let x = column.x.start.max(viewport.min.x)..column.x.end.min(viewport.max.x);
+            if x.is_empty() {
+                return None;
+            }
+            let y = line_across(y, viewport.min.y..viewport.max.y)?;
+            Some(OverlayShape::Line(IRect::new(
+                x.start, y.start, x.end, y.end,
+            )))
+        }
+        DropTarget::NewColumn { index } => {
+            let before = index.checked_sub(1).and_then(column_at);
+            let after = column_at(index);
+            let x = match (before, after) {
+                (Some(before), Some(after)) => i32::midpoint(before.x.end, after.x.start),
+                (Some(before), None) => before.x.end,
+                (None, Some(after)) => after.x.start,
+                (None, None) => return None,
+            };
+            let x = line_across(x, viewport.min.x..viewport.max.x)?;
+            Some(OverlayShape::Line(IRect::new(
+                x.start,
+                viewport.min.y,
+                x.end,
+                viewport.max.y,
+            )))
+        }
+        DropTarget::Refused => {
+            let corner = pointer + REFUSAL_OFFSET;
+            Some(OverlayShape::Refusal(IRect::from_corners(
+                corner,
+                corner + IVec2::splat(REFUSAL_SYMBOL),
+            )))
+        }
+        DropTarget::Home => None,
+    }
+}
+
+/// The span of an insertion line centred on `at`, moved inside `within` so
+/// a line at a screen edge stays whole and on screen. `None` when `within`
+/// is too short for a whole line.
+fn line_across(at: i32, within: Range<i32>) -> Option<Range<i32>> {
+    if within.end - within.start < INSERTION_LINE {
+        return None;
+    }
+    let start = (at - INSERTION_LINE / 2).clamp(within.start, within.end - INSERTION_LINE);
+    Some(start..start + INSERTION_LINE)
+}
+
 /// Draws the drop feedback on screen. The app draws with
 /// [`DragOverlay`](crate::overlay::DragOverlay), and tests record the calls.
 pub(crate) trait DragOverlayApi {
@@ -258,6 +353,13 @@ pub(crate) trait DragOverlayApi {
 
 /// The drag overlay the engine draws with, as a non-send resource.
 pub(crate) struct DragOverlayHandle(pub Box<dyn DragOverlayApi>);
+
+/// What the drag overlay shows now, and the color of its line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Resource)]
+pub(crate) struct DragFeedback {
+    shape: Option<OverlayShape>,
+    line_color: (f64, f64, f64),
+}
 
 /// A tiled window a press landed on, with the frame the layout gave it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +437,8 @@ pub(crate) struct Press {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Drag {
     pub window: Entity,
+    /// Where the pointer is now.
+    pub pointer: IVec2,
     /// How far right of the pointer the window's centre is, fixed at the
     /// press.
     pub centre_dx: i32,
@@ -499,7 +603,8 @@ pub(crate) fn step(
                 (DragState::Dragging(drag), None)
             }
         }
-        (DragState::Dragging(mut drag), DragInput::Dragged { .. }) => {
+        (DragState::Dragging(mut drag), DragInput::Dragged { point }) => {
+            drag.pointer = point;
             drag.button_up_since = None;
             (DragState::Dragging(drag), None)
         }
@@ -597,6 +702,7 @@ fn pressed(mut press: Press, input: DragInput, now: Duration) -> DragState {
     if follows {
         DragState::Dragging(Drag {
             window: press.window,
+            pointer: press.samples.last().copied().unwrap_or(press.point),
             centre_dx: press.frame.center().x - press.point.x,
             button_up_since: press.button_up_since,
         })
@@ -700,22 +806,43 @@ impl Plugin for DragEventsPlugin {
         let allowed = |config: Res<Config>, mission_control: Option<Res<MissionControlActive>>| {
             drags_allowed(&config, mission_control.as_deref())
         };
-        app.init_resource::<DragState>().add_systems(
-            Update,
-            (
-                drag_events
-                    // A drop focuses the window after giving it its new
-                    // column's width. Run the other way round, the focus
-                    // check would read the old size back from the window
-                    // before the new one is committed.
-                    .after(super::focus::fix_window_size_on_focus)
-                    .run_if(on_message::<Event>.or_eager(awaiting_move))
-                    .run_if(allowed),
-                drag_watchdog.after(drag_events).run_if(in_progress),
+        let dragging = |state: Res<DragState>| matches!(*state, DragState::Dragging(_));
+        app.init_resource::<DragState>()
+            .init_resource::<DragFeedback>()
+            .add_systems(
+                Update,
+                (
+                    drag_events
+                        // A drop focuses the window after giving it its new
+                        // column's width. Run the other way round, the focus
+                        // check would read the old size back from the window
+                        // before the new one is committed.
+                        .after(super::focus::fix_window_size_on_focus)
+                        .run_if(on_message::<Event>.or_eager(awaiting_move))
+                        .run_if(allowed),
+                    drag_watchdog.after(drag_events).run_if(in_progress),
+                )
+                    .in_set(UpdateSet::Focus)
+                    .run_if(not(resource_exists::<Initializing>)),
             )
-                .in_set(UpdateSet::Focus)
-                .run_if(not(resource_exists::<Initializing>)),
-        );
+            .add_systems(
+                Update,
+                // After the layout, so the shape is drawn from where the
+                // layout put the windows this frame.
+                drag_feedback
+                    .in_set(UpdateSet::Housekeeping)
+                    .run_if(
+                        resource_changed::<DragState>
+                            .or_eager(dragging.and_then(feedback_inputs_changed)),
+                    )
+                    .run_if(not(resource_exists::<Initializing>)),
+            )
+            .add_systems(
+                PostUpdate,
+                show_drag_feedback
+                    .in_set(PostUpdateSet::Ui)
+                    .run_if(feedback_pending),
+            );
     }
 }
 
@@ -742,6 +869,29 @@ type Strips<'w, 's> = Query<
     ),
 >;
 type Displays<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
+type ReadPlacements<'w, 's> =
+    Query<'w, 's, (&'static LayoutPosition, &'static Bounds), With<Window>>;
+type ReadStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static LayoutStrip,
+        &'static Position,
+        &'static ChildOf,
+        Has<PreviousStripPosition>,
+    ),
+>;
+type MovedStrips<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    (
+        With<LayoutStrip>,
+        Or<(Changed<LayoutStrip>, Changed<Position>)>,
+    ),
+>;
+type MovedWindows<'w, 's> =
+    Query<'w, 's, (), (With<Window>, Or<(Changed<LayoutPosition>, Changed<Bounds>)>)>;
 
 /// Whether title-bar drags may move windows now: the option is on, and
 /// Mission Control, which moves windows on its own, is not showing.
@@ -847,8 +997,15 @@ fn advance(
     let (next, drop) = {
         let snapshot = OnceCell::new();
         let hit = |dragged, pointer, centre_dx| {
-            let snapshot =
-                snapshot.get_or_init(|| snapshot_of(dragged, strips, placements, displays, config));
+            let snapshot = snapshot.get_or_init(|| {
+                snapshot_of(
+                    dragged,
+                    &strips.as_readonly(),
+                    &placements.as_readonly(),
+                    displays,
+                    config,
+                )
+            });
             hit_test(snapshot, dragged, pointer, centre_dx)
         };
         step((**state).clone(), input, now, &hit)
@@ -1059,12 +1216,99 @@ fn drag_watchdog(
     }
 }
 
+/// Whether anything the drop feedback is drawn from, other than the drag
+/// state, changed since the last check: a strip, a window's slot or size, a
+/// display, the appearance, or the config.
+fn feedback_inputs_changed(
+    strips: MovedStrips,
+    windows: MovedWindows,
+    displays: Query<(), Changed<Display>>,
+    theme: Option<Res<SystemTheme>>,
+    config: Res<Config>,
+) -> bool {
+    !strips.is_empty()
+        || !windows.is_empty()
+        || !displays.is_empty()
+        || theme.is_some_and(|theme| theme.is_changed())
+        || config.is_changed()
+}
+
+/// Keeps [`DragFeedback`] on what the overlay should show: where a release
+/// would put the dragged window, in the focus border's color. It shows
+/// nothing unless a drag would move the window.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn drag_feedback(
+    state: Res<DragState>,
+    mut feedback: ResMut<DragFeedback>,
+    strips: ReadStrips,
+    placements: ReadPlacements,
+    displays: Displays,
+    config: Res<Config>,
+    theme: Option<Res<SystemTheme>>,
+) {
+    let shape = match &*state {
+        DragState::Dragging(drag) => {
+            let snapshot = snapshot_of(drag.window, &strips, &placements, &displays, &config);
+            let target = hit_test(&snapshot, drag.window, drag.pointer, drag.centre_dx);
+            overlay_shape(&snapshot, drag.window, drag.pointer, target)
+        }
+        _ => None,
+    };
+    let line_color = match shape {
+        Some(OverlayShape::Line(_)) => {
+            config.border_color(theme.is_some_and(|theme| theme.is_dark))
+        }
+        _ => feedback.line_color,
+    };
+    feedback.set_if_neq(DragFeedback { shape, line_color });
+}
+
+/// Whether the overlay may have something to draw: new feedback, or a shape
+/// it shows that a display change may have moved. The feedback starts
+/// hidden, as the overlay does.
+fn feedback_pending(feedback: Res<DragFeedback>) -> bool {
+    feedback.shape.is_some() || (feedback.is_changed() && !feedback.is_added())
+}
+
+/// Draws [`DragFeedback`] when it changes. A display change draws a shown
+/// shape again, even when it is the same, because the overlay's windows and
+/// its conversion from screen points follow the screens.
+fn show_drag_feedback(
+    feedback: Res<DragFeedback>,
+    mut messages: MessageReader<Event>,
+    displays: Query<(), Changed<Display>>,
+    overlay: Option<NonSendMut<DragOverlayHandle>>,
+) {
+    let display_event = messages.read().fold(false, |seen, event| {
+        seen | matches!(
+            event,
+            Event::DisplayAdded { .. }
+                | Event::DisplayRemoved { .. }
+                | Event::DisplayMoved { .. }
+                | Event::DisplayResized { .. }
+                | Event::DisplayConfigured { .. }
+                | Event::DisplayChanged
+        )
+    });
+    if !feedback.is_changed() && !display_event && displays.is_empty() {
+        return;
+    }
+    let Some(mut overlay) = overlay else {
+        return;
+    };
+    match feedback.shape {
+        Some(OverlayShape::Line(line)) => overlay.0.show_line(line, feedback.line_color),
+        Some(OverlayShape::Refusal(square)) => overlay.0.show_refusal(square),
+        None => overlay.0.hide(),
+    }
+}
+
 /// The snapshot of the strip holding `dragged`, on the display that strip is
 /// on.
 fn snapshot_of(
     dragged: Entity,
-    strips: &Strips,
-    placements: &Placements,
+    strips: &ReadStrips,
+    placements: &ReadPlacements,
     displays: &Displays,
     config: &Config,
 ) -> LayoutSnapshot {
@@ -1366,11 +1610,27 @@ mod tests {
             state,
             DragState::Dragging(Drag {
                 window: w,
+                pointer: PRESS + IVec2::new(50, 5),
                 centre_dx: FRAME.center().x - PRESS.x,
                 button_up_since: None,
             })
         );
         assert_eq!(drops, vec![]);
+    }
+
+    #[test]
+    fn a_drag_keeps_the_latest_pointer_position() {
+        let w = entities(1)[0];
+        let (state, _) = run(&[
+            down(w, PRESS),
+            dragged(IVec2::new(50, 5)),
+            moved_by(w, IVec2::new(50, 5)),
+            dragged(IVec2::new(80, 40)),
+        ]);
+        let DragState::Dragging(drag) = state else {
+            panic!("{state:?}");
+        };
+        assert_eq!(drag.pointer, PRESS + IVec2::new(80, 40));
     }
 
     #[test]
@@ -2109,6 +2369,158 @@ mod tests {
         );
     }
 
+    /// The overlay shape for a drag of `dragged` with the pointer at (600,
+    /// 300), whose release would land at `target`.
+    fn shape(
+        snapshot: &LayoutSnapshot,
+        dragged: Entity,
+        target: DropTarget,
+    ) -> Option<OverlayShape> {
+        overlay_shape(snapshot, dragged, IVec2::new(600, 300), target)
+    }
+
+    fn line(x: Range<i32>, y: Range<i32>) -> OverlayShape {
+        OverlayShape::Line(IRect::new(x.start, y.start, x.end, y.end))
+    }
+
+    #[test]
+    fn a_drop_into_a_column_shows_a_line_across_it_at_the_gap() {
+        let e = entities(5);
+        let snap = four_columns(&e);
+
+        assert_eq!(
+            shape(&snap, e[4], into(1, 1)),
+            Some(line(400..800, 393..396))
+        );
+    }
+
+    #[test]
+    fn a_line_at_the_top_or_bottom_of_a_column_stays_on_screen() {
+        let e = entities(5);
+        let snap = four_columns(&e);
+
+        assert_eq!(
+            shape(&snap, e[4], into(1, 0)),
+            Some(line(400..800, 20..23)),
+            "top"
+        );
+        assert_eq!(
+            shape(&snap, e[4], into(1, 2)),
+            Some(line(400..800, 765..768)),
+            "bottom"
+        );
+        assert_eq!(
+            shape(&snap, e[4], into(0, 1)),
+            Some(line(0..400, 765..768)),
+            "below a lone window"
+        );
+    }
+
+    #[test]
+    fn a_line_across_a_column_partly_off_screen_stops_at_the_screen_edge() {
+        let e = entities(5);
+        let snap = four_columns(&e);
+
+        assert_eq!(
+            shape(&snap, e[0], into(2, 0)),
+            Some(line(800..1024, 20..23))
+        );
+        assert_eq!(shape(&snap, e[0], into(3, 0)), None, "wholly off screen");
+    }
+
+    #[test]
+    fn a_reorder_shows_the_line_between_the_other_windows_of_its_stack() {
+        let e = entities(5);
+        let snap = four_columns(&e);
+
+        assert_eq!(
+            shape(&snap, e[1], into(1, 1)),
+            Some(line(400..800, 765..768)),
+            "B under C"
+        );
+        assert_eq!(
+            shape(&snap, e[2], into(1, 0)),
+            Some(line(400..800, 20..23)),
+            "C over B"
+        );
+    }
+
+    #[test]
+    fn a_new_column_shows_a_line_down_the_full_height_of_its_gap() {
+        let e = entities(5);
+        let snap = four_columns(&e);
+
+        assert_eq!(
+            shape(&snap, e[4], new_column(1)),
+            Some(line(399..402, 20..768)),
+            "between A and B"
+        );
+        assert_eq!(
+            shape(&snap, e[4], new_column(0)),
+            Some(line(0..3, 20..768)),
+            "before the first column"
+        );
+        assert_eq!(shape(&snap, e[4], new_column(5)), None, "no such gap");
+    }
+
+    #[test]
+    fn a_new_column_in_a_padded_gap_shows_its_line_in_the_middle() {
+        let e = entities(3);
+        let snap = snapshot(
+            748,
+            vec![
+                column(0, 200..500, vec![band(&[e[0]], 20..768)]),
+                column(1, 510..800, vec![band(&[e[1]], 20..768)]),
+            ],
+        );
+
+        assert_eq!(
+            shape(&snap, e[2], new_column(1)),
+            Some(line(504..507, 20..768)),
+            "between the columns"
+        );
+        assert_eq!(
+            shape(&snap, e[2], new_column(2)),
+            Some(line(799..802, 20..768)),
+            "after the last column"
+        );
+    }
+
+    #[test]
+    fn a_refused_drop_shows_the_refusal_symbol_beside_the_pointer() {
+        let e = entities(5);
+
+        assert_eq!(
+            shape(&four_columns(&e), e[4], DropTarget::Refused),
+            Some(OverlayShape::Refusal(IRect::new(614, 314, 636, 336)))
+        );
+    }
+
+    #[test]
+    fn a_drop_home_shows_nothing() {
+        let e = entities(5);
+
+        assert_eq!(shape(&four_columns(&e), e[4], DropTarget::Home), None);
+    }
+
+    #[test]
+    fn a_viewport_too_small_for_a_line_shows_nothing() {
+        let e = entities(3);
+        for span in 0..INSERTION_LINE {
+            let mut snap = snapshot(
+                span,
+                vec![
+                    column(0, 0..400, vec![band(&[e[0]], 20..20 + span)]),
+                    column(1, 400..800, vec![band(&[e[1]], 20..20 + span)]),
+                ],
+            );
+            assert_eq!(shape(&snap, e[2], into(1, 0)), None, "{span} pt high");
+
+            snap.viewport = IRect::new(400, 20, 400 + span, 768);
+            assert_eq!(shape(&snap, e[2], new_column(1)), None, "{span} pt wide");
+        }
+    }
+
     /// A drop that goes home, is refused, or names a column the window can
     /// not join leaves the strip unchanged, so `Changed<LayoutStrip>` does not
     /// fire, and gives no window a new width.
@@ -2227,6 +2639,79 @@ mod tests {
             })
             .on_iteration(3, |world, _| {
                 assert_eq!(*world.resource::<DragState>(), DragState::Idle);
+            })
+            .run(commands);
+    }
+
+    /// While a drag holds still, nothing the drop feedback is drawn from
+    /// changes, so `drag_feedback` does not run. A pointer move runs it.
+    #[test]
+    fn a_still_drag_does_not_run_the_drop_feedback() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use bevy::ecs::change_detection::Tick;
+        use bevy::ecs::schedule::Schedules;
+        use bevy::ecs::system::System as _;
+
+        use crate::commands::Command;
+        use crate::events::Event;
+        use crate::platform::Modifiers;
+        use crate::tests::TestHarness;
+
+        fn last_feedback_run(world: &World) -> Tick {
+            let feedback = bevy::ecs::system::IntoSystem::into_system(drag_feedback).system_type();
+            world
+                .resource::<Schedules>()
+                .get(Update)
+                .expect("an Update schedule")
+                .systems()
+                .expect("Update has run")
+                .find(|(_, system)| system.system_type() == feedback)
+                .map(|(_, system)| system.get_last_run())
+                .expect("drag_feedback is in Update")
+        }
+
+        let drag_to = |y: f64| Event::MouseDragged {
+            point: CGPoint::new(200.0, y),
+            modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+        };
+        let commands = vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::MouseDown {
+                point: CGPoint::new(600.0, 30.0),
+                modifiers: Modifiers::empty(),
+                button: MouseButton::Left,
+                window_id: Some(1),
+            },
+            drag_to(600.0),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            drag_to(620.0),
+        ];
+
+        let harness = TestHarness::new()
+            .with_config(Config::try_from("[options]\ndrag_to_reorder = true\n").unwrap())
+            .with_windows(3);
+        harness.mock_state.set_left_button_down(true);
+        let run = Rc::new(Cell::new(None));
+        let (still, moved) = (run.clone(), run.clone());
+        harness
+            .on_iteration(1, |_, state| state.os_move_window(1, IVec2::new(0, 590)))
+            .on_iteration(2, move |world, _| {
+                assert!(matches!(
+                    world.resource::<DragState>(),
+                    DragState::Dragging(_)
+                ));
+                run.set(Some(last_feedback_run(world)));
+            })
+            .on_iteration(3, move |world, _| {
+                assert_eq!(Some(last_feedback_run(world)), still.get());
+            })
+            .on_iteration(4, move |world, _| {
+                assert_ne!(Some(last_feedback_run(world)), moved.get());
             })
             .run(commands);
     }

@@ -25,6 +25,7 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
+use crate::ecs::drag::DragOverlayHandle;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
@@ -1327,17 +1328,25 @@ pub(super) fn commit_window_size(
         });
 }
 
-/// Restores user-visible window state before Paneru shuts down: clears any
-/// brightness dim, removes the dim/border overlay window, and centers every
-/// managed window on the display its frame center falls in.
+/// Restores user-visible window state before Paneru shuts down: removes any
+/// drop feedback, clears any brightness dim, removes the dim/border overlay
+/// window, and centers every managed window on the display its frame center
+/// falls in.
 pub(crate) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
     mut all_windows: Query<&mut Window>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
+    mut drag_overlay: Option<NonSendMut<DragOverlayHandle>>,
 ) {
     for _ in exit_events.read() {
+        // First, because restoring the windows below goes through slow
+        // accessibility calls, and drop feedback must not stay on screen
+        // meanwhile.
+        if let Some(ref mut drag_overlay) = drag_overlay {
+            drag_overlay.0.remove();
+        }
         let ids = all_windows.iter().map(|w| w.id()).collect::<Vec<_>>();
         info!("exit cleanup: restoring {} window(s)", ids.len());
         window_manager.dim_windows(&ids, 0.0);
