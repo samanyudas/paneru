@@ -53,10 +53,17 @@ fn area(rect: IRect) -> i64 {
 }
 
 /// The test display's strip of windows 0 to 3 beside `ext`, which holds
-/// window 100, scrolled to `focus`.
-fn beside(ext: IRect, focus: Direction) -> TestHarness {
-    let mut harness = TestHarness::new()
-        .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
+/// window 100, and the empty displays `more`, scrolled to `focus`.
+fn beside(ext: IRect, more: &[IRect], focus: Direction) -> TestHarness {
+    let mut harness = TestHarness::new().with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID]);
+    for (offset, bounds) in (1..).zip(more) {
+        harness = harness.with_display(
+            EXT_DISPLAY_ID + offset,
+            *bounds,
+            vec![EXT_WORKSPACE_ID + u64::from(offset)],
+        );
+    }
+    harness = harness
         .with_windows(4)
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
             window.frame = IRect::new(ext.min.x + 100, ext.min.y + 20, ext.min.x + 900, ext.max.y);
@@ -79,7 +86,7 @@ fn a_column_hidden_toward_a_display_beside_stays_off_it() {
         TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
         EXT_DISPLAY_HEIGHT,
     );
-    let mut harness = beside(ext, Direction::First);
+    let mut harness = beside(ext, &[], Direction::First);
     for id in 0..4 {
         let shown = frame(harness.world(), id);
         assert!(
@@ -96,20 +103,85 @@ fn a_column_hidden_toward_a_display_beside_stays_off_it() {
 }
 
 #[test]
-fn a_column_tucks_past_the_corner_when_the_display_beside_ends_above_it() {
+fn a_column_shows_one_point_past_the_corner_when_the_display_beside_ends_above_it() {
     let ext = IRect::new(
         TEST_DISPLAY_WIDTH,
         0,
         TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
         TEST_DISPLAY_HEIGHT / 2,
     );
-    let mut harness = beside(ext, Direction::First);
+    let mut harness = beside(ext, &[], Direction::First);
     let hidden = frame(harness.world(), 3);
+    let showing = hidden.intersect(OWN);
+    assert_eq!(
+        (showing.min.x, showing.width()),
+        (TEST_DISPLAY_WIDTH - 1, 1),
+        "window 3 shows 1 point past the bottom-right corner: {hidden:?}"
+    );
     assert!(
-        hidden.min.x >= TEST_DISPLAY_WIDTH - 10 && hidden.min.y >= TEST_DISPLAY_HEIGHT - 10,
-        "window 3 shows only a corner of itself: {hidden:?}"
+        hidden.min.y >= TEST_DISPLAY_HEIGHT - 10,
+        "window 3 hangs below its display: {hidden:?}"
     );
     assert!(hidden.intersect(ext).is_empty(), "{hidden:?}");
+}
+
+#[test]
+fn a_column_goes_past_the_other_bottom_corner_when_a_display_sits_past_the_first() {
+    let ext = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT / 2,
+    );
+    let diagonal = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
+    );
+    let mut harness = beside(ext, &[diagonal], Direction::First);
+    let hidden = frame(harness.world(), 3);
+    let showing = hidden.intersect(OWN);
+    assert_eq!(
+        (showing.min.x, showing.width()),
+        (0, 1),
+        "window 3 shows 1 point past the bottom-left corner: {hidden:?}"
+    );
+    assert!(
+        hidden.min.y >= TEST_DISPLAY_HEIGHT - 10,
+        "window 3 hangs below its display: {hidden:?}"
+    );
+    assert!(
+        hidden.intersect(ext).is_empty() && hidden.intersect(diagonal).is_empty(),
+        "{hidden:?}"
+    );
+}
+
+#[test]
+fn a_column_tucks_flush_when_displays_fill_both_bottom_corners() {
+    let ext = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        EXT_DISPLAY_HEIGHT,
+    );
+    let left = IRect::new(-EXT_DISPLAY_WIDTH, 0, 0, EXT_DISPLAY_HEIGHT);
+    let mut harness = beside(ext, &[left], Direction::First);
+    let hidden = frame(harness.world(), 3);
+    let showing = hidden.intersect(OWN);
+    assert_eq!(
+        (showing.max.x, showing.width()),
+        (TEST_DISPLAY_WIDTH, hidden.width()),
+        "window 3 shows flush inside the right edge: {hidden:?}"
+    );
+    assert!(
+        hidden.min.y >= TEST_DISPLAY_HEIGHT - 10,
+        "window 3 hangs below its display: {hidden:?}"
+    );
+    assert!(
+        hidden.intersect(ext).is_empty() && hidden.intersect(left).is_empty(),
+        "{hidden:?}"
+    );
 }
 
 #[test]
@@ -120,7 +192,7 @@ fn a_column_hidden_toward_a_free_side_keeps_its_sliver() {
         TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
         EXT_DISPLAY_HEIGHT,
     );
-    let mut harness = beside(ext, Direction::Last);
+    let mut harness = beside(ext, &[], Direction::Last);
     let hidden = frame(harness.world(), 0);
     assert!(
         hidden.max.x <= 10 && hidden.min.y < TEST_DISPLAY_HEIGHT / 2,
@@ -136,7 +208,7 @@ fn moving_a_display_beside_a_parked_column_keeps_the_column_in_its_strip() {
         EXT_DISPLAY_WIDTH,
         TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
     );
-    let mut harness = beside(below, Direction::Last);
+    let mut harness = beside(below, &[], Direction::Last);
     let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
     let parked = frame(harness.world(), 0);
     assert!(

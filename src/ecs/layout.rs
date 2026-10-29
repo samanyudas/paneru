@@ -3327,10 +3327,12 @@ fn keep_on_own_display(
     }
 }
 
-/// `frame` tucked below the bottom edge of `own`, against the side it hangs
-/// past, with `sliver` points of the window showing. It hangs past that
-/// corner when no other display is there, and otherwise shows flush inside the
-/// side. `None` when a display below `own` takes most of either.
+/// `frame` tucked below the bottom edge of `own`, with `sliver` points of the
+/// window showing above that edge. It hangs past the first free bottom
+/// corner of `own` with 1 point showing, trying the side it hangs past
+/// first. A corner is free when no other display is there. With neither
+/// corner free it shows flush inside the side it hangs past. `None` when a
+/// display below `own` takes most of that flush frame.
 fn bottom_tuck(
     frame: IRect,
     own: IRect,
@@ -3340,23 +3342,19 @@ fn bottom_tuck(
 ) -> Option<IRect> {
     let size = frame.size();
     let y = own.max.y - sliver - margins.min.y;
-    let (corner, flush) = if frame.center().x < own.center().x {
-        (
-            own.min.x - size.x + sliver + margins.max.x,
-            own.min.x - margins.min.x,
-        )
+    let past_left = own.min.x - size.x + 1 + margins.max.x;
+    let past_right = own.max.x - 1 - margins.min.x;
+    let (corners, flush) = if frame.center().x < own.center().x {
+        ([past_left, past_right], own.min.x - margins.min.x)
     } else {
-        (
-            own.max.x - sliver - margins.min.x,
-            own.max.x - size.x + margins.max.x,
-        )
+        ([past_right, past_left], own.max.x - size.x + margins.max.x)
     };
     let at = |x: i32| IRect::from_corners(IVec2::new(x, y), IVec2::new(x, y) + size);
-    let corner = at(corner);
-    if others
-        .iter()
-        .all(|other| overlap_area(margins.shown(corner), *other) == 0)
-    {
+    if let Some(corner) = corners.into_iter().map(at).find(|corner| {
+        others
+            .iter()
+            .all(|other| overlap_area(margins.shown(*corner), *other) == 0)
+    }) {
         return Some(corner);
     }
     let flush = at(flush);
