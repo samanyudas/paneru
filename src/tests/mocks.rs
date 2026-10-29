@@ -10,6 +10,9 @@ use stdext::prelude::RwLockExt;
 use crate::errors::Error;
 use crate::events::{DestroySource, Event};
 use crate::manager::app::MockApplicationApi;
+use crate::manager::window_writer::{
+    Answers, AppWriter, AxFrame, FrameTarget, FrameWrite, WindowWriters, WindowWrites,
+};
 use crate::manager::{
     Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
     Window, origin_from, origin_to,
@@ -84,12 +87,21 @@ struct MockDisplayData {
 }
 
 /// Whether a mocked app is answering window writes, to model one that is
-/// stuck.
+/// slow or stuck.
 #[derive(Default)]
 struct WriteHold {
+    /// The app has yet to take a write.
     held: bool,
+    /// The app takes each write and reports it, then keeps the writer
+    /// waiting, as when the writer reads the frame back after a resize.
+    read_back_held: bool,
+    /// The next frame read that gives up waiting for a write releases the
+    /// app, and returns once the write has landed.
+    land_as_read_gives_up: bool,
     /// Holds that ran out with nobody releasing them.
     expired_holds: usize,
+    /// Frame reads begun while a write to the same window was still queued.
+    reads_behind_writes: usize,
 }
 
 /// A held write gives up after this long, so a test that waits on one fails
@@ -132,6 +144,119 @@ pub struct MockState {
     /// Kept outside `inner` so a slow write never holds the lock every other
     /// mock call needs.
     write_holds: Arc<WriteHolds>,
+    /// Writer threads for apps that were ever held, as `WindowOS` has for
+    /// every app.
+    writers: Arc<WindowWriters<MockWriteTarget>>,
+    /// Keeps each writer alive, as a `WindowOS` handle does.
+    live_writers: Arc<Mutex<HashMap<Pid, Arc<AppWriter<MockWriteTarget>>>>>,
+    views: Arc<Mutex<HashMap<WinID, WindowView>>>,
+}
+
+/// One window as `WindowOS` and its writer see it, from where the app had it
+/// when the engine first wrote or read it.
+struct WindowView {
+    /// The frame last asked for, which `WindowOS` keeps until the next read.
+    asked: IRect,
+    answers: Arc<Answers>,
+    asked_origins: Vec<Origin>,
+    /// Every origin the app was given, by the engine or by a staged resize.
+    taken_origins: Vec<Origin>,
+}
+
+impl WindowView {
+    fn new(frame: IRect) -> Self {
+        Self {
+            asked: frame,
+            answers: Arc::new(Answers::new(frame)),
+            asked_origins: Vec::new(),
+            taken_origins: Vec::new(),
+        }
+    }
+}
+
+/// Lands a window's queued writes on the mock app.
+#[derive(Clone)]
+struct MockWriteTarget {
+    state: MockState,
+    window_id: WinID,
+}
+
+impl FrameTarget for MockWriteTarget {
+    /// Lands the write the way `AxWindow` does. An app that was ever held
+    /// also reports each change back, as real apps do, and reports nothing
+    /// for a write that changes nothing.
+    fn write(&self, write: FrameWrite) {
+        let (state, id) = (&self.state, self.window_id);
+        let Some(pid) = state.inner.force_read().windows.get(&id).map(|w| w.pid) else {
+            return;
+        };
+        let echo = state.answer(pid, |app| &mut app.held);
+        let Some(answers) = state.view(id, |view| Arc::clone(&view.answers)) else {
+            return;
+        };
+        let Ok(before) = self.read_frame() else {
+            return;
+        };
+        answers.land(self, write);
+        let Ok(after) = self.read_frame() else {
+            return;
+        };
+        if echo {
+            let mut inner = state.inner.force_write();
+            if after.min != before.min {
+                inner
+                    .event_queue
+                    .push_back(Event::WindowMoved { window_id: id });
+            }
+            if after.size() != before.size() {
+                inner
+                    .event_queue
+                    .push_back(Event::WindowResized { window_id: id });
+            }
+            drop(inner);
+            state.answer(pid, |app| &mut app.read_back_held);
+        }
+    }
+}
+
+impl AxFrame for MockWriteTarget {
+    fn set_position(&self, origin: Origin) {
+        self.state
+            .view(self.window_id, |view| view.taken_origins.push(origin));
+        if let Some(w) = self
+            .state
+            .inner
+            .force_write()
+            .windows
+            .get_mut(&self.window_id)
+        {
+            let size = w.frame.size();
+            w.frame.min = origin;
+            w.frame.max = origin + size;
+        }
+    }
+
+    fn set_size(&self, size: Size) {
+        if let Some(w) = self
+            .state
+            .inner
+            .force_write()
+            .windows
+            .get_mut(&self.window_id)
+        {
+            let max_width = if w.max_width > 0 {
+                w.max_width
+            } else {
+                i32::MAX
+            };
+            let width = size.x.max(w.min_width).min(max_width);
+            w.frame.max = w.frame.min + size.with_x(width);
+        }
+    }
+
+    fn read_frame(&self) -> crate::errors::Result<IRect> {
+        self.state.read_app_frame(self.window_id)
+    }
 }
 
 impl MockState {
@@ -152,19 +277,67 @@ impl MockState {
                 app_reads: HashMap::new(),
             })),
             write_holds: Arc::default(),
+            writers: Arc::default(),
+            live_writers: Arc::default(),
+            views: Arc::default(),
         }
+    }
+
+    fn view<R>(&self, id: WinID, f: impl FnOnce(&mut WindowView) -> R) -> Option<R> {
+        let frame = self.read_app_frame(id).ok()?;
+        let mut views = self.views.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(f(views.entry(id).or_insert_with(|| WindowView::new(frame))))
+    }
+
+    fn read_app_frame(&self, id: WinID) -> crate::errors::Result<IRect> {
+        self.inner
+            .force_read()
+            .windows
+            .get(&id)
+            .map(|w| w.frame)
+            .ok_or(Error::InvalidWindow)
+    }
+
+    /// Origins the app was given for the window that the engine never asked
+    /// for, such as a staged resize's offscreen one.
+    pub fn origins_not_asked(&self, id: WinID) -> Vec<Origin> {
+        self.view(id, |view| {
+            view.taken_origins
+                .iter()
+                .filter(|origin| !view.asked_origins.contains(origin))
+                .copied()
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Marks `pid` as ever held, which threads its writes from then on.
+    fn write_hold<R>(&self, pid: Pid, f: impl FnOnce(&mut WriteHold) -> R) -> R {
+        f(self
+            .write_holds
+            .apps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(pid)
+            .or_default())
     }
 
     /// Makes `pid`'s window writes wait until [`Self::release_writes`], or
     /// until [`WRITE_HOLD_LIMIT`] runs out.
     pub fn hold_writes(&self, pid: Pid) {
-        self.write_holds
-            .apps
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(pid)
-            .or_default()
-            .held = true;
+        self.write_hold(pid, |app| app.held = true);
+    }
+
+    /// Makes `pid` take each window write and report it, then keep the
+    /// writer waiting until [`Self::release_writes`].
+    pub fn hold_read_back(&self, pid: Pid) {
+        self.write_hold(pid, |app| app.read_back_held = true);
+    }
+
+    /// Makes the next read that gives up on one of `pid`'s writes release
+    /// the app and let the write land before the read returns.
+    pub fn land_as_read_gives_up(&self, pid: Pid) {
+        self.write_hold(pid, |app| app.land_as_read_gives_up = true);
     }
 
     pub fn release_writes(&self, pid: Pid) {
@@ -176,18 +349,84 @@ impl MockState {
             .get_mut(&pid)
         {
             app.held = false;
+            app.read_back_held = false;
         }
         self.write_holds.released.notify_all();
     }
 
     /// How many of `pid`'s held writes waited out [`WRITE_HOLD_LIMIT`].
     pub fn expired_write_holds(&self, pid: Pid) -> usize {
+        self.write_hold_count(pid, |app| app.expired_holds)
+    }
+
+    /// How many frame reads of `pid`'s windows began while a write to the
+    /// same window was still queued. Each of those waits on the app.
+    pub fn reads_behind_writes(&self, pid: Pid) -> usize {
+        self.write_hold_count(pid, |app| app.reads_behind_writes)
+    }
+
+    fn write_hold_count(&self, pid: Pid, count: fn(&WriteHold) -> usize) -> usize {
         self.write_holds
             .apps
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&pid)
-            .map_or(0, |app| app.expired_holds)
+            .map_or(0, count)
+    }
+
+    /// Waits up to [`WRITE_HOLD_LIMIT`] for every queued write to land.
+    pub fn wait_for_writes(&self) {
+        assert!(
+            self.writers.flush(WRITE_HOLD_LIMIT),
+            "queued window writes never landed"
+        );
+    }
+
+    /// The window's writes, threaded once its app was ever held, the way
+    /// `WindowOS` threads every app's.
+    fn window_writes(&self, id: WinID) -> Option<WindowWrites<MockWriteTarget>> {
+        let pid = self.inner.force_read().windows.get(&id).map(|w| w.pid)?;
+        let ever_held = self
+            .write_holds
+            .apps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&pid);
+        let writer = ever_held.then(|| {
+            let writer = self.writers.for_app(pid);
+            self.live_writers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(pid, Arc::clone(&writer));
+            writer
+        });
+        let target = MockWriteTarget {
+            state: self.clone(),
+            window_id: id,
+        };
+        Some(WindowWrites::new(id, target, writer))
+    }
+
+    /// Waits for the window's queued writes the way `WindowOS::update_frame`
+    /// does.
+    fn wait_before_read(&self, id: WinID) -> crate::errors::Result<()> {
+        let Some(writes) = self.window_writes(id) else {
+            return Ok(());
+        };
+        let Some(pid) = self.inner.force_read().windows.get(&id).map(|w| w.pid) else {
+            return Ok(());
+        };
+        if writes.pending() {
+            self.write_hold(pid, |app| app.reads_behind_writes += 1);
+        }
+        let landed = writes.wait_for_landing();
+        if landed.is_err()
+            && self.write_hold(pid, |app| std::mem::take(&mut app.land_as_read_gives_up))
+        {
+            self.release_writes(pid);
+            assert!(writes.wait_for_landing().is_ok(), "released write landed");
+        }
+        landed
     }
 
     /// Where the app has the window, which lags what the engine asked for
@@ -201,8 +440,9 @@ impl MockState {
             .expect("finding window")
     }
 
-    /// Blocks while `pid` is held, and returns whether `pid` was ever held.
-    fn answer_write(&self, pid: Pid) -> bool {
+    /// Blocks while `held` says `pid` is held, and returns whether `pid` was
+    /// ever held.
+    fn answer(&self, pid: Pid, held: fn(&mut WriteHold) -> &mut bool) -> bool {
         let holds = &self.write_holds;
         let mut apps = holds.apps.lock().unwrap_or_else(PoisonError::into_inner);
         if !apps.contains_key(&pid) {
@@ -210,11 +450,11 @@ impl MockState {
         }
         let deadline = Instant::now() + WRITE_HOLD_LIMIT;
         while let Some(app) = apps.get_mut(&pid)
-            && app.held
+            && *held(app)
         {
             let now = Instant::now();
             if now >= deadline {
-                app.held = false;
+                *held(app) = false;
                 app.expired_holds += 1;
                 break;
             }
@@ -227,42 +467,27 @@ impl MockState {
         true
     }
 
-    /// Writes a window's position, then its size, the way the app would. An
-    /// app that was ever held also reports each change back, as real apps do.
+    /// Queues a write the way `WindowOS` does.
     fn write_frame(&self, id: WinID, origin: Option<Origin>, size: Option<Size>) {
-        let Some(pid) = self.inner.force_read().windows.get(&id).map(|w| w.pid) else {
+        let Some(origin_before) = self.view(id, |view| {
+            let before = view.asked;
+            if let Some(origin) = origin {
+                view.asked_origins.push(origin);
+                view.asked = IRect::from_corners(origin, origin + before.size());
+            }
+            if let Some(size) = size {
+                view.asked.max = view.asked.min + size;
+            }
+            before.min
+        }) else {
             return;
         };
-        let echo = self.answer_write(pid);
-        let mut inner = self.inner.force_write();
-        let Some(w) = inner.windows.get_mut(&id) else {
-            return;
-        };
-        if let Some(origin) = origin {
-            let size = w.frame.size();
-            w.frame.min = origin;
-            w.frame.max = origin + size;
-        }
-        if let Some(size) = size {
-            let max_width = if w.max_width > 0 {
-                w.max_width
-            } else {
-                i32::MAX
-            };
-            let width = size.x.max(w.min_width).min(max_width);
-            w.frame.max = w.frame.min + size.with_x(width);
-        }
-        if echo {
-            if origin.is_some() {
-                inner
-                    .event_queue
-                    .push_back(Event::WindowMoved { window_id: id });
-            }
-            if size.is_some() {
-                inner
-                    .event_queue
-                    .push_back(Event::WindowResized { window_id: id });
-            }
+        if let Some(writes) = self.window_writes(id) {
+            writes.push(FrameWrite {
+                origin,
+                size,
+                origin_before,
+            });
         }
     }
 
@@ -658,13 +883,18 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_update_frame().returning(move || {
-            s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .map(|w| w.frame)
-                .ok_or(Error::InvalidWindow)
+            s.wait_before_read(id)?;
+            let frame = s.read_app_frame(id)?;
+            s.view(id, |view| {
+                view.asked = frame;
+                view.answers.record(frame);
+            });
+            Ok(frame)
         });
+
+        let s = self.clone();
+        mw.expect_write_pending()
+            .returning(move || s.window_writes(id).is_some_and(|writes| writes.pending()));
 
         let s = self.clone();
         mw.expect_identifier().returning(move || {
@@ -911,6 +1141,11 @@ impl MockState {
     #[allow(clippy::too_many_lines)]
     pub fn create_window_manager(&self) -> MockWindowManagerApi {
         let mut wm = MockWindowManagerApi::new();
+
+        let s = self.clone();
+        wm.expect_flush_window_writes().returning(move |timeout| {
+            s.writers.flush(timeout);
+        });
 
         let s = self.clone();
         wm.expect_window_is_unordered().returning(move |window_id| {

@@ -416,6 +416,13 @@ pub(super) fn fix_window_size_on_focus(
     if !verify_size {
         return;
     }
+    // Reading now would wait on the app, so check on a later focus instead.
+    if windows
+        .get(entity)
+        .is_ok_and(|(window, ..)| window.write_pending())
+    {
+        return;
+    }
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         entity_commands.try_remove::<VerifyWindowSize>();
     }

@@ -5,7 +5,7 @@ use accessibility_sys::{
     kAXUnknownRole, kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
 };
 use bevy::ecs::component::Component;
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2};
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
@@ -27,6 +27,9 @@ use super::skylight::{
     _AXUIElementGetWindow, _SLPSSetFrontProcessWithOptions, AXUIElementCopyAttributeValue,
     AXUIElementPerformAction, AXUIElementSetAttributeValue, SLPSPostEventRecordTo,
     SLSWindowIteratorAdvance,
+};
+use super::window_writer::{
+    Answers, AxFrame, FrameTarget, FrameWrite, WindowWriters, WindowWrites,
 };
 use crate::config::Config;
 use crate::errors::{Error, Result};
@@ -264,7 +267,7 @@ fn set_enhanced_ui(
 ///
 /// Only retry when the first attempt actually grew the window. Fixed-size apps
 /// otherwise look identical to this failure mode and must not be moved offscreen.
-fn resize_staging_origin(
+pub(super) fn resize_staging_origin(
     previous_frame: IRect,
     actual_frame: IRect,
     target_width: i32,
@@ -275,6 +278,182 @@ fn resize_staging_origin(
             .min
             .with_x(actual_frame.min.x - (target_width - actual_width))
     })
+}
+
+static AX_WRITERS: LazyLock<WindowWriters<Arc<AxWindow>>> = LazyLock::new(WindowWriters::default);
+
+/// Waits up to `timeout` for every queued window write to land, and returns
+/// whether they all did.
+pub(crate) fn flush_window_writes(timeout: Duration) -> bool {
+    AX_WRITERS.flush(timeout)
+}
+
+fn set_ax_position(element: &CFRetained<AXUIWrapper>, origin: Origin) {
+    let mut point = CGPoint::new(f64::from(origin.x), f64::from(origin.y));
+    let position_ref = unsafe {
+        AXValueCreate(
+            kAXValueTypeCGPoint,
+            NonNull::from(&mut point).as_ptr().cast(),
+        )
+    };
+    if let Ok(position) = AXUIWrapper::from_retained(position_ref) {
+        unsafe {
+            AXUIElementSetAttributeValue(
+                element.as_ptr(),
+                CFString::from_static_str(kAXPositionAttribute).as_ref(),
+                position.as_ref(),
+            )
+        };
+    }
+}
+
+fn set_ax_size(element: &CFRetained<AXUIWrapper>, size: Size) {
+    let mut cgsize = CGSize::new(f64::from(size.x), f64::from(size.y));
+    let size_ref = unsafe {
+        AXValueCreate(
+            kAXValueTypeCGSize,
+            NonNull::from(&mut cgsize).as_ptr().cast(),
+        )
+    };
+    if let Ok(size_value) = AXUIWrapper::from_retained(size_ref) {
+        unsafe {
+            AXUIElementSetAttributeValue(
+                element.as_ptr(),
+                CFString::from_static_str(kAXSizeAttribute).as_ref(),
+                size_value.as_ref(),
+            )
+        };
+    }
+}
+
+/// Reads the window's frame as the app reports it, without padding.
+fn read_ax_frame(element: &CFRetained<AXUIWrapper>) -> Result<IRect> {
+    let window_ref = element.as_ptr();
+
+    let position = unsafe {
+        let mut position_ref: *mut CFType = null_mut();
+        AXUIElementCopyAttributeValue(
+            window_ref,
+            CFString::from_static_str(kAXPositionAttribute).as_ref(),
+            &mut position_ref,
+        )
+        .to_result(function_name!())?;
+        AXUIWrapper::from_retained(position_ref)?
+    };
+    let size = unsafe {
+        let mut size_ref: *mut CFType = null_mut();
+        AXUIElementCopyAttributeValue(
+            window_ref,
+            CFString::from_static_str(kAXSizeAttribute).as_ref(),
+            &mut size_ref,
+        )
+        .to_result(function_name!())?;
+        AXUIWrapper::from_retained(size_ref)?
+    };
+
+    let mut frame = CGRect::default();
+    unsafe {
+        AXValueGetValue(
+            position.as_ptr(),
+            kAXValueTypeCGPoint,
+            NonNull::from(&mut frame.origin).as_ptr().cast(),
+        );
+        AXValueGetValue(
+            size.as_ptr(),
+            kAXValueTypeCGSize,
+            NonNull::from(&mut frame.size).as_ptr().cast(),
+        );
+    }
+    Ok(irect_from(frame))
+}
+
+struct EnhancedUi {
+    pid: Pid,
+    app_element: CFRetained<AXUIWrapper>,
+    state: Arc<Mutex<EnhancedUiState>>,
+    /// Set once this app is known not to use `AXEnhancedUserInterface` (the
+    /// common case), so the steady-state check is a relaxed atomic load
+    /// instead of acquiring the PID lock.
+    absent: AtomicBool,
+}
+
+/// What a writer thread needs to write one window's frame. Its frames are in
+/// AX coordinates, which leave out the window's padding.
+struct AxWindow {
+    id: WinID,
+    element: CFRetained<AXUIWrapper>,
+    enhanced_ui: Option<EnhancedUi>,
+    answers: Answers,
+}
+
+impl AxWindow {
+    /// Suppresses app-driven move/resize animations until the last guard drops.
+    /// The PID lock covers flag/counter transitions, not the window operations.
+    fn disable_enhanced_ui(&self) -> Option<EnhancedUiGuard<impl FnOnce() -> Result<()> + use<>>> {
+        let enhanced_ui = self.enhanced_ui.as_ref()?;
+        if enhanced_ui.absent.load(Ordering::Relaxed) {
+            return None;
+        }
+        let pid = enhanced_ui.pid;
+        let app_element = &enhanced_ui.app_element;
+        let restore_element = app_element.clone();
+        let window_id = self.id;
+        match acquire_enhanced_ui(
+            enhanced_ui.state.clone(),
+            pid,
+            || {
+                read_enhanced_ui(app_element).inspect(|enabled| {
+                    debug!(
+                        target: "paneru::ax_diagnostics",
+                        pid,
+                        window_id,
+                        enabled,
+                        "read AXEnhancedUserInterface"
+                    );
+                })
+            },
+            || set_enhanced_ui(app_element, false, pid, window_id),
+            move || set_enhanced_ui(&restore_element, true, pid, window_id),
+        ) {
+            Ok(guard) => {
+                if guard.is_none() {
+                    debug!(
+                        target: "paneru::ax_diagnostics",
+                        pid,
+                        window_id,
+                        "permanently caching false; skipping enhanced UI workaround"
+                    );
+                    enhanced_ui.absent.store(true, Ordering::Relaxed);
+                }
+                guard
+            }
+            Err(err) => {
+                warn!(pid, window_id, "error reading enhanced UI: {err}");
+                None
+            }
+        }
+    }
+}
+
+impl AxFrame for AxWindow {
+    fn set_position(&self, origin: Origin) {
+        set_ax_position(&self.element, origin);
+    }
+
+    fn set_size(&self, size: Size) {
+        set_ax_size(&self.element, size);
+    }
+
+    fn read_frame(&self) -> Result<IRect> {
+        read_ax_frame(&self.element)
+    }
+}
+
+impl FrameTarget for Arc<AxWindow> {
+    fn write(&self, write: FrameWrite) {
+        let _enhanced_ui = self.disable_enhanced_ui();
+        self.answers.land(self.as_ref(), write);
+    }
 }
 
 #[derive(Debug)]
@@ -306,6 +485,10 @@ pub trait WindowApi: Send + Sync {
     fn reposition(&mut self, origin: Origin);
     fn resize(&mut self, size: Size);
     fn update_frame(&mut self) -> Result<IRect>;
+    /// Whether a move or resize asked of this window has yet to reach its
+    /// app. [`Self::update_frame`] waits for it, so a caller that must not
+    /// wait on the app checks this first.
+    fn write_pending(&self) -> bool;
     fn focus_without_raise(
         &self,
         psn: ProcessSerialNumber,
@@ -378,13 +561,8 @@ pub struct WindowOS {
     horizontal_padding: i32,
     border_radius: OnceLock<Option<f64>>,
     pid: OnceLock<Result<Pid>>,
-    app_reference: OnceLock<Option<CFRetained<AXUIWrapper>>>,
-    enhanced_ui_state: OnceLock<Arc<Mutex<EnhancedUiState>>>,
-    /// Set once this window's app is known not to use
-    /// `AXEnhancedUserInterface` (the common case), so the steady-state check
-    /// in [`Self::disable_enhanced_ui`] is a relaxed atomic load instead of
-    /// acquiring the PID lock from every `par_iter_mut` worker.
-    enhanced_ui_absent: AtomicBool,
+    /// Runs on the app's writer thread, or inline when the app is unknown.
+    ax_writes: OnceLock<WindowWrites<Arc<AxWindow>>>,
 
     /// The last title read off the element, cached because reading one is a
     /// synchronous cross-process call and many callers want it for every
@@ -448,9 +626,7 @@ impl WindowOS {
             horizontal_padding: 0,
             border_radius: OnceLock::new(),
             pid: OnceLock::new(),
-            app_reference: OnceLock::new(),
-            enhanced_ui_state: OnceLock::new(),
-            enhanced_ui_absent: AtomicBool::new(false),
+            ax_writes: OnceLock::new(),
             title: RwLock::new(None),
             role: OnceLock::new(),
             subrole: OnceLock::new(),
@@ -531,115 +707,43 @@ impl WindowOS {
                 && subrole.as_deref() == Some(kAXFloatingWindowSubrole))
     }
 
-    fn app_reference(&self) -> Option<CFRetained<AXUIWrapper>> {
-        self.app_reference
-            .get_or_init(|| {
-                self.pid()
-                    .map(|pid| unsafe { AXUIElementCreateApplication(pid) })
-                    .and_then(AXUIWrapper::from_retained)
-                    .inspect_err(|err| warn!("error getting app reference: {err}"))
-                    .ok()
-            })
-            .clone()
-    }
-
-    /// Suppresses app-driven move/resize animations until the last guard drops.
-    /// The PID lock covers flag/counter transitions, not the window operations.
-    fn disable_enhanced_ui(&self) -> Option<EnhancedUiGuard<impl FnOnce() -> Result<()> + use<>>> {
-        if self.enhanced_ui_absent.load(Ordering::Relaxed) {
-            return None;
-        }
-        let pid = self.pid().ok()?;
-        let state = self
-            .enhanced_ui_state
-            .get_or_init(|| enhanced_ui_state(pid))
-            .clone();
-        let app_element = self.app_reference()?;
-        let restore_element = app_element.clone();
-        let window_id = self.id;
-        match acquire_enhanced_ui(
-            state,
-            pid,
-            || {
-                read_enhanced_ui(&app_element).inspect(|enabled| {
-                    debug!(
-                        target: "paneru::ax_diagnostics",
-                        pid,
-                        window_id,
-                        enabled,
-                        "read AXEnhancedUserInterface"
-                    );
+    fn ax_writes(&self) -> &WindowWrites<Arc<AxWindow>> {
+        self.ax_writes.get_or_init(|| {
+            let pid = self
+                .pid()
+                .inspect_err(|err| warn!("writing window {} inline: {err}", self.id))
+                .ok();
+            let enhanced_ui = pid.and_then(|pid| {
+                let app_element =
+                    AXUIWrapper::from_retained(unsafe { AXUIElementCreateApplication(pid) })
+                        .inspect_err(|err| warn!("error getting app reference: {err}"))
+                        .ok()?;
+                Some(EnhancedUi {
+                    pid,
+                    app_element,
+                    state: enhanced_ui_state(pid),
+                    absent: AtomicBool::new(false),
                 })
-            },
-            || set_enhanced_ui(&app_element, false, pid, window_id),
-            move || set_enhanced_ui(&restore_element, true, pid, window_id),
-        ) {
-            Ok(guard) => {
-                if guard.is_none() {
-                    debug!(
-                        target: "paneru::ax_diagnostics",
-                        pid,
-                        window_id,
-                        "permanently caching false; skipping enhanced UI workaround"
-                    );
-                    self.enhanced_ui_absent.store(true, Ordering::Relaxed);
-                }
-                guard
-            }
-            Err(err) => {
-                warn!(pid, window_id, "error reading enhanced UI: {err}");
-                None
-            }
-        }
+            });
+            let target = Arc::new(AxWindow {
+                id: self.id,
+                element: self.ax_element.clone(),
+                enhanced_ui,
+                answers: Answers::new(self.ax_frame()),
+            });
+            WindowWrites::new(self.id, target, pid.map(|pid| AX_WRITERS.for_app(pid)))
+        })
     }
 
-    fn set_ax_position(&mut self, origin: Origin) {
-        let mut point = CGPoint::new(
-            f64::from(origin.x + self.horizontal_padding),
-            f64::from(origin.y + self.vertical_padding),
-        );
-        let position_ref = unsafe {
-            AXValueCreate(
-                kAXValueTypeCGPoint,
-                NonNull::from(&mut point).as_ptr().cast(),
-            )
-        };
-        if let Ok(position) = AXUIWrapper::from_retained(position_ref) {
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    self.ax_element.as_ptr(),
-                    CFString::from_static_str(kAXPositionAttribute).as_ref(),
-                    position.as_ref(),
-                )
-            };
-            let size = self.frame.size();
-            self.frame.min = origin;
-            self.frame.max = origin + size;
-        }
+    fn padding(&self) -> IVec2 {
+        IVec2::new(self.horizontal_padding, self.vertical_padding)
     }
 
-    fn set_ax_size(&mut self, size: Size) {
-        let width_padding = 2 * self.horizontal_padding;
-        let height_padding = 2 * self.vertical_padding;
-        let mut cgsize = CGSize::new(
-            f64::from(size.x - width_padding),
-            f64::from(size.y - height_padding),
-        );
-        let size_ref = unsafe {
-            AXValueCreate(
-                kAXValueTypeCGSize,
-                NonNull::from(&mut cgsize).as_ptr().cast(),
-            )
-        };
-        if let Ok(size_value) = AXUIWrapper::from_retained(size_ref) {
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    self.ax_element.as_ptr(),
-                    CFString::from_static_str(kAXSizeAttribute).as_ref(),
-                    size_value.as_ref(),
-                )
-            };
-            self.frame.max = self.frame.min + size;
+    /// The frame last asked for, in AX coordinates.
+    fn ax_frame(&self) -> IRect {
+        IRect {
+            min: self.frame.min + self.padding(),
+            max: self.frame.max - self.padding(),
         }
     }
 
@@ -780,61 +884,37 @@ impl WindowApi for WindowOS {
         self.ax_element.full_screen().unwrap_or(false)
     }
 
+    /// Queues the move on the app's writer thread and returns at once.
     #[instrument(level = Level::TRACE)]
     fn reposition(&mut self, origin: Origin) {
         if self.frame.min == origin {
             trace!("already in position.");
             return;
         }
-        let _enhanced_ui = self.disable_enhanced_ui();
-        self.set_ax_position(origin);
+        self.ax_writes().push(FrameWrite {
+            origin: Some(origin + self.padding()),
+            size: None,
+            origin_before: self.ax_frame().min,
+        });
+        let size = self.frame.size();
+        self.frame.min = origin;
+        self.frame.max = origin + size;
     }
 
+    /// Queues the resize on the app's writer thread and returns at once.
     #[instrument(level = Level::TRACE)]
     fn resize(&mut self, size: Size) {
-        if self.frame.size() == size {
+        let limited = self.ax_writes().target().answers.size_limited();
+        if self.frame.size() == size && !limited {
             trace!("already correct size.");
             return;
         }
-        let previous_frame = self.frame;
-        let target_origin = previous_frame.min;
-        let _enhanced_ui = self.disable_enhanced_ui();
-        self.set_ax_size(size);
-
-        let mut previous_observed_frame = previous_frame;
-        let mut staged = false;
-        for attempt in 1..=3 {
-            let Ok(actual_frame) = self.update_frame() else {
-                break;
-            };
-            let Some(staging_origin) =
-                resize_staging_origin(previous_observed_frame, actual_frame, size.x)
-            else {
-                break;
-            };
-            debug!(
-                attempt,
-                requested_width = size.x,
-                actual_width = actual_frame.width(),
-                staging_x = staging_origin.x,
-                "retrying partially constrained AX resize from an offscreen origin"
-            );
-            staged = true;
-            previous_observed_frame = actual_frame;
-            self.set_ax_position(staging_origin);
-            self.set_ax_size(size);
-        }
-
-        if staged {
-            if let Ok(final_frame) = self.update_frame() {
-                debug!(
-                    requested_width = size.x,
-                    actual_width = final_frame.width(),
-                    "completed staged AX resize"
-                );
-            }
-            self.set_ax_position(target_origin);
-        }
+        self.ax_writes().push(FrameWrite {
+            origin: None,
+            size: Some(size - 2 * self.padding()),
+            origin_before: self.ax_frame().min,
+        });
+        self.frame.max = self.frame.min + size;
     }
 
     /// Updates the internal `frame` of the window by querying its current position and size from the Accessibility API.
@@ -847,54 +927,28 @@ impl WindowApi for WindowOS {
     /// # Returns
     ///
     /// `Ok(())` if the frame is updated successfully, otherwise `Err(Error)`.
+    ///
+    /// Waits up to `LANDING_TIMEOUT` for the window's own queued writes to
+    /// land first, and fails if they have not, so a caller never mistakes
+    /// the frame the window is leaving for the one the app chose.
     fn update_frame(&mut self) -> Result<IRect> {
-        let window_ref = self.ax_element.as_ptr();
-
-        let position = unsafe {
-            let mut position_ref: *mut CFType = null_mut();
-            AXUIElementCopyAttributeValue(
-                window_ref,
-                CFString::from_static_str(kAXPositionAttribute).as_ref(),
-                &mut position_ref,
-            )
-            .to_result(function_name!())?;
-            AXUIWrapper::from_retained(position_ref)?
-        };
-        let size = unsafe {
-            let mut size_ref: *mut CFType = null_mut();
-            AXUIElementCopyAttributeValue(
-                window_ref,
-                CFString::from_static_str(kAXSizeAttribute).as_ref(),
-                &mut size_ref,
-            )
-            .to_result(function_name!())?;
-            AXUIWrapper::from_retained(size_ref)?
-        };
-
-        let mut frame = CGRect::default();
-        unsafe {
-            AXValueGetValue(
-                position.as_ptr(),
-                kAXValueTypeCGPoint,
-                NonNull::from(&mut frame.origin).as_ptr().cast(),
-            );
-            AXValueGetValue(
-                size.as_ptr(),
-                kAXValueTypeCGSize,
-                NonNull::from(&mut frame.size).as_ptr().cast(),
-            );
+        let writes = self.ax_writes.get();
+        if let Some(writes) = writes {
+            writes.wait_for_landing()?;
         }
-        // if (CGRectEqualToRect(new_frame, window->frame)) {
-        //     debug("%s:DEBOUNCED %s %d\n", __FUNCTION__, window->application->name, window->id);
-        // }
-        self.frame = irect_from(frame);
-
-        self.frame.min.x -= self.horizontal_padding;
-        self.frame.min.y -= self.vertical_padding;
-        self.frame.max.x += self.horizontal_padding;
-        self.frame.max.y += self.vertical_padding;
-
+        let frame = read_ax_frame(&self.ax_element)?;
+        if let Some(writes) = writes {
+            writes.target().answers.record(frame);
+        }
+        self.frame = IRect {
+            min: frame.min - self.padding(),
+            max: frame.max + self.padding(),
+        };
         Ok(self.frame)
+    }
+
+    fn write_pending(&self) -> bool {
+        self.ax_writes.get().is_some_and(WindowWrites::pending)
     }
 
     /// Focuses the window without raising it. This involves sending specific events to the process.

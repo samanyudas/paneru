@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, ExistingMarker, FreshMarker, RepositionMarker, ResizeMarker,
-    RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition,
+    ActiveDisplayMarker, BProcess, DeferredMoveReport, DeferredResizeReport, ExistingMarker,
+    FreshMarker, Landing, RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger,
+    Timeout, VerifyWindowPosition, poll_landing,
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
@@ -96,6 +97,7 @@ type MovableWindows<'w, 's> = Query<
     'w,
     's,
     (
+        Entity,
         &'static mut Window,
         &'static mut Position,
         &'static Bounds,
@@ -939,16 +941,39 @@ pub(crate) fn pump_events(
 pub(super) fn window_resized_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: ResizableWindows,
+    mut deferred: Query<(Entity, &mut DeferredResizeReport)>,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
+    time: Res<Time>,
+    mut commands: Commands,
 ) {
+    // One read per window answers every report it sent this frame.
+    let mut reported: Vec<Entity> = Vec::new();
     for event in messages.read() {
-        let Event::WindowResized { window_id } = event else {
-            continue;
-        };
+        if let Event::WindowResized { window_id } = event
+            && let Some((_, entity, ..)) = windows.iter().find(|window| window.0.id() == *window_id)
+            && !reported.contains(&entity)
+        {
+            reported.push(entity);
+        }
+    }
+    for (entity, mut wait) in &mut deferred {
+        let pending = windows
+            .get(entity)
+            .is_ok_and(|(window, ..)| window.write_pending());
+        match poll_landing(&mut wait, pending, time.delta()) {
+            Landing::Waiting => continue,
+            Landing::Landed if !reported.contains(&entity) => reported.push(entity),
+            Landing::Landed => {}
+            Landing::GaveUp => debug!("dropping resize report for {entity}: write never landed"),
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<DeferredResizeReport>();
+        }
+    }
 
-        let Some((mut window, entity, position, mut bounds, unmanaged, resizing)) = windows
-            .iter_mut()
-            .find(|window| window.0.id() == *window_id)
+    for entity in reported {
+        let Ok((mut window, entity, position, mut bounds, unmanaged, resizing)) =
+            windows.get_mut(entity)
         else {
             continue;
         };
@@ -960,6 +985,14 @@ pub(super) fn window_resized_update_frame(
         // the echo in here would fight the animation producing that difference.
         // Only a resize we did not initiate is new information.
         if resizing {
+            continue;
+        }
+        // The app can report before the writer is done with the write, so no
+        // later report is coming. Read once the write lands.
+        if window.write_pending() {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_insert_if_new(DeferredResizeReport::default());
+            }
             continue;
         }
         let Ok(new_frame) = window.update_frame() else {
@@ -1015,15 +1048,38 @@ pub(super) fn window_resized_update_frame(
 pub(crate) fn window_moved_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: MovableWindows,
+    mut deferred: Query<(Entity, &mut DeferredMoveReport)>,
+    time: Res<Time>,
+    mut commands: Commands,
 ) {
+    // One read per window answers every report it sent this frame.
+    let mut reported: Vec<Entity> = Vec::new();
     for event in messages.read() {
-        let Event::WindowMoved { window_id } = event else {
-            continue;
-        };
+        if let Event::WindowMoved { window_id } = event
+            && let Some((entity, ..)) = windows.iter().find(|window| window.1.id() == *window_id)
+            && !reported.contains(&entity)
+        {
+            reported.push(entity);
+        }
+    }
+    for (entity, mut wait) in &mut deferred {
+        let pending = windows
+            .get(entity)
+            .is_ok_and(|(_, window, ..)| window.write_pending());
+        match poll_landing(&mut wait, pending, time.delta()) {
+            Landing::Waiting => continue,
+            Landing::Landed if !reported.contains(&entity) => reported.push(entity),
+            Landing::Landed => {}
+            Landing::GaveUp => debug!("dropping move report for {entity}: write never landed"),
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<DeferredMoveReport>();
+        }
+    }
 
-        let Some((mut window, mut position, bounds, unmanaged, repositioning)) = windows
-            .iter_mut()
-            .find(|window| window.0.id() == *window_id)
+    for entity in reported {
+        let Ok((_, mut window, mut position, bounds, unmanaged, repositioning)) =
+            windows.get_mut(entity)
         else {
             continue;
         };
@@ -1034,6 +1090,14 @@ pub(crate) fn window_moved_update_frame(
         // `Position`, so overwriting it with the echoed frame mid-animation
         // restarts each step from behind, and the two chase each other.
         if repositioning {
+            continue;
+        }
+        // The app can report before the writer is done with the write, so no
+        // later report is coming. Read once the write lands.
+        if window.write_pending() {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_insert_if_new(DeferredMoveReport::default());
+            }
             continue;
         }
         let Ok(new_frame) = window.update_frame() else {
@@ -1257,21 +1321,33 @@ pub(super) fn update_overlays(
 pub(super) fn commit_window_position(
     mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
 ) {
-    // `par_iter_mut` runs on `ComputeTaskPool` worker threads, which have no
-    // `CFRunLoop` of their own to drain thread-local autorelease pools.
-    moved_windows
-        .par_iter_mut()
-        .for_each(|(mut window, position)| {
-            objc2::rc::autoreleasepool(|_| window.reposition(position.0));
-        });
+    for (mut window, position) in &mut moved_windows {
+        window.reposition(position.0);
+    }
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn verify_window_position(
     mut windows: Populated<(Entity, &mut Window, &Position, &mut VerifyWindowPosition)>,
+    time: Res<Time>,
     mut commands: Commands,
 ) {
     for (entity, mut window, position, mut verification) in &mut windows {
+        // The window is still on its way, so there is nothing to verify yet.
+        match poll_landing(
+            &mut verification.landing,
+            window.write_pending(),
+            time.delta(),
+        ) {
+            Landing::Landed => {}
+            Landing::Waiting => continue,
+            Landing::GaveUp => {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<VerifyWindowPosition>();
+                }
+                continue;
+            }
+        }
         if window
             .update_frame()
             .is_ok_and(|frame| frame.min == position.0)
@@ -1307,30 +1383,24 @@ pub(super) fn commit_window_size(
     >,
 ) {
     let fallback = active_display.bounds().width();
-    let widths: EntityHashMap<i32> = resized_windows
-        .iter()
-        .map(|(entity, ..)| {
-            let width = strips
-                .iter()
-                .find(|(strip, _)| strip.contains(entity))
-                .and_then(|(_, parent)| displays.get(parent.parent()).ok())
-                .map_or(fallback, |display| display.bounds().width());
-            (entity, width)
-        })
-        .collect();
-    resized_windows
-        .par_iter_mut()
-        .for_each(|(entity, mut window, size, mut width_ratio)| {
-            let width = widths.get(&entity).copied().unwrap_or(fallback);
-            width_ratio.0 = f64::from(size.0.x) / f64::from(width);
-            objc2::rc::autoreleasepool(|_| window.resize(size.0));
-        });
+    for (entity, mut window, size, mut width_ratio) in &mut resized_windows {
+        let width = strips
+            .iter()
+            .find(|(strip, _)| strip.contains(entity))
+            .and_then(|(_, parent)| displays.get(parent.parent()).ok())
+            .map_or(fallback, |display| display.bounds().width());
+        width_ratio.0 = f64::from(size.0.x) / f64::from(width);
+        window.resize(size.0);
+    }
 }
+
+/// How long exit waits for slow apps to take their windows' last frames.
+const EXIT_WRITE_FLUSH: Duration = Duration::from_secs(1);
 
 /// Restores user-visible window state before Paneru shuts down: clears any
 /// brightness dim, removes the dim/border overlay window, and centers every
 /// managed window on the display its frame center falls in.
-pub(super) fn cleanup_on_exit(
+pub(crate) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
     mut all_windows: Query<&mut Window>,
     displays: Query<&Display>,
@@ -1387,6 +1457,8 @@ pub(super) fn cleanup_on_exit(
             );
             window.reposition(origin);
         }
+        // The process ends once this returns, taking any queued writes with it.
+        window_manager.flush_window_writes(EXIT_WRITE_FLUSH);
     }
 }
 

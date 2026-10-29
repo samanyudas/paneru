@@ -26,10 +26,12 @@ use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, AwaitResize, Bounds, DockPosition, Initializing, LayoutPosition,
-    Position, RepositionMarker, ResizeAnchor, ResizeMarker, RestoreWindowState, Scrolling,
-    SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, WidthRatio, WindowProperties,
+    ActiveWorkspaceMarker, AwaitResize, Bounds, DeferredResizeCheck, DeferredResizeReport,
+    DockPosition, Initializing, Landing, LayoutPosition, Position, RepositionMarker, ResizeAnchor,
+    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    VerifyWindowPosition, WidthRatio, WindowProperties, landing_timer, poll_landing,
 };
+use crate::errors::Error;
 use crate::events::{DestroySource, Event};
 use crate::manager::{
     Application, Display, Origin, Process, Size, Window, WindowManager, WindowPadding,
@@ -47,6 +49,7 @@ type AddedWindowDefaults<'w, 's> = Populated<
     'w,
     's,
     (
+        Entity,
         &'static mut Window,
         &'static mut Position,
         &'static mut Bounds,
@@ -1230,9 +1233,10 @@ pub(super) fn apply_window_defaults(
     active_display: ActiveDisplay,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
+    mut commands: Commands,
 ) {
     let focused_ratio = windows.p1().single().ok().map(|ratio| ratio.0);
-    for (ref mut window, mut position, mut bounds, mut width_ratio, child) in windows.p0() {
+    for (entity, ref mut window, mut position, mut bounds, mut width_ratio, child) in windows.p0() {
         let Ok((_, app)) = apps.get(child.parent()) else {
             continue;
         };
@@ -1275,12 +1279,24 @@ pub(super) fn apply_window_defaults(
             let new_width = round_px(display_width * width);
             let height = window.frame().height();
             window.resize(Size::new(new_width, height));
+            // Until the app answers, lay the window out at the size asked for.
+            bounds.bypass_change_detection().0 = Size::new(new_width, height);
+            width_ratio.0 = f64::from(new_width) / display_width;
             // Re-read the actual OS size: the app may enforce a minimum width
             // that differs from our request.
-            if let Ok(frame) = window.update_frame().inspect_err(|err| error!("{err}")) {
-                position.0 = frame.min;
-                bounds.bypass_change_detection().0 = frame.size();
-                width_ratio.0 = f64::from(frame.width()) / display_width;
+            match window.update_frame() {
+                Ok(frame) => {
+                    position.0 = frame.min;
+                    bounds.bypass_change_detection().0 = frame.size();
+                    width_ratio.0 = f64::from(frame.width()) / display_width;
+                }
+                // A busy app has yet to take the size, so read it once it has.
+                Err(Error::WriteNotLanded(_)) => {
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_insert_if_new(DeferredResizeReport::default());
+                    }
+                }
+                Err(err) => error!("{err}"),
             }
         }
     }
@@ -1659,23 +1675,57 @@ pub(super) fn record_resize_anchor(
 pub(super) fn window_resize_verifier(
     mut removed: RemovedComponents<ResizeMarker>,
     resizing: Query<(), With<ResizeMarker>>,
+    mut deferred: Query<(Entity, &mut DeferredResizeCheck)>,
     mut windows: ResizedWindows,
     layout_strips: Query<&LayoutStrip>,
+    time: Res<Time>,
     mut commands: Commands,
 ) {
     use std::cmp::Ordering;
-    for entity in removed.read() {
+    let mut ended: Vec<Entity> = removed.read().collect();
+    for (entity, mut wait) in &mut deferred {
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            continue;
+        };
+        // A resize that starts again supersedes the wait, and checks once it ends.
+        if resizing.contains(entity) {
+            entity_commands.try_remove::<DeferredResizeCheck>();
+            continue;
+        }
+        let pending = windows
+            .get(entity)
+            .is_ok_and(|(window, ..)| window.write_pending());
+        match poll_landing(&mut wait, pending, time.delta()) {
+            Landing::Waiting => continue,
+            Landing::Landed if !ended.contains(&entity) => ended.push(entity),
+            Landing::Landed => {}
+            Landing::GaveUp => {
+                debug!("dropping resize check for {entity}: write never landed");
+                entity_commands.try_remove::<ResizeAnchor>();
+            }
+        }
+        entity_commands.try_remove::<DeferredResizeCheck>();
+    }
+
+    for entity in ended {
         if resizing.contains(entity) {
             continue;
         }
         let Ok(mut entity_commands) = commands.get_entity(entity) else {
             continue;
         };
-        entity_commands.try_remove::<ResizeAnchor>();
         let Ok((mut window, position, reposition, mut bounds, anchor, _)) = windows.get_mut(entity)
         else {
+            entity_commands.try_remove::<ResizeAnchor>();
             continue;
         };
+        // The app has yet to take the last size asked of it. Reading now would
+        // wait on it, and a refusal found later would be lost.
+        if window.write_pending() {
+            entity_commands.try_insert_if_new(DeferredResizeCheck::default());
+            continue;
+        }
+        entity_commands.try_remove::<ResizeAnchor>();
         let Ok(frame) = window.update_frame() else {
             continue;
         };
@@ -1700,6 +1750,7 @@ pub(super) fn window_resize_verifier(
                 requested: expected_size,
                 x,
                 anchor_offset: anchor.0 - x,
+                landing: landing_timer(),
             });
         }
         bounds.0 = actual_size;
@@ -1774,10 +1825,22 @@ pub(super) fn settle_refused_resize(
         {
             continue;
         }
+        // Reading a member whose write is still on its way would wait on its app.
+        let pending = column.as_ref().is_some_and(|column| {
+            column.window_iter().any(|member| {
+                windows
+                    .get(member)
+                    .is_ok_and(|(window, ..)| window.write_pending())
+            })
+        });
+        let landing = poll_landing(&mut wait.landing, pending, time.delta());
+        if landing == Landing::Waiting {
+            continue;
+        }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<AwaitResize>();
         }
-        if destination_x(position, reposition) != wait.x {
+        if landing == Landing::GaveUp || destination_x(position, reposition) != wait.x {
             continue;
         }
         let Some(column) = column else {
