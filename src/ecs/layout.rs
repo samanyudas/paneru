@@ -387,6 +387,10 @@ pub struct LayoutStrip {
     /// and of `LayoutStrip::tabbed()`, which callers like
     /// `apply_window_positions`/`give_away_focus` already key off for that unrelated feature.
     tabbed_stacks: EntityHashSet,
+    /// A window from each column that a whole stack item joined or left. The next layout splits
+    /// those columns evenly instead of keeping the heights their windows had, and then clears
+    /// this through [`Self::clear_even_splits`].
+    even_splits: EntityHashSet,
 }
 
 impl LayoutStrip {
@@ -396,6 +400,7 @@ impl LayoutStrip {
             virtual_index,
             columns: VecDeque::new(),
             tabbed_stacks: EntityHashSet::default(),
+            even_splits: EntityHashSet::default(),
         }
     }
 
@@ -407,6 +412,7 @@ impl LayoutStrip {
             virtual_index: 0,
             columns,
             tabbed_stacks: EntityHashSet::default(),
+            even_splits: EntityHashSet::default(),
         }
     }
 
@@ -620,6 +626,7 @@ impl LayoutStrip {
                 }
                 Column::Stack(mut stack) => {
                     self.tabbed_stacks.remove(&entity);
+                    let items_before = stack.len();
                     for item in &mut stack {
                         match item {
                             StackItem::Single(_) => {}
@@ -632,6 +639,12 @@ impl LayoutStrip {
                         StackItem::Single(id) => *id != entity,
                         StackItem::Tabs(tabs) => !tabs.is_empty(),
                     });
+                    // A closed native tab leaves its stack item, and the
+                    // heights, in place.
+                    if stack.len() < items_before {
+                        self.even_splits
+                            .extend(stack.first().and_then(StackItem::top));
+                    }
                     if stack.len() > 1 {
                         self.columns.insert(index, Column::Stack(stack));
                     } else if let Some(remaining_item) = stack.first() {
@@ -804,6 +817,7 @@ impl LayoutStrip {
         };
 
         self.columns.insert(index - 1, new_column);
+        self.even_splits.insert(entity);
         Ok(())
     }
 
@@ -842,6 +856,8 @@ impl LayoutStrip {
             };
             self.columns.insert(index, unstacked_column);
 
+            self.even_splits
+                .extend(items.first().and_then(StackItem::top));
             // Re-insert the modified stack (if not empty) at the original position
             if !items.is_empty() {
                 let new_column = if items.len() == 1 {
@@ -931,8 +947,15 @@ impl LayoutStrip {
                         .flat_map(StackItem::window_iter)
                         .any(|e| self.tabbed_stacks.contains(&e));
 
+                let splits_evenly = items
+                    .iter()
+                    .flat_map(StackItem::window_iter)
+                    .any(|entity| self.even_splits.contains(&entity));
+
                 let heights = if is_tabbed_column {
                     vec![layout_strip_height; items.len()]
+                } else if splits_evenly {
+                    even_heights(items.len(), layout_strip_height)
                 } else {
                     let current_heights = items
                         .iter()
@@ -1110,6 +1133,12 @@ impl LayoutStrip {
         Some(now_tabbed)
     }
 
+    /// Forgets the columns waiting for an even split, once a layout has given
+    /// them one or when a rebuilt strip is not a membership change.
+    pub fn clear_even_splits(&mut self) {
+        self.even_splits.clear();
+    }
+
     /// Whether `entity` belongs to a `Column::Stack` currently displayed as
     /// tabs. Independent of `tabbed()` (native-OS-tab detection).
     pub fn is_tabbed_display(&self, entity: Entity) -> bool {
@@ -1267,7 +1296,7 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
 /// re-calculates the logical positions of all the windows in the layout strip.
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn layout_strip_changed(
-    changed_strips: Populated<(&LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
+    mut changed_strips: Populated<(&mut LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
     mut windows: WindowFrames,
     displays: DisplayViewports,
     config: Res<Config>,
@@ -1282,19 +1311,17 @@ pub(super) fn layout_strip_changed(
             .ok()
     };
 
-    let changed = changed_strips
-        .into_iter()
-        .filter_map(|(layout_strip, child_of)| {
-            displays
-                .get(child_of.parent())
-                .map(|(display, dock)| {
-                    let height = display.actual_display_bounds(dock, &config).height();
-                    layout_strip.relative_positions(height, &get_window_frame)
-                })
-                .ok()
-        })
-        .flatten()
-        .collect::<Vec<_>>();
+    let mut changed = Vec::new();
+    for (mut layout_strip, child_of) in &mut changed_strips {
+        let Ok((display, dock)) = displays.get(child_of.parent()) else {
+            continue;
+        };
+        let height = display.actual_display_bounds(dock, &config).height();
+        changed.extend(layout_strip.relative_positions(height, &get_window_frame));
+        // Later layouts keep the heights this one sets. Clearing the record
+        // is bookkeeping, not a layout change.
+        layout_strip.bypass_change_detection().clear_even_splits();
+    }
 
     for (entity, frame) in changed {
         if let Ok((_, mut bounds, mut layout_position, resize)) = windows.get_mut(entity) {
@@ -2257,7 +2284,8 @@ mod tests {
             .iter()
             .map(|(_, frame)| frame.height())
             .collect::<Vec<_>>();
-        assert_eq!(height, vec![500, 300, 200, 500]);
+        // The column a window joined splits evenly.
+        assert_eq!(height, vec![500, 250, 250, 500]);
     }
 
     /// Every single-column window must fill the full viewport height.
@@ -2523,6 +2551,32 @@ mod tests {
         );
         let index = strip.index_of(entities[0]).unwrap();
         assert!(matches!(strip.get(index).unwrap(), Column::Single(_)));
+    }
+
+    #[test]
+    fn only_a_whole_stack_item_leaving_splits_the_column_evenly() {
+        let mut world = World::new();
+        let e1 = world.spawn_empty().id();
+        let e2 = world.spawn_empty().id();
+        let e3 = world.spawn_empty().id();
+        let e4 = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(e1);
+        strip.append(e2);
+        strip.append(e3);
+        strip.stack(e2).unwrap();
+        strip.stack(e3).unwrap();
+        strip.convert_to_tabs(e1, e4).unwrap();
+        // [Stack([Tabs([e4, e1]), Single(e2), Single(e3)])]
+        strip.clear_even_splits();
+
+        // A closed native tab leaves its stack item in place.
+        strip.remove(e4);
+        assert!(strip.even_splits.is_empty());
+
+        strip.remove(e3);
+        assert!(!strip.even_splits.is_empty());
     }
 
     #[test]
