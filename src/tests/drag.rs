@@ -21,6 +21,7 @@ use crate::{assert_focused, assert_window_at, assert_window_size};
 use super::*;
 
 mod displays;
+mod edges;
 
 /// The height every window of a lone column gets.
 const FULL_HEIGHT: i32 = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT;
