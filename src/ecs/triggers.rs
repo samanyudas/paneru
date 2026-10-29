@@ -1629,9 +1629,10 @@ type RefusedResizes<'w, 's> = Populated<
     ),
 >;
 
-/// Records the center a window resizes around. A resize that starts while an
-/// earlier one waits on the app, with the window still in place, keeps the
-/// earlier center.
+/// Records the center a window resizes around. That is the center of where the
+/// window is moving to, so a resize during a strip animation keeps the place
+/// the animation settles on. A resize that starts while an earlier one waits
+/// on the app, with the window still in place, keeps the earlier center.
 pub(super) fn record_resize_anchor(
     trigger: On<Insert, ResizeMarker>,
     windows: UnanchoredWindows,
@@ -1644,9 +1645,8 @@ pub(super) fn record_resize_anchor(
     let x = destination_x(position, reposition);
     let center = waiting.filter(|waiting| waiting.x == x).map_or_else(
         || {
-            IRect::from_corners(position.0, position.0 + bounds.0)
-                .center()
-                .x
+            let origin = position.0.with_x(x);
+            IRect::from_corners(origin, origin + bounds.0).center().x
         },
         |waiting| x + waiting.anchor_offset,
     );
