@@ -3263,6 +3263,83 @@ fn test_auto_discover_unmanaged_focused_window() {
         .run(events);
 }
 
+/// A focus event can name a window no tracked app owns, such as the caret
+/// indicator macOS shows beside a focused text field. The engine asks no app
+/// for its windows then, so a busy app cannot hold up the frame. (#162)
+#[test]
+fn a_focused_window_no_app_owns_asks_no_app() {
+    const BUSY_APP: crate::platform::Pid = 8;
+    const CARET_SERVICE: crate::platform::Pid = 9;
+    const CARET: WinID = 90;
+    let mut harness =
+        TestHarness::new()
+            .with_windows(1)
+            .with_app(BUSY_APP, "com.example.busy", "Busy", |app| {
+                app.ax_busy = true;
+            });
+    let state = harness.mock_state.clone();
+    state.spawn_window(
+        CARET_SERVICE,
+        TEST_WORKSPACE_ID,
+        CARET,
+        IRect::new(100, 100, 164, 164),
+    );
+    harness.advance(Duration::from_secs(1));
+    let reads = || {
+        (
+            state.window_list_reads(TEST_PROCESS_ID),
+            state.window_list_reads(BUSY_APP),
+        )
+    };
+    let before = reads();
+
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: CARET });
+    harness.advance(Duration::from_millis(200));
+
+    assert_eq!(reads(), before, "no app was asked for its windows");
+}
+
+/// Focus on a window the engine missed finds it by asking the app that owns
+/// it, and no other app. (#162)
+#[test]
+fn a_focused_unknown_window_is_found_through_its_own_app() {
+    const OTHER_APP: crate::platform::Pid = 8;
+    const MISSED: WinID = 80;
+    let mut harness = TestHarness::new().with_windows(1).with_app(
+        OTHER_APP,
+        "com.example.other",
+        "Other",
+        |app| app.is_frontmost = false,
+    );
+    let state = harness.mock_state.clone();
+    harness.advance(Duration::from_secs(1));
+    state.spawn_window(
+        OTHER_APP,
+        TEST_WORKSPACE_ID,
+        MISSED,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    let reads = state.window_list_reads(TEST_PROCESS_ID);
+
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: MISSED });
+    harness.advance(Duration::from_millis(200));
+
+    let mut windows = harness.world().query::<&Window>();
+    assert!(
+        windows.iter(harness.world()).any(|w| w.id() == MISSED),
+        "the missed window is managed"
+    );
+    assert_eq!(
+        state.window_list_reads(TEST_PROCESS_ID),
+        reads,
+        "the app that does not own the window was not asked"
+    );
+}
+
 /// The centering config the manual-offset tests share: `auto_center` off and
 /// `continuous_swipe` off is the combination that arms the edge invariant in
 /// `reshuffle_layout_strip`, which is what used to snap a centered strip back
