@@ -17,7 +17,7 @@ use crate::{
     ecs::{
         ActiveWorkspaceMarker, Bounds, DockPosition, FlashMessage, FocusedMarker, FullWidthMarker,
         Initializing, LayoutPosition, NativeFullscreenMarker, Position, RepositionMarker,
-        ResizeMarker, Scrolling, Unmanaged, WidthRatio, layout::LayoutStrip,
+        ResizeMarker, Scrolling, Unmanaged, WidthRatio, drag::EdgeHold, layout::LayoutStrip,
     },
     manager::{Application, Display, Origin, Size, Window},
     platform::{ProcessSerialNumber, WinID},
@@ -205,16 +205,19 @@ pub struct FrameActivity<'w, 's> {
     resizing: Query<'w, 's, (), With<ResizeMarker>>,
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
+    edge_holds: Query<'w, 's, (), With<EdgeHold>>,
 }
 
 impl FrameActivity<'_, '_> {
     /// Returns `true` while any window is being moved, resized or scrolled, or
     /// a flash message is on screen — i.e. while frames still need drawing.
+    /// Also while a drag holds the edge of a strip, which scrolls on a timer.
     pub fn mid_frame(&self) -> bool {
         !self.repositioning.is_empty()
             || !self.resizing.is_empty()
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
+            || !self.edge_holds.is_empty()
     }
 }
 
