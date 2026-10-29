@@ -17,8 +17,8 @@ use crate::ecs::params::Windows;
 use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, ResizeAnchor,
-    ResizeMarker, Scrolling, SpawnCommandsExt,
+    ManualStripOffset, Position, PresentedOrigin, RepositionMarker, ReshuffleAroundMarker,
+    ResizeAnchor, ResizeMarker, Scrolling, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -107,6 +107,7 @@ type RepositionedWindows<'w, 's> = Populated<
         &'static mut Position,
         &'static mut Bounds,
         Option<&'static ResizeMarker>,
+        Option<&'static mut PresentedOrigin>,
     ),
     (Changed<LayoutPosition>, With<Window>, Without<LayoutStrip>),
 >;
@@ -864,6 +865,113 @@ impl LayoutStrip {
             // Not in a stack, put it back
             self.columns.insert(index, column);
             Ok(())
+        }
+    }
+
+    /// Moves the stack item holding `entity`, the window or its native tab
+    /// group, into the column at `column`, `slot` items from the top. `column`
+    /// counts the columns as they are before the move. A move within the
+    /// item's own stack reorders it, and a move into its own lone column
+    /// leaves the strip as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Error)`, with the strip unchanged, if the window is not in
+    /// the strip, if there is no column `column`, or if either column is
+    /// fullscreen.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "called by title-bar drags, added next")
+    )]
+    pub fn insert_into_column(&mut self, entity: Entity, column: usize, slot: usize) -> Result<()> {
+        let (source, item, fills_column) = self.movable_item(entity)?;
+        let Some(target) = self
+            .columns
+            .get(column)
+            .filter(|target| !matches!(target, Column::Fullscren(_)))
+        else {
+            return Err(Error::InvalidInput(format!(
+                "{}: column {column} can not take another window",
+                function_name!()
+            )));
+        };
+        if fills_column && column == source {
+            return Ok(());
+        }
+        // Read before `remove`, which drops the lone survivor of a tabbed
+        // stack of two from `tabbed_stacks` while the item is out.
+        let tabbed = target
+            .window_iter()
+            .any(|entity| self.tabbed_stacks.contains(&entity));
+
+        for member in item.window_iter() {
+            self.remove(member);
+        }
+        let column = if fills_column && column > source {
+            column - 1
+        } else {
+            column
+        };
+        let mut items = match self.columns.remove(column) {
+            Some(Column::Single(id)) => vec![StackItem::Single(id)],
+            Some(Column::Tabs(tabs)) => vec![StackItem::Tabs(tabs)],
+            Some(Column::Stack(items)) => items,
+            Some(Column::Fullscren(_)) | None => unreachable!("checked above"),
+        };
+        items.insert(slot.min(items.len()), item);
+        // A stack never mixes tabbed and split members (see `tabbed_stacks`).
+        if tabbed {
+            self.tabbed_stacks
+                .extend(items.iter().flat_map(StackItem::window_iter));
+        }
+        self.columns.insert(column, Column::Stack(items));
+        Ok(())
+    }
+
+    /// Moves the stack item holding `entity`, the window or its native tab
+    /// group, into a new column of its own at gap `index`, where gap 0 is
+    /// before the first column. `index` counts the columns as they are before
+    /// the move.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Error)`, with the strip unchanged, if the window is not in
+    /// the strip or its column is fullscreen.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "called by title-bar drags, added next")
+    )]
+    pub fn insert_as_column(&mut self, entity: Entity, index: usize) -> Result<()> {
+        let (source, item, fills_column) = self.movable_item(entity)?;
+        let index = if fills_column && index > source {
+            index - 1
+        } else {
+            index
+        };
+        self.insert_tab_group_at(index, &item.window_iter().collect::<Vec<_>>());
+        Ok(())
+    }
+
+    /// The index of the column holding `entity`, the stack item holding it,
+    /// and whether that item is the whole column, so the column goes away
+    /// when the item moves out.
+    fn movable_item(&self, entity: Entity) -> Result<(usize, StackItem, bool)> {
+        let index = self.index_of(entity)?;
+        match &self.columns[index] {
+            Column::Single(id) => Ok((index, StackItem::Single(*id), true)),
+            Column::Tabs(tabs) => Ok((index, StackItem::Tabs(tabs.clone()), true)),
+            Column::Stack(items) => items
+                .iter()
+                .find(|item| item.contains(entity))
+                .map(|item| (index, item.clone(), items.len() == 1))
+                .ok_or(Error::NotFound(format!(
+                    "{}: can not find window {entity} in its stack.",
+                    function_name!()
+                ))),
+            Column::Fullscren(_) => Err(Error::InvalidInput(format!(
+                "{}: fullscreen window {entity} can not move.",
+                function_name!()
+            ))),
         }
     }
 
@@ -1730,7 +1838,9 @@ fn position_layout_windows(
         );
     }
 
-    for (entity, window, layout_position, mut position, mut bounds, resize) in positioned_windows {
+    for (entity, window, layout_position, mut position, mut bounds, resize, presented) in
+        positioned_windows
+    {
         let Some(context) = strip_contexts.get(&entity) else {
             continue;
         };
@@ -1802,6 +1912,16 @@ fn position_layout_windows(
 
         if resize.is_none() && bounds.0 != frame.size() {
             bounds.0 = frame.size();
+        }
+        match presented {
+            Some(mut presented) => {
+                presented.set_if_neq(PresentedOrigin(frame.min));
+            }
+            None => {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(PresentedOrigin(frame.min));
+                }
+            }
         }
 
         if position.0 != frame.min {

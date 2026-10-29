@@ -15,6 +15,14 @@ use crate::platform::{
 };
 use crate::util::AXUIWrapper;
 
+/// The mouse button behind a press, release, or drag. The event tap reports
+/// both buttons on the same [`Event`] variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Right,
+}
+
 /// Where a [`Event::WindowDestroyed`] came from, which decides how far it can be
 /// trusted. macOS reports a closing window through two unrelated channels, and
 /// only one of them actually means "this window is gone".
@@ -121,16 +129,27 @@ pub enum Event {
     MouseDown {
         point: CGPoint,
         modifiers: Modifiers,
+        #[expect(dead_code, reason = "read by title-bar drags, added next")]
+        button: MouseButton,
+        /// The window under the pointer when the window server sent the
+        /// press, if it named one. A lookup when the press is handled can
+        /// find another window, because the pressed one may have moved.
+        #[expect(dead_code, reason = "read by title-bar drags, added next")]
+        window_id: Option<WinID>,
     },
     /// A mouse up event has occurred.
     MouseUp {
         point: CGPoint,
         modifiers: Modifiers,
+        #[expect(dead_code, reason = "read by title-bar drags, added next")]
+        button: MouseButton,
     },
     /// A mouse drag event has occurred.
     MouseDragged {
         point: CGPoint,
         modifiers: Modifiers,
+        #[expect(dead_code, reason = "read by title-bar drags, added next")]
+        button: MouseButton,
     },
     /// A mouse move event has occurred.
     MouseMoved {

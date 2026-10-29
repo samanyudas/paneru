@@ -12,9 +12,9 @@ use objc2_core_foundation::{
     CFType, CGPoint, CGRect, CGSize, kCFBooleanTrue,
 };
 use objc2_core_graphics::{
-    CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds,
-    CGGetActiveDisplayList, CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo,
-    CGWindowListOption, kCGNullWindowID, kCGWindowNumber,
+    CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGEventSource,
+    CGEventSourceStateID, CGGetActiveDisplayList, CGMouseButton, CGWarpMouseCursorPosition,
+    CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowNumber,
 };
 use std::path::Path;
 use std::ptr::null_mut;
@@ -197,6 +197,11 @@ pub trait WindowManagerApi: Send + Sync {
     /// Returns the current cursor position in absolute CG coordinates,
     /// or `None` if the position cannot be determined.
     fn cursor_position(&self) -> Option<CGPoint>;
+
+    /// Whether the left mouse button is down right now, as the window
+    /// server sees it, whatever events the tap did or did not deliver.
+    #[expect(dead_code, reason = "polled by title-bar drags, added next")]
+    fn left_button_down(&self) -> bool;
 
     fn dim_windows(&self, windows: &[WinID], level: f32);
 
@@ -556,6 +561,13 @@ impl WindowManagerApi for WindowManagerOS {
             .to_result(function_name!())
             .ok()?;
         Some(cursor)
+    }
+
+    fn left_button_down(&self) -> bool {
+        CGEventSource::button_state(
+            CGEventSourceStateID::CombinedSessionState,
+            CGMouseButton::Left,
+        )
     }
 
     fn setup_config_watcher(&self, path: &Path) -> Result<Box<dyn Watcher>> {
