@@ -43,7 +43,7 @@ use crate::ecs::{
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
-    Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
+    Application, Display, Origin, Process, Window, WindowManager, WindowOS, bruteforce_windows,
 };
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::input::TapHealth;
@@ -685,9 +685,22 @@ const MAX_ANIMATION_STEP_SECS: f64 = 1.0 / 30.0;
     clippy::cast_possible_truncation,
     reason = "clamped to [0, 1], well within f32's range; only sub-pixel precision is lost"
 )]
-fn ease_out_factor(rate: f64, delta: f64) -> f32 {
+pub(crate) fn ease_out_factor(rate: f64, delta: f64) -> f32 {
     let delta = delta.min(MAX_ANIMATION_STEP_SECS);
     (1.0 - (-rate * delta).exp()).clamp(0.0, 1.0) as f32
+}
+
+/// One step of the reposition ease from `current` toward `target` by the
+/// fraction `t`: where it lands, and whether that is `target`. Snaps once
+/// within a pixel of the target (or after one effectively-complete tick), so
+/// the move ends promptly.
+pub(crate) fn ease_step(current: Origin, target: Origin, t: f32) -> (Origin, bool) {
+    let lerped = current.as_vec2().lerp(target.as_vec2(), t);
+    if (target.as_vec2() - lerped).length() <= ANIAMTE_SNAP_THRESHOLD {
+        (target, true)
+    } else {
+        (lerped.round().as_ivec2(), false)
+    }
 }
 
 /// This is a Bevy system that runs on `Update`. It smoothly moves windows to their target
@@ -716,18 +729,7 @@ pub(super) fn animate_entities(
     animate
         .into_iter()
         .for_each(|(mut position, entity, RepositionMarker(origin))| {
-            let target = origin.as_vec2();
-            let current = position.0.as_vec2();
-            let lerped = current.lerp(target, t);
-
-            // Snap once we're within a pixel of the target (or after one effectively-
-            // complete tick), so the marker is dropped promptly.
-            let finished = (target - lerped).length() <= ANIAMTE_SNAP_THRESHOLD;
-            let new_pos = if finished {
-                *origin
-            } else {
-                lerped.round().as_ivec2()
-            };
+            let (new_pos, finished) = ease_step(position.0, *origin, t);
 
             trace!(
                 "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",

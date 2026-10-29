@@ -6,7 +6,7 @@ use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -52,6 +52,28 @@ struct Panel {
     window: Retained<NSPanel>,
     slice: EdgeSlice,
     painted: bool,
+}
+
+impl Panel {
+    /// Shows the slice's part of the photo of the whole window. The layer's
+    /// unit space starts at the bottom of the photo.
+    fn crop(&self) {
+        let Some(layer) = self.window.contentView().and_then(|view| view.layer()) else {
+            return;
+        };
+        let (min, max) = (
+            self.slice.in_window.min.as_dvec2(),
+            self.slice.in_window.max.as_dvec2(),
+        );
+        let size = self.slice.size.as_dvec2();
+        if size.x <= 0.0 || size.y <= 0.0 {
+            return;
+        }
+        layer.setContentsRect(CGRect::new(
+            CGPoint::new(min.x / size.x, 1.0 - max.y / size.y),
+            CGSize::new((max.x - min.x) / size.x, (max.y - min.y) / size.y),
+        ));
+    }
 }
 
 impl SliceScreenOS {
@@ -162,27 +184,27 @@ impl SliceScreen for SliceScreenOS {
         });
         for (id, slice) in slices {
             let frame = self.cocoa_frame(slice.on_screen);
-            match self.panels.get_mut(id) {
+            let panel = match self.panels.get_mut(id) {
                 Some(panel) if panel.slice.on_screen == slice.on_screen => {
                     panel.slice = *slice;
+                    panel.crop();
                     continue;
                 }
                 Some(panel) => {
                     panel.window.setFrame_display(frame, panel.painted);
                     panel.slice = *slice;
+                    panel
                 }
                 None => {
                     let window = self.make_panel(frame);
-                    self.panels.insert(
-                        *id,
-                        Panel {
-                            window,
-                            slice: *slice,
-                            painted: false,
-                        },
-                    );
+                    self.panels.entry(*id).or_insert(Panel {
+                        window,
+                        slice: *slice,
+                        painted: false,
+                    })
                 }
-            }
+            };
+            panel.crop();
             let on = slice.on_screen;
             debug!(
                 "edge slice panel placed: window {id} at ({},{})-({},{})",
@@ -205,7 +227,7 @@ impl SliceScreen for SliceScreenOS {
             window,
             generation,
         };
-        let crop = slice.in_window;
+        let crop = IRect::from_corners(IVec2::ZERO, slice.size);
         let scale = self.scale_at(slice.on_screen);
         if lookup == Lookup::Reuse
             && let Some(filter) = self.filters.get(&window).and_then(|found| found.get())
@@ -261,6 +283,7 @@ impl SliceScreen for SliceScreenOS {
         };
         let image: &CFType = &photo.image;
         unsafe { layer.setContents(Some(image.as_ref())) };
+        panel.crop();
         if !panel.painted {
             panel.window.orderFrontRegardless();
             panel.painted = true;

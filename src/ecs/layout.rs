@@ -8,7 +8,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Changed, Has, Or, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res};
+use bevy::ecs::system::{Commands, EntityCommands, Local, ParamSet, Populated, Query, Res};
 use bevy::math::{IRect, IVec2};
 use bevy::time::{Time, Timer, TimerMode};
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ use crate::config::{Config, StackLimit};
 use crate::ecs::drag::DragState;
 use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::params::Windows;
-use crate::ecs::shared_edge::EdgeSlice;
+use crate::ecs::shared_edge::{EdgeSlice, SlideIn};
 use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
@@ -174,6 +174,8 @@ type RepositionedWindows<'w, 's> = Populated<
         &'static mut Position,
         &'static mut Bounds,
         Option<&'static ResizeMarker>,
+        Option<&'static EdgeSlice>,
+        Option<&'static SlideIn>,
     ),
     (
         Or<(Changed<LayoutPosition>, Changed<Bounds>)>,
@@ -3168,7 +3170,9 @@ fn position_layout_windows(
                 .unwrap_or_else(|| vec![held])
         })
         .unwrap_or_default();
-    for (entity, window, layout_position, mut position, mut bounds, resize) in positioned_windows {
+    for (entity, window, layout_position, mut position, mut bounds, resize, tucked, sliding) in
+        positioned_windows
+    {
         if held_group.contains(&entity) {
             continue;
         }
@@ -3217,12 +3221,19 @@ fn position_layout_windows(
         if resize.is_none() && bounds.0 != frame.size() {
             bounds.0 = frame.size();
         }
+        let may_slide = config.shared_edge_slices() && !context.swiping && !context.snap_settling;
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(PresentedOrigin(frame.min));
-            match slice {
-                Some(slice) => entity_commands.try_insert(slice),
-                None => entity_commands.try_remove::<EdgeSlice>(),
-            };
+            if present_tuck(
+                &mut entity_commands,
+                slice,
+                tucked,
+                sliding,
+                may_slide,
+                margins,
+            ) {
+                continue;
+            }
         }
 
         if position.0 != frame.min {
@@ -3261,6 +3272,42 @@ fn position_layout_windows(
             } else {
                 commands.reposition_entity(entity, frame.min);
             }
+        }
+    }
+}
+
+/// Writes a window's tuck: `slice` when its new frame is tucked, else a
+/// slide when it leaves its tuck `tucked` and `may_slide`. A slide in
+/// progress keeps going, and keeps its [`EdgeSlice`]. Returns whether the
+/// window's photo moves now, which leaves its `Position` to the slide.
+fn present_tuck(
+    entity_commands: &mut EntityCommands,
+    slice: Option<EdgeSlice>,
+    tucked: Option<&EdgeSlice>,
+    sliding: Option<&SlideIn>,
+    may_slide: bool,
+    margins: Margins,
+) -> bool {
+    if let Some(slice) = slice {
+        entity_commands.try_insert(slice).try_remove::<SlideIn>();
+        return false;
+    }
+    match (sliding, tucked) {
+        (Some(sliding), _) => matches!(sliding, SlideIn::Moving { .. }),
+        (None, Some(tucked)) if may_slide => {
+            let from = tucked.shown().min - margins.min;
+            entity_commands
+                .try_insert(SlideIn::Moving {
+                    at: from,
+                    from,
+                    slice: *tucked,
+                })
+                .try_remove::<RepositionMarker>();
+            true
+        }
+        (None, _) => {
+            entity_commands.try_remove::<EdgeSlice>();
+            false
         }
     }
 }

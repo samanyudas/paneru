@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bevy::app::{App, PostUpdate};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
@@ -7,7 +9,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{In, IntoSystem as _, Local, Query, Res};
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2};
 use tracing::debug;
 
 use crate::ecs::focus::FocusHistory;
@@ -41,6 +43,8 @@ pub(crate) struct EdgeSlice {
     /// `on_screen` in the window's own points, from the top left corner of
     /// its shown frame.
     pub in_window: IRect,
+    /// The size of the window's shown frame, which its photo covers.
+    pub size: IVec2,
     pub side: Side,
     pub display: Entity,
 }
@@ -49,22 +53,61 @@ impl EdgeSlice {
     /// The slice of a window showing `shown` at its sliver position on a
     /// display with bounds `own`. `None` when none of it is on `own`.
     pub(crate) fn new(shown: IRect, own: IRect, display: Entity) -> Option<Self> {
-        let on_screen = shown.intersect(own);
-        if on_screen.is_empty() {
-            return None;
-        }
         let side = if shown.center().x < own.center().x {
             Side::West
         } else {
             Side::East
         };
+        Self::on_side(shown, own, display, side)
+    }
+
+    fn on_side(shown: IRect, own: IRect, display: Entity, side: Side) -> Option<Self> {
+        let on_screen = shown.intersect(own);
+        if on_screen.is_empty() {
+            return None;
+        }
         Some(Self {
             on_screen,
             in_window: IRect::from_corners(on_screen.min - shown.min, on_screen.max - shown.min),
+            size: shown.size(),
             side,
             display,
         })
     }
+
+    /// The window's shown frame that this slice is a part of.
+    pub(crate) fn shown(&self) -> IRect {
+        let min = self.on_screen.min - self.in_window.min;
+        IRect::from_corners(min, min + self.size)
+    }
+
+    /// This slice with the window's shown frame moved by `by`, still cut by
+    /// the display bounds `own` and still on the side it came from.
+    pub(crate) fn moved(&self, by: IVec2, own: IRect) -> Option<Self> {
+        let shown = self.shown();
+        let shown = IRect::from_corners(shown.min + by, shown.max + by);
+        Self::on_side(shown, own, self.display, self.side)
+    }
+}
+
+/// A window leaving its tuck for a place on its display while its slice
+/// photo slides there, as the row it belongs to scrolls. The window stays
+/// tucked until the photo arrives, because macOS would show a window that
+/// crosses the shared edge on the other display. Layout writes where the
+/// window goes to [`PresentedOrigin`](crate::ecs::PresentedOrigin) and
+/// leaves its `Position` and [`EdgeSlice`] to the slide.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlideIn {
+    /// The photo shows the window as if its frame had its origin at `at`.
+    /// `slice` is the slice it showed with its frame at `from`.
+    Moving {
+        at: IVec2,
+        from: IVec2,
+        slice: EdgeSlice,
+    },
+    /// The window has moved to where the photo rests. The photo stays over
+    /// it until macOS has taken the move, or until the engine time `until`.
+    Landing { until: Duration },
 }
 
 /// The windows of `strip` that show a slice: on each side, every window of

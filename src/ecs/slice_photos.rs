@@ -9,20 +9,26 @@ use std::time::Duration;
 
 use bevy::app::{App, PostUpdate};
 use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _};
+use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
+use bevy::ecs::query::Has;
 use bevy::ecs::resource::Resource;
-use bevy::ecs::schedule::common_conditions::resource_changed;
+use bevy::ecs::schedule::common_conditions::{any_with_component, resource_changed};
 use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
-use bevy::ecs::system::{In, IntoSystem as _, NonSend, NonSendMut, Res, ResMut};
+use bevy::ecs::system::{Commands, In, IntoSystem as _, NonSend, NonSendMut, Query, Res, ResMut};
+use bevy::time::Time;
 use bevy::time::common_conditions::on_timer;
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::CGImage;
 use tracing::{debug, warn};
 
 use crate::config::Config;
-use crate::ecs::PostUpdateSet;
-use crate::ecs::shared_edge::{EdgeSlice, showing_edge_slices, showing_may_change};
+use crate::ecs::shared_edge::{EdgeSlice, SlideIn, showing_edge_slices, showing_may_change};
+use crate::ecs::systems::{self, ease_out_factor, ease_step};
+use crate::ecs::{Position, PostUpdateSet, PresentedOrigin, RepositionMarker};
 use crate::events::Event;
+use crate::manager::window_writer::LANDING_TIMEOUT;
+use crate::manager::{Display, Window};
 use crate::platform::WinID;
 
 /// How often a shown slice is photographed again.
@@ -31,6 +37,14 @@ pub(crate) const REFRESH: Duration = Duration::from_secs(2);
 pub(crate) fn register(app: &mut App) {
     app.init_resource::<SliceAccess>()
         .init_resource::<Slices>()
+        .add_systems(
+            PostUpdate,
+            slide_photos
+                .in_set(PostUpdateSet::Animate)
+                .after(systems::animate_entities)
+                .before(systems::commit_window_frame)
+                .run_if(any_with_component::<SlideIn>),
+        )
         .add_systems(
             PostUpdate,
             (
@@ -104,10 +118,12 @@ pub(crate) trait SliceScreen {
     /// Whether macOS lets the engine photograph other apps' windows. Never
     /// asks the user.
     fn may_photograph(&self) -> bool;
-    /// Gives each of `slices` a panel at its place on screen and closes every
-    /// other panel. A panel stays out of sight until its first paint.
+    /// Gives each of `slices` a panel at its place on screen, showing the
+    /// slice's part of the window's photo, and closes every other panel. A
+    /// panel stays out of sight until its first paint.
     fn place(&mut self, slices: &[(WinID, EdgeSlice)]);
-    /// Starts a photo of the slice of `window`, unless `ticket` is called off
+    /// Starts a photo of the whole of `window`, which shows a frame of
+    /// `slice.size` and gives the panel `slice`, unless `ticket` is called off
     /// before the capture. The result arrives as [`Event::SlicePhoto`]
     /// carrying `generation`. `place` forgets the lookups of windows it gets
     /// no slice for.
@@ -227,10 +243,11 @@ fn update_access(
 }
 
 /// Gives each showing slice a panel, photographs the slices that are new or
-/// moved after looking their windows up, and closes the panels of slices that stopped showing. A moved
-/// slice whose painted panel no one can see waits for the next refresh that
-/// sees it. A panel never painted is out of sight, so its first photo never
-/// waits.
+/// whose window changed size after looking their windows up, and closes the
+/// panels of slices that stopped showing. A photo shows the whole window, so
+/// a slice that only moved keeps it. A slice whose painted panel no one can
+/// see waits for the next refresh that sees it. A panel never painted is out
+/// of sight, so its first photo never waits.
 fn present_slices(
     In(showing): In<Vec<(WinID, EdgeSlice)>>,
     access: Res<SliceAccess>,
@@ -252,7 +269,9 @@ fn present_slices(
     let mut before = std::mem::take(shown);
     for (id, slice) in showing {
         let photo = match before.remove(&id) {
-            Some((was, photo)) if was == slice || matches!(photo, SlicePhoto::Ended) => photo,
+            Some((was, photo)) if was.size == slice.size || matches!(photo, SlicePhoto::Ended) => {
+                photo
+            }
             was => match was.and_then(|(_, photo)| photo.shown()) {
                 Some(digest) if !screen.0.seen(id) => {
                     debug!("edge slice photo deferred, panel unseen: window {id}");
@@ -372,5 +391,92 @@ fn receive_photos(
     }
     if ended {
         screen.0.place(&slices.placed());
+    }
+}
+
+/// The windows whose photo slides: where each one's photo is, its `Position`,
+/// where layout puts it, and whether it still has a slice.
+type Sliding<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Window,
+        &'static mut SlideIn,
+        &'static mut Position,
+        &'static PresentedOrigin,
+        Has<EdgeSlice>,
+    ),
+>;
+
+/// Moves each sliding photo one step of the row's ease toward where layout
+/// puts its window. Once the photo arrives, the window moves there under it,
+/// and the photo closes when macOS has taken the move, or after
+/// [`LANDING_TIMEOUT`] if the app does not answer. A window whose photo does
+/// not show moves at once.
+fn slide_photos(
+    mut sliding: Sliding,
+    displays: Query<&Display>,
+    slices: Res<Slices>,
+    time: Res<Time>,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    for (entity, window, mut slide, mut position, presented, tucked) in &mut sliding {
+        let id = window.id();
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            continue;
+        };
+        match *slide {
+            SlideIn::Moving { at, from, slice } => {
+                let shows = slices
+                    .showing
+                    .get(&id)
+                    .is_some_and(|(_, photo)| photo.shown().is_some());
+                let (next, arrived) = ease_step(at, presented.0, t);
+                let moved = displays
+                    .get(slice.display)
+                    .ok()
+                    .and_then(|own| slice.moved(next - from, own.bounds()))
+                    .filter(|_| shows);
+                let Some(moved) = moved else {
+                    debug!("edge slice photo not shown: window {id} moves at once");
+                    position.0 = presented.0;
+                    entity_commands.try_remove::<(SlideIn, EdgeSlice, RepositionMarker)>();
+                    continue;
+                };
+                entity_commands.try_insert(moved);
+                if arrived {
+                    position.0 = presented.0;
+                    entity_commands.try_remove::<RepositionMarker>();
+                    *slide = SlideIn::Landing {
+                        until: time.elapsed() + LANDING_TIMEOUT,
+                    };
+                    debug!(
+                        "edge slice photo arrived: window {id} at ({}, {})",
+                        next.x, next.y
+                    );
+                } else {
+                    *slide = SlideIn::Moving {
+                        at: next,
+                        from,
+                        slice,
+                    };
+                    debug!(
+                        "edge slice photo sliding: window {id} at ({}, {})",
+                        next.x, next.y
+                    );
+                }
+            }
+            SlideIn::Landing { .. } if !tucked => {
+                entity_commands.try_remove::<SlideIn>();
+            }
+            SlideIn::Landing { until } if !window.write_pending() || time.elapsed() >= until => {
+                entity_commands.try_remove::<EdgeSlice>();
+                debug!("edge slice photo handed over: window {id}");
+            }
+            SlideIn::Landing { .. } => {}
+        }
     }
 }

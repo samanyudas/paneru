@@ -88,6 +88,19 @@ fn command(operation: Operation) -> Event {
     }
 }
 
+/// Slices on, with windows moving as fast as Sam has them.
+pub(super) fn animated() -> Config {
+    (
+        MainOptions {
+            shared_edge_slices: Some(true),
+            animation_speed: Some(14.0),
+            ..MainOptions::default()
+        },
+        vec![],
+    )
+        .into()
+}
+
 fn switch(on: bool) -> Config {
     (
         MainOptions {
@@ -283,7 +296,7 @@ fn painted(
 }
 
 #[test]
-fn a_showing_slice_gets_a_panel_at_its_place_and_a_photo_of_its_strip() {
+fn a_showing_slice_gets_a_panel_at_its_place_and_a_photo_of_its_window() {
     let (mut harness, log) = beside(switch(true), Screen::default());
 
     let showing = showing(harness.world());
@@ -293,7 +306,7 @@ fn a_showing_slice_gets_a_panel_at_its_place_and_a_photo_of_its_strip() {
     assert_eq!(
         log.borrow().asked.last().map(|(id, crop, _)| (*id, *crop)),
         Some((id, slice.in_window)),
-        "a photo of the slice's strip of window 3"
+        "a photo of window 3 for its slice"
     );
     assert!(log.borrow().painted.is_empty(), "nothing to paint yet");
 
@@ -531,4 +544,37 @@ fn a_slice_looks_its_window_up_once_until_it_moves() {
         lookups + 1,
         "a lookup for the moved slice"
     );
+}
+
+#[test]
+fn focus_on_a_tucked_window_slides_its_photo_in_without_a_new_photo() {
+    let (mut harness, log) = painted(beside(animated(), Screen::default()), 3);
+    let asks = log.borrow().asked.len();
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Last)));
+    let mut places = Vec::new();
+    for _ in 0..60 {
+        harness.advance(Duration::from_millis(20));
+        if let Some((_, slice)) = log.borrow().placed.iter().find(|(id, _)| *id == 3) {
+            places.push(slice.on_screen);
+        }
+    }
+
+    let rest = harness.mock_state.ax_frame(3);
+    assert!(
+        rest.min.x >= 0 && rest.max.x <= TEST_DISPLAY_WIDTH,
+        "{rest:?} in view"
+    );
+    assert!(placed_ids(&log).is_empty(), "the panel closed");
+    places.dedup();
+    assert!(places.len() >= 5, "the photo slides through {places:?}");
+    assert_eq!(
+        places.last(),
+        Some(&rest),
+        "the photo stops where window 3 rests"
+    );
+    assert_eq!(log.borrow().asked.len(), asks, "the photo it had slides");
+    assert_eq!(log.borrow().painted, vec![(3, Digest(7))]);
 }

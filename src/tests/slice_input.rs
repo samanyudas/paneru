@@ -10,7 +10,7 @@ use mach2::mach_time::mach_absolute_time;
 use objc2_core_foundation::CGPoint;
 use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventType, CGMouseButton};
 
-use super::slice_photos::{ScreenLog, painted_beside_with, painted_west_with};
+use super::slice_photos::{ScreenLog, animated, painted_beside_with, painted_west_with};
 use super::*;
 use crate::config::{Config, MainOptions};
 use crate::ecs::FocusedMarker;
@@ -249,6 +249,98 @@ fn a_press_on_a_panel_focuses_and_reveals_its_window_and_posts_nothing_before_it
     assert!(desk.posted.is_empty() && desk.reached.is_empty());
     desk.wait(SLIDE);
     assert!(on_display(desk.frame(3)), "{:?} in view", desk.frame(3));
+}
+
+/// What the user sees after each step of a reveal: the panel of window 3,
+/// window 3, and window 2 beside it.
+struct Seen {
+    panel: Option<IRect>,
+    three: IRect,
+    two: IRect,
+    posted: bool,
+}
+
+#[test]
+fn a_press_slides_the_photo_in_with_the_row_then_the_window_takes_its_place() {
+    let mut desk = Desk::of(painted_beside_with(animated()), 3);
+    let (start, two_start) = (desk.panel.on_screen, desk.frame(2));
+    let pressed = desk.on_panel();
+
+    desk.user(Mouse::Down(LEFT), pressed);
+    let mut seen = Vec::new();
+    for _ in 0..60 {
+        desk.wait(Duration::from_millis(20));
+        let panel = desk
+            .log
+            .borrow()
+            .placed
+            .iter()
+            .find(|(id, _)| *id == 3)
+            .map(|(_, slice)| slice.on_screen);
+        seen.push(Seen {
+            panel,
+            three: desk.frame(3),
+            two: desk.frame(2),
+            posted: !desk.posted.is_empty(),
+        });
+    }
+
+    let rest = desk.frame(3);
+    let two_rest = desk.frame(2);
+    assert!(on_display(rest), "window 3 rests in view at {rest:?}");
+    assert!(
+        seen.last().is_some_and(|last| last.panel.is_none()),
+        "the panel closed"
+    );
+    let shown = seen.iter().take_while(|step| step.panel.is_some()).count();
+    let sliding = &seen[..shown];
+    assert_eq!(
+        seen.get(shown).map(|step| step.three),
+        Some(rest),
+        "window 3 already rests where the photo was when the photo closes"
+    );
+    let places = sliding
+        .iter()
+        .filter_map(|step| step.panel)
+        .collect::<Vec<_>>();
+    assert!(places.len() >= 5, "the photo slides through {places:?}");
+    assert_eq!(
+        places.last(),
+        Some(&rest),
+        "the photo stops where window 3 rests"
+    );
+    for pair in places.windows(2) {
+        assert!(
+            pair[1].min.x <= pair[0].min.x,
+            "the photo only moves in: {places:?}"
+        );
+    }
+    for step in sliding.iter().filter(|step| step.panel != Some(rest)) {
+        assert!(
+            !on_display(step.three),
+            "window 3 stays tucked while its photo slides: {:?}",
+            step.three
+        );
+    }
+    let moved = |from: i32, now: i32, to: i32| f64::from(now - from) / f64::from(to - from);
+    for step in sliding.iter().filter(|step| step.panel != Some(rest)) {
+        let photo = moved(start.min.x, step.panel.unwrap().min.x, rest.min.x);
+        let row = moved(two_start.min.x, step.two.min.x, two_rest.min.x);
+        assert!(
+            (photo - row).abs() <= 0.03,
+            "the photo keeps step with the row: {photo:.3} of its way, the row {row:.3}"
+        );
+    }
+    assert!(
+        sliding.iter().all(|step| !step.posted),
+        "no press while the photo shows"
+    );
+    assert_eq!(
+        desk.posted.len(),
+        1,
+        "the press arrives after: {:?}",
+        desk.posted
+    );
 }
 
 #[test]
