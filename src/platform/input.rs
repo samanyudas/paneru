@@ -27,6 +27,7 @@ use crate::config::Config;
 use crate::config::swipe::SwipeGestureDirection;
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender, MouseButton};
+use crate::platform::slice_tap::{self, Mouse, Pointer, SliceTap, Verdict};
 use crate::platform::{Modifiers, WinID};
 
 const NX_DEVICEFNKEYMASK: u64 = 0x0080_0100;
@@ -190,6 +191,7 @@ pub(super) struct InputHandler {
     events: Option<EventSender>,
     /// The application `Config` for looking up keybindings.
     config: Config,
+    slice_tap: SliceTap,
     /// Tracks finger motion since the last swipe sent to the ECS.
     swipe_accumulator: SwipeAccumulator<Retained<AnyObject>>,
     /// The `CFMachPort` representing the `CGEventTap`.
@@ -224,6 +226,7 @@ impl InputHandler {
         InputHandler {
             events: Some(events),
             config,
+            slice_tap: SliceTap::default(),
             swipe_accumulator: SwipeAccumulator::default(),
             tap_port: None,
             run_loop_source: None,
@@ -303,6 +306,7 @@ impl InputHandler {
     }
 
     fn uninstall_tap(&mut self) {
+        self.slice_tap.reset();
         if let Some(run_loop_source) = self.run_loop_source.take()
             && let Some(main_loop) = CFRunLoop::main()
         {
@@ -334,6 +338,7 @@ impl InputHandler {
             return TapHealth::Healthy;
         }
 
+        self.slice_tap.reset();
         CGEvent::tap_enable(&port, true);
         if CGEvent::tap_is_enabled(&port) {
             warn!("event tap was disabled, re-enabled it");
@@ -408,6 +413,7 @@ impl InputHandler {
             CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
         ) {
             warn!("Tap Disabled, re-enabling");
+            self.slice_tap.reset();
             if let Some(port) = &self.tap_port {
                 CGEvent::tap_enable(port, true);
             }
@@ -417,6 +423,26 @@ impl InputHandler {
         let Some(events) = &self.events else {
             return false;
         };
+
+        if let Some(mouse) = Mouse::of(event_type) {
+            let pointer = Pointer::read(mouse, event);
+            match self.slice_tap.handle(&pointer) {
+                Verdict::Pass => {}
+                Verdict::Quiet => return false,
+                Verdict::Swallow => return true,
+                Verdict::Move(to) => CGEvent::set_location(Some(event), to),
+                Verdict::Hold(press) => {
+                    if let Err(err) = events.send(Event::SlicePress { press }) {
+                        error!("error sending event: {err}");
+                        self.events = None;
+                    }
+                    return true;
+                }
+                Verdict::PassAndRelease { id, button } => {
+                    slice_tap::post(id, button, false, pointer.point, pointer.flags);
+                }
+            }
+        }
 
         let flags = CGEvent::flags(Some(event));
         let modifiers = get_modifiers(flags);

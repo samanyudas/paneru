@@ -13,6 +13,7 @@ mod session_restore;
 mod settling;
 mod shared_edge;
 mod side_by_side;
+mod slice_input;
 mod slice_photos;
 mod stacks;
 mod state;
