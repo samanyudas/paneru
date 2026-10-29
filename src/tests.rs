@@ -5,6 +5,7 @@ mod interaction;
 mod mocks;
 mod mouse_focus;
 mod session_restore;
+mod stacks;
 mod state;
 mod tabbed_display;
 mod tabs;
