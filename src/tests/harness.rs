@@ -32,7 +32,7 @@ use super::*;
 /// paces to once a frame is active, which is when the scroll integrator runs.
 /// A coarser tick would land above that integrator's step cap and exercise
 /// clamped physics production never sees.
-const FRAME: Duration = Duration::from_millis(20);
+pub(crate) const FRAME: Duration = Duration::from_millis(20);
 
 /// How much simulated time each command in [`TestHarness::run`] is given to
 /// play out.

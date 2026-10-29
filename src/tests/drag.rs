@@ -1,12 +1,18 @@
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use bevy::math::{IRect, IVec2};
 use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
 
 use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::Config;
+use crate::ecs::drag::{DragOverlayApi, DragOverlayHandle, DragState};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::workspace::PreviousStripPosition;
-use crate::ecs::{ActiveWorkspaceMarker, SpawnWindowTrigger};
+use crate::ecs::{
+    ActiveWorkspaceMarker, LayoutPosition, Position, SpawnWindowTrigger, SystemTheme,
+};
 use crate::events::{Event, MouseButton};
 use crate::manager::{Origin, Size, Window};
 use crate::platform::{Modifiers, WinID};
@@ -1499,4 +1505,464 @@ fn a_window_sliding_to_its_slot_is_not_dragged_by_a_pointer_it_does_not_follow()
         assert_eq!(columns(world), vec![vec![0], vec![1], vec![2]]);
     })
     .run(commands);
+}
+
+/// One call the engine made to the drag overlay.
+#[derive(Clone, Debug, PartialEq)]
+enum OverlayCall {
+    Line(IRect, (f64, f64, f64)),
+    Refusal(IRect),
+    Hide,
+    Remove,
+}
+
+type OverlayLog = Rc<RefCell<Vec<OverlayCall>>>;
+
+struct RecordingOverlay(OverlayLog);
+
+impl DragOverlayApi for RecordingOverlay {
+    fn show_line(&mut self, line: IRect, color: (f64, f64, f64)) {
+        self.0.borrow_mut().push(OverlayCall::Line(line, color));
+    }
+
+    fn show_refusal(&mut self, square: IRect) {
+        self.0.borrow_mut().push(OverlayCall::Refusal(square));
+    }
+
+    fn hide(&mut self) {
+        self.0.borrow_mut().push(OverlayCall::Hide);
+    }
+
+    fn remove(&mut self) {
+        self.0.borrow_mut().push(OverlayCall::Remove);
+    }
+}
+
+/// Gives the engine a drag overlay that records each call it gets.
+fn record_overlay(harness: &mut TestHarness) -> OverlayLog {
+    let log = OverlayLog::default();
+    harness
+        .world()
+        .insert_non_send(DragOverlayHandle(Box::new(RecordingOverlay(log.clone()))));
+    log
+}
+
+fn last_call(log: &OverlayLog) -> Option<OverlayCall> {
+    log.borrow().last().cloned()
+}
+
+/// The line color with no border color configured.
+const WHITE: (f64, f64, f64) = (1.0, 1.0, 1.0);
+const RED: (f64, f64, f64) = (1.0, 0.0, 0.0);
+
+/// Window 2 is dragged by the middle of its title bar over the lower half
+/// of column 0, and held there with the button down.
+fn drag_into_column_0(
+    harness: TestHarness,
+    then: impl IntoIterator<Item = Event>,
+) -> (TestHarness, Vec<Event>) {
+    let from = Origin::new(1000, 30);
+    let to = Origin::new(200, 600);
+    let commands = [
+        Event::MenuOpened { window_id: 0 },
+        press(from, 2),
+        drag_to(to),
+    ]
+    .into_iter()
+    .chain(then)
+    .collect();
+    (window_follows(holding(harness), 1, 2, to - from), commands)
+}
+
+/// The insertion line under window 0, at the bottom of column 0.
+const BELOW_WINDOW_0: IRect = IRect {
+    min: IVec2::new(0, TEST_DISPLAY_HEIGHT - 3),
+    max: IVec2::new(TEST_WINDOW_WIDTH, TEST_DISPLAY_HEIGHT),
+};
+
+#[test]
+fn a_drag_into_a_column_shows_a_line_at_its_gap_until_the_drop() {
+    let mut harness = TestHarness::new()
+        .with_config(drag_enabled())
+        .with_windows(3);
+    let log = record_overlay(&mut harness);
+    let (harness, commands) =
+        drag_into_column_0(harness, [release(Origin::new(200, 600)), settle()]);
+
+    let shown = log.clone();
+    harness
+        .on_iteration(2, move |_, _| {
+            assert_eq!(
+                last_call(&shown),
+                Some(OverlayCall::Line(BELOW_WINDOW_0, WHITE))
+            );
+        })
+        .on_iteration(4, move |world, _| {
+            assert_eq!(columns(world), vec![vec![0, 2], vec![1]]);
+            assert_eq!(
+                *log.borrow(),
+                vec![OverlayCall::Line(BELOW_WINDOW_0, WHITE), OverlayCall::Hide]
+            );
+        })
+        .run(commands);
+}
+
+/// Window 0's centre is over the right quarter of column 1, so a drop opens
+/// a new column between columns 1 and 2. The line runs down that gap.
+#[test]
+fn a_drag_over_the_outer_quarter_of_a_column_shows_a_line_down_the_gap() {
+    let from = Origin::new(200, 30);
+    let to = Origin::new(790, 300);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(from, 0),
+        drag_to(to),
+        release(to),
+        settle(),
+    ];
+
+    let mut harness = holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_windows(3),
+    );
+    let log = record_overlay(&mut harness);
+    let shown = log.clone();
+    window_follows(harness, 1, 0, to - from)
+        .on_iteration(2, move |_, _| {
+            assert_eq!(
+                last_call(&shown),
+                Some(OverlayCall::Line(
+                    IRect::new(799, TEST_MENUBAR_HEIGHT, 802, TEST_DISPLAY_HEIGHT),
+                    WHITE
+                ))
+            );
+        })
+        .on_iteration(4, move |world, _| {
+            assert_eq!(columns(world), vec![vec![1], vec![0], vec![2]]);
+            assert_eq!(last_call(&log), Some(OverlayCall::Hide));
+        })
+        .run(commands);
+}
+
+/// On a display 500 points tall, column 0 has no room for a third window,
+/// so the refusal symbol shows beside the pointer instead of a line.
+#[test]
+fn a_drag_over_a_column_without_room_shows_the_refusal_symbol_until_the_return() {
+    const DISPLAY_HEIGHT: i32 = 500;
+    let from = Origin::new(600, 30);
+    let to = Origin::new(200, 400);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::Focus(Direction::East)),
+        window_command(Operation::Stack(true)),
+        settle(),
+        press(from, 2),
+        drag_to(to),
+        release(to),
+        settle(),
+    ];
+
+    let harness = TestHarness::new().with_config(drag_enabled());
+    harness.mock_state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, DISPLAY_HEIGHT),
+    );
+    let mut harness = holding(harness.with_windows(3));
+    let log = record_overlay(&mut harness);
+    let shown = log.clone();
+    window_follows(harness, 5, 2, to - from)
+        .on_iteration(6, move |_, _| {
+            assert_eq!(
+                last_call(&shown),
+                Some(OverlayCall::Refusal(IRect::new(214, 414, 236, 436)))
+            );
+        })
+        .on_iteration(8, move |world, _| {
+            assert_eq!(columns(world), vec![vec![0, 1], vec![2]]);
+            assert_eq!(last_call(&log), Some(OverlayCall::Hide));
+        })
+        .run(commands);
+}
+
+/// The release never reaches the tap, but the window server reads the
+/// button up, so the drag ends and the line goes.
+#[test]
+fn a_lost_release_hides_the_overlay() {
+    let mut harness = TestHarness::new()
+        .with_config(drag_enabled())
+        .with_windows(3);
+    let log = record_overlay(&mut harness);
+    let (harness, commands) = drag_into_column_0(harness, [settle()]);
+
+    let shown = log.clone();
+    harness
+        .on_iteration(2, move |_, state| {
+            assert_eq!(
+                last_call(&shown),
+                Some(OverlayCall::Line(BELOW_WINDOW_0, WHITE))
+            );
+            state.set_left_button_down(false);
+        })
+        .on_iteration(3, move |world, _| {
+            assert_eq!(*world.resource::<DragState>(), DragState::Idle);
+            assert_eq!(last_call(&log), Some(OverlayCall::Hide));
+        })
+        .run(commands);
+}
+
+#[test]
+fn without_the_option_a_title_bar_drag_never_calls_the_overlay() {
+    let mut harness = TestHarness::new().with_windows(3);
+    let log = record_overlay(&mut harness);
+    let (harness, commands) = drag_into_column_0(
+        harness,
+        [
+            Event::DisplayResized {
+                display_id: TEST_DISPLAY_ID,
+            },
+            release(Origin::new(200, 600)),
+            settle(),
+        ],
+    );
+
+    harness
+        .on_iteration(5, move |_, _| assert_eq!(*log.borrow(), vec![]))
+        .run(commands);
+}
+
+/// A display change can move the screens under an unchanged shape, so the
+/// overlay draws the shape again in the frame of the display event, for the
+/// screens as they are now. The engine reconciles the display only 350 ms
+/// later.
+#[test]
+fn a_display_change_redraws_an_unchanged_line_at_once() {
+    let mut harness = TestHarness::new()
+        .with_config(drag_enabled())
+        .with_windows(3);
+    let log = record_overlay(&mut harness);
+    let (mut harness, commands) = drag_into_column_0(harness, []);
+    harness.run(commands);
+    assert_eq!(
+        last_call(&log),
+        Some(OverlayCall::Line(BELOW_WINDOW_0, WHITE))
+    );
+    log.borrow_mut().clear();
+
+    harness.world().write_message(Event::DisplayResized {
+        display_id: TEST_DISPLAY_ID,
+    });
+    harness.advance(FRAME);
+
+    assert_eq!(
+        *log.borrow(),
+        vec![OverlayCall::Line(BELOW_WINDOW_0, WHITE)]
+    );
+}
+
+/// Restoring windows on exit goes through slow accessibility calls, and the
+/// line must not stay on screen meanwhile.
+#[test]
+fn exiting_during_a_drag_removes_the_overlay() {
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    let mut harness = TestHarness::new()
+        .with_config(drag_enabled())
+        .with_windows(3);
+    let log = record_overlay(&mut harness);
+    let (harness, commands) = drag_into_column_0(harness, []);
+
+    harness
+        .on_iteration(2, move |world, _| {
+            assert_eq!(
+                last_call(&log),
+                Some(OverlayCall::Line(BELOW_WINDOW_0, WHITE))
+            );
+            log.borrow_mut().clear();
+
+            // Only the window cleanup sees the exit. An update that saw it
+            // would also save the state, which writes the user's state file.
+            world.write_message(AppExit::Success);
+            world
+                .run_system_once(crate::ecs::systems::cleanup_on_exit)
+                .expect("cleanup_on_exit runs");
+            world
+                .resource_mut::<bevy::ecs::message::Messages<AppExit>>()
+                .clear();
+
+            assert_eq!(*log.borrow(), vec![OverlayCall::Remove]);
+        })
+        .run(commands);
+}
+
+/// The pointer and the layout stay still while the button is held, so the
+/// drag state and the overlay stay as they are.
+#[test]
+fn a_still_drag_leaves_the_drag_state_and_the_overlay_unchanged() {
+    let mut harness = TestHarness::new()
+        .with_config(drag_enabled())
+        .with_windows(3);
+    let log = record_overlay(&mut harness);
+    let (harness, commands) = drag_into_column_0(harness, [settle()]);
+    let changed = |world: &mut World| {
+        world
+            .get_resource_change_ticks::<DragState>()
+            .expect("the drag state exists")
+            .changed
+    };
+
+    let shown = log.clone();
+    let tick = Rc::new(Cell::new(None));
+    let before = tick.clone();
+    harness
+        .on_iteration(2, move |world, _| {
+            assert_eq!(
+                last_call(&shown),
+                Some(OverlayCall::Line(BELOW_WINDOW_0, WHITE))
+            );
+            shown.borrow_mut().clear();
+            before.set(Some(changed(world)));
+        })
+        .on_iteration(3, move |world, _| {
+            assert!(matches!(
+                *world.resource::<DragState>(),
+                DragState::Dragging(_)
+            ));
+            assert_eq!(Some(changed(world)), tick.get());
+            assert_eq!(*log.borrow(), vec![]);
+        })
+        .run(commands);
+}
+
+/// The app shrinks window 0 while window 2 is held still over the gap
+/// between windows 0 and 1. The layout moves the gap up, and the line
+/// follows it in the same frame.
+#[test]
+fn a_still_drag_line_follows_its_gap_when_the_layout_moves_it() {
+    let from = Origin::new(600, 30);
+    let to = Origin::new(200, 380);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::First)),
+        window_command(Operation::Focus(Direction::East)),
+        window_command(Operation::Stack(true)),
+        settle(),
+        press(from, 2),
+        drag_to(to),
+    ];
+
+    let mut harness = holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_windows(3),
+    );
+    let log = record_overlay(&mut harness);
+    let mut harness = window_follows(harness, 5, 2, to - from);
+    harness.run(commands);
+    assert_eq!(columns(harness.world()), vec![vec![0, 1], vec![2]]);
+    let line_at = |y: i32| OverlayCall::Line(IRect::new(0, y - 1, TEST_WINDOW_WIDTH, y + 2), WHITE);
+    assert_eq!(last_call(&log), Some(line_at(394)));
+
+    let window_1 = find_window_entity(1, harness.world());
+    // The top of window 1's slot on screen.
+    let gap = |world: &mut World| {
+        let strip = world
+            .query_filtered::<&Position, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>()
+            .single(world)
+            .expect("one active strip")
+            .y;
+        strip
+            + world
+                .get::<LayoutPosition>(window_1)
+                .expect("window 1 has a slot")
+                .y
+    };
+    harness
+        .mock_state
+        .os_resize_window(0, Size::new(TEST_WINDOW_WIDTH, 200));
+    let mut frames = 0;
+    while gap(harness.world()) == 394 {
+        harness.advance(FRAME);
+        frames += 1;
+        assert!(frames < 25, "the layout never moved the gap");
+    }
+
+    assert!(matches!(
+        *harness.world().resource::<DragState>(),
+        DragState::Dragging(_)
+    ));
+    let moved = gap(harness.world());
+    assert_eq!(last_call(&log), Some(line_at(moved)));
+}
+
+/// macOS switches to dark mode while the pointer stays still, and the line
+/// takes the border's night color.
+#[test]
+fn a_still_drag_line_takes_the_new_color_when_the_appearance_changes() {
+    const GREEN: (f64, f64, f64) = (0.0, 1.0, 0.0);
+    let mut harness = TestHarness::new()
+        .with_config(config(
+            "drag_to_reorder = true\n\
+             [decorations.active.border]\n\
+             color = '#FF0000'\n\
+             color_night = '#00FF00'\n",
+        ))
+        .with_windows(3);
+    harness
+        .world()
+        .insert_resource(SystemTheme { is_dark: false });
+    let log = record_overlay(&mut harness);
+    let (harness, commands) = drag_into_column_0(harness, [settle()]);
+
+    let shown = log.clone();
+    harness
+        .on_iteration(2, move |world, _| {
+            assert_eq!(
+                last_call(&shown),
+                Some(OverlayCall::Line(BELOW_WINDOW_0, RED))
+            );
+            world.resource_mut::<SystemTheme>().is_dark = true;
+        })
+        .on_iteration(3, move |_, _| {
+            assert_eq!(
+                last_call(&log),
+                Some(OverlayCall::Line(BELOW_WINDOW_0, GREEN))
+            );
+        })
+        .run(commands);
+}
+
+/// The user saves a new border color while the pointer stays still, and the
+/// line takes it.
+#[test]
+fn a_still_drag_line_takes_the_new_color_when_the_config_changes() {
+    const BLUE: (f64, f64, f64) = (0.0, 0.0, 1.0);
+    let border = |color: &str| {
+        config(&format!(
+            "drag_to_reorder = true\n[decorations.active.border]\ncolor = '{color}'\n"
+        ))
+    };
+    let mut harness = TestHarness::new()
+        .with_config(border("#FF0000"))
+        .with_windows(3);
+    let log = record_overlay(&mut harness);
+    let (harness, commands) = drag_into_column_0(harness, [settle()]);
+
+    let shown = log.clone();
+    harness
+        .on_iteration(2, move |world, _| {
+            assert_eq!(
+                last_call(&shown),
+                Some(OverlayCall::Line(BELOW_WINDOW_0, RED))
+            );
+            *world.resource_mut::<Config>() = border("#0000FF");
+        })
+        .on_iteration(3, move |_, _| {
+            assert_eq!(
+                last_call(&log),
+                Some(OverlayCall::Line(BELOW_WINDOW_0, BLUE))
+            );
+        })
+        .run(commands);
 }
