@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use bevy::math::{IRect, IVec2};
 use bevy::prelude::With;
+use mach2::mach_time::mach_absolute_time;
 use objc2_core_foundation::CGPoint;
-use objc2_core_graphics::CGEventFlags;
+use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventType, CGMouseButton};
 
 use super::slice_photos::{ScreenLog, painted_beside_with, painted_west_with};
 use super::*;
@@ -16,7 +17,7 @@ use crate::ecs::FocusedMarker;
 use crate::events::MouseButton;
 use crate::manager::WindowManager;
 use crate::platform::slice_tap::{
-    GIVE_UP, Mouse, Pointer, SlicePanel, SlicePress, SliceTap, Verdict,
+    GIVE_UP, Mouse, Pointer, SlicePanel, SlicePress, SliceTap, Verdict, posted_event,
 };
 use crate::platform::{Modifiers, WinID};
 use crate::types::commands::Side;
@@ -704,4 +705,166 @@ fn the_tap_lets_through_only_the_posted_press_it_waits_for() {
         tap.handle(&user(Mouse::Dragged(LEFT), 600.0, 100.0, None)),
         Verdict::Pass
     );
+}
+
+fn west_panel() -> SlicePanel {
+    SlicePanel {
+        panel: 9,
+        window: 42,
+        on_screen: IRect::new(1019, 20, 1024, 200),
+        in_window: IRect::new(395, 0, 400, 180),
+        side: Side::West,
+    }
+}
+
+/// The mach ticks now, as the trackpad stamps the events it makes.
+fn ticks() -> u64 {
+    unsafe { mach_absolute_time() }
+}
+
+/// The nanoseconds since startup now, as the window server stamps the
+/// events software posts.
+fn uptime_nanos() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &raw mut now) };
+    u64::try_from(now.tv_sec).unwrap_or_default() * 1_000_000_000
+        + u64::try_from(now.tv_nsec).unwrap_or_default()
+}
+
+/// A left button event of the user's, stamped `stamp`, as it reaches the
+/// tap.
+fn read(kind: CGEventType, point: CGPoint, stamp: u64, panel: Option<SlicePanel>) -> Pointer {
+    let event =
+        CGEvent::new_mouse_event(None, kind, point, CGMouseButton::Left).expect("a mouse event");
+    CGEvent::set_timestamp(Some(&event), stamp);
+    let mouse = Mouse::of(kind).expect("a pointer event");
+    Pointer {
+        panel,
+        ..Pointer::read(mouse, &event)
+    }
+}
+
+/// Press `id`, or its release, as the engine posts it at `point` and it
+/// reaches the tap.
+fn read_posted(id: u32, down: bool, point: CGPoint) -> Pointer {
+    let event = posted_event(id, LEFT, down, point, CGEventFlags::empty()).expect("a posted event");
+    let mouse = if down {
+        Mouse::Down(LEFT)
+    } else {
+        Mouse::Up(LEFT)
+    };
+    Pointer::read(mouse, &event)
+}
+
+#[test]
+fn trackpad_clicks_and_drags_reach_the_app_around_presses_on_a_panel() {
+    let mut tap = SliceTap::default();
+    let on_panel = CGPoint::new(1020.0, 80.0);
+    let elsewhere = CGPoint::new(600.0, 80.0);
+    let shown = CGPoint::new(500.0, 80.0);
+    let (down, dragged, up) = (
+        CGEventType::LeftMouseDown,
+        CGEventType::LeftMouseDragged,
+        CGEventType::LeftMouseUp,
+    );
+
+    for pressed_by_trackpad in [true, false] {
+        let stamp = if pressed_by_trackpad {
+            ticks()
+        } else {
+            uptime_nanos()
+        };
+        let Verdict::Hold(press) = tap.handle(&read(down, on_panel, stamp, Some(west_panel())))
+        else {
+            panic!("a click on the panel is held back");
+        };
+        assert_eq!(
+            tap.handle(&read(up, on_panel, ticks(), None)),
+            Verdict::Swallow
+        );
+        assert_eq!(
+            tap.handle(&read_posted(press.id, true, shown)),
+            Verdict::PassAndRelease {
+                id: press.id,
+                button: LEFT
+            },
+            "pressed by trackpad: {pressed_by_trackpad}"
+        );
+        assert_eq!(
+            tap.handle(&read_posted(press.id, false, shown)),
+            Verdict::Pass
+        );
+        for kind in [down, dragged, up] {
+            assert_eq!(
+                tap.handle(&read(kind, elsewhere, ticks(), None)),
+                Verdict::Pass,
+                "{kind:?} after a click on the panel"
+            );
+        }
+
+        let Verdict::Hold(press) = tap.handle(&read(down, on_panel, ticks(), Some(west_panel())))
+        else {
+            panic!("a drag from the panel is held back");
+        };
+        assert_eq!(
+            tap.handle(&read_posted(press.id, true, shown)),
+            Verdict::Pass
+        );
+        for kind in [dragged, up, down, up] {
+            assert_eq!(
+                tap.handle(&read(kind, elsewhere, ticks(), None)),
+                Verdict::Pass,
+                "{kind:?} after a drag from the panel"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_drag_from_a_panel_moves_only_what_the_user_made_before_its_press_arrived() {
+    for (maker, stamp) in [
+        ("trackpad", ticks as fn() -> u64),
+        ("software", uptime_nanos),
+    ] {
+        let mut tap = SliceTap::default();
+        let pressed = CGPoint::new(1020.0, 80.0);
+
+        let Verdict::Hold(press) = tap.handle(&read(
+            CGEventType::LeftMouseDown,
+            pressed,
+            stamp(),
+            Some(west_panel()),
+        )) else {
+            panic!("a press on the panel is held back");
+        };
+        let before = stamp();
+        assert_eq!(
+            tap.handle(&read_posted(press.id, true, CGPoint::new(500.0, 80.0))),
+            Verdict::Pass,
+            "{maker}"
+        );
+        assert_eq!(
+            tap.handle(&read(
+                CGEventType::LeftMouseDragged,
+                CGPoint::new(1010.0, 80.0),
+                before,
+                None
+            )),
+            Verdict::Move(CGPoint::new(490.0, 80.0)),
+            "{maker}"
+        );
+        for (kind, x) in [
+            (CGEventType::LeftMouseDragged, 450.0),
+            (CGEventType::LeftMouseUp, 440.0),
+        ] {
+            assert_eq!(
+                tap.handle(&read(kind, CGPoint::new(x, 80.0), stamp(), None)),
+                Verdict::Pass,
+                "{maker} {kind:?} at {x}"
+            );
+        }
+    }
 }

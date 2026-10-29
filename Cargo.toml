@@ -93,6 +93,9 @@ derive_more = { version = "2.1", features = ["deref", "deref_mut"] }
 embed_plist = "1.2"
 launchctl = "0.3"
 libc = "0.2"
+# Already in the tree via async-mach-ports. libc deprecates its mach clock
+# bindings in favor of this crate.
+mach2 = "0.6"
 mlua = { version = "0.12", default-features = false, optional = true, features = [
   "serialize",
   "async",
