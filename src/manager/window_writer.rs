@@ -1071,6 +1071,17 @@ mod writer_tests {
         }
     }
 
+    fn slid(window: u32, from_x: i32, to_x: i32) -> PendingWrite<u32> {
+        PendingWrite {
+            window,
+            from: IRect::new(from_x, 0, from_x + 300, 100),
+            to: IRect::new(to_x, 0, to_x + 300, 100),
+            position: true,
+            size: false,
+            size_limited: Arc::default(),
+        }
+    }
+
     fn resized(window: u32, frame: IRect) -> PendingWrite<u32> {
         PendingWrite {
             window,
@@ -1218,6 +1229,41 @@ mod writer_tests {
             assert!(writers.flush(SECOND), "flush {x} timed out");
         }
         assert_eq!(probe.log(1).last(), Some(&Op::Finish));
+    }
+
+    /// One app's windows in a row move one at a time. The window at the back
+    /// of the motion goes first, so a window that has moved overlaps the one
+    /// ahead of it until that one moves, instead of leaving the desktop
+    /// showing between them.
+    #[test]
+    fn an_apps_windows_move_from_the_back_of_the_motion() {
+        for dx in [-300, 300] {
+            let (probe, entered) = Probe::new();
+            let writers = writers(&probe, SECOND, SETTLE);
+            probe.hold(1);
+            writers.push(1, key(99), moved(99, 0));
+            assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+            for window in 0..6_u32 {
+                let x = window.cast_signed() * 400;
+                writers.push(1, key(window), slid(window, x, x + dx));
+            }
+            probe.release(1);
+            assert!(writers.flush(SECOND));
+
+            let order = probe
+                .log(1)
+                .into_iter()
+                .filter_map(|op| match op {
+                    Op::Position(window, _) if window != 99 => Some(window),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let mut back_first = (0..6).collect::<Vec<_>>();
+            if dx < 0 {
+                back_first.reverse();
+            }
+            assert_eq!(order, back_first, "moving by {dx}");
+        }
     }
 
     /// Frames asked for while an earlier write is in flight replace each
