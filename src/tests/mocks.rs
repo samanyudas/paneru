@@ -1881,6 +1881,10 @@ impl MockState {
             .returning(move || s.inner.force_read().windows.keys().copied().collect());
 
         let s = self.clone();
+        wm.expect_window_owner()
+            .returning(move |id| s.inner.force_read().windows.get(&id).map(|w| w.pid));
+
+        let s = self.clone();
         wm.expect_warp_mouse()
             .returning(move |origin| s.inner.force_write().cursor_position = origin);
 
