@@ -932,6 +932,15 @@ impl Config {
             .is_some_and(|enabled| enabled)
     }
 
+    /// Whether dragging a tiled window by its title bar moves it in the
+    /// layout. Default is disabled: without it, a title-bar drag only moves
+    /// the window on screen, as macOS does.
+    pub fn drag_to_reorder(&self) -> bool {
+        self.options()
+            .drag_to_reorder
+            .is_some_and(|enabled| enabled)
+    }
+
     pub fn create_workspace_automatically(&self) -> bool {
         self.options()
             .create_virtual_workspace_automatically
@@ -1347,6 +1356,10 @@ pub struct MainOptions {
     /// shifting the rest) instead of appending it to the end of the strip.
     /// Off by default.
     pub insert_windows_mid_strip: Option<bool>,
+
+    /// Dragging a tiled window by its title bar drops it into the column
+    /// under it, or into a new column between two others. Off by default.
+    pub drag_to_reorder: Option<bool>,
 
     /// If a non-enumerated (e.g. South) gesture or window movement would target a nonexistent
     /// virtual workspace, create the workspace automatically.
