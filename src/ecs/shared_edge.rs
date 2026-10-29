@@ -6,7 +6,7 @@ use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Added, Changed, With};
+use bevy::ecs::query::{Added, Changed, Has, With};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{In, IntoSystem as _, Local, Query, Res};
 use bevy::math::{IRect, IVec2};
@@ -16,7 +16,7 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::{PostUpdateSet, SelectedVirtualMarker};
 use crate::events::Event;
-use crate::manager::{Display, Window, WindowManager};
+use crate::manager::{Display, Margins, Window, WindowManager};
 use crate::platform::WinID;
 use crate::types::commands::Side;
 
@@ -82,11 +82,50 @@ impl EdgeSlice {
     }
 
     /// This slice with the window's shown frame moved by `by`, still cut by
-    /// the display bounds `own` and still on the side it came from.
-    pub(crate) fn moved(&self, by: IVec2, own: IRect) -> Option<Self> {
+    /// the display bounds `own` and still on the side it came from, but held
+    /// here where `by` would take it further past the edge.
+    pub(crate) fn slid(&self, by: IVec2, own: IRect) -> Option<Self> {
+        let x = match self.side {
+            Side::West => by.x.max(0),
+            Side::East => by.x.min(0),
+        };
         let shown = self.shown();
+        let by = by.with_x(x);
         let shown = IRect::from_corners(shown.min + by, shown.max + by);
         Self::on_side(shown, own, self.display, self.side)
+    }
+}
+
+/// A slice a sliding photo never goes further past the edge than, and the
+/// origin of the window's frame where it shows that slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Hold {
+    pub slice: EdgeSlice,
+    pub origin: IVec2,
+}
+
+impl Hold {
+    /// `slice`, shown by a window with `margins` round what it shows.
+    pub(crate) fn of(slice: EdgeSlice, margins: Margins) -> Self {
+        Self {
+            slice,
+            origin: slice.shown().min - margins.min,
+        }
+    }
+
+    /// The photo of the window with its frame's origin at `at`, on the
+    /// display with bounds `own`.
+    pub(crate) fn photo(&self, at: IVec2, own: IRect) -> Option<EdgeSlice> {
+        self.slice.slid(at - self.origin, own)
+    }
+
+    /// Whichever of `self` and `other` lies further past the edge.
+    pub(crate) fn further_out(self, other: Self) -> Self {
+        if other.slice.on_screen.width() < self.slice.on_screen.width() {
+            other
+        } else {
+            self
+        }
     }
 }
 
@@ -96,47 +135,51 @@ impl EdgeSlice {
 /// other display. Layout writes where the window goes to
 /// [`PresentedOrigin`](crate::ecs::PresentedOrigin) and leaves its
 /// `Position` and [`EdgeSlice`] to the slide.
+///
+/// `at` is the origin of the window's frame at its place in the row, which
+/// moves with the row's ease. The photo shows the window there, but held at
+/// a [`Hold`] where the row takes it further past the edge, so a hidden
+/// column keeps its sliver until the row brings it out.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Slide {
-    /// The window leaves its tuck. The photo shows the window as if its
-    /// frame had its origin at `at`. `slice` is the slice it showed with its
-    /// frame at `from`.
-    Moving {
-        at: IVec2,
-        from: IVec2,
-        slice: EdgeSlice,
-    },
+    /// The window leaves its tuck, where it showed `from`.
+    Moving { at: IVec2, from: Hold },
     /// The window has moved to where the photo rests. The photo stays over
     /// it until macOS has taken the move, or until the engine time `until`.
     Landing { until: Duration },
-    /// The window heads for a tuck, where its frame at `to` shows `slice`,
-    /// and its photo is on its way. The window shows itself at `at`, as far
-    /// toward `to` as it stays mostly on its display. It waits for the photo
-    /// until the engine time `until`, which is `None` before its first wait.
+    /// The window heads for a tuck that shows `slice`, at its place `to`
+    /// in the row, and its photo is on its way. The window shows itself at
+    /// `at`, as far toward `to` as it stays mostly on its display. It waits
+    /// for the photo until the engine time `until`, which is `None` before
+    /// its first wait.
     Leaving {
         at: IVec2,
         to: IVec2,
-        slice: EdgeSlice,
+        slice: Hold,
         until: Option<Duration>,
     },
-    /// The photo shows the window at `at` and the window tucks under it.
-    /// Once macOS has taken the tuck, or at the engine time `until`, the
-    /// photo slides to `to`.
+    /// The photo slides with the row from `at` to `to`, held at `hold`, and
+    /// rests as `slice`. The window tucks under the photo first: the photo
+    /// slides once macOS has taken the tuck, or at the engine time `until`.
     Tucking {
         at: IVec2,
         to: IVec2,
+        hold: Hold,
         slice: EdgeSlice,
         until: Duration,
     },
 }
 
 /// The windows of `strip` that show a slice: on each side, every window of
-/// the hidden column nearest the edge in strip order, and no other, each with
-/// the part of its slice no window in front of it covers. A native tab group
-/// shows its front tab, and a tabbed stack the tab focused last.
+/// the hidden column nearest the edge in strip order, and every window
+/// whose photo slides, each with the part of its slice no window in its
+/// column in front of it covers. A native tab group shows its front tab, and
+/// a tabbed stack the tab focused last. They come back to front: a column
+/// further past its edge before a nearer one, whose photo covers it.
 pub(crate) fn showing(
     strip: &LayoutStrip,
     slice_of: impl Fn(Entity) -> Option<EdgeSlice>,
+    sliding: impl Fn(Entity) -> bool,
     history: &FocusHistory,
 ) -> Vec<(Entity, EdgeSlice)> {
     let on_side = |column: &Column, side: Side| {
@@ -148,16 +191,30 @@ pub(crate) fn showing(
                 .collect(),
         )
     };
-    let west = strip
-        .columns()
-        .map(|column| on_side(column, Side::West))
-        .filter(|slices| !slices.is_empty())
-        .last();
-    let east = strip
+    let shown = |columns: Vec<Vec<(Entity, EdgeSlice)>>| {
+        let nearest = columns.iter().rposition(|slices| !slices.is_empty());
+        let mut shown = Vec::new();
+        for (index, slices) in columns.into_iter().enumerate() {
+            shown.extend(
+                slices
+                    .into_iter()
+                    .filter(|(entity, _)| Some(index) == nearest || sliding(*entity)),
+            );
+        }
+        shown
+    };
+    let west = shown(
+        strip
+            .columns()
+            .map(|column| on_side(column, Side::West))
+            .collect(),
+    );
+    let mut east = strip
         .columns()
         .map(|column| on_side(column, Side::East))
-        .find(|slices| !slices.is_empty());
-    west.into_iter().chain(east).flatten().collect()
+        .collect::<Vec<_>>();
+    east.reverse();
+    west.into_iter().chain(shown(east)).collect()
 }
 
 /// The windows `column` shows, ordered as the stack orders them on screen:
@@ -206,15 +263,15 @@ fn uncovered(back_to_front: Vec<(Entity, EdgeSlice)>) -> Vec<(Entity, EdgeSlice)
 }
 
 /// The slices that show on every display now, from the strip each display
-/// shows, ordered by window id.
+/// shows, each strip's back to front.
 pub(crate) fn showing_edge_slices(
     strips: Query<(&LayoutStrip, &ChildOf), With<SelectedVirtualMarker>>,
     displays: Query<&Display>,
-    windows: Query<(&Window, Option<&EdgeSlice>)>,
+    windows: Query<(&Window, Option<&EdgeSlice>, Has<Slide>)>,
     window_manager: Res<WindowManager>,
     history: Res<FocusHistory>,
 ) -> Vec<(WinID, EdgeSlice)> {
-    let mut slices: Vec<(WinID, EdgeSlice)> = strips
+    strips
         .iter()
         .filter(|(strip, child_of)| {
             displays.get(child_of.parent()).is_ok_and(|display| {
@@ -230,23 +287,23 @@ pub(crate) fn showing_edge_slices(
                     windows
                         .get(entity)
                         .ok()
-                        .and_then(|(_, slice)| slice.copied())
+                        .and_then(|(_, slice, _)| slice.copied())
                 },
+                |entity| windows.get(entity).is_ok_and(|(_, _, sliding)| sliding),
                 &history,
             )
         })
         .filter_map(|(entity, slice)| Some((windows.get(entity).ok()?.0.id(), slice)))
-        .collect();
-    slices.sort_by_key(|(id, _)| *id);
-    slices
+        .collect()
 }
 
 /// Whether the showing slices may have changed: a slice moved, appeared, or
-/// went, a strip reordered its columns or tabs, a display switched strips, or
-/// macOS switched a Space.
+/// went, a photo stopped sliding, a strip reordered its columns or tabs, a
+/// display switched strips, or macOS switched a Space.
 pub(crate) fn showing_may_change(
     changed: Query<(), Changed<EdgeSlice>>,
     removed: RemovedComponents<EdgeSlice>,
+    stopped: RemovedComponents<Slide>,
     strips: Query<(), Changed<LayoutStrip>>,
     selected: Query<(), Added<SelectedVirtualMarker>>,
     mut messages: MessageReader<Event>,
@@ -259,6 +316,7 @@ pub(crate) fn showing_may_change(
     space_changed
         || !changed.is_empty()
         || !removed.is_empty()
+        || !stopped.is_empty()
         || !strips.is_empty()
         || !selected.is_empty()
 }

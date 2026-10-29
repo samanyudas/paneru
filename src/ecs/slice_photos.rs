@@ -25,7 +25,7 @@ use tracing::{debug, warn};
 
 use crate::config::Config;
 use crate::ecs::layout::lies_mostly_elsewhere;
-use crate::ecs::shared_edge::{EdgeSlice, Slide, showing_edge_slices, showing_may_change};
+use crate::ecs::shared_edge::{EdgeSlice, Hold, Slide, showing_edge_slices, showing_may_change};
 use crate::ecs::systems::{self, ease_out_factor, ease_step};
 use crate::ecs::{Position, PostUpdateSet, PresentedOrigin, RepositionMarker};
 use crate::events::Event;
@@ -125,8 +125,9 @@ pub(crate) trait SliceScreen {
     /// asks the user.
     fn may_photograph(&self) -> bool;
     /// Gives each of `slices` a panel at its place on screen, showing the
-    /// slice's part of the window's photo, and closes every other panel. A
-    /// panel stays out of sight until its first paint.
+    /// slice's part of the window's photo, and closes every other panel.
+    /// Each panel shows above the ones before it. A panel stays out of sight
+    /// until its first paint.
     fn place(&mut self, slices: &[(WinID, EdgeSlice)]);
     /// Starts a photo of the whole of `window`, which shows a frame of
     /// `slice.size` and gives the panel `slice`, unless `ticket` is called off
@@ -190,10 +191,10 @@ impl SlicePhoto {
     }
 }
 
-/// The showing slices, by window, each with the slice its photo is of.
+/// The showing slices, back to front, each with the slice its photo is of.
 #[derive(Resource, Default)]
 struct Slices {
-    showing: BTreeMap<WinID, (EdgeSlice, SlicePhoto)>,
+    showing: Vec<(WinID, EdgeSlice, SlicePhoto)>,
     /// The latest photo of each window, with the size of the frame it shows,
     /// kept after its slice stops showing. A window that crosses the shared
     /// edge again shows it at once, rather than waiting for a new photo that
@@ -208,9 +209,27 @@ impl Slices {
     fn placed(&self) -> Vec<(WinID, EdgeSlice)> {
         self.showing
             .iter()
-            .filter(|(_, (_, photo))| !matches!(photo, SlicePhoto::Ended))
-            .map(|(id, (slice, _))| (*id, *slice))
+            .filter(|(_, _, photo)| !matches!(photo, SlicePhoto::Ended))
+            .map(|(id, slice, _)| (*id, *slice))
             .collect()
+    }
+
+    fn photo(&self, window: WinID) -> Option<&SlicePhoto> {
+        self.showing
+            .iter()
+            .find(|(id, _, _)| *id == window)
+            .map(|(_, _, photo)| photo)
+    }
+
+    /// Whether a photo of `window` that shows `size` can show now: its panel
+    /// shows one, or one is kept.
+    fn has_photo(&self, window: WinID, size: IVec2) -> bool {
+        self.photo(window)
+            .is_some_and(|photo| photo.shown().is_some())
+            || self
+                .kept
+                .get(&window)
+                .is_some_and(|(kept, _)| *kept == size)
     }
 }
 
@@ -282,7 +301,10 @@ fn present_slices(
         kept.clear();
         Vec::new()
     };
-    let mut before = std::mem::take(shown);
+    let mut before = std::mem::take(shown)
+        .into_iter()
+        .map(|(id, slice, photo)| (id, (slice, photo)))
+        .collect::<BTreeMap<_, _>>();
     let mut from_kept = Vec::new();
     for (id, slice) in showing {
         let photo = match before.remove(&id) {
@@ -312,7 +334,7 @@ fn present_slices(
                 },
             },
         };
-        shown.insert(id, (slice, photo));
+        shown.push((id, slice, photo));
     }
     screen.0.place(&slices.placed());
     for id in from_kept {
@@ -334,7 +356,7 @@ fn refresh_slices(mut slices: ResMut<Slices>, screen: Option<NonSendMut<SliceScr
         generation,
         ..
     } = &mut *slices;
-    for (id, (slice, photo)) in showing.iter_mut() {
+    for (id, slice, photo) in showing.iter_mut() {
         let SlicePhoto::Shown { digest } = *photo else {
             continue;
         };
@@ -376,8 +398,9 @@ fn receive_photos(
         };
         let Slices { showing, kept, .. } = &mut *slices;
         let asked = showing
-            .get_mut(window_id)
-            .and_then(|(slice, photo)| match *photo {
+            .iter_mut()
+            .find(|(id, _, _)| id == window_id)
+            .and_then(|(_, slice, photo)| match *photo {
                 SlicePhoto::Asked {
                     generation: asked,
                     last,
@@ -463,16 +486,13 @@ fn slide_photos(
             continue;
         };
         match *slide {
-            Slide::Moving { at, from, slice } => {
-                let shows = slices
-                    .showing
-                    .get(&id)
-                    .is_some_and(|(_, photo)| photo.shown().is_some());
+            Slide::Moving { at, from } => {
+                let shows = slices.has_photo(id, from.slice.size);
                 let (next, arrived) = ease_step(at, presented.0, t);
                 let moved = displays
-                    .get(slice.display)
+                    .get(from.slice.display)
                     .ok()
-                    .and_then(|own| slice.moved(next - from, own.bounds()))
+                    .and_then(|own| from.photo(next, own.bounds()))
                     .filter(|_| shows);
                 let Some(moved) = moved else {
                     debug!("edge slice photo not shown: window {id} moves at once");
@@ -492,11 +512,7 @@ fn slide_photos(
                         next.x, next.y
                     );
                 } else {
-                    *slide = Slide::Moving {
-                        at: next,
-                        from,
-                        slice,
-                    };
+                    *slide = Slide::Moving { at: next, from };
                     debug!(
                         "edge slice photo sliding: window {id} at ({}, {})",
                         next.x, next.y
@@ -543,13 +559,14 @@ fn slide_photos_out(
                 until,
             } => {
                 let now = time.elapsed();
-                let photo = slices.showing.get(&id).map(|(_, photo)| photo);
+                let photo = slices.photo(id);
                 if photo.is_some_and(|photo| photo.shown().is_some()) {
                     position.0 = presented.0;
                     *slide = Slide::Tucking {
                         at,
                         to,
-                        slice,
+                        hold: slice,
+                        slice: slice.slice,
                         until: now + LANDING_TIMEOUT,
                     };
                     debug!("edge slice photo covers: window {id} tucks under it");
@@ -562,7 +579,7 @@ fn slide_photos_out(
                         now < until
                             && photo.is_some_and(|photo| !matches!(photo, SlicePhoto::Ended))
                     });
-                let own = displays.get(slice.display).map(Display::bounds);
+                let own = displays.get(slice.slice.display).map(Display::bounds);
                 let (true, Ok(own)) = (waits, own) else {
                     let waited = until.map(|until| (now + PHOTO_WAIT).saturating_sub(until));
                     debug!(
@@ -570,7 +587,9 @@ fn slide_photos_out(
                         *access
                     );
                     position.0 = presented.0;
-                    entity_commands.try_insert(slice).try_remove::<Slide>();
+                    entity_commands
+                        .try_insert(slice.slice)
+                        .try_remove::<Slide>();
                     continue;
                 };
                 let all = displays.iter().map(Display::bounds).collect::<Vec<_>>();
@@ -594,6 +613,7 @@ fn slide_photos_out(
             Slide::Tucking {
                 at,
                 to,
+                hold,
                 slice,
                 until,
             } => {
@@ -604,13 +624,14 @@ fn slide_photos_out(
                 let moved = displays
                     .get(slice.display)
                     .ok()
-                    .and_then(|own| slice.moved(next - to, own.bounds()))
-                    .filter(|_| !arrived);
+                    .and_then(|own| hold.photo(next, own.bounds()))
+                    .filter(|moved| !arrived && *moved != slice);
                 if let Some(moved) = moved {
                     entity_commands.try_insert(moved);
                     *slide = Slide::Tucking {
                         at: next,
                         to,
+                        hold,
                         slice,
                         until,
                     };
@@ -629,12 +650,12 @@ fn slide_photos_out(
 }
 
 /// One step of the row's ease for a window at `at` heading for `to`, where
-/// its frame shows `slice` on the display with bounds `own`, among the
-/// displays with bounds `all`. Stays at `at` when the step would put most
-/// of the window on another display. Returns where the window is, with its
-/// slice there.
+/// it shows `slice`, on the display with bounds `own`, among the displays
+/// with bounds `all`. Stays at `at` when the step would put most of the
+/// window on another display. Returns where the window is, with its slice
+/// there.
 fn step_in_view(
-    slice: &EdgeSlice,
+    slice: &Hold,
     at: IVec2,
     to: IVec2,
     t: f32,
@@ -648,12 +669,12 @@ fn step_in_view(
         .collect::<Vec<_>>();
     let shows_at = |origin: IVec2| {
         slice
-            .moved(origin - to, own)
+            .photo(origin, own)
             .filter(|moved| !lies_mostly_elsewhere(moved.shown(), own, &others))
     };
     let (next, _) = ease_step(at, to, t);
     match shows_at(next) {
         Some(moved) => (next, moved),
-        None => (at, shows_at(at).unwrap_or(*slice)),
+        None => (at, shows_at(at).unwrap_or(slice.slice)),
     }
 }

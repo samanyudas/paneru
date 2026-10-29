@@ -22,7 +22,7 @@ use crate::config::{Config, StackLimit};
 use crate::ecs::drag::DragState;
 use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::params::Windows;
-use crate::ecs::shared_edge::{EdgeSlice, Slide};
+use crate::ecs::shared_edge::{EdgeSlice, Hold, Slide};
 use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
@@ -3132,6 +3132,7 @@ fn insert_stack_item_window_contexts(
 /// Reacts to changes of logical window layout in the strip and any have been changed, reposition
 /// the layout strip against the current display viewport.
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_lines)]
 fn position_layout_windows(
     positioned_windows: RepositionedWindows,
     workspaces: StripsForWindowPositioning,
@@ -3143,11 +3144,15 @@ fn position_layout_windows(
 ) {
     let offscreen_sliver_width = config.sliver_width();
     let mut strip_contexts = EntityHashMap::default();
+    let mut scrolls = EntityHashMap::default();
     for (strip_entity, layout_strip, Position(strip_position), reposition, swiping, child_of) in
         &workspaces
     {
         let snap_settling = snap_guards.iter().any(|guard| guard.strip == strip_entity);
         let strip_target = reposition.map_or(*strip_position, |target| target.0);
+        for entity in layout_strip.all_windows() {
+            scrolls.insert(entity, strip_target.x - strip_position.x);
+        }
         insert_strip_window_contexts(
             &mut strip_contexts,
             layout_strip,
@@ -3194,6 +3199,10 @@ fn position_layout_windows(
         frame.min += context.strip_position;
         frame.max += context.strip_position;
 
+        let row = RowPlace {
+            to: frame.min.x,
+            now: frame.min.x - scrolls.get(&entity).copied().unwrap_or_default(),
+        };
         let mut frame = hidden_frame(frame, viewport, margins, context, &config);
 
         // Keep the window anchored to its own display. The parked strip origin
@@ -3226,12 +3235,12 @@ fn position_layout_windows(
             entity_commands.try_insert(PresentedOrigin(frame.min));
             if present_tuck(
                 &mut entity_commands,
-                slice,
-                tucked,
+                slice.map(|slice| Hold::of(slice, margins)),
+                tucked.map(|tucked| Hold::of(*tucked, margins)),
                 sliding,
                 may_slide,
                 shown_at(position.0, frame, margins, park_row, display, &displays),
-                margins,
+                row,
             ) {
                 continue;
             }
@@ -3277,46 +3286,77 @@ fn position_layout_windows(
     }
 }
 
+/// The left edge of a window's frame at its place in the row, before a
+/// hidden window is held at its sliver: `to` with its strip where it heads,
+/// and `now` with its strip where it is now.
+#[derive(Clone, Copy, Debug)]
+struct RowPlace {
+    to: i32,
+    now: i32,
+}
+
+impl RowPlace {
+    /// Where a slide from `from` starts: the window's place in the row now,
+    /// held at `from` like its photo, while its strip scrolls. A layout
+    /// change that does not scroll gives no earlier place, so it starts at
+    /// `from`.
+    fn start(self, from: Hold) -> Origin {
+        let x = match from.slice.side {
+            _ if self.now == self.to => from.origin.x,
+            Side::West => self.now.min(from.origin.x),
+            Side::East => self.now.max(from.origin.x),
+        };
+        from.origin.with_x(x)
+    }
+}
+
 /// Writes a window's tuck: `slice` when its new frame is tucked, else none.
 /// With `may_slide`, a window that tucks from `shown_at`, where it shows on
-/// its display now, slides out, and one that leaves its tuck `tucked` slides
-/// in. A slide in progress keeps going, or turns back. Returns whether the
-/// slide moves the window, which leaves its `Position` to the slide.
+/// its display now, slides out, one that leaves its tuck `tucked` slides in,
+/// and a tucked one whose slice moves slides to it. Each starts from its
+/// place in the `row`. A slide in progress keeps going, or turns back.
+/// Returns whether the slide moves the window, which leaves its `Position`
+/// to the slide.
 fn present_tuck(
     entity_commands: &mut EntityCommands,
-    slice: Option<EdgeSlice>,
-    tucked: Option<&EdgeSlice>,
+    slice: Option<Hold>,
+    tucked: Option<Hold>,
     sliding: Option<&Slide>,
     may_slide: bool,
     shown_at: Option<Origin>,
-    margins: Margins,
+    row: RowPlace,
 ) -> bool {
     if let Some(slice) = slice {
-        let to = slice.shown().min - margins.min;
+        let to = slice.origin.with_x(row.to);
         let leaving = |at, until| Slide::Leaving {
             at,
             to,
             slice,
             until,
         };
+        let tucking = |at, hold: Hold, until| Slide::Tucking {
+            at,
+            to,
+            hold: hold.further_out(slice),
+            slice: slice.slice,
+            until,
+        };
         let out = match sliding.copied() {
-            Some(Slide::Moving { at, .. }) => Some(Slide::Tucking {
-                at,
-                to,
-                slice,
-                until: Duration::ZERO,
-            }),
-            Some(Slide::Tucking { at, until, .. }) => Some(Slide::Tucking {
-                at,
-                to,
-                slice,
-                until,
-            }),
+            Some(Slide::Moving { at, from }) => Some(tucking(at, from, Duration::ZERO)),
+            Some(Slide::Tucking {
+                at, hold, until, ..
+            }) => Some(tucking(at, hold, until)),
             Some(Slide::Leaving { at, until, .. }) => Some(leaving(at, until)),
             Some(Slide::Landing { .. }) => shown_at.map(|at| leaving(at, None)),
-            None => shown_at
-                .filter(|_| tucked.is_none())
-                .map(|at| leaving(at, None)),
+            None => match tucked {
+                None => shown_at.map(|at| leaving(at, None)),
+                Some(tucked)
+                    if tucked.slice != slice.slice && tucked.slice.size == slice.slice.size =>
+                {
+                    Some(tucking(row.start(tucked), tucked, Duration::ZERO))
+                }
+                Some(_) => None,
+            },
         };
         if let Some(out) = out.filter(|_| may_slide) {
             entity_commands
@@ -3324,28 +3364,32 @@ fn present_tuck(
                 .try_remove::<RepositionMarker>();
             return true;
         }
-        entity_commands.try_insert(slice).try_remove::<Slide>();
+        entity_commands
+            .try_insert(slice.slice)
+            .try_remove::<Slide>();
         return false;
     }
-    match (sliding, tucked) {
-        (Some(Slide::Moving { .. }), _) => true,
-        (Some(Slide::Landing { .. }), _) => false,
-        (Some(Slide::Tucking { .. }) | None, Some(tucked)) if may_slide => {
-            let from = tucked.shown().min - margins.min;
-            entity_commands
-                .try_insert(Slide::Moving {
-                    at: from,
-                    from,
-                    slice: *tucked,
-                })
-                .try_remove::<RepositionMarker>();
-            true
-        }
+    let moving = match (sliding.copied(), tucked) {
+        (Some(Slide::Moving { .. }), _) => return true,
+        (Some(Slide::Landing { .. }), _) => return false,
+        (Some(Slide::Tucking { at, hold, .. }), Some(_)) => Slide::Moving { at, from: hold },
+        (None, Some(tucked)) => Slide::Moving {
+            at: row.start(tucked),
+            from: tucked,
+        },
         _ => {
             entity_commands.try_remove::<(Slide, EdgeSlice)>();
-            false
+            return false;
         }
+    };
+    if !may_slide {
+        entity_commands.try_remove::<(Slide, EdgeSlice)>();
+        return false;
     }
+    entity_commands
+        .try_insert(moving)
+        .try_remove::<RepositionMarker>();
+    true
 }
 
 /// `frame` placed to show its sliver at the side of `viewport` it is hidden

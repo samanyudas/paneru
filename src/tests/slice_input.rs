@@ -322,15 +322,18 @@ fn a_press_slides_the_photo_in_with_the_row_then_the_window_takes_its_place() {
             step.three
         );
     }
-    let moved = |from: i32, now: i32, to: i32| f64::from(now - from) / f64::from(to - from);
     for step in sliding.iter().filter(|step| step.panel != Some(rest)) {
-        let photo = moved(start.min.x, step.panel.unwrap().min.x, rest.min.x);
-        let row = moved(two_start.min.x, step.two.min.x, two_rest.min.x);
+        let panel = step.panel.unwrap();
         assert!(
-            (photo - row).abs() <= 0.03,
-            "the photo keeps step with the row: {photo:.3} of its way, the row {row:.3}"
+            panel == start || (panel.min.x - step.two.max.x).abs() <= 1,
+            "the photo holds at the slice or shows window 3 beside window 2, where the row puts it: {panel:?}, window 2 at {:?}",
+            step.two
         );
     }
+    assert!(
+        two_rest.max.x < two_start.max.x,
+        "window 2 moves with the row: {two_start:?} to {two_rest:?}"
+    );
     assert!(
         sliding.iter().all(|step| !step.posted),
         "no press while the photo shows"

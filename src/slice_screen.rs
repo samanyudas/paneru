@@ -36,6 +36,10 @@ pub struct SliceScreenOS {
     mtm: MainThreadMarker,
     events: EventSender,
     panels: HashMap<WinID, Panel>,
+    /// The placed windows, their panels back to front.
+    stack: Vec<WinID>,
+    /// The painted panels in the order they were last brought to the front.
+    fronted: Vec<WinID>,
     /// The filter of each placed window's last lookup, once it arrives.
     filters: HashMap<WinID, Arc<OnceLock<Filter>>>,
 }
@@ -82,6 +86,8 @@ impl SliceScreenOS {
             mtm,
             events,
             panels: HashMap::new(),
+            stack: Vec::new(),
+            fronted: Vec::new(),
             filters: HashMap::new(),
         }
     }
@@ -96,12 +102,35 @@ impl SliceScreenOS {
         )
     }
 
+    /// Brings the painted panels to the front in stack order, so each shows
+    /// above the ones before it, unless they are in that order already.
+    fn restack(&mut self) {
+        let painted = self
+            .stack
+            .iter()
+            .copied()
+            .filter(|id| self.panels.get(id).is_some_and(|panel| panel.painted))
+            .collect::<Vec<_>>();
+        if painted == self.fronted {
+            return;
+        }
+        for id in &painted {
+            if let Some(panel) = self.panels.get(id) {
+                panel.window.orderFrontRegardless();
+            }
+        }
+        debug!("edge slice panels stacked: {painted:?}");
+        self.fronted = painted;
+    }
+
     /// Tells the event tap and the window lookups where the painted panels
-    /// are.
+    /// are, the front one first.
     fn publish_panels(&self) {
         set_slice_panels(
-            self.panels
+            self.stack
                 .iter()
+                .rev()
+                .filter_map(|window| Some((window, self.panels.get(window)?)))
                 .filter(|(_, panel)| panel.painted)
                 .filter_map(|(window, panel)| {
                     Some(SlicePanel {
@@ -182,6 +211,7 @@ impl SliceScreen for SliceScreenOS {
             }
             keep
         });
+        self.fronted.retain(|id| self.panels.contains_key(id));
         for (id, slice) in slices {
             let frame = self.cocoa_frame(slice.on_screen);
             let panel = match self.panels.get_mut(id) {
@@ -211,6 +241,8 @@ impl SliceScreen for SliceScreenOS {
                 on.min.x, on.min.y, on.max.x, on.max.y
             );
         }
+        self.stack = slices.iter().map(|(id, _)| *id).collect();
+        self.restack();
         self.publish_panels();
     }
 
@@ -285,9 +317,9 @@ impl SliceScreen for SliceScreenOS {
         unsafe { layer.setContents(Some(image.as_ref())) };
         panel.crop();
         if !panel.painted {
-            panel.window.orderFrontRegardless();
             panel.painted = true;
             debug!("edge slice panel shown: window {window}");
+            self.restack();
             self.publish_panels();
         }
     }
