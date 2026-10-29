@@ -8,11 +8,12 @@ use bevy::app::{App, PostUpdate, Update};
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_exists};
-use bevy::prelude::{Commands, Entity, Has, Query, Res, Resource, Time};
+use bevy::prelude::{Commands, Entity, Has, Query, Res, Resource, Time, With};
 use tracing::debug;
 
 use crate::commands::focus_with_verification;
 use crate::ecs::params::Windows;
+use crate::ecs::shared_edge::Slide;
 use crate::ecs::{PostUpdateSet, RepositionMarker, ResizeMarker, SpawnCommandsExt as _, UpdateSet};
 use crate::events::Event;
 use crate::manager::{Display, Window, WindowManager, origin_from};
@@ -75,10 +76,11 @@ fn reveal_pressed(
 }
 
 /// Posts the press once its window rests on a display where the window
-/// server sends the press to it.
+/// server sends the press to it, with no photo of it sliding or over it.
 fn deliver_press(
     pending: Res<PendingPress>,
     windows: Query<(&Window, Has<RepositionMarker>, Has<ResizeMarker>)>,
+    sliding: Query<(), With<Slide>>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     time: Res<Time>,
@@ -101,7 +103,7 @@ fn deliver_press(
         commands.remove_resource::<PendingPress>();
         return;
     };
-    if moving || resizing || window.write_pending() {
+    if moving || resizing || sliding.contains(pending.window) || window.write_pending() {
         return;
     }
     let point = press.point_in(window.shown_frame());

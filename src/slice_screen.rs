@@ -6,7 +6,7 @@ use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -36,6 +36,10 @@ pub struct SliceScreenOS {
     mtm: MainThreadMarker,
     events: EventSender,
     panels: HashMap<WinID, Panel>,
+    /// The placed windows, their panels back to front.
+    stack: Vec<WinID>,
+    /// The painted panels in the order they were last brought to the front.
+    fronted: Vec<WinID>,
     /// The filter of each placed window's last lookup, once it arrives.
     filters: HashMap<WinID, Arc<OnceLock<Filter>>>,
 }
@@ -54,12 +58,36 @@ struct Panel {
     painted: bool,
 }
 
+impl Panel {
+    /// Shows the slice's part of the photo of the whole window. The layer's
+    /// unit space starts at the bottom of the photo.
+    fn crop(&self) {
+        let Some(layer) = self.window.contentView().and_then(|view| view.layer()) else {
+            return;
+        };
+        let (min, max) = (
+            self.slice.in_window.min.as_dvec2(),
+            self.slice.in_window.max.as_dvec2(),
+        );
+        let size = self.slice.size.as_dvec2();
+        if size.x <= 0.0 || size.y <= 0.0 {
+            return;
+        }
+        layer.setContentsRect(CGRect::new(
+            CGPoint::new(min.x / size.x, 1.0 - max.y / size.y),
+            CGSize::new((max.x - min.x) / size.x, (max.y - min.y) / size.y),
+        ));
+    }
+}
+
 impl SliceScreenOS {
     pub fn new(mtm: MainThreadMarker, events: EventSender) -> Self {
         Self {
             mtm,
             events,
             panels: HashMap::new(),
+            stack: Vec::new(),
+            fronted: Vec::new(),
             filters: HashMap::new(),
         }
     }
@@ -74,12 +102,35 @@ impl SliceScreenOS {
         )
     }
 
+    /// Brings the painted panels to the front in stack order, so each shows
+    /// above the ones before it, unless they are in that order already.
+    fn restack(&mut self) {
+        let painted = self
+            .stack
+            .iter()
+            .copied()
+            .filter(|id| self.panels.get(id).is_some_and(|panel| panel.painted))
+            .collect::<Vec<_>>();
+        if painted == self.fronted {
+            return;
+        }
+        for id in &painted {
+            if let Some(panel) = self.panels.get(id) {
+                panel.window.orderFrontRegardless();
+            }
+        }
+        debug!("edge slice panels stacked: {painted:?}");
+        self.fronted = painted;
+    }
+
     /// Tells the event tap and the window lookups where the painted panels
-    /// are.
+    /// are, the front one first.
     fn publish_panels(&self) {
         set_slice_panels(
-            self.panels
+            self.stack
                 .iter()
+                .rev()
+                .filter_map(|window| Some((window, self.panels.get(window)?)))
                 .filter(|(_, panel)| panel.painted)
                 .filter_map(|(window, panel)| {
                     Some(SlicePanel {
@@ -160,35 +211,38 @@ impl SliceScreen for SliceScreenOS {
             }
             keep
         });
+        self.fronted.retain(|id| self.panels.contains_key(id));
         for (id, slice) in slices {
             let frame = self.cocoa_frame(slice.on_screen);
-            match self.panels.get_mut(id) {
+            let panel = match self.panels.get_mut(id) {
                 Some(panel) if panel.slice.on_screen == slice.on_screen => {
                     panel.slice = *slice;
+                    panel.crop();
                     continue;
                 }
                 Some(panel) => {
                     panel.window.setFrame_display(frame, panel.painted);
                     panel.slice = *slice;
+                    panel
                 }
                 None => {
                     let window = self.make_panel(frame);
-                    self.panels.insert(
-                        *id,
-                        Panel {
-                            window,
-                            slice: *slice,
-                            painted: false,
-                        },
-                    );
+                    self.panels.entry(*id).or_insert(Panel {
+                        window,
+                        slice: *slice,
+                        painted: false,
+                    })
                 }
-            }
+            };
+            panel.crop();
             let on = slice.on_screen;
             debug!(
                 "edge slice panel placed: window {id} at ({},{})-({},{})",
                 on.min.x, on.min.y, on.max.x, on.max.y
             );
         }
+        self.stack = slices.iter().map(|(id, _)| *id).collect();
+        self.restack();
         self.publish_panels();
     }
 
@@ -205,7 +259,7 @@ impl SliceScreen for SliceScreenOS {
             window,
             generation,
         };
-        let crop = slice.in_window;
+        let crop = IRect::from_corners(IVec2::ZERO, slice.size);
         let scale = self.scale_at(slice.on_screen);
         if lookup == Lookup::Reuse
             && let Some(filter) = self.filters.get(&window).and_then(|found| found.get())
@@ -261,10 +315,11 @@ impl SliceScreen for SliceScreenOS {
         };
         let image: &CFType = &photo.image;
         unsafe { layer.setContents(Some(image.as_ref())) };
+        panel.crop();
         if !panel.painted {
-            panel.window.orderFrontRegardless();
             panel.painted = true;
             debug!("edge slice panel shown: window {window}");
+            self.restack();
             self.publish_panels();
         }
     }

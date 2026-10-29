@@ -8,7 +8,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Changed, Has, Or, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res};
+use bevy::ecs::system::{Commands, EntityCommands, Local, ParamSet, Populated, Query, Res};
 use bevy::math::{IRect, IVec2};
 use bevy::time::{Time, Timer, TimerMode};
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ use crate::config::{Config, StackLimit};
 use crate::ecs::drag::DragState;
 use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::params::Windows;
-use crate::ecs::shared_edge::EdgeSlice;
+use crate::ecs::shared_edge::{EdgeSlice, Hold, Slide};
 use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
@@ -174,6 +174,8 @@ type RepositionedWindows<'w, 's> = Populated<
         &'static mut Position,
         &'static mut Bounds,
         Option<&'static ResizeMarker>,
+        Option<&'static EdgeSlice>,
+        Option<&'static Slide>,
     ),
     (
         Or<(Changed<LayoutPosition>, Changed<Bounds>)>,
@@ -3130,6 +3132,7 @@ fn insert_stack_item_window_contexts(
 /// Reacts to changes of logical window layout in the strip and any have been changed, reposition
 /// the layout strip against the current display viewport.
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_lines)]
 fn position_layout_windows(
     positioned_windows: RepositionedWindows,
     workspaces: StripsForWindowPositioning,
@@ -3141,11 +3144,15 @@ fn position_layout_windows(
 ) {
     let offscreen_sliver_width = config.sliver_width();
     let mut strip_contexts = EntityHashMap::default();
+    let mut scrolls = EntityHashMap::default();
     for (strip_entity, layout_strip, Position(strip_position), reposition, swiping, child_of) in
         &workspaces
     {
         let snap_settling = snap_guards.iter().any(|guard| guard.strip == strip_entity);
         let strip_target = reposition.map_or(*strip_position, |target| target.0);
+        for entity in layout_strip.all_windows() {
+            scrolls.insert(entity, strip_target.x - strip_position.x);
+        }
         insert_strip_window_contexts(
             &mut strip_contexts,
             layout_strip,
@@ -3168,7 +3175,9 @@ fn position_layout_windows(
                 .unwrap_or_else(|| vec![held])
         })
         .unwrap_or_default();
-    for (entity, window, layout_position, mut position, mut bounds, resize) in positioned_windows {
+    for (entity, window, layout_position, mut position, mut bounds, resize, tucked, sliding) in
+        positioned_windows
+    {
         if held_group.contains(&entity) {
             continue;
         }
@@ -3190,6 +3199,10 @@ fn position_layout_windows(
         frame.min += context.strip_position;
         frame.max += context.strip_position;
 
+        let row = RowPlace {
+            to: frame.min.x,
+            now: frame.min.x - scrolls.get(&entity).copied().unwrap_or_default(),
+        };
         let mut frame = hidden_frame(frame, viewport, margins, context, &config);
 
         // Keep the window anchored to its own display. The parked strip origin
@@ -3217,12 +3230,20 @@ fn position_layout_windows(
         if resize.is_none() && bounds.0 != frame.size() {
             bounds.0 = frame.size();
         }
+        let may_slide = config.shared_edge_slices() && !context.swiping && !context.snap_settling;
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(PresentedOrigin(frame.min));
-            match slice {
-                Some(slice) => entity_commands.try_insert(slice),
-                None => entity_commands.try_remove::<EdgeSlice>(),
-            };
+            if present_tuck(
+                &mut entity_commands,
+                slice.map(|slice| Hold::of(slice, margins)),
+                tucked.map(|tucked| Hold::of(*tucked, margins)),
+                sliding,
+                may_slide,
+                shown_at(position.0, frame, margins, park_row, display, &displays),
+                row,
+            ) {
+                continue;
+            }
         }
 
         if position.0 != frame.min {
@@ -3263,6 +3284,111 @@ fn position_layout_windows(
             }
         }
     }
+}
+
+/// The left edge of a window's frame at its place in the row, before a
+/// hidden window is held at its sliver: `to` with its strip where it heads,
+/// and `now` with its strip where it is now.
+#[derive(Clone, Copy, Debug)]
+struct RowPlace {
+    to: i32,
+    now: i32,
+}
+
+impl RowPlace {
+    /// Where a slide from `from` starts: the window's place in the row now,
+    /// held at `from` like its photo, while its strip scrolls. A layout
+    /// change that does not scroll gives no earlier place, so it starts at
+    /// `from`.
+    fn start(self, from: Hold) -> Origin {
+        let x = match from.slice.side {
+            _ if self.now == self.to => from.origin.x,
+            Side::West => self.now.min(from.origin.x),
+            Side::East => self.now.max(from.origin.x),
+        };
+        from.origin.with_x(x)
+    }
+}
+
+/// Writes a window's tuck: `slice` when its new frame is tucked, else none.
+/// With `may_slide`, a window that tucks from `shown_at`, where it shows on
+/// its display now, slides out, one that leaves its tuck `tucked` slides in,
+/// and a tucked one whose slice moves slides to it. Each starts from its
+/// place in the `row`. A slide in progress keeps going, or turns back.
+/// Returns whether the slide moves or holds the window, which leaves its
+/// `Position` to the slide.
+fn present_tuck(
+    entity_commands: &mut EntityCommands,
+    slice: Option<Hold>,
+    tucked: Option<Hold>,
+    sliding: Option<&Slide>,
+    may_slide: bool,
+    shown_at: Option<Origin>,
+    row: RowPlace,
+) -> bool {
+    if let Some(slice) = slice {
+        let to = slice.origin.with_x(row.to);
+        let leaving = |at, until| Slide::Leaving {
+            at,
+            to,
+            slice,
+            until,
+        };
+        let tucking = |at, hold: Hold, until| Slide::Tucking {
+            at,
+            to,
+            hold: hold.further_out(slice),
+            slice: slice.slice,
+            until,
+        };
+        let out = match sliding.copied() {
+            Some(Slide::Moving { at, from }) => Some(tucking(at, from, Duration::ZERO)),
+            Some(Slide::Tucking {
+                at, hold, until, ..
+            }) => Some(tucking(at, hold, until)),
+            Some(Slide::Leaving { at, until, .. }) => Some(leaving(at, until)),
+            Some(Slide::Landing { .. }) => shown_at.map(|at| leaving(at, None)),
+            None => match tucked {
+                None => shown_at.map(|at| leaving(at, None)),
+                Some(tucked)
+                    if tucked.slice != slice.slice && tucked.slice.size == slice.slice.size =>
+                {
+                    Some(tucking(row.start(tucked), tucked, Duration::ZERO))
+                }
+                Some(_) => None,
+            },
+        };
+        if let Some(out) = out.filter(|_| may_slide) {
+            entity_commands
+                .try_insert(out)
+                .try_remove::<RepositionMarker>();
+            return true;
+        }
+        entity_commands
+            .try_insert(slice.slice)
+            .try_remove::<Slide>();
+        return false;
+    }
+    let moving = match (sliding.copied(), tucked) {
+        (Some(Slide::Moving { .. }), _) | (Some(Slide::Landing { .. }), Some(_)) => return true,
+        (Some(Slide::Tucking { at, hold, .. }), Some(_)) => Slide::Moving { at, from: hold },
+        (None, Some(tucked)) => Slide::Moving {
+            at: row.start(tucked),
+            from: tucked,
+        },
+        _ => {
+            entity_commands.try_remove::<(Slide, EdgeSlice)>();
+            return false;
+        }
+    };
+    if !may_slide {
+        entity_commands.try_remove::<(Slide, EdgeSlice)>();
+        return false;
+    }
+    entity_commands
+        .try_insert(moving)
+        .try_remove::<RepositionMarker>();
+    true
 }
 
 /// `frame` placed to show its sliver at the side of `viewport` it is hidden
@@ -3327,11 +3453,38 @@ fn overlap_area(a: IRect, b: IRect) -> i64 {
 /// Whether `shown`, the frame a window shows, has its center or more of
 /// itself on another display than on `own`. macOS then moves the window into
 /// that display's space and draws it there.
-fn lies_mostly_elsewhere(shown: IRect, own: IRect, others: &[IRect]) -> bool {
+pub(crate) fn lies_mostly_elsewhere(shown: IRect, own: IRect, others: &[IRect]) -> bool {
     let home = overlap_area(shown, own);
     others
         .iter()
         .any(|other| other.contains(shown.center()) || overlap_area(shown, *other) > home)
+}
+
+/// `origin` when a window with the size of `frame` there shows on `display`
+/// now: above the park row, and where macOS shows it on that display.
+fn shown_at(
+    origin: Origin,
+    frame: IRect,
+    margins: Margins,
+    park_row: i32,
+    display: &Display,
+    displays: &DisplayViewports,
+) -> Option<Origin> {
+    let own = display.bounds();
+    let shown = margins.shown(IRect::from_corners(origin, origin + frame.size()));
+    (origin.y < park_row
+        && !shown.intersect(own).is_empty()
+        && !lies_mostly_elsewhere(shown, own, &other_bounds(own, displays)))
+    .then_some(origin)
+}
+
+/// The bounds of each of `displays` other than `own`.
+fn other_bounds(own: IRect, displays: &DisplayViewports) -> Vec<IRect> {
+    displays
+        .iter()
+        .map(|(other, _)| other.bounds())
+        .filter(|other| *other != own)
+        .collect()
 }
 
 /// `frame`, or its bottom tuck when more of it lies on another of `displays`
@@ -3345,11 +3498,7 @@ fn keep_on_own_display(
     margins: Margins,
 ) -> (IRect, Option<EdgeSlice>) {
     let own = display.bounds();
-    let others: Vec<IRect> = displays
-        .iter()
-        .map(|(other, _)| other.bounds())
-        .filter(|other| *other != own)
-        .collect();
+    let others = other_bounds(own, displays);
     let shown = margins.shown(frame);
     if !lies_mostly_elsewhere(shown, own, &others) {
         return (frame, None);
