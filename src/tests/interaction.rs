@@ -3286,10 +3286,12 @@ fn a_focused_window_no_app_owns_asks_no_app() {
     );
     harness.advance(Duration::from_secs(1));
     let reads = || {
-        (
-            state.window_list_reads(TEST_PROCESS_ID),
-            state.window_list_reads(BUSY_APP),
-        )
+        [TEST_PROCESS_ID, BUSY_APP].map(|pid| {
+            (
+                state.focused_window_reads(pid),
+                state.window_list_reads(pid),
+            )
+        })
     };
     let before = reads();
 
@@ -3298,7 +3300,7 @@ fn a_focused_window_no_app_owns_asks_no_app() {
         .write_message(Event::WindowFocused { window_id: CARET });
     harness.advance(Duration::from_millis(200));
 
-    assert_eq!(reads(), before, "no app was asked for its windows");
+    assert_eq!(reads(), before, "no app was asked for a window");
 }
 
 /// Focus on a window the engine missed finds it by asking the app that owns
@@ -3321,7 +3323,13 @@ fn a_focused_unknown_window_is_found_through_its_own_app() {
         MISSED,
         IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
     );
-    let reads = state.window_list_reads(TEST_PROCESS_ID);
+    let reads = || {
+        (
+            state.focused_window_reads(TEST_PROCESS_ID),
+            state.window_list_reads(TEST_PROCESS_ID),
+        )
+    };
+    let before = reads();
 
     harness
         .world()
@@ -3334,8 +3342,8 @@ fn a_focused_unknown_window_is_found_through_its_own_app() {
         "the missed window is managed"
     );
     assert_eq!(
-        state.window_list_reads(TEST_PROCESS_ID),
-        reads,
+        reads(),
+        before,
         "the app that does not own the window was not asked"
     );
 }
