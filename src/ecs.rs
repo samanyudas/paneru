@@ -419,6 +419,71 @@ pub struct AwaitResize {
     pub x: i32,
     /// The window's `ResizeAnchor`, relative to `x`.
     pub anchor_offset: i32,
+    /// Runs once `timer` has, while a column member's write has yet to land.
+    pub landing: Timer,
+}
+
+/// How long a read put off for a window write still on its way to the app
+/// waits for the write to land. Each AX call of a write can wait out the
+/// 0.25 s messaging timeout, so a slow app can take seconds to land one.
+/// Past this the app counts as stuck, and the read is dropped.
+pub const LANDING_LIMIT: Duration = Duration::from_secs(5);
+
+pub fn landing_timer() -> Timer {
+    Timer::new(LANDING_LIMIT, bevy::time::TimerMode::Once)
+}
+
+/// Where a read put off for a window write stands this frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Landing {
+    Landed,
+    Waiting,
+    GaveUp,
+}
+
+/// Ticks the wait of a read put off for a window write.
+pub fn poll_landing(timer: &mut Timer, pending: bool, delta: Duration) -> Landing {
+    if !pending {
+        Landing::Landed
+    } else if timer.tick(delta).is_finished() {
+        Landing::GaveUp
+    } else {
+        Landing::Waiting
+    }
+}
+
+/// A move report that arrived while the engine's own write to the window was
+/// still on its way to the app. The app may have reported it before the
+/// writer was done, so no later report is coming. The move handler reads the
+/// frame once the write lands.
+#[derive(Component, Debug, Deref, DerefMut)]
+pub struct DeferredMoveReport(pub Timer);
+
+impl Default for DeferredMoveReport {
+    fn default() -> Self {
+        Self(landing_timer())
+    }
+}
+
+/// [`DeferredMoveReport`] for a resize report.
+#[derive(Component, Debug, Deref, DerefMut)]
+pub struct DeferredResizeReport(pub Timer);
+
+impl Default for DeferredResizeReport {
+    fn default() -> Self {
+        Self(landing_timer())
+    }
+}
+
+/// A finished resize whose last write had not landed, so the check for a
+/// size the app refused waits for it.
+#[derive(Component, Debug, Deref, DerefMut)]
+pub struct DeferredResizeCheck(pub Timer);
+
+impl Default for DeferredResizeCheck {
+    fn default() -> Self {
+        Self(landing_timer())
+    }
 }
 
 /// The horizontal center a window had before its current run of resizes. The
@@ -628,11 +693,16 @@ pub enum DockPosition {
 #[derive(Component)]
 pub struct VerifyWindowPosition {
     remaining: u8,
+    /// Bounds the frames skipped while a write to the window is on its way.
+    pub landing: Timer,
 }
 
 impl Default for VerifyWindowPosition {
     fn default() -> Self {
-        Self { remaining: 3 }
+        Self {
+            remaining: 3,
+            landing: landing_timer(),
+        }
     }
 }
 

@@ -57,6 +57,7 @@ pub(crate) mod app;
 mod display;
 mod process;
 mod skylight;
+pub(crate) mod window_writer;
 mod windows;
 
 pub type Origin = IVec2;
@@ -184,6 +185,10 @@ pub trait WindowManagerApi: Send + Sync {
     fn windows_in_workspace(&self, space_id: WorkspaceId) -> Result<Vec<WinID>>;
     /// Returns `true` when a window is no longer ordered into the window list.
     fn window_is_unordered(&self, window_id: WinID) -> bool;
+
+    /// Waits up to `timeout` for every queued window move and resize to
+    /// reach its app.
+    fn flush_window_writes(&self, timeout: Duration);
 
     /// Sends an `Event::Exit` to the event loop, signaling the application to quit.
     ///
@@ -544,6 +549,12 @@ impl WindowManagerApi for WindowManagerOS {
             unsafe { SLSWindowIsOrderedIn(self.main_cid, window_id, &mut ordered_in) };
 
         ordered_status == 0 && ordered_in == 0
+    }
+
+    fn flush_window_writes(&self, timeout: Duration) {
+        if !windows::flush_window_writes(timeout) {
+            warn!("gave up waiting for window writes after {timeout:?}");
+        }
     }
 
     fn quit(&self) -> Result<()> {

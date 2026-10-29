@@ -23,6 +23,9 @@ pub enum Error {
     IO(String),
     /// A generic error with a descriptive message.
     Generic(String),
+    /// A read gave up waiting for the window's queued move or resize to
+    /// reach its app.
+    WriteNotLanded(crate::platform::WinID),
 }
 
 impl Error {
@@ -53,6 +56,7 @@ impl Display for Error {
             Error::InvalidInput(msg) => format!("Invalid input: {msg}"),
             Error::IO(msg) => format!("IO error: {msg}"),
             Error::Generic(msg) => format!("Generic error: {msg}"),
+            Error::WriteNotLanded(id) => format!("Window {id}: queued write has not landed"),
         };
         write!(f, "{msg}")
     }
