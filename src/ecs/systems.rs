@@ -1,6 +1,6 @@
 use bevy::app::AppExit;
 use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut};
-use bevy::ecs::entity::{Entity, EntityHashMap};
+use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
@@ -29,9 +29,9 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, SystemTheme, Unmanaged, WidthRatio,
-    WindowProperties,
+    KeptHeight, KeptHeightReread, KeptHold, LowPowerMode, MissionControlActive, Position,
+    ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    SystemTheme, Unmanaged, WidthRatio, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -120,6 +120,22 @@ type ResizableWindows<'w, 's> = Query<
         Has<ResizeMarker>,
     ),
     Without<LayoutStrip>,
+>;
+
+/// Windows whose `Bounds` changed, with what `commit_window_size` needs to
+/// leave out a write the app has refused and to notice a height it kept.
+type CommittedWindows<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut Window,
+        &'static mut Bounds,
+        &'static mut WidthRatio,
+        Option<&'static KeptHeight>,
+        Has<ResizeMarker>,
+    ),
+    Changed<Bounds>,
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
@@ -940,6 +956,8 @@ pub(super) fn window_resized_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: ResizableWindows,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
+    kept_heights: Query<&KeptHeight>,
+    mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::WindowResized { window_id } = event else {
@@ -972,7 +990,26 @@ pub(super) fn window_resized_update_frame(
             .as_ref()
             .is_some_and(|strip| strip.0.tabbed(entity));
 
+        // An echo of the height the app kept changes nothing. A slow app
+        // that takes the asked height releases the window in the next layout,
+        // even when its `Bounds` already show that height. Any other height
+        // is the user's or the app's own, so the next ask goes to the app
+        // again. Native tabs come through here too.
+        let mut released = false;
+        if let Ok(kept) = kept_heights.get(entity) {
+            if kept.hold(new_frame.height()) == KeptHold::Released {
+                released = !tabbed;
+            } else if kept.superseded_by(new_frame.height())
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_remove::<(KeptHeight, KeptHeightReread)>();
+            }
+        }
+
         let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
+        if released {
+            bounds.set_changed();
+        }
         if old_frame.size() != new_frame.size() {
             if tabbed {
                 bounds.bypass_change_detection().0 = new_frame.size();
@@ -1296,15 +1333,20 @@ pub(super) fn verify_window_position(
 /// focus is sized for its own, and a share of the other would grow or shrink
 /// the window wherever it went next. A window in no strip is of the active
 /// display.
+///
+/// `Window::resize` reads the frame back. A window that kept a taller height
+/// than asked gets a [`KeptHeight`], and its `Bounds` take that height at
+/// once, so the layout moves the windows below it out of the way. A window
+/// still in a resize animation is skipped: its `Bounds` are the animation's
+/// progress, not what the app shows. Its last step comes after the animation
+/// drops the `ResizeMarker`, and is checked like any other write.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_size(
     active_display: ActiveDisplay,
     strips: Query<(&LayoutStrip, &ChildOf)>,
     displays: Query<&Display>,
-    mut resized_windows: Populated<
-        (Entity, &mut Window, &Bounds, &mut WidthRatio),
-        Changed<Bounds>,
-    >,
+    mut resized_windows: CommittedWindows,
+    mut commands: Commands,
 ) {
     let fallback = active_display.bounds().width();
     let widths: EntityHashMap<i32> = resized_windows
@@ -1318,13 +1360,86 @@ pub(super) fn commit_window_size(
             (entity, width)
         })
         .collect();
+    let declined: EntityHashSet = resized_windows
+        .iter()
+        .filter(|(_, window, bounds, _, kept, _)| {
+            kept.is_some_and(|kept| kept.declines(window.frame().height(), bounds.0.y))
+        })
+        .map(|(entity, ..)| entity)
+        .collect();
     resized_windows
         .par_iter_mut()
-        .for_each(|(entity, mut window, size, mut width_ratio)| {
+        .for_each(|(entity, mut window, bounds, mut width_ratio, ..)| {
             let width = widths.get(&entity).copied().unwrap_or(fallback);
-            width_ratio.0 = f64::from(size.0.x) / f64::from(width);
-            objc2::rc::autoreleasepool(|_| window.resize(size.0));
+            width_ratio.0 = f64::from(bounds.0.x) / f64::from(width);
+            if !declined.contains(&entity) {
+                objc2::rc::autoreleasepool(|_| window.resize(bounds.0));
+            }
         });
+
+    for (entity, window, mut bounds, _, kept, resizing) in &mut resized_windows {
+        let height = window.frame().height();
+        if resizing || declined.contains(&entity) || height <= bounds.0.y + 1 {
+            continue;
+        }
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            continue;
+        };
+        debug!(
+            "window {} kept height {height} when asked for {}",
+            window.id(),
+            bounds.0.y
+        );
+        let asked = kept.map_or(bounds.0.y, |kept| kept.asked.min(bounds.0.y));
+        entity_commands.try_insert(KeptHeight {
+            asked,
+            kept: height,
+        });
+        if kept.is_none() {
+            entity_commands.try_insert(KeptHeightReread::default());
+        }
+        bounds.0.y = height;
+    }
+}
+
+/// Reads each window with a new [`KeptHeight`] once, after its
+/// [`KeptHeightReread`] wait, for a resize notice macOS did not send (two AX
+/// reads, no write). It acts as that notice would: a height at or below the
+/// one asked for releases the window in the next layout, and any other new
+/// height ends the record.
+#[instrument(level = Level::TRACE, skip_all)]
+pub(super) fn reread_kept_heights(
+    mut windows: Populated<
+        (
+            Entity,
+            &mut Window,
+            &mut Bounds,
+            &KeptHeight,
+            &mut KeptHeightReread,
+        ),
+        Without<ResizeMarker>,
+    >,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    for (entity, mut window, mut bounds, kept, mut reread) in &mut windows {
+        if !reread.0.tick(time.delta()).is_finished() {
+            continue;
+        }
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            continue;
+        };
+        entity_commands.try_remove::<KeptHeightReread>();
+        let Ok(height) = window.update_frame().map(|frame| frame.height()) else {
+            continue;
+        };
+        if kept.superseded_by(height) {
+            entity_commands.try_remove::<KeptHeight>();
+        } else if kept.hold(height) != KeptHold::Released {
+            continue;
+        }
+        bounds.0.y = height;
+    }
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any

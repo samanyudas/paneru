@@ -21,15 +21,16 @@ use crate::config::snippet::{RuleSubject, SnippetDialect, window_rule_snippet};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::{FocusHistory, PageHapticRequest};
 use crate::ecs::layout::{
-    Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, strip_signature,
+    Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, fit_kept_heights,
+    strip_signature,
 };
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::scroll::{PageFocusRequest, PageGestureState, PageInFlight};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, AwaitResize, Bounds, DockPosition, FocusedMarker,
-    FullWidthMarker, ManualStripOffset, NativeFullscreenMarker, Position, RaiseWindow,
-    RepositionMarker, ResizeAnchor, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt,
-    Timeout, Unmanaged,
+    FullWidthMarker, KeptHeight, KeptHold, ManualStripOffset, NativeFullscreenMarker, Position,
+    RaiseWindow, RepositionMarker, ResizeAnchor, SelectedVirtualMarker, SendMessageTrigger,
+    SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -1032,6 +1033,7 @@ fn resize_window_vertical(
     mut messages: MessageReader<Event>,
     windows: Windows,
     active_display: ActiveDisplay,
+    kept_heights: Query<(&KeptHeight, &Window)>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -1081,8 +1083,15 @@ fn resize_window_vertical(
         return;
     };
 
+    // A height an app has kept is not asked for again: the resize stops
+    // where the window, or its neighbour, would go below it.
+    let floor = |item: &StackItem| match kept_hold(&kept_heights, item) {
+        Some(KeptHold::Kept { kept, .. }) => kept.max(MIN_WINDOW_HEIGHT),
+        _ => MIN_WINDOW_HEIGHT,
+    };
+    let (floor, neighbour_floor) = (floor(&items[position]), floor(&items[neighbour]));
     let pair = frame.height() + neighbour_frame.height();
-    if pair < 2 * MIN_WINDOW_HEIGHT {
+    if pair < floor + neighbour_floor {
         return;
     }
 
@@ -1118,8 +1127,8 @@ fn resize_window_vertical(
                 }
             }),
     };
-    let new_height = round_px(next_ratio * f64::from(viewport.height()))
-        .clamp(MIN_WINDOW_HEIGHT, pair - MIN_WINDOW_HEIGHT);
+    let new_height =
+        round_px(next_ratio * f64::from(viewport.height())).clamp(floor, pair - neighbour_floor);
 
     // Leaving the pair's total untouched is what makes the new height survive
     // `binpack_heights`, which hands the column's last item the remainder.
@@ -1490,6 +1499,7 @@ fn equalize_column(
     current_focus: Single<(&Window, Entity), With<FocusedMarker>>,
     windows: Windows,
     active_display: ActiveDisplay,
+    kept_heights: Query<(&KeptHeight, &Window)>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -1510,18 +1520,37 @@ fn equalize_column(
     };
 
     if let Column::Stack(stack) = column {
-        #[allow(clippy::cast_precision_loss)]
-        let equal_height =
-            active_display.actual_bounds(&config).height() / i32::try_from(stack.len()).unwrap();
+        let total = active_display.actual_bounds(&config).height();
+        let Ok(count) = i32::try_from(stack.len()) else {
+            return;
+        };
+        let mut heights = vec![total / count; stack.len()];
+        // A window whose app kept more keeps it, and the others share the
+        // rest, so no resize asks for a height an app has refused. When the
+        // kept heights cannot all fit, the split stays even.
+        let holds = stack
+            .iter()
+            .map(|item| kept_hold(&kept_heights, item))
+            .collect::<Vec<_>>();
+        fit_kept_heights(&mut heights, &holds, total);
 
-        for item in &stack {
+        for (item, height) in stack.iter().zip(heights) {
             for entity in item.window_iter() {
                 if let Some(size) = windows.size(entity) {
-                    commands.resize_entity(entity, size.with_y(equal_height));
+                    commands.resize_entity(entity, size.with_y(height));
                 }
             }
         }
     }
+}
+
+fn kept_hold(kept_heights: &Query<(&KeptHeight, &Window)>, item: &StackItem) -> Option<KeptHold> {
+    item.kept_hold(&|entity| {
+        kept_heights
+            .get(entity)
+            .ok()
+            .map(|(kept, window)| kept.hold(window.frame().height()))
+    })
 }
 
 /// Makes all columns in the active strip the same width as the focused window.

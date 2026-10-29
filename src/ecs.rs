@@ -315,6 +315,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             (
                 systems::animate_resize_entities,
                 systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
+                systems::reread_kept_heights.run_if(not(resource_exists::<Initializing>)),
             )
                 .chain(),
         )
@@ -419,6 +420,71 @@ pub struct AwaitResize {
     pub x: i32,
     /// The window's `ResizeAnchor`, relative to `x`.
     pub anchor_offset: i32,
+}
+
+/// A window whose app kept a taller height than it was last asked for. Until
+/// the user resizes the window, its column gains or loses a window, or a
+/// display changes, the stack layout places the other windows around `kept`
+/// and nothing asks the window for less: the app has refused that once
+/// already. A slow app that applies `asked` after all releases the window,
+/// and the windows that made room for it get that room back.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct KeptHeight {
+    /// The height the app was asked for and did not take.
+    pub asked: i32,
+    /// The height the app kept instead.
+    pub kept: i32,
+}
+
+impl KeptHeight {
+    /// How the layout treats the window while it is `height` tall. One pixel
+    /// of slack, as `sizes_match` allows: macOS rounds some sizes.
+    pub fn hold(self, height: i32) -> KeptHold {
+        if height > self.asked + 1 {
+            KeptHold::Kept {
+                asked: self.asked,
+                kept: self.kept,
+            }
+        } else {
+            KeptHold::Released
+        }
+    }
+
+    /// Whether to leave out a write of `height` to a window that is
+    /// `current` tall: the app has already kept more than that once.
+    pub fn declines(self, current: i32, height: i32) -> bool {
+        matches!(self.hold(current), KeptHold::Kept { .. }) && height < self.kept - 1
+    }
+
+    /// Whether a window seen `height` tall, with no write of ours, ends the
+    /// record: neither the height the app kept nor the one it was asked for,
+    /// so the user or the app changed it.
+    pub fn superseded_by(self, height: i32) -> bool {
+        matches!(self.hold(height), KeptHold::Kept { .. }) && (height - self.kept).abs() > 1
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeptHold {
+    /// The app keeps `kept` after it was asked for `asked`.
+    Kept { asked: i32, kept: i32 },
+    /// The app has since taken the height it was asked for.
+    Released,
+}
+
+/// A window with a new [`KeptHeight`], read once more after a wait. A slow
+/// app may apply the asked height late without a resize notice. The read
+/// never writes, so it cannot be mistaken for the user or the app.
+#[derive(Component, Debug)]
+pub struct KeptHeightReread(pub Timer);
+
+impl Default for KeptHeightReread {
+    fn default() -> Self {
+        Self(Timer::new(
+            Duration::from_millis(500),
+            bevy::time::TimerMode::Once,
+        ))
+    }
 }
 
 /// The horizontal center a window had before its current run of resizes. The
