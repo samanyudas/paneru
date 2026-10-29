@@ -286,8 +286,8 @@ fn mouse_down_trigger(
 }
 
 /// Handles mouse-up events. Triggers the deferred reshuffle so the clicked
-/// window slides into view after the user releases the button. A window
-/// released from a title-bar drag is placed by its drop instead.
+/// window slides into view after the user releases the button. A window a
+/// title-bar press or drag holds is placed when the press or drag ends.
 fn mouse_up_trigger(
     mut messages: MessageReader<InputEvent>,
     mouse_held: Query<(Entity, &MouseHeldMarker)>,
@@ -299,9 +299,9 @@ fn mouse_up_trigger(
             continue;
         }
 
-        let dragged = drag.as_ref().and_then(|drag| drag.dragged());
+        let held = drag.as_ref().and_then(|drag| drag.held());
         for (held_entity, marker) in &mouse_held {
-            if dragged != Some(marker.0) {
+            if held != Some(marker.0) {
                 commands.reshuffle_around(marker.0);
             }
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {

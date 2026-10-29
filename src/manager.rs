@@ -39,8 +39,8 @@ use skylight::{
     _AXUIElementCreateWithRemoteToken, SLSConnectionGetPID, SLSCopyActiveMenuBarDisplayIdentifier,
     SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags,
     SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation,
-    SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSGetWindowOwner, SLSMainConnectionID,
-    SLSManagedDisplayGetCurrentSpace, SLSSpaceGetType, SLSWindowIsOrderedIn,
+    SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSGetWindowBounds, SLSGetWindowOwner,
+    SLSMainConnectionID, SLSManagedDisplayGetCurrentSpace, SLSSpaceGetType, SLSWindowIsOrderedIn,
     SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID,
     SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
     SLSWindowQueryWindows,
@@ -209,6 +209,12 @@ pub trait WindowManagerApi: Send + Sync {
     /// Returns the process that owns a window, as the window server has it:
     /// asks no application, so an unresponsive one can't stall the caller.
     fn window_owner(&self, window_id: WinID) -> Option<Pid>;
+
+    /// Returns a window's frame as the window server has it: asks no
+    /// application, so it is current even when the app's move notification
+    /// is late, and an unresponsive app can't stall the caller. The frame has
+    /// no padding.
+    fn window_bounds(&self, window_id: WinID) -> Result<IRect>;
 }
 
 /// `WindowManager` is a Bevy resource that holds a boxed `WindowManagerApi` trait object.
@@ -634,6 +640,13 @@ impl WindowManagerApi for WindowManagerOS {
             .to_result(function_name!())
             .ok()?;
         (pid != 0).then_some(pid)
+    }
+
+    fn window_bounds(&self, window_id: WinID) -> Result<IRect> {
+        let mut frame = CGRect::default();
+        unsafe { SLSGetWindowBounds(self.main_cid, window_id, &mut frame) }
+            .to_result(function_name!())?;
+        Ok(irect_from(frame))
     }
 }
 

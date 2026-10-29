@@ -19,10 +19,10 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With};
 use bevy::ecs::resource::Resource;
-use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, on_message, resource_exists};
+use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
 use bevy::ecs::system::{Commands, Query, Res, ResMut};
-use bevy::math::{IRect, IVec2};
+use bevy::math::{BVec2, IRect, IVec2};
 use bevy::time::Time;
 use objc2_core_foundation::CGPoint;
 use tracing::{Level, debug, instrument};
@@ -49,12 +49,19 @@ const DRAG_THRESHOLD: i32 = 4;
 /// still count as the window following the pointer.
 const MOVE_TOLERANCE: i32 = 8;
 
+/// How far a window held at a screen edge must move on its free axis to
+/// confirm a drag from that axis alone. Three times [`MOVE_TOLERANCE`], so a
+/// window that barely moves, or that its app moves on its own, stays within
+/// the tolerance and confirms nothing.
+const STRONG_MOVE: i32 = 3 * MOVE_TOLERANCE;
+
 /// How long after the pointer passes the drag threshold the window has to
 /// follow it. A window that moves later is the app moving it.
 const CONFIRM_WINDOW: Duration = Duration::from_millis(250);
 
 /// How long a press that never becomes a drag can last, even with the
-/// button down.
+/// button down. A real drag moves its window within the confirm window, so
+/// a hold this long is a button state stuck down or a lost release.
 const PRESS_LIMIT: Duration = Duration::from_secs(10);
 
 /// How long after a drop the dropped window stays watched.
@@ -242,6 +249,9 @@ fn gap_at(columns: &[ColumnSnap], x: i32) -> usize {
 pub(crate) struct PressedWindow {
     pub entity: Entity,
     pub frame: IRect,
+    /// Per axis, whether the frame touches an edge of its display on that
+    /// axis, where macOS can hold the window while the pointer moves on.
+    pub screen_edges: BVec2,
 }
 
 /// One thing that happened, as the drag state machine sees it.
@@ -303,6 +313,8 @@ pub(crate) struct Press {
     pub window_moved: Option<IVec2>,
     /// When the button first read as up, if it reads up now.
     pub button_up_since: Option<Duration>,
+    /// Per axis, whether a display edge can hold the window on that axis.
+    pub screen_edges: BVec2,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -328,6 +340,12 @@ pub(crate) enum DragState {
     Idle,
     /// The left button went down in a tiled window's title bar.
     Pressed(Press),
+    /// The button came up at `point` before the window was seen to follow
+    /// the pointer. Its move can still arrive within the confirm window.
+    Released { press: Press, point: IVec2 },
+    /// The window did not follow the pointer in time, but macOS may still be
+    /// dragging it, so the press holds it until the release.
+    Unconfirmed(Press),
     /// The window follows the pointer.
     Dragging(Drag),
     /// A drop just happened.
@@ -339,16 +357,37 @@ impl DragState {
     pub(crate) fn window(&self) -> Option<Entity> {
         match self {
             Self::Idle => None,
-            Self::Pressed(press) => Some(press.window),
+            Self::Pressed(press) | Self::Released { press, .. } | Self::Unconfirmed(press) => {
+                Some(press.window)
+            }
             Self::Dragging(drag) => Some(drag.window),
             Self::Settling(settle) => Some(settle.window),
         }
     }
 
-    /// The window being dragged, which nothing else should move.
-    pub(crate) fn dragged(&self) -> Option<Entity> {
+    /// The window a press or drag holds, which nothing else should move: a
+    /// dragged window, or a pressed one once the pointer has passed the drag
+    /// threshold, because macOS may be moving it with the pointer.
+    pub(crate) fn held(&self) -> Option<Entity> {
         match self {
+            Self::Pressed(press) if press.moved_at.is_some() => Some(press.window),
+            Self::Released { press, .. } | Self::Unconfirmed(press) => Some(press.window),
             Self::Dragging(drag) => Some(drag.window),
+            _ => None,
+        }
+    }
+
+    /// The press whose window may still follow the pointer: it has passed
+    /// the drag threshold, and the confirm window has not passed.
+    fn awaiting_move(&self, now: Duration) -> Option<&Press> {
+        match self {
+            Self::Pressed(press) | Self::Released { press, .. }
+                if press
+                    .moved_at
+                    .is_some_and(|at| now.saturating_sub(at) <= CONFIRM_WINDOW) =>
+            {
+                Some(press)
+            }
             _ => None,
         }
     }
@@ -386,34 +425,53 @@ pub(crate) fn step(
     };
     let state = match state {
         DragState::Settling(settle) if now >= settle.deadline => DragState::Idle,
+        DragState::Pressed(press) if confirm_passed(&press, now) => DragState::Unconfirmed(press),
         state => state,
     };
+    // The window that goes back to its slot when the press or drag holding
+    // it ends without a drop.
+    let held = state.held();
 
     match (state, input) {
-        // A press always starts afresh. One that arrives mid-drag means the
-        // release was lost, so the dragged window goes home first.
+        // A press always starts afresh, so a window the last gesture still
+        // held goes back to its slot first.
         (
-            state,
+            _,
             DragInput::Down {
                 point,
                 button: MouseButton::Left,
                 window,
             },
-        ) => (press(point, window, now), state.dragged().and_then(home)),
+        ) => (press(point, window, now), held.and_then(home)),
         // Nothing is left to place, so nothing is dropped.
         (state, DragInput::WindowGone { window }) if state.window() == Some(window) => {
             (DragState::Idle, None)
         }
-        (state, DragInput::Cancel) => (DragState::Idle, state.dragged().and_then(home)),
-        (DragState::Pressed(mut press), DragInput::Tick { button_down }) => {
-            let confirm_passed = press
-                .moved_at
-                .is_some_and(|at| now.saturating_sub(at) > CONFIRM_WINDOW);
-            let ended = let_go(&mut press.button_up_since, button_down, now)
-                || confirm_passed
-                || now.saturating_sub(press.at) > PRESS_LIMIT;
+        // The pointer moving with no button held means the release of a
+        // press never reached the tap.
+        (_, DragInput::Cancel) | (DragState::Pressed(_), DragInput::Moved) => {
+            (DragState::Idle, held.and_then(home))
+        }
+        (DragState::Released { press, point }, input) => released(press, point, input, now, hit),
+        (DragState::Unconfirmed(mut press), input) => {
+            let ended = match input {
+                DragInput::Up { .. } | DragInput::Moved => true,
+                DragInput::Tick { button_down } => press_ended(&mut press, button_down, now),
+                _ => false,
+            };
             if ended {
-                (DragState::Idle, None)
+                (DragState::Idle, home(press.window))
+            } else {
+                (DragState::Unconfirmed(press), None)
+            }
+        }
+        (DragState::Pressed(press), DragInput::Up { point }) => match press.moved_at {
+            Some(_) => (DragState::Released { press, point }, None),
+            None => (DragState::Idle, None),
+        },
+        (DragState::Pressed(mut press), DragInput::Tick { button_down }) => {
+            if press_ended(&mut press, button_down, now) {
+                (DragState::Idle, held.and_then(home))
             } else {
                 (DragState::Pressed(press), None)
             }
@@ -450,7 +508,12 @@ pub(crate) fn step(
 /// The state a left-button press leaves: [`DragState::Pressed`] in the title
 /// bar of a tiled window, otherwise idle.
 fn press(point: IVec2, window: Option<PressedWindow>, now: Duration) -> DragState {
-    let Some(PressedWindow { entity, frame }) = window else {
+    let Some(PressedWindow {
+        entity,
+        frame,
+        screen_edges,
+    }) = window
+    else {
         return DragState::Idle;
     };
     let in_title_bar = (frame.min.x..frame.max.x).contains(&point.x)
@@ -467,6 +530,7 @@ fn press(point: IVec2, window: Option<PressedWindow>, now: Duration) -> DragStat
         moved_at: None,
         window_moved: None,
         button_up_since: None,
+        screen_edges,
     })
 }
 
@@ -501,24 +565,19 @@ fn pressed(mut press: Press, input: DragInput, now: Duration) -> DragState {
                 press.window_moved = Some(moved);
             }
         }
+        // A resize is not a drag, and the window stays where the resize puts
+        // it, as without the option.
         DragInput::WindowResized { window } if window == press.window => {
             return DragState::Idle;
         }
-        DragInput::Up { .. } | DragInput::Moved => return DragState::Idle,
         _ => return DragState::Pressed(press),
     }
 
-    if press
-        .moved_at
-        .is_some_and(|moved_at| now.saturating_sub(moved_at) > CONFIRM_WINDOW)
-    {
-        return DragState::Idle;
-    }
     let follows = press.window_moved.is_some_and(|moved| {
         press
             .samples
             .iter()
-            .any(|sample| follows_pointer(moved, *sample - press.point))
+            .any(|sample| follows_pointer(moved, *sample - press.point, press.screen_edges))
     });
     if follows {
         DragState::Dragging(Drag {
@@ -531,12 +590,72 @@ fn pressed(mut press: Press, input: DragInput, now: Duration) -> DragState {
     }
 }
 
-/// Whether a window move of `moved` follows a pointer move of `pointer`:
-/// the pointer moved past the threshold and the window matches it within
-/// [`MOVE_TOLERANCE`] on both axes.
-fn follows_pointer(moved: IVec2, pointer: IVec2) -> bool {
+/// The next state of a press released at `point` before its window was
+/// seen to follow the pointer, and the drop it makes, if any. A window move
+/// that confirms the drag within the confirm window drops the window at the
+/// release point. Otherwise the window goes back to its slot.
+fn released(
+    press: Press,
+    point: IVec2,
+    input: DragInput,
+    now: Duration,
+    hit: &dyn Fn(Entity, IVec2, i32) -> DropTarget,
+) -> (DragState, Option<DragDrop>) {
+    let home = Some(DragDrop {
+        window: press.window,
+        target: DropTarget::Home,
+    });
+    if confirm_passed(&press, now) {
+        return (DragState::Idle, home);
+    }
+    if !matches!(
+        input,
+        DragInput::WindowMoved { .. } | DragInput::WindowResized { .. }
+    ) {
+        return (DragState::Released { press, point }, None);
+    }
+    match pressed(press, input, now) {
+        DragState::Dragging(drag) => {
+            step(DragState::Dragging(drag), DragInput::Up { point }, now, hit)
+        }
+        DragState::Pressed(press) => (DragState::Released { press, point }, None),
+        _ => (DragState::Idle, home),
+    }
+}
+
+/// Whether the confirm window of `press` has passed with its window not
+/// seen to follow the pointer.
+fn confirm_passed(press: &Press, now: Duration) -> bool {
+    press
+        .moved_at
+        .is_some_and(|at| now.saturating_sub(at) > CONFIRM_WINDOW)
+}
+
+/// Whether a window move of `moved` follows a pointer move of `pointer`.
+///
+/// The pointer must have moved past the threshold, and the window must
+/// match it within [`MOVE_TOLERANCE`] on both axes. A display edge can hold
+/// a window on one axis: a window on a display's left edge can move only
+/// down while the pointer moves right and down. So on an axis in
+/// `screen_edges`, the other axis alone confirms, when it matches the
+/// pointer and moves at least [`STRONG_MOVE`].
+fn follows_pointer(moved: IVec2, pointer: IVec2, screen_edges: BVec2) -> bool {
+    if !past_threshold(pointer) {
+        return false;
+    }
     let gap = (pointer - moved).abs();
-    past_threshold(pointer) && gap.x <= MOVE_TOLERANCE && gap.y <= MOVE_TOLERANCE
+    let along = |gap: i32, moved: i32| gap <= MOVE_TOLERANCE && moved.abs() >= STRONG_MOVE;
+    (gap.x <= MOVE_TOLERANCE && gap.y <= MOVE_TOLERANCE)
+        || (screen_edges.x && along(gap.y, moved.y))
+        || (screen_edges.y && along(gap.x, moved.x))
+}
+
+/// Records a read of the button for a press that is not a drag, and returns
+/// whether the press has ended: the button has been let go, or the press
+/// has reached [`PRESS_LIMIT`] even with the button reading down.
+fn press_ended(press: &mut Press, button_down: bool, now: Duration) -> bool {
+    let_go(&mut press.button_up_since, button_down, now)
+        || now.saturating_sub(press.at) > PRESS_LIMIT
 }
 
 /// Records a read of the button in `up_since`, and returns whether the
@@ -561,6 +680,8 @@ pub struct DragEventsPlugin;
 impl Plugin for DragEventsPlugin {
     fn build(&self, app: &mut App) {
         let in_progress = |state: Res<DragState>| *state != DragState::Idle;
+        let awaiting_move =
+            |state: Res<DragState>, time: Res<Time>| state.awaiting_move(time.elapsed()).is_some();
         let allowed = |config: Res<Config>, mission_control: Option<Res<MissionControlActive>>| {
             drags_allowed(&config, mission_control.as_deref())
         };
@@ -573,7 +694,7 @@ impl Plugin for DragEventsPlugin {
                     // check would read the old size back from the window
                     // before the new one is committed.
                     .after(super::focus::fix_window_size_on_focus)
-                    .run_if(on_message::<Event>)
+                    .run_if(on_message::<Event>.or_eager(awaiting_move))
                     .run_if(allowed),
                 drag_watchdog.after(drag_events).run_if(in_progress),
             )
@@ -614,7 +735,8 @@ fn drags_allowed(config: &Config, mission_control: Option<&MissionControlActive>
 }
 
 /// Feeds mouse and window events to [`step`] and applies the drops it asks
-/// for.
+/// for. While a press waits for its window to follow the pointer, it also
+/// feeds the window's frame as the window server has it.
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn drag_events(
@@ -631,21 +753,29 @@ fn drag_events(
     mut commands: Commands,
 ) {
     let now = time.elapsed();
-    for event in messages.read() {
+    let events = messages.read().collect::<Vec<_>>();
+    for (at, event) in events.iter().enumerate() {
         let Some(input) = drag_input(event, &state, &windows, &strips, |point, window_id| {
             // The window the tap saw under the press, because by now the
             // pressed window may have moved off the point.
-            let (entity, _) = window_id
-                .and_then(|id| find_window(&windows, id))
-                .or_else(|| {
-                    window_manager
-                        .find_window_at_point(&point)
-                        .ok()
-                        .and_then(|id| find_window(&windows, id))
-                })?;
+            let (entity, window) =
+                window_id
+                    .and_then(|id| find_window(&windows, id))
+                    .or_else(|| {
+                        window_manager
+                            .find_window_at_point(&point)
+                            .ok()
+                            .and_then(|id| find_window(&windows, id))
+                    })?;
+            // A move later in this update was already read into the cached
+            // frames, so they may show the window past where it was pressed.
+            let moved_later = events[at + 1..]
+                .iter()
+                .any(|later| matches!(later, Event::WindowMoved { .. }));
             pressed_window(
                 origin_from(point),
                 entity,
+                (!moved_later).then(|| window.frame()),
                 &strips,
                 &presented,
                 &placements,
@@ -654,29 +784,94 @@ fn drag_events(
         }) else {
             continue;
         };
-        if *state == DragState::Idle && !matches!(input, DragInput::Down { .. }) {
-            continue;
-        }
-
-        let (next, drop) = {
-            let snapshot = OnceCell::new();
-            let hit = |dragged, pointer, centre_dx| {
-                let snapshot = snapshot
-                    .get_or_init(|| snapshot_of(dragged, &strips, &placements, &displays, &config));
-                hit_test(snapshot, dragged, pointer, centre_dx)
-            };
-            step(state.clone(), input, now, &hit)
-        };
-        state.set_if_neq(next);
-
-        if let Some(drop) = drop {
-            debug!("dropping {} at {:?}", drop.window, drop.target);
-            let focused = windows
-                .get(drop.window)
-                .is_ok_and(|(_, _, _, focused)| focused);
-            apply_drop(drop, focused, &mut strips, &mut placements, &mut commands);
-        }
+        advance(
+            input,
+            now,
+            &mut state,
+            &windows,
+            &mut strips,
+            &mut placements,
+            &displays,
+            &config,
+            &mut commands,
+        );
     }
+
+    if let Some(input) = polled_move(&state, now, &windows, &window_manager) {
+        advance(
+            input,
+            now,
+            &mut state,
+            &windows,
+            &mut strips,
+            &mut placements,
+            &displays,
+            &config,
+            &mut commands,
+        );
+    }
+}
+
+/// Runs `input` through [`step`] and applies the drop it makes, if any.
+#[allow(clippy::too_many_arguments)]
+fn advance(
+    input: DragInput,
+    now: Duration,
+    state: &mut ResMut<DragState>,
+    windows: &WindowInfo,
+    strips: &mut Strips,
+    placements: &mut Placements,
+    displays: &Displays,
+    config: &Config,
+    commands: &mut Commands,
+) {
+    if **state == DragState::Idle && !matches!(input, DragInput::Down { .. }) {
+        return;
+    }
+
+    let (next, drop) = {
+        let snapshot = OnceCell::new();
+        let hit = |dragged, pointer, centre_dx| {
+            let snapshot =
+                snapshot.get_or_init(|| snapshot_of(dragged, strips, placements, displays, config));
+            hit_test(snapshot, dragged, pointer, centre_dx)
+        };
+        step((**state).clone(), input, now, &hit)
+    };
+    state.set_if_neq(next);
+
+    if let Some(drop) = drop {
+        debug!("dropping {} at {:?}", drop.window, drop.target);
+        let focused = windows
+            .get(drop.window)
+            .is_ok_and(|(_, _, _, focused)| focused);
+        apply_drop(drop, focused, strips, placements, commands);
+    }
+}
+
+/// The move of the window a press waits for, read from the window server,
+/// if the window has moved from where it was pressed.
+///
+/// An app's move notification can reach the engine after the confirm window
+/// has passed, though the window followed the pointer in time. The window
+/// server already has the new frame, and asking it asks no app. The reads
+/// stop when the confirm window passes.
+fn polled_move(
+    state: &DragState,
+    now: Duration,
+    windows: &WindowInfo,
+    window_manager: &WindowManager,
+) -> Option<DragInput> {
+    let press = state.awaiting_move(now)?;
+    let (_, window, _, _) = windows.get(press.window).ok()?;
+    let bounds = window_manager.window_bounds(window.id()).ok()?;
+    // The engine's frames include the window's padding.
+    let padding = IVec2::new(window.horizontal_padding(), window.vertical_padding());
+    let frame = IRect::from_corners(bounds.min - padding, bounds.max + padding);
+    (frame.min != press.frame.min).then_some(DragInput::WindowMoved {
+        window: press.window,
+        frame,
+    })
 }
 
 fn find_window<'a>(windows: &'a WindowInfo, window_id: WinID) -> Option<(Entity, &'a Window)> {
@@ -697,7 +892,7 @@ fn drag_input(
     // macOS may report any tab of a native tab group as the one that moved,
     // so a move of any tab counts as a move of the pressed one.
     let pressed_tab = |entity: Entity| match state {
-        DragState::Pressed(press)
+        DragState::Pressed(press) | DragState::Released { press, .. }
             if press.window != entity
                 && strips.iter().any(|(strip, ..)| {
                     strip
@@ -756,15 +951,19 @@ fn drag_input(
 }
 
 /// The tiled window `entity` as a press at `point` found it: in a strip
-/// shown on the display under the press, where the layout last presented it.
+/// shown on the display under the press, at `cached`, its frame as the
+/// engine last read or wrote it.
 ///
-/// The presented origin, not the live frame, gives the frame. The tap can
-/// hand over a whole gesture in one update, and by then the window has
-/// already followed the pointer away from the press. The presented origin
-/// also includes the offsets of a window parked as an edge sliver.
+/// A window still sliding to its slot, or held off it, is not where the
+/// layout presented it, so a move is measured from the cached frame. When
+/// `cached` is `None`, the tap handed over the gesture in one update, and
+/// the window may already have followed the pointer away from the press.
+/// The frame then comes from where the layout last presented the window,
+/// which includes the offsets of a window parked as an edge sliver.
 fn pressed_window(
     point: IVec2,
     entity: Entity,
+    cached: Option<IRect>,
     strips: &Strips,
     presented: &Query<&PresentedOrigin>,
     placements: &Placements,
@@ -776,14 +975,27 @@ fn pressed_window(
     if parked || !display.bounds().contains(point) {
         return None;
     }
-    let origin = presented.get(entity).ok()?.0;
-    // An app can resize its window after the layout placed it, so the size
-    // comes from the current bounds.
-    let (_, bounds) = placements.get(entity).ok()?;
+    let frame = cached.or_else(|| {
+        let origin = presented.get(entity).ok()?.0;
+        // An app can resize its window after the layout placed it, so the
+        // size comes from the current bounds.
+        let (_, bounds) = placements.get(entity).ok()?;
+        Some(IRect::from_corners(origin, origin + bounds.0))
+    })?;
     Some(PressedWindow {
         entity,
-        frame: IRect::from_corners(origin, origin + bounds.0),
+        frame,
+        screen_edges: screen_edges(frame, display.bounds()),
     })
+}
+
+/// Per axis, whether `frame` has an edge on the matching edge of `display`.
+fn screen_edges(frame: IRect, display: IRect) -> BVec2 {
+    let near = |a: i32, b: i32| (a - b).abs() <= MOVE_TOLERANCE;
+    BVec2::new(
+        near(frame.min.x, display.min.x) || near(frame.max.x, display.max.x),
+        near(frame.min.y, display.min.y) || near(frame.max.y, display.max.y),
+    )
 }
 
 /// Ends a press or drag the tap never saw end: the button reads as up for
@@ -1033,6 +1245,7 @@ mod tests {
             window: Some(PressedWindow {
                 entity: window,
                 frame: FRAME,
+                screen_edges: BVec2::FALSE,
             }),
         }
     }
@@ -1113,6 +1326,7 @@ mod tests {
             window: Some(PressedWindow {
                 entity: w,
                 frame: FRAME,
+                screen_edges: BVec2::FALSE,
             }),
         };
         let no_tiled_window = DragInput::Down {
@@ -1249,8 +1463,9 @@ mod tests {
         let (state, _) = run(&[down(w, PRESS), dragged(IVec2::new(50, 0))]);
         assert!(is_pressed(&state), "{state:?}");
 
-        let (state, _) = run_from(state, &[moved_by(w, IVec2::new(50, 0))], ms(400));
-        assert_eq!(state, DragState::Idle);
+        let (state, drops) = run_from(state, &[moved_by(w, IVec2::new(50, 0))], ms(400));
+        assert!(matches!(state, DragState::Unconfirmed(_)), "{state:?}");
+        assert_eq!(drops, vec![]);
     }
 
     #[test]
@@ -1335,25 +1550,242 @@ mod tests {
     /// Every press ends: a button stuck down can not hold a window that never
     /// followed the pointer. A drag held still with the button down goes on.
     #[test]
-    fn a_press_held_down_ends_at_its_limit_or_its_confirm_window() {
+    fn a_press_held_down_ends_at_its_limit() {
         let w = entities(1)[0];
         let held = DragInput::Tick { button_down: true };
         let (pressed, _) = run(&[down(w, PRESS)]);
 
         let (state, _) = run_from(pressed.clone(), &[held], Duration::from_secs(9));
         assert!(is_pressed(&state), "{state:?}");
-        let (state, _) = run_from(pressed, &[held], PRESS_LIMIT + ms(1));
-        assert_eq!(state, DragState::Idle);
+        let (state, drops) = run_from(pressed, &[held], PRESS_LIMIT + ms(1));
+        assert_eq!((state, drops), (DragState::Idle, vec![]));
 
         let (moved, _) = run(&[down(w, PRESS), dragged(IVec2::new(50, 0))]);
         let (state, _) = run_from(moved.clone(), &[held], ms(20) + CONFIRM_WINDOW);
         assert!(is_pressed(&state), "{state:?}");
         let (state, _) = run_from(moved, &[held], ms(21) + CONFIRM_WINDOW);
-        assert_eq!(state, DragState::Idle);
+        assert!(matches!(state, DragState::Unconfirmed(_)), "{state:?}");
+        let (still, _) = run_from(state.clone(), &[held], Duration::from_secs(9));
+        assert_eq!(still, state, "held until the limit");
+        let (state, drops) = run_from(state, &[held], PRESS_LIMIT + ms(1));
+        assert_eq!((state, drops), (DragState::Idle, home(w)));
 
         let (state, drops) = run_from(dragging(w), &[held], Duration::from_secs(60));
         assert!(matches!(state, DragState::Dragging(_)), "{state:?}");
         assert_eq!(drops, vec![]);
+    }
+
+    fn unconfirmed(w: Entity) -> DragState {
+        let (state, _) = run(&[down(w, PRESS), dragged(IVec2::new(50, 0))]);
+        let (state, _) = run_from(state, &[moved_by(w, IVec2::new(0, 50))], ms(40));
+        let (state, _) = run_from(
+            state,
+            &[DragInput::Tick { button_down: true }],
+            ms(21) + CONFIRM_WINDOW,
+        );
+        assert!(matches!(state, DragState::Unconfirmed(_)), "{state:?}");
+        state
+    }
+
+    fn released(w: Entity, point: IVec2) -> DragState {
+        let (state, _) = run(&[
+            down(w, PRESS),
+            dragged(IVec2::new(50, 0)),
+            DragInput::Up { point },
+        ]);
+        assert!(matches!(state, DragState::Released { .. }), "{state:?}");
+        state
+    }
+
+    /// A press holds its window once the pointer has passed the threshold,
+    /// because macOS may be moving it. A click holds nothing.
+    #[test]
+    fn a_press_holds_its_window_once_the_pointer_moves() {
+        let w = entities(1)[0];
+        let (clicked, _) = run(&[down(w, PRESS)]);
+        assert_eq!(clicked.held(), None);
+        let (moved, _) = run(&[down(w, PRESS), dragged(IVec2::new(50, 0))]);
+        assert_eq!(moved.held(), Some(w));
+        for state in [unconfirmed(w), released(w, PRESS), dragging(w)] {
+            assert_eq!(state.held(), Some(w), "{state:?}");
+        }
+
+        let (state, drops) = run(&[down(w, PRESS), DragInput::Up { point: PRESS }]);
+        assert_eq!((state, drops), (DragState::Idle, vec![]), "a click");
+    }
+
+    /// The release comes before the window's move. The drop waits for the
+    /// move and lands where the button came up.
+    #[test]
+    fn a_quick_drop_waits_for_its_window_and_drops_at_the_release() {
+        let w = entities(1)[0];
+        let release = IVec2::new(320, 200);
+        let state = released(w, release);
+
+        let (state, drops) = run_from(
+            state,
+            &[
+                DragInput::Dragged { point: PRESS },
+                DragInput::Moved,
+                DragInput::Tick { button_down: false },
+            ],
+            ms(60),
+        );
+        assert!(matches!(state, DragState::Released { .. }), "{state:?}");
+        assert_eq!(drops, vec![]);
+
+        let (state, drops) = run_from(state, &[moved_by(w, IVec2::new(50, 0))], ms(200));
+        assert_eq!(state.settling(), Some(w));
+        assert_eq!(
+            drops,
+            vec![DragDrop {
+                window: w,
+                target: hit_at(w, release, 0),
+            }]
+        );
+    }
+
+    /// A released press whose window never follows, follows too late, or
+    /// changes size sends the window back to its slot.
+    #[test]
+    fn a_released_press_whose_window_does_not_follow_goes_home() {
+        let w = entities(1)[0];
+        let tick = DragInput::Tick { button_down: false };
+        let late = ms(21) + CONFIRM_WINDOW;
+
+        let (state, drops) = run_from(released(w, PRESS), &[tick], late);
+        assert_eq!((state, drops), (DragState::Idle, home(w)));
+        let (state, drops) = run_from(released(w, PRESS), &[moved_by(w, IVec2::new(50, 0))], late);
+        assert_eq!((state, drops), (DragState::Idle, home(w)));
+        let (state, drops) = run_from(
+            released(w, PRESS),
+            &[DragInput::WindowResized { window: w }],
+            ms(60),
+        );
+        assert_eq!((state, drops), (DragState::Idle, home(w)));
+    }
+
+    /// An unconfirmed press holds its window while the button is down, and
+    /// sends it back to its slot when the press ends.
+    #[test]
+    fn an_unconfirmed_press_holds_its_window_until_the_release() {
+        let w = entities(1)[0];
+        let state = unconfirmed(w);
+        let held = [
+            DragInput::Dragged { point: PRESS },
+            moved_by(w, IVec2::new(50, 0)),
+            DragInput::WindowResized { window: w },
+            DragInput::Tick { button_down: true },
+        ];
+        let (next, drops) = run_from(state.clone(), &held, ms(400));
+        assert!(matches!(next, DragState::Unconfirmed(_)), "{next:?}");
+        assert_eq!(drops, vec![]);
+
+        let up = DragInput::Tick { button_down: false };
+        for ending in [
+            vec![DragInput::Up { point: PRESS }],
+            vec![DragInput::Moved],
+            vec![up, up],
+            vec![down(w, PRESS)],
+            vec![DragInput::Cancel],
+        ] {
+            let mut times = [ms(400), ms(401) + RELEASE_GRACE].into_iter();
+            let (mut next, mut drops) = (state.clone(), Vec::new());
+            for input in &ending {
+                let (after, drop) = step(next, *input, times.next().unwrap(), &hit_at);
+                next = after;
+                drops.extend(drop);
+            }
+            assert_eq!(drops, home(w), "{ending:?}");
+            assert_eq!(next.held(), None, "{ending:?}");
+        }
+    }
+
+    /// A resize is not a drag. It ends the press without sending the window
+    /// back, so the window stays where the resize puts it.
+    #[test]
+    fn a_resize_ends_a_press_without_moving_the_window() {
+        let w = entities(1)[0];
+        let (state, drops) = run(&[
+            down(w, PRESS),
+            dragged(IVec2::new(0, -50)),
+            DragInput::WindowResized { window: w },
+        ]);
+        assert_eq!((state, drops), (DragState::Idle, vec![]));
+    }
+
+    /// A window on a display's left edge moves only down while the pointer
+    /// moves right and down. Its vertical move alone confirms the drag, but
+    /// only when it is large, and only for a window at an edge.
+    #[test]
+    fn a_window_at_a_screen_edge_confirms_a_drag_on_its_free_axis() {
+        let w = entities(1)[0];
+        let at_edges = |screen_edges| DragInput::Down {
+            point: PRESS,
+            button: MouseButton::Left,
+            window: Some(PressedWindow {
+                entity: w,
+                frame: FRAME,
+                screen_edges,
+            }),
+        };
+        let left_edge = BVec2::new(true, false);
+        let bottom_edge = BVec2::new(false, true);
+        let confirms = |screen_edges, pointer: IVec2, window: IVec2| {
+            let (state, _) = run(&[
+                at_edges(screen_edges),
+                dragged(pointer),
+                moved_by(w, window),
+            ]);
+            matches!(state, DragState::Dragging(_))
+        };
+
+        assert!(confirms(left_edge, IVec2::new(30, 300), IVec2::new(0, 300)));
+        assert!(confirms(
+            bottom_edge,
+            IVec2::new(300, 30),
+            IVec2::new(300, 0)
+        ));
+        assert!(
+            !confirms(BVec2::FALSE, IVec2::new(30, 300), IVec2::new(0, 300)),
+            "off the edges both axes must match"
+        );
+        assert!(
+            !confirms(bottom_edge, IVec2::new(30, 300), IVec2::new(0, 300)),
+            "the held axis must be the one at the edge"
+        );
+        assert!(
+            !confirms(left_edge, IVec2::new(30, 20), IVec2::new(0, 20)),
+            "a move under STRONG_MOVE confirms nothing"
+        );
+        assert!(
+            !confirms(left_edge, IVec2::new(180, 0), IVec2::new(0, 240)),
+            "a window moving across the pointer"
+        );
+    }
+
+    #[test]
+    fn a_frame_at_a_display_edge_marks_that_axis() {
+        let display = IRect::new(0, 0, 1024, 768);
+        let frame = |x, y, w, h| IRect::new(x, y, x + w, y + h);
+        assert_eq!(
+            screen_edges(frame(0, 20, 400, 748), display),
+            BVec2::new(true, true)
+        );
+        assert_eq!(
+            screen_edges(frame(400, 20, 400, 700), display),
+            BVec2::FALSE
+        );
+        assert_eq!(
+            screen_edges(frame(630, 20, 400, 700), display),
+            BVec2::new(true, false),
+            "within the tolerance of the right edge"
+        );
+        assert_eq!(
+            screen_edges(frame(400, 30, 400, 700), IRect::new(0, 30, 1024, 768)),
+            BVec2::new(false, true),
+            "the top edge of the display"
+        );
     }
 
     #[test]
@@ -1385,6 +1817,10 @@ mod tests {
         assert_eq!(
             run_from(pressed, &[DragInput::Cancel], ms(100)),
             (DragState::Idle, vec![])
+        );
+        assert_eq!(
+            run_from(released(w, PRESS), &[DragInput::Cancel], ms(100)),
+            (DragState::Idle, home(w))
         );
         assert_eq!(
             run_from(dragging(w), &[DragInput::Cancel], ms(100)),
@@ -1770,7 +2206,7 @@ mod tests {
         harness
             .on_iteration(1, |_, state| state.os_move_window(1, IVec2::new(0, 590)))
             .on_iteration(2, |world, state| {
-                let dragging = world.resource::<DragState>().dragged().is_some();
+                let dragging = matches!(world.resource::<DragState>(), DragState::Dragging(_));
                 assert!(dragging, "{:?}", world.resource::<DragState>());
                 state.os_close_window(1);
             })

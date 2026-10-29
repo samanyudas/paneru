@@ -1242,6 +1242,80 @@ fn an_app_moving_its_window_across_the_pointer_is_not_a_drag() {
     .run(commands);
 }
 
+/// A press waits for its window to follow the pointer only for the confirm
+/// window. It asks the window server, never the app, where the window is,
+/// and stops asking when the confirm window passes, though the button stays
+/// down.
+#[test]
+fn a_waiting_press_asks_only_the_window_server_and_only_within_the_confirm_window() {
+    let from = Origin::new(1000, 30);
+    let to = Origin::new(200, 30);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(from, 2),
+        drag_to(to),
+        settle(),
+        release(to),
+        settle(),
+    ];
+
+    holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_windows(3),
+    )
+    .on_iteration(1, |_, state| {
+        assert_eq!(state.take_bounds_reads(), 0, "a press that has not moved");
+        state.take_ax_frame_reads();
+    })
+    .on_iteration(2, |_, state| {
+        assert!(
+            state.take_bounds_reads() > 0,
+            "the press waited for its window"
+        );
+        assert_eq!(state.take_ax_frame_reads(), 0, "no AX frame read");
+    })
+    .on_iteration(3, |_, state| {
+        assert_eq!(state.take_bounds_reads(), 0, "past the confirm window");
+    })
+    .run(commands);
+}
+
+/// The engine pads a window's frame, and the window server's frame has no
+/// padding. A late-reported drag of a padded window still drops.
+#[test]
+fn a_late_reported_drag_of_a_padded_window_still_drops() {
+    let from = Origin::new(1000, 30);
+    let to = Origin::new(200, 600);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(from, 2),
+        drag_to(to),
+        Event::WindowMoved { window_id: 2 },
+        release(to),
+        settle(),
+    ];
+
+    holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_windows(3),
+    )
+    .on_iteration(0, |_, state| {
+        state.update_window(2, |window| {
+            window.horizontal_padding = 6;
+            window.vertical_padding = 4;
+        });
+    })
+    .on_iteration(1, move |world, state| {
+        move_unreported(world, &state, 2, to - from);
+    })
+    .on_iteration(5, |world, _| {
+        assert_eq!(columns(world), vec![vec![0, 2], vec![1]]);
+    })
+    .run(commands);
+}
+
 const UNCONFIRMED_FROM: Origin = Origin::new(600, 30);
 
 /// Window 1 is on no side edge of the display. The pointer moves right and
@@ -1347,4 +1421,82 @@ fn without_the_option_a_late_reported_drag_leaves_the_layout_alone() {
             assert_window_at!(world, 2, 624, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
+}
+
+fn dragging(world: &World) -> bool {
+    matches!(
+        world.resource::<crate::ecs::drag::DragState>(),
+        crate::ecs::drag::DragState::Dragging(_)
+    )
+}
+
+/// The window server has window 2 40 points left of its slot, where it
+/// stays. A press on its title bar, then a pointer move of 40 points left
+/// with the window still, as in a toolbar text selection, is not a drag.
+#[test]
+fn a_still_window_off_its_slot_is_not_dragged_by_a_pointer_moving_its_offset() {
+    let from = Origin::new(960, 30);
+    let to = Origin::new(920, 30);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(from, 2),
+        drag_to(to),
+        settle(),
+        release(to),
+        settle(),
+    ];
+
+    holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_windows(3),
+    )
+    .on_iteration(0, |world, state| {
+        move_unreported(world, &state, 2, IVec2::new(-40, 0));
+    })
+    .on_iteration(2, |world, _| assert!(!dragging(world)))
+    .on_iteration(3, |world, _| assert!(!dragging(world)))
+    .on_iteration(5, |world, _| {
+        assert_eq!(columns(world), vec![vec![0], vec![1], vec![2]]);
+    })
+    .run(commands);
+}
+
+/// With a slow animation, window 2 is still sliding left to its slot at
+/// x = 624 when its title bar is pressed. The pointer then moves 60 points
+/// right, against the slide, and the window does not follow it. The window's
+/// distance from its slot passes 60 points as it slides, but that is not a
+/// drag.
+#[test]
+fn a_window_sliding_to_its_slot_is_not_dragged_by_a_pointer_it_does_not_follow() {
+    let from = Origin::new(900, 30);
+    let to = Origin::new(960, 30);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::Focus(Direction::Last)),
+        press(from, 2),
+        drag_to(to),
+        settle(),
+        release(to),
+        settle(),
+    ];
+
+    holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_windows(3),
+    )
+    .on_iteration(0, |world, _| {
+        world.insert_resource(config("drag_to_reorder = true\nanimation_speed = 1\n"));
+    })
+    .on_iteration(1, |world, _| {
+        let x = frame(world, 2).min.x;
+        assert!(x > 624 + 100 && x < 800, "still sliding, at x = {x}");
+    })
+    .on_iteration(3, |world, _| assert!(!dragging(world)))
+    .on_iteration(4, |world, _| assert!(!dragging(world)))
+    .on_iteration(6, |world, _| {
+        assert_eq!(columns(world), vec![vec![0], vec![1], vec![2]]);
+    })
+    .run(commands);
 }

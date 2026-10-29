@@ -561,9 +561,9 @@ fn autocenter_window_on_focus(
     if global_state.skip_reshuffle() || global_state.initializing() || !mouse_held.is_empty() {
         return;
     }
-    // A dragged or just dropped window is where the drag put it, and its
-    // drop scrolls only as far as needed to show it.
-    if drag.is_some_and(|drag| drag.dragged() == Some(entity) || drag.settling() == Some(entity)) {
+    // A window a press or drag holds is where macOS put it. A just dropped
+    // window's drop scrolls only as far as needed to show it.
+    if drag.is_some_and(|drag| drag.held() == Some(entity) || drag.settling() == Some(entity)) {
         return;
     }
     if active_display.active_strip().tabbed(entity) {
