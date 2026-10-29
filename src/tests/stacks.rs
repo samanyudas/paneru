@@ -26,11 +26,15 @@ fn command(operation: Operation) -> Event {
 }
 
 fn tall_harness() -> TestHarness {
+    tall_harness_with_windows(3)
+}
+
+fn tall_harness_with_windows(count: i32) -> TestHarness {
     let harness = TestHarness::new();
     harness
         .mock_state
         .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, TEST_DISPLAY_WIDTH, TALL));
-    harness.with_windows(3)
+    harness.with_windows(count)
 }
 
 /// Stacks windows 1 and 2 under window 0, one at a time, so one column holds
@@ -137,4 +141,41 @@ fn a_stack_command_that_changes_nothing_keeps_set_heights() {
     harness.advance(SETTLE);
 
     assert_eq!(column_heights(harness.world(), &[0, 1, 2]), before);
+}
+
+/// Window 1 accepts no less than 500 px. By the time window 3 joins, window 1
+/// already sits at that minimum, so the even split's smaller height changes
+/// nothing and the app reports no resize.
+#[test]
+fn a_window_with_a_minimum_height_does_not_overlap_the_next() {
+    let mut harness = tall_harness_with_windows(4);
+    harness
+        .mock_state
+        .update_window(1, |window| window.min_height = 500);
+    stack_three(&mut harness);
+    harness.run(vec![
+        command(Operation::Focus(Direction::Last)),
+        command(Operation::Stack(true)),
+    ]);
+    harness.advance(SETTLE);
+
+    let heights = column_heights(harness.world(), &[0, 1, 2, 3]);
+    assert_eq!(heights[1], 500, "{heights:?}");
+    assert_even(&[heights[0], heights[2], heights[3]], COLUMN - 500);
+}
+
+/// The last window gets what is left of the column, so when it is the one
+/// with a minimum height, the windows above it make room.
+#[test]
+fn a_last_window_with_a_minimum_height_stays_on_screen() {
+    let mut harness = tall_harness();
+    harness
+        .mock_state
+        .update_window(2, |window| window.min_height = 500);
+    stack_three(&mut harness);
+
+    let heights = column_heights(harness.world(), &[0, 1, 2]);
+    assert_eq!(heights[2], 500, "{heights:?}");
+    assert_eq!(frame(harness.world(), 2).max.y, TALL, "ends at the bottom");
+    assert_even(&heights[..2], COLUMN - 500);
 }

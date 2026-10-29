@@ -49,6 +49,8 @@ pub(crate) struct MockWindowData {
     pub(crate) min_width: i32,
     /// The widest width the app accepts, or no limit when zero.
     pub(crate) max_width: i32,
+    /// The shortest height the app accepts, like an `NSWindow.minSize`.
+    pub(crate) min_height: i32,
 }
 
 impl Default for MockWindowData {
@@ -71,6 +73,7 @@ impl Default for MockWindowData {
             child_role: false,
             min_width: 0,
             max_width: 0,
+            min_height: 0,
         }
     }
 }
@@ -496,7 +499,8 @@ impl MockState {
                     i32::MAX
                 };
                 let width = size.x.max(w.min_width).min(max_width);
-                w.frame.max = w.frame.min + size.with_x(width);
+                let height = size.y.max(w.min_height);
+                w.frame.max = w.frame.min + size.with_x(width).with_y(height);
             }
         });
 
