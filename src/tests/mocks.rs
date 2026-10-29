@@ -110,6 +110,9 @@ struct MockStateInner {
     /// How many times each app has been asked for its focused window or its
     /// window list, so a test can check who a lookup bothers.
     app_reads: HashMap<Pid, usize>,
+    /// How many times any window's frame was read from its app over AX, so a
+    /// test can check what asks apps for their frames.
+    ax_frame_reads: usize,
 }
 
 impl MockStateInner {
@@ -155,6 +158,7 @@ impl MockState {
                 background_tabs: HashSet::new(),
                 raised: Vec::new(),
                 app_reads: HashMap::new(),
+                ax_frame_reads: 0,
             })),
         }
     }
@@ -178,6 +182,12 @@ impl MockState {
     /// list since this was last called.
     pub fn take_app_reads(&self, pid: Pid) -> usize {
         self.inner.force_write().app_reads.remove(&pid).unwrap_or(0)
+    }
+
+    /// How many window frames were read from their apps over AX since this
+    /// was last called.
+    pub fn take_ax_frame_reads(&self) -> usize {
+        std::mem::take(&mut self.inner.force_write().ax_frame_reads)
     }
 
     /// Makes `window_id` a background native tab: on screen as far as the
@@ -591,8 +601,9 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_update_frame().returning(move || {
-            s.inner
-                .force_read()
+            let mut inner = s.inner.force_write();
+            inner.ax_frame_reads += 1;
+            inner
                 .windows
                 .get(&id)
                 .map(|w| w.frame)

@@ -1050,3 +1050,301 @@ fn a_full_width_window_that_joins_a_column_can_be_made_full_width_again() {
         })
         .run(commands);
 }
+
+/// Moves `window` by `by` as the window server has it, with no move
+/// notification from its app yet.
+fn move_unreported(world: &mut World, state: &MockState, window: WinID, by: IVec2) {
+    let origin = frame(world, window).min + by;
+    state.update_window(window, |window| {
+        window.frame = IRect::from_corners(origin, origin + window.frame.size());
+    });
+}
+
+/// The window follows the pointer, but its app's move notification reaches
+/// the engine 500 ms later, past the confirm window. A slow window ID lookup
+/// behind the notification can delay it like this.
+#[test]
+fn a_drag_whose_move_notification_arrives_late_still_drops() {
+    let from = Origin::new(1000, 30);
+    let to = Origin::new(200, 600);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(from, 2),
+        drag_to(to),
+        Event::WindowMoved { window_id: 2 },
+        release(to),
+        settle(),
+    ];
+
+    holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_windows(3),
+    )
+    .on_iteration(1, move |world, state| {
+        move_unreported(world, &state, 2, to - from);
+    })
+    .on_iteration(5, |world, _| {
+        assert_eq!(columns(world), vec![vec![0, 2], vec![1]]);
+        assert_focused!(world, 2);
+    })
+    .run(commands);
+}
+
+/// The button comes up in the same update as the pointer's move, and the
+/// window's move is reported only after the release. The drop waits for it.
+#[test]
+fn a_quick_drop_reported_after_its_release_still_drops() {
+    let from = Origin::new(1000, 30);
+    let to = Origin::new(200, 600);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(from, 2),
+        release(to),
+        settle(),
+    ];
+
+    holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_windows(3),
+    )
+    .on_iteration(1, move |world, state| {
+        state.os_move_window(2, frame(world, 2).min + (to - from));
+        world.write_message(drag_to(to));
+    })
+    .on_iteration(3, |world, _| {
+        assert_eq!(columns(world), vec![vec![0, 2], vec![1]]);
+        assert_focused!(world, 2);
+    })
+    .run(commands);
+}
+
+/// A quick drop whose window moves only after the confirm window is an app
+/// moving it, not a drag.
+#[test]
+fn a_quick_drop_whose_window_moves_only_after_the_confirm_window_is_not_a_drag() {
+    let from = Origin::new(1000, 30);
+    let to = Origin::new(200, 600);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(from, 2),
+        release(to),
+        settle(),
+    ];
+
+    holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_windows(3),
+    )
+    .on_iteration(1, move |world, _| {
+        world.write_message(drag_to(to));
+    })
+    .on_iteration(2, move |world, state| {
+        state.os_move_window(2, frame(world, 2).min + (to - from));
+    })
+    .on_iteration(3, |world, _| {
+        assert_eq!(columns(world), vec![vec![0], vec![1], vec![2]]);
+    })
+    .run(commands);
+}
+
+/// Selecting text in a toolbar moves the pointer but not the window, so it
+/// never becomes a drag. No app is asked for its window's frame while the
+/// press waits for the window to follow.
+#[test]
+fn a_toolbar_text_selection_never_becomes_a_drag() {
+    let from = Origin::new(1000, 30);
+    let to = Origin::new(200, 30);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(from, 2),
+        drag_to(to),
+        settle(),
+        release(to),
+        settle(),
+    ];
+
+    holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_windows(3),
+    )
+    .on_iteration(1, |_, state| {
+        state.take_ax_frame_reads();
+    })
+    .on_iteration(2, |_, state| {
+        assert_eq!(state.take_ax_frame_reads(), 0, "no AX frame read");
+    })
+    .on_iteration(5, |world, _| {
+        assert_eq!(columns(world), vec![vec![0], vec![1], vec![2]]);
+    })
+    .run(commands);
+}
+
+/// Window 0's left edge is on the display's left edge. The pointer moves
+/// right and down, but macOS holds the window on the edge and moves it only
+/// down. The drop still lands where the pointer is.
+#[test]
+fn a_window_held_at_a_screen_edge_still_drags_and_drops_at_the_pointer() {
+    let from = Origin::new(200, 30);
+    let to = Origin::new(600, 600);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(from, 0),
+        drag_to(from + IVec2::new(30, 300)),
+        drag_to(to),
+        release(to),
+        settle(),
+    ];
+
+    holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_windows(3),
+    )
+    .on_iteration(0, |world, _| assert_three_columns(world))
+    .on_iteration(1, |world, state| {
+        state.os_move_window(0, frame(world, 0).min + IVec2::new(0, 300));
+    })
+    .on_iteration(5, |world, _| {
+        assert_eq!(columns(world), vec![vec![1, 0], vec![2]]);
+        assert_focused!(world, 0);
+    })
+    .run(commands);
+}
+
+/// The pointer moves right while the app moves its window down. The window
+/// is on the display's left edge, so one axis alone may confirm a drag, but
+/// neither axis matches the pointer.
+#[test]
+fn an_app_moving_its_window_across_the_pointer_is_not_a_drag() {
+    let from = Origin::new(200, 30);
+    let to = from + IVec2::new(180, 0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(from, 0),
+        drag_to(to),
+        release(to),
+        settle(),
+    ];
+
+    holding(
+        TestHarness::new()
+            .with_config(drag_enabled())
+            .with_windows(3),
+    )
+    .on_iteration(1, |world, state| {
+        state.os_move_window(0, frame(world, 0).min + IVec2::new(0, 240));
+    })
+    .on_iteration(4, |world, _| assert_three_columns(world))
+    .run(commands);
+}
+
+const UNCONFIRMED_FROM: Origin = Origin::new(600, 30);
+
+/// Window 1 is on no side edge of the display. The pointer moves right and
+/// down, and macOS moves the window only down, so the window does not follow
+/// the pointer and the press is not a drag.
+fn unconfirmed_press(
+    harness: TestHarness,
+    then: impl IntoIterator<Item = Event>,
+) -> (TestHarness, Vec<Event>) {
+    let commands = [
+        Event::MenuOpened { window_id: 0 },
+        press(UNCONFIRMED_FROM, 1),
+        drag_to(UNCONFIRMED_FROM + IVec2::new(30, 300)),
+    ]
+    .into_iter()
+    .chain(then)
+    .collect();
+    let harness = holding(harness.with_config(drag_enabled()).with_windows(3)).on_iteration(
+        1,
+        |world, state| {
+            state.os_move_window(1, frame(world, 1).min + IVec2::new(0, 300));
+        },
+    );
+    (harness, commands)
+}
+
+/// A press that is not a drag leaves the window where macOS put it while
+/// the button is down, even when the layout changes, because macOS may
+/// still be dragging it. The release sends it back to its slot.
+#[test]
+fn an_unconfirmed_press_leaves_the_window_where_macos_put_it_until_the_release() {
+    let to = UNCONFIRMED_FROM + IVec2::new(30, 300);
+    let (harness, commands) =
+        unconfirmed_press(TestHarness::new(), [settle(), release(to), settle()]);
+
+    harness
+        .on_iteration(2, |_, state| state.os_close_window(0))
+        .on_iteration(3, |world, _| {
+            assert_eq!(columns(world), vec![vec![1], vec![2]]);
+            assert_window_at!(world, 1, 400, 320);
+        })
+        .on_iteration(5, |world, _| {
+            assert_eq!(columns(world), vec![vec![1], vec![2]]);
+            assert_window_at!(world, 1, 0, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+/// The release never reaches the tap, but the window server reads the
+/// button up, so the press ends and the window goes back to its slot.
+#[test]
+fn a_lost_release_of_an_unconfirmed_press_returns_the_window() {
+    let (harness, commands) = unconfirmed_press(TestHarness::new(), [settle()]);
+
+    harness
+        .on_iteration(2, |world, state| {
+            assert_window_at!(world, 1, 400, 320);
+            state.set_left_button_down(false);
+        })
+        .on_iteration(3, |world, _| assert_three_columns(world))
+        .run(commands);
+}
+
+/// The window server reads the button down for good, and no event comes.
+/// The press still ends 10 seconds after it began, and the window goes back
+/// to its slot.
+#[test]
+fn a_button_stuck_down_ends_an_unconfirmed_press_at_the_press_limit() {
+    // Each command plays out for 500 ms. The press comes at 500 ms, so it
+    // reaches its limit during iteration 21.
+    let (harness, commands) =
+        unconfirmed_press(TestHarness::new(), std::iter::repeat_n(settle(), 19));
+
+    harness
+        .on_iteration(19, |world, _| assert_window_at!(world, 1, 400, 320))
+        .on_iteration(21, |world, _| assert_three_columns(world))
+        .run(commands);
+}
+
+/// With the option off, a drag whose move is reported late works as it
+/// always has: the release only scrolls the strip to show the window.
+#[test]
+fn without_the_option_a_late_reported_drag_leaves_the_layout_alone() {
+    let from = Origin::new(1000, 30);
+    let to = Origin::new(200, 600);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        press(from, 2),
+        drag_to(to),
+        Event::WindowMoved { window_id: 2 },
+        release(to),
+        settle(),
+    ];
+
+    holding(TestHarness::new().with_windows(3))
+        .on_iteration(1, move |world, state| {
+            move_unreported(world, &state, 2, to - from);
+        })
+        .on_iteration(5, |world, _| {
+            assert_eq!(columns(world), vec![vec![0], vec![1], vec![2]]);
+            assert_window_at!(world, 0, -176, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 224, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 624, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
