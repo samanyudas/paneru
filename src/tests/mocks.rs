@@ -49,6 +49,24 @@ pub(crate) struct MockWindowData {
     pub(crate) min_width: i32,
     /// The widest width the app accepts, or no limit when zero.
     pub(crate) max_width: i32,
+    /// The shortest height the app accepts, like an `NSWindow.minSize`.
+    pub(crate) min_height: i32,
+    pub(crate) resize_writes: usize,
+}
+
+impl MockWindowData {
+    /// The size the app ends at when asked for `size`.
+    fn accepted_size(&self, size: Size) -> Size {
+        let max_width = if self.max_width > 0 {
+            self.max_width
+        } else {
+            i32::MAX
+        };
+        Size::new(
+            size.x.max(self.min_width).min(max_width),
+            size.y.max(self.min_height),
+        )
+    }
 }
 
 impl Default for MockWindowData {
@@ -71,6 +89,8 @@ impl Default for MockWindowData {
             child_role: false,
             min_width: 0,
             max_width: 0,
+            min_height: 0,
+            resize_writes: 0,
         }
     }
 }
@@ -355,6 +375,10 @@ impl MockState {
         }
     }
 
+    pub fn resize_writes(&self, id: WinID) -> usize {
+        self.inner.force_read().windows[&id].resize_writes
+    }
+
     #[allow(unused)]
     pub fn os_minimize_window(&self, id: WinID, minimized: bool) {
         let mut inner = self.inner.force_write();
@@ -489,14 +513,12 @@ impl MockState {
         let s = self.clone();
         mw.expect_resize().returning(move |size| {
             let mut inner = s.inner.force_write();
-            if let Some(w) = inner.windows.get_mut(&id) {
-                let max_width = if w.max_width > 0 {
-                    w.max_width
-                } else {
-                    i32::MAX
-                };
-                let width = size.x.max(w.min_width).min(max_width);
-                w.frame.max = w.frame.min + size.with_x(width);
+            // `Window::resize` sends nothing for the size the window has.
+            if let Some(w) = inner.windows.get_mut(&id)
+                && w.frame.size() != size
+            {
+                w.resize_writes += 1;
+                w.frame.max = w.frame.min + w.accepted_size(size);
             }
         });
 
