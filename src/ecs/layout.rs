@@ -22,6 +22,7 @@ use crate::config::{Config, StackLimit};
 use crate::ecs::drag::DragState;
 use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::params::Windows;
+use crate::ecs::shared_edge::EdgeSlice;
 use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
@@ -161,8 +162,8 @@ type WindowFrames<'w, 's> = Query<
     (Without<LayoutStrip>, With<Window>),
 >;
 
-/// Windows the layout just assigned a new slot to, with the frame fields that
-/// slot has to be translated into.
+/// Windows the layout just assigned a new slot or size to, with the frame
+/// fields that slot has to be translated into.
 type RepositionedWindows<'w, 's> = Populated<
     'w,
     's,
@@ -174,7 +175,11 @@ type RepositionedWindows<'w, 's> = Populated<
         &'static mut Bounds,
         Option<&'static ResizeMarker>,
     ),
-    (Changed<LayoutPosition>, With<Window>, Without<LayoutStrip>),
+    (
+        Or<(Changed<LayoutPosition>, Changed<Bounds>)>,
+        With<Window>,
+        Without<LayoutStrip>,
+    ),
 >;
 
 /// Strips whose position or target offset changed this tick.
@@ -3135,7 +3140,6 @@ fn position_layout_windows(
     mut commands: Commands,
 ) {
     let offscreen_sliver_width = config.sliver_width();
-    let (_, pad_right, _, pad_left) = config.edge_padding();
     let mut strip_contexts = EntityHashMap::default();
     for (strip_entity, layout_strip, Position(strip_position), reposition, swiping, child_of) in
         &workspaces
@@ -3180,49 +3184,13 @@ fn position_layout_windows(
             continue;
         };
 
-        // The window shows inside its frame by its margins, so they are
-        // taken off here for the window to land exactly sliver_width pixels
-        // from the screen edge.
         let margins = window.margins();
         let target_size = resize.map_or(bounds.0, |resize| bounds.0.with_x(resize.0.x));
         let mut frame = IRect::from_corners(layout_position.0, layout_position.0 + target_size);
-        let width = frame.width();
         frame.min += context.strip_position;
         frame.max += context.strip_position;
 
-        let mut offscreen = false;
-        if frame.max.x <= viewport.min.x + margins.max.x {
-            // Window hidden to the left — position so exactly
-            // sliver_width CG pixels are visible from the real
-            // display edge. The right margin can leave a window just
-            // inside the viewport edge while its CG frame is fully
-            // past it.
-            frame.min.x =
-                viewport.min.x - width + offscreen_sliver_width - pad_left + margins.max.x;
-            offscreen = true;
-        } else if frame.min.x >= viewport.max.x - margins.min.x {
-            // Window hidden to the right — mirror of above.
-            frame.min.x = viewport.max.x - offscreen_sliver_width + pad_right - margins.min.x;
-            offscreen = true;
-        }
-        frame.max.x = frame.min.x + width;
-
-        // During swipe, keep full height. The vertical sliver inset only
-        // applies to horizontally off-screen windows, so they expose just
-        // a `sliver_height` fraction of their height at the viewport's
-        // vertical center.
-        if !context.swiping && offscreen {
-            // Don't compress stacked windows vertically when off-screen.
-            // The height reduction corrupts their proportions: when the
-            // column scrolls back on-screen, binpack_heights makes the
-            // last window absorb all remaining space.
-            if !context.stacked {
-                let inset =
-                    round_px(f64::from(viewport.height()) * (1.0 - config.sliver_height()) / 2.0);
-                frame.min.y += inset;
-                frame.max.y += inset;
-            }
-        }
+        let mut frame = hidden_frame(frame, viewport, margins, context, &config);
 
         // Keep the window anchored to its own display. The parked strip origin
         // only accounts for the first window: everything sitting below it in a
@@ -3237,13 +3205,24 @@ fn position_layout_windows(
             frame.max.y = park_row + height;
         }
 
-        let frame = keep_on_own_display(frame, display, &displays, offscreen_sliver_width, margins);
+        let (frame, slice) = keep_on_own_display(
+            frame,
+            display,
+            context.display_entity,
+            &displays,
+            offscreen_sliver_width,
+            margins,
+        );
 
         if resize.is_none() && bounds.0 != frame.size() {
             bounds.0 = frame.size();
         }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(PresentedOrigin(frame.min));
+            match slice {
+                Some(slice) => entity_commands.try_insert(slice),
+                None => entity_commands.try_remove::<EdgeSlice>(),
+            };
         }
 
         if position.0 != frame.min {
@@ -3286,6 +3265,56 @@ fn position_layout_windows(
     }
 }
 
+/// `frame` placed to show its sliver at the side of `viewport` it is hidden
+/// past, or `frame` when it is not hidden.
+fn hidden_frame(
+    mut frame: IRect,
+    viewport: IRect,
+    margins: Margins,
+    context: &StripWindowContext,
+    config: &Config,
+) -> IRect {
+    // The window shows inside its frame by its margins, so they are
+    // taken off here for the window to land exactly sliver_width pixels
+    // from the screen edge.
+    let sliver = config.sliver_width();
+    let (_, pad_right, _, pad_left) = config.edge_padding();
+    let width = frame.width();
+    let mut offscreen = false;
+    if frame.max.x <= viewport.min.x + margins.max.x {
+        // Window hidden to the left — position so exactly
+        // sliver_width CG pixels are visible from the real
+        // display edge. The right margin can leave a window just
+        // inside the viewport edge while its CG frame is fully
+        // past it.
+        frame.min.x = viewport.min.x - width + sliver - pad_left + margins.max.x;
+        offscreen = true;
+    } else if frame.min.x >= viewport.max.x - margins.min.x {
+        // Window hidden to the right — mirror of above.
+        frame.min.x = viewport.max.x - sliver + pad_right - margins.min.x;
+        offscreen = true;
+    }
+    frame.max.x = frame.min.x + width;
+
+    // During swipe, keep full height. The vertical sliver inset only
+    // applies to horizontally off-screen windows, so they expose just
+    // a `sliver_height` fraction of their height at the viewport's
+    // vertical center.
+    if !context.swiping && offscreen {
+        // Don't compress stacked windows vertically when off-screen.
+        // The height reduction corrupts their proportions: when the
+        // column scrolls back on-screen, binpack_heights makes the
+        // last window absorb all remaining space.
+        if !context.stacked {
+            let inset =
+                round_px(f64::from(viewport.height()) * (1.0 - config.sliver_height()) / 2.0);
+            frame.min.y += inset;
+            frame.max.y += inset;
+        }
+    }
+    frame
+}
+
 fn overlap_area(a: IRect, b: IRect) -> i64 {
     let shared = a.intersect(b);
     if shared.is_empty() {
@@ -3306,24 +3335,28 @@ fn lies_mostly_elsewhere(shown: IRect, own: IRect, others: &[IRect]) -> bool {
 }
 
 /// `frame`, or its bottom tuck when more of it lies on another of `displays`
-/// than on `display`.
+/// than on `display`. A tuck also returns the slice `frame` would show.
 fn keep_on_own_display(
     frame: IRect,
     display: &Display,
+    display_entity: Entity,
     displays: &DisplayViewports,
     sliver: i32,
     margins: Margins,
-) -> IRect {
+) -> (IRect, Option<EdgeSlice>) {
     let own = display.bounds();
     let others: Vec<IRect> = displays
         .iter()
         .map(|(other, _)| other.bounds())
         .filter(|other| *other != own)
         .collect();
-    if lies_mostly_elsewhere(margins.shown(frame), own, &others) {
-        bottom_tuck(frame, own, sliver, margins, &others).unwrap_or(frame)
-    } else {
-        frame
+    let shown = margins.shown(frame);
+    if !lies_mostly_elsewhere(shown, own, &others) {
+        return (frame, None);
+    }
+    match bottom_tuck(frame, own, sliver, margins, &others) {
+        Some(tucked) => (tucked, EdgeSlice::new(shown, own, display_entity)),
+        None => (frame, None),
     }
 }
 

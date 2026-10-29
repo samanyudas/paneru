@@ -11,6 +11,7 @@ mod mouse_focus;
 mod reconnect;
 mod session_restore;
 mod settling;
+mod shared_edge;
 mod side_by_side;
 mod stacks;
 mod state;

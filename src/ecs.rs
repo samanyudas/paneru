@@ -55,6 +55,7 @@ pub mod params;
 pub(crate) mod restore;
 pub mod script_state;
 pub mod scroll;
+pub(crate) mod shared_edge;
 pub mod state;
 pub(crate) mod systems;
 pub mod tile_overrides;
@@ -136,6 +137,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     const APP_OBSERVABILITY_CHECK_FREQ: Duration = Duration::from_millis(200);
 
     native_membership::register(app);
+    shared_edge::register(app);
 
     let overlays_dirty =
         |config: Option<Res<Config>>,
