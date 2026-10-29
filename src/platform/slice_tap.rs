@@ -235,12 +235,13 @@ enum Gesture {
     Idle,
     /// The tap holds `button` back until the engine posts press `id` or
     /// `deadline` passes, and notes whether the user dragged it meanwhile.
-    /// The user pressed at `pressed` on the screen.
+    /// The user pressed at `pressed` on the screen, on `panel`.
     Holding {
         id: u32,
         button: MouseButton,
         dragged: bool,
         pressed: CGPoint,
+        panel: SlicePanel,
         deadline: Duration,
     },
     /// As `Holding`, after the user released the button.
@@ -260,10 +261,13 @@ struct Passed {
     button: MouseButton,
     drags: u32,
     /// When the posted press went through. The drags and release the user
-    /// made before then, with the pointer still on the panel, reach the app
-    /// moved `by` as far as the press.
+    /// made before then, with the pointer still on `panel`, reach the app
+    /// moved `by` as far as the press. Posting the press moved the pointer
+    /// off the panel, so one made after the post but before the tap saw it
+    /// is already in place.
     posted_at: Duration,
     by: CGVector,
+    panel: SlicePanel,
 }
 
 #[derive(Debug, Default)]
@@ -309,6 +313,7 @@ impl SliceTap {
                     id,
                     button,
                     pressed,
+                    panel,
                     deadline,
                     ..
                 },
@@ -318,6 +323,7 @@ impl SliceTap {
                     button,
                     dragged: true,
                     pressed,
+                    panel,
                     deadline,
                 };
                 Verdict::Swallow
@@ -384,6 +390,7 @@ impl SliceTap {
             button,
             dragged: false,
             pressed: pointer.point,
+            panel,
             deadline: pointer.time + GIVE_UP,
         };
         debug!(
@@ -406,7 +413,7 @@ impl SliceTap {
     /// A drag or release of the posted press.
     fn passing(&mut self, pointer: &Pointer, passed: Passed) -> Verdict {
         let (x, y) = (pointer.point.x, pointer.point.y);
-        let early = pointer.time < passed.posted_at;
+        let early = pointer.time < passed.posted_at && passed.panel.contains(pointer.point);
         let to = if early {
             CGPoint::new(x + passed.by.dx, y + passed.by.dy)
         } else {
@@ -450,6 +457,7 @@ impl SliceTap {
                 id,
                 button,
                 pressed,
+                panel,
                 ..
             } if id == tag && button == posted => {
                 debug!("edge slice press delivered: press {id} at ({x:.0}, {y:.0}), button held");
@@ -459,6 +467,7 @@ impl SliceTap {
                     drags: 0,
                     posted_at: pointer.time,
                     by: CGVector::new(x - pressed.x, y - pressed.y),
+                    panel,
                 });
                 Verdict::Pass
             }
