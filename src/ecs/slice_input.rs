@@ -13,7 +13,7 @@ use tracing::debug;
 
 use crate::commands::focus_with_verification;
 use crate::ecs::params::Windows;
-use crate::ecs::shared_edge::SlideIn;
+use crate::ecs::shared_edge::Slide;
 use crate::ecs::{PostUpdateSet, RepositionMarker, ResizeMarker, SpawnCommandsExt as _, UpdateSet};
 use crate::events::Event;
 use crate::manager::{Display, Window, WindowManager, origin_from};
@@ -80,7 +80,7 @@ fn reveal_pressed(
 fn deliver_press(
     pending: Res<PendingPress>,
     windows: Query<(&Window, Has<RepositionMarker>, Has<ResizeMarker>)>,
-    sliding: Query<(), With<SlideIn>>,
+    sliding: Query<(), With<Slide>>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     time: Res<Time>,

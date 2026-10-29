@@ -90,16 +90,17 @@ impl EdgeSlice {
     }
 }
 
-/// A window leaving its tuck for a place on its display while its slice
-/// photo slides there, as the row it belongs to scrolls. The window stays
-/// tucked until the photo arrives, because macOS would show a window that
-/// crosses the shared edge on the other display. Layout writes where the
-/// window goes to [`PresentedOrigin`](crate::ecs::PresentedOrigin) and
-/// leaves its `Position` and [`EdgeSlice`] to the slide.
+/// A window moving across a shared edge while its photo slides there, as the
+/// row it belongs to scrolls. Where the window lies mostly past the edge,
+/// its photo shows in its place, because macOS would show the window on the
+/// other display. Layout writes where the window goes to
+/// [`PresentedOrigin`](crate::ecs::PresentedOrigin) and leaves its
+/// `Position` and [`EdgeSlice`] to the slide.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SlideIn {
-    /// The photo shows the window as if its frame had its origin at `at`.
-    /// `slice` is the slice it showed with its frame at `from`.
+pub(crate) enum Slide {
+    /// The window leaves its tuck. The photo shows the window as if its
+    /// frame had its origin at `at`. `slice` is the slice it showed with its
+    /// frame at `from`.
     Moving {
         at: IVec2,
         from: IVec2,
@@ -108,6 +109,25 @@ pub(crate) enum SlideIn {
     /// The window has moved to where the photo rests. The photo stays over
     /// it until macOS has taken the move, or until the engine time `until`.
     Landing { until: Duration },
+    /// The window heads for a tuck, where its frame at `to` shows `slice`,
+    /// and its photo is on its way. The window shows itself at `at`, as far
+    /// toward `to` as it stays mostly on its display. It waits for the photo
+    /// until the engine time `until`, which is `None` before its first wait.
+    Leaving {
+        at: IVec2,
+        to: IVec2,
+        slice: EdgeSlice,
+        until: Option<Duration>,
+    },
+    /// The photo shows the window at `at` and the window tucks under it.
+    /// Once macOS has taken the tuck, or at the engine time `until`, the
+    /// photo slides to `to`.
+    Tucking {
+        at: IVec2,
+        to: IVec2,
+        slice: EdgeSlice,
+        until: Duration,
+    },
 }
 
 /// The windows of `strip` that show a slice: on each side, every window of

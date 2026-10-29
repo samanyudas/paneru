@@ -578,3 +578,238 @@ fn focus_on_a_tucked_window_slides_its_photo_in_without_a_new_photo() {
     assert_eq!(log.borrow().asked.len(), asks, "the photo it had slides");
     assert_eq!(log.borrow().painted, vec![(3, Digest(7))]);
 }
+
+const DISPLAY: IRect = IRect {
+    min: IVec2::ZERO,
+    max: IVec2::new(TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+};
+
+/// Whether most of `frame` is on the test display, where macOS shows it.
+fn in_view(frame: IRect) -> bool {
+    frame.intersect(DISPLAY).width() * 2 > frame.width()
+}
+
+/// What the user sees of a window after one frame: where it is, and its
+/// panel if the panel shows a photo.
+struct Seen {
+    window: IRect,
+    photo: Option<IRect>,
+}
+
+/// Focuses with `reveal` until window `id` rests in view, then focuses
+/// with `leave`, which moves it past the shared edge, for `frames` frames.
+/// The photo of window `id` arrives after `photo_after` frames, if at all,
+/// and `then` focuses again after its frames.
+fn leave(
+    (mut harness, log): (TestHarness, ScreenLog),
+    id: WinID,
+    (reveal, leave): (Direction, Direction),
+    photo_after: Option<usize>,
+    then: Option<(usize, Direction)>,
+) -> (Vec<Seen>, IRect, TestHarness) {
+    harness
+        .world()
+        .write_message(command(Operation::Focus(reveal)));
+    harness.advance(SETTLE);
+    let start = harness.mock_state.ax_frame(id);
+    assert!(in_view(start), "window {id} rests in view at {start:?}");
+    assert!(placed_ids(&log).is_empty(), "no panel while it is in view");
+    let (asks, paints) = (asks_for(&log, id).len(), log.borrow().painted.len());
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(leave)));
+    let mut seen = Vec::new();
+    for step in 0..60 {
+        if photo_after == Some(step) {
+            assert_eq!(asks_for(&log, id).len(), asks + 1, "one photo of {id}");
+            let asked = last_ask(&log, id);
+            arrive(&mut harness, id, asked, Ok(photo(8)));
+        }
+        if let Some((_, direction)) = then.as_ref().filter(|(after, _)| *after == step) {
+            harness
+                .world()
+                .write_message(command(Operation::Focus(direction.clone())));
+        }
+        harness.advance(Duration::from_millis(20));
+        let photo = (log.borrow().painted.len() > paints)
+            .then(|| {
+                log.borrow()
+                    .placed
+                    .iter()
+                    .find(|(placed, _)| *placed == id)
+                    .map(|(_, slice)| slice.on_screen)
+            })
+            .flatten();
+        seen.push(Seen {
+            window: harness.mock_state.ax_frame(id),
+            photo,
+        });
+    }
+    (seen, start, harness)
+}
+
+fn assert_shown_every_frame(id: WinID, seen: &[Seen]) {
+    for (step, frame) in seen.iter().enumerate() {
+        assert!(
+            in_view(frame.window) || frame.photo.is_some(),
+            "window {id} or its photo shows after step {step}: window at {:?}",
+            frame.window
+        );
+    }
+}
+
+/// Window `id` slides out past the shared edge with its photo arriving
+/// after 5 frames, as fast as photos arrive on Sam's Mac.
+fn assert_slides_out(laid_out: (TestHarness, ScreenLog), id: WinID, focus: (Direction, Direction)) {
+    let (seen, start, mut harness) = leave(laid_out, id, focus, Some(5), None);
+
+    let rest = showing(harness.world());
+    let [(shown, slice)] = rest.as_slice() else {
+        panic!("one slice shows at rest: {rest:?}")
+    };
+    assert_eq!(*shown, id, "the slice of window {id} shows");
+    let end = seen.last().expect("steps");
+    assert!(!in_view(end.window), "window {id} tucks: {:?}", end.window);
+    assert_eq!(
+        end.photo,
+        Some(slice.on_screen),
+        "the photo rests as the slice"
+    );
+    assert_shown_every_frame(id, &seen);
+    let waiting = seen
+        .iter()
+        .take_while(|frame| frame.photo.is_none())
+        .count();
+    assert!(
+        waiting >= 5,
+        "window {id} shows itself until its photo arrives: {waiting} steps"
+    );
+    let on_display = |frame: IRect| frame.intersect(DISPLAY).width();
+    assert!(
+        on_display(seen[0].window) < on_display(start),
+        "window {id} moves with the row before its photo arrives: {:?} from {start:?}",
+        seen[0].window
+    );
+    assert_eq!(
+        seen[waiting].photo,
+        Some(seen[waiting - 1].window.intersect(DISPLAY)),
+        "the photo first shows where window {id} was"
+    );
+    let mut places = seen[waiting..]
+        .iter()
+        .filter_map(|frame| frame.photo)
+        .collect::<Vec<_>>();
+    for pair in places.windows(2) {
+        assert!(
+            pair[1].width() <= pair[0].width(),
+            "the photo only moves out: {places:?}"
+        );
+    }
+    places.dedup();
+    assert!(places.len() >= 5, "the photo slides through {places:?}");
+}
+
+#[test]
+fn focus_away_from_a_window_at_the_shared_edge_slides_it_out_under_its_photo() {
+    assert_slides_out(
+        painted(beside(animated(), Screen::default()), 3),
+        3,
+        (Direction::Last, Direction::First),
+    );
+    assert_slides_out(
+        painted_west_with(animated()),
+        0,
+        (Direction::First, Direction::Last),
+    );
+}
+
+#[test]
+fn focus_back_during_a_slide_out_slides_the_photo_back_in() {
+    let laid_out = painted(beside(animated(), Screen::default()), 3);
+    let focus = (Direction::Last, Direction::First);
+    let (seen, _, harness) = leave(laid_out, 3, focus, Some(5), Some((8, Direction::Last)));
+
+    assert_shown_every_frame(3, &seen);
+    let rest = harness.mock_state.ax_frame(3);
+    assert!(in_view(rest), "window 3 rests in view at {rest:?}");
+    let end = seen.last().expect("steps");
+    assert_eq!(end.photo, None, "the photo closed");
+    let turned = seen
+        .windows(2)
+        .filter_map(|pair| Some((pair[0].photo?, pair[1].photo?)))
+        .any(|(was, now)| now.width() > was.width());
+    assert!(turned, "the photo turns back");
+}
+
+#[test]
+fn a_window_whose_photo_never_arrives_tucks_after_a_short_wait() {
+    let laid_out = painted(beside(animated(), Screen::default()), 3);
+    let focus = (Direction::Last, Direction::First);
+    let (seen, _, _) = leave(laid_out, 3, focus, None, None);
+
+    let waited = seen
+        .iter()
+        .take_while(|frame| in_view(frame.window))
+        .count();
+    assert!(
+        (5..=15).contains(&waited),
+        "window 3 shows itself for {waited} frames, then tucks"
+    );
+    assert!(seen[waited..].iter().all(|frame| !in_view(frame.window)));
+}
+
+#[test]
+fn focus_away_during_a_slide_in_slides_the_photo_back_out() {
+    let (mut harness, log) = painted(beside(animated(), Screen::default()), 3);
+    let panel = || {
+        log.borrow()
+            .placed
+            .iter()
+            .find(|(id, _)| *id == 3)
+            .map(|(_, slice)| slice.on_screen)
+    };
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Last)));
+    harness.advance(Duration::from_millis(60));
+    let turned_at = panel().expect("the photo slides in");
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::First)));
+    let mut places = Vec::new();
+    for step in 0..40 {
+        harness.advance(Duration::from_millis(20));
+        let window = harness.mock_state.ax_frame(3);
+        let photo = panel();
+        assert!(
+            in_view(window) || photo.is_some(),
+            "window 3 or its photo shows after step {step}: window at {window:?}"
+        );
+        places.extend(photo);
+    }
+
+    let rest = showing(harness.world());
+    let [(3, slice)] = rest.as_slice() else {
+        panic!("window 3 shows a slice at rest: {rest:?}")
+    };
+    assert!(
+        !in_view(harness.mock_state.ax_frame(3)),
+        "window 3 stays tucked"
+    );
+    assert_eq!(
+        places.last(),
+        Some(&slice.on_screen),
+        "the photo rests as the slice"
+    );
+    let widths = std::iter::once(turned_at.width())
+        .chain(places.iter().map(IRect::width))
+        .collect::<Vec<_>>();
+    assert!(
+        widths.windows(2).all(|pair| pair[1] <= pair[0]),
+        "the photo turns back out at once: {widths:?}"
+    );
+    places.dedup();
+    assert!(places.len() >= 5, "the photo slides through {places:?}");
+}

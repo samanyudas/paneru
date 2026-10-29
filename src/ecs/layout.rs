@@ -22,7 +22,7 @@ use crate::config::{Config, StackLimit};
 use crate::ecs::drag::DragState;
 use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::params::Windows;
-use crate::ecs::shared_edge::{EdgeSlice, SlideIn};
+use crate::ecs::shared_edge::{EdgeSlice, Slide};
 use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
@@ -175,7 +175,7 @@ type RepositionedWindows<'w, 's> = Populated<
         &'static mut Bounds,
         Option<&'static ResizeMarker>,
         Option<&'static EdgeSlice>,
-        Option<&'static SlideIn>,
+        Option<&'static Slide>,
     ),
     (
         Or<(Changed<LayoutPosition>, Changed<Bounds>)>,
@@ -3230,6 +3230,7 @@ fn position_layout_windows(
                 tucked,
                 sliding,
                 may_slide,
+                shown_at(position.0, frame, margins, park_row, display, &displays),
                 margins,
             ) {
                 continue;
@@ -3276,28 +3277,63 @@ fn position_layout_windows(
     }
 }
 
-/// Writes a window's tuck: `slice` when its new frame is tucked, else a
-/// slide when it leaves its tuck `tucked` and `may_slide`. A slide in
-/// progress keeps going, and keeps its [`EdgeSlice`]. Returns whether the
-/// window's photo moves now, which leaves its `Position` to the slide.
+/// Writes a window's tuck: `slice` when its new frame is tucked, else none.
+/// With `may_slide`, a window that tucks from `shown_at`, where it shows on
+/// its display now, slides out, and one that leaves its tuck `tucked` slides
+/// in. A slide in progress keeps going, or turns back. Returns whether the
+/// slide moves the window, which leaves its `Position` to the slide.
 fn present_tuck(
     entity_commands: &mut EntityCommands,
     slice: Option<EdgeSlice>,
     tucked: Option<&EdgeSlice>,
-    sliding: Option<&SlideIn>,
+    sliding: Option<&Slide>,
     may_slide: bool,
+    shown_at: Option<Origin>,
     margins: Margins,
 ) -> bool {
     if let Some(slice) = slice {
-        entity_commands.try_insert(slice).try_remove::<SlideIn>();
+        let to = slice.shown().min - margins.min;
+        let leaving = |at, until| Slide::Leaving {
+            at,
+            to,
+            slice,
+            until,
+        };
+        let out = match sliding.copied() {
+            Some(Slide::Moving { at, .. }) => Some(Slide::Tucking {
+                at,
+                to,
+                slice,
+                until: Duration::ZERO,
+            }),
+            Some(Slide::Tucking { at, until, .. }) => Some(Slide::Tucking {
+                at,
+                to,
+                slice,
+                until,
+            }),
+            Some(Slide::Leaving { at, until, .. }) => Some(leaving(at, until)),
+            Some(Slide::Landing { .. }) => shown_at.map(|at| leaving(at, None)),
+            None => shown_at
+                .filter(|_| tucked.is_none())
+                .map(|at| leaving(at, None)),
+        };
+        if let Some(out) = out.filter(|_| may_slide) {
+            entity_commands
+                .try_insert(out)
+                .try_remove::<RepositionMarker>();
+            return true;
+        }
+        entity_commands.try_insert(slice).try_remove::<Slide>();
         return false;
     }
     match (sliding, tucked) {
-        (Some(sliding), _) => matches!(sliding, SlideIn::Moving { .. }),
-        (None, Some(tucked)) if may_slide => {
+        (Some(Slide::Moving { .. }), _) => true,
+        (Some(Slide::Landing { .. }), _) => false,
+        (Some(Slide::Tucking { .. }) | None, Some(tucked)) if may_slide => {
             let from = tucked.shown().min - margins.min;
             entity_commands
-                .try_insert(SlideIn::Moving {
+                .try_insert(Slide::Moving {
                     at: from,
                     from,
                     slice: *tucked,
@@ -3305,8 +3341,8 @@ fn present_tuck(
                 .try_remove::<RepositionMarker>();
             true
         }
-        (None, _) => {
-            entity_commands.try_remove::<EdgeSlice>();
+        _ => {
+            entity_commands.try_remove::<(Slide, EdgeSlice)>();
             false
         }
     }
@@ -3374,11 +3410,38 @@ fn overlap_area(a: IRect, b: IRect) -> i64 {
 /// Whether `shown`, the frame a window shows, has its center or more of
 /// itself on another display than on `own`. macOS then moves the window into
 /// that display's space and draws it there.
-fn lies_mostly_elsewhere(shown: IRect, own: IRect, others: &[IRect]) -> bool {
+pub(crate) fn lies_mostly_elsewhere(shown: IRect, own: IRect, others: &[IRect]) -> bool {
     let home = overlap_area(shown, own);
     others
         .iter()
         .any(|other| other.contains(shown.center()) || overlap_area(shown, *other) > home)
+}
+
+/// `origin` when a window with the size of `frame` there shows on `display`
+/// now: above the park row, and where macOS shows it on that display.
+fn shown_at(
+    origin: Origin,
+    frame: IRect,
+    margins: Margins,
+    park_row: i32,
+    display: &Display,
+    displays: &DisplayViewports,
+) -> Option<Origin> {
+    let own = display.bounds();
+    let shown = margins.shown(IRect::from_corners(origin, origin + frame.size()));
+    (origin.y < park_row
+        && !shown.intersect(own).is_empty()
+        && !lies_mostly_elsewhere(shown, own, &other_bounds(own, displays)))
+    .then_some(origin)
+}
+
+/// The bounds of each of `displays` other than `own`.
+fn other_bounds(own: IRect, displays: &DisplayViewports) -> Vec<IRect> {
+    displays
+        .iter()
+        .map(|(other, _)| other.bounds())
+        .filter(|other| *other != own)
+        .collect()
 }
 
 /// `frame`, or its bottom tuck when more of it lies on another of `displays`
@@ -3392,11 +3455,7 @@ fn keep_on_own_display(
     margins: Margins,
 ) -> (IRect, Option<EdgeSlice>) {
     let own = display.bounds();
-    let others: Vec<IRect> = displays
-        .iter()
-        .map(|(other, _)| other.bounds())
-        .filter(|other| *other != own)
-        .collect();
+    let others = other_bounds(own, displays);
     let shown = margins.shown(frame);
     if !lies_mostly_elsewhere(shown, own, &others) {
         return (frame, None);
