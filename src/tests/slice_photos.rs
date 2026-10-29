@@ -1322,3 +1322,126 @@ fn a_tucked_slice_a_new_window_pushes_out_slides_with_the_row() {
         "the photo of window 2 only slides out: {widths:?}"
     );
 }
+
+/// The first stretch of the display line, from the shared edge on, where
+/// nothing shows before the first window not in `edge`.
+fn wallpaper_at_edge(edge: &[WinID], runs: &[Run]) -> Option<(i32, i32)> {
+    let mut x = 0;
+    for run in runs {
+        if run.from > x {
+            return Some((x, run.from));
+        }
+        if !edge.contains(&run.window) {
+            return None;
+        }
+        x = run.to;
+    }
+    None
+}
+
+/// Sam's recording: East presses push two columns past the shared edge, the
+/// last press landing just as the farther column's photo covers it. The
+/// nearer column's app takes its tuck two frames late, so its photo holds
+/// still, and the farther photo must not slide away from the edge under it.
+#[test]
+fn rapid_east_presses_that_tuck_two_columns_leave_no_wallpaper_at_the_edge() {
+    const OTHER_APP: crate::platform::Pid = 2;
+    const LATE_TUCK: usize = 2;
+    let ids = [0, 1, 2, 3, 4, 5];
+    let log = Rc::new(RefCell::new(Screen::default()));
+    let mut harness = TestHarness::new()
+        .with_config(animated())
+        .with_display(EXT_DISPLAY_ID, LEFT, vec![EXT_WORKSPACE_ID])
+        .with_app(OTHER_APP, "other", "OtherApp", |_| {});
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    harness.mock_state.queue_writes(OTHER_APP);
+    for (id, width) in (0..).zip([410, 670, 296, 700, 300, 300]) {
+        let pid = if id == 0 { OTHER_APP } else { TEST_PROCESS_ID };
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness
+        .world()
+        .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    let settle = |harness: &mut TestHarness| {
+        for _ in 0..100 {
+            harness.advance(Duration::from_millis(20));
+            harness.mock_state.flush_writes(Duration::from_secs(1));
+        }
+    };
+    settle(&mut harness);
+    for _ in 1..ids.len() {
+        harness
+            .world()
+            .write_message(command(Operation::Focus(Direction::East)));
+        settle(&mut harness);
+        paint_asked(&mut harness, &log, &ids);
+    }
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::First)));
+    settle(&mut harness);
+    assert!(
+        in_view(harness.mock_state.ax_frame(0)) && in_view(harness.mock_state.ax_frame(1)),
+        "windows 0 and 1 rest in view"
+    );
+    assert!(
+        placed_ids(&log).is_empty(),
+        "no panel while they are in view"
+    );
+
+    let presses = [
+        (0, Direction::East),
+        (6, Direction::East),
+        (8, Direction::East),
+    ];
+    let mut seen = Vec::new();
+    let mut held = None;
+    for frame in 0..60 {
+        for (_, direction) in presses.iter().filter(|(at, _)| *at == frame) {
+            harness
+                .world()
+                .write_message(command(Operation::Focus(direction.clone())));
+        }
+        harness.advance(Duration::from_millis(20));
+        if held.is_none() && panel_photo(&log, 1).is_some() {
+            harness.mock_state.hold_writes(TEST_PROCESS_ID);
+            held = Some(frame);
+        }
+        if held.is_some_and(|from| frame == from + LATE_TUCK) {
+            harness.mock_state.release_writes(TEST_PROCESS_ID);
+        }
+        if held.is_none_or(|from| frame >= from + LATE_TUCK) {
+            harness.mock_state.flush_writes(Duration::from_secs(1));
+        }
+        seen.push(scanline(&harness, &log, &ids));
+    }
+
+    assert!(held.is_some(), "window 1 slides out under its photo");
+    for (frame, runs) in seen.iter().enumerate() {
+        assert_eq!(
+            wallpaper_at_edge(&[0, 1], runs),
+            None,
+            "windows 0 and 1, or their photos, cover the shared edge after frame {frame}: {runs:?}"
+        );
+    }
+    assert!(
+        !in_view(harness.mock_state.ax_frame(0)) && !in_view(harness.mock_state.ax_frame(1)),
+        "windows 0 and 1 tuck"
+    );
+    assert_eq!(
+        placed_ids(&log),
+        vec![1],
+        "at rest window 1 shows its slice"
+    );
+}

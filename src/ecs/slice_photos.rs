@@ -32,6 +32,7 @@ use crate::events::Event;
 use crate::manager::window_writer::LANDING_TIMEOUT;
 use crate::manager::{Display, Window};
 use crate::platform::WinID;
+use crate::types::commands::Side;
 
 /// How often a shown slice is photographed again.
 pub(crate) const REFRESH: Duration = Duration::from_secs(2);
@@ -535,7 +536,10 @@ fn slide_photos(
 /// on its display, until its photo shows in its place. Then the window tucks
 /// under the photo, and once macOS has taken that, the photo slides on to
 /// the slice. A window whose photo does not show within [`PHOTO_WAIT`]
-/// tucks at once.
+/// tucks at once. A photo never slides further past the edge than its place
+/// in the row beside a nearer window that waits, so no wallpaper shows
+/// between them.
+#[allow(clippy::too_many_lines)]
 fn slide_photos_out(
     mut sliding: Sliding,
     displays: Query<&Display>,
@@ -546,7 +550,12 @@ fn slide_photos_out(
     mut commands: Commands,
 ) {
     let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
-    for (entity, window, mut slide, mut position, presented, _) in &mut sliding {
+    let mut moved_out = Vec::<Out>::new();
+    for entity in Out::nearest_first(&sliding) {
+        let Ok((entity, window, mut slide, mut position, presented, _)) = sliding.get_mut(entity)
+        else {
+            continue;
+        };
         let id = window.id();
         let Ok(mut entity_commands) = commands.get_entity(entity) else {
             continue;
@@ -570,6 +579,7 @@ fn slide_photos_out(
                         until: now + LANDING_TIMEOUT,
                     };
                     debug!("edge slice photo covers: window {id} tucks under it");
+                    moved_out.extend(Out::of(&slide));
                     continue;
                 }
                 // After its first wait, a slice with no photo on its way does
@@ -621,6 +631,8 @@ fn slide_photos_out(
                     position.0 = presented.0;
                 }
                 let (next, arrived) = ease_step(at, to, t);
+                let next = Out::of(&slide).map_or(next, |out| out.beside(&moved_out, next));
+                let arrived = arrived && next == to;
                 let moved = displays
                     .get(slice.display)
                     .ok()
@@ -646,6 +658,74 @@ fn slide_photos_out(
             }
             Slide::Moving { .. } | Slide::Landing { .. } => {}
         }
+        moved_out.extend(Out::of(&slide));
+    }
+}
+
+/// A window heading for a tuck on `side` of `display`: the origin `to` of
+/// its place in the row, and the origin `at` it or its photo shows at.
+#[derive(Clone, Copy, Debug)]
+struct Out {
+    display: Entity,
+    side: Side,
+    to: IVec2,
+    at: IVec2,
+}
+
+impl Out {
+    fn of(state: &Slide) -> Option<Self> {
+        let (slice, to, at) = match *state {
+            Slide::Leaving { at, to, slice, .. } => (slice.slice, to, at),
+            Slide::Tucking { at, to, slice, .. } => (slice, to, at),
+            Slide::Moving { .. } | Slide::Landing { .. } => return None,
+        };
+        Some(Self {
+            display: slice.display,
+            side: slice.side,
+            to,
+            at,
+        })
+    }
+
+    /// The windows of `sliding` heading for a tuck, each display's nearest
+    /// its edge first, so each one steps after the windows nearer the edge.
+    fn nearest_first(sliding: &Sliding) -> Vec<Entity> {
+        let mut order = sliding
+            .iter()
+            .filter_map(|(entity, _, slide, ..)| Some((Self::of(slide)?.outwards(), entity)))
+            .collect::<Vec<_>>();
+        order.sort_unstable();
+        order.into_iter().map(|(_, entity)| entity).collect()
+    }
+
+    /// How far past its edge the row places it, so that windows nearer the
+    /// edge sort first.
+    fn outwards(&self) -> (Entity, i32) {
+        let x = match self.side {
+            Side::West => -self.to.x,
+            Side::East => self.to.x,
+        };
+        (self.display, x)
+    }
+
+    /// `next`, held where it would go further past the edge than its place
+    /// beside any of `nearer` that the row puts between it and the display.
+    /// Never moves it back toward the display from where it shows now.
+    fn beside(&self, nearer: &[Out], next: IVec2) -> IVec2 {
+        let places = nearer
+            .iter()
+            .filter(|other| other.display == self.display && other.side == self.side)
+            .filter(|other| other.outwards().1 < self.outwards().1)
+            .map(|other| other.at.x + self.to.x - other.to.x);
+        let x = match self.side {
+            Side::West => places
+                .max()
+                .map_or(next.x, |held| next.x.max(held.min(self.at.x))),
+            Side::East => places
+                .min()
+                .map_or(next.x, |held| next.x.min(held.max(self.at.x))),
+        };
+        next.with_x(x)
     }
 }
 
