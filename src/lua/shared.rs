@@ -54,7 +54,8 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::types::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, Side, parse_command,
+    Command, Direction, MouseMove, MoveFocus, Operation, Reach, ResizeDirection, Side,
+    parse_command,
 };
 
 /// Issues a [`Command`]. The only thing the two hosts differ by.
@@ -206,11 +207,15 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     )?;
     window.set(
         "focus_edge",
-        side_directional(lua, dispatch, "window.focus_edge", Operation::FocusEdge)?,
+        side_directional(lua, dispatch, "window.focus_edge", |side| {
+            Operation::FocusEdge(side, Reach::Display)
+        })?,
     )?;
     window.set(
         "move_edge",
-        side_directional(lua, dispatch, "window.move_edge", Operation::MoveEdge)?,
+        side_directional(lua, dispatch, "window.move_edge", |side| {
+            Operation::MoveEdge(side, Reach::Display)
+        })?,
     )?;
 
     for (name, operation) in [
@@ -701,11 +706,11 @@ mod tests {
         assert_eq!(
             commands,
             vec![
-                Command::Window(Operation::FocusEdge(Side::West)),
-                Command::Window(Operation::FocusEdge(Side::East)),
-                Command::Window(Operation::MoveEdge(Side::West)),
-                Command::Window(Operation::MoveEdge(Side::East)),
-                Command::Window(Operation::MoveEdge(Side::East)),
+                Command::Window(Operation::FocusEdge(Side::West, Reach::Display)),
+                Command::Window(Operation::FocusEdge(Side::East, Reach::Display)),
+                Command::Window(Operation::MoveEdge(Side::West, Reach::Display)),
+                Command::Window(Operation::MoveEdge(Side::East, Reach::Display)),
+                Command::Window(Operation::MoveEdge(Side::East, Reach::Display)),
             ]
         );
     }

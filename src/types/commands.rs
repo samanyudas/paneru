@@ -211,6 +211,16 @@ impl Side {
     }
 }
 
+/// How far an edge command may go once its strip's end column has focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reach {
+    /// On to the display on that side.
+    Display,
+    /// No farther: a held edge key runs this, so only a fresh press crosses.
+    Strip,
+}
+
 /// Direction used when cycling preset resize widths and heights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -313,12 +323,14 @@ pub enum Operation {
     MoveToDisplay(Direction),
     /// Focuses the first (`West`) or last (`East`) column of the active strip.
     /// When that column already has focus, or the strip has no column, focuses
-    /// the display on that side instead, as `FocusDisplay` does.
-    FocusEdge(Side),
+    /// the display on that side instead, as `FocusDisplay` does, if `Reach`
+    /// allows it.
+    FocusEdge(Side, Reach),
     /// Moves the focused window's whole column to the first (`West`) or last
     /// (`East`) position of its strip. When it is already there, moves the
-    /// column on to the display on that side instead, as `MoveToDisplay` does.
-    MoveEdge(Side),
+    /// column on to the display on that side instead, as `MoveToDisplay` does,
+    /// if `Reach` allows it.
+    MoveEdge(Side, Reach),
     /// Distributes heights equally among windows in the focused stack.
     Equalize,
     /// Makes all columns in the active strip the same width as the focused window.
@@ -403,4 +415,21 @@ pub enum Command {
     Layout(Vec<crate::types::windowset::LayoutOp>),
     /// Shows or hides the menu bar item and remembers the choice.
     MenuBar(bool),
+}
+
+impl Command {
+    /// The command a key auto-repeat of this one runs: an edge command that
+    /// stops at its strip's end. Every other command repeats unchanged.
+    #[must_use]
+    pub fn repeated(self) -> Self {
+        match self {
+            Command::Window(Operation::FocusEdge(side, _)) => {
+                Command::Window(Operation::FocusEdge(side, Reach::Strip))
+            }
+            Command::Window(Operation::MoveEdge(side, _)) => {
+                Command::Window(Operation::MoveEdge(side, Reach::Strip))
+            }
+            other => other,
+        }
+    }
 }

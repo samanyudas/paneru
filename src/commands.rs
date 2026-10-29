@@ -39,7 +39,7 @@ use crate::platform::WorkspaceId;
 use crate::util::round_px;
 
 pub use crate::types::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, Side,
+    Command, Direction, MouseMove, MoveFocus, Operation, Reach, ResizeDirection, Side,
 };
 
 /// Every strip alongside the two flags that say where it sits: whether it is the
@@ -1484,7 +1484,7 @@ fn display_move(
     match operation {
         Operation::ToNextDisplay(move_focus) => Some((move_focus, None)),
         Operation::MoveToDisplay(direction) => Some((MoveFocus::Follow, Some(direction))),
-        Operation::MoveEdge(side) => {
+        Operation::MoveEdge(side, reach) => {
             let (_, mut strip, _, _, _) = moves
                 .strips
                 .iter_mut()
@@ -1495,7 +1495,7 @@ fn display_move(
                 }
                 return None;
             }
-            Some((MoveFocus::Follow, Some(side.direction())))
+            (reach == Reach::Display).then_some((MoveFocus::Follow, Some(side.direction())))
         }
         _ => None,
     }
@@ -1537,7 +1537,7 @@ fn to_next_display(
     let Some(operation) = filter_window_operations(&mut messages, |op| {
         matches!(
             op,
-            Operation::ToNextDisplay(_) | Operation::MoveToDisplay(_) | Operation::MoveEdge(_)
+            Operation::ToNextDisplay(_) | Operation::MoveToDisplay(_) | Operation::MoveEdge(..)
         )
     })
     .next()
@@ -1662,7 +1662,7 @@ fn focus_display(
     mut commands: Commands,
 ) {
     let Some(operation) = filter_window_operations(&mut messages, |op| {
-        matches!(op, Operation::FocusDisplay(_) | Operation::FocusEdge(_))
+        matches!(op, Operation::FocusDisplay(_) | Operation::FocusEdge(..))
     })
     .next()
     .cloned() else {
@@ -1670,7 +1670,7 @@ fn focus_display(
     };
     let direction = match operation {
         Operation::FocusDisplay(direction) => direction,
-        Operation::FocusEdge(side) => {
+        Operation::FocusEdge(side, reach) => {
             let strip = active_display.active_strip();
             let focused = windows.focused().map(|(_, entity)| entity);
             if let EdgeStep::Column(index) = edge_step(strip, focused, side) {
@@ -1682,6 +1682,9 @@ fn focus_display(
                     focus_with_verification(entity, focused, &mut commands);
                     commands.reshuffle_around(entity);
                 }
+                return;
+            }
+            if reach == Reach::Strip {
                 return;
             }
             side.direction()

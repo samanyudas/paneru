@@ -5,7 +5,7 @@
 //! together here and are checked against each other by round-trip tests.
 
 use crate::types::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, Side,
+    Command, Direction, MouseMove, MoveFocus, Operation, Reach, ResizeDirection, Side,
     parse_virtual_workspace_number,
 };
 
@@ -107,8 +107,8 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
         "focusdisplay" => Operation::FocusDisplay(Direction::parse_compass(argument()?)?),
         "movedisplay" => Operation::MoveToDisplay(Direction::parse_compass(argument()?)?),
-        "focusedge" => Operation::FocusEdge(Side::parse(argument()?)?),
-        "moveedge" => Operation::MoveEdge(Side::parse(argument()?)?),
+        "focusedge" => Operation::FocusEdge(Side::parse(argument()?)?, Reach::Display),
+        "moveedge" => Operation::MoveEdge(Side::parse(argument()?)?, Reach::Display),
         "snap" => Operation::Snap,
         "copyrule" => Operation::CopyRule,
         // The `virtual*` verbs take either a direction or a workspace number,
@@ -227,8 +227,8 @@ impl Operation {
             Operation::MoveToDisplay(direction) => {
                 vec!["movedisplay".to_string(), direction.token()]
             }
-            Operation::FocusEdge(side) => owned(&["focusedge", side.token()]),
-            Operation::MoveEdge(side) => owned(&["moveedge", side.token()]),
+            Operation::FocusEdge(side, _) => owned(&["focusedge", side.token()]),
+            Operation::MoveEdge(side, _) => owned(&["moveedge", side.token()]),
             Operation::Equalize => owned(&["equalize"]),
             Operation::Balance => owned(&["balance"]),
             Operation::Manage => owned(&["manage"]),
@@ -309,19 +309,19 @@ mod tests {
         let window = |operation| Ok(Command::Window(operation));
         assert_eq!(
             parse("window_focusedge_west"),
-            window(Operation::FocusEdge(Side::West))
+            window(Operation::FocusEdge(Side::West, Reach::Display))
         );
         assert_eq!(
             parse("window_focusedge_east"),
-            window(Operation::FocusEdge(Side::East))
+            window(Operation::FocusEdge(Side::East, Reach::Display))
         );
         assert_eq!(
             parse("window_moveedge_west"),
-            window(Operation::MoveEdge(Side::West))
+            window(Operation::MoveEdge(Side::West, Reach::Display))
         );
         assert_eq!(
             parse("window_moveedge_east"),
-            window(Operation::MoveEdge(Side::East))
+            window(Operation::MoveEdge(Side::East, Reach::Display))
         );
         for key in [
             "window_focusedge",
@@ -354,10 +354,10 @@ mod tests {
             Operation::FocusDisplay(Direction::West),
             Operation::MoveToDisplay(Direction::South),
             Operation::MoveToDisplay(Direction::East),
-            Operation::FocusEdge(Side::West),
-            Operation::FocusEdge(Side::East),
-            Operation::MoveEdge(Side::West),
-            Operation::MoveEdge(Side::East),
+            Operation::FocusEdge(Side::West, Reach::Display),
+            Operation::FocusEdge(Side::East, Reach::Display),
+            Operation::MoveEdge(Side::West, Reach::Display),
+            Operation::MoveEdge(Side::East, Reach::Display),
             Operation::Equalize,
             Operation::Balance,
             Operation::Manage,
