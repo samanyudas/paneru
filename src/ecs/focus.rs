@@ -2,16 +2,17 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy::app::{App, Plugin, PostUpdate, Update};
+use bevy::ecs::change_detection::{DetectChanges, Ref};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::lifecycle::{Add, Remove};
+use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::message::{Message, MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Added, Has, With, Without};
+use bevy::ecs::query::{Added, Changed, Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, NonSend, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, Local, NonSend, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::Time;
@@ -26,13 +27,13 @@ use super::{
 use crate::commands::visible_floating_entities;
 use crate::config::Config;
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::scroll::{PageGestureState, PageInFlight};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, RepositionMarker, ReshuffleAroundMarker,
-    ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
+    ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent, TopBarHeight,
     VerifyWindowSize,
 };
 use crate::events::Event;
@@ -154,6 +155,9 @@ impl Plugin for FocusEventsPlugin {
                     .run_if(on_timer(Duration::from_millis(
                         REFRESH_WINDOW_CHECK_FREQ_MS,
                     ))),
+                order_overlapping_stacks
+                    .in_set(super::PostUpdateSet::Ui)
+                    .run_if(overlapping_stacks_need_ordering),
             ),
         );
         app.add_observer(dim_remove_window_trigger)
@@ -780,6 +784,88 @@ fn raise_window_trigger(
 
     // Raise the focused window last, because raised windows get OS focus events.
     window.raise_without_focus();
+}
+
+fn overlapping_stacks_need_ordering(
+    gained: Query<(), Added<FocusedMarker>>,
+    mut lost: RemovedComponents<FocusedMarker>,
+    strips: Query<(), (Changed<LayoutStrip>, With<ActiveWorkspaceMarker>)>,
+) -> bool {
+    lost.read().count() > 0 || !gained.is_empty() || !strips.is_empty()
+}
+
+/// Keeps every top bar of an overlapping stack visible: each lower window
+/// goes in front of the window above it, and the focused window in front of
+/// everything. Runs when focus enters or leaves a stacked window and when a
+/// strip changes, so a window that loses focus goes back to its place in its
+/// stack.
+///
+/// `applied` holds the order last given to each overlapping stack, back to
+/// front. A stack already in the order it needs is not raised again: raising
+/// a window of the frontmost app can make it the app's focused window, and
+/// the focus notifications that follow must not start another round.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn order_overlapping_stacks(
+    gained: Query<Entity, Added<FocusedMarker>>,
+    mut lost: RemovedComponents<FocusedMarker>,
+    strips: Query<Ref<LayoutStrip>, With<ActiveWorkspaceMarker>>,
+    windows: Query<(&Window, Has<TopBarHeight>)>,
+    focused: Query<Entity, With<FocusedMarker>>,
+    mut applied: Local<Vec<Vec<Entity>>>,
+) {
+    let touched = gained.iter().chain(lost.read()).collect::<Vec<_>>();
+    let focus = focused.iter().next();
+
+    let mut back_to_front = vec![];
+    for strip in &strips {
+        for column in strip.columns() {
+            let Column::Stack(items) = column else {
+                continue;
+            };
+            let in_stack = |entity: &Entity| items.iter().any(|item| item.contains(*entity));
+            if !strip.is_changed() && !touched.iter().any(in_stack) {
+                continue;
+            }
+            let tops = items.iter().filter_map(StackItem::top).collect::<Vec<_>>();
+            // The layout measures a top bar only for a stack that overlaps.
+            let overlaps = tops
+                .iter()
+                .any(|top| windows.get(*top).is_ok_and(|(_, top_bar)| top_bar));
+            let order = overlaps.then(|| {
+                let mut order = tops.clone();
+                if let Some(index) = order.iter().position(|top| Some(*top) == focus) {
+                    let focused = order.remove(index);
+                    order.push(focused);
+                }
+                order
+            });
+            if order.as_ref().is_some_and(|order| applied.contains(order)) {
+                continue;
+            }
+            applied.retain(|order| !order.iter().any(in_stack));
+            if let Some(order) = order {
+                back_to_front.extend(order.iter().copied());
+                applied.push(order);
+            }
+        }
+    }
+    applied.retain(|order| order.iter().all(|entity| windows.contains(*entity)));
+
+    if back_to_front.is_empty() {
+        return;
+    }
+    for entity in back_to_front
+        .into_iter()
+        .filter(|entity| Some(*entity) != focus)
+    {
+        if let Ok((window, _)) = windows.get(entity) {
+            window.raise_without_focus();
+        }
+    }
+    // Last, so it stays in front and keeps its app's focus.
+    if let Some((window, _)) = focus.and_then(|focus| windows.get(focus).ok()) {
+        window.raise_without_focus();
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]

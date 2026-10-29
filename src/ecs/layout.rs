@@ -8,9 +8,10 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, ParamSet, Populated, Query, Res};
 use bevy::math::IRect;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use stdext::function_name;
-use tracing::{Level, instrument, trace};
+use tracing::{Level, debug, instrument, trace};
 
 use crate::config::Config;
 use crate::ecs::params::Windows;
@@ -18,7 +19,7 @@ use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
     ManualStripOffset, MinimumHeight, Position, RepositionMarker, ReshuffleAroundMarker,
-    ResizeAnchor, ResizeMarker, Scrolling, SpawnCommandsExt,
+    ResizeAnchor, ResizeMarker, Scrolling, SpawnCommandsExt, TopBarHeight,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -28,6 +29,10 @@ use crate::util::round_px;
 /// The floor every window in a column is packed against. Heights that would
 /// starve a sibling below it make [`binpack_heights`] fall back to averaging.
 pub(crate) const MIN_WINDOW_HEIGHT: i32 = 200;
+
+/// The top bar an overlapping stack keeps visible for a window whose top bar
+/// Accessibility cannot measure: a title bar with a small toolbar.
+pub(crate) const FALLBACK_TOP_BAR_HEIGHT: i32 = 52;
 
 pub struct LayoutEventsPlugin;
 
@@ -916,16 +921,23 @@ impl LayoutStrip {
         self.columns.iter()
     }
 
+    /// Frames for every window, relative to the strip. `get_minimum_height`
+    /// gives the height a stacked window must not go below, and
+    /// `get_top_bar_height` the top bar a stack too tall for its column keeps
+    /// visible, [`FALLBACK_TOP_BAR_HEIGHT`] when it gives none. It is called
+    /// only for the windows of such a stack. See [`overlapping_rows`].
     #[instrument(level = Level::TRACE, skip_all, fields(layout_strip_height))]
-    pub fn relative_positions<W, M>(
+    pub fn relative_positions<W, M, T>(
         &self,
         layout_strip_height: i32,
         get_window_frame: &W,
         get_minimum_height: &M,
+        get_top_bar_height: &T,
     ) -> impl Iterator<Item = (Entity, IRect)>
     where
         W: Fn(Entity) -> Option<IRect>,
         M: Fn(Entity) -> Option<i32>,
+        T: Fn(Entity) -> Option<i32>,
     {
         self.column_positions(get_window_frame)
             .filter_map(move |(column, position)| {
@@ -959,32 +971,63 @@ impl LayoutStrip {
                     .map(|item| item.top().and_then(get_minimum_height).unwrap_or(0))
                     .collect::<Vec<_>>();
                 let has_minimum = minimums.iter().any(|minimum| *minimum > 0);
+                let floors = minimums
+                    .iter()
+                    .map(|minimum| (*minimum).max(MIN_WINDOW_HEIGHT))
+                    .collect::<Vec<_>>();
+                let overflows = matches!(column, Column::Stack(_))
+                    && floors.iter().sum::<i32>() > layout_strip_height;
 
-                let mut heights = if is_tabbed_column {
-                    vec![layout_strip_height; items.len()]
-                } else if splits_evenly {
-                    even_heights(items.len(), layout_strip_height)
-                } else {
-                    let mut current_heights = items
+                let rows = if is_tabbed_column {
+                    vec![
+                        Row {
+                            y: 0,
+                            height: layout_strip_height
+                        };
+                        items.len()
+                    ]
+                } else if overflows {
+                    let top_bars = items
                         .iter()
-                        .filter_map(|item| item.top().and_then(get_window_frame))
-                        .map(|frame| frame.height())
+                        .map(|item| {
+                            item.top()
+                                .and_then(get_top_bar_height)
+                                .unwrap_or(FALLBACK_TOP_BAR_HEIGHT)
+                        })
                         .collect::<Vec<_>>();
-                    // A refused height arrives as a current height above the
-                    // window's share. Taking the extra evenly from the others
-                    // first keeps binpack from taking it all from the last one.
+                    overlapping_rows(layout_strip_height, &floors, &top_bars)
+                } else {
+                    let mut heights = if splits_evenly {
+                        even_heights(items.len(), layout_strip_height)
+                    } else {
+                        let mut current_heights = items
+                            .iter()
+                            .filter_map(|item| item.top().and_then(get_window_frame))
+                            .map(|frame| frame.height())
+                            .collect::<Vec<_>>();
+                        // A refused height arrives as a current height above the
+                        // window's share. Taking the extra evenly from the others
+                        // first keeps binpack from taking it all from the last one.
+                        if has_minimum {
+                            hold_minimum_heights(
+                                &mut current_heights,
+                                &minimums,
+                                layout_strip_height,
+                            );
+                        }
+                        // When binpack gives up, such as when the heights it keeps
+                        // leave too little for the rest, an even split still places
+                        // every window rather than leaving the column out.
+                        binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)
+                            .unwrap_or_else(|| {
+                                even_heights(current_heights.len(), layout_strip_height)
+                            })
+                    };
                     if has_minimum {
-                        hold_minimum_heights(&mut current_heights, &minimums, layout_strip_height);
+                        hold_minimum_heights(&mut heights, &minimums, layout_strip_height);
                     }
-                    // When binpack gives up, for example on a column too short
-                    // for every window's minimum, an even split still places
-                    // every window rather than leaving the column out.
-                    binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)
-                        .unwrap_or_else(|| even_heights(current_heights.len(), layout_strip_height))
+                    stacked_rows(&heights)
                 };
-                if has_minimum && !is_tabbed_column {
-                    hold_minimum_heights(&mut heights, &minimums, layout_strip_height);
-                }
 
                 // Every window in a column shares the master's (top item's)
                 // width, so a window stacked onto a master of a different width
@@ -997,22 +1040,17 @@ impl LayoutStrip {
                     .and_then(get_window_frame)
                     .map(|frame| frame.width())?;
 
-                let mut next_y = 0;
                 let frames = items
                     .into_iter()
-                    .zip(heights)
-                    .filter_map(|(item, height)| {
+                    .zip(rows)
+                    .filter_map(|(item, row)| {
                         let entity = item.top()?;
                         let mut frame = get_window_frame(entity)?;
                         frame.min.x = position;
                         frame.max.x = frame.min.x + column_width;
 
-                        frame.min.y = next_y;
-                        frame.max.y = frame.min.y + height;
-
-                        if !is_tabbed_column {
-                            next_y = frame.max.y;
-                        }
+                        frame.min.y = row.y;
+                        frame.max.y = row.y + row.height;
 
                         // Return ALL windows in the item with the same frame
                         let results = item.window_iter().map(|e| (e, frame)).collect::<Vec<_>>();
@@ -1259,8 +1297,8 @@ fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Optio
 
 /// Raises each height below its window's minimum to that minimum, and takes
 /// the extra evenly from the other windows, none going below its own minimum or
-/// `MIN_WINDOW_HEIGHT`. If the minimums alone exceed `total_height`, the column
-/// overflows rather than overlap.
+/// `MIN_WINDOW_HEIGHT`. Minimums that cannot all fit are left for
+/// [`overlapping_rows`], which the layout uses instead.
 fn hold_minimum_heights(heights: &mut [i32], minimums: &[i32], total_height: i32) {
     for (height, minimum) in heights.iter_mut().zip(minimums) {
         *height = (*height).max(*minimum);
@@ -1279,6 +1317,75 @@ fn hold_minimum_heights(heights: &mut [i32], minimums: &[i32], total_height: i32
         heights[giver] -= 1;
         excess -= 1;
     }
+}
+
+/// Where one window of a column sits: its distance from the column top and
+/// its height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Row {
+    y: i32,
+    height: i32,
+}
+
+/// Rows for windows that fit, each starting where the one above ends.
+fn stacked_rows(heights: &[i32]) -> Vec<Row> {
+    let mut y = 0;
+    heights
+        .iter()
+        .map(|&height| {
+            let row = Row { y, height };
+            y += height;
+            row
+        })
+        .collect()
+}
+
+/// Rows for a stack whose `floors`, each window's minimum height and at least
+/// `MIN_WINDOW_HEIGHT`, add up to more than `column_height`.
+///
+/// Each lower window overlaps the window above it, but only below that
+/// window's top bar, given by `top_bars`. The last window ends at the column
+/// bottom, and the space it leaves above is shared evenly between the upper
+/// windows' visible strips. A window starts no lower than lets it fit above
+/// the column bottom at its floor, so it extends past the bottom only when the
+/// top bars above it and its own floor do not fit.
+///
+/// Every window reaches down to the column bottom, so a window raised in
+/// front of the stack, such as the focused one, shows as much of itself as
+/// the column holds.
+fn overlapping_rows(column_height: i32, floors: &[i32], top_bars: &[i32]) -> Vec<Row> {
+    let Some(last) = floors.len().checked_sub(1) else {
+        return vec![];
+    };
+    let upper_bars = top_bars[..last].iter().sum::<i32>();
+    let leftover = (column_height - floors[last] - upper_bars).max(0);
+    let upper_count = i32::try_from(last).unwrap_or(i32::MAX).max(1);
+    let (share, remainder) = (leftover / upper_count, leftover % upper_count);
+    // The lowest each window may start and still leave every window below it
+    // its top bar and its own floor above the column bottom.
+    let mut latest = floors
+        .iter()
+        .map(|floor| column_height - floor)
+        .collect::<Vec<_>>();
+    for index in (0..last).rev() {
+        latest[index] = latest[index].min(latest[index + 1] - top_bars[index]);
+    }
+
+    let mut rows = Vec::with_capacity(floors.len());
+    // Where the even share would put the next window, and the highest it may
+    // start without covering the top bar above it.
+    let (mut target, mut earliest) = (0, 0);
+    for (index, (floor, top_bar)) in floors.iter().zip(top_bars).enumerate() {
+        let y = earliest.max(target.min(latest[index]));
+        rows.push(Row {
+            y,
+            height: (*floor).max(column_height - y),
+        });
+        let extra = share + i32::from(i32::try_from(index).unwrap_or(i32::MAX) < remainder);
+        target += top_bar + extra;
+        earliest = y + top_bar;
+    }
+    rows
 }
 
 /// `total_height` split into `count` heights that sum to it exactly.
@@ -1335,13 +1442,19 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
 
 /// Watches for changes to `LayoutStrip` (i.e. a window added or window order changed) and
 /// re-calculates the logical positions of all the windows in the layout strip.
+///
+/// A window in a stack too tall for its column has its top bar measured the
+/// first time the layout needs it, and keeps it as [`TopBarHeight`] while the
+/// layout keeps placing it in such a stack. Only those windows are asked.
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn layout_strip_changed(
     mut changed_strips: Populated<(&mut LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
     mut windows: WindowFrames,
     minimum_heights: Query<&MinimumHeight>,
+    top_bars: Query<(&Window, Option<&TopBarHeight>)>,
     displays: DisplayViewports,
     config: Res<Config>,
+    mut commands: Commands,
 ) {
     let get_window_frame = |entity| {
         windows
@@ -1353,6 +1466,21 @@ pub(super) fn layout_strip_changed(
             .ok()
     };
     let get_minimum_height = |entity| minimum_heights.get(entity).ok().map(|minimum| minimum.0);
+    let overlapping = RefCell::new(EntityHashMap::default());
+    let get_top_bar_height = |entity| {
+        let (window, top_bar) = top_bars.get(entity).ok()?;
+        let height = top_bar.map_or_else(
+            || {
+                window.top_bar_height().unwrap_or_else(|err| {
+                    debug!("top bar of window {}: {err}", window.id());
+                    FALLBACK_TOP_BAR_HEIGHT
+                })
+            },
+            |top_bar| top_bar.0,
+        );
+        overlapping.borrow_mut().insert(entity, height);
+        Some(height)
+    };
 
     let mut changed = Vec::new();
     for (mut layout_strip, child_of) in &mut changed_strips {
@@ -1364,10 +1492,28 @@ pub(super) fn layout_strip_changed(
             height,
             &get_window_frame,
             &get_minimum_height,
+            &get_top_bar_height,
         ));
         // Later layouts keep the heights this one sets. Clearing the record
         // is bookkeeping, not a layout change.
         layout_strip.bypass_change_detection().clear_even_splits();
+    }
+
+    let overlapping = overlapping.into_inner();
+    for (entity, _) in &changed {
+        let cached = top_bars.get(*entity).ok().and_then(|(_, top_bar)| top_bar);
+        let Ok(mut entity_commands) = commands.get_entity(*entity) else {
+            continue;
+        };
+        match overlapping.get(entity) {
+            Some(height) if cached.is_none() => {
+                entity_commands.try_insert(TopBarHeight(*height));
+            }
+            None if cached.is_some() => {
+                entity_commands.try_remove::<TopBarHeight>();
+            }
+            _ => {}
+        }
     }
 
     for (entity, frame) in changed {
@@ -2309,6 +2455,52 @@ mod tests {
         assert_eq!(heights, vec![600, 600]);
     }
 
+    fn rows(rows: &[(i32, i32)]) -> Vec<Row> {
+        rows.iter().map(|&(y, height)| Row { y, height }).collect()
+    }
+
+    /// The last window ends at the column bottom, and the windows above it
+    /// share what it leaves evenly, each strip at least its top bar. Every
+    /// window reaches the column bottom.
+    #[test]
+    fn overlapping_rows_share_the_space_above_the_last_window() {
+        // 548 above the last window: 156 of top bars and 392 shared, 130
+        // each with the 2 left over going to the first windows.
+        assert_eq!(
+            overlapping_rows(748, &[200; 4], &[52; 4]),
+            rows(&[(0, 748), (183, 565), (366, 382), (548, 200)])
+        );
+        assert_eq!(
+            overlapping_rows(1270, &[700; 3], &[52; 3]),
+            rows(&[(0, 1270), (285, 985), (570, 700)])
+        );
+    }
+
+    /// Window 1 starts high enough to fit its 900 px above the bottom, and
+    /// window 2 still starts below window 1's 40 px top bar.
+    #[test]
+    fn overlapping_rows_fit_a_tall_window_above_the_bottom() {
+        assert_eq!(
+            overlapping_rows(1270, &[200, 900, 200], &[60, 40, 52]),
+            rows(&[(0, 1270), (370, 900), (1070, 200)])
+        );
+    }
+
+    /// When the top bars above the last window and its floor do not fit,
+    /// each window starts right below the top bar above it and only the last
+    /// one extends past the column bottom.
+    #[test]
+    fn overlapping_rows_extend_past_the_bottom_only_when_top_bars_do_not_fit() {
+        assert_eq!(
+            overlapping_rows(1270, &[1200; 3], &[52; 3]),
+            rows(&[(0, 1270), (52, 1218), (104, 1200)])
+        );
+        assert_eq!(
+            overlapping_rows(1270, &[1200; 3], &[30; 3]),
+            rows(&[(0, 1270), (35, 1235), (70, 1200)])
+        );
+    }
+
     #[test]
     fn test_even_heights() {
         assert_eq!(even_heights(3, 1000), vec![333, 333, 334]);
@@ -2338,7 +2530,7 @@ mod tests {
         _ = strip.stack(entities[2]);
         let get_window_frame = |_| Some(sizes[0]);
         let out = strip
-            .relative_positions(500, &get_window_frame, &|_| None)
+            .relative_positions(500, &get_window_frame, &|_| None, &|_| None)
             .collect::<Vec<_>>();
 
         let xpos = out.iter().map(|(_, frame)| frame.min.x).collect::<Vec<_>>();
@@ -2372,7 +2564,7 @@ mod tests {
                 Some(IRect::new(0, 0, 300, current[index]))
             };
             strip
-                .relative_positions(1270, &get_window_frame, &get_minimum_height)
+                .relative_positions(1270, &get_window_frame, &get_minimum_height, &|_| None)
                 .map(|(_, frame)| frame.height())
                 .collect::<Vec<_>>()
         };
@@ -2396,7 +2588,7 @@ mod tests {
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 400));
         let out: Vec<_> = strip
-            .relative_positions(800, &get_window_frame, &|_| None)
+            .relative_positions(800, &get_window_frame, &|_| None, &|_| None)
             .collect();
 
         assert_eq!(out.len(), 3);
@@ -2439,7 +2631,7 @@ mod tests {
         };
 
         let out: Vec<_> = strip
-            .relative_positions(600, &get_window_frame, &|_| None)
+            .relative_positions(600, &get_window_frame, &|_| None, &|_| None)
             .collect();
         assert_eq!(out.len(), 4);
 
@@ -2531,7 +2723,7 @@ mod tests {
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 400, 300));
         let out: Vec<_> = strip
-            .relative_positions(700, &get_window_frame, &|_| None)
+            .relative_positions(700, &get_window_frame, &|_| None, &|_| None)
             .collect();
 
         assert_eq!(out.len(), 3);
@@ -2567,7 +2759,7 @@ mod tests {
         strip.toggle_tabbed_display(entities[1]);
 
         let out: Vec<_> = strip
-            .relative_positions(600, &get_window_frame, &|_| None)
+            .relative_positions(600, &get_window_frame, &|_| None, &|_| None)
             .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(
@@ -2718,7 +2910,7 @@ mod tests {
         // relative_positions should yield e1, e4 (same frame) and e2
         let get_window_frame = |_| Some(IRect::new(0, 0, 100, 100));
         let out: Vec<_> = strip
-            .relative_positions(400, &get_window_frame, &|_| None)
+            .relative_positions(400, &get_window_frame, &|_| None, &|_| None)
             .collect();
 
         // We expect e1, e4, e2 from the first column, and e3 from the second.
@@ -2749,7 +2941,7 @@ mod tests {
 
         // Before unstack: e0 and e1 share 500px height.
         let out: Vec<_> = strip
-            .relative_positions(500, &get_window_frame, &|_| None)
+            .relative_positions(500, &get_window_frame, &|_| None, &|_| None)
             .collect();
         let e1_height = out
             .iter()
@@ -2764,7 +2956,7 @@ mod tests {
         assert_eq!(strip.len(), 3);
 
         let out: Vec<_> = strip
-            .relative_positions(500, &get_window_frame, &|_| None)
+            .relative_positions(500, &get_window_frame, &|_| None, &|_| None)
             .collect();
         for (_, f) in &out {
             assert_eq!(
@@ -2790,7 +2982,7 @@ mod tests {
         // Stack: [Stack(e0, e1)]
         strip.stack(entities[1]).unwrap();
         let out: Vec<_> = strip
-            .relative_positions(500, &get_window_frame, &|_| None)
+            .relative_positions(500, &get_window_frame, &|_| None, &|_| None)
             .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(heights.iter().sum::<i32>(), 500);
@@ -2799,7 +2991,7 @@ mod tests {
         // Unstack: [Single(e0), Single(e1)]
         strip.unstack(entities[1]).unwrap();
         let out: Vec<_> = strip
-            .relative_positions(500, &get_window_frame, &|_| None)
+            .relative_positions(500, &get_window_frame, &|_| None, &|_| None)
             .collect();
         for (_, f) in &out {
             assert_eq!(f.height(), 500);
@@ -2808,7 +3000,7 @@ mod tests {
         // Re-stack: [Stack(e0, e1)] — e1 stacks onto left neighbor e0
         strip.stack(entities[1]).unwrap();
         let out: Vec<_> = strip
-            .relative_positions(500, &get_window_frame, &|_| None)
+            .relative_positions(500, &get_window_frame, &|_| None, &|_| None)
             .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(heights.iter().sum::<i32>(), 500);
@@ -2849,7 +3041,7 @@ mod tests {
         };
 
         let out: Vec<_> = strip
-            .relative_positions(600, &get_window_frame, &|_| None)
+            .relative_positions(600, &get_window_frame, &|_| None, &|_| None)
             .collect();
         assert_eq!(out.len(), 3);
 
@@ -2887,7 +3079,7 @@ mod tests {
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 600));
 
         let out: Vec<_> = strip
-            .relative_positions(600, &get_window_frame, &|_| None)
+            .relative_positions(600, &get_window_frame, &|_| None, &|_| None)
             .collect();
         let xs: Vec<_> = out.iter().map(|(_, f)| f.min.x).collect();
         assert_eq!(xs, vec![0, 300, 600]);
@@ -3028,7 +3220,7 @@ mod tests {
         };
 
         let out = strip
-            .relative_positions(600, &get_window_frame, &|_| None)
+            .relative_positions(600, &get_window_frame, &|_| None, &|_| None)
             .collect::<Vec<_>>();
 
         assert_eq!(out.len(), 2);

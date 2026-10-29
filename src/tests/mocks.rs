@@ -51,6 +51,11 @@ pub(crate) struct MockWindowData {
     pub(crate) max_width: i32,
     /// The shortest height the app accepts, like an `NSWindow.minSize`.
     pub(crate) min_height: i32,
+    /// What Accessibility measures for the window's top bar, or a failed
+    /// measurement when `None`.
+    pub(crate) top_bar_height: Option<i32>,
+    /// How many times the window's top bar was measured.
+    pub(crate) top_bar_reads: usize,
 }
 
 impl Default for MockWindowData {
@@ -74,6 +79,8 @@ impl Default for MockWindowData {
             min_width: 0,
             max_width: 0,
             min_height: 0,
+            top_bar_height: None,
+            top_bar_reads: 0,
         }
     }
 }
@@ -104,6 +111,9 @@ struct MockStateInner {
     /// Windows raised without focus, in order, so a test can check what ends
     /// up in front of what.
     raised: Vec<WinID>,
+    /// Whether raising a window also makes it its app's focused window, as
+    /// `AXRaise` does for a window of the frontmost app.
+    raise_takes_focus: bool,
     /// How many times each app has been asked for its focused window or its
     /// window list, so a test can check who a lookup bothers.
     app_reads: HashMap<Pid, usize>,
@@ -129,6 +139,7 @@ impl MockState {
                 unordered_windows: HashSet::new(),
                 background_tabs: HashSet::new(),
                 raised: Vec::new(),
+                raise_takes_focus: false,
                 app_reads: HashMap::new(),
             })),
         }
@@ -137,6 +148,10 @@ impl MockState {
     /// The windows raised since this was last called, in the order they were.
     pub fn take_raised(&self) -> Vec<WinID> {
         std::mem::take(&mut self.inner.force_write().raised)
+    }
+
+    pub fn set_raise_takes_focus(&self, takes_focus: bool) {
+        self.inner.force_write().raise_takes_focus = takes_focus;
     }
 
     #[allow(dead_code)]
@@ -657,11 +672,32 @@ impl MockState {
                 .and_then(|w| w.border_radius)
         });
 
+        let s = self.clone();
+        mw.expect_top_bar_height().returning(move || {
+            let mut inner = s.inner.force_write();
+            let window = inner
+                .windows
+                .get_mut(&id)
+                .ok_or(crate::errors::Error::InvalidWindow)?;
+            window.top_bar_reads += 1;
+            window
+                .top_bar_height
+                .ok_or_else(|| crate::errors::Error::Generic("top bar unreadable".to_string()))
+        });
+
         // Fill in remaining defaults
         mw.expect_element().return_const(None);
         let s = self.clone();
-        mw.expect_raise_without_focus()
-            .returning(move || s.inner.force_write().raised.push(id));
+        mw.expect_raise_without_focus().returning(move || {
+            let takes_focus = {
+                let mut inner = s.inner.force_write();
+                inner.raised.push(id);
+                inner.raise_takes_focus
+            };
+            if takes_focus {
+                s.focus_window(id);
+            }
+        });
 
         // Focusing without raising still moves the OS focus, it just leaves the
         // window order alone. Only the app's idea of its focused window changes

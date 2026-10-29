@@ -428,6 +428,14 @@ pub struct AwaitResize {
 #[derive(Component, Clone, Copy, Debug)]
 pub struct MinimumHeight(pub i32);
 
+/// How far a window's top bar (title bar and toolbars) reaches below its top
+/// edge. Only a window in a stack too tall for its column has one: the layout
+/// measures it the first time the stack overlaps, and drops it once the
+/// layout places the window anywhere else, so the next overlap measures it
+/// afresh.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TopBarHeight(pub i32);
+
 /// The horizontal center a window had before its current run of resizes. The
 /// layout keeps a resizing window centered on it, so a size the app refuses
 /// puts the window back where it was.

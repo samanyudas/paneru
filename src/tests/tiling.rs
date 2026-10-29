@@ -461,17 +461,19 @@ fn test_window_vertical_resize_is_a_noop_outside_a_stack() {
 }
 
 /// Four windows need 800px at the 200px minimum window height, more than the
-/// 748px viewport, so the column is split evenly below that minimum.
-fn assert_four_window_stack_split_evenly(world: &mut World) {
-    const ROW_HEIGHT: i32 = (TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT) / 4;
-    for id in 0..4 {
-        assert_window_at!(world, id, 0, TEST_MENUBAR_HEIGHT + ROW_HEIGHT * id);
-        assert_window_size!(world, id, TEST_WINDOW_WIDTH, ROW_HEIGHT);
+/// 748px viewport, so each overlaps the one above it below that window's
+/// 52px fallback top bar, and reaches down to the display bottom.
+fn assert_four_window_stack_overlaps(world: &mut World) {
+    const TOPS: [i32; 4] = [0, 183, 366, 548];
+    const VIEWPORT_HEIGHT: i32 = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT;
+    for (id, top) in (0..).zip(TOPS) {
+        assert_window_at!(world, id, 0, TEST_MENUBAR_HEIGHT + top);
+        assert_window_size!(world, id, TEST_WINDOW_WIDTH, VIEWPORT_HEIGHT - top);
     }
 }
 
 #[test]
-fn test_stack_too_tall_for_the_minimum_height_is_split_evenly() {
+fn test_stack_too_tall_for_the_minimum_height_overlaps() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -500,15 +502,15 @@ fn test_stack_too_tall_for_the_minimum_height_is_split_evenly() {
     TestHarness::new()
         .with_windows(4)
         .on_iteration(7, |world, _state| {
-            assert_four_window_stack_split_evenly(world);
+            assert_four_window_stack_overlaps(world);
         })
         .run(commands);
 }
 
-/// A whole stack joining a full-height window: not even the full-height window
-/// keeps its height, which takes a different give-up path in the binpacker.
+/// A whole stack joining a full-height window overlaps the same way. Before
+/// the overlap, this took a different give-up path in the binpacker.
 #[test]
-fn test_stack_joining_a_full_height_window_is_split_evenly() {
+fn test_stack_joining_a_full_height_window_overlaps() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -541,7 +543,7 @@ fn test_stack_joining_a_full_height_window_is_split_evenly() {
             assert_eq!(strip.len(), 2, "windows 1-3 share the second column");
         })
         .on_iteration(7, |world, _state| {
-            assert_four_window_stack_split_evenly(world);
+            assert_four_window_stack_overlaps(world);
         })
         .run(commands);
 }

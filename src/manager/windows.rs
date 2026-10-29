@@ -1,7 +1,8 @@
 use accessibility_sys::{
     AXUIElementCreateApplication, AXUIElementRef, AXValueCreate, AXValueGetValue,
-    kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXErrorSuccess, kAXFloatingWindowSubrole,
-    kAXPositionAttribute, kAXRaiseAction, kAXSizeAttribute, kAXStandardWindowSubrole,
+    kAXChildrenAttribute, kAXCloseButtonAttribute, kAXErrorAttributeUnsupported, kAXErrorNoValue,
+    kAXErrorNotImplemented, kAXErrorSuccess, kAXFloatingWindowSubrole, kAXPositionAttribute,
+    kAXRaiseAction, kAXRoleAttribute, kAXSizeAttribute, kAXStandardWindowSubrole, kAXToolbarRole,
     kAXUnknownRole, kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
 };
 use bevy::ecs::component::Component;
@@ -10,10 +11,11 @@ use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
+    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize, Type,
     kCFBooleanFalse, kCFBooleanTrue,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
@@ -322,6 +324,11 @@ pub trait WindowApi: Send + Sync {
     fn horizontal_padding(&self) -> i32;
     fn vertical_padding(&self) -> i32;
     fn border_radius(&self) -> Option<f64>;
+    /// How far the window's top bar (title bar and toolbars) reaches below
+    /// its top edge, read through Accessibility. Fails when the window shows
+    /// neither a close button nor a toolbar, or when a read fails, such as
+    /// while its app is busy.
+    fn top_bar_height(&self) -> Result<i32>;
 }
 
 #[derive(Component, Deref, DerefMut)]
@@ -363,6 +370,192 @@ pub fn try_ax_window_id(element_ref: AXUIElementRef) -> Option<WinID> {
         return None;
     }
     Some(window_id)
+}
+
+/// How many levels below the window the toolbar search looks. Chromium
+/// browsers nest their toolbars six levels down.
+const TOP_BAR_SEARCH_DEPTH: usize = 6;
+/// How many elements the toolbar search inspects in total, so a window with a
+/// large or wide tree costs a bounded number of Accessibility calls.
+const TOP_BAR_SEARCH_BUDGET: usize = 200;
+/// Elements that start further below the window top than this hold content,
+/// not the top bar.
+const TOP_BAR_SEARCH_REACH: i32 = 200;
+/// A toolbar that starts at most this far below the top bar found so far
+/// continues it.
+const TOOLBAR_JOIN_SLACK: i32 = 8;
+/// Roles that hold content or controls, never a toolbar.
+const TOP_BAR_LEAF_ROLES: [&str; 12] = [
+    "AXBrowser",
+    "AXButton",
+    "AXImage",
+    "AXList",
+    "AXMenuBar",
+    "AXOutline",
+    "AXScrollArea",
+    "AXStaticText",
+    "AXTable",
+    "AXTextArea",
+    "AXTextField",
+    "AXWebArea",
+];
+
+/// Reads an attribute. `Ok(None)` when the element does not have it, and an
+/// error when the read fails, such as while the app is busy.
+fn read_ax_attribute<T: Type>(
+    element: &CFRetained<AXUIWrapper>,
+    attribute: &'static str,
+) -> Result<Option<CFRetained<T>>> {
+    let mut value: *mut CFType = null_mut();
+    let code = unsafe {
+        AXUIElementCopyAttributeValue(
+            element.as_ptr(),
+            CFString::from_static_str(attribute).as_ref(),
+            &mut value,
+        )
+    };
+    if [
+        kAXErrorAttributeUnsupported,
+        kAXErrorNoValue,
+        kAXErrorNotImplemented,
+    ]
+    .contains(&code)
+    {
+        return Ok(None);
+    }
+    code.to_result(attribute)?;
+    Ok(NonNull::new(value).map(|value| unsafe { CFRetained::from_raw(value.cast::<T>()) }))
+}
+
+fn read_ax_frame(element: &CFRetained<AXUIWrapper>) -> Result<Option<IRect>> {
+    let position = read_ax_attribute::<AXUIWrapper>(element, kAXPositionAttribute)?;
+    let size = read_ax_attribute::<AXUIWrapper>(element, kAXSizeAttribute)?;
+    let Some((position, size)) = position.zip(size) else {
+        return Ok(None);
+    };
+    let mut frame = CGRect::default();
+    unsafe {
+        AXValueGetValue(
+            position.as_ptr(),
+            kAXValueTypeCGPoint,
+            NonNull::from(&mut frame.origin).as_ptr().cast(),
+        );
+        AXValueGetValue(
+            size.as_ptr(),
+            kAXValueTypeCGSize,
+            NonNull::from(&mut frame.size).as_ptr().cast(),
+        );
+    }
+    Ok(Some(irect_from(frame)))
+}
+
+/// Measures how far a window's top bar reaches below its top edge.
+///
+/// The title bar is twice the distance from the window top to the middle of
+/// the close button, since macOS centers the window buttons in the bar that
+/// holds them, whether that is a plain title bar or a unified toolbar. Each
+/// `AXToolbar` near the top that starts where the bar found so far ends, such
+/// as a browser's address bar and bookmarks bar under its tab strip, extends it.
+///
+/// Any failed read fails the measurement, so a busy app costs one timed-out
+/// read rather than one per element, and a partly read top bar is never kept.
+fn measure_top_bar(window: &CFRetained<AXUIWrapper>) -> Result<i32> {
+    let frame = read_ax_frame(window)?.ok_or(Error::InvalidWindow)?;
+    let top = frame.min.y;
+    let title_bar = match read_ax_attribute::<AXUIWrapper>(window, kAXCloseButtonAttribute)? {
+        Some(button) => read_ax_frame(&button)?.map(|button| button.min.y + button.max.y - 2 * top),
+        None => None,
+    };
+
+    let toolbars = search_toolbars(
+        window.clone(),
+        |element| {
+            Ok(
+                read_ax_attribute::<CFArray<AXUIWrapper>>(element, kAXChildrenAttribute)?
+                    .map(|children| children.to_vec())
+                    .unwrap_or_default(),
+            )
+        },
+        |child| {
+            let Some(role) = read_ax_attribute::<CFString>(child, kAXRoleAttribute)? else {
+                return Ok(TopBarElement::Other);
+            };
+            let role = role.to_string();
+            if TOP_BAR_LEAF_ROLES.contains(&role.as_str()) {
+                return Ok(TopBarElement::Other);
+            }
+            let Some(child_frame) = read_ax_frame(child)? else {
+                return Ok(TopBarElement::Other);
+            };
+            Ok(if child_frame.min.y - top > TOP_BAR_SEARCH_REACH {
+                TopBarElement::Other
+            } else if role == kAXToolbarRole {
+                TopBarElement::Toolbar(child_frame.min.y - top..child_frame.max.y - top)
+            } else {
+                TopBarElement::Container
+            })
+        },
+    )?;
+    top_bar_extent(title_bar, toolbars)
+        .filter(|height| *height < frame.height())
+        .ok_or_else(|| Error::NotFound("no close button or toolbar".to_string()))
+}
+
+/// What the toolbar search learns about one element.
+#[derive(Debug)]
+enum TopBarElement {
+    /// A toolbar, given as offsets from the window top.
+    Toolbar(Range<i32>),
+    /// An element near the top that may hold a toolbar.
+    Container,
+    /// Content, a control, or an element too far down to matter.
+    Other,
+}
+
+/// Walks the tree under `root` breadth first, at most
+/// [`TOP_BAR_SEARCH_DEPTH`] levels deep, and returns every toolbar found.
+/// Each element `inspect` classifies counts against one
+/// [`TOP_BAR_SEARCH_BUDGET`], so a wide tree costs no more than a deep one.
+/// A failed read from either closure ends the search with that error.
+fn search_toolbars<N>(
+    root: N,
+    mut children: impl FnMut(&N) -> Result<Vec<N>>,
+    mut inspect: impl FnMut(&N) -> Result<TopBarElement>,
+) -> Result<Vec<Range<i32>>> {
+    let mut toolbars = vec![];
+    let mut budget = TOP_BAR_SEARCH_BUDGET;
+    let mut queue = VecDeque::from([(root, 0)]);
+    while let Some((element, depth)) = queue.pop_front() {
+        for child in children(&element)? {
+            if budget == 0 {
+                return Ok(toolbars);
+            }
+            budget -= 1;
+            match inspect(&child)? {
+                TopBarElement::Toolbar(range) => toolbars.push(range),
+                TopBarElement::Container if depth + 1 < TOP_BAR_SEARCH_DEPTH => {
+                    queue.push_back((child, depth + 1));
+                }
+                TopBarElement::Container | TopBarElement::Other => {}
+            }
+        }
+    }
+    Ok(toolbars)
+}
+
+/// The top bar's reach below the window top: the title bar, extended by each
+/// toolbar that starts where the bar so far ends. Toolbars are given as
+/// offsets from the window top.
+fn top_bar_extent(title_bar: Option<i32>, mut toolbars: Vec<Range<i32>>) -> Option<i32> {
+    toolbars.sort_by_key(|toolbar| toolbar.start);
+    let mut bottom = title_bar;
+    for toolbar in toolbars {
+        let so_far = bottom.unwrap_or(0);
+        if toolbar.start <= so_far + TOOLBAR_JOIN_SLACK {
+            bottom = Some(so_far.max(toolbar.end));
+        }
+    }
+    bottom.filter(|height| *height > 0)
 }
 
 // const CPS_ALL_WINDOWS: u32 = 0x100;
@@ -1021,6 +1214,11 @@ impl WindowApi for WindowOS {
             radii.get(0)?.as_i64().map(|v| v as f64)
         })
     }
+
+    #[instrument(level = Level::DEBUG)]
+    fn top_bar_height(&self) -> Result<i32> {
+        measure_top_bar(&self.ax_element)
+    }
 }
 
 #[cfg(test)]
@@ -1529,5 +1727,84 @@ mod tests {
         let previous = IRect::new(0, 40, 800, 640);
         let completed = IRect::new(0, 40, 4112, 640);
         assert_eq!(resize_staging_origin(previous, completed, 4112), None);
+    }
+
+    /// A Chromium browser's window buttons center in a 34 px tab strip, and
+    /// its address bar and bookmarks bar toolbars continue the top bar to
+    /// 96 px. A toolbar further down, such as a find bar, does not.
+    #[test]
+    fn a_top_bar_reaches_through_the_toolbars_that_continue_it() {
+        assert_eq!(
+            top_bar_extent(Some(34), vec![300..330, 62..96, 34..62]),
+            Some(96)
+        );
+        assert_eq!(top_bar_extent(None, vec![0..52, 300..330]), Some(52));
+        assert_eq!(top_bar_extent(Some(28), vec![]), Some(28));
+        assert_eq!(top_bar_extent(None, vec![]), None);
+    }
+
+    /// Each element is either a container holding the next ones or a leaf.
+    /// `None` children for a leaf.
+    fn search(tree: &[Option<Vec<usize>>], toolbars: &[usize]) -> (Vec<Range<i32>>, usize) {
+        let mut inspected = 0;
+        let found = search_toolbars(
+            0,
+            |node| Ok(tree[*node].clone().unwrap_or_default()),
+            |node| {
+                inspected += 1;
+                Ok(if toolbars.contains(node) {
+                    TopBarElement::Toolbar(0..40)
+                } else if tree[*node].is_some() {
+                    TopBarElement::Container
+                } else {
+                    TopBarElement::Other
+                })
+            },
+        )
+        .unwrap();
+        (found, inspected)
+    }
+
+    #[test]
+    fn the_toolbar_search_inspects_at_most_its_budget() {
+        // The root and its first child each hold 1000 containers.
+        let mut tree = vec![Some((1..=1000).collect::<Vec<_>>())];
+        tree.push(Some((1001..=2000).collect()));
+        tree.extend((2..=2000).map(|_| Some(vec![])));
+        let (_, inspected) = search(&tree, &[]);
+        assert_eq!(inspected, TOP_BAR_SEARCH_BUDGET);
+    }
+
+    #[test]
+    fn the_toolbar_search_finds_a_toolbar_within_its_depth() {
+        // A chain of containers, each holding the next.
+        let chain = |levels: usize| {
+            let mut tree = (0..levels)
+                .map(|node| Some(vec![node + 1]))
+                .collect::<Vec<_>>();
+            tree.push(None);
+            tree
+        };
+        let (found, _) = search(&chain(TOP_BAR_SEARCH_DEPTH), &[TOP_BAR_SEARCH_DEPTH]);
+        assert_eq!(found, vec![0..40]);
+        let deeper = TOP_BAR_SEARCH_DEPTH + 1;
+        let (found, _) = search(&chain(deeper), &[deeper]);
+        assert_eq!(found, Vec::<Range<i32>>::new());
+    }
+
+    #[test]
+    fn a_failed_read_fails_the_toolbar_search() {
+        let failed = search_toolbars(
+            0,
+            |node| Ok(if *node == 0 { vec![1, 2] } else { vec![] }),
+            |node| {
+                if *node == 2 {
+                    Err(Error::Generic("busy".to_string()))
+                } else {
+                    Ok(TopBarElement::Toolbar(0..40))
+                }
+            },
+        );
+        assert!(failed.is_err());
     }
 }
