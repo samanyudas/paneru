@@ -315,6 +315,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
             (
                 systems::animate_resize_entities,
                 systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
+                systems::notice_kept_height.run_if(not(resource_exists::<Initializing>)),
+                systems::check_minimum_height.run_if(not(resource_exists::<Initializing>)),
             )
                 .chain(),
         )
@@ -419,6 +421,47 @@ pub struct AwaitResize {
     pub x: i32,
     /// The window's `ResizeAnchor`, relative to `x`.
     pub anchor_offset: i32,
+}
+
+/// The smallest height a window's app accepted when the layout asked for less.
+/// Stack layout never gives the window less while every minimum in the column
+/// fits, so it cannot cover the window below it. Dropped once the window is
+/// seen shorter, as when a window joining or leaving its column asks every
+/// window there for an even share.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct MinimumHeight(pub i32);
+
+/// A window that kept more height than it was asked for. The height it keeps
+/// counts as its [`MinimumHeight`] only after a wait and a release, because a
+/// slow app applies a size after the write returns, and macOS keeps a window's
+/// bottom edge at the screen's bottom through a small shrink. Ends after at
+/// most two waits, or when a later resize, by the layout or the user,
+/// supersedes it.
+#[derive(Component, Debug)]
+pub struct MinimumHeightCheck {
+    pub asked: Size,
+    pub step: HeightCheckStep,
+    pub timer: Timer,
+}
+
+impl MinimumHeightCheck {
+    /// Whether `height` can come from the app applying the lowering or the
+    /// asked height, perhaps late, rather than from the user.
+    pub fn awaits(&self, height: i32) -> bool {
+        let HeightCheckStep::Lowering(lowered) = self.step else {
+            return false;
+        };
+        (lowered - 1..=self.asked.y + 1).contains(&height)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeightCheckStep {
+    /// Gives a slow app time to apply the asked height.
+    Settling,
+    /// Asked for this height, less than the asked height, and gives the app
+    /// time to apply it before the height it keeps counts as its minimum.
+    Lowering(i32),
 }
 
 /// The horizontal center a window had before its current run of resizes. The

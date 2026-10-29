@@ -54,6 +54,10 @@ pub(crate) struct MockWindowData {
     /// The bottom edge of the screen the window is on, when macOS keeps the
     /// window's bottom edge there through a small shrink.
     pub(crate) sticky_bottom: Option<i32>,
+    /// Size writes the app has not applied yet, while it is busy, like an app
+    /// that applies a size after the call returns. See
+    /// [`MockState::os_apply_late_resizes`].
+    pub(crate) late_resizes: Option<Vec<Size>>,
     pub(crate) resize_writes: usize,
 }
 
@@ -103,6 +107,7 @@ impl Default for MockWindowData {
             max_width: 0,
             min_height: 0,
             sticky_bottom: None,
+            late_resizes: None,
             resize_writes: 0,
         }
     }
@@ -388,6 +393,22 @@ impl MockState {
         }
     }
 
+    /// Applies, in order, the size writes window `id`'s app held while busy,
+    /// and applies later writes as they arrive.
+    pub fn os_apply_late_resizes(&self, id: WinID) {
+        let sizes = self
+            .inner
+            .force_write()
+            .windows
+            .get_mut(&id)
+            .and_then(|w| w.late_resizes.take())
+            .unwrap_or_default();
+        for size in sizes {
+            let size = self.inner.force_read().windows[&id].accepted_size(size);
+            self.os_resize_window(id, size);
+        }
+    }
+
     pub fn resize_writes(&self, id: WinID) -> usize {
         self.inner.force_read().windows[&id].resize_writes
     }
@@ -531,7 +552,11 @@ impl MockState {
                 && w.frame.size() != size
             {
                 w.resize_writes += 1;
-                w.frame.max = w.frame.min + w.accepted_size(size);
+                if let Some(late) = &mut w.late_resizes {
+                    late.push(size);
+                } else {
+                    w.frame.max = w.frame.min + w.accepted_size(size);
+                }
             }
         });
 

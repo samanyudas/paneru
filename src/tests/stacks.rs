@@ -6,7 +6,7 @@ use bevy::prelude::*;
 
 use crate::commands::{Command, Direction, Operation, ResizeDirection};
 use crate::events::Event;
-use crate::manager::Window;
+use crate::manager::{Size, Window};
 use crate::platform::WinID;
 
 use super::*;
@@ -293,4 +293,185 @@ fn a_vertical_resize_in_a_column_too_short_for_its_minimums_changes_nothing() {
         let after = [frame(harness.world(), 0), frame(harness.world(), 1)];
         assert_eq!(after, before, "{direction:?}");
     }
+}
+
+/// A learned minimum is dropped once the user makes the window shorter than
+/// it, so an app that now accepts less gets an even share from Equalize.
+#[test]
+fn a_minimum_height_is_dropped_when_the_window_is_seen_shorter() {
+    let mut harness = tall_harness();
+    harness
+        .mock_state
+        .update_window(1, |window| window.min_height = 500);
+    stack_three(&mut harness);
+    assert_eq!(frame(harness.world(), 1).height(), 500);
+
+    harness
+        .mock_state
+        .update_window(1, |window| window.min_height = 0);
+    harness
+        .mock_state
+        .os_resize_window(1, Size::new(TEST_WINDOW_WIDTH, 300));
+    harness.advance(SETTLE);
+    harness.run(vec![command(Operation::Equalize)]);
+    harness.advance(SETTLE);
+
+    let heights = column_heights(harness.world(), &[0, 1, 2]);
+    assert_even(&heights, COLUMN);
+}
+
+/// Window 1's app accepts any height again, for example once a sheet that
+/// held it open has closed. A window leaving and joining the column asks
+/// every window in it for an even share again, so window 1 gets one.
+#[test]
+fn a_stack_change_checks_a_minimum_height_again() {
+    let mut harness = tall_harness();
+    harness
+        .mock_state
+        .update_window(1, |window| window.min_height = 500);
+    stack_three(&mut harness);
+    assert_eq!(frame(harness.world(), 1).height(), 500);
+
+    harness
+        .mock_state
+        .update_window(1, |window| window.min_height = 0);
+    harness.run(vec![command(Operation::Stack(false))]);
+    harness.advance(SETTLE);
+    harness.run(vec![command(Operation::Stack(true))]);
+    harness.advance(SETTLE);
+
+    let heights = column_heights(harness.world(), &[0, 1, 2]);
+    assert_even(&heights, COLUMN);
+}
+
+/// An app that applies a size after the write returns, as Chromium-based
+/// apps do, still shows its old height when the frame is read back. Window 0
+/// is asked to go from half the column to a third when window 2 joins. Its old
+/// height is not a minimum, so the stack splits evenly once the app catches
+/// up, whether before the window is read again or after it was asked for less.
+#[test]
+fn a_window_that_resizes_late_gets_an_even_share() {
+    for delay in [Duration::from_millis(200), Duration::from_millis(800)] {
+        let mut harness = tall_harness();
+        harness.run(vec![
+            Event::MenuOpened { window_id: 0 },
+            command(Operation::Focus(Direction::First)),
+            command(Operation::Focus(Direction::East)),
+            command(Operation::Stack(true)),
+            command(Operation::Focus(Direction::Last)),
+        ]);
+        harness.advance(SETTLE);
+        harness
+            .mock_state
+            .update_window(0, |window| window.late_resizes = Some(Vec::new()));
+        harness
+            .world()
+            .write_message(command(Operation::Stack(true)));
+        harness.advance(delay);
+        let late = frame(harness.world(), 0);
+        assert_eq!(late.height(), COLUMN / 2, "{delay:?}: not applied yet");
+        harness.mock_state.os_apply_late_resizes(0);
+        harness.advance(SETTLE);
+
+        let heights = column_heights(harness.world(), &[0, 1, 2]);
+        assert_even(&heights, COLUMN);
+    }
+}
+
+/// When the minimums in a column add up to more than its height, no split
+/// keeps every window both whole and on screen. The windows keep the split
+/// they would get with no minimum known, and only the window that refuses
+/// its share reaches past it.
+#[test]
+fn minimums_too_tall_for_the_column_keep_the_other_windows_on_screen() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness
+        .mock_state
+        .update_window(1, |window| window.min_height = 500);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(true)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(true)),
+    ]);
+    harness.advance(SETTLE);
+
+    for id in [0, 2] {
+        let frame = frame(harness.world(), id);
+        assert!(
+            frame.min.y >= TEST_MENUBAR_HEIGHT && frame.max.y <= TEST_DISPLAY_HEIGHT,
+            "window {id} is on screen: {frame:?}"
+        );
+    }
+}
+
+/// A tabbed display gives each window the whole column. A window whose app
+/// refuses that height keeps the height it has, and nothing asks it again
+/// and again.
+#[test]
+fn a_tabbed_stack_with_a_refused_height_stops_resizing() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.mock_state.update_window(0, |window| {
+        window.min_height = TEST_DISPLAY_HEIGHT + 100;
+    });
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(true)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(true)),
+        command(Operation::ToggleTabbedDisplay),
+    ]);
+    harness.advance(SETTLE);
+
+    let before = harness.mock_state.resize_writes(0);
+    harness.advance(SETTLE);
+    assert_eq!(harness.mock_state.resize_writes(0), before);
+}
+
+/// The user resizes window 0 while a check waits to see whether its app
+/// takes a lower height: 700 ms after the stack is after the first 500 ms
+/// wait and before the second ends. The height the user gives it is not a
+/// minimum, so shrinking the window still takes it down to the 700 px its app
+/// accepts.
+#[test]
+fn a_user_resize_during_a_minimum_height_check_is_not_a_minimum() {
+    let mut harness = tall_harness_with_windows(2);
+    harness
+        .mock_state
+        .update_window(0, |window| window.min_height = 700);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+    ]);
+    harness.advance(SETTLE);
+    harness
+        .world()
+        .write_message(command(Operation::Stack(true)));
+    harness.advance(Duration::from_millis(700));
+    harness
+        .mock_state
+        .os_resize_window(0, Size::new(TEST_WINDOW_WIDTH, 900));
+    harness.advance(SETTLE);
+    assert_eq!(
+        column_heights(harness.world(), &[0, 1]),
+        vec![900, COLUMN - 900]
+    );
+
+    harness.run(vec![command(Operation::Focus(Direction::North))]);
+    for _ in 0..2 {
+        harness.run(vec![command(Operation::ResizeVertical(
+            ResizeDirection::Shrink,
+        ))]);
+        harness.advance(SETTLE);
+    }
+
+    assert_eq!(
+        column_heights(harness.world(), &[0, 1]),
+        vec![700, COLUMN - 700]
+    );
 }

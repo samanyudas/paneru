@@ -10,7 +10,7 @@ use bevy::ecs::system::{
 use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
-use bevy::time::Time;
+use bevy::time::{Time, Timer, TimerMode};
 use objc2_foundation::NSPoint;
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -28,10 +28,10 @@ use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, SystemTheme, Unmanaged, WidthRatio,
-    WindowProperties,
+    ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, HeightCheckStep,
+    Initializing, LowPowerMode, MinimumHeight, MinimumHeightCheck, MissionControlActive, Position,
+    ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    SystemTheme, Unmanaged, WidthRatio, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -118,8 +118,18 @@ type ResizableWindows<'w, 's> = Query<
         &'static mut Bounds,
         Option<&'static Unmanaged>,
         Has<ResizeMarker>,
+        Option<&'static MinimumHeightCheck>,
     ),
     Without<LayoutStrip>,
+>;
+
+/// Windows whose `Bounds` changed outside a resize animation, because
+/// `commit_window_size` resized them or the user did.
+type CommittedResizes<'w, 's> = Populated<
+    'w,
+    's,
+    (Entity, &'static Window, &'static Bounds),
+    (Changed<Bounds>, With<WidthRatio>, Without<ResizeMarker>),
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
@@ -940,13 +950,15 @@ pub(super) fn window_resized_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: ResizableWindows,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
+    minimum_heights: Query<&MinimumHeight>,
+    mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::WindowResized { window_id } = event else {
             continue;
         };
 
-        let Some((mut window, entity, position, mut bounds, unmanaged, resizing)) = windows
+        let Some((mut window, entity, position, mut bounds, unmanaged, resizing, check)) = windows
             .iter_mut()
             .find(|window| window.0.id() == *window_id)
         else {
@@ -965,6 +977,23 @@ pub(super) fn window_resized_update_frame(
         let Ok(new_frame) = window.update_frame() else {
             continue;
         };
+        // Likewise a height `check_minimum_height` asked for while it waits
+        // on its lowering: it reads the window itself, and taking a late echo
+        // of the lowering as the window's size would end the check before the
+        // window regrows. Any other height is the user's. It becomes the
+        // window's `Bounds`, so `notice_kept_height` ends the check with no
+        // minimum.
+        if check.is_some_and(|check| check.awaits(new_frame.height())) {
+            continue;
+        }
+        // The app now accepts less than it once refused.
+        if minimum_heights
+            .get(entity)
+            .is_ok_and(|minimum| new_frame.height() < minimum.0)
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<MinimumHeight>();
+        }
         let active_strip = workspaces
             .iter_mut()
             .find(|(strip, _)| strip.contains(entity));
@@ -1003,7 +1032,7 @@ pub(super) fn window_resized_update_frame(
         let diff = old_frame.min.y - new_frame.min.y;
         if diff.abs() > 0
             && let Some(above_entity) = strip.above(entity)
-            && let Ok((_, _, _, mut above_bounds, _, _)) = windows.get_mut(above_entity)
+            && let Ok((_, _, _, mut above_bounds, ..)) = windows.get_mut(above_entity)
             && above_bounds.0.y - diff > 200
         {
             above_bounds.0.y -= diff;
@@ -1325,6 +1354,111 @@ pub(super) fn commit_window_size(
             width_ratio.0 = f64::from(size.0.x) / f64::from(width);
             objc2::rc::autoreleasepool(|_| window.resize(size.0));
         });
+}
+
+/// How long an app has to apply a size before the height it shows counts.
+/// Chromium-based and busy apps apply a size after the write returns.
+const LATE_RESIZE_GRACE: Duration = Duration::from_millis(500);
+
+/// How far below the asked height [`check_minimum_height`] lowers a window
+/// that kept more. macOS ignores a small shrink that leaves a window's bottom
+/// edge near the bottom of the screen, but takes a larger one and then lets
+/// the window grow back into that zone.
+const RELEASE_DROP: i32 = 100;
+
+/// Starts a [`MinimumHeightCheck`] on a window whose app kept it taller than
+/// its new `Bounds`, unless that height is already its known minimum. The
+/// layout asks such a window for less in an even split, which the next layout
+/// corrects, or when the column cannot fit every minimum, where the window
+/// keeps the `Bounds` it was given, as with no minimum known. A window seen
+/// shorter than its minimum loses it.
+/// `Window::resize` reads the frame back after it sets a new size, so this
+/// asks the app nothing.
+/// A window in a resize animation is skipped. Its `Bounds` step toward the
+/// target every frame. `window_resize_verifier` reconciles it once the
+/// animation ends.
+#[instrument(level = Level::TRACE, skip_all)]
+pub(super) fn notice_kept_height(
+    resized_windows: CommittedResizes,
+    minimum_heights: Query<&MinimumHeight>,
+    mut commands: Commands,
+) {
+    for (entity, window, bounds) in &resized_windows {
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            continue;
+        };
+        let height = window.frame().height();
+        let minimum = minimum_heights.get(entity).ok().map(|minimum| minimum.0);
+        // One pixel of slack, as `sizes_match` allows: macOS rounds some
+        // sizes to even numbers.
+        if minimum.is_some_and(|minimum| height < minimum - 1) {
+            entity_commands.try_remove::<MinimumHeight>();
+        }
+        if height <= bounds.0.y + 1 {
+            entity_commands.try_remove::<MinimumHeightCheck>();
+        } else if minimum.is_none_or(|minimum| (height - minimum).abs() > 1) {
+            entity_commands.try_insert(MinimumHeightCheck {
+                asked: bounds.0,
+                step: HeightCheckStep::Settling,
+                timer: Timer::new(LATE_RESIZE_GRACE, TimerMode::Once),
+            });
+        }
+    }
+}
+
+/// Decides whether a window that kept more height than it was asked for
+/// refuses less. It reads the window again after [`LATE_RESIZE_GRACE`]. A
+/// window still taller is lowered below the asked height and grown back to
+/// it. Only a height the window keeps through that becomes its
+/// [`MinimumHeight`], and its `Bounds` take that height so the layout moves
+/// the windows below it out of the way.
+/// Each step reads the frame once (two AX reads), and each size write reads it
+/// back (one AX write, two AX reads), so a check makes at most two writes and
+/// eight reads.
+#[instrument(level = Level::TRACE, skip_all)]
+pub(super) fn check_minimum_height(
+    mut checks: Populated<(Entity, &mut Window, &mut Bounds, &mut MinimumHeightCheck)>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    for (entity, mut window, mut bounds, mut check) in &mut checks {
+        if !check.timer.tick(time.delta()).is_finished() {
+            continue;
+        }
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            continue;
+        };
+        let Ok(frame) = window.update_frame() else {
+            entity_commands.try_remove::<MinimumHeightCheck>();
+            continue;
+        };
+        let asked = check.asked.y;
+        let mut height = frame.height();
+        let lowered = match check.step {
+            HeightCheckStep::Settling if height > asked + 1 => {
+                let lower = asked - RELEASE_DROP.min(asked / 2);
+                window.resize(frame.size().with_y(lower));
+                height = window.frame().height();
+                if height >= asked - 1 {
+                    check.step = HeightCheckStep::Lowering(lower);
+                    check.timer.reset();
+                    continue;
+                }
+                true
+            }
+            HeightCheckStep::Settling => false,
+            HeightCheckStep::Lowering(_) => height < asked - 1,
+        };
+        if lowered {
+            window.resize(Size::new(frame.width(), asked));
+            height = window.frame().height();
+        }
+        entity_commands.try_remove::<MinimumHeightCheck>();
+        if height > asked + 1 {
+            entity_commands.try_insert(MinimumHeight(height));
+            bounds.0.y = height;
+        }
+    }
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any
