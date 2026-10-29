@@ -849,11 +849,11 @@ fn a_drag_from_a_panel_moves_only_what_the_user_made_before_its_press_arrived() 
         assert_eq!(
             tap.handle(&read(
                 CGEventType::LeftMouseDragged,
-                CGPoint::new(1010.0, 80.0),
+                CGPoint::new(1022.0, 80.0),
                 before,
                 None
             )),
-            Verdict::Move(CGPoint::new(490.0, 80.0)),
+            Verdict::Move(CGPoint::new(502.0, 80.0)),
             "{maker}"
         );
         for (kind, x) in [
@@ -866,5 +866,34 @@ fn a_drag_from_a_panel_moves_only_what_the_user_made_before_its_press_arrived() 
                 "{maker} {kind:?} at {x}"
             );
         }
+    }
+}
+
+#[test]
+fn a_click_released_after_its_press_was_posted_reaches_the_app_where_the_press_did() {
+    let pressed = CGPoint::new(1020.0, 80.0);
+    let shown = CGPoint::new(500.0, 80.0);
+    for (released_at, reaches) in [(shown, Verdict::Pass), (pressed, Verdict::Move(shown))] {
+        let mut tap = SliceTap::default();
+        let Verdict::Hold(press) = tap.handle(&read(
+            CGEventType::LeftMouseDown,
+            pressed,
+            ticks(),
+            Some(west_panel()),
+        )) else {
+            panic!("a press on the panel is held back");
+        };
+        let before = ticks();
+        assert_eq!(
+            tap.handle(&read_posted(press.id, true, shown)),
+            Verdict::Pass
+        );
+        assert_eq!(
+            tap.handle(&read(CGEventType::LeftMouseUp, released_at, before, None)),
+            reaches,
+            "released at ({}, {})",
+            released_at.x,
+            released_at.y
+        );
     }
 }
