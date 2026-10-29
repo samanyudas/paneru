@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bevy::math::IRect;
+use mach2::mach_time::{mach_absolute_time, mach_timebase_info};
 use objc2::MainThreadMarker;
 use objc2_app_kit::NSWindow;
-use objc2_core_foundation::{CGPoint, CGVector};
+use objc2_core_foundation::{CFRetained, CGPoint, CGVector};
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton,
 };
@@ -167,7 +168,7 @@ impl Pointer {
         let time = if tag.is_some() {
             uptime()
         } else {
-            Duration::from_nanos(CGEvent::timestamp(Some(event)))
+            made_at(CGEvent::timestamp(Some(event)))
         };
         Self {
             mouse,
@@ -180,17 +181,33 @@ impl Pointer {
     }
 }
 
-/// The clock of the user's event timestamps.
+/// Time since startup, not counting sleep, as `CLOCK_UPTIME_RAW` counts it.
 fn uptime() -> Duration {
-    let mut now = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &raw mut now) };
-    Duration::new(
-        u64::try_from(now.tv_sec).unwrap_or_default(),
-        u32::try_from(now.tv_nsec).unwrap_or_default(),
-    )
+    from_ticks(unsafe { mach_absolute_time() })
+}
+
+/// When the user made an event stamped `stamp`, on the clock of [`uptime`].
+/// The trackpad and the mouse stamp their events in mach ticks, and the
+/// window server stamps events posted in software in nanoseconds. A stamp
+/// in ticks is never past the tick count now. One in nanoseconds is, unless
+/// a tick is a nanosecond and the two agree, or the event was made in the
+/// first `denom / numer` of the uptime, 2.4% of it on Apple silicon.
+fn made_at(stamp: u64) -> Duration {
+    if stamp <= unsafe { mach_absolute_time() } {
+        from_ticks(stamp)
+    } else {
+        Duration::from_nanos(stamp)
+    }
+}
+
+fn from_ticks(ticks: u64) -> Duration {
+    static TIMEBASE: LazyLock<mach_timebase_info> = LazyLock::new(|| {
+        let mut timebase = mach_timebase_info { numer: 1, denom: 1 };
+        unsafe { mach_timebase_info(&raw mut timebase) };
+        timebase
+    });
+    let nanos = u128::from(ticks) * u128::from(TIMEBASE.numer) / u128::from(TIMEBASE.denom);
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -485,16 +502,28 @@ impl SliceTap {
 /// the window server sends it to the window under `point` and moves the
 /// pointer there.
 pub(crate) fn post(id: u32, button: MouseButton, down: bool, point: CGPoint, flags: CGEventFlags) {
+    let Some(event) = posted_event(id, button, down, point, flags) else {
+        warn!("edge slice press {id} not posted: no mouse event");
+        return;
+    };
+    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+}
+
+/// Press `id`, or its release, as [`post`] posts it.
+pub(crate) fn posted_event(
+    id: u32,
+    button: MouseButton,
+    down: bool,
+    point: CGPoint,
+    flags: CGEventFlags,
+) -> Option<CFRetained<CGEvent>> {
     let (kind, cg_button) = match (button, down) {
         (MouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
         (MouseButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
         (MouseButton::Right, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
         (MouseButton::Right, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
     };
-    let Some(event) = CGEvent::new_mouse_event(None, kind, point, cg_button) else {
-        warn!("edge slice press {id} not posted: no mouse event");
-        return;
-    };
+    let event = CGEvent::new_mouse_event(None, kind, point, cg_button)?;
     CGEvent::set_flags(Some(&event), flags);
     CGEvent::set_integer_value_field(Some(&event), CGEventField::MouseEventClickState, 1);
     CGEvent::set_integer_value_field(
@@ -502,5 +531,5 @@ pub(crate) fn post(id: u32, button: MouseButton, down: bool, point: CGPoint, fla
         CGEventField::EventSourceUserData,
         TAG | i64::from(id),
     );
-    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    Some(event)
 }
