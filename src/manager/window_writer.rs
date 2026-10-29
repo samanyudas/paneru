@@ -1079,6 +1079,29 @@ mod writer_tests {
         );
     }
 
+    /// Each frame of a motion reaches the app as a batch of its own. Some
+    /// apps take longer to finish a batch than a frame lasts (Chromium
+    /// rebuilds its accessibility tree when `AXEnhancedUserInterface` comes
+    /// back on), so the app stays begun from one frame to the next.
+    #[test]
+    fn an_app_stays_begun_between_the_frames_of_one_motion() {
+        let (probe, _entered) = Probe::new();
+        let writers = writers(&probe, SECOND);
+        for x in [10, 20, 30] {
+            writers.push(1, key(7), moved(7, x));
+            assert!(writers.wait_landed(1, key(7), SECOND));
+        }
+        assert_eq!(
+            probe.log(1)[..4],
+            [
+                Op::Begin,
+                Op::Position(7, Origin::new(10, 0)),
+                Op::Position(7, Origin::new(20, 0)),
+                Op::Position(7, Origin::new(30, 0)),
+            ]
+        );
+    }
+
     /// Frames asked for while an earlier write is in flight replace each
     /// other, so the app gets only the newest once it answers. A position
     /// and a later size merge into one write of both.
