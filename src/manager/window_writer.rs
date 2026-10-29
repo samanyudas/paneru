@@ -80,6 +80,17 @@ pub(crate) struct PendingWrite<W> {
 }
 
 impl<W> PendingWrite<W> {
+    /// Orders a batch from the back of the motion to the front. A window that
+    /// moves first then overlaps the window ahead of it until that one moves,
+    /// instead of leaving the desktop showing between them.
+    fn back_first(&self) -> i32 {
+        if self.to.min.x < self.from.min.x {
+            -self.to.min.x
+        } else {
+            self.to.min.x
+        }
+    }
+
     /// Takes on a newer request for the same window, keeping the frame the
     /// window had before the older one.
     fn merge(&mut self, newer: Self) {
@@ -393,7 +404,9 @@ impl<S: WriteSink> Shared<S> {
                         if begin {
                             sink.begin();
                         }
-                        for write in batch.into_values() {
+                        let mut writes = batch.into_values().collect::<Vec<_>>();
+                        writes.sort_by_key(PendingWrite::back_first);
+                        for write in writes {
                             Self::write(&mut sink, write);
                         }
                     });
