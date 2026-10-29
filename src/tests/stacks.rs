@@ -6,7 +6,7 @@ use bevy::prelude::*;
 
 use crate::commands::{Command, Direction, Operation, ResizeDirection};
 use crate::events::Event;
-use crate::manager::Window;
+use crate::manager::{Size, Window};
 use crate::platform::WinID;
 
 use super::*;
@@ -178,4 +178,65 @@ fn a_last_window_with_a_minimum_height_stays_on_screen() {
     assert_eq!(heights[2], 500, "{heights:?}");
     assert_eq!(frame(harness.world(), 2).max.y, TALL, "ends at the bottom");
     assert_even(&heights[..2], COLUMN - 500);
+}
+
+/// A learned minimum is dropped once the window is seen shorter than it, so
+/// an app that now accepts less gets an even share at the next split.
+#[test]
+fn a_minimum_height_is_dropped_when_the_window_is_seen_shorter() {
+    let mut harness = tall_harness();
+    harness
+        .mock_state
+        .update_window(1, |window| window.min_height = 500);
+    stack_three(&mut harness);
+    assert_eq!(frame(harness.world(), 1).height(), 500);
+
+    harness
+        .mock_state
+        .update_window(1, |window| window.min_height = 0);
+    harness
+        .mock_state
+        .os_resize_window(1, Size::new(TEST_WINDOW_WIDTH, 300));
+    harness.advance(SETTLE);
+    harness.run(vec![command(Operation::Stack(false))]);
+    harness.advance(SETTLE);
+    harness.run(vec![command(Operation::Stack(true))]);
+    harness.advance(SETTLE);
+
+    let heights = column_heights(harness.world(), &[0, 1, 2]);
+    assert_even(&heights, COLUMN);
+}
+
+/// Equalize asks every window for the same height. With animation on, the
+/// window that refuses it ends at its minimum and no resize keeps running.
+#[test]
+fn equalizing_a_stack_with_a_minimum_height_settles() {
+    use crate::config::{Config, MainOptions};
+    use crate::ecs::ResizeMarker;
+
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(14.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = tall_harness().with_config(config);
+    harness
+        .mock_state
+        .update_window(0, |window| window.min_height = 700);
+    stack_three(&mut harness);
+    harness.run(vec![command(Operation::Equalize)]);
+    harness.advance(SETTLE);
+
+    let world = harness.world();
+    let resizing = world
+        .query_filtered::<(), With<ResizeMarker>>()
+        .iter(world)
+        .count();
+    assert_eq!(resizing, 0, "every resize has finished");
+    let heights = column_heights(world, &[0, 1, 2]);
+    assert_eq!(heights[0], 700, "{heights:?}");
+    assert_even(&heights[1..], COLUMN - 700);
 }

@@ -29,9 +29,9 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, SystemTheme, Unmanaged, WidthRatio,
-    WindowProperties,
+    LowPowerMode, MinimumHeight, MissionControlActive, Position, ReadDisplayProperties,
+    RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt, SystemTheme, Unmanaged,
+    WidthRatio, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -120,6 +120,14 @@ type ResizableWindows<'w, 's> = Query<
         Has<ResizeMarker>,
     ),
     Without<LayoutStrip>,
+>;
+
+/// Windows `commit_window_size` resized this frame outside a resize animation.
+type CommittedResizes<'w, 's> = Populated<
+    'w,
+    's,
+    (Entity, &'static Window, &'static mut Bounds),
+    (Changed<Bounds>, With<WidthRatio>, Without<ResizeMarker>),
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
@@ -940,6 +948,8 @@ pub(super) fn window_resized_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: ResizableWindows,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
+    minimum_heights: Query<&MinimumHeight>,
+    mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::WindowResized { window_id } = event else {
@@ -965,6 +975,14 @@ pub(super) fn window_resized_update_frame(
         let Ok(new_frame) = window.update_frame() else {
             continue;
         };
+        // The app now accepts less than it once refused.
+        if minimum_heights
+            .get(entity)
+            .is_ok_and(|minimum| new_frame.height() < minimum.0)
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<MinimumHeight>();
+        }
         let active_strip = workspaces
             .iter_mut()
             .find(|(strip, _)| strip.contains(entity));
@@ -1325,6 +1343,28 @@ pub(super) fn commit_window_size(
             width_ratio.0 = f64::from(size.0.x) / f64::from(width);
             objc2::rc::autoreleasepool(|_| window.resize(size.0));
         });
+}
+
+/// Records the height of a window whose app kept it taller than its new
+/// `Bounds`, and takes that height as the window's size, so the layout moves
+/// the windows below it out of the way. `Window::resize` reads the frame back
+/// after it sets a new size, so this asks the app nothing.
+/// A window in a resize animation is skipped. Its `Bounds` step toward the
+/// target every frame, and raising them here would restart the animation.
+/// `window_resize_verifier` reconciles it once the animation ends.
+#[instrument(level = Level::TRACE, skip_all)]
+pub(super) fn record_minimum_height(mut resized_windows: CommittedResizes, mut commands: Commands) {
+    for (entity, window, mut bounds) in &mut resized_windows {
+        let height = window.frame().height();
+        // One pixel of slack, as `sizes_match` allows: macOS rounds some
+        // sizes to even numbers.
+        if height > bounds.0.y + 1
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_insert(MinimumHeight(height));
+            bounds.0.y = height;
+        }
+    }
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any
