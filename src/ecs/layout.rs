@@ -3370,7 +3370,7 @@ fn present_tuck(
         return false;
     }
     let moving = match (sliding.copied(), tucked) {
-        (Some(Slide::Moving { .. } | Slide::Landing { .. }), _) => return true,
+        (Some(Slide::Moving { .. }), _) | (Some(Slide::Landing { .. }), Some(_)) => return true,
         (Some(Slide::Tucking { at, hold, .. }), Some(_)) => Slide::Moving { at, from: hold },
         (None, Some(tucked)) => Slide::Moving {
             at: row.start(tucked),
