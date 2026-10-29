@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 
-use crate::commands::{Command, Direction, Operation};
+use crate::commands::{Command, Direction, Operation, ResizeDirection};
 use crate::events::Event;
 use crate::manager::Window;
 use crate::platform::WinID;
@@ -116,4 +116,25 @@ fn closing_a_stacked_window_splits_the_rest_evenly() {
 
     let heights = column_heights(harness.world(), &[1, 2]);
     assert_even(&heights, COLUMN);
+}
+
+/// Stacking the top window has no column to join, so the heights the user
+/// set stay.
+#[test]
+fn a_stack_command_that_changes_nothing_keeps_set_heights() {
+    let mut harness = tall_harness();
+    stack_three(&mut harness);
+    harness.run(vec![
+        command(Operation::Focus(Direction::North)),
+        command(Operation::Focus(Direction::North)),
+        command(Operation::ResizeVertical(ResizeDirection::Grow)),
+    ]);
+    harness.advance(SETTLE);
+    let before = column_heights(harness.world(), &[0, 1, 2]);
+    assert!(before[0] > before[1], "the resize took effect: {before:?}");
+
+    harness.run(vec![command(Operation::Stack(true))]);
+    harness.advance(SETTLE);
+
+    assert_eq!(column_heights(harness.world(), &[0, 1, 2]), before);
 }
