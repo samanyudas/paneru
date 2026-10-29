@@ -244,6 +244,21 @@ fn gap_at(columns: &[ColumnSnap], x: i32) -> usize {
         )
 }
 
+/// Draws the drop feedback on screen. The app draws with
+/// [`DragOverlay`](crate::overlay::DragOverlay), and tests record the calls.
+pub(crate) trait DragOverlayApi {
+    /// Shows an insertion line over `line`, in screen points, in `color`.
+    fn show_line(&mut self, line: IRect, color: (f64, f64, f64));
+    /// Shows the refusal symbol in `square`, in screen points.
+    fn show_refusal(&mut self, square: IRect);
+    fn hide(&mut self);
+    /// Closes the overlay's windows.
+    fn remove(&mut self);
+}
+
+/// The drag overlay the engine draws with, as a non-send resource.
+pub(crate) struct DragOverlayHandle(pub Box<dyn DragOverlayApi>);
+
 /// A tiled window a press landed on, with the frame the layout gave it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PressedWindow {
