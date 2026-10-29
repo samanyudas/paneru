@@ -11,6 +11,9 @@
 //!   to the [`LayoutStrip`]s.
 //! - [`overlay_shape`] is the pure drop feedback. [`drag_feedback`] keeps
 //!   [`DragFeedback`] on it, and [`show_drag_feedback`] draws it.
+//! - [`held_edge`] and [`edge_shift`] are the pure edge scroll rules.
+//!   [`drag_edge_scroll`] scrolls a strip one column at a time while the
+//!   pointer of a drag holds its edge.
 
 use std::cell::OnceCell;
 use std::ops::Range;
@@ -22,11 +25,13 @@ use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Changed, Has, Or, With};
+use bevy::ecs::query::{Changed, Has, Or, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::common_conditions::{not, on_message, resource_changed, resource_exists};
 use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
-use bevy::ecs::system::{Commands, NonSendMut, Populated, Query, Res, ResMut, SystemParam};
+use bevy::ecs::system::{
+    Commands, NonSendMut, ParamSet, Populated, Query, Res, ResMut, SystemParam,
+};
 use bevy::math::{BVec2, IRect, IVec2};
 use bevy::time::Time;
 use objc2_core_foundation::CGPoint;
@@ -39,8 +44,9 @@ use crate::ecs::layout::{Column, LayoutStrip, MIN_WINDOW_HEIGHT};
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
     Bounds, DockPosition, FocusedMarker, FullWidthMarker, Initializing, LayoutPosition,
-    MissionControlActive, NativeFullscreenMarker, Position, PostUpdateSet, PresentedOrigin,
-    SpawnCommandsExt, SystemTheme, Timeout, Unmanaged, UpdateSet,
+    ManualStripOffset, MissionControlActive, NativeFullscreenMarker, Position, PostUpdateSet,
+    PresentedOrigin, RepositionMarker, Scrolling, SpawnCommandsExt, SystemTheme, Timeout,
+    Unmanaged, UpdateSet,
 };
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Window, WindowManager, origin_from};
@@ -83,6 +89,19 @@ const MAX_SAMPLES: usize = 32;
 /// little after the button state changes, so a shorter wait would cancel
 /// drops still in flight.
 const RELEASE_GRACE: Duration = Duration::from_millis(250);
+
+/// How close to the left or right edge of a display the pointer must be to
+/// hold that edge.
+const EDGE_BAND: i32 = 6;
+
+/// How long the pointer must hold an edge before the strip first scrolls.
+const EDGE_DELAY: Duration = Duration::from_millis(500);
+
+/// How often the strip scrolls again while the pointer still holds the edge.
+const EDGE_REPEAT: Duration = Duration::from_millis(350);
+
+/// How far apart the edges of two displays may be and still touch.
+const NEIGHBOUR_TOLERANCE: u32 = 2;
 
 /// Where the windows of a strip shown on a display are, in screen points.
 /// It is taken from the layout rather than live frames, so the dragged
@@ -384,6 +403,73 @@ fn line_across(at: i32, within: Range<i32>) -> Option<Range<i32>> {
     }
     let start = (at - INSERTION_LINE / 2).clamp(within.start, within.end - INSERTION_LINE);
     Some(start..start + INSERTION_LINE)
+}
+
+/// The left or the right edge of a display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeSide {
+    Left,
+    Right,
+}
+
+/// The strip and the side whose edge `pointer` holds: the pointer is within
+/// [`EDGE_BAND`] of the left or right edge of the display of one of
+/// `snapshots`, and no display in `displays` touches that edge at the
+/// pointer's height.
+///
+/// `displays` holds the whole bounds of every display, because a display
+/// that shows no strip a drop can join, such as one in a native fullscreen
+/// space, is still beside the edge. A display beside only part of the edge,
+/// or only across a corner, does not touch the rest of it.
+fn held_edge(
+    snapshots: &[LayoutSnapshot],
+    displays: &[IRect],
+    pointer: IVec2,
+) -> Option<(Entity, EdgeSide)> {
+    let snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.bounds.contains(pointer))?;
+    let bounds = snapshot.bounds;
+    let (side, edge) = if pointer.x < bounds.min.x + EDGE_BAND {
+        (EdgeSide::Left, bounds.min.x)
+    } else if pointer.x >= bounds.max.x - EDGE_BAND {
+        (EdgeSide::Right, bounds.max.x)
+    } else {
+        return None;
+    };
+    // The strict comparisons leave out the pointer's own display.
+    let touches = |other: &IRect| {
+        let beside = match side {
+            EdgeSide::Left => {
+                other.min.x < edge && other.max.x.abs_diff(edge) <= NEIGHBOUR_TOLERANCE
+            }
+            EdgeSide::Right => {
+                other.max.x > edge && other.min.x.abs_diff(edge) <= NEIGHBOUR_TOLERANCE
+            }
+        };
+        beside && (other.min.y..other.max.y).contains(&pointer.y)
+    };
+    (!displays.iter().any(touches)).then_some((snapshot.strip, side))
+}
+
+/// How far right to move the strip of `snapshot` so that the nearest column
+/// that reaches past its `side` edge shows in full at that edge. `None` when
+/// no column reaches past that edge.
+fn edge_shift(snapshot: &LayoutSnapshot, side: EdgeSide) -> Option<i32> {
+    let viewport = snapshot.viewport;
+    match side {
+        EdgeSide::Left => snapshot
+            .columns
+            .iter()
+            .rev()
+            .find(|column| column.x.start < viewport.min.x)
+            .map(|column| viewport.min.x - column.x.start),
+        EdgeSide::Right => snapshot
+            .columns
+            .iter()
+            .find(|column| column.x.end > viewport.max.x)
+            .map(|column| viewport.max.x - column.x.end),
+    }
 }
 
 /// Draws the drop feedback on screen. The app draws with
@@ -869,6 +955,19 @@ pub(crate) struct DragReturnedFrom {
     pub display: CGDirectDisplayID,
 }
 
+/// Spawned while the pointer of a drag holds the `side` edge of the display
+/// that shows `strip`, and a column of the strip reaches past that edge.
+/// Despawned when the pointer leaves that edge, no column is left past it, or
+/// the drag ends. While one exists, the event pump keeps drawing frames, so
+/// the strip scrolls on time with the pointer still.
+#[derive(Component, Debug)]
+pub(crate) struct EdgeHold {
+    strip: Entity,
+    side: EdgeSide,
+    /// When the strip scrolls next.
+    next_scroll: Duration,
+}
+
 /// What title-bar drags know about windows macOS may list in the wrong
 /// space.
 #[derive(SystemParam)]
@@ -948,6 +1047,8 @@ impl Plugin for DragEventsPlugin {
                         .run_if(allowed),
                     drag_watchdog.after(drag_events).run_if(in_progress),
                     forget_returns.after(drag_events),
+                    drag_edge_scroll.after(drag_watchdog).run_if(dragging),
+                    end_edge_holds.after(drag_watchdog).run_if(not(dragging)),
                 )
                     .in_set(UpdateSet::Focus)
                     .run_if(not(resource_exists::<Initializing>)),
@@ -1433,6 +1534,99 @@ fn forget_returns(
         if (pressed.contains(&guard.window) || !windows.contains(guard.window))
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
+            entity_commands.try_despawn();
+        }
+    }
+}
+
+type StripOffsets<'w, 's> =
+    Query<'w, 's, &'static mut Position, (With<LayoutStrip>, Without<Window>)>;
+
+/// Keeps the drag's [`EdgeHold`] on the edge its pointer holds, and scrolls
+/// the held strip one column when the hold is due: [`EDGE_DELAY`] after it
+/// starts, then every [`EDGE_REPEAT`].
+///
+/// A scroll moves the strip's offset, as a swipe does. The layout then places
+/// the strip's windows again, all but the held ones, so the dragged window
+/// stays under the pointer, and the drop rule reads the scrolled strip.
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = Level::DEBUG, skip_all)]
+fn drag_edge_scroll(
+    state: Res<DragState>,
+    time: Res<Time>,
+    mut holds: Query<(Entity, &mut EdgeHold)>,
+    shown: Res<ShownStrips>,
+    mut strips: ParamSet<(ReadStrips, StripOffsets)>,
+    placements: ReadPlacements,
+    displays: Displays,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    let DragState::Dragging(drag) = &*state else {
+        return;
+    };
+    let snapshots = snapshot_of(
+        drag.window,
+        &shown,
+        &strips.p0(),
+        &placements,
+        &displays,
+        &config,
+    );
+    let bounds: Vec<_> = displays
+        .iter()
+        .map(|(display, _)| display.physical_bounds())
+        .collect();
+    // An edge with no column past it has nothing to scroll, so it holds
+    // nothing, and the event loop draws no frames for it.
+    let edge = held_edge(&snapshots, &bounds, drag.pointer).and_then(|(strip, side)| {
+        let snapshot = snapshots.iter().find(|snapshot| snapshot.strip == strip)?;
+        Some((strip, side, edge_shift(snapshot, side)?))
+    });
+    let now = time.elapsed();
+
+    let mut current = None;
+    for (entity, hold) in &mut holds {
+        if current.is_none()
+            && edge.is_some_and(|(strip, side, _)| (strip, side) == (hold.strip, hold.side))
+        {
+            current = Some(hold);
+        } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_despawn();
+        }
+    }
+    let Some((strip, side, shift)) = edge else {
+        return;
+    };
+    let Some(mut hold) = current else {
+        commands.spawn(EdgeHold {
+            strip,
+            side,
+            next_scroll: now + EDGE_DELAY,
+        });
+        return;
+    };
+    if now < hold.next_scroll {
+        return;
+    }
+    hold.next_scroll = now + EDGE_REPEAT;
+
+    debug!("scrolling strip {strip} by {shift} at its {side:?} edge");
+    if let Ok(mut position) = strips.p1().get_mut(strip) {
+        position.0.x += shift;
+    }
+    // The pointer drives the strip now, as a swipe would: an animation, a
+    // swipe's momentum, or a placement the user made earlier would move it
+    // away from the column the scroll shows.
+    if let Ok(mut entity_commands) = commands.get_entity(strip) {
+        entity_commands.try_remove::<(RepositionMarker, ManualStripOffset, Scrolling)>();
+    }
+}
+
+/// Despawns the edge hold of a drag that ended.
+fn end_edge_holds(holds: Populated<Entity, With<EdgeHold>>, mut commands: Commands) {
+    for entity in holds {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_despawn();
         }
     }
@@ -3082,6 +3276,119 @@ mod tests {
             None,
             "a strip with no snapshot"
         );
+    }
+
+    /// The edge `pointer` holds on the display of [`snapshot`], with the
+    /// displays of `others` around it.
+    fn edge_at(others: &[IRect], x: i32, y: i32) -> Option<EdgeSide> {
+        let mut displays = vec![BOUNDS];
+        displays.extend_from_slice(others);
+        let snapshots = [snapshot(748, Vec::new())];
+        held_edge(&snapshots, &displays, IVec2::new(x, y)).map(|(strip, side)| {
+            assert_eq!(strip, STRIP);
+            side
+        })
+    }
+
+    #[test]
+    fn the_pointer_holds_an_edge_within_six_points_of_it() {
+        assert_eq!(edge_at(&[], 0, 500), Some(EdgeSide::Left));
+        assert_eq!(edge_at(&[], 5, 500), Some(EdgeSide::Left));
+        assert_eq!(edge_at(&[], 6, 500), None);
+        assert_eq!(edge_at(&[], 512, 500), None);
+        assert_eq!(edge_at(&[], 1017, 500), None);
+        assert_eq!(edge_at(&[], 1018, 500), Some(EdgeSide::Right));
+        assert_eq!(edge_at(&[], 1024, 500), Some(EdgeSide::Right));
+        assert_eq!(edge_at(&[], 2, 900), None, "off the display");
+    }
+
+    /// A display touches an edge when its own edge is at most two points
+    /// away and it spans the pointer's height, whether or not it shows a
+    /// strip.
+    #[test]
+    fn a_display_touching_an_edge_at_the_pointers_height_stops_the_hold() {
+        for side in [EdgeSide::Left, EdgeSide::Right] {
+            for (gap, top, bottom, y, holds) in [
+                (0, 0, 768, 500, false),
+                (2, 0, 768, 500, false),
+                (3, 0, 768, 500, true),
+                (0, 768, 1536, 500, true),
+                (0, -768, 0, 500, true),
+                (0, 400, 768, 399, true),
+                (0, 400, 768, 400, false),
+                (0, 0, 400, 399, false),
+                (0, 0, 400, 400, true),
+            ] {
+                let (other, x) = match side {
+                    EdgeSide::Left => (IRect::new(-gap - 1920, top, -gap, bottom), 2),
+                    EdgeSide::Right => (IRect::new(1024 + gap, top, 2944 + gap, bottom), 1022),
+                };
+                assert_eq!(
+                    edge_at(&[other], x, y),
+                    holds.then_some(side),
+                    "{side:?}, gap {gap}, {top}..{bottom}, y {y}"
+                );
+            }
+        }
+    }
+
+    /// With the pointer on the second display, its strip's edge is held.
+    #[test]
+    fn the_pointer_holds_the_edge_of_the_display_it_is_on() {
+        let e = entities(7);
+        let snaps = two_displays(&e, 1180);
+        let displays = [BOUNDS, snaps[1].bounds];
+        let at = |x| held_edge(&snaps, &displays, IVec2::new(x, 500));
+        assert_eq!(at(2942), Some((e[5], EdgeSide::Right)));
+        assert_eq!(at(1026), None, "beside the first display");
+        assert_eq!(at(1022), None, "beside the second display");
+    }
+
+    /// `A | [B, C] | D | E` scrolled `by` points right.
+    fn scrolled(e: &[Entity], by: i32) -> LayoutSnapshot {
+        let mut snapshot = four_columns(e);
+        for column in &mut snapshot.columns {
+            column.x = column.x.start + by..column.x.end + by;
+        }
+        snapshot
+    }
+
+    /// Each scroll shows the nearest column that reaches past the held edge
+    /// in full at that edge, whether it is partly on screen or not at all. A
+    /// column that ends at the edge reaches no further.
+    #[test]
+    fn an_edge_scroll_shows_the_nearest_column_past_the_edge() {
+        let e = entities(5);
+        assert_eq!(edge_shift(&scrolled(&e, 0), EdgeSide::Right), Some(-176));
+        assert_eq!(edge_shift(&scrolled(&e, 0), EdgeSide::Left), None);
+        assert_eq!(edge_shift(&scrolled(&e, -700), EdgeSide::Left), Some(300));
+        assert_eq!(edge_shift(&scrolled(&e, -1200), EdgeSide::Left), Some(400));
+        assert_eq!(edge_shift(&scrolled(&e, -576), EdgeSide::Right), None);
+        assert_eq!(edge_shift(&scrolled(&e, -575), EdgeSide::Right), Some(-1));
+    }
+
+    /// With nothing to draw, the event pump can wait up to 500 ms for an
+    /// event, or 2 s in low power mode. An edge hold keeps it drawing frames,
+    /// so the strip scrolls on time with the pointer still.
+    #[test]
+    fn an_edge_hold_keeps_the_event_pump_drawing_frames() {
+        use bevy::ecs::system::RunSystemOnce as _;
+
+        use crate::ecs::params::FrameActivity;
+
+        let mut world = World::new();
+        let mid_frame = |world: &mut World| {
+            world
+                .run_system_once(|activity: FrameActivity| activity.mid_frame())
+                .expect("system runs")
+        };
+        assert!(!mid_frame(&mut world));
+        world.spawn(EdgeHold {
+            strip: STRIP,
+            side: EdgeSide::Left,
+            next_scroll: Duration::ZERO,
+        });
+        assert!(mid_frame(&mut world));
     }
 
     /// Which reports that macOS lists a window in another display's space

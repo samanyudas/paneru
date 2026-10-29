@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::ecs::SelectedVirtualMarker;
+use crate::ecs::drag::EdgeHold;
 
 /// Window 5's title bar, with the strip scrolled to show the last column.
 /// The press is above the window's centre, so the pointer alone picks the
@@ -61,6 +62,10 @@ fn strip_x(world: &mut World) -> i32 {
         .x
 }
 
+fn edge_holds(world: &mut World) -> usize {
+    world.query::<&EdgeHold>().iter(world).count()
+}
+
 fn drag_state(world: &mut World) -> DragState {
     world.resource::<DragState>().clone()
 }
@@ -97,7 +102,7 @@ fn assert_dragging(world: &mut World) {
     );
 }
 
-/// The pointer holds the left edge with columns 0 to 4 hidden or cut off
+/// The pointer holds the left edge with windows 0 to 3 hidden or cut off
 /// there. Each scroll brings the next of them into full view at the edge:
 /// window 3, which shows 224 of its 400 points, after 500 ms, then window 2
 /// 350 ms later. The dragged window stays where macOS put it. After the drop
@@ -109,6 +114,7 @@ fn holding_the_pointer_at_an_edge_scrolls_one_column_after_500_ms_then_every_350
     assert_eq!(strip_x(harness.world()), SHOWING_LAST);
     drag_and_hold(&mut harness, 5, LAST_TITLE_BAR, LEFT_EDGE);
     assert_dragging(harness.world());
+    assert_eq!(edge_holds(harness.world()), 1);
     let dragged = frame(harness.world(), 5);
     assert_eq!(dragged.min, Origin::new(-198, 490));
 
@@ -138,6 +144,7 @@ fn holding_the_pointer_at_an_edge_scrolls_one_column_after_500_ms_then_every_350
         columns(harness.world()),
         vec![vec![0], vec![1], vec![5], vec![2], vec![3], vec![4]]
     );
+    assert_eq!(edge_holds(harness.world()), 0);
     let dropped = strip_x(harness.world());
     harness.advance(ms(1000));
     assert_eq!(strip_x(harness.world()), dropped);
@@ -151,6 +158,7 @@ fn leaving_the_edge_ends_the_hold_and_coming_back_waits_again() {
     drag_and_hold(&mut harness, 5, LAST_TITLE_BAR, LEFT_EDGE);
     harness.advance(ms(300));
     move_pointer(&mut harness, Origin::new(40, 500));
+    assert_eq!(edge_holds(harness.world()), 0);
     harness.advance(ms(400));
     assert_eq!(strip_x(harness.world()), SHOWING_LAST, "away from the edge");
 
@@ -306,6 +314,7 @@ fn a_lost_release_or_a_closed_window_stops_the_scrolling() {
             SHOWING_LAST + 176,
             "closed={closed}"
         );
+        assert_eq!(edge_holds(harness.world()), 1, "closed={closed}");
 
         if closed {
             harness.mock_state.os_close_window(5);
@@ -318,6 +327,7 @@ fn a_lost_release_or_a_closed_window_stops_the_scrolling() {
             DragState::Idle,
             "closed={closed}"
         );
+        assert_eq!(edge_holds(harness.world()), 0, "closed={closed}");
         let ended = strip_x(harness.world());
         harness.advance(ms(1000));
         assert_eq!(strip_x(harness.world()), ended, "closed={closed}");
@@ -333,4 +343,102 @@ fn without_the_option_an_edge_hold_scrolls_nothing() {
     assert_eq!(drag_state(harness.world()), DragState::Idle);
     harness.advance(ms(1200));
     assert_eq!(strip_x(harness.world()), SHOWING_LAST);
+    assert_eq!(edge_holds(harness.world()), 0);
+}
+
+/// The pointer holds the right edge of an external display, which nothing
+/// touches, and whose strip has three columns of 800 points, the last one
+/// past that edge. When that display goes away, the pointer is on no
+/// display, so the hold ends with the pointer still.
+#[test]
+fn a_display_removed_during_an_edge_hold_ends_the_hold() {
+    let ext = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        EXT_DISPLAY_HEIGHT,
+    );
+    let mut harness = TestHarness::new().with_config(drag_enabled()).with_display(
+        EXT_DISPLAY_ID,
+        ext,
+        vec![EXT_WORKSPACE_ID],
+    );
+    for id in 100..103 {
+        harness = harness.with_workspace_window(id, EXT_WORKSPACE_ID, move |window| {
+            window.frame = IRect::new(ext.min.x, 20, ext.min.x + 800, ext.max.y);
+        });
+    }
+    let mut harness = six_columns(harness, false);
+    let edge = Origin::new(ext.max.x - 2, 500);
+    drag_and_hold(&mut harness, 0, FIRST_TITLE_BAR, edge);
+    assert_dragging(harness.world());
+    assert_eq!(edge_holds(harness.world()), 1);
+
+    harness.mock_state.remove_display(EXT_DISPLAY_ID);
+    harness.world().write_message(Event::DisplayRemoved {
+        display_id: EXT_DISPLAY_ID,
+    });
+    harness.advance(FRAME * 2);
+    assert_dragging(harness.world());
+    assert_eq!(edge_holds(harness.world()), 0);
+}
+
+/// With slow animations, the strip can still be on its way to an earlier
+/// target when a step comes. The step replaces that target, so the strip
+/// stays where the step put it, with window 3 flush with the left edge.
+#[test]
+fn a_step_replaces_the_target_of_a_strip_still_animating() {
+    let mut harness = six_dragged_columns(true);
+    assert_eq!(strip_x(harness.world()), SHOWING_LAST);
+    harness
+        .world()
+        .insert_resource(config("drag_to_reorder = true\nanimation_speed = 1\n"));
+    drag_and_hold(&mut harness, 5, LAST_TITLE_BAR, LEFT_EDGE);
+
+    let strip = harness
+        .world()
+        .query_filtered::<(Entity, &LayoutStrip), With<SelectedVirtualMarker>>()
+        .iter(harness.world())
+        .find_map(|(entity, strip)| (strip.id() == TEST_WORKSPACE_ID).then_some(entity))
+        .expect("a strip for the main display");
+    let y = harness
+        .world()
+        .get::<Position>(strip)
+        .expect("strip position")
+        .0
+        .y;
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(Origin::new(
+            SHOWING_LAST - 100,
+            y,
+        )));
+    harness.advance(ms(520));
+    assert_eq!(strip_x(harness.world()), SHOWING_LAST + 176);
+    harness.advance(ms(300));
+    assert_eq!(strip_x(harness.world()), SHOWING_LAST + 176);
+}
+
+/// With the strip at its first column, no column reaches past the left
+/// edge, so a pointer held there starts no hold and scrolls nothing. The
+/// same goes for the right edge with the strip at its last column. The other
+/// edge, with columns past it, still starts a hold.
+#[test]
+fn an_edge_with_no_column_past_it_holds_nothing() {
+    for (last, id, title_bar, idle, other) in [
+        (false, 0, FIRST_TITLE_BAR, LEFT_EDGE, RIGHT_EDGE),
+        (true, 5, LAST_TITLE_BAR, RIGHT_EDGE, LEFT_EDGE),
+    ] {
+        let mut harness = six_dragged_columns(last);
+        let x = strip_x(harness.world());
+        drag_and_hold(&mut harness, id, title_bar, idle);
+        assert_dragging(harness.world());
+        harness.advance(ms(1200));
+        assert_eq!(edge_holds(harness.world()), 0, "at {idle:?}");
+        assert_eq!(strip_x(harness.world()), x, "at {idle:?}");
+
+        move_pointer(&mut harness, other);
+        assert_eq!(edge_holds(harness.world()), 1, "at {other:?}");
+    }
 }
