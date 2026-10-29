@@ -240,3 +240,84 @@ fn equalizing_a_stack_with_a_minimum_height_settles() {
     assert_eq!(heights[0], 700, "{heights:?}");
     assert_even(&heights[1..], COLUMN - 700);
 }
+
+/// Stacks windows 1 to `count - 1` under window 0, one at a time, so one
+/// column holds them all and window `count - 1` is focused.
+fn stack_all(harness: &mut TestHarness, count: WinID) {
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    for _ in 1..count {
+        harness.run(vec![
+            command(Operation::Focus(Direction::East)),
+            command(Operation::Stack(true)),
+        ]);
+        harness.advance(SETTLE);
+    }
+}
+
+/// Each window's top and height, checking that they share one column.
+fn rows(world: &mut World, ids: &[WinID]) -> Vec<(i32, i32)> {
+    let frames = ids.iter().map(|id| frame(world, *id)).collect::<Vec<_>>();
+    assert!(
+        frames.windows(2).all(|pair| pair[0].min.x == pair[1].min.x),
+        "one column: {frames:?}"
+    );
+    frames
+        .iter()
+        .map(|frame| (frame.min.y, frame.height()))
+        .collect()
+}
+
+/// Four windows need 800 px at the 200 px minimum window height, more than
+/// the 748 px column. Each lower window overlaps the one above it below that
+/// window's top bar, 52 px when it is not known. The last window ends at the
+/// display bottom, and the 548 px above it hold the three top bars above it
+/// and an even share of the rest, 130 px each.
+#[test]
+fn a_stack_too_tall_for_the_minimum_window_height_overlaps_below_each_top_bar() {
+    let mut harness = TestHarness::new().with_windows(4);
+    stack_all(&mut harness, 4);
+
+    assert_eq!(
+        rows(harness.world(), &[0, 1, 2, 3]),
+        vec![(20, 748), (203, 565), (386, 382), (568, 200)]
+    );
+}
+
+/// Three windows that accept no less than 700 px each need 2100 px of a
+/// 1270 px column. Stacked one under the other, the last one would start
+/// below the display bottom. They overlap instead, and every window starts
+/// on screen.
+#[test]
+fn a_stack_whose_minimum_heights_cannot_fit_keeps_every_window_on_screen() {
+    let mut harness = tall_harness();
+    for id in 0..3 {
+        harness
+            .mock_state
+            .update_window(id, |window| window.min_height = 700);
+    }
+    stack_three(&mut harness);
+
+    assert_eq!(
+        rows(harness.world(), &[0, 1, 2]),
+        vec![(20, COLUMN), (305, 985), (590, 700)]
+    );
+}
+
+/// Each lower window of an overlapping stack is raised after the window above
+/// it, so it is in front and the top bar above it shows. The focused window
+/// is raised last, and goes back to its place once focus leaves it.
+#[test]
+fn an_overlapping_stack_raises_each_lower_window_in_front() {
+    let mut harness = TestHarness::new().with_windows(5);
+    stack_all(&mut harness, 4);
+    harness.mock_state.take_raised();
+
+    harness.run(vec![command(Operation::Focus(Direction::North))]);
+    assert_eq!(harness.mock_state.take_raised(), vec![0, 1, 3, 2]);
+
+    harness.run(vec![command(Operation::Focus(Direction::East))]);
+    assert_eq!(harness.mock_state.take_raised(), vec![0, 1, 2, 3, 4]);
+}
