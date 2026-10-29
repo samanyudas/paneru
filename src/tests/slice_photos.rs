@@ -42,6 +42,8 @@ pub(super) struct Screen {
     tickets: BTreeMap<u32, Ticket>,
     lookups: Vec<WinID>,
     painted: Vec<(WinID, Digest)>,
+    /// The panels that show a photo: painted since they were placed.
+    showing_photo: HashSet<WinID>,
 }
 
 pub(super) type ScreenLog = Rc<RefCell<Screen>>;
@@ -54,7 +56,11 @@ impl SliceScreen for RecordingScreen {
     }
 
     fn place(&mut self, slices: &[(WinID, EdgeSlice)]) {
-        self.0.borrow_mut().placed = slices.to_vec();
+        let mut screen = self.0.borrow_mut();
+        screen
+            .showing_photo
+            .retain(|id| slices.iter().any(|(placed, _)| placed == id));
+        screen.placed = slices.to_vec();
     }
 
     fn photograph(
@@ -74,7 +80,11 @@ impl SliceScreen for RecordingScreen {
     }
 
     fn paint(&mut self, window: WinID, photo: &Photo) {
-        self.0.borrow_mut().painted.push((window, photo.digest));
+        let mut screen = self.0.borrow_mut();
+        screen.painted.push((window, photo.digest));
+        if screen.placed.iter().any(|(placed, _)| *placed == window) {
+            screen.showing_photo.insert(window);
+        }
     }
 
     fn seen(&self, window: WinID) -> bool {
@@ -281,8 +291,13 @@ pub(super) fn painted_beside_with(config: Config) -> (TestHarness, ScreenLog) {
 /// Window 0 shows a slice on the edge shared with the display to the left,
 /// with its first photo painted, under `config`, which turns slices on.
 pub(super) fn painted_west_with(config: Config) -> (TestHarness, ScreenLog) {
-    let laid_out = laid_out(config, Screen::default(), &[LEFT], 4, Some(Direction::Last));
-    painted(laid_out, 0)
+    painted(west(config), 0)
+}
+
+/// Window 0 shows a slice on the edge shared with the display to the left,
+/// under `config`, which turns slices on. Its first photo is on its way.
+fn west(config: Config) -> (TestHarness, ScreenLog) {
+    laid_out(config, Screen::default(), &[LEFT], 4, Some(Direction::Last))
 }
 
 fn painted(
@@ -389,6 +404,21 @@ fn turning_the_switch_off_closes_the_panels() {
 
     assert!(log.borrow().placed.is_empty());
     assert_eq!(log.borrow().asked.len(), asks, "no photo after the switch");
+}
+
+#[test]
+fn turning_the_switch_back_on_shows_no_photo_from_before() {
+    let (mut harness, log) = painted_beside();
+    harness.world().insert_resource(switch(false));
+    harness.advance(REFRESH);
+    let asks = asks_for(&log, 3).len();
+
+    harness.world().insert_resource(switch(true));
+    harness.advance(SETTLE);
+
+    assert_eq!(placed_ids(&log), vec![3]);
+    assert_eq!(panel_photo(&log, 3), None, "the old photo is gone");
+    assert_eq!(asks_for(&log, 3).len(), asks + 1, "a new photo of window 3");
 }
 
 #[test]
@@ -659,8 +689,9 @@ fn assert_shown_every_frame(id: WinID, seen: &[Seen]) {
     }
 }
 
-/// Window `id` slides out past the shared edge with its photo arriving
-/// after 5 frames, as fast as photos arrive on Sam's Mac.
+/// Window `id`, with no photo yet, slides out past the shared edge with its
+/// first photo arriving after 5 frames, as fast as photos arrive on Sam's
+/// Mac.
 fn assert_slides_out(laid_out: (TestHarness, ScreenLog), id: WinID, focus: (Direction, Direction)) {
     let (seen, start, mut harness) = leave(laid_out, id, focus, Some(5), None);
 
@@ -713,20 +744,16 @@ fn assert_slides_out(laid_out: (TestHarness, ScreenLog), id: WinID, focus: (Dire
 #[test]
 fn focus_away_from_a_window_at_the_shared_edge_slides_it_out_under_its_photo() {
     assert_slides_out(
-        painted(beside(animated(), Screen::default()), 3),
+        beside(animated(), Screen::default()),
         3,
         (Direction::Last, Direction::First),
     );
-    assert_slides_out(
-        painted_west_with(animated()),
-        0,
-        (Direction::First, Direction::Last),
-    );
+    assert_slides_out(west(animated()), 0, (Direction::First, Direction::Last));
 }
 
 #[test]
 fn focus_back_during_a_slide_out_slides_the_photo_back_in() {
-    let laid_out = painted(beside(animated(), Screen::default()), 3);
+    let laid_out = beside(animated(), Screen::default());
     let focus = (Direction::Last, Direction::First);
     let (seen, _, harness) = leave(laid_out, 3, focus, Some(5), Some((8, Direction::Last)));
 
@@ -744,7 +771,7 @@ fn focus_back_during_a_slide_out_slides_the_photo_back_in() {
 
 #[test]
 fn a_window_whose_photo_never_arrives_tucks_after_a_short_wait() {
-    let laid_out = painted(beside(animated(), Screen::default()), 3);
+    let laid_out = beside(animated(), Screen::default());
     let focus = (Direction::Last, Direction::First);
     let (seen, _, _) = leave(laid_out, 3, focus, None, None);
 
@@ -812,4 +839,132 @@ fn focus_away_during_a_slide_in_slides_the_photo_back_out() {
     );
     places.dedup();
     assert!(places.len() >= 5, "the photo slides through {places:?}");
+}
+
+/// The place of the panel of window `id`, if the panel shows a photo.
+fn panel_photo(log: &ScreenLog, id: WinID) -> Option<IRect> {
+    let screen = log.borrow();
+    screen
+        .placed
+        .iter()
+        .find(|(placed, _)| *placed == id && screen.showing_photo.contains(placed))
+        .map(|(_, slice)| slice.on_screen)
+}
+
+/// What the user sees of window `id` after each of `frames` frames, while
+/// each of `presses` focuses at its frame and no photo arrives.
+fn drive(
+    harness: &mut TestHarness,
+    log: &ScreenLog,
+    id: WinID,
+    presses: &[(usize, Direction)],
+    frames: usize,
+) -> Vec<Seen> {
+    (0..frames)
+        .map(|frame| {
+            for (_, direction) in presses.iter().filter(|(at, _)| *at == frame) {
+                harness
+                    .world()
+                    .write_message(command(Operation::Focus(direction.clone())));
+            }
+            harness.advance(Duration::from_millis(20));
+            Seen {
+                window: harness.mock_state.ax_frame(id),
+                photo: panel_photo(log, id),
+            }
+        })
+        .collect()
+}
+
+/// Reveals window `id`, whose slice shows its painted photo, with focus
+/// `reveal`, and checks that it rests in view with its panel closed.
+fn revealed(
+    (mut harness, log): (TestHarness, ScreenLog),
+    id: WinID,
+    reveal: Direction,
+) -> (TestHarness, ScreenLog) {
+    harness
+        .world()
+        .write_message(command(Operation::Focus(reveal)));
+    harness.advance(SETTLE);
+    let rest = harness.mock_state.ax_frame(id);
+    assert!(in_view(rest), "window {id} rests in view at {rest:?}");
+    assert_eq!(
+        panel_photo(&log, id),
+        None,
+        "the panel of window {id} closed"
+    );
+    (harness, log)
+}
+
+/// Asserts that window `id` rests tucked, with its photo as its slice.
+fn assert_rests_tucked(harness: &mut TestHarness, id: WinID, seen: &[Seen]) {
+    let rest = showing(harness.world());
+    let [(shown, slice)] = rest.as_slice() else {
+        panic!("one slice shows at rest: {rest:?}")
+    };
+    assert_eq!(*shown, id, "the slice of window {id} shows");
+    let end = seen.last().expect("frames");
+    assert!(!in_view(end.window), "window {id} tucks: {:?}", end.window);
+    assert_eq!(
+        end.photo,
+        Some(slice.on_screen),
+        "the photo rests as the slice"
+    );
+}
+
+#[test]
+fn a_window_that_slid_in_slides_back_out_under_the_photo_it_had() {
+    for (laid_out, id, (reveal, leave)) in [
+        (
+            painted_beside_with(animated()),
+            3,
+            (Direction::Last, Direction::First),
+        ),
+        (
+            painted_west_with(animated()),
+            0,
+            (Direction::First, Direction::Last),
+        ),
+    ] {
+        let (mut harness, log) = revealed(laid_out, id, reveal);
+
+        let seen = drive(&mut harness, &log, id, &[(0, leave)], 40);
+
+        assert_shown_every_frame(id, &seen);
+        let covered = seen.iter().position(|frame| frame.photo.is_some());
+        assert!(
+            covered.is_some_and(|frame| frame <= 1),
+            "the photo of window {id} shows at once: after frame {covered:?}"
+        );
+        assert_rests_tucked(&mut harness, id, &seen);
+        let mut places = seen
+            .iter()
+            .filter_map(|frame| frame.photo)
+            .collect::<Vec<_>>();
+        places.dedup();
+        assert!(places.len() >= 5, "the photo slides through {places:?}");
+        assert_eq!(
+            log.borrow().painted.last(),
+            Some(&(id, Digest(7))),
+            "the photo it had shows"
+        );
+    }
+}
+
+#[test]
+fn rapid_presses_across_the_shared_edge_show_the_window_or_its_photo_every_frame() {
+    let (mut harness, log) = revealed(painted_west_with(animated()), 0, Direction::First);
+    let presses = [
+        (0, Direction::Last),
+        (8, Direction::First),
+        (14, Direction::Last),
+        (20, Direction::First),
+        (26, Direction::Last),
+    ];
+
+    let seen = drive(&mut harness, &log, 0, &presses, 70);
+
+    assert_shown_every_frame(0, &seen);
+    assert_rests_tucked(&mut harness, 0, &seen);
 }

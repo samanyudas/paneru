@@ -194,6 +194,11 @@ impl SlicePhoto {
 #[derive(Resource, Default)]
 struct Slices {
     showing: BTreeMap<WinID, (EdgeSlice, SlicePhoto)>,
+    /// The latest photo of each window, with the size of the frame it shows,
+    /// kept after its slice stops showing. A window that crosses the shared
+    /// edge again shows it at once, rather than waiting for a new photo that
+    /// can take 700 ms.
+    kept: BTreeMap<WinID, (IVec2, Photo)>,
     /// The generation of the latest photo asked for, so a photo of an
     /// earlier ask is told apart.
     generation: u32,
@@ -251,28 +256,34 @@ fn update_access(
 /// Gives each showing slice a panel, photographs the slices that are new or
 /// whose window changed size after looking their windows up, and closes the
 /// panels of slices that stopped showing. A photo shows the whole window, so
-/// a slice that only moved keeps it. A slice whose painted panel no one can
+/// a slice that only moved keeps it, and a new slice shows its window's kept
+/// photo of the same size at once. A slice whose painted panel no one can
 /// see waits for the next refresh that sees it. A panel never painted is out
 /// of sight, so its first photo never waits.
 fn present_slices(
     In(showing): In<Vec<(WinID, EdgeSlice)>>,
     access: Res<SliceAccess>,
     mut slices: ResMut<Slices>,
+    windows: Query<&Window>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
     let Some(mut screen) = screen else {
         return;
     };
-    let showing = if *access == SliceAccess::On {
-        showing
-    } else {
-        Vec::new()
-    };
     let Slices {
         showing: shown,
+        kept,
         generation,
     } = &mut *slices;
+    let showing = if *access == SliceAccess::On {
+        kept.retain(|id, _| windows.iter().any(|window| window.id() == *id));
+        showing
+    } else {
+        kept.clear();
+        Vec::new()
+    };
     let mut before = std::mem::take(shown);
+    let mut from_kept = Vec::new();
     for (id, slice) in showing {
         let photo = match before.remove(&id) {
             Some((was, photo)) if was.size == slice.size || matches!(photo, SlicePhoto::Ended) => {
@@ -283,19 +294,33 @@ fn present_slices(
                     debug!("edge slice photo deferred, panel unseen: window {id}");
                     SlicePhoto::Shown { digest }
                 }
-                last => ask(
-                    screen.0.as_mut(),
-                    generation,
-                    id,
-                    &slice,
-                    last,
-                    Lookup::Fresh,
-                ),
+                last => match kept.get(&id).filter(|(size, _)| *size == slice.size) {
+                    Some((_, photo)) => {
+                        from_kept.push(id);
+                        SlicePhoto::Shown {
+                            digest: photo.digest,
+                        }
+                    }
+                    None => ask(
+                        screen.0.as_mut(),
+                        generation,
+                        id,
+                        &slice,
+                        last,
+                        Lookup::Fresh,
+                    ),
+                },
             },
         };
         shown.insert(id, (slice, photo));
     }
     screen.0.place(&slices.placed());
+    for id in from_kept {
+        if let Some((_, photo)) = slices.kept.get(&id) {
+            screen.0.paint(id, photo);
+            debug!("edge slice photo kept: window {id}");
+        }
+    }
 }
 
 /// Photographs each shown slice again with its last lookup, unless no one
@@ -307,6 +332,7 @@ fn refresh_slices(mut slices: ResMut<Slices>, screen: Option<NonSendMut<SliceScr
     let Slices {
         showing,
         generation,
+        ..
     } = &mut *slices;
     for (id, (slice, photo)) in showing.iter_mut() {
         let SlicePhoto::Shown { digest } = *photo else {
@@ -327,8 +353,8 @@ fn refresh_slices(mut slices: ResMut<Slices>, screen: Option<NonSendMut<SliceScr
     }
 }
 
-/// Paints each photo that differs from the one its panel shows. A failed
-/// photo closes its panel, and a refused one closes them all.
+/// Paints each photo that differs from the one its panel shows, and keeps it.
+/// A failed photo closes its panel, and a refused one closes them all.
 fn receive_photos(
     mut messages: MessageReader<Event>,
     mut slices: ResMut<Slices>,
@@ -348,31 +374,33 @@ fn receive_photos(
         else {
             continue;
         };
-        let asked = slices
-            .showing
+        let Slices { showing, kept, .. } = &mut *slices;
+        let asked = showing
             .get_mut(window_id)
-            .and_then(|(_, photo)| match *photo {
+            .and_then(|(slice, photo)| match *photo {
                 SlicePhoto::Asked {
                     generation: asked,
                     last,
                     ..
-                } if asked == *generation => Some((photo, last)),
+                } if asked == *generation => Some((slice.size, photo, last)),
                 _ => None,
             });
-        let Some((photo, last)) = asked else {
+        let Some((size, photo, last)) = asked else {
             debug!("edge slice photo dropped as stale: window {window_id} generation {generation}");
             continue;
         };
+        if result.is_err() {
+            kept.remove(window_id);
+        }
         *photo = match result {
-            Ok(taken) if Some(taken.digest) == last => {
-                debug!("edge slice unchanged: window {window_id}");
-                SlicePhoto::Shown {
-                    digest: taken.digest,
-                }
-            }
             Ok(taken) => {
-                screen.0.paint(*window_id, taken);
-                debug!("edge slice repainted: window {window_id}");
+                if Some(taken.digest) == last {
+                    debug!("edge slice unchanged: window {window_id}");
+                } else {
+                    screen.0.paint(*window_id, taken);
+                    debug!("edge slice repainted: window {window_id}");
+                }
+                kept.insert(*window_id, (size, taken.clone()));
                 SlicePhoto::Shown {
                     digest: taken.digest,
                 }
@@ -536,7 +564,11 @@ fn slide_photos_out(
                     });
                 let own = displays.get(slice.display).map(Display::bounds);
                 let (true, Ok(own)) = (waits, own) else {
-                    debug!("edge slice photo not shown: window {id} tucks at once");
+                    let waited = until.map(|until| (now + PHOTO_WAIT).saturating_sub(until));
+                    debug!(
+                        "edge slice photo not shown: window {id} tucks at once after {waited:?}, photo {photo:?}, access {:?}",
+                        *access
+                    );
                     position.0 = presented.0;
                     entity_commands.try_insert(slice).try_remove::<Slide>();
                     continue;
