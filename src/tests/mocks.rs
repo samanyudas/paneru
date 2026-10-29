@@ -49,7 +49,24 @@ pub(crate) struct MockWindowData {
     pub(crate) min_width: i32,
     /// The widest width the app accepts, or no limit when zero.
     pub(crate) max_width: i32,
+    /// The shortest height the app accepts, like an `NSWindow.minSize`.
+    pub(crate) min_height: i32,
+    /// Whether macOS ignores a small shrink of this window while its bottom
+    /// edge is at the bottom of its screen. See [`BOTTOM_HOLD`].
+    pub(crate) holds_bottom_edge: bool,
+    /// How many size writes reached the app.
+    pub(crate) size_writes: usize,
 }
+
+/// A window with [`MockWindowData::holds_bottom_edge`] ignores a shrink by
+/// less than this many points while its bottom edge is at or below the bottom
+/// of its screen.
+///
+/// This is a model, not a measured macOS rule. On a live display, with its
+/// bottom edge at the bottom of the screen, Spotify ignored a shrink from 1410
+/// to 1394 points, took a shrink to 1000 points, and then grew back to 1394
+/// points. Any value from 17 to 410 points fits that.
+const BOTTOM_HOLD: i32 = 32;
 
 impl Default for MockWindowData {
     fn default() -> Self {
@@ -71,6 +88,9 @@ impl Default for MockWindowData {
             child_role: false,
             min_width: 0,
             max_width: 0,
+            min_height: 0,
+            holds_bottom_edge: false,
+            size_writes: 0,
         }
     }
 }
@@ -104,6 +124,37 @@ struct MockStateInner {
     /// How many times each app has been asked for its focused window or its
     /// window list, so a test can check who a lookup bothers.
     app_reads: HashMap<Pid, usize>,
+}
+
+impl MockStateInner {
+    /// Applies one size write to window `id` the way its app and macOS would.
+    fn write_size(&mut self, id: WinID, size: Size) {
+        let screen_bottom = self.windows.get(&id).and_then(|w| {
+            let top = Origin::new(w.frame.center().x, w.frame.min.y);
+            self.displays
+                .values()
+                .find(|display| display.bounds.contains(top))
+                .map(|display| display.bounds.max.y)
+        });
+        let Some(w) = self.windows.get_mut(&id) else {
+            return;
+        };
+        w.size_writes += 1;
+        let max_width = if w.max_width > 0 {
+            w.max_width
+        } else {
+            i32::MAX
+        };
+        let width = size.x.max(w.min_width).min(max_width);
+        let mut height = size.y.max(w.min_height);
+        if w.holds_bottom_edge
+            && screen_bottom.is_some_and(|bottom| w.frame.max.y >= bottom)
+            && (1..BOTTOM_HOLD).contains(&(w.frame.height() - height))
+        {
+            height = w.frame.height();
+        }
+        w.frame.max = w.frame.min + Size::new(width, height);
+    }
 }
 
 #[derive(Clone)]
@@ -144,6 +195,11 @@ impl MockState {
         } else {
             inner.unordered_windows.remove(&window_id);
         }
+    }
+
+    /// How many size writes have reached window `id`'s app.
+    pub fn size_writes(&self, id: WinID) -> usize {
+        self.inner.force_read().windows[&id].size_writes
     }
 
     /// How many times `pid` has been asked for its focused window or window
@@ -489,14 +545,13 @@ impl MockState {
         let s = self.clone();
         mw.expect_resize().returning(move |size| {
             let mut inner = s.inner.force_write();
-            if let Some(w) = inner.windows.get_mut(&id) {
-                let max_width = if w.max_width > 0 {
-                    w.max_width
-                } else {
-                    i32::MAX
-                };
-                let width = size.x.max(w.min_width).min(max_width);
-                w.frame.max = w.frame.min + size.with_x(width);
+            // `Window::resize` sends nothing for the size the window has.
+            if inner
+                .windows
+                .get(&id)
+                .is_some_and(|w| w.frame.size() != size)
+            {
+                inner.write_size(id, size);
             }
         });
 
