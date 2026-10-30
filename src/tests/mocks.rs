@@ -656,6 +656,16 @@ impl MockState {
         }
     }
 
+    /// How many position writes every window's app has taken so far.
+    pub fn position_writes(&self) -> usize {
+        self.inner
+            .force_read()
+            .windows
+            .values()
+            .map(|window| window.position_writes)
+            .sum()
+    }
+
     /// How many times any window was raised.
     pub fn raise_count(&self) -> usize {
         self.inner.force_read().raise_count
