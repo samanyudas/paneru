@@ -1725,8 +1725,14 @@ fn a_window_leaving_past_the_edge_waits_for_a_slow_window_behind_it() {
     );
 
     harness.mock_state.hold_writes(TEST_PROCESS_ID);
-    let seen = watch(&mut harness, &log, &ids, &[(0, Direction::East)], 10);
+    let mut seen = watch(&mut harness, &log, &ids, &[(0, Direction::East)], 10);
     harness.mock_state.release_writes(TEST_PROCESS_ID);
+    // At the speed the slow app takes its moves, through its last one.
+    for _ in 0..40 {
+        harness.advance(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(20));
+        seen.push(scanline(&harness, &log, &ids));
+    }
     assert!(harness.mock_state.flush_writes(Duration::from_secs(5)));
 
     for (frame, runs) in seen.iter().enumerate() {

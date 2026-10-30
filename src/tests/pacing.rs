@@ -31,6 +31,11 @@ const FLUSH: Duration = Duration::from_secs(5);
 /// Windows 0, 1 and 2 in a row, at rest with window 0 at the display's left
 /// edge.
 fn harness() -> TestHarness {
+    harness_with_widths([WINDOW_WIDTH; 3])
+}
+
+/// [`harness`], with windows 0, 1 and 2 `widths` wide.
+fn harness_with_widths(widths: [i32; 3]) -> TestHarness {
     let config: Config = (
         MainOptions {
             animation_speed: Some(14.0),
@@ -45,8 +50,11 @@ fn harness() -> TestHarness {
             .with_app(FAST_APP, "fast", "FastApp", |_| {});
     harness.mock_state.queue_writes(SLOW_APP);
     harness.mock_state.set_write_delay(SLOW_APP, SLOW_WRITE);
-    for (id, pid) in [(0, FAST_APP), (1, SLOW_APP), (2, FAST_APP)] {
-        let frame = IRect::new(0, 0, WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    for ((id, pid), width) in [(0, FAST_APP), (1, SLOW_APP), (2, FAST_APP)]
+        .into_iter()
+        .zip(widths)
+    {
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
         let window = harness
             .mock_state
             .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
@@ -105,6 +113,26 @@ fn gap(harness: &TestHarness, left: WinID, right: WinID) -> i32 {
     harness.mock_state.ax_frame(right).min.x - harness.mock_state.ax_frame(left).max.x
 }
 
+/// Runs frames at the speed the slow app takes its moves until the row
+/// settles, asserting after each that no more desktop than `rest` shows
+/// between windows `left` and `right`.
+fn settle_beside(harness: &mut TestHarness, left: WinID, right: WinID, rest: i32) {
+    for frame in 0..200 {
+        harness.advance(FRAME);
+        std::thread::sleep(FRAME);
+        assert!(
+            gap(harness, left, right) <= rest,
+            "desktop shows between windows {left} and {right} {frame} frames after the release: {:?} {:?}",
+            harness.mock_state.ax_frame(left),
+            harness.mock_state.ax_frame(right)
+        );
+        if !moving(harness.world()) && harness.mock_state.flush_writes(Duration::ZERO) {
+            return;
+        }
+    }
+    panic!("the row did not settle");
+}
+
 fn assert_landed(harness: &mut TestHarness) {
     for id in 0..3 {
         assert_eq!(
@@ -136,6 +164,7 @@ fn the_window_ahead_waits_for_a_slow_window_behind_it() {
         );
     }
     harness.mock_state.release_writes(SLOW_APP);
+    settle_beside(&mut harness, 0, 1, rest);
     settle(&mut harness);
 
     assert_landed(&mut harness);
@@ -168,6 +197,7 @@ fn the_window_ahead_waits_for_a_slow_window_behind_it_scrolling_right() {
         );
     }
     harness.mock_state.release_writes(SLOW_APP);
+    settle_beside(&mut harness, 1, 2, rest);
     settle(&mut harness);
 
     assert_landed(&mut harness);
@@ -206,4 +236,35 @@ fn a_stuck_window_does_not_hold_the_row_for_good() {
     harness.mock_state.release_writes(SLOW_APP);
     settle(&mut harness);
     assert_landed(&mut harness);
+}
+
+/// A move short enough to finish in one step of the ease: window 0 ahead
+/// still waits for the slow window 1 behind it, rather than snapping to its
+/// target while window 1 has yet to move.
+#[test]
+fn the_window_ahead_does_not_snap_past_a_slow_window_on_a_short_move() {
+    let mut harness = harness_with_widths([600, TEST_DISPLAY_WIDTH - 600 + 6, 400]);
+    let rest = gap(&harness, 0, 1);
+    let start = harness.mock_state.ax_frame(0);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::East));
+    for frame in 0..8 {
+        harness.advance(FRAME);
+        assert!(
+            gap(&harness, 0, 1) <= rest,
+            "desktop shows between windows 0 and 1 after frame {frame}: {:?} {:?}",
+            harness.mock_state.ax_frame(0),
+            harness.mock_state.ax_frame(1)
+        );
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle(&mut harness);
+
+    assert_landed(&mut harness);
+    assert_eq!(
+        harness.mock_state.ax_frame(0).min.x,
+        start.min.x - 6,
+        "the row scrolled by 6 points"
+    );
 }
