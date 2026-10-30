@@ -176,6 +176,7 @@ type RepositionedWindows<'w, 's> = Populated<
         Option<&'static ResizeMarker>,
         Option<&'static EdgeSlice>,
         Option<&'static Slide>,
+        Option<&'static RepositionMarker>,
     ),
     (
         Or<(Changed<LayoutPosition>, Changed<Bounds>)>,
@@ -3175,8 +3176,17 @@ fn position_layout_windows(
                 .unwrap_or_else(|| vec![held])
         })
         .unwrap_or_default();
-    for (entity, window, layout_position, mut position, mut bounds, resize, tucked, sliding) in
-        positioned_windows
+    for (
+        entity,
+        window,
+        layout_position,
+        mut position,
+        mut bounds,
+        resize,
+        tucked,
+        sliding,
+        pending,
+    ) in positioned_windows
     {
         if held_group.contains(&entity) {
             continue;
@@ -3246,7 +3256,9 @@ fn position_layout_windows(
             }
         }
 
-        if position.0 != frame.min {
+        // A window pacing held short of its last target can already sit at
+        // the new one, with the move to the old one still pending.
+        if position.0 != frame.min || pending.is_some_and(|to| to.0 != frame.min) {
             // Direct-assign (snap) when:
             //   - The user is actively swiping: windows must track the finger in lockstep.
             //   - A workspace switch just moved the strip vertically: jumping the full off-screen

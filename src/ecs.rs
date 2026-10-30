@@ -296,6 +296,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::animate_entities,
             systems::animate_resize_entities,
             pacing::pace_rows.run_if(not(resource_exists::<Initializing>)),
+            systems::finish_repositions,
             systems::commit_window_frame.run_if(not(resource_exists::<Initializing>)),
             systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
             triggers::window_resize_verifier,
