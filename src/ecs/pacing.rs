@@ -11,7 +11,8 @@
 //! window. The slowest window then sets the pace for every window ahead of
 //! it. A window that lags into the window ahead only overlaps it, which
 //! shows no desktop, so nothing waits on the windows ahead of the slow one.
-//! A photo sliding at a shared edge is held the same way.
+//! A photo sliding at a shared edge is held the same way, and closes over
+//! its window only once the window server shows the window where it rests.
 //!
 //! The windows ahead of a window whose app has shown every move of a whole
 //! motion in time follow where the engine puts it, so a row of quick apps
@@ -24,7 +25,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use bevy::ecs::entity::{Entity, EntityHashMap};
+use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::Added;
@@ -180,15 +181,19 @@ impl Shared {
 }
 
 /// How far each sliding photo may go this frame, as [`pace_rows`] holds it
-/// with the rest of its row. The photo steps after that.
+/// with the rest of its row, and which landing windows the window server
+/// shows where they rest. The photos step after that.
 #[derive(Resource, Default)]
-pub(crate) struct SlideHolds(EntityHashMap<i32>);
+pub(crate) struct SlideHolds {
+    bounds: EntityHashMap<i32>,
+    landed: EntityHashSet,
+}
 
 impl SlideHolds {
     /// `next`, the step of the photo of `entity` from `at`, held where
     /// pacing stops it this frame.
     pub(crate) fn limit(&self, entity: Entity, at: IVec2, next: IVec2) -> IVec2 {
-        let Some(&bound) = self.0.get(&entity) else {
+        let Some(&bound) = self.bounds.get(&entity) else {
             return next;
         };
         next.with_x(if next.x < at.x {
@@ -196,6 +201,12 @@ impl SlideHolds {
         } else {
             next.x.min(bound).max(at.x)
         })
+    }
+
+    /// Whether the window server shows the landing window `entity` where the
+    /// engine put it.
+    pub(crate) fn landed(&self, entity: Entity) -> bool {
+        self.landed.contains(&entity)
     }
 }
 
@@ -361,10 +372,8 @@ pub(super) fn pace_rows(
     mut tracked: Local<EntityHashMap<Tracked>>,
     mut watching: Local<bool>,
 ) {
-    slide_holds.0.clear();
-    let focused = focused.iter().collect::<Vec<_>>();
-    let unfocused = unfocused.read().collect::<Vec<_>>();
-    forget_switched_apps(&mut tracked, &focused, &unfocused, &apps);
+    *slide_holds = SlideHolds::default();
+    forget_switched_apps(&mut tracked, focused.iter(), unfocused.read(), &apps);
     let Some(shown_frames) = shown_frames else {
         return;
     };
@@ -392,6 +401,7 @@ pub(super) fn pace_rows(
         return;
     };
     *watching = true;
+    slide_holds.landed = landed(&rows, &windows, &shown);
 
     let now = time.elapsed();
     let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
@@ -452,7 +462,7 @@ pub(super) fn pace_rows(
                     "pacing holds the photo of window {} at x {} on its way to {}",
                     member.id, member.x, member.target
                 );
-                slide_holds.0.insert(member.entity, member.x);
+                slide_holds.bounds.insert(member.entity, member.x);
             } else if let Ok((_, mut position, ..)) = windows.get_mut(member.entity) {
                 debug!(
                     "pacing holds window {} at x {} short of {} on its way to {}",
@@ -471,13 +481,17 @@ pub(super) fn pace_rows(
 /// one app neither activates nor deactivates it.
 fn forget_switched_apps(
     tracked: &mut EntityHashMap<Tracked>,
-    focused: &[Entity],
-    unfocused: &[Entity],
+    focused: impl Iterator<Item = Entity>,
+    unfocused: impl Iterator<Item = Entity>,
     apps: &Query<&ChildOf>,
 ) {
     let app = |entity: &Entity| apps.get(*entity).ok().map(ChildOf::parent);
-    let gained = focused.iter().filter_map(app).collect::<Vec<_>>();
-    let lost = unfocused.iter().filter_map(app).collect::<Vec<_>>();
+    let gained = focused
+        .filter_map(|entity| app(&entity))
+        .collect::<Vec<_>>();
+    let lost = unfocused
+        .filter_map(|entity| app(&entity))
+        .collect::<Vec<_>>();
     let switched = gained
         .iter()
         .filter(|app| !lost.contains(app))
@@ -488,8 +502,31 @@ fn forget_switched_apps(
     }
 }
 
-/// The windows of each strip that has a window on its way somewhere, column
-/// by column, left to right.
+/// The windows of `rows` landing under their photos that the window server
+/// shows where the engine put them.
+fn landed(
+    rows: &[Vec<Vec<Entity>>],
+    windows: &RowWindows,
+    shown: &HashMap<WinID, IRect>,
+) -> EntityHashSet {
+    rows.iter()
+        .flatten()
+        .flatten()
+        .copied()
+        .filter(|&entity| {
+            windows.get(entity).is_ok_and(|(window, _, _, slide)| {
+                matches!(slide, Some((Slide::Landing { .. }, _)))
+                    && shown
+                        .get(&window.id())
+                        .map(|&frame| window.margins().tracked(frame).min)
+                        == Some(window.frame().min)
+            })
+        })
+        .collect()
+}
+
+/// The windows of each strip that has a window on its way somewhere or
+/// landing under its photo, column by column, left to right.
 fn moving_rows(strips: &Query<&LayoutStrip>, windows: &RowWindows) -> Vec<Vec<Vec<Entity>>> {
     strips
         .iter()
@@ -500,9 +537,12 @@ fn moving_rows(strips: &Query<&LayoutStrip>, windows: &RowWindows) -> Vec<Vec<Ve
                 .collect::<Vec<_>>()
         })
         .filter(|row| {
-            row.iter()
-                .flatten()
-                .any(|&entity| windows.get(entity).is_ok_and(|(_, _, to, _)| to.is_some()))
+            row.iter().flatten().any(|&entity| {
+                windows.get(entity).is_ok_and(|(_, _, to, slide)| {
+                    to.is_some()
+                        || slide.is_some_and(|(slide, _)| matches!(slide, Slide::Landing { .. }))
+                })
+            })
         })
         .collect()
 }
