@@ -14,7 +14,8 @@
 //! A photo sliding at a shared edge is held the same way.
 //!
 //! The windows ahead of a window whose app has shown every move of a whole
-//! motion in time follow where the engine puts it, so a row of quick apps
+//! motion in time follow where the engine puts it once it has shown a move
+//! of the current one, so a row of quick apps
 //! moves together. Any other window paces from where it is shown.
 
 use std::collections::HashMap;
@@ -251,7 +252,9 @@ impl Tracked {
                 if before.is_some_and(|before| before != asked) {
                     self.on_time = true;
                 }
-                if self.prompt {
+                // Until the window shows a move of this motion, a prompt app
+                // may have turned slow, as Helium does after a focus change.
+                if self.prompt && self.on_time {
                     Pacer::Asked
                 } else {
                     Pacer::Shown(asked)

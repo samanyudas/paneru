@@ -207,6 +207,36 @@ fn the_window_ahead_waits_for_a_slow_window_behind_it_scrolling_right() {
     );
 }
 
+/// An app that showed every move of one motion in time can still be slow on
+/// the next, as Helium is right after a focus change: window 2 ahead waits
+/// for window 1 from the first step, rather than trusting it to keep up.
+#[test]
+fn the_window_ahead_waits_for_a_window_that_turns_slow_after_a_prompt_motion() {
+    let mut harness = harness();
+    harness.mock_state.set_write_delay(SLOW_APP, Duration::ZERO);
+    harness.world().write_message(focus(Direction::Last));
+    settle_beside(&mut harness, 1, 2, i32::MAX);
+    settle(&mut harness);
+    let rest = gap(&harness, 1, 2);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::First));
+    for frame in 0..10 {
+        harness.advance(FRAME);
+        assert!(
+            gap(&harness, 1, 2) <= rest,
+            "desktop shows between windows 1 and 2 after frame {frame}: {:?} {:?}",
+            harness.mock_state.ax_frame(1),
+            harness.mock_state.ax_frame(2)
+        );
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle_beside(&mut harness, 1, 2, rest);
+    settle(&mut harness);
+
+    assert_landed(&mut harness);
+}
+
 /// An app that stops answering holds the row only for a while: window 0
 /// reaches its target while window 1's app is still stuck.
 #[test]
