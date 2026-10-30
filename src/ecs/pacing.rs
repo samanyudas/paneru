@@ -17,8 +17,8 @@
 //! The windows ahead of a window whose app has shown every move of a whole
 //! motion in time follow where the engine puts it, so a row of quick apps
 //! moves together. Any other window paces from where it is shown, and so do
-//! the windows of an app that focus moves to or from another app, which
-//! can turn slow.
+//! the windows of an app that comes to the front or leaves it, which can
+//! turn slow.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -29,6 +29,7 @@ use std::time::Duration;
 use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
+use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::Added;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Local, Query, Res, ResMut};
@@ -41,9 +42,10 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::shared_edge::Slide;
 use crate::ecs::systems::{ease_out_factor, ease_step};
 use crate::ecs::{FocusedMarker, Position, PresentedOrigin, RepositionMarker};
-use crate::manager::Window;
+use crate::events::Event;
 use crate::manager::window_writer::LANDING_TIMEOUT;
-use crate::platform::WinID;
+use crate::manager::{Application, Window};
+use crate::platform::{ProcessSerialNumber, WinID};
 
 /// How long the sampler rests between reads, a quarter of a frame.
 const READ_INTERVAL: Duration = Duration::from_millis(4);
@@ -256,8 +258,8 @@ pub(super) struct Tracked {
     /// Where the engine had asked for the window as of the previous frame.
     asked: Option<i32>,
     /// The app showed each of the engine's moves by the next frame through
-    /// a whole motion, and has not been late since, nor gained or lost focus
-    /// to another app, so it takes this frame's move about as soon as the
+    /// a whole motion, and has not been late since, nor come to the front or
+    /// left it, so it takes this frame's move about as soon as the
     /// windows ahead take theirs. Kept across motions, so a slow app is
     /// paced from the first step of the next one.
     prompt: bool,
@@ -388,10 +390,12 @@ type RowWindows<'w, 's> = Query<
 /// from its target as the column behind it, in the direction of motion, is
 /// from its own. Runs between the animation step and the frame write, and
 /// before the photos at shared edges step.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn pace_rows(
     focused: Query<Entity, Added<FocusedMarker>>,
     mut unfocused: RemovedComponents<FocusedMarker>,
+    mut messages: MessageReader<Event>,
+    applications: Query<(Entity, &Application)>,
     apps: Query<&ChildOf>,
     shown_frames: Option<Res<ShownFrames>>,
     strips: Query<&LayoutStrip>,
@@ -401,9 +405,17 @@ pub(super) fn pace_rows(
     mut slide_holds: ResMut<SlideHolds>,
     mut tracked: Local<EntityHashMap<Tracked>>,
     mut watching: Local<bool>,
+    mut front: Local<Option<ProcessSerialNumber>>,
 ) {
     *slide_holds = SlideHolds::default();
     forget_switched_apps(&mut tracked, focused.iter(), unfocused.read(), &apps);
+    forget_fronted_apps(
+        &mut tracked,
+        &mut front,
+        messages.read(),
+        &applications,
+        &apps,
+    );
     let Some(shown_frames) = shown_frames else {
         return;
     };
@@ -509,7 +521,8 @@ pub(super) fn pace_rows(
 /// another app or lost it to one taking their moves. Such an app can turn
 /// slow, as Helium and Beeper do, so its windows pace the row from where
 /// they show until they keep up again. Focus moving between the windows of
-/// one app neither activates nor deactivates it.
+/// one app neither activates nor deactivates it. The engine also hears of
+/// the switch from macOS, later, which [`forget_fronted_apps`] takes in.
 fn forget_switched_apps(
     tracked: &mut EntityHashMap<Tracked>,
     focused: impl Iterator<Item = Entity>,
@@ -530,6 +543,40 @@ fn forget_switched_apps(
         .collect::<Vec<_>>();
     if !switched.is_empty() {
         tracked.retain(|entity, _| app(entity).is_none_or(|app| !switched.contains(&&app)));
+    }
+}
+
+/// Forgets what the engine has seen of the app that each front switch in
+/// `events` brings to the front, and of the app it takes from the front,
+/// `front`, taking their moves. Focus on an empty display brings Finder to
+/// the front with only its desktop window, which the engine does not track,
+/// and focus back on the same window brings its app back, though no tracked
+/// window gains or loses focus.
+fn forget_fronted_apps<'a>(
+    tracked: &mut EntityHashMap<Tracked>,
+    front: &mut Option<ProcessSerialNumber>,
+    events: impl Iterator<Item = &'a Event>,
+    applications: &Query<(Entity, &Application)>,
+    apps: &Query<&ChildOf>,
+) {
+    for event in events {
+        let Event::ApplicationFrontSwitched { psn } = *event else {
+            continue;
+        };
+        let left = front.replace(psn);
+        if left == Some(psn) {
+            continue;
+        }
+        let switched = applications
+            .iter()
+            .filter(|(_, app)| app.psn() == psn || Some(app.psn()) == left)
+            .map(|(entity, _)| entity)
+            .collect::<Vec<_>>();
+        tracked.retain(|entity, _| {
+            apps.get(*entity)
+                .ok()
+                .is_none_or(|app| !switched.contains(&app.parent()))
+        });
     }
 }
 

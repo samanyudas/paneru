@@ -19,6 +19,8 @@ use super::*;
 const SLOW_APP: Pid = TEST_PROCESS_ID;
 /// Owns windows 0 and 2, and takes each move before the call returns.
 const FAST_APP: Pid = 2;
+/// Owns no window the engine tracks, like Finder showing only the desktop.
+const DESKTOP_APP: Pid = 3;
 
 /// Three of them fill more than the display.
 const WINDOW_WIDTH: i32 = 600;
@@ -239,6 +241,48 @@ fn the_window_ahead_waits_for_a_prompt_window_whose_app_gains_focus() {
     assert!(
         harness.mock_state.ax_frame(1).min.x > start.min.x,
         "window 1 scrolled right from {start:?}"
+    );
+}
+
+/// Focus on an empty display brings Finder to the front with only its
+/// desktop window, which the engine does not track, so window 1 keeps focus.
+/// Focus back on window 1 brings its app to the front again, where it can
+/// turn slow: window 0 ahead waits for it from the first step.
+#[test]
+fn the_window_ahead_waits_for_a_prompt_window_whose_app_comes_back_to_the_front() {
+    let mut harness = harness().with_app(DESKTOP_APP, "com.apple.finder", "Finder", |_| {});
+    harness.mock_state.set_write_delay(SLOW_APP, Duration::ZERO);
+    harness.world().write_message(focus(Direction::East));
+    settle_beside(&mut harness, 0, 1, i32::MAX);
+    settle(&mut harness);
+    for app in [DESKTOP_APP, SLOW_APP] {
+        harness.mock_state.activate_app(app);
+        settle(&mut harness);
+    }
+    let rest = gap(&harness, 0, 1);
+    let start = harness.mock_state.ax_frame(1);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(Event::Command {
+        command: Command::Window(Operation::Center),
+    });
+    for frame in 0..10 {
+        harness.advance(FRAME);
+        assert!(
+            gap(&harness, 0, 1) <= rest,
+            "desktop shows between windows 0 and 1 after frame {frame}: {:?} {:?}",
+            harness.mock_state.ax_frame(0),
+            harness.mock_state.ax_frame(1)
+        );
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle_beside(&mut harness, 0, 1, rest);
+    settle(&mut harness);
+
+    assert_landed(&mut harness);
+    assert!(
+        harness.mock_state.ax_frame(1).min.x < start.min.x,
+        "window 1 moved left to the center from {start:?}"
     );
 }
 
