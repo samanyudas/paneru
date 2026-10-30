@@ -53,6 +53,8 @@ pub(crate) fn register(app: &mut App) {
                 .before(systems::commit_window_frame)
                 .run_if(any_with_component::<Slide>),
         )
+        // The panels take their places before the frame's window writes, so
+        // a window ahead of a sliding photo never shows its move first.
         .add_systems(
             PostUpdate,
             (
@@ -64,7 +66,10 @@ pub(crate) fn register(app: &mut App) {
                 refresh_slices.run_if(on_timer(REFRESH)),
             )
                 .chain()
-                .in_set(PostUpdateSet::Ui),
+                .in_set(PostUpdateSet::Animate)
+                .after(slide_photos)
+                .after(slide_photos_out)
+                .before(systems::commit_window_frame),
         );
 }
 
