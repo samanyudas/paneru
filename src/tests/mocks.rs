@@ -474,6 +474,7 @@ impl MockState {
             let holds = holds.clone();
             Arc::new(WindowWriters::new(
                 std::time::Duration::from_millis(200),
+                std::time::Duration::ZERO,
                 move |pid| MockApp {
                     pid: pid.unwrap_or_default(),
                     inner: inner.clone(),
