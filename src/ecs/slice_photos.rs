@@ -53,6 +53,8 @@ pub(crate) fn register(app: &mut App) {
                 .before(systems::commit_window_frame)
                 .run_if(any_with_component::<Slide>),
         )
+        // The panels take their places before the frame's window writes, so
+        // a window ahead of a sliding photo never shows its move first.
         .add_systems(
             PostUpdate,
             (
@@ -64,7 +66,10 @@ pub(crate) fn register(app: &mut App) {
                 refresh_slices.run_if(on_timer(REFRESH)),
             )
                 .chain()
-                .in_set(PostUpdateSet::Ui),
+                .in_set(PostUpdateSet::Animate)
+                .after(slide_photos)
+                .after(slide_photos_out)
+                .before(systems::commit_window_frame),
         );
 }
 
@@ -470,10 +475,10 @@ type Sliding<'w, 's> = Query<
 
 /// Moves each sliding photo one step of the row's ease toward where layout
 /// puts its window. Once the photo arrives, the window moves there under it,
-/// and the photo closes when macOS has taken the move, or after
-/// [`LANDING_TIMEOUT`] if the app does not answer. Until then the window
-/// holds under the photo, and then it moves on to where layout puts it. A
-/// window whose photo does not show moves at once.
+/// and the photo closes when the window server shows the window there, or
+/// after [`LANDING_TIMEOUT`] if it does not. Until then the window holds
+/// under the photo, and then it moves on to where layout puts it. A window
+/// whose photo does not show moves at once.
 fn slide_photos(
     mut sliding: Sliding,
     displays: Query<&Display>,
@@ -528,7 +533,7 @@ fn slide_photos(
             Slide::Landing { .. } if !tucked => {
                 entity_commands.try_remove::<Slide>();
             }
-            Slide::Landing { until } if !window.write_pending() || time.elapsed() >= until => {
+            Slide::Landing { until } if holds.landed(entity) || time.elapsed() >= until => {
                 entity_commands.try_remove::<EdgeSlice>();
                 if position.0 != presented.0 {
                     entity_commands.try_insert(RepositionMarker(presented.0));

@@ -19,6 +19,7 @@ use objc2_app_kit::{
 use objc2_core_foundation::{CFRetained, CFType, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{CGDataProvider, CGImage, CGPreflightScreenCaptureAccess};
 use objc2_foundation::{NSError, NSPoint, NSRect, NSSize};
+use objc2_quartz_core::CATransaction;
 use objc2_screen_capture_kit::{
     SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
     SCStreamErrorCode,
@@ -243,6 +244,9 @@ impl SliceScreen for SliceScreenOS {
         }
         self.stack = slices.iter().map(|(id, _)| *id).collect();
         self.restack();
+        // A layer-backed panel shows a new frame only once Core Animation
+        // commits, which otherwise waits for the run loop in the next frame.
+        CATransaction::flush();
         self.publish_panels();
     }
 

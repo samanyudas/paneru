@@ -45,6 +45,10 @@ pub(super) struct Screen {
     painted: Vec<(WinID, Digest)>,
     /// The panels that show a photo: painted since they were placed.
     showing_photo: HashSet<WinID>,
+    /// Counts the position writes apps have taken, if set.
+    count_writes: Option<Box<dyn Fn() -> usize>>,
+    /// How many position writes apps had taken at each placement.
+    writes_at_place: Vec<usize>,
 }
 
 pub(super) type ScreenLog = Rc<RefCell<Screen>>;
@@ -58,6 +62,9 @@ impl SliceScreen for RecordingScreen {
 
     fn place(&mut self, slices: &[(WinID, EdgeSlice)]) {
         let mut screen = self.0.borrow_mut();
+        if let Some(writes) = screen.count_writes.as_ref().map(|count| count()) {
+            screen.writes_at_place.push(writes);
+        }
         screen
             .showing_photo
             .retain(|id| slices.iter().any(|(placed, _)| placed == id));
@@ -608,6 +615,93 @@ fn focus_on_a_tucked_window_slides_its_photo_in_without_a_new_photo() {
     );
     assert_eq!(log.borrow().asked.len(), asks, "the photo it had slides");
     assert_eq!(log.borrow().painted, vec![(3, Digest(7))]);
+}
+
+/// The panel of a photo sliding in takes its place for a frame before the
+/// windows ahead of it take their moves of that frame, so no desktop shows
+/// between them while the window server has the windows' moves and not yet
+/// the panel's.
+#[test]
+fn a_sliding_photo_takes_its_place_before_the_windows_ahead_move() {
+    let (mut harness, log) = painted(beside(animated(), Screen::default()), 3);
+    let state = harness.mock_state.clone();
+    log.borrow_mut().count_writes = Some(Box::new(move || state.position_writes()));
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Last)));
+    let mut together = 0;
+    for frame in 0..60 {
+        let writes = harness.mock_state.position_writes();
+        let earlier = log.borrow().writes_at_place.len();
+        harness.advance(Duration::from_millis(20));
+        let this_frame = log.borrow().writes_at_place[earlier..].to_vec();
+        if harness.mock_state.position_writes() > writes && !this_frame.is_empty() {
+            assert!(
+                this_frame.iter().all(|&at| at == writes),
+                "frame {frame}: the panel took its place after windows moved: {this_frame:?} from {writes}"
+            );
+            together += 1;
+        }
+    }
+    assert!(together >= 3, "the photo slid beside moving windows");
+}
+
+/// Slides window 3 in from its tuck while the window server keeps showing
+/// it tucked, and returns once its app has taken the move to where it rests.
+fn slide_in_shown_late() -> (TestHarness, ScreenLog) {
+    let (mut harness, log) = painted(beside(animated(), Screen::default()), 3);
+    harness.mock_state.show_late(3);
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Last)));
+    for _ in 0..60 {
+        harness.advance(Duration::from_millis(20));
+        if in_view(harness.mock_state.ax_frame(3)) {
+            return (harness, log);
+        }
+    }
+    panic!("window 3 never moved into view");
+}
+
+/// macOS shows a window a moment after its app has taken a move. The photo
+/// of a window sliding in stays up until the window server shows the window
+/// where it rests, so no desktop shows in its place.
+#[test]
+fn a_photo_sliding_in_stays_up_until_its_window_shows_where_it_rests() {
+    let (mut harness, log) = slide_in_shown_late();
+
+    for frame in 0..5 {
+        assert!(
+            panel_photo(&log, 3).is_some(),
+            "the photo shows while window 3 shows tucked, frame {frame}"
+        );
+        harness.advance(Duration::from_millis(20));
+    }
+    harness.mock_state.show_now(3);
+    harness.advance(Duration::from_millis(20));
+    harness.advance(Duration::from_millis(20));
+
+    assert_eq!(
+        panel_photo(&log, 3),
+        None,
+        "the photo closes once window 3 shows where it rests"
+    );
+}
+
+/// A window the window server does not show where it rests keeps its photo
+/// up only for a while.
+#[test]
+fn a_photo_sliding_in_closes_after_a_while_when_its_window_does_not_show() {
+    let (mut harness, log) = slide_in_shown_late();
+
+    harness.advance(SETTLE);
+
+    assert_eq!(panel_photo(&log, 3), None, "the photo closed");
+    assert!(
+        in_view(harness.mock_state.ax_frame(3)),
+        "window 3 rests in view"
+    );
 }
 
 const DISPLAY: IRect = IRect {

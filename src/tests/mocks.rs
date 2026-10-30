@@ -246,6 +246,9 @@ struct MockStateInner {
     /// Whether a position write that puts a window's center on another display
     /// moves it into that display's current Space, as macOS does.
     spaces_follow_frames: bool,
+    /// Windows the window server still shows at these frames, whatever their
+    /// apps have taken since.
+    shown_late: HashMap<WinID, IRect>,
 }
 
 /// The window on top at `point`: raised windows first, then the lowest ID.
@@ -467,6 +470,7 @@ impl MockState {
             activated: Vec::new(),
             pending_raises: Vec::new(),
             spaces_follow_frames: false,
+            shown_late: HashMap::new(),
         }));
         let holds = Arc::new(WriteHolds::default());
         let writers = {
@@ -650,6 +654,16 @@ impl MockState {
                 .event_queue
                 .push_back(Event::ApplicationFrontSwitched { psn });
         }
+    }
+
+    /// How many position writes every window's app has taken so far.
+    pub fn position_writes(&self) -> usize {
+        self.inner
+            .force_read()
+            .windows
+            .values()
+            .map(|window| window.position_writes)
+            .sum()
     }
 
     /// How many times any window was raised.
@@ -1245,15 +1259,33 @@ impl MockState {
     }
 
     /// Reads where the window server shows windows, which is where their
-    /// apps last put them.
+    /// apps last put them, unless it shows them late.
     pub(crate) fn shown_frames(&self) -> impl Fn(&[WinID]) -> Vec<(WinID, IRect)> + use<> {
         let inner = self.inner.clone();
         move |ids| {
             let inner = inner.force_read();
             ids.iter()
-                .filter_map(|id| inner.windows.get(id).map(|window| (*id, window.frame)))
+                .filter_map(|id| {
+                    let frame = inner
+                        .shown_late
+                        .get(id)
+                        .or(inner.windows.get(id).map(|window| &window.frame))?;
+                    Some((*id, *frame))
+                })
                 .collect()
         }
+    }
+
+    /// Makes the window server keep showing window `id` where it is now
+    /// until [`Self::show_now`], whatever moves its app takes.
+    pub fn show_late(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        let frame = inner.windows[&id].frame;
+        inner.shown_late.insert(id, frame);
+    }
+
+    pub fn show_now(&self, id: WinID) {
+        self.inner.force_write().shown_late.remove(&id);
     }
 
     /// The frame window `id` has as far as its app is concerned, which can
