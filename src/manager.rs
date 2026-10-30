@@ -16,12 +16,14 @@ use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGEventSource,
     CGEventSourceStateID, CGGetActiveDisplayList, CGMouseButton,
     CGRectMakeWithDictionaryRepresentation, CGWarpMouseCursorPosition, CGWindowLevelForKey,
-    CGWindowLevelKey, CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID,
-    kCGWindowBounds, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
+    CGWindowLevelKey, CGWindowListCopyWindowInfo, CGWindowListCreateDescriptionFromArray,
+    CGWindowListOption, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowNumber,
+    kCGWindowOwnerPID,
 };
 use objc2_foundation::NSBundle;
+use std::ffi::c_void;
 use std::path::Path;
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 use std::slice::from_raw_parts_mut;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -698,6 +700,43 @@ fn desktop_window_at(point: Origin) -> Option<(WinID, Pid)> {
             number(unsafe { kCGWindowOwnerPID })?,
         ))
     })
+}
+
+/// The frames the window server shows windows `ids` at, which is what the
+/// user sees. A window it does not list is left out.
+pub(crate) fn shown_frames(ids: &[WinID]) -> Vec<(WinID, IRect)> {
+    // The call takes the window numbers themselves as the array's values.
+    let mut values = ids
+        .iter()
+        .filter_map(|&id| u32::try_from(id).ok())
+        .map(|id| id as usize as *const c_void)
+        .collect::<Vec<_>>();
+    let Ok(count) = values.len().try_into() else {
+        return Vec::new();
+    };
+    let Some(array) = (unsafe { CFArray::new(None, values.as_mut_ptr(), count, null()) }) else {
+        return Vec::new();
+    };
+    let Some(info) = (unsafe { CGWindowListCreateDescriptionFromArray(Some(&array)) }) else {
+        return Vec::new();
+    };
+    let info = unsafe { info.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+    info.iter()
+        .filter_map(|dict| {
+            let id = dict
+                .get(unsafe { kCGWindowNumber })?
+                .downcast::<CFNumber>()
+                .ok()?
+                .as_i32()?;
+            let bounds = dict
+                .get(unsafe { kCGWindowBounds })?
+                .downcast::<CFDictionary>()
+                .ok()?;
+            let mut frame = CGRect::default();
+            unsafe { CGRectMakeWithDictionaryRepresentation(Some(&bounds), &raw mut frame) }
+                .then_some((id, irect_from(frame)))
+        })
+        .collect()
 }
 
 /// The IDs of the windows `CGWindowListCopyWindowInfo` lists for `options`.

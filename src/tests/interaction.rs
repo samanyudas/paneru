@@ -3832,8 +3832,11 @@ fn test_virtual_move_number_recreates_missing_baseline_row() {
 
 /// Issuing a keyboard focus command to an off-edge window must compute the
 /// strip target, project all window targets against that strip target, and
-/// advance their positions on the very first `app.update()` frame (Frame 0),
-/// rather than lagging by extra frames.
+/// start the row on the very first `app.update()` frame (Frame 0), rather
+/// than lagging by extra frames. Windows the engine has not yet seen take
+/// their moves in time are paced: the window furthest behind in the
+/// direction of motion moves on Frame 0, and each window ahead of it a
+/// frame after the window behind it shows its move.
 #[test]
 fn test_focus_command_starts_animation_on_first_frame() {
     let config: Config = (
@@ -3855,11 +3858,13 @@ fn test_focus_command_starts_animation_on_first_frame() {
             .expect("active strip")
             .x
     };
-    let initial_win0_x = {
+    let initial_x = |harness: &mut TestHarness, id| {
         let world = harness.world();
-        let entity = find_window_entity(0, world);
-        world.get::<Position>(entity).expect("window 0 pos").x
+        let entity = find_window_entity(id, world);
+        world.get::<Position>(entity).expect("window pos").x
     };
+    let initial_win0_x = initial_x(&mut harness, 0);
+    let initial_win2_x = initial_x(&mut harness, 2);
 
     // Issue Focus(Last) to move focus from window 0 (at index 0) to window 2
     // (at index 2, x=800..1200, partially offscreen right), scrolling the strip on Frame 0.
@@ -3888,15 +3893,24 @@ fn test_focus_command_starts_animation_on_first_frame() {
     );
 
     let win0_entity = find_window_entity(0, world);
-    let win0_pos = world.get::<Position>(win0_entity).expect("window 0 pos");
-    let win0_reposition = world.get::<RepositionMarker>(win0_entity);
     assert!(
-        win0_reposition.is_some(),
+        world.get::<RepositionMarker>(win0_entity).is_some(),
         "window 0 should have RepositionMarker on Frame 0"
     );
+    let win2_entity = find_window_entity(2, world);
+    let win2_pos = world.get::<Position>(win2_entity).expect("window 2 pos");
+    assert_ne!(
+        win2_pos.x, initial_win2_x,
+        "window 2, furthest behind, should already have advanced on Frame 0"
+    );
+
+    harness.app.update();
+    harness.app.update();
+    let world = harness.world();
+    let win0_pos = world.get::<Position>(win0_entity).expect("window 0 pos");
     assert_ne!(
         win0_pos.x, initial_win0_x,
-        "window 0 should already have advanced on Frame 0"
+        "window 0 should have advanced once windows 1 and 2 showed their moves"
     );
 }
 
