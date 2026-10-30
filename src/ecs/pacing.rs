@@ -46,9 +46,9 @@ const SAMPLER_IDLE: Duration = Duration::from_secs(1);
 type ReadShown = dyn Fn(&[WinID]) -> Vec<(WinID, IRect)> + Send + Sync;
 
 /// Reads where the window server shows the windows of a moving row, on a
-/// thread of its own. A read waits on the window server: at frame pace it
-/// took 0.4 ms typically, 8 ms at the 99th percentile and up to 50 ms, too
-/// long to wait for on the engine frame.
+/// thread of its own. A read waits on the window server: at frame pace, one
+/// for Sam's row of seven windows took 1.6 ms typically, 9 ms at the 99th
+/// percentile and up to 26 ms, too long to wait for on the engine frame.
 #[derive(Resource, Clone)]
 pub(crate) struct ShownFrames {
     shared: Arc<Shared>,

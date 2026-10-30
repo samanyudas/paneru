@@ -16,14 +16,12 @@ use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGEventSource,
     CGEventSourceStateID, CGGetActiveDisplayList, CGMouseButton,
     CGRectMakeWithDictionaryRepresentation, CGWarpMouseCursorPosition, CGWindowLevelForKey,
-    CGWindowLevelKey, CGWindowListCopyWindowInfo, CGWindowListCreateDescriptionFromArray,
-    CGWindowListOption, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowNumber,
-    kCGWindowOwnerPID,
+    CGWindowLevelKey, CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID,
+    kCGWindowBounds, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use objc2_foundation::NSBundle;
-use std::ffi::c_void;
 use std::path::Path;
-use std::ptr::{null, null_mut};
+use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -47,10 +45,10 @@ use skylight::{
     SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags,
     SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation,
     SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSMainConnectionID,
-    SLSManagedDisplayGetCurrentSpace, SLSSpaceGetType, SLSWindowIsOrderedIn,
-    SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID,
-    SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
-    SLSWindowQueryWindows,
+    SLSManagedDisplayGetCurrentSpace, SLSNewConnection, SLSSpaceGetType, SLSWindowIsOrderedIn,
+    SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes, SLSWindowIteratorGetBounds,
+    SLSWindowIteratorGetParentID, SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID,
+    SLSWindowQueryResultCopyWindows, SLSWindowQueryWindows,
 };
 pub(crate) use windows::forget_enhanced_ui_state;
 pub use windows::{
@@ -704,39 +702,38 @@ fn desktop_window_at(point: Origin) -> Option<(WinID, Pid)> {
 
 /// The frames the window server shows windows `ids` at, which is what the
 /// user sees. A window it does not list is left out.
+///
+/// Reads on a connection of its own. A window list read on the main
+/// connection first waits for the engine's own drawing pending there, and
+/// that drawing waits for the read, which froze the engine for 500 ms at a
+/// time while a slice photo slid.
 pub(crate) fn shown_frames(ids: &[WinID]) -> Vec<(WinID, IRect)> {
-    // The call takes the window numbers themselves as the array's values.
-    let mut values = ids
-        .iter()
-        .filter_map(|&id| u32::try_from(id).ok())
-        .map(|id| id as usize as *const c_void)
-        .collect::<Vec<_>>();
-    let Ok(count) = values.len().try_into() else {
+    static CONNECTION: OnceLock<Option<ConnID>> = OnceLock::new();
+    let connection = *CONNECTION.get_or_init(|| {
+        let mut cid = 0;
+        let opened = unsafe { SLSNewConnection(0, &mut cid) }.to_result(function_name!());
+        opened.inspect_err(|err| warn!("{err}")).ok().map(|()| cid)
+    });
+    let Some(cid) = connection else {
         return Vec::new();
     };
-    let Some(array) = (unsafe { CFArray::new(None, values.as_mut_ptr(), count, null()) }) else {
+    let Ok(windows) = create_array(ids, CFNumberType::SInt32Type) else {
         return Vec::new();
     };
-    let Some(info) = (unsafe { CGWindowListCreateDescriptionFromArray(Some(&array)) }) else {
+    let Ok(count) = isize::try_from(ids.len()) else {
         return Vec::new();
     };
-    let info = unsafe { info.cast_unchecked::<CFDictionary<CFString, CFType>>() };
-    info.iter()
-        .filter_map(|dict| {
-            let id = dict
-                .get(unsafe { kCGWindowNumber })?
-                .downcast::<CFNumber>()
-                .ok()?
-                .as_i32()?;
-            let bounds = dict
-                .get(unsafe { kCGWindowBounds })?
-                .downcast::<CFDictionary>()
-                .ok()?;
-            let mut frame = CGRect::default();
-            unsafe { CGRectMakeWithDictionaryRepresentation(Some(&bounds), &raw mut frame) }
-                .then_some((id, irect_from(frame)))
-        })
-        .collect()
+    let query =
+        unsafe { CFRetained::from_raw(SLSWindowQueryWindows(cid, &raw const *windows, count)) };
+    let iterator =
+        unsafe { CFRetained::from_raw(SLSWindowQueryResultCopyWindows(query.deref().into())) };
+    let mut frames = Vec::with_capacity(ids.len());
+    while unsafe { SLSWindowIteratorAdvance(&raw const *iterator) } {
+        let id = unsafe { SLSWindowIteratorGetWindowID(&raw const *iterator) };
+        let bounds = unsafe { SLSWindowIteratorGetBounds(&raw const *iterator) };
+        frames.push((id, irect_from(bounds)));
+    }
+    frames
 }
 
 /// The IDs of the windows `CGWindowListCopyWindowInfo` lists for `options`.
