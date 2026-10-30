@@ -14,6 +14,7 @@ use crate::ecs::drag::DragEventsPlugin;
 use crate::ecs::focus::FocusEventsPlugin;
 use crate::ecs::layout::LayoutEventsPlugin;
 use crate::ecs::mouse::MouseEventsPlugin;
+use crate::ecs::pacing::ShownFrames;
 use crate::ecs::scroll::ScrollEventsPlugin;
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::WorkspaceEventsPlugin;
@@ -76,6 +77,7 @@ impl TestHarness {
 
         let wm = mock_state.create_window_manager();
         world.insert_resource(WindowManager(Box::new(wm)));
+        world.insert_resource(ShownFrames::inline(mock_state.shown_frames()));
 
         Self {
             app,

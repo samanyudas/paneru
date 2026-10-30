@@ -51,6 +51,7 @@ pub mod layout_ops;
 pub(crate) mod maximize;
 pub mod mouse;
 pub(crate) mod native_membership;
+pub(crate) mod pacing;
 pub mod params;
 pub(crate) mod restore;
 pub mod script_state;
@@ -139,6 +140,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     const APP_OBSERVABILITY_CHECK_FREQ: Duration = Duration::from_millis(200);
 
     native_membership::register(app);
+    app.init_resource::<pacing::SlideHolds>();
     shared_edge::register(app);
     slice_photos::register(app);
     slice_input::register(app);
@@ -293,6 +295,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
         ((
             systems::animate_entities,
             systems::animate_resize_entities,
+            pacing::pace_rows.run_if(not(resource_exists::<Initializing>)),
+            systems::finish_repositions,
             systems::commit_window_frame.run_if(not(resource_exists::<Initializing>)),
             systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
             triggers::window_resize_verifier,
@@ -1142,6 +1146,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .add_message::<Event>()
         .insert_resource(Time::<Virtual>::from_max_delta(Duration::from_secs(10)))
         .insert_resource(WindowManager(window_manager))
+        .insert_resource(pacing::ShownFrames::new(crate::manager::shown_frames))
         .insert_resource(SkipReshuffle(false))
         .insert_resource(SystemTheme {
             is_dark: crate::util::is_dark_mode(),

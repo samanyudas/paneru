@@ -1244,6 +1244,18 @@ impl MockState {
         self.writers.flush(timeout)
     }
 
+    /// Reads where the window server shows windows, which is where their
+    /// apps last put them.
+    pub(crate) fn shown_frames(&self) -> impl Fn(&[WinID]) -> Vec<(WinID, IRect)> + use<> {
+        let inner = self.inner.clone();
+        move |ids| {
+            let inner = inner.force_read();
+            ids.iter()
+                .filter_map(|id| inner.windows.get(id).map(|window| (*id, window.frame)))
+                .collect()
+        }
+    }
+
     /// The frame window `id` has as far as its app is concerned, which can
     /// lag the frame the engine asked for.
     pub fn ax_frame(&self, id: WinID) -> IRect {

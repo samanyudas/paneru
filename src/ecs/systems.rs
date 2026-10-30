@@ -714,13 +714,13 @@ pub(crate) fn ease_step(current: Origin, target: Origin, t: f32) -> (Origin, boo
 /// * `displays` - A query for all `Display` entities, used to get display bounds and menubar height.
 /// * `time` - The Bevy `Time` resource for calculating delta time.
 /// * `config` - The `Config` resource, used for animation speed.
-/// * `commands` - Bevy commands to remove the `RepositionMarker` when animation is complete.
+///
+/// [`finish_repositions`] ends the move once the window is at its target.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
     animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
     time: Res<Time>,
     config: Res<Config>,
-    mut commands: Commands,
 ) {
     // Frame-rate-independent exponential smoothing (ease-out).
     // `animation_speed` is the decay rate (per second); higher = snappier.
@@ -729,17 +729,29 @@ pub(super) fn animate_entities(
     animate
         .into_iter()
         .for_each(|(mut position, entity, RepositionMarker(origin))| {
-            let (new_pos, finished) = ease_step(position.0, *origin, t);
+            let (new_pos, _) = ease_step(position.0, *origin, t);
 
             trace!(
                 "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
                 position.0,
             );
             position.0 = new_pos;
-            if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<RepositionMarker>();
-            }
         });
+}
+
+/// Removes the `RepositionMarker` of each entity at its target. Runs after
+/// pacing, which can hold a window short of the target its ease snapped to.
+pub(super) fn finish_repositions(
+    moves: Populated<(Entity, &Position, &RepositionMarker)>,
+    mut commands: Commands,
+) {
+    for (entity, position, RepositionMarker(target)) in &moves {
+        if position.0 == *target
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<RepositionMarker>();
+        }
+    }
 }
 
 /// Animates window resizing.

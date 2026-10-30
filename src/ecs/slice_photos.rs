@@ -25,6 +25,7 @@ use tracing::{debug, warn};
 
 use crate::config::Config;
 use crate::ecs::layout::lies_mostly_elsewhere;
+use crate::ecs::pacing::{self, SlideHolds};
 use crate::ecs::shared_edge::{EdgeSlice, Hold, Slide, showing_edge_slices, showing_may_change};
 use crate::ecs::systems::{self, ease_out_factor, ease_step};
 use crate::ecs::{Position, PostUpdateSet, PresentedOrigin, RepositionMarker};
@@ -48,7 +49,7 @@ pub(crate) fn register(app: &mut App) {
             PostUpdate,
             (slide_photos, slide_photos_out)
                 .in_set(PostUpdateSet::Animate)
-                .after(systems::animate_entities)
+                .after(pacing::pace_rows)
                 .before(systems::commit_window_frame)
                 .run_if(any_with_component::<Slide>),
         )
@@ -477,6 +478,7 @@ fn slide_photos(
     mut sliding: Sliding,
     displays: Query<&Display>,
     slices: Res<Slices>,
+    holds: Res<SlideHolds>,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
@@ -491,6 +493,8 @@ fn slide_photos(
             Slide::Moving { at, from } => {
                 let shows = slices.has_photo(id, from.slice.size);
                 let (next, arrived) = ease_step(at, presented.0, t);
+                let next = holds.limit(entity, at, next);
+                let arrived = arrived && next == presented.0;
                 let moved = displays
                     .get(from.slice.display)
                     .ok()
@@ -543,11 +547,12 @@ fn slide_photos(
 /// tucks at once. A photo never slides further past the edge than its place
 /// in the row beside a nearer window that waits, so no wallpaper shows
 /// between them.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn slide_photos_out(
     mut sliding: Sliding,
     displays: Query<&Display>,
     slices: Res<Slices>,
+    holds: Res<SlideHolds>,
     access: Res<SliceAccess>,
     time: Res<Time>,
     config: Res<Config>,
@@ -607,7 +612,9 @@ fn slide_photos_out(
                     continue;
                 };
                 let all = displays.iter().map(Display::bounds).collect::<Vec<_>>();
-                let (at, moved) = step_in_view(&slice, at, to, t, own, &all);
+                let (at, moved) = step_in_view(&slice, at, to, t, own, &all, |next| {
+                    holds.limit(entity, at, next)
+                });
                 if position.0 != at {
                     position.0 = at;
                 }
@@ -636,6 +643,7 @@ fn slide_photos_out(
                 }
                 let (next, arrived) = ease_step(at, to, t);
                 let next = Out::of(&slide).map_or(next, |out| out.beside(&moved_out, next));
+                let next = holds.limit(entity, at, next);
                 let arrived = arrived && next == to;
                 let moved = displays
                     .get(slice.display)
@@ -745,6 +753,7 @@ fn step_in_view(
     t: f32,
     own: IRect,
     all: &[IRect],
+    held: impl Fn(IVec2) -> IVec2,
 ) -> (IVec2, EdgeSlice) {
     let others = all
         .iter()
@@ -757,6 +766,7 @@ fn step_in_view(
             .filter(|moved| !lies_mostly_elsewhere(moved.shown(), own, &others))
     };
     let (next, _) = ease_step(at, to, t);
+    let next = held(next);
     match shows_at(next) {
         Some(moved) => (next, moved),
         None => (at, shows_at(at).unwrap_or(slice.slice)),

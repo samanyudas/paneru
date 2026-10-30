@@ -2,7 +2,7 @@ use std::{ffi::c_void, os::raw::c_float, ptr::NonNull};
 
 use accessibility_sys::AXUIElementRef;
 use objc2_core_foundation::{
-    CFArray, CFDictionary, CFMutableData, CFNumber, CFString, CFType, CFUUID, CGPoint,
+    CFArray, CFDictionary, CFMutableData, CFNumber, CFString, CFType, CFUUID, CGPoint, CGRect,
 };
 use objc2_core_graphics::{CGDirectDisplayID, CGError};
 
@@ -35,6 +35,13 @@ unsafe extern "C" {
     /// # Original signature
     /// extern int SLSMainConnectionID(void);
     pub fn SLSMainConnectionID() -> ConnID;
+
+    /// Opens a connection to the window server of its own, whose calls do
+    /// not wait on the drawing pending on the main connection.
+    ///
+    /// # Original signature
+    /// extern `CGError` SLSNewConnection(int zero, int *cid);
+    pub fn SLSNewConnection(zero: i32, cid: &mut ConnID) -> CGError;
 
     /// Reports whether a window is currently ordered into the window list.
     pub fn SLSWindowIsOrderedIn(cid: ConnID, window_id: WinID, ordered_in: &mut u8) -> OSStatus;
@@ -330,6 +337,12 @@ unsafe extern "C" {
     /// # Original signature
     /// extern `uint32_t` SLSWindowIteratorGetWindowID(CFTypeRef iterator);
     pub fn SLSWindowIteratorGetWindowID(iterator: *const CFType) -> i32;
+
+    /// Retrieves the frame the window server shows the iterator's window at.
+    ///
+    /// # Original signature
+    /// extern `CGRect` SLSWindowIteratorGetBounds(CFTypeRef iterator);
+    pub fn SLSWindowIteratorGetBounds(iterator: *const CFType) -> CGRect;
 
     /// Retrieves the tags from a window iterator.
     ///

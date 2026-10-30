@@ -1680,3 +1680,77 @@ fn a_press_while_a_revealed_photo_waits_never_shows_its_window_beside_it() {
     );
     assert_eq!(photo_of_three(&log), None, "the photo handed over");
 }
+
+/// A window that leaves past the shared edge waits, with its photo, for a
+/// slower window behind it, so no wallpaper shows between them while the
+/// slower app has yet to take its move.
+#[test]
+fn a_window_leaving_past_the_edge_waits_for_a_slow_window_behind_it() {
+    const FAST_APP: crate::platform::Pid = 2;
+    let ids = [0, 1, 2];
+    let log = Rc::new(RefCell::new(Screen::default()));
+    let mut harness = TestHarness::new()
+        .with_config(animated())
+        .with_display(EXT_DISPLAY_ID, LEFT, vec![EXT_WORKSPACE_ID])
+        .with_app(FAST_APP, "fast", "FastApp", |_| {});
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    harness
+        .mock_state
+        .set_write_delay(TEST_PROCESS_ID, Duration::from_millis(40));
+    for (id, width) in (0..).zip([600, 900, 400]) {
+        let pid = if id == 1 { TEST_PROCESS_ID } else { FAST_APP };
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness
+        .world()
+        .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+        harness.mock_state.flush_writes(Duration::from_secs(1));
+    }
+    assert!(
+        in_view(harness.mock_state.ax_frame(0)),
+        "window 0 rests in view"
+    );
+
+    harness.mock_state.hold_writes(TEST_PROCESS_ID);
+    let mut seen = watch(&mut harness, &log, &ids, &[(0, Direction::East)], 10);
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    // At the speed the slow app takes its moves, through its last one.
+    for _ in 0..40 {
+        harness.advance(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(20));
+        seen.push(scanline(&harness, &log, &ids));
+    }
+    assert!(harness.mock_state.flush_writes(Duration::from_secs(5)));
+
+    for (frame, runs) in seen.iter().enumerate() {
+        let left = runs.iter().find(|run| run.window == 0);
+        let right = runs.iter().find(|run| run.window == 1);
+        if let (Some(left), Some(right)) = (left, right) {
+            assert_eq!(
+                left.to, right.from,
+                "window 0, or its photo, shows beside the slow window 1 after frame {frame}: {runs:?}"
+            );
+        }
+    }
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+        harness.mock_state.flush_writes(Duration::from_secs(1));
+    }
+    assert!(
+        !in_view(harness.mock_state.ax_frame(0)),
+        "window 0 tucks once window 1 has moved"
+    );
+}
