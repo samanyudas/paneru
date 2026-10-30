@@ -491,8 +491,12 @@ impl InputHandler {
             CGEventType::KeyDown => {
                 let keycode =
                     CGEvent::integer_value_field(Some(event), CGEventField::KeyboardEventKeycode);
+                let repeat = CGEvent::integer_value_field(
+                    Some(event),
+                    CGEventField::KeyboardEventAutorepeat,
+                ) != 0;
                 // handle_keypress can intercept the event, so it may return true.
-                return self.handle_keypress(keycode, flags);
+                return self.handle_keypress(keycode, flags, repeat);
             }
             CGEventType::ScrollWheel => {
                 return self.handle_scroll_wheel(event);
@@ -694,11 +698,12 @@ impl InputHandler {
     ///
     /// * `keycode` - The key code of the pressed key.
     /// * `eventflags` - The `CGEventFlags` representing active modifiers.
+    /// * `repeat` - Whether macOS sent the press as a key auto-repeat.
     ///
     /// # Returns
     ///
     /// `true` if the key press was handled and should be intercepted, `false` otherwise.
-    fn handle_keypress(&self, keycode: i64, eventflags: CGEventFlags) -> bool {
+    fn handle_keypress(&self, keycode: i64, eventflags: CGEventFlags, repeat: bool) -> bool {
         let Some(events) = &self.events else {
             return false;
         };
@@ -729,6 +734,7 @@ impl InputHandler {
                 }
                 self.config.find_keybind(keycode, mask)
             })
+            .map(|command| if repeat { command.repeated() } else { command })
             .and_then(|command| {
                 events
                     .send(Event::Command { command })
