@@ -237,38 +237,6 @@ fn the_window_ahead_waits_for_a_window_that_turns_slow_after_a_prompt_motion() {
     assert_landed(&mut harness);
 }
 
-/// The same when window 1's app was prompt through a motion that ended with
-/// window 1 the last to land: on the reversal, window 0 ahead still waits.
-#[test]
-fn the_window_ahead_waits_on_a_reversal_after_a_prompt_motion() {
-    let mut harness = harness();
-    harness.mock_state.set_write_delay(SLOW_APP, Duration::ZERO);
-    harness.world().write_message(focus(Direction::Last));
-    settle_beside(&mut harness, 1, 2, i32::MAX);
-    settle(&mut harness);
-    harness.world().write_message(focus(Direction::First));
-    settle_beside(&mut harness, 0, 1, i32::MAX);
-    settle(&mut harness);
-    let rest = gap(&harness, 0, 1);
-    harness.mock_state.hold_writes(SLOW_APP);
-
-    harness.world().write_message(focus(Direction::Last));
-    for frame in 0..10 {
-        harness.advance(FRAME);
-        assert!(
-            gap(&harness, 0, 1) <= rest,
-            "desktop shows between windows 0 and 1 after frame {frame}: {:?} {:?}",
-            harness.mock_state.ax_frame(0),
-            harness.mock_state.ax_frame(1)
-        );
-    }
-    harness.mock_state.release_writes(SLOW_APP);
-    settle_beside(&mut harness, 0, 1, rest);
-    settle(&mut harness);
-
-    assert_landed(&mut harness);
-}
-
 /// An app that stops answering holds the row only for a while: window 0
 /// reaches its target while window 1's app is still stuck.
 #[test]

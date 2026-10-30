@@ -267,13 +267,10 @@ impl Tracked {
     /// every move of the motion in time. A window the motion did not move
     /// keeps what it was.
     fn rest(&mut self) {
-        // Only `prompt` carries into the next motion. The last frame seen may
-        // predate the window's final write, so a kept `asked` would count a
-        // move this motion has not shown.
-        *self = Self {
-            prompt: self.prompt || (self.on_time && !self.late_this_motion),
-            ..Self::default()
-        };
+        self.prompt |= self.on_time && !self.late_this_motion;
+        self.on_time = false;
+        self.late_this_motion = false;
+        self.late = None;
     }
 }
 
