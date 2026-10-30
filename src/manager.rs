@@ -16,12 +16,14 @@ use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGEventSource,
     CGEventSourceStateID, CGGetActiveDisplayList, CGMouseButton,
     CGRectMakeWithDictionaryRepresentation, CGWarpMouseCursorPosition, CGWindowLevelForKey,
-    CGWindowLevelKey, CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID,
-    kCGWindowBounds, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
+    CGWindowLevelKey, CGWindowListCopyWindowInfo, CGWindowListCreateDescriptionFromArray,
+    CGWindowListOption, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowNumber,
+    kCGWindowOwnerPID,
 };
 use objc2_foundation::NSBundle;
+use std::ffi::c_void;
 use std::path::Path;
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 use std::slice::from_raw_parts_mut;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -233,6 +235,10 @@ pub trait WindowManagerApi: Send + Sync {
 
     /// Every window that exists right now, on any Space, minimized or not.
     fn all_window_ids(&self) -> Vec<WinID>;
+
+    /// The process that owns `window_id`, as the window server knows it,
+    /// without asking any app. `None` when no such window exists.
+    fn window_owner(&self, window_id: WinID) -> Option<Pid>;
 
     /// Waits up to `timeout` for every window move and resize asked for so
     /// far to reach its app. Returns whether all of them did.
@@ -667,6 +673,22 @@ impl WindowManagerApi for WindowManagerOS {
     fn all_window_ids(&self) -> Vec<WinID> {
         window_ids(CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements)
             .unwrap_or_default()
+    }
+
+    fn window_owner(&self, window_id: WinID) -> Option<Pid> {
+        // The array holds the bare window number, which this call expects
+        // rather than a `CFNumber`. Unlike a window list query, it describes
+        // windows that are off screen too.
+        let mut ids = [window_id.cast_unsigned() as usize as *const c_void];
+        let windows = unsafe { CFArray::new(None, ids.as_mut_ptr(), 1, null()) }?;
+        let info = unsafe { CGWindowListCreateDescriptionFromArray(Some(&windows)) }?;
+        let array = unsafe { info.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+        array.iter().find_map(|dict| {
+            dict.get(unsafe { kCGWindowOwnerPID })?
+                .downcast::<CFNumber>()
+                .ok()?
+                .as_i32()
+        })
     }
 }
 
