@@ -205,6 +205,7 @@ struct MockStateInner {
     membership_failures: HashMap<WorkspaceId, u16>,
     membership_reads: HashMap<WorkspaceId, usize>,
     window_list_reads: HashMap<Pid, usize>,
+    focused_window_reads: HashMap<Pid, usize>,
     observe_calls: HashMap<Pid, usize>,
     active_display_id: u32,
     cursor_position: Origin,
@@ -447,6 +448,7 @@ impl MockState {
             membership_failures: HashMap::new(),
             membership_reads: HashMap::new(),
             window_list_reads: HashMap::new(),
+            focused_window_reads: HashMap::new(),
             observe_calls: HashMap::new(),
             active_display_id: 0,
             cursor_position: Origin::ZERO,
@@ -1153,6 +1155,16 @@ impl MockState {
             .unwrap_or(0)
     }
 
+    /// How many times the engine asked app `pid` for its focused window.
+    pub fn focused_window_reads(&self, pid: Pid) -> usize {
+        self.inner
+            .force_read()
+            .focused_window_reads
+            .get(&pid)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// How many times the engine tried to register app `pid`'s observers.
     pub fn observe_calls(&self, pid: Pid) -> usize {
         self.inner
@@ -1664,7 +1676,8 @@ impl MockState {
         let s = self.clone();
         ma.expect_focused_window().returning(move |_config| {
             let focused_id = {
-                let inner = s.inner.force_read();
+                let mut inner = s.inner.force_write();
+                *inner.focused_window_reads.entry(pid).or_default() += 1;
                 let focused_id = inner.apps.get(&pid).and_then(|a| a.focused_window_id)?;
                 inner
                     .windows
@@ -1892,6 +1905,10 @@ impl MockState {
         let s = self.clone();
         wm.expect_all_window_ids()
             .returning(move || s.inner.force_read().windows.keys().copied().collect());
+
+        let s = self.clone();
+        wm.expect_window_owner()
+            .returning(move |id| s.inner.force_read().windows.get(&id).map(|w| w.pid));
 
         let s = self.clone();
         wm.expect_warp_mouse()

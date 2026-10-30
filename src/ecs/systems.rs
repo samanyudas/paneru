@@ -2028,11 +2028,14 @@ pub(crate) fn detect_tabbed_windows(
 
 /// Listens for focus events for unknown window IDs and attempts to auto-discover
 /// and manage them on the fly (e.g., when a user clicks an unmanaged tab or window).
+/// Asks only the app that owns the window: each question blocks this frame
+/// until the app answers, so asking every app lets any busy one freeze it.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn auto_discover_unmanaged_focused_windows(
     mut messages: MessageReader<Event>,
     windows: Query<&Window>,
     apps: Query<&Application>,
+    window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut cache: Local<HashSet<WinID>>,
     mut commands: Commands,
@@ -2053,28 +2056,21 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
 
         trace!("Focus event for unknown window id {window_id}; attempting on-the-fly discovery.");
 
-        let mut discovered = None;
-        let (frontmost, non_frontmost): (Vec<_>, Vec<_>) =
-            apps.iter().partition(|app| app.is_frontmost());
-
-        for app in frontmost.into_iter().chain(non_frontmost) {
-            if let Some(window) = app.focused_window(&config)
-                && window.id() == window_id
-            {
-                debug!("Discovered unknown focused window {window_id} via focused_window.");
-                discovered = Some(window);
-                break;
-            }
-
-            let window_list = app.window_list(&config);
-            if let Some(window) = window_list.into_iter().find(|w| w.id() == window_id) {
-                debug!("Discovered unknown focused window {window_id} via window_list scan.");
-                discovered = Some(window);
-                break;
-            }
-        }
+        let owner = window_manager
+            .window_owner(window_id)
+            .and_then(|pid| apps.iter().find(|app| app.pid() == pid));
+        let discovered = owner.and_then(|app| {
+            app.focused_window(&config)
+                .filter(|window| window.id() == window_id)
+                .or_else(|| {
+                    app.window_list(&config)
+                        .into_iter()
+                        .find(|window| window.id() == window_id)
+                })
+        });
 
         if let Some(window) = discovered {
+            debug!("Discovered unknown focused window {window_id}.");
             commands.trigger(SpawnWindowTrigger(vec![window]));
         } else {
             trace!(
