@@ -474,6 +474,51 @@ fn a_held_edge_move_stops_at_the_strip_end() {
     assert_eq!(columns(world, TEST_WORKSPACE_ID), [vec![3]]);
 }
 
+/// A held edge focus key whose first press crosses to another display stops
+/// there: its repeats do not run on to that display's far end.
+#[test]
+fn a_held_edge_focus_stops_after_it_crosses() {
+    let mut harness = stacked_beside(external_bounds(&Direction::West), &[100, 101]);
+    harness.run(vec![command(Operation::FocusEdge(
+        Side::West,
+        Reach::Display,
+    ))]);
+    assert_focused!(harness.world(), 101);
+
+    harness.run(vec![repeated(Operation::FocusEdge(
+        Side::West,
+        Reach::Display,
+    ))]);
+    harness.run(vec![repeated(Operation::FocusEdge(
+        Side::West,
+        Reach::Display,
+    ))]);
+    assert_focused!(harness.world(), 101);
+}
+
+/// A held edge move key whose first press takes the column to another display
+/// leaves it where it arrived there.
+#[test]
+fn a_held_edge_move_stops_after_it_crosses() {
+    let mut harness = stacked_beside(external_bounds(&Direction::West), &[100, 101]);
+    harness.run(vec![command(Operation::MoveEdge(
+        Side::West,
+        Reach::Display,
+    ))]);
+    let arrived = [vec![100], vec![101], vec![0, 1, 2]];
+    assert_eq!(columns(harness.world(), EXT_WORKSPACE_ID), arrived);
+
+    harness.run(vec![repeated(Operation::MoveEdge(
+        Side::West,
+        Reach::Display,
+    ))]);
+    harness.run(vec![repeated(Operation::MoveEdge(
+        Side::West,
+        Reach::Display,
+    ))]);
+    assert_eq!(columns(harness.world(), EXT_WORKSPACE_ID), arrived);
+}
+
 /// A single window follows the same two stages as a stack.
 #[test]
 fn edge_move_of_a_single_window_reaches_the_end_then_crosses() {

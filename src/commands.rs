@@ -119,6 +119,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // A default dialect so the mock harness has one; the real app overwrites it
     // once it knows whether a Lua script took over the configuration.
     app.init_resource::<SnippetDialect>();
+    app.init_resource::<HeldEdge>();
     app.add_systems(
         PreUpdate,
         (
@@ -709,6 +710,28 @@ fn edge_step(strip: &LayoutStrip, focused: Option<Entity>, side: Side) -> EdgeSt
     match focused.and_then(|entity| strip.index_of(entity).ok()) {
         Some(index) if index == edge => EdgeStep::Display,
         _ => EdgeStep::Column(edge),
+    }
+}
+
+/// Whether the fresh press of a held edge key crossed to another display.
+/// The key's repeats then do nothing, so a hold crosses at most once and stops
+/// where it arrived.
+#[derive(bevy::ecs::resource::Resource, Default)]
+struct HeldEdge {
+    crossed: bool,
+}
+
+impl HeldEdge {
+    /// Whether an edge command with `reach` may take `step`. A fresh press
+    /// starts a new hold.
+    fn allows(&mut self, reach: Reach, step: EdgeStep) -> bool {
+        match reach {
+            Reach::Display => {
+                self.crossed = step == EdgeStep::Display;
+                true
+            }
+            Reach::Strip => !self.crossed,
+        }
     }
 }
 
@@ -1479,6 +1502,7 @@ fn display_move(
     operation: Operation,
     entity: Entity,
     moves: &mut DisplayMoves,
+    held: &mut HeldEdge,
     commands: &mut Commands,
 ) -> Option<(MoveFocus, Option<Direction>)> {
     match operation {
@@ -1489,7 +1513,11 @@ fn display_move(
                 .strips
                 .iter_mut()
                 .find(|(_, strip, _, _, _)| strip.contains(entity))?;
-            if let EdgeStep::Column(_) = edge_step(&strip, Some(entity), side) {
+            let step = edge_step(&strip, Some(entity), side);
+            if !held.allows(reach, step) {
+                return None;
+            }
+            if let EdgeStep::Column(_) = step {
                 if swap_in_strip(&mut strip, entity, &side.end()).is_some() {
                     commands.ensure_visible(entity);
                 }
@@ -1523,7 +1551,7 @@ fn arrival_index(
 /// its strip's end on that side, and crosses only from there. The column
 /// lands right after the destination's active column, the window
 /// `focus_display` would focus there.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -1532,6 +1560,7 @@ fn to_next_display(
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut native: ResMut<crate::ecs::native_membership::NativeMembership>,
+    mut held: ResMut<HeldEdge>,
     mut commands: Commands,
 ) {
     let Some(operation) = filter_window_operations(&mut messages, |op| {
@@ -1555,7 +1584,8 @@ fn to_next_display(
         return;
     }
 
-    let Some((move_focus, direction)) = display_move(operation, entity, &mut moves, &mut commands)
+    let Some((move_focus, direction)) =
+        display_move(operation, entity, &mut moves, &mut held, &mut commands)
     else {
         return;
     };
@@ -1659,6 +1689,7 @@ fn focus_display(
     focus_history: Res<FocusHistory>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
+    mut held: ResMut<HeldEdge>,
     mut commands: Commands,
 ) {
     let Some(operation) = filter_window_operations(&mut messages, |op| {
@@ -1673,7 +1704,11 @@ fn focus_display(
         Operation::FocusEdge(side, reach) => {
             let strip = active_display.active_strip();
             let focused = windows.focused().map(|(_, entity)| entity);
-            if let EdgeStep::Column(index) = edge_step(strip, focused, side) {
+            let step = edge_step(strip, focused, side);
+            if !held.allows(reach, step) {
+                return;
+            }
+            if let EdgeStep::Column(index) = step {
                 if let Some(entity) = strip
                     .get(index)
                     .ok()
