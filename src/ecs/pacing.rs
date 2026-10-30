@@ -15,7 +15,9 @@
 //!
 //! The windows ahead of a window whose app has shown every move of a whole
 //! motion in time follow where the engine puts it, so a row of quick apps
-//! moves together. Any other window paces from where it is shown.
+//! moves together. Any other window paces from where it is shown, and so do
+//! the windows of an app that focus moves to or from another app, which
+//! can turn slow.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -23,6 +25,9 @@ use std::thread;
 use std::time::Duration;
 
 use bevy::ecs::entity::{Entity, EntityHashMap};
+use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::RemovedComponents;
+use bevy::ecs::query::Added;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Local, Query, Res, ResMut};
 use bevy::math::{IRect, IVec2};
@@ -33,7 +38,7 @@ use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::shared_edge::Slide;
 use crate::ecs::systems::{ease_out_factor, ease_step};
-use crate::ecs::{Position, PresentedOrigin, RepositionMarker};
+use crate::ecs::{FocusedMarker, Position, PresentedOrigin, RepositionMarker};
 use crate::manager::Window;
 use crate::manager::window_writer::LANDING_TIMEOUT;
 use crate::platform::WinID;
@@ -210,10 +215,10 @@ pub(super) struct Tracked {
     /// Where the engine had asked for the window as of the previous frame.
     asked: Option<i32>,
     /// The app showed each of the engine's moves by the next frame through
-    /// a whole motion, and has not been late since, so it takes this
-    /// frame's move about as soon as the windows ahead take theirs. Kept
-    /// across motions, so a slow app is paced from the first step of the
-    /// next one, when a focus change makes Helium slowest.
+    /// a whole motion, and has not been late since, nor gained or lost focus
+    /// to another app, so it takes this frame's move about as soon as the
+    /// windows ahead take theirs. Kept across motions, so a slow app is
+    /// paced from the first step of the next one.
     prompt: bool,
     /// This motion, the app has shown a move by the next frame.
     on_time: bool,
@@ -344,6 +349,9 @@ type RowWindows<'w, 's> = Query<
 /// before the photos at shared edges step.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pace_rows(
+    focused: Query<Entity, Added<FocusedMarker>>,
+    mut unfocused: RemovedComponents<FocusedMarker>,
+    apps: Query<&ChildOf>,
     shown_frames: Option<Res<ShownFrames>>,
     strips: Query<&LayoutStrip>,
     mut windows: RowWindows,
@@ -354,6 +362,9 @@ pub(super) fn pace_rows(
     mut watching: Local<bool>,
 ) {
     slide_holds.0.clear();
+    let focused = focused.iter().collect::<Vec<_>>();
+    let unfocused = unfocused.read().collect::<Vec<_>>();
+    forget_switched_apps(&mut tracked, &focused, &unfocused, &apps);
     let Some(shown_frames) = shown_frames else {
         return;
     };
@@ -450,6 +461,30 @@ pub(super) fn pace_rows(
                 position.0.x = member.x;
             }
         }
+    }
+}
+
+/// Forgets what the engine has seen of the apps that gained focus from
+/// another app or lost it to one taking their moves. Such an app can turn
+/// slow, as Helium and Beeper do, so its windows pace the row from where
+/// they show until they keep up again. Focus moving between the windows of
+/// one app neither activates nor deactivates it.
+fn forget_switched_apps(
+    tracked: &mut EntityHashMap<Tracked>,
+    focused: &[Entity],
+    unfocused: &[Entity],
+    apps: &Query<&ChildOf>,
+) {
+    let app = |entity: &Entity| apps.get(*entity).ok().map(ChildOf::parent);
+    let gained = focused.iter().filter_map(app).collect::<Vec<_>>();
+    let lost = unfocused.iter().filter_map(app).collect::<Vec<_>>();
+    let switched = gained
+        .iter()
+        .filter(|app| !lost.contains(app))
+        .chain(lost.iter().filter(|app| !gained.contains(app)))
+        .collect::<Vec<_>>();
+    if !switched.is_empty() {
+        tracked.retain(|entity, _| app(entity).is_none_or(|app| !switched.contains(&&app)));
     }
 }
 
