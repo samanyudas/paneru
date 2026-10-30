@@ -45,6 +45,10 @@ pub(super) struct Screen {
     painted: Vec<(WinID, Digest)>,
     /// The panels that show a photo: painted since they were placed.
     showing_photo: HashSet<WinID>,
+    /// Counts the position writes apps have taken, if set.
+    count_writes: Option<Box<dyn Fn() -> usize>>,
+    /// How many position writes apps had taken at each placement.
+    writes_at_place: Vec<usize>,
 }
 
 pub(super) type ScreenLog = Rc<RefCell<Screen>>;
@@ -58,6 +62,9 @@ impl SliceScreen for RecordingScreen {
 
     fn place(&mut self, slices: &[(WinID, EdgeSlice)]) {
         let mut screen = self.0.borrow_mut();
+        if let Some(writes) = screen.count_writes.as_ref().map(|count| count()) {
+            screen.writes_at_place.push(writes);
+        }
         screen
             .showing_photo
             .retain(|id| slices.iter().any(|(placed, _)| placed == id));
@@ -608,6 +615,36 @@ fn focus_on_a_tucked_window_slides_its_photo_in_without_a_new_photo() {
     );
     assert_eq!(log.borrow().asked.len(), asks, "the photo it had slides");
     assert_eq!(log.borrow().painted, vec![(3, Digest(7))]);
+}
+
+/// The panel of a photo sliding in takes its place for a frame before the
+/// windows ahead of it take their moves of that frame, so no desktop shows
+/// between them while the window server has the windows' moves and not yet
+/// the panel's.
+#[test]
+fn a_sliding_photo_takes_its_place_before_the_windows_ahead_move() {
+    let (mut harness, log) = painted(beside(animated(), Screen::default()), 3);
+    let state = harness.mock_state.clone();
+    log.borrow_mut().count_writes = Some(Box::new(move || state.position_writes()));
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Last)));
+    let mut together = 0;
+    for frame in 0..60 {
+        let writes = harness.mock_state.position_writes();
+        let earlier = log.borrow().writes_at_place.len();
+        harness.advance(Duration::from_millis(20));
+        let this_frame = log.borrow().writes_at_place[earlier..].to_vec();
+        if harness.mock_state.position_writes() > writes && !this_frame.is_empty() {
+            assert!(
+                this_frame.iter().all(|&at| at == writes),
+                "frame {frame}: the panel took its place after windows moved: {this_frame:?} from {writes}"
+            );
+            together += 1;
+        }
+    }
+    assert!(together >= 3, "the photo slid beside moving windows");
 }
 
 /// Slides window 3 in from its tuck while the window server keeps showing
