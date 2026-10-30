@@ -30,9 +30,9 @@ use stdext::sync::rw_lock::RwLockExt;
 use tracing::{Level, debug, instrument, trace, warn};
 
 use super::skylight::{
-    _AXUIElementGetWindow, _SLPSSetFrontProcessWithOptions, AXUIElementCopyAttributeValue,
-    AXUIElementPerformAction, AXUIElementSetAttributeValue, SLPSPostEventRecordTo,
-    SLSWindowIteratorAdvance,
+    _AXUIElementGetWindow, _SLPSGetFrontProcess, _SLPSSetFrontProcessWithOptions,
+    AXUIElementCopyAttributeValue, AXUIElementPerformAction, AXUIElementSetAttributeValue,
+    SLPSPostEventRecordTo, SLSWindowIteratorAdvance,
 };
 use super::window_writer::{FrameWrites, WindowWriters, WriteSink};
 use crate::config::Config;
@@ -932,6 +932,28 @@ pub(super) fn focus_window(psn: ProcessSerialNumber, window_id: WinID) {
         _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
     }
     make_key_window(&psn, window_id);
+}
+
+/// Brings the process `psn` to the front with its desktop window `window_id`
+/// as the key window, as [`focus_window`] does.
+///
+/// macOS ignores the request when `psn` is already in front, as Finder is
+/// when one of its windows has focus, so the menu bar stays on the old
+/// display. Fronting this process first, which has no window, makes the
+/// request a real switch.
+pub(super) fn focus_desktop_window(psn: ProcessSerialNumber, window_id: WinID) -> Result<()> {
+    let mut front = ProcessSerialNumber::default();
+    if unsafe { _SLPSGetFrontProcess(&mut front) }
+        .to_result(function_name!())
+        .is_ok_and(|()| front == psn)
+    {
+        let own = super::process::psn_for_pid(Pid::try_from(std::process::id())?)?;
+        unsafe {
+            _SLPSSetFrontProcessWithOptions(&own, 0, CPS_USER_GENERATED);
+        }
+    }
+    focus_window(psn, window_id);
+    Ok(())
 }
 
 #[derive(Debug)]

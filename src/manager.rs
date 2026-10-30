@@ -480,8 +480,7 @@ impl WindowManagerApi for WindowManagerOS {
     fn focus_desktop(&self, bounds: IRect) -> Result<()> {
         let (window_id, pid) = desktop_window_at(bounds.center())
             .ok_or_else(|| Error::NotFound(format!("no desktop window covers {bounds:?}")))?;
-        windows::focus_window(process::psn_for_pid(pid)?, window_id);
-        Ok(())
+        windows::focus_desktop_window(process::psn_for_pid(pid)?, window_id)
     }
 
     /// Adds existing windows for a given application, attempting to resolve any that are not yet found.
