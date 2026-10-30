@@ -20,7 +20,8 @@
 //! the windows of an app that focus moves to or from another app, which
 //! can turn slow.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -75,6 +76,9 @@ struct Watch {
     /// the frame the engine had asked for when watching began, where a
     /// window at rest is shown.
     shown: HashMap<WinID, IRect>,
+    /// The watched windows whose frame in `shown` is still the one asked for
+    /// when watching began, not yet read.
+    unread: HashSet<WinID>,
     /// Bumped on each stop, so a read started before it is dropped.
     generation: u64,
     sampling: bool,
@@ -113,16 +117,19 @@ impl ShownFrames {
     /// Watches the windows of `asked`, each with the frame the engine last
     /// asked for, and returns where each is shown as of the newest read.
     /// `None` when no sampler can run.
-    fn watch(&self, asked: &[(WinID, IRect)]) -> Option<HashMap<WinID, IRect>> {
+    fn watch(&self, asked: &[(WinID, IRect)]) -> Option<Shown> {
         let mut watch = lock(&self.shared.watch);
         watch.ids.clear();
         watch.ids.extend(asked.iter().map(|&(id, _)| id));
         for &(id, frame) in asked {
-            watch.shown.entry(id).or_insert(frame);
+            if let Entry::Vacant(entry) = watch.shown.entry(id) {
+                entry.insert(frame);
+                watch.unread.insert(id);
+            }
         }
         if !self.sampled {
             let frames = (self.shared.read)(&watch.ids);
-            watch.shown.extend(frames);
+            watch.take(frames);
         } else if !watch.sampling {
             let shared = self.shared.clone();
             if let Err(err) = thread::Builder::new()
@@ -135,19 +142,34 @@ impl ShownFrames {
             watch.sampling = true;
         }
         self.shared.wake.notify_one();
-        Some(
-            asked
+        Some(Shown {
+            frames: asked
                 .iter()
                 .filter_map(|&(id, _)| watch.shown.get(&id).map(|&frame| (id, frame)))
                 .collect(),
-        )
+            unread: asked
+                .iter()
+                .map(|&(id, _)| id)
+                .filter(|id| watch.unread.contains(id))
+                .collect(),
+        })
     }
 
     fn stop(&self) {
         let mut watch = lock(&self.shared.watch);
         watch.ids.clear();
         watch.shown.clear();
+        watch.unread.clear();
         watch.generation += 1;
+    }
+}
+
+impl Watch {
+    fn take(&mut self, frames: Vec<(WinID, IRect)>) {
+        for (id, frame) in frames {
+            self.unread.remove(&id);
+            self.shown.insert(id, frame);
+        }
     }
 }
 
@@ -172,12 +194,20 @@ impl Shared {
             let frames = (self.read)(&ids);
             let mut watch = lock(&self.watch);
             if watch.generation == generation {
-                watch.shown.extend(frames);
+                watch.take(frames);
             }
             drop(watch);
             thread::sleep(READ_INTERVAL);
         }
     }
+}
+
+/// Where the window server shows watched windows, as of one moment.
+struct Shown {
+    frames: HashMap<WinID, IRect>,
+    /// The windows whose frame is still the one the engine asked for when
+    /// watching began, as no read has come since.
+    unread: HashSet<WinID>,
 }
 
 /// How far each sliding photo may go this frame, as [`pace_rows`] holds it
@@ -433,6 +463,7 @@ pub(super) fn pace_rows(
                         }
                         let asked = window.frame().min.x;
                         let shown_x = shown
+                            .frames
                             .get(&id)
                             .map(|&frame| window.margins().tracked(frame).min.x);
                         Some(Member {
@@ -503,12 +534,8 @@ fn forget_switched_apps(
 }
 
 /// The windows of `rows` landing under their photos that the window server
-/// shows where the engine put them.
-fn landed(
-    rows: &[Vec<Vec<Entity>>],
-    windows: &RowWindows,
-    shown: &HashMap<WinID, IRect>,
-) -> EntityHashSet {
+/// was read to show where the engine put them.
+fn landed(rows: &[Vec<Vec<Entity>>], windows: &RowWindows, shown: &Shown) -> EntityHashSet {
     rows.iter()
         .flatten()
         .flatten()
@@ -516,7 +543,9 @@ fn landed(
         .filter(|&entity| {
             windows.get(entity).is_ok_and(|(window, _, _, slide)| {
                 matches!(slide, Some((Slide::Landing { .. }, _)))
+                    && !shown.unread.contains(&window.id())
                     && shown
+                        .frames
                         .get(&window.id())
                         .map(|&frame| window.margins().tracked(frame).min)
                         == Some(window.frame().min)
@@ -573,7 +602,7 @@ fn pace_row(row: &mut [Vec<Member>]) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
 
     use super::*;
@@ -593,10 +622,10 @@ mod tests {
         let asked = IRect::new(0, 0, 100, 100);
 
         let first = frames.watch(&[(7, asked)]).expect("a sampler runs");
-        assert_eq!(first[&7], asked, "seeded with the asked frame");
+        assert_eq!(first.frames[&7], asked, "seeded with the asked frame");
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while frames.watch(&[(7, asked)]).expect("a sampler runs")[&7] != shown {
+        while frames.watch(&[(7, asked)]).expect("a sampler runs").frames[&7] != shown {
             assert!(Instant::now() < deadline, "the sampler read window 7");
             thread::sleep(Duration::from_millis(1));
         }
@@ -609,5 +638,37 @@ mod tests {
             reads.load(Ordering::Relaxed) <= after_stop + 1,
             "the sampler stops reading once nothing is watched"
         );
+    }
+
+    /// Until the sampler has read a window, the frame a watch returns for it
+    /// is only the one the engine asked for, and does not count as read.
+    #[test]
+    fn a_window_counts_as_read_only_once_the_sampler_has_read_it() {
+        let answers = Arc::new(AtomicBool::new(false));
+        let answering = answers.clone();
+        let frames = ShownFrames::new(move |ids| {
+            if answering.load(Ordering::Relaxed) {
+                ids.iter()
+                    .map(|&id| (id, IRect::new(0, 0, 100, 100)))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        });
+        let asked = [(7, IRect::new(0, 0, 100, 100))];
+        let watch = |frames: &ShownFrames| frames.watch(&asked).expect("a sampler runs");
+        watch(&frames);
+        thread::sleep(READ_INTERVAL * 10);
+        assert!(
+            watch(&frames).unread.contains(&7),
+            "the asked frame does not count as read"
+        );
+
+        answers.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while watch(&frames).unread.contains(&7) {
+            assert!(Instant::now() < deadline, "the sampler read window 7");
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
