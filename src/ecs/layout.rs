@@ -22,7 +22,7 @@ use crate::config::{Config, StackLimit};
 use crate::ecs::drag::DragState;
 use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::params::Windows;
-use crate::ecs::shared_edge::{EdgeSlice, Hold, Slide};
+use crate::ecs::shared_edge::{EdgeSlice, Hold, PhotoWait, Slide};
 use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
@@ -3340,11 +3340,11 @@ fn present_tuck(
 ) -> bool {
     if let Some(slice) = slice {
         let to = slice.origin.with_x(row.to);
-        let leaving = |at, until| Slide::Leaving {
+        let leaving = |at, wait| Slide::Leaving {
             at,
             to,
             slice,
-            until,
+            wait,
         };
         let tucking = |at, hold: Hold, until| Slide::Tucking {
             at,
@@ -3358,10 +3358,10 @@ fn present_tuck(
             Some(Slide::Tucking {
                 at, hold, until, ..
             }) => Some(tucking(at, hold, until)),
-            Some(Slide::Leaving { at, until, .. }) => Some(leaving(at, until)),
-            Some(Slide::Landing { .. }) => shown_at.map(|at| leaving(at, None)),
+            Some(Slide::Leaving { at, wait, .. }) => Some(leaving(at, wait)),
+            Some(Slide::Landing { .. }) => shown_at.map(|at| leaving(at, PhotoWait::Unasked)),
             None => match tucked {
-                None => shown_at.map(|at| leaving(at, None)),
+                None => shown_at.map(|at| leaving(at, PhotoWait::Unasked)),
                 Some(tucked)
                     if tucked.slice != slice.slice && tucked.slice.size == slice.slice.size =>
                 {

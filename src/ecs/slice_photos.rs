@@ -26,7 +26,9 @@ use tracing::{debug, warn};
 use crate::config::Config;
 use crate::ecs::layout::lies_mostly_elsewhere;
 use crate::ecs::pacing::{self, SlideHolds};
-use crate::ecs::shared_edge::{EdgeSlice, Hold, Slide, showing_edge_slices, showing_may_change};
+use crate::ecs::shared_edge::{
+    EdgeSlice, Hold, PhotoWait, Slide, showing_edge_slices, showing_may_change,
+};
 use crate::ecs::systems::{self, ease_out_factor, ease_step};
 use crate::ecs::{Position, PostUpdateSet, PresentedOrigin, RepositionMarker};
 use crate::events::Event;
@@ -91,6 +93,9 @@ pub(crate) enum PhotoError {
     /// macOS refused to photograph windows for the engine.
     Refused,
     Failed,
+    /// The photo shows almost nothing, as the window of an app that stops
+    /// drawing off screen does.
+    Blank,
 }
 
 /// Tells the capture of one photo whether the engine still wants it. The
@@ -383,7 +388,9 @@ fn refresh_slices(mut slices: ResMut<Slices>, screen: Option<NonSendMut<SliceScr
 }
 
 /// Paints each photo that differs from the one its panel shows, and keeps it.
-/// A failed photo closes its panel, and a refused one closes them all.
+/// A blank photo leaves the panel with the photo it shows. A failed photo, or
+/// a blank one for a panel that shows none, closes its panel, and a refused
+/// one closes them all.
 fn receive_photos(
     mut messages: MessageReader<Event>,
     mut slices: ResMut<Slices>,
@@ -419,11 +426,14 @@ fn receive_photos(
             debug!("edge slice photo dropped as stale: window {window_id} generation {generation}");
             continue;
         };
-        if result.is_err() {
+        if result
+            .as_ref()
+            .is_err_and(|error| *error != PhotoError::Blank)
+        {
             kept.remove(window_id);
         }
-        *photo = match result {
-            Ok(taken) => {
+        *photo = match (result, last) {
+            (Ok(taken), _) => {
                 if Some(taken.digest) == last {
                     debug!("edge slice unchanged: window {window_id}");
                 } else {
@@ -435,7 +445,11 @@ fn receive_photos(
                     digest: taken.digest,
                 }
             }
-            Err(PhotoError::Refused) => {
+            (Err(PhotoError::Blank), Some(digest)) => {
+                debug!("edge slice photo blank: window {window_id} keeps the photo it shows");
+                SlicePhoto::Shown { digest }
+            }
+            (Err(PhotoError::Refused), _) => {
                 if *access == SliceAccess::On {
                     warn!(
                         "macOS refused a photo of window {window_id}: shared edges show nothing until the config or the Screen Recording permission changes"
@@ -446,7 +460,7 @@ fn receive_photos(
                 });
                 SlicePhoto::Ended
             }
-            Err(error) => {
+            (Err(error), _) => {
                 debug!("edge slice photo failed: window {window_id}: {error:?}, closing its panel");
                 ended = true;
                 SlicePhoto::Ended
@@ -548,8 +562,8 @@ fn slide_photos(
 /// Moves each window heading for a tuck with the row while most of it stays
 /// on its display, until its photo shows in its place. Then the window tucks
 /// under the photo, and once macOS has taken that, the photo slides on to
-/// the slice. A window whose photo does not show within [`PHOTO_WAIT`]
-/// tucks at once. A photo never slides further past the edge than its place
+/// the slice. A window whose photo does not show within [`PHOTO_WAIT`] of
+/// the frame after it was asked for tucks at once. A photo never slides further past the edge than its place
 /// in the row beside a nearer window that waits, so no wallpaper shows
 /// between them.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -579,7 +593,7 @@ fn slide_photos_out(
                 at,
                 to,
                 slice,
-                until,
+                wait,
             } => {
                 let now = time.elapsed();
                 let photo = slices.photo(id);
@@ -596,16 +610,21 @@ fn slide_photos_out(
                     moved_out.extend(Out::of(&slide));
                     continue;
                 }
-                // After its first wait, a slice with no photo on its way does
+                // After its first step, a slice with no photo on its way does
                 // not show, so it never gets one.
+                let on_its_way = photo.is_some_and(|photo| !matches!(photo, SlicePhoto::Ended));
                 let waits = *access == SliceAccess::On
-                    && until.is_none_or(|until| {
-                        now < until
-                            && photo.is_some_and(|photo| !matches!(photo, SlicePhoto::Ended))
-                    });
+                    && match wait {
+                        PhotoWait::Unasked => true,
+                        PhotoWait::Asked => on_its_way,
+                        PhotoWait::Until(until) => now < until && on_its_way,
+                    };
                 let own = displays.get(slice.slice.display).map(Display::bounds);
                 let (true, Ok(own)) = (waits, own) else {
-                    let waited = until.map(|until| (now + PHOTO_WAIT).saturating_sub(until));
+                    let waited = match wait {
+                        PhotoWait::Until(until) => Some((now + PHOTO_WAIT).saturating_sub(until)),
+                        PhotoWait::Unasked | PhotoWait::Asked => None,
+                    };
                     debug!(
                         "edge slice photo not shown: window {id} tucks at once after {waited:?}, photo {photo:?}, access {:?}",
                         *access
@@ -628,7 +647,11 @@ fn slide_photos_out(
                     at,
                     to,
                     slice,
-                    until: Some(until.unwrap_or(now + PHOTO_WAIT)),
+                    wait: match wait {
+                        PhotoWait::Unasked => PhotoWait::Asked,
+                        PhotoWait::Asked => PhotoWait::Until(now + PHOTO_WAIT),
+                        until @ PhotoWait::Until(_) => until,
+                    },
                 };
                 debug!(
                     "edge slice photo awaited: window {id} shows at ({}, {})",

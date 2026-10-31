@@ -151,14 +151,13 @@ pub(crate) enum Slide {
     Landing { until: Duration },
     /// The window heads for a tuck that shows `slice`, at its place `to`
     /// in the row, and its photo is on its way. The window shows itself at
-    /// `at`, as far toward `to` as it stays mostly on its display. It waits
-    /// for the photo until the engine time `until`, which is `None` before
-    /// its first wait.
+    /// `at`, as far toward `to` as it stays mostly on its display, and
+    /// waits for the photo as `wait` says.
     Leaving {
         at: IVec2,
         to: IVec2,
         slice: Hold,
-        until: Option<Duration>,
+        wait: PhotoWait,
     },
     /// The photo slides with the row from `at` to `to`, held at `hold`, and
     /// rests as `slice`. The window tucks under the photo first: the photo
@@ -170,6 +169,22 @@ pub(crate) enum Slide {
         slice: EdgeSlice,
         until: Duration,
     },
+}
+
+/// How long a window heading for a tuck has waited for its photo.
+///
+/// The engine reads the time once as a frame starts, and the frame that asks
+/// for the photo can run long, such as one that moves focus to an app that
+/// answers slowly. A wait that counted from that frame could end before the
+/// photo was even asked for, so it counts from the next frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhotoWait {
+    /// The window has not stepped yet, and its photo is not asked for.
+    Unasked,
+    /// The photo was asked for in the window's first step.
+    Asked,
+    /// The window waits until the engine time.
+    Until(Duration),
 }
 
 /// The windows of `strip` that show a slice: on each side, every window of
