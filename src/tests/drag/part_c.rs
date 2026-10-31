@@ -343,6 +343,35 @@ fn a_drop_in_empty_space_on_another_display_opens_a_column_at_the_nearest_end() 
 }
 
 #[test]
+fn a_drop_on_another_display_lands_under_the_pointer_wherever_it_was_grabbed() {
+    for right in [false, true] {
+        for into_column in [false, true] {
+            let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+            let target = frame(harness.world(), 100);
+            let (to, expected) = if into_column {
+                (middle_of(harness.world(), 100, 900), vec![vec![100, 2]])
+            } else {
+                (
+                    Origin::new(target.min.x + 20, 600),
+                    vec![vec![2], vec![100]],
+                )
+            };
+            let press = grab_end(frame(harness.world(), 2), right);
+            drag_from(&mut harness, 2, press, to);
+            release(&mut harness, to);
+            macos_moves_to_ext(&mut harness, 2);
+            harness.advance(SETTLE);
+
+            assert_eq!(
+                layout_on(harness.world(), EXT_WORKSPACE_ID),
+                expected,
+                "right={right} into_column={into_column}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_full_stack_on_another_display_refuses_the_drop_and_the_window_returns() {
     let mut harness = two_displays("[options]\nstack_limit = 1\n", EXT_DISPLAY_HEIGHT);
 
@@ -3423,12 +3452,12 @@ fn a_display_diagonally_below_right_is_no_neighbor_at_the_right_edge() {
     }
 }
 
-/// The pointer, not the dragged window's centre, starts an edge hold. A
-/// window grabbed near its right end has the pointer at the edge and the
-/// centre well inside. Grabbed near its left end, the centre reaches the
-/// edge while the pointer stays clear of it.
+/// Only the pointer at the edge starts an edge hold, wherever the window was
+/// grabbed. Grabbed near its right end, the pointer reaches the edge while
+/// most of the window is still inside. Grabbed near its left end and moved
+/// until its middle reaches the edge, the pointer stays clear of it.
 #[test]
-fn the_pointer_not_the_windows_centre_starts_an_edge_hold() {
+fn only_the_pointer_at_an_edge_starts_an_edge_hold() {
     let ext = IRect::new(
         TEST_DISPLAY_WIDTH,
         TEST_DISPLAY_HEIGHT,
@@ -3438,13 +3467,11 @@ fn the_pointer_not_the_windows_centre_starts_an_edge_hold() {
     for (grab_right, scrolls) in [(true, true), (false, false)] {
         let mut harness = overflowing_right_with_display(ext);
         let start = frame(harness.world(), 1);
-        let (press, to) = if grab_right {
-            let press = Origin::new(start.max.x - 5, start.min.y + 10);
-            (press, Origin::new(TEST_DISPLAY_WIDTH - 2, 500))
+        let press = grab_end(start, grab_right);
+        let to = if grab_right {
+            Origin::new(TEST_DISPLAY_WIDTH - 2, 500)
         } else {
-            let press = Origin::new(start.min.x + 5, start.min.y + 10);
-            let centre_dx = start.center().x - press.x;
-            (press, Origin::new(TEST_DISPLAY_WIDTH - 2 - centre_dx, 500))
+            Origin::new(TEST_DISPLAY_WIDTH - 2 - (start.center().x - press.x), 500)
         };
         drag_from(&mut harness, 1, press, to);
         let before = strip_x(harness.world(), TEST_WORKSPACE_ID);

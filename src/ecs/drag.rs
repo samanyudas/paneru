@@ -5,8 +5,8 @@
 //!
 //! - [`step`] is the pure drag state machine. It turns one input into the
 //!   next [`DragState`] and the effects to apply.
-//! - [`hit_test`] is the pure drop rule. It turns a [`LayoutSnapshot`], a
-//!   pointer, and the dragged window's centre into a [`DropTarget`].
+//! - [`hit_test`] is the pure drop rule. It turns a [`LayoutSnapshot`] and a
+//!   pointer into a [`DropTarget`].
 //! - [`drag_events`] feeds platform events to [`step`] and applies its
 //!   effects to the [`LayoutStrip`].
 //!
@@ -168,19 +168,12 @@ impl ColumnSnap {
     }
 }
 
-/// The drop target for `dragged` with the pointer at `pointer` and the
-/// window's centre `centre_dx` points right of the pointer. `limit` gives the
-/// stack limit of each display.
-///
-/// The pointer picks the display and the height. The window's centre picks
-/// the column and its zone, so where the top bar was grabbed does not matter.
-/// A centre outside the pointer's display counts as the nearest point inside
-/// it.
+/// The drop target for `dragged` with the pointer at `pointer`. `limit` gives
+/// the stack limit of each display.
 pub(crate) fn hit_test(
     snapshot: &LayoutSnapshot,
     dragged: Entity,
     pointer: IVec2,
-    centre_dx: i32,
     limit: impl Fn(DisplayId) -> usize,
 ) -> DropTarget {
     let Some(display) = snapshot
@@ -190,10 +183,6 @@ pub(crate) fn hit_test(
     else {
         return DropTarget::Home;
     };
-    let aim = IVec2::new(
-        (pointer.x + centre_dx).clamp(display.bounds.min.x, display.bounds.max.x - 1),
-        pointer.y,
-    );
     // A window alone in its column, or a native tab group alone in it,
     // already is a column of its own.
     let lone = display
@@ -205,12 +194,12 @@ pub(crate) fn hit_test(
     let target = match display
         .columns
         .iter()
-        .find(|column| column.x.contains(&aim.x))
+        .find(|column| column.x.contains(&pointer.x))
     {
-        Some(column) => column_target(display.id, column, dragged, aim, limit(display.id)),
+        Some(column) => column_target(display.id, column, dragged, pointer, limit(display.id)),
         None => DropTarget::NewColumn {
             display: display.id,
-            index: gap_at(&display.columns, aim.x),
+            index: gap_at(&display.columns, pointer.x),
         },
     };
     match (target, lone) {
@@ -222,29 +211,31 @@ pub(crate) fn hit_test(
     }
 }
 
-/// The drop target with `aim`, the window's centre across and the pointer
-/// down, over `column`.
+/// The drop target with the pointer at `pointer`, over `column`.
 fn column_target(
     display: DisplayId,
     column: &ColumnSnap,
     dragged: Entity,
-    aim: IVec2,
+    pointer: IVec2,
     limit: usize,
 ) -> DropTarget {
+    let own = column.holds(dragged);
+    // Over its own column a window only reorders its stack, so a window
+    // grabbed near either end of its top bar and dragged straight down does
+    // not leave the stack.
     let quarter = (column.x.end - column.x.start) / 4;
-    if aim.x < column.x.start + quarter {
+    if !own && pointer.x < column.x.start + quarter {
         return DropTarget::NewColumn {
             display,
             index: column.index,
         };
     }
-    if aim.x >= column.x.end - quarter {
+    if !own && pointer.x >= column.x.end - quarter {
         return DropTarget::NewColumn {
             display,
             index: column.index + 1,
         };
     }
-    let own = column.holds(dragged);
     if column.kind == ColumnKind::Fullscreen && !own {
         return DropTarget::Refused {
             reason: Refusal::Fullscreen,
@@ -262,7 +253,7 @@ fn column_target(
         .bands
         .iter()
         .filter(|band| !band.windows.contains(&dragged))
-        .filter(|band| i32::midpoint(band.y.start, band.y.end) < aim.y)
+        .filter(|band| i32::midpoint(band.y.start, band.y.end) < pointer.y)
         .count();
     DropTarget::IntoColumn {
         display,
@@ -271,7 +262,7 @@ fn column_target(
     }
 }
 
-/// The gap a window centred at `x` in empty space opens: the nearest strip end,
+/// The gap the pointer at `x` in empty space opens: the nearest strip end,
 /// or the gap it sits in between two columns.
 fn gap_at(columns: &[ColumnSnap], x: i32) -> usize {
     columns
@@ -462,9 +453,6 @@ pub(crate) struct Press {
 pub(crate) struct Drag {
     pub window: Entity,
     pub pointer: IVec2,
-    /// How far right of the pointer the window's centre is, fixed at the
-    /// press.
-    pub centre_dx: i32,
     /// What a release here would do.
     pub target: DropTarget,
     /// When the button first read as up, if it reads up now.
@@ -575,12 +563,12 @@ pub(crate) enum DragEffect {
 }
 
 /// The drag state after `input` arrives at `now`. `hit` gives the drop
-/// target for a window, pointer, and centre offset.
+/// target for a window and pointer.
 pub(crate) fn step(
     state: DragState,
     input: DragInput,
     now: Duration,
-    hit: &dyn Fn(Entity, IVec2, i32) -> DropTarget,
+    hit: &dyn Fn(Entity, IVec2) -> DropTarget,
 ) -> (DragState, Vec<DragEffect>) {
     let state = match state {
         DragState::Settling(settle) if now >= settle.deadline => DragState::Idle,
@@ -665,7 +653,7 @@ pub(crate) fn step(
         (DragState::Pressed(press), input) => (pressed(press, input, now, hit), vec![]),
         (DragState::Dragging(mut drag), DragInput::Dragged { point }) => {
             drag.pointer = point;
-            drag.target = hit(drag.window, point, drag.centre_dx);
+            drag.target = hit(drag.window, point);
             drag.button_up_since = None;
             (DragState::Dragging(drag), vec![])
         }
@@ -676,7 +664,7 @@ pub(crate) fn step(
             }),
             vec![DragEffect::Drop {
                 window: drag.window,
-                target: hit(drag.window, point, drag.centre_dx),
+                target: hit(drag.window, point),
             }],
         ),
         // The pointer moving with no button held means the release never
@@ -733,7 +721,7 @@ fn pressed(
     mut press: Press,
     input: DragInput,
     now: Duration,
-    hit: &dyn Fn(Entity, IVec2, i32) -> DropTarget,
+    hit: &dyn Fn(Entity, IVec2) -> DropTarget,
 ) -> DragState {
     match input {
         DragInput::Dragged { point } => {
@@ -779,13 +767,11 @@ fn pressed(
             .iter()
             .any(|sample| follows_pointer(moved, *sample - press.point, press.screen_edges))
     });
-    let centre_dx = press.frame.center().x - press.point.x;
     match press.samples.last() {
         Some(pointer) if follows => DragState::Dragging(Drag {
             window: press.window,
             pointer: *pointer,
-            centre_dx,
-            target: hit(press.window, *pointer, centre_dx),
+            target: hit(press.window, *pointer),
             button_up_since: press.button_up_since,
         }),
         _ => DragState::Pressed(press),
@@ -1243,7 +1229,7 @@ pub(super) fn drag_events(
 
         let (next, effects) = {
             let snapshot = OnceCell::new();
-            let hit = |dragged, pointer, centre_dx| {
+            let hit = |dragged, pointer| {
                 let snapshot = snapshot.get_or_init(|| {
                     snapshot_of(
                         dragged,
@@ -1257,7 +1243,7 @@ pub(super) fn drag_events(
                         &config,
                     )
                 });
-                hit_test(snapshot, dragged, pointer, centre_dx, |id| {
+                hit_test(snapshot, dragged, pointer, |id| {
                     stack_limit(snapshot, id, &config)
                 })
             };
@@ -1485,7 +1471,7 @@ pub(super) fn drag_watchdog(
         }
     };
     // Neither input asks where the pointer is.
-    let home = |_, _, _| DropTarget::Home;
+    let home = |_, _| DropTarget::Home;
     let (next, effects) = step(state.clone(), input, time.elapsed(), &home);
     if effects.is_empty() {
         restore_ended_hold(&state, &next, &moves, &mut placements);
@@ -1551,7 +1537,7 @@ fn drag_feedback(
                 },
                 &config,
             );
-            let target = hit_test(&snapshot, drag.window, drag.pointer, drag.centre_dx, |id| {
+            let target = hit_test(&snapshot, drag.window, drag.pointer, |id| {
                 stack_limit(&snapshot, id, &config)
             });
             let mut next = drag.clone();
