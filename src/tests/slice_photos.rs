@@ -398,8 +398,8 @@ fn with_the_switch_off_no_panel_shows_and_no_photo_is_taken() {
     let (mut harness, log) = beside(switch(false), Screen::default());
 
     assert_eq!(showing(harness.world()).len(), 1, "window 3 still hides");
-    assert!(log.borrow().placed.is_empty());
-    assert!(log.borrow().asked.is_empty());
+    assert_eq!(log.borrow().placed, [] as [(WinID, EdgeSlice); 0]);
+    assert_eq!(log.borrow().asked, [] as [(WinID, IRect, u32); 0]);
 }
 
 #[test]
@@ -410,7 +410,7 @@ fn turning_the_switch_off_closes_the_panels() {
     harness.world().insert_resource(switch(false));
     harness.advance(REFRESH * 2);
 
-    assert!(log.borrow().placed.is_empty());
+    assert_eq!(log.borrow().placed, [] as [(WinID, EdgeSlice); 0]);
     assert_eq!(log.borrow().asked.len(), asks, "no photo after the switch");
 }
 
@@ -437,8 +437,8 @@ fn without_permission_no_panel_shows_until_it_is_granted() {
     };
     let (mut harness, log) = beside(switch(true), denied);
     harness.advance(REFRESH * 2);
-    assert!(log.borrow().placed.is_empty());
-    assert!(log.borrow().asked.is_empty());
+    assert_eq!(log.borrow().placed, [] as [(WinID, EdgeSlice); 0]);
+    assert_eq!(log.borrow().asked, [] as [(WinID, IRect, u32); 0]);
 
     log.borrow_mut().denied = false;
     harness.advance(REFRESH);
@@ -454,8 +454,8 @@ fn a_slice_that_stops_showing_closes_its_panel() {
 
     harness.run(vec![command(Operation::Focus(Direction::Last))]);
     harness.advance(SETTLE);
-    assert!(showing(harness.world()).is_empty());
-    assert!(log.borrow().placed.is_empty());
+    assert_eq!(showing(harness.world()), [] as [(WinID, EdgeSlice); 0]);
+    assert_eq!(log.borrow().placed, [] as [(WinID, EdgeSlice); 0]);
 
     arrive(&mut harness, 3, asked, Ok(photo(8)));
     assert_eq!(log.borrow().painted, vec![(3, Digest(7))], "a late photo");
@@ -486,7 +486,7 @@ fn a_refused_photo_closes_every_panel_until_the_config_changes() {
     let asks = log.borrow().asked.len();
 
     arrive(&mut harness, 1, one, Err(PhotoError::Refused));
-    assert!(log.borrow().placed.is_empty());
+    assert_eq!(log.borrow().placed, [] as [(WinID, EdgeSlice); 0]);
     arrive(&mut harness, 5, five, Ok(photo(7)));
     harness.advance(REFRESH * 2);
     assert!(log.borrow().painted.is_empty(), "no photo after a refusal");
@@ -526,7 +526,7 @@ fn a_slice_that_stops_showing_calls_off_its_photo_on_its_way() {
     harness.run(vec![command(Operation::Focus(Direction::Last))]);
     harness.advance(SETTLE);
 
-    assert!(showing(harness.world()).is_empty());
+    assert_eq!(showing(harness.world()), [] as [(WinID, EdgeSlice); 0]);
     assert!(called_off(&log, asked));
 }
 

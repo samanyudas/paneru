@@ -1293,7 +1293,7 @@ mod tests {
 
         assert_eq!(found, vec![55561, 62288]);
         assert_eq!(end, ScanEnd::Resolved);
-        assert!(window_list.is_empty());
+        assert_eq!(window_list, [] as [i32; 0]);
     }
 
     #[test]
@@ -1311,7 +1311,7 @@ mod tests {
             |()| None::<()>,
         );
 
-        assert!(found.is_empty());
+        assert_eq!(found, [] as [(); 0]);
         assert_eq!(
             end,
             ScanEnd::PastLastElement(58 + BRUTEFORCE_TRAILING_GAP + 1)
@@ -1326,7 +1326,7 @@ mod tests {
 
         let (found, end) = scan_elements(&mut window_list, Instant::now(), helium_element, Some);
 
-        assert!(found.is_empty());
+        assert_eq!(found, [] as [i32; 0]);
         assert_eq!(end, ScanEnd::Deadline(0));
     }
 
