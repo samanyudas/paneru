@@ -360,7 +360,7 @@ fn an_overflowing_hidden_stack_shows_what_each_window_shows_of_itself() {
         .fold(twins[0].0, |union, (on_screen, _)| union.union(*on_screen));
 
     let slices = showing(beside.world());
-    assert!(!slices.is_empty());
+    assert_ne!(slices, [] as [(WinID, EdgeSlice); 0]);
     for (index, (id, slice)) in slices.iter().enumerate() {
         let (twin, twin_in_window) = twins[usize::try_from(*id).expect("a stacked window")];
         assert_eq!(

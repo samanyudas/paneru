@@ -1216,7 +1216,7 @@ fn test_accepted_desktop_focus_shows_no_message() {
     wait_out_desktop_focus(&mut harness);
 
     assert_eq!(harness.mock_state.active_display(), EXT_DISPLAY_ID);
-    assert!(flash_messages(harness.world()).is_empty());
+    assert_eq!(flash_messages(harness.world()), [] as [String; 0]);
 }
 
 /// macOS can ignore a desktop focus and still report success. The engine
@@ -1266,7 +1266,7 @@ fn test_switch_back_after_a_late_desktop_focus_shows_no_message() {
     harness.mock_state.activate_display(TEST_DISPLAY_ID);
     wait_out_desktop_focus(&mut harness);
 
-    assert!(flash_messages(harness.world()).is_empty());
+    assert_eq!(flash_messages(harness.world()), [] as [String; 0]);
 }
 
 /// A newer focus replaces the desktop focus the check waits on, so the
@@ -1287,7 +1287,7 @@ fn test_newer_focus_cancels_the_desktop_focus_check() {
     );
     wait_out_desktop_focus(&mut harness);
 
-    assert!(flash_messages(harness.world()).is_empty());
+    assert_eq!(flash_messages(harness.world()), [] as [String; 0]);
 }
 
 /// A held edge key crosses to an empty display once and ignores its
