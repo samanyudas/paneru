@@ -1937,8 +1937,11 @@ pub(crate) fn regroup_stray_native_tabs(
                 .iter()
                 .any(|other| stray.shares_frame_with(other))
     });
-    last_snapshot.clone_from(&candidates);
+    // Only a strip with no overlap is skipped until it changes. Ghostty can
+    // drop a background tab from its accessibility list without any frame
+    // changing, so an overlapping pair is rechecked until it folds.
     if !has_overlapping_stray {
+        last_snapshot.clone_from(&candidates);
         return;
     }
 

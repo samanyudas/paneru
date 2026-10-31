@@ -1619,6 +1619,50 @@ fn test_regroup_stray_native_tabs_skips_os_queries_without_overlapping_columns()
     harness.advance(Duration::from_millis(1100));
 }
 
+/// Ghostty can drop a background tab from its accessibility list some time
+/// after the tab's frame last changed. The periodic check must still fold it,
+/// so a strip with an overlapping pair is rechecked until the pair folds.
+#[test]
+fn test_overlapping_tab_folds_when_the_app_drops_it_later_without_a_frame_change() {
+    use crate::ecs::{Bounds, Position};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    for _ in 0..3 {
+        harness.app.update();
+    }
+
+    let world = harness.app.world_mut();
+    let leader = find_window_entity(0, world);
+    let background = find_window_entity(1, world);
+    let position = world.get::<Position>(leader).expect("a position").clone();
+    let bounds = world.get::<Bounds>(leader).expect("bounds").clone();
+    world.entity_mut(background).insert((position, bounds));
+
+    // A registered system keeps its local state between runs, as the
+    // scheduled one does between timer ticks.
+    let regroup = world.register_system(crate::ecs::systems::regroup_stray_native_tabs);
+    let strip_len = |world: &mut World| {
+        let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+        strips.single(world).expect("one active strip").len()
+    };
+
+    world.run_system(regroup).expect("the first check runs");
+    assert_eq!(
+        strip_len(world),
+        2,
+        "a tab the app still lists keeps its column"
+    );
+
+    harness.mock_state.set_background_tab(1, true);
+    let world = harness.app.world_mut();
+    world.run_system(regroup).expect("the later check runs");
+
+    assert_eq!(strip_len(world), 1, "the stray column is gone");
+    let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+    let strip = strips.single(world).expect("one active strip");
+    assert!(strip.tabbed(background), "the background tab is a tab now");
+}
+
 /// An app with native tabs answers "which window is focused?" with whichever
 /// member of the tab group it decided to show, so the id on a focus event can
 /// already be out of date. Paneru has to follow the app to that window; drop
