@@ -211,6 +211,9 @@ struct MockStateInner {
     cursor_position: Origin,
     /// The display bounds whose desktop the engine last focused.
     focused_desktop: Option<IRect>,
+    /// Whether macOS ignores a desktop focus, as it does for a desktop window
+    /// whose owner is already the front app.
+    ignores_desktop_focus: bool,
     /// Whether the window server sees the left mouse button down.
     left_button_down: bool,
     /// The presses the engine posted, oldest first, each where it posted it.
@@ -456,6 +459,7 @@ impl MockState {
             active_display_id: 0,
             cursor_position: Origin::ZERO,
             focused_desktop: None,
+            ignores_desktop_focus: false,
             left_button_down: false,
             posted_presses: Vec::new(),
             raised: Vec::new(),
@@ -1208,6 +1212,12 @@ impl MockState {
         self.inner.force_read().focused_desktop
     }
 
+    /// Makes macOS ignore every later desktop focus: the request still
+    /// returns success, but the active display stays where it is.
+    pub fn ignore_desktop_focus(&self) {
+        self.inner.force_write().ignores_desktop_focus = true;
+    }
+
     // --- Mock Factory Methods ---
 
     fn mock_resize(&self, id: WinID, ax_generation: u32, size: Size) {
@@ -1948,7 +1958,19 @@ impl MockState {
 
         let s = self.clone();
         wm.expect_focus_desktop().returning(move |bounds| {
-            s.inner.force_write().focused_desktop = Some(bounds);
+            let mut inner = s.inner.force_write();
+            inner.focused_desktop = Some(bounds);
+            let shown = inner
+                .displays
+                .values()
+                .find(|display| display.bounds.contains(bounds.center()))
+                .map(|display| display.id);
+            if !inner.ignores_desktop_focus
+                && let Some(id) = shown
+            {
+                inner.active_display_id = id;
+                inner.event_queue.push_back(Event::DisplayChanged);
+            }
             Ok(())
         });
 

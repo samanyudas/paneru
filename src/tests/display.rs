@@ -1169,6 +1169,86 @@ fn test_focus_display_without_a_window_focuses_its_desktop() {
         ]);
 }
 
+/// The flash messages on screen, oldest first.
+fn flash_messages(world: &mut World) -> Vec<String> {
+    let mut query = world.query::<&crate::ecs::FlashMessage>();
+    query.iter(world).map(|message| message.0.clone()).collect()
+}
+
+/// A harness whose display above has no window, so focusing it focuses its
+/// desktop.
+fn harness_with_empty_display_above() -> TestHarness {
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    TestHarness::new().with_windows(1).with_display(
+        EXT_DISPLAY_ID,
+        ext_bounds,
+        vec![EXT_WORKSPACE_ID],
+    )
+}
+
+/// A desktop focus that makes its display active shows no message.
+#[test]
+fn test_accepted_desktop_focus_shows_no_message() {
+    let mut harness = harness_with_empty_display_above();
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::FocusDisplay(Direction::North)),
+    ]);
+    harness.advance(Duration::from_secs(1));
+
+    assert_eq!(harness.mock_state.active_display(), EXT_DISPLAY_ID);
+    assert!(flash_messages(harness.world()).is_empty());
+}
+
+/// macOS can ignore a desktop focus and still report success. The engine
+/// then sees that the display did not become active and says so.
+#[test]
+fn test_ignored_desktop_focus_shows_a_message() {
+    let mut harness = harness_with_empty_display_above();
+    harness.mock_state.ignore_desktop_focus();
+    harness
+        .world()
+        .write_message::<Event>(Event::MenuOpened { window_id: 0 });
+    harness.advance(Duration::from_millis(100));
+    harness
+        .world()
+        .write_message::<Event>(window_command(Operation::FocusDisplay(Direction::North)));
+    harness.advance(Duration::from_millis(300));
+    assert!(
+        flash_messages(harness.world()).is_empty(),
+        "macOS gets time to act before the check"
+    );
+    harness.advance(Duration::from_secs(1));
+
+    assert_eq!(harness.mock_state.active_display(), TEST_DISPLAY_ID);
+    assert_eq!(
+        flash_messages(harness.world()),
+        vec!["macOS did not switch to the other display".to_owned()]
+    );
+}
+
+/// A newer focus command replaces the desktop focus the check waits on, so
+/// the check does not report on a request the user already moved past.
+#[test]
+fn test_newer_focus_command_cancels_the_desktop_focus_check() {
+    let mut harness = harness_with_empty_display_above();
+    harness.mock_state.ignore_desktop_focus();
+    harness
+        .world()
+        .write_message::<Event>(Event::MenuOpened { window_id: 0 });
+    harness.advance(Duration::from_millis(100));
+    harness
+        .world()
+        .write_message::<Event>(window_command(Operation::FocusDisplay(Direction::North)));
+    harness.advance(Duration::from_millis(100));
+    harness
+        .world()
+        .write_message::<Event>(window_command(Operation::FocusDisplay(Direction::South)));
+    harness.advance(Duration::from_secs(1));
+
+    assert!(flash_messages(harness.world()).is_empty());
+}
+
 /// Centre column and moving a window to another display leave the pointer
 /// where it is.
 #[test]
