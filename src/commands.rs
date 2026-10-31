@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bevy::app::{PostUpdate, PreUpdate};
 use bevy::ecs::entity::{Entity, EntityHashSet};
@@ -11,7 +11,7 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_changed};
 use bevy::ecs::system::{Commands, ParamSet, Query, Res, ResMut, Single};
 use bevy::math::IRect;
-use bevy::time::Time;
+use bevy::time::{Real, Time};
 use tracing::{Level, instrument};
 use tracing::{debug, error, info, warn};
 
@@ -743,13 +743,21 @@ impl HeldEdge {
 /// desktop. It takes well under this on a display that accepts the focus.
 const DESKTOP_FOCUS_WAIT: Duration = Duration::from_millis(500);
 
-/// The display whose desktop the engine last focused, with the time its wait
-/// ends. macOS can ignore that focus request and still report success, so
-/// [`check_desktop_focus`] reads the active display until it changes or the
-/// wait ends. The wait counts from the request in real time, because the
-/// frame clock also counts the pump's sleep before the key press arrived.
+/// A desktop focus that macOS may still ignore. It ignores the request and
+/// still reports success, so [`check_desktop_focus`] reads the active display
+/// until it changes or the wait ends.
 #[derive(bevy::ecs::resource::Resource, Default)]
-struct DesktopFocusCheck(Option<(u32, Instant)>);
+struct DesktopFocusCheck(Option<PendingDesktopFocus>);
+
+struct PendingDesktopFocus {
+    display_id: u32,
+    /// Real time at the start of the frame that sent the request.
+    requested: Duration,
+    /// Real time when the wait ends. It counts from the start of the next
+    /// frame: the request's own frame started before the pump waited for the
+    /// key press, so its start can lie up to a whole pump wait before it.
+    deadline: Option<Duration>,
+}
 
 /// The window display `bounds` shows as active in `strip`: the window that
 /// last had focus there when it is visible, otherwise the most visible window.
@@ -1707,6 +1715,7 @@ fn focus_display(
     config: Res<Config>,
     mut held: ResMut<HeldEdge>,
     mut desktop_check: ResMut<DesktopFocusCheck>,
+    clock: Res<Time<Real>>,
     mut commands: Commands,
 ) {
     let Some(operation) = filter_window_operations(&mut messages, |op| {
@@ -1776,7 +1785,11 @@ fn focus_display(
     }
     match window_manager.focus_desktop(target_bounds) {
         Ok(()) => {
-            desktop_check.0 = Some((target.id(), Instant::now() + DESKTOP_FOCUS_WAIT));
+            desktop_check.0 = Some(PendingDesktopFocus {
+                display_id: target.id(),
+                requested: clock.elapsed(),
+                deadline: None,
+            });
         }
         Err(err) => warn!(
             "can not focus the desktop of display {}: {err}",
@@ -1794,13 +1807,15 @@ fn focus_display(
 /// a later switch back, by the user or the engine, is not taken for a refusal.
 fn check_desktop_focus(
     mut check: ResMut<DesktopFocusCheck>,
+    clock: Res<Time<Real>>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
-    let Some((display_id, deadline)) = check.0 else {
+    let Some(pending) = check.0.as_mut() else {
         return;
     };
+    let display_id = pending.display_id;
     if !displays.iter().any(|display| display.id() == display_id) {
         debug!("display {display_id} went away before its desktop focus was checked.");
         check.0 = None;
@@ -1811,7 +1826,11 @@ fn check_desktop_focus(
         check.0 = None;
         return;
     }
-    if Instant::now() < deadline {
+    let now = clock.elapsed();
+    if pending.deadline.is_none() && now > pending.requested {
+        pending.deadline = Some(now + DESKTOP_FOCUS_WAIT);
+    }
+    if pending.deadline.is_none_or(|deadline| now < deadline) {
         return;
     }
     check.0 = None;

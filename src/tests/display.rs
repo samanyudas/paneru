@@ -1175,10 +1175,6 @@ fn flash_messages(world: &mut World) -> Vec<String> {
     query.iter(world).map(|message| message.0.clone()).collect()
 }
 
-/// Real time that covers the engine's wait for a desktop focus to take
-/// effect. That wait counts real time, not frames.
-const PAST_THE_DESKTOP_FOCUS_WAIT: Duration = Duration::from_millis(600);
-
 /// A harness with `windows` windows whose display at `bounds` has none, so
 /// focusing that display focuses its desktop.
 fn harness_with_empty_display(windows: i32, bounds: IRect) -> TestHarness {
@@ -1201,10 +1197,9 @@ fn send(harness: &mut TestHarness, events: Vec<Event>) {
     }
 }
 
-/// Lets the desktop focus wait end in real time, then runs a few frames.
+/// Runs past the engine's wait for a desktop focus to take effect.
 fn wait_out_desktop_focus(harness: &mut TestHarness) {
-    std::thread::sleep(PAST_THE_DESKTOP_FOCUS_WAIT);
-    harness.advance(Duration::from_millis(100));
+    harness.advance(Duration::from_secs(1));
 }
 
 /// A desktop focus that makes its display active shows no message.
@@ -1237,6 +1232,7 @@ fn test_ignored_desktop_focus_shows_a_message() {
             window_command(Operation::FocusDisplay(Direction::North)),
         ],
     );
+    harness.advance(Duration::from_millis(400));
     assert!(
         flash_messages(harness.world()).is_empty(),
         "macOS gets time to act before the check"
@@ -1251,10 +1247,12 @@ fn test_ignored_desktop_focus_shows_a_message() {
 }
 
 /// Once the display is active the check ends, so a switch back before the
-/// wait ends, such as a click on the first display, is not a refusal.
+/// wait ends, such as a click on the first display, is not a refusal. Here
+/// macOS makes the display active a while after the request.
 #[test]
-fn test_switch_back_after_an_accepted_desktop_focus_shows_no_message() {
+fn test_switch_back_after_a_late_desktop_focus_shows_no_message() {
     let mut harness = harness_with_empty_display_above();
+    harness.mock_state.ignore_desktop_focus();
     send(
         &mut harness,
         vec![
@@ -1262,6 +1260,9 @@ fn test_switch_back_after_an_accepted_desktop_focus_shows_no_message() {
             window_command(Operation::FocusDisplay(Direction::North)),
         ],
     );
+    harness.advance(Duration::from_millis(100));
+    harness.mock_state.activate_display(EXT_DISPLAY_ID);
+    harness.advance(Duration::from_millis(40));
     harness.mock_state.activate_display(TEST_DISPLAY_ID);
     wait_out_desktop_focus(&mut harness);
 
