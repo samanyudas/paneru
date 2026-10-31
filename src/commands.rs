@@ -1674,7 +1674,7 @@ fn to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut moves: DisplayMoves,
-    focus_history: Res<FocusHistory>,
+    mut focus_history: ResMut<FocusHistory>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut native: ResMut<crate::ecs::native_membership::NativeMembership>,
@@ -1785,6 +1785,11 @@ fn to_next_display(
         commands.focus_entity(neighbour, false);
     }
     if let Some(strip) = arrival.strip {
+        if matches!(move_focus, MoveFocus::Follow)
+            && let Ok((_, layout, ..)) = moves.strips.get(strip)
+        {
+            focus_history.record(layout.id(), entity, unmanaged);
+        }
         commands.place_after_arrival(entity, strip);
     }
 }
