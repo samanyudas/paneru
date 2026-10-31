@@ -1731,6 +1731,16 @@ fn fit_on_display(frame: IRect, bounds: IRect) -> IRect {
     IRect::from_corners(origin, origin + size)
 }
 
+/// How long a flash message takes to fade out at the end of its time.
+const FLASH_FADE: Duration = Duration::from_millis(300);
+
+/// A flash message's opacity with `remaining` time left: full until the last
+/// [`FLASH_FADE`], then fading to nothing. A message that faded over its
+/// whole time was hard to read for most of it.
+fn flash_opacity(remaining: Duration) -> f32 {
+    (remaining.as_secs_f32() / FLASH_FADE.as_secs_f32()).min(1.0)
+}
+
 pub(crate) fn update_flash_messages(
     messages: Populated<(Entity, &FlashMessage, &Timeout)>,
     active_display: Single<(&Display, Entity), With<ActiveDisplayMarker>>,
@@ -1785,7 +1795,7 @@ pub(crate) fn update_flash_messages(
     }
 
     if let Some((_, flash, timeout)) = alive {
-        let opacity = timeout.timer.fraction_remaining();
+        let opacity = flash_opacity(timeout.timer.remaining());
         flash_manager.show(flash, opacity, top_right);
     } else {
         flash_manager.remove();
@@ -2305,6 +2315,21 @@ mod startup_tests {
         app.update();
 
         assert_eq!(app.should_exit(), Some(AppExit::Success));
+    }
+}
+
+#[cfg(test)]
+mod flash_tests {
+    use std::time::Duration;
+
+    use super::flash_opacity;
+
+    #[test]
+    fn a_flash_message_stays_opaque_until_its_fade() {
+        assert!((flash_opacity(Duration::from_millis(2000)) - 1.0).abs() < f32::EPSILON);
+        assert!((flash_opacity(Duration::from_millis(300)) - 1.0).abs() < f32::EPSILON);
+        assert!((flash_opacity(Duration::from_millis(150)) - 0.5).abs() < 1e-6);
+        assert!(flash_opacity(Duration::ZERO).abs() < f32::EPSILON);
     }
 }
 
