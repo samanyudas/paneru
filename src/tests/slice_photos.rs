@@ -9,7 +9,7 @@ use std::time::Duration;
 use bevy::ecs::system::RunSystemOnce as _;
 use bevy::math::{IRect, IVec2};
 use bevy::prelude::World;
-use bevy::time::TimeUpdateStrategy;
+use bevy::time::{Time, TimeUpdateStrategy, Virtual};
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGImage, CGImageAlphaInfo,
@@ -760,7 +760,7 @@ fn leave(
         .world()
         .write_message(command(Operation::Focus(leave)));
     let mut seen = Vec::new();
-    for step in 0..60 {
+    for step in 0..100 {
         if photo_after == Some(step) {
             assert_eq!(asks_for(&log, id).len(), asks + 1, "one photo of {id}");
             let asked = last_ask(&log, id);
@@ -879,8 +879,10 @@ fn focus_back_during_a_slide_out_slides_the_photo_back_in() {
     assert!(turned, "the photo turns back");
 }
 
+/// The first photo after the engine starts took a second on Sam's Mac, so a
+/// window waits that long for its photo before it tucks without one.
 #[test]
-fn a_window_whose_photo_never_arrives_tucks_after_a_short_wait() {
+fn a_window_whose_photo_never_arrives_tucks_after_a_wait_of_a_second_and_a_half() {
     let laid_out = beside(animated(), Screen::default());
     let focus = (Direction::Last, Direction::First);
     let (seen, _, _) = leave(laid_out, 3, focus, None, None);
@@ -890,10 +892,40 @@ fn a_window_whose_photo_never_arrives_tucks_after_a_short_wait() {
         .take_while(|frame| in_view(frame.window))
         .count();
     assert!(
-        (5..=15).contains(&waited),
+        (70..=80).contains(&waited),
         "window 3 shows itself for {waited} frames, then tucks"
     );
     assert!(seen[waited..].iter().all(|frame| !in_view(frame.window)));
+}
+
+/// An app that is still starting may draw nothing yet, so its first photo
+/// comes out blank while its window still shows.
+#[test]
+fn a_blank_first_photo_of_a_window_still_in_view_asks_for_another() {
+    let (mut harness, log) = beside(animated(), Screen::default());
+    harness.run(vec![command(Operation::Focus(Direction::Last))]);
+    harness.advance(SETTLE);
+    let asks = asks_for(&log, 3).len();
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::First)));
+    while asks_for(&log, 3).len() == asks {
+        harness.advance(Duration::from_millis(20));
+    }
+    arrive(&mut harness, 3, last_ask(&log, 3), Err(PhotoError::Blank));
+    assert_eq!(asks_for(&log, 3).len(), asks + 2, "a second photo of 3");
+    harness.advance(Duration::from_millis(20));
+    assert!(
+        in_view(harness.mock_state.ax_frame(3)),
+        "window 3 waits in view for it"
+    );
+
+    arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(8)));
+    harness.advance(SETTLE);
+    assert_eq!(log.borrow().painted, vec![(3, Digest(8))]);
+    assert_eq!(placed_ids(&log), vec![3], "the photo shows on the edge");
+    assert!(!in_view(harness.mock_state.ax_frame(3)), "window 3 tucked");
 }
 
 #[test]
@@ -909,9 +941,14 @@ fn a_photo_asked_for_in_a_long_frame_still_gets_its_whole_wait() {
     while asks_for(&log, 3).len() == asks {
         harness.advance(Duration::from_millis(20));
     }
+    harness
+        .app
+        .world_mut()
+        .resource_mut::<Time<Virtual>>()
+        .set_max_delta(Duration::from_secs(2));
     let frame = std::mem::replace(
         &mut *harness.app.world_mut().resource_mut::<TimeUpdateStrategy>(),
-        TimeUpdateStrategy::ManualDuration(Duration::from_millis(240)),
+        TimeUpdateStrategy::ManualDuration(Duration::from_millis(1490)),
     );
     harness.app.update();
     *harness.app.world_mut().resource_mut::<TimeUpdateStrategy>() = frame;
