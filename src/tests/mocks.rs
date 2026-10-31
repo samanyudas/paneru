@@ -286,12 +286,22 @@ struct WriteHolds {
 }
 
 impl WriteHolds {
-    /// Longer than any test holds an app, yet short enough that a write made
-    /// on the engine's own thread fails a test rather than hanging it.
-    const LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
+    /// Longer than any test runs, so a hold lasts until the test releases it
+    /// however slowly frames run on a loaded machine. A one-second limit
+    /// ended holds mid-test there, and the stuck app's writes landed.
+    const LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
     fn wait_while_held(&self, pid: Pid) {
         let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        // Writer threads are named in `WindowWriters::push`. A held write
+        // anywhere else would stall the engine frame, so it fails the test.
+        assert!(
+            !held.contains(&pid)
+                || std::thread::current()
+                    .name()
+                    .is_some_and(|name| name.starts_with("window-writer-")),
+            "a write for held app {pid} ran on the engine's thread"
+        );
         let _ = self
             .released
             .wait_timeout_while(held, Self::LIMIT, |held| held.contains(&pid))

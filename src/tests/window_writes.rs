@@ -23,7 +23,7 @@ const WINDOW_WIDTH: i32 = 700;
 /// How long each of the slow app's writes takes, like Helium mid-swipe.
 const SLOW_WRITE: Duration = Duration::from_millis(200);
 /// How long the other app's write may take to land while the slow app is
-/// stuck, under the second a held app stays stuck.
+/// stuck.
 const OTHER_APP_LANDING: Duration = Duration::from_millis(500);
 /// Simulated time per frame, as the harness runs it.
 const FRAME: Duration = Duration::from_millis(20);
@@ -164,6 +164,32 @@ fn other_apps_get_their_writes_while_one_app_is_stuck() {
     assert_eq!(
         slow_app_frame, stuck_at,
         "the stuck app had not applied its write yet"
+    );
+    assert!(harness.mock_state.flush_writes(FLUSH));
+    assert_eq!(
+        harness.mock_state.ax_frame(0),
+        engine_frame(harness.world(), 0)
+    );
+}
+
+/// A held app stays stuck until the test releases it, however long the test
+/// takes in real time, as frames do on a loaded machine.
+#[test]
+fn a_held_app_stays_stuck_until_released() {
+    let mut harness = harness();
+    let stuck_at = harness.mock_state.ax_frame(0);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    swipe(&mut harness);
+    run_frames(&mut harness, 3);
+    // Past the one second after which a hold used to end on its own.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let held_frame = harness.mock_state.ax_frame(0);
+    harness.mock_state.release_writes(SLOW_APP);
+    assert_eq!(
+        held_frame, stuck_at,
+        "the held app had not applied its write"
     );
     assert!(harness.mock_state.flush_writes(FLUSH));
     assert_eq!(
