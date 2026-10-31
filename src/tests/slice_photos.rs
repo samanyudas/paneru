@@ -9,6 +9,7 @@ use std::time::Duration;
 use bevy::ecs::system::RunSystemOnce as _;
 use bevy::math::{IRect, IVec2};
 use bevy::prelude::World;
+use bevy::time::TimeUpdateStrategy;
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGImage, CGImageAlphaInfo,
@@ -893,6 +894,38 @@ fn a_window_whose_photo_never_arrives_tucks_after_a_short_wait() {
         "window 3 shows itself for {waited} frames, then tucks"
     );
     assert!(seen[waited..].iter().all(|frame| !in_view(frame.window)));
+}
+
+#[test]
+fn a_photo_asked_for_in_a_long_frame_still_gets_its_whole_wait() {
+    let (mut harness, log) = beside(animated(), Screen::default());
+    harness.run(vec![command(Operation::Focus(Direction::Last))]);
+    harness.advance(SETTLE);
+    let asks = asks_for(&log, 3).len();
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::First)));
+    while asks_for(&log, 3).len() == asks {
+        harness.advance(Duration::from_millis(20));
+    }
+    let frame = std::mem::replace(
+        &mut *harness.app.world_mut().resource_mut::<TimeUpdateStrategy>(),
+        TimeUpdateStrategy::ManualDuration(Duration::from_millis(240)),
+    );
+    harness.app.update();
+    *harness.app.world_mut().resource_mut::<TimeUpdateStrategy>() = frame;
+    harness.advance(Duration::from_millis(60));
+    let waiting = harness.mock_state.ax_frame(3);
+    assert!(
+        waiting.intersect(DISPLAY).height() * 2 > waiting.height(),
+        "window 3 waits for its photo untucked at {waiting:?}"
+    );
+
+    arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(8)));
+    harness.advance(SETTLE);
+    assert_eq!(log.borrow().painted, vec![(3, Digest(8))]);
+    assert_eq!(placed_ids(&log), vec![3], "the photo shows on the edge");
 }
 
 #[test]
