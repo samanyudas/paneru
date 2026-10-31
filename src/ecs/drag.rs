@@ -850,6 +850,9 @@ fn past_threshold(delta: IVec2) -> bool {
 }
 
 const EDGE_BAND: i32 = 6;
+/// How far in from a display edge the visible part of a column cut off at
+/// that edge starts a hold.
+const HOLD_ZONE: i32 = 200;
 const EDGE_DELAY: Duration = Duration::from_millis(500);
 const EDGE_REPEAT: Duration = Duration::from_millis(350);
 
@@ -859,53 +862,112 @@ enum EdgeSide {
     Right,
 }
 
-#[derive(Component)]
-pub(crate) struct EdgeHold {
+/// Where a held pointer scrolls a display's strip toward `side`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HoldZone {
     display: DisplayId,
     side: EdgeSide,
+    /// Screen points, end exclusive.
+    x: Range<i32>,
+}
+
+#[derive(Component)]
+pub(crate) struct EdgeHold {
+    /// The zone as it was when the hold started. The first scroll uncovers
+    /// the cut-off column that made the zone, and the hold must go on while
+    /// the pointer stays put.
+    zone: HoldZone,
     next_scroll: Duration,
 }
 
 /// How far apart two display edges may be and still touch.
 const NEIGHBOR_TOLERANCE: u32 = 2;
 
-/// The display side whose edge band holds `pointer`, when no other display
-/// touches that edge at the pointer's height. `snapshot` names the displays
-/// whose strip can scroll. `physical_displays` lists every display, because a
-/// neighbor that shows no managed strip, such as one in a native fullscreen
-/// space, is still a neighbor. A display beside only part of the edge, or
-/// only diagonally across a corner, is no neighbor where it does not touch.
-fn held_edge(
+/// The hold zone that holds `pointer`, if any. On each side of the pointer's
+/// display, the zone covers the [`EDGE_BAND`] at an edge with no other
+/// display beside it at the pointer's height, and the visible part, up to
+/// [`HOLD_ZONE`] wide, of a column that the viewport edge cuts off. A column
+/// that holds `dragged` makes no zone.
+///
+/// `snapshot` names the displays whose strip can scroll. `physical_displays`
+/// lists every display, because a neighbor that shows no managed strip, such
+/// as one in a native fullscreen space, is still a neighbor. A display beside
+/// only part of the edge, or only diagonally across a corner, is no neighbor
+/// where it does not touch.
+fn hold_zone(
     snapshot: &LayoutSnapshot,
+    dragged: Entity,
     physical_displays: &[(DisplayId, IRect)],
     pointer: IVec2,
-) -> Option<(DisplayId, EdgeSide)> {
+) -> Option<HoldZone> {
     let display = snapshot
         .managed_strip_displays
         .iter()
         .find(|display| display.bounds.contains(pointer))?;
-    let (side, edge) = if pointer.x < display.bounds.min.x + EDGE_BAND {
-        (EdgeSide::Left, display.bounds.min.x)
-    } else if pointer.x >= display.bounds.max.x - EDGE_BAND {
-        (EdgeSide::Right, display.bounds.max.x)
-    } else {
-        return None;
-    };
-    let touches = |other: &IRect| {
-        let adjacent = match side {
-            EdgeSide::Left => {
-                other.min.x < edge && other.max.x.abs_diff(edge) <= NEIGHBOR_TOLERANCE
-            }
-            EdgeSide::Right => {
-                other.max.x > edge && other.min.x.abs_diff(edge) <= NEIGHBOR_TOLERANCE
-            }
+    let (bounds, viewport) = (display.bounds, display.viewport);
+    let band = |side: EdgeSide| {
+        let touches = |other: &IRect| {
+            let adjacent = match side {
+                EdgeSide::Left => {
+                    other.min.x < bounds.min.x
+                        && other.max.x.abs_diff(bounds.min.x) <= NEIGHBOR_TOLERANCE
+                }
+                EdgeSide::Right => {
+                    other.max.x > bounds.max.x
+                        && other.min.x.abs_diff(bounds.max.x) <= NEIGHBOR_TOLERANCE
+                }
+            };
+            adjacent && (other.min.y..other.max.y).contains(&pointer.y)
         };
-        adjacent && (other.min.y..other.max.y).contains(&pointer.y)
+        let neighbor = physical_displays
+            .iter()
+            .any(|(id, other)| *id != display.id && touches(other));
+        if neighbor { 0 } else { EDGE_BAND }
     };
-    (!physical_displays
-        .iter()
-        .any(|(id, bounds)| *id != display.id && touches(bounds)))
-    .then_some((display.id, side))
+    let cut_visible = |side: EdgeSide| {
+        let edge = match side {
+            EdgeSide::Left => viewport.min.x,
+            EdgeSide::Right => viewport.max.x,
+        };
+        let column = display
+            .columns
+            .iter()
+            .find(|column| column.x.start < edge && edge < column.x.end)
+            .filter(|column| !column.holds(dragged))?;
+        let visible = match side {
+            EdgeSide::Left => column.x.end - edge,
+            EdgeSide::Right => edge - column.x.start,
+        };
+        Some(visible.min(HOLD_ZONE))
+    };
+    let left_reach =
+        cut_visible(EdgeSide::Left).map_or(bounds.min.x, |visible| viewport.min.x + visible);
+    let right_reach =
+        cut_visible(EdgeSide::Right).map_or(bounds.max.x, |visible| viewport.max.x - visible);
+    [
+        (
+            EdgeSide::Left,
+            bounds.min.x..left_reach.max(bounds.min.x + band(EdgeSide::Left)),
+        ),
+        (
+            EdgeSide::Right,
+            right_reach.min(bounds.max.x - band(EdgeSide::Right))..bounds.max.x,
+        ),
+    ]
+    .into_iter()
+    .find(|(_, x)| x.contains(&x_on(bounds, pointer)))
+    .map(|(side, x)| HoldZone {
+        display: display.id,
+        side,
+        x,
+    })
+}
+
+/// The pointer's x on a display with `bounds`, with the far edge counted as
+/// the display's last point. [`IRect::contains`] puts that edge on the
+/// display, and a pointer pushed against the edge rounds onto it.
+fn x_on(bounds: IRect, pointer: IVec2) -> i32 {
+    pointer.x.min(bounds.max.x - 1)
 }
 
 type EdgeStrips<'w, 's> =
@@ -937,36 +999,39 @@ fn drag_edge_scroll(
         },
         &config,
     );
-    let physical_displays: Vec<_> = parameters
-        .p0()
-        .displays
-        .iter()
-        .map(|(_, display, _, _)| (display.id(), display.physical_bounds()))
-        .collect();
-    let edge = held_edge(&snapshot, &physical_displays, drag.pointer);
     let mut current = None;
     for (entity, hold) in &mut holds {
-        if edge == Some((hold.display, hold.side)) {
-            current = Some((entity, hold));
+        let held = snapshot.managed_strip_displays.iter().any(|display| {
+            display.id == hold.zone.display
+                && display.bounds.contains(drag.pointer)
+                && hold.zone.x.contains(&x_on(display.bounds, drag.pointer))
+        });
+        if held {
+            current = Some(hold);
         } else {
             commands.entity(entity).despawn();
         }
     }
-    let Some((display, side)) = edge else {
-        return;
-    };
-    let Some((_, mut hold)) = current else {
-        commands.spawn(EdgeHold {
-            display,
-            side,
-            next_scroll: time.elapsed() + EDGE_DELAY,
-        });
+    let Some(mut hold) = current else {
+        let physical_displays: Vec<_> = parameters
+            .p0()
+            .displays
+            .iter()
+            .map(|(_, display, _, _)| (display.id(), display.physical_bounds()))
+            .collect();
+        if let Some(zone) = hold_zone(&snapshot, drag.window, &physical_displays, drag.pointer) {
+            commands.spawn(EdgeHold {
+                zone,
+                next_scroll: time.elapsed() + EDGE_DELAY,
+            });
+        }
         return;
     };
     if time.elapsed() < hold.next_scroll {
         return;
     }
     hold.next_scroll = time.elapsed() + EDGE_REPEAT;
+    let (display, side) = (hold.zone.display, hold.zone.side);
     let Some(view) = snapshot
         .managed_strip_displays
         .iter()
