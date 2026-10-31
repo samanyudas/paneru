@@ -5,7 +5,7 @@ use std::time::Duration;
 use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
 
-use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation, Side};
+use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation, Reach, Side};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::{DockPosition, Timeout};
@@ -1175,26 +1175,50 @@ fn flash_messages(world: &mut World) -> Vec<String> {
     query.iter(world).map(|message| message.0.clone()).collect()
 }
 
-/// A harness whose display above has no window, so focusing it focuses its
-/// desktop.
-fn harness_with_empty_display_above() -> TestHarness {
-    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
-    TestHarness::new().with_windows(1).with_display(
+/// Real time that covers the engine's wait for a desktop focus to take
+/// effect. That wait counts real time, not frames.
+const PAST_THE_DESKTOP_FOCUS_WAIT: Duration = Duration::from_millis(600);
+
+/// A harness with `windows` windows whose display at `bounds` has none, so
+/// focusing that display focuses its desktop.
+fn harness_with_empty_display(windows: i32, bounds: IRect) -> TestHarness {
+    TestHarness::new().with_windows(windows).with_display(
         EXT_DISPLAY_ID,
-        ext_bounds,
+        bounds,
         vec![EXT_WORKSPACE_ID],
     )
+}
+
+fn harness_with_empty_display_above() -> TestHarness {
+    harness_with_empty_display(1, IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0))
+}
+
+/// Sends each command and runs one frame after it.
+fn send(harness: &mut TestHarness, events: Vec<Event>) {
+    for event in events {
+        harness.world().write_message::<Event>(event);
+        harness.advance(Duration::from_millis(20));
+    }
+}
+
+/// Lets the desktop focus wait end in real time, then runs a few frames.
+fn wait_out_desktop_focus(harness: &mut TestHarness) {
+    std::thread::sleep(PAST_THE_DESKTOP_FOCUS_WAIT);
+    harness.advance(Duration::from_millis(100));
 }
 
 /// A desktop focus that makes its display active shows no message.
 #[test]
 fn test_accepted_desktop_focus_shows_no_message() {
     let mut harness = harness_with_empty_display_above();
-    harness.run(vec![
-        Event::MenuOpened { window_id: 0 },
-        window_command(Operation::FocusDisplay(Direction::North)),
-    ]);
-    harness.advance(Duration::from_secs(1));
+    send(
+        &mut harness,
+        vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::FocusDisplay(Direction::North)),
+        ],
+    );
+    wait_out_desktop_focus(&mut harness);
 
     assert_eq!(harness.mock_state.active_display(), EXT_DISPLAY_ID);
     assert!(flash_messages(harness.world()).is_empty());
@@ -1206,19 +1230,18 @@ fn test_accepted_desktop_focus_shows_no_message() {
 fn test_ignored_desktop_focus_shows_a_message() {
     let mut harness = harness_with_empty_display_above();
     harness.mock_state.ignore_desktop_focus();
-    harness
-        .world()
-        .write_message::<Event>(Event::MenuOpened { window_id: 0 });
-    harness.advance(Duration::from_millis(100));
-    harness
-        .world()
-        .write_message::<Event>(window_command(Operation::FocusDisplay(Direction::North)));
-    harness.advance(Duration::from_millis(300));
+    send(
+        &mut harness,
+        vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::FocusDisplay(Direction::North)),
+        ],
+    );
     assert!(
         flash_messages(harness.world()).is_empty(),
         "macOS gets time to act before the check"
     );
-    harness.advance(Duration::from_secs(1));
+    wait_out_desktop_focus(&mut harness);
 
     assert_eq!(harness.mock_state.active_display(), TEST_DISPLAY_ID);
     assert_eq!(
@@ -1227,26 +1250,72 @@ fn test_ignored_desktop_focus_shows_a_message() {
     );
 }
 
-/// A newer focus command replaces the desktop focus the check waits on, so
-/// the check does not report on a request the user already moved past.
+/// Once the display is active the check ends, so a switch back before the
+/// wait ends, such as a click on the first display, is not a refusal.
 #[test]
-fn test_newer_focus_command_cancels_the_desktop_focus_check() {
+fn test_switch_back_after_an_accepted_desktop_focus_shows_no_message() {
     let mut harness = harness_with_empty_display_above();
-    harness.mock_state.ignore_desktop_focus();
-    harness
-        .world()
-        .write_message::<Event>(Event::MenuOpened { window_id: 0 });
-    harness.advance(Duration::from_millis(100));
-    harness
-        .world()
-        .write_message::<Event>(window_command(Operation::FocusDisplay(Direction::North)));
-    harness.advance(Duration::from_millis(100));
-    harness
-        .world()
-        .write_message::<Event>(window_command(Operation::FocusDisplay(Direction::South)));
-    harness.advance(Duration::from_secs(1));
+    send(
+        &mut harness,
+        vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::FocusDisplay(Direction::North)),
+        ],
+    );
+    harness.mock_state.activate_display(TEST_DISPLAY_ID);
+    wait_out_desktop_focus(&mut harness);
 
     assert!(flash_messages(harness.world()).is_empty());
+}
+
+/// A newer focus replaces the desktop focus the check waits on, so the
+/// check does not report on a request the user already moved past.
+#[test]
+fn test_newer_focus_cancels_the_desktop_focus_check() {
+    let mut harness =
+        harness_with_empty_display(2, IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0));
+    harness.mock_state.ignore_desktop_focus();
+    send(
+        &mut harness,
+        vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::Last)),
+            window_command(Operation::FocusDisplay(Direction::North)),
+            window_command(Operation::FocusEdge(Side::West, Reach::Display)),
+        ],
+    );
+    wait_out_desktop_focus(&mut harness);
+
+    assert!(flash_messages(harness.world()).is_empty());
+}
+
+/// A held edge key crosses to an empty display once and ignores its
+/// repeats. An ignored repeat is no newer focus, so a refusal of the fresh
+/// press still shows the message.
+#[test]
+fn test_ignored_repeat_keeps_the_desktop_focus_check() {
+    let mut harness =
+        harness_with_empty_display(1, IRect::new(-EXT_DISPLAY_WIDTH, 0, 0, EXT_DISPLAY_HEIGHT));
+    harness.mock_state.ignore_desktop_focus();
+    send(
+        &mut harness,
+        vec![
+            Event::MenuOpened { window_id: 0 },
+            window_command(Operation::Focus(Direction::First)),
+            window_command(Operation::FocusEdge(Side::West, Reach::Display)),
+            window_command(Operation::FocusEdge(Side::West, Reach::Strip)),
+        ],
+    );
+    assert!(
+        harness.mock_state.focused_desktop().is_some(),
+        "the fresh press crossed"
+    );
+    wait_out_desktop_focus(&mut harness);
+
+    assert_eq!(
+        flash_messages(harness.world()),
+        vec!["macOS did not switch to the other display".to_owned()]
+    );
 }
 
 /// Centre column and moving a window to another display leave the pointer

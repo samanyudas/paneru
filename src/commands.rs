@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bevy::app::{PostUpdate, PreUpdate};
 use bevy::ecs::entity::{Entity, EntityHashSet};
@@ -11,7 +11,7 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_changed};
 use bevy::ecs::system::{Commands, ParamSet, Query, Res, ResMut, Single};
 use bevy::math::IRect;
-use bevy::time::{Time, Timer, TimerMode};
+use bevy::time::Time;
 use tracing::{Level, instrument};
 use tracing::{debug, error, info, warn};
 
@@ -129,7 +129,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             copy_window_rule,
             toggle_tabbed_display_handler,
             focus_display,
-            check_desktop_focus,
+            check_desktop_focus.after(focus_display),
             end_width_runs.before(resize_window),
         )
             .in_set(crate::ecs::PreUpdateSet::Dispatch),
@@ -743,11 +743,13 @@ impl HeldEdge {
 /// desktop. It takes well under this on a display that accepts the focus.
 const DESKTOP_FOCUS_WAIT: Duration = Duration::from_millis(500);
 
-/// The display whose desktop the engine last focused, until the wait ends.
-/// macOS can ignore that focus request and still report success, so
-/// [`check_desktop_focus`] then reads the active display again.
+/// The display whose desktop the engine last focused, with the time its wait
+/// ends. macOS can ignore that focus request and still report success, so
+/// [`check_desktop_focus`] reads the active display until it changes or the
+/// wait ends. The wait counts from the request in real time, because the
+/// frame clock also counts the pump's sleep before the key press arrived.
 #[derive(bevy::ecs::resource::Resource, Default)]
-struct DesktopFocusCheck(Option<(u32, Timer)>);
+struct DesktopFocusCheck(Option<(u32, Instant)>);
 
 /// The window display `bounds` shows as active in `strip`: the window that
 /// last had focus there when it is visible, otherwise the most visible window.
@@ -1714,8 +1716,6 @@ fn focus_display(
     .cloned() else {
         return;
     };
-    // A newer focus command replaces the request the check waits on.
-    desktop_check.0 = None;
     let direction = match operation {
         Operation::FocusDisplay(direction) => direction,
         Operation::FocusEdge(side, reach) => {
@@ -1726,6 +1726,8 @@ fn focus_display(
                 return;
             }
             if let EdgeStep::Column(index) = step {
+                // A newer focus replaces the request the check waits on.
+                desktop_check.0 = None;
                 if let Some(entity) = strip
                     .get(index)
                     .ok()
@@ -1755,6 +1757,7 @@ fn focus_display(
         return;
     };
     let target_bounds = target.bounds();
+    desktop_check.0 = None;
 
     let strip = window_manager
         .active_display_space(target.id())
@@ -1773,7 +1776,7 @@ fn focus_display(
     }
     match window_manager.focus_desktop(target_bounds) {
         Ok(()) => {
-            desktop_check.0 = Some((target.id(), Timer::new(DESKTOP_FOCUS_WAIT, TimerMode::Once)));
+            desktop_check.0 = Some((target.id(), Instant::now() + DESKTOP_FOCUS_WAIT));
         }
         Err(err) => warn!(
             "can not focus the desktop of display {}: {err}",
@@ -1786,31 +1789,45 @@ fn focus_display(
 }
 
 /// Reports a desktop focus that macOS ignored. The request returns success even
-/// then, so the active display read after [`DESKTOP_FOCUS_WAIT`] is the only
-/// sign that the display did not become active.
+/// then, so an active display that has not changed when [`DESKTOP_FOCUS_WAIT`]
+/// ends is the only sign. The check ends early once the display is active, so
+/// a later switch back, by the user or the engine, is not taken for a refusal.
 fn check_desktop_focus(
     mut check: ResMut<DesktopFocusCheck>,
-    clock: Res<Time>,
+    displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
-    let Some((display_id, timer)) = check.0.as_mut() else {
+    let Some((display_id, deadline)) = check.0 else {
         return;
     };
-    if !timer.tick(clock.delta()).is_finished() {
+    if !displays.iter().any(|display| display.id() == display_id) {
+        debug!("display {display_id} went away before its desktop focus was checked.");
+        check.0 = None;
         return;
     }
-    let display_id = *display_id;
-    check.0 = None;
     let active = window_manager.active_display_id();
     if active.as_ref().is_ok_and(|&active| active == display_id) {
+        check.0 = None;
         return;
     }
-    warn!(
-        "macOS did not make display {display_id} active after the engine focused its desktop \
-         (active display: {active:?})"
-    );
-    commands.flash_message("macOS did not switch to the other display".to_owned(), 2.5);
+    if Instant::now() < deadline {
+        return;
+    }
+    check.0 = None;
+    match active {
+        Ok(active) => {
+            warn!(
+                "macOS did not make display {display_id} active after the engine focused its \
+                 desktop. Display {active} is still active."
+            );
+            commands.flash_message("macOS did not switch to the other display".to_owned(), 2.5);
+        }
+        Err(err) => warn!(
+            "can not tell whether display {display_id} became active after the engine focused \
+             its desktop: {err}"
+        ),
+    }
 }
 
 /// Moves the mouse pointer to the next available display.
