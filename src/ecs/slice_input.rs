@@ -61,7 +61,12 @@ fn reveal_pressed(
             );
             continue;
         };
-        focus_with_verification(entity, windows.focused().map(|(_, e)| e), &mut commands);
+        focus_with_verification(
+            entity,
+            windows.focused().map(|(_, e)| e),
+            None,
+            &mut commands,
+        );
         commands.reshuffle_around(entity);
         commands.insert_resource(PendingPress {
             press: *press,

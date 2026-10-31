@@ -54,7 +54,11 @@ fn focus(direction: Direction) -> Event {
 }
 
 fn swipe(delta: f64) -> Event {
-    Event::Swipe { delta, fingers: 3 }
+    Event::Swipe {
+        delta,
+        fingers: 3,
+        distance_cm: 0.0,
+    }
 }
 
 fn send(harness: &mut TestHarness, event: Event) {

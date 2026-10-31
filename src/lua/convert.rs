@@ -188,7 +188,7 @@ impl TryFrom<&Event> for LuaEvent {
                 LuaEvent::MouseMoved(mouse(point, *modifiers))
             }
 
-            Event::Swipe { delta, fingers } => LuaEvent::Swipe {
+            Event::Swipe { delta, fingers, .. } => LuaEvent::Swipe {
                 delta: *delta,
                 fingers: *fingers,
             },
@@ -537,12 +537,14 @@ mod tests {
             &Event::Swipe {
                 delta: 1.5,
                 fingers: 3,
+                distance_cm: 0.0,
             },
         )
         .expect("swipe should marshal");
         assert_eq!(name, "swipe");
         assert!((table.get::<f64>("delta").unwrap() - 1.5).abs() < f64::EPSILON);
         assert_eq!(table.get::<i64>("fingers").unwrap(), 3);
+        assert!(table.get::<mlua::Value>("distance_cm").unwrap().is_nil());
     }
 
     #[test]

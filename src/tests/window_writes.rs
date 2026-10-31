@@ -75,6 +75,7 @@ fn swipe(harness: &mut TestHarness) {
     harness.world().write_message::<Event>(Event::Swipe {
         delta: 0.3,
         fingers: 3,
+        distance_cm: 0.0,
     });
 }
 

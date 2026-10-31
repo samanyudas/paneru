@@ -757,6 +757,9 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         fingers_count: _,
         direction: _,
         vertical: _,
+        paging: _,
+        page_distance_cm: _,
+        haptics: _,
     } = GestureOptions::default();
     let gesture = lua.create_table()?;
     gesture.set("fingers_count", config.swipe_gesture_fingers())?;
@@ -766,6 +769,9 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     };
     gesture.set("direction", direction_str)?;
     gesture.set("vertical", config.swipe_vertical())?;
+    gesture.set("paging", config.swipe_gesture_paging())?;
+    gesture.set("page_distance_cm", config.swipe_gesture_page_distance_cm())?;
+    gesture.set("haptics", config.swipe_gesture_haptics())?;
     swipe.set("gesture", gesture)?;
 
     let ScrollOptions {
@@ -891,6 +897,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn config_to_lua_table_covers_every_struct_field() {
         // Build a config where optional fields without built-in scalar defaults
         // are populated, so every mapped key in the Lua table is non-nil.
@@ -906,6 +913,9 @@ mod tests {
 
             [swipe.gesture]
             fingers_count = 3
+            paging = true
+            page_distance_cm = 3.0
+            haptics = false
 
             [swipe.scroll]
             modifier = "alt"
@@ -958,6 +968,9 @@ mod tests {
                 "GestureOptions field '{field}' is missing from paneru.config.swipe.gesture!"
             );
         }
+        assert!(gesture_table.get::<bool>("paging").unwrap());
+        assert_eq!(gesture_table.get::<f64>("page_distance_cm").unwrap(), 3.0);
+        assert!(!gesture_table.get::<bool>("haptics").unwrap());
 
         let scroll_table: Table = swipe_table.get("scroll").unwrap();
         for field in struct_field_names::<ScrollOptions>() {
@@ -976,6 +989,12 @@ mod tests {
                 "RestoreOptions field '{field}' is missing from paneru.config.restore!"
             );
         }
+        let defaults = config_to_lua_table(&lua, &Config::default()).unwrap();
+        let swipe: Table = defaults.get("swipe").unwrap();
+        let gesture: Table = swipe.get("gesture").unwrap();
+        assert!(!gesture.get::<bool>("paging").unwrap());
+        assert_eq!(gesture.get::<f64>("page_distance_cm").unwrap(), 2.0);
+        assert!(gesture.get::<bool>("haptics").unwrap());
     }
 
     #[test]

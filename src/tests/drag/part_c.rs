@@ -3181,9 +3181,11 @@ fn tile_lifecycle_settlement_retries_after_swipe_or_frame_read_failure() {
         if swipe {
             for _ in 0..20 {
                 for delta in [0.01, -0.01] {
-                    harness
-                        .world()
-                        .write_message(Event::Swipe { delta, fingers: 3 });
+                    harness.world().write_message(Event::Swipe {
+                        delta,
+                        fingers: 3,
+                        distance_cm: 0.0,
+                    });
                 }
                 harness.advance(FRAME * 2);
             }

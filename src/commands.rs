@@ -4,12 +4,12 @@ use bevy::app::{PostUpdate, PreUpdate};
 use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove};
-use bevy::ecs::message::MessageReader;
+use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_changed};
-use bevy::ecs::system::{Commands, ParamSet, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, ParamSet, Query, Res, ResMut, Single, SystemParam};
 use bevy::math::IRect;
 use bevy::time::{Real, Time};
 use tracing::{Level, instrument};
@@ -21,22 +21,23 @@ use crate::config::Config;
 use crate::config::snippet::{RuleSubject, SnippetDialect, window_rule_snippet};
 use crate::ecs::display::{DisplayMoves, FloatingLayer};
 use crate::ecs::drag::NativeResizeStart;
-use crate::ecs::focus::FocusHistory;
+use crate::ecs::focus::{FocusHistory, PageHapticRequest};
 use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, RestoreTo, StackItem, anchored_origin,
     clamp_origin_to_viewport, effective_stack_limit, hold_minimum_heights, strip_signature,
 };
 use crate::ecs::maximize::{FloatingMaximized, restore_tiled};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowCtx, Windows};
+use crate::ecs::scroll::{PageFocusRequest, PageGestureState, PageInFlight};
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, ManualStripOffset,
-    MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, RaiseWindow,
-    SelectedVirtualMarker, SpawnCommandsExt, StepPartners, Timeout, Unmanaged, VerifyWindowSize,
-    WidthAnchor, WidthRun, WindowProperties,
+    MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, Position, RaiseWindow,
+    RepositionMarker, SelectedVirtualMarker, SpawnCommandsExt, StepPartners, Timeout, Unmanaged,
+    VerifyWindowSize, WidthAnchor, WidthRun, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
-use crate::manager::{Application, Display, Size, Window, WindowManager, origin_from};
+use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::platform::WorkspaceId;
 use crate::util::round_px;
 
@@ -58,6 +59,16 @@ type StripsWithVisibility<'w, 's> = Query<
         Has<SelectedVirtualMarker>,
     ),
 >;
+
+#[derive(SystemParam)]
+struct PagingFocusParams<'w, 's> {
+    page_requests: MessageReader<'w, 's, PageFocusRequest>,
+    page_state: ResMut<'w, PageGestureState>,
+    config: Res<'w, Config>,
+    strip_positions:
+        Query<'w, 's, (&'static Position, Option<&'static RepositionMarker>), With<LayoutStrip>>,
+    haptics: MessageWriter<'w, PageHapticRequest>,
+}
 
 pub fn register_commands(app: &mut bevy::app::App) {
     app.init_resource::<crate::menubar::MenuBarVisibility>()
@@ -330,11 +341,15 @@ fn nearest_float_in_direction(
 pub(crate) fn focus_with_verification(
     entity: Entity,
     focused_entity: Option<Entity>,
+    paging: Option<&mut PageGestureState>,
     commands: &mut Commands,
 ) {
     if focused_entity != Some(entity)
         && let Ok(mut entity_commands) = commands.get_entity(entity)
     {
+        if let Some(paging) = paging {
+            paging.await_focus(entity);
+        }
         entity_commands.try_insert((
             crate::ecs::VerifyFocus::default(),
             Timeout::for_component::<crate::ecs::VerifyFocus>(
@@ -345,67 +360,15 @@ pub(crate) fn focus_with_verification(
     commands.focus_entity(entity, true);
 }
 
-fn command_move_focus(
-    mut messages: MessageReader<Event>,
-    windows: Windows,
-    workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
-    active_display: ActiveDisplay,
-    window_manager: Res<WindowManager>,
-    focus_history: Res<FocusHistory>,
-    mut commands: Commands,
-) {
-    let Some(Operation::Focus(direction)) =
-        filter_window_operations(&mut messages, |op| matches!(op, Operation::Focus(_))).next()
-    else {
-        return;
-    };
-
-    let active_strip = active_display.active_strip();
-
-    // On a fullscreen space, swap to the last column in the workspace.
-    if let Some(NativeFullscreenMarker {
-        layout_strip,
-        workspace_id,
-        index: _,
-    }) = active_display.fullscreen()
-        && matches!(direction, Direction::West)
-    {
-        let mut strip = workspaces
-            .into_iter()
-            .find_map(|(strip, entity, _)| (entity == *layout_strip).then_some(strip));
-        if strip.is_none() {
-            strip = workspaces
-                .into_iter()
-                .find_map(|(strip, _, _)| (strip.id() == *workspace_id).then_some(strip));
-        }
-
-        if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
-            debug!("fullscreen: swap raising {entity}");
-            focus_with_verification(entity, windows.focused().map(|(_, e)| e), &mut commands);
-        }
-        return;
-    }
-
-    let Some((_, focused_entity)) = windows.focused() else {
-        return;
-    };
-
-    if let Some((_, _, Some(Unmanaged::Floating))) = windows.get_managed(focused_entity)
-        && !matches!(direction, Direction::Nth(_))
-    {
-        if let Some(entity) = nearest_float_in_direction(
-            direction,
-            focused_entity,
-            &windows,
-            &window_manager,
-            active_strip.id(),
-            active_display.bounds(),
-        ) {
-            focus_with_verification(entity, Some(focused_entity), &mut commands);
-        }
-        return;
-    }
-
+/// A first, last, or numbered column jump lands on the window last focused in
+/// that column, not on the column top.
+fn active_focus_candidate(
+    direction: &Direction,
+    focused_entity: Entity,
+    active_strip: &LayoutStrip,
+    workspaces: &Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
+    focus_history: &FocusHistory,
+) -> Option<Entity> {
     let column_jump = match direction {
         Direction::First => active_strip.first().ok(),
         Direction::Last => active_strip.last().ok(),
@@ -413,7 +376,7 @@ fn command_move_focus(
         Direction::North | Direction::South | Direction::West | Direction::East => None,
     }
     .map(|column| focus_history.last_focused_in(&column));
-    let candidate = if let Some(target) = column_jump {
+    if let Some(target) = column_jump {
         target
     } else if active_strip.contains(focused_entity) {
         get_window_in_direction(direction, focused_entity, active_strip).or_else(|| {
@@ -436,14 +399,145 @@ fn command_move_focus(
             Direction::West => active_strip.last().ok().and_then(|col| col.top()),
             _ => None,
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_move_focus(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
+    active_display: ActiveDisplay,
+    window_manager: Res<WindowManager>,
+    focus_history: Res<FocusHistory>,
+    mut paging: PagingFocusParams,
+    mut commands: Commands,
+) {
+    let Some((direction, is_page)) =
+        filter_window_operations(&mut messages, |op| matches!(op, Operation::Focus(_)))
+            .find_map(|op| match op {
+                Operation::Focus(direction) => Some((direction.clone(), false)),
+                _ => None,
+            })
+            .or_else(|| {
+                let generation = paging.page_state.generation;
+                let dispatched =
+                    matches!(paging.page_state.in_flight, Some(PageInFlight::Dispatched));
+                paging.page_requests.read().find_map(|req| {
+                    (dispatched && req.generation == generation)
+                        .then(|| (req.direction.clone(), true))
+                })
+            })
+    else {
+        return;
+    };
+    let direction = &direction;
+    if is_page {
+        paging.page_state.in_flight = None;
+    }
+
+    let active_strip = active_display.active_strip();
+
+    // On a fullscreen space, swap to the last column in the workspace.
+    if let Some(fullscreen) = active_display.fullscreen()
+        && matches!(direction, Direction::West)
+    {
+        focus_from_fullscreen(
+            fullscreen,
+            &workspaces,
+            &windows,
+            is_page,
+            &mut paging.page_state,
+            &mut commands,
+        );
+        return;
+    }
+
+    let Some((_, focused_entity)) = windows.focused() else {
+        return;
     };
 
+    if let Some((_, _, Some(Unmanaged::Floating))) = windows.get_managed(focused_entity)
+        && !matches!(direction, Direction::Nth(_))
+    {
+        if let Some(entity) = nearest_float_in_direction(
+            direction,
+            focused_entity,
+            &windows,
+            &window_manager,
+            active_strip.id(),
+            active_display.bounds(),
+        ) {
+            focus_with_verification(
+                entity,
+                Some(focused_entity),
+                is_page.then_some(&mut *paging.page_state),
+                &mut commands,
+            );
+        }
+        return;
+    }
+
+    if is_page
+        && reveal_clipped_page(
+            direction,
+            focused_entity,
+            &windows,
+            &active_display,
+            &mut paging,
+            &mut commands,
+        )
+    {
+        return;
+    }
+
+    let candidate = active_focus_candidate(
+        direction,
+        focused_entity,
+        active_strip,
+        &workspaces,
+        &focus_history,
+    );
+
     if let Some(entity) = candidate {
-        focus_with_verification(entity, Some(focused_entity), &mut commands);
+        focus_with_verification(
+            entity,
+            Some(focused_entity),
+            is_page.then_some(&mut *paging.page_state),
+            &mut commands,
+        );
         // Explicitly reshuffle so the target window is brought into view.
         // This avoids a race where focus-follows-mouse leaves skip_reshuffle
         // set, causing the WindowFocused handler to skip the reshuffle.
         commands.reshuffle_around(entity);
+    }
+}
+
+fn focus_from_fullscreen(
+    fullscreen: &NativeFullscreenMarker,
+    workspaces: &Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
+    windows: &Windows,
+    is_page: bool,
+    page_state: &mut PageGestureState,
+    commands: &mut Commands,
+) {
+    let mut strip = workspaces
+        .iter()
+        .find_map(|(strip, entity, _)| (entity == fullscreen.layout_strip).then_some(strip));
+    if strip.is_none() {
+        strip = workspaces
+            .iter()
+            .find_map(|(strip, _, _)| (strip.id() == fullscreen.workspace_id).then_some(strip));
+    }
+
+    if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
+        debug!("fullscreen: swap raising {entity}");
+        focus_with_verification(
+            entity,
+            windows.focused().map(|(_, e)| e),
+            is_page.then_some(page_state),
+            commands,
+        );
     }
 }
 
@@ -1742,7 +1836,7 @@ fn focus_display(
                     .ok()
                     .and_then(|column| focus_history.last_focused_in(&column))
                 {
-                    focus_with_verification(entity, focused, &mut commands);
+                    focus_with_verification(entity, focused, None, &mut commands);
                     commands.reshuffle_around(entity);
                 }
                 return;
@@ -1854,7 +1948,7 @@ fn check_desktop_focus(
 fn mouse_to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    layout_strips: Query<(&LayoutStrip, Entity)>,
+    layout_strips: Query<(&LayoutStrip, Entity, Has<SelectedVirtualMarker>)>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
@@ -1883,7 +1977,13 @@ fn mouse_to_next_display(
     let Some((other_strip, _)) = window_manager
         .active_display_space(other.id())
         .ok()
-        .and_then(|id| layout_strips.iter().find(|(strip, _)| strip.id() == id))
+        .and_then(|id| {
+            layout_strips
+                .iter()
+                .filter(|(strip, _, _)| strip.id() == id)
+                .min_by_key(|(strip, _, selected)| (!*selected, strip.virtual_index))
+                .map(|(strip, entity, _)| (strip, entity))
+        })
     else {
         return;
     };
@@ -2047,29 +2147,91 @@ fn snap_window(
     let Some((_, entity)) = windows.focused() else {
         return;
     };
-    let Some(layout_position) = windows.layout_position(entity) else {
+    let Some(strip_position) = snap_strip_position(entity, &windows, &active_display, &config)
+    else {
         return;
     };
-    let Some(mut frame) = windows.moving_frame(entity) else {
-        return;
-    };
+    reposition_strip_to_snap(strip_position, &active_display, &windows, &mut commands);
+}
 
-    let display_bounds = active_display.actual_bounds(&config);
+fn snap_strip_position(
+    entity: Entity,
+    windows: &Windows,
+    active_display: &ActiveDisplay,
+    config: &Config,
+) -> Option<Origin> {
+    let layout_position = windows.layout_position(entity)?;
+    let mut frame = windows.moving_frame(entity)?;
+
+    let display_bounds = active_display.actual_bounds(config);
 
     // Clamp the frame into the display and reposition the *strip* (not the
     // window) so the layout stays consistent.
     let size = frame.size();
     frame.min = clamp_origin_to_viewport(frame.min, size, display_bounds);
-    frame.max = frame.min + size;
+    Some(frame.min - layout_position.0)
+}
 
-    let strip_position = frame.min - layout_position.0;
+/// A page gesture reveals a mouse-focused window that is clipped on the side
+/// being swiped toward before advancing focus to the next window.
+fn reveal_clipped_page(
+    direction: &Direction,
+    focused_entity: Entity,
+    windows: &Windows,
+    active_display: &ActiveDisplay,
+    paging: &mut PagingFocusParams,
+    commands: &mut Commands,
+) -> bool {
+    if !active_display.active_strip().contains(focused_entity) {
+        return false;
+    }
+    let Some(frame) = windows.moving_frame(focused_entity) else {
+        return false;
+    };
+    let bounds = active_display.actual_bounds(&paging.config);
+    let clipped_on_swipe_side = match direction {
+        Direction::West => frame.min.x < bounds.min.x,
+        Direction::East => frame.max.x > bounds.max.x,
+        _ => false,
+    };
+    if !clipped_on_swipe_side {
+        return false;
+    }
+
+    let Some(target) = snap_strip_position(focused_entity, windows, active_display, &paging.config)
+    else {
+        return false;
+    };
+    let Ok((position, reposition)) = paging
+        .strip_positions
+        .get(active_display.active_strip_entity())
+    else {
+        return false;
+    };
+    if target == reposition.map_or(position.0, |pending| pending.0) {
+        return false;
+    }
+
+    reposition_strip_to_snap(target, active_display, windows, commands);
+    if paging.config.swipe_gesture_haptics() {
+        paging.haptics.write(PageHapticRequest);
+    }
+    true
+}
+
+fn reposition_strip_to_snap(
+    strip_position: Origin,
+    active_display: &ActiveDisplay,
+    windows: &Windows,
+    commands: &mut Commands,
+) {
     let strip_entity = active_display.active_strip_entity();
     commands.reposition_entity(strip_entity, strip_position);
     mark_manual_offset(
         strip_entity,
         active_display.active_strip(),
-        &windows,
-        &mut commands,
+        windows,
+        commands,
     );
 }
 
