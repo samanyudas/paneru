@@ -1012,9 +1012,11 @@ fn a_swipe_scrolls_past_a_maximized_window() {
 
     let swipe = |harness: &mut TestHarness, delta: f64| {
         for _ in 0..10 {
-            harness
-                .world()
-                .write_message(Event::Swipe { delta, fingers: 3 });
+            harness.world().write_message(Event::Swipe {
+                delta,
+                fingers: 3,
+                distance_cm: 0.0,
+            });
             harness.advance(Duration::from_millis(20));
             assert_eq!(os_frame(harness, 1).size(), area.size(), "still maximized");
             assert_nothing_covers(harness, 1, &[0, 2]);
@@ -1385,6 +1387,7 @@ fn a_padding_reload_keeps_a_swiped_strip_where_it_was() {
         harness.world().write_message(Event::Swipe {
             delta: 0.05,
             fingers: 3,
+            distance_cm: 0.0,
         });
         harness.advance(Duration::from_millis(20));
     }

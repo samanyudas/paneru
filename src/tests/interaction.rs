@@ -208,6 +208,22 @@ fn test_edge_touching_focus_during_center_animation_returns_into_view() {
     );
 }
 
+#[derive(Resource, Default)]
+struct PagingHapticCount(usize);
+
+fn count_paging_haptics(
+    mut requests: MessageReader<crate::ecs::focus::PageHapticRequest>,
+    mut count: ResMut<PagingHapticCount>,
+) {
+    count.0 += requests.read().count();
+}
+
+fn with_paging_haptic_counter(mut harness: TestHarness) -> TestHarness {
+    harness.app.init_resource::<PagingHapticCount>();
+    harness.app.add_systems(PostUpdate, count_paging_haptics);
+    harness
+}
+
 #[test]
 fn native_fullscreen_transition_removes_window_from_original_strip_without_focus_marker() {
     const FULLSCREEN_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 100;
@@ -519,6 +535,7 @@ fn test_scrolling() {
         Event::Swipe {
             delta: 0.04,
             fingers: 3,
+            distance_cm: 0.0,
         },
         Event::Command {
             command: Command::PrintState,
@@ -556,6 +573,303 @@ fn test_scrolling() {
 }
 
 #[test]
+fn paging_waits_for_distance_then_focuses_without_free_scrolling() {
+    let config = Config::try_from(
+        "[swipe.gesture]\nfingers_count = 3\npaging = true\npage_distance_cm = 2.0\n",
+    )
+    .unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(4);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 1.5,
+    });
+    h.advance(Duration::from_millis(40));
+    let world = h.world();
+    assert_focused!(world, 0);
+    assert_eq!(
+        world.query::<&crate::ecs::Scrolling>().iter(world).count(),
+        0
+    );
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 0.5,
+    });
+    h.advance(Duration::from_millis(100));
+    let world = h.world();
+    assert_focused!(world, 1);
+    assert_eq!(
+        world.query::<&crate::ecs::Scrolling>().iter(world).count(),
+        0
+    );
+}
+
+#[test]
+fn paging_first_reveals_a_mouse_focused_window_clipped_on_the_swipe_side() {
+    // Miri turns focus follows mouse off by default; this test needs it.
+    let config = Config::try_from(
+        "[options]\nanimation_speed = 10000.0\nfocus_follows_mouse = true\n[swipe.gesture]\nfingers_count = 3\npaging = true\n",
+    )
+    .unwrap();
+    let mut h = with_paging_haptic_counter(TestHarness::new().with_config(config).with_windows(3));
+    h.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Center),
+        },
+    ]);
+    assert!(window_x(h.world(), 0) < 0);
+
+    // Centering window 1 leaves window 0 partly visible on the left. Mouse
+    // focus changes to window 0 without moving the strip.
+    h.world().write_message::<Event>(Event::MouseMoved {
+        point: CGPoint { x: 25.0, y: 400.0 },
+        modifiers: Modifiers::empty(),
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 0);
+    assert!(window_x(h.world(), 0) < 0);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: -0.2,
+        fingers: 3,
+        distance_cm: -2.0,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 0);
+    assert_eq!(window_x(h.world(), 0), 0);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 1);
+
+    // A further westward page at the strip edge cannot change anything.
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: -0.2,
+        fingers: 3,
+        distance_cm: -2.0,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 0);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 1);
+}
+
+#[test]
+fn paging_fast_swipe_keeps_each_step_and_signed_remainder() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(4);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.3,
+        fingers: 3,
+        distance_cm: 4.5,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 2);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: -0.1,
+        fingers: 3,
+        distance_cm: -0.6,
+    });
+    h.advance(Duration::from_millis(40));
+    assert_focused!(h.world(), 2);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: -0.2,
+        fingers: 3,
+        distance_cm: -1.9,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 1);
+}
+
+#[test]
+fn paging_lift_discards_only_fractional_travel() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 1.5,
+    });
+    h.advance(Duration::from_millis(40));
+    h.world().write_message::<Event>(Event::TouchpadUp);
+    h.advance(Duration::from_millis(20));
+    h.world().write_message::<Event>(Event::TouchpadDown);
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 0.6,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 0);
+}
+
+#[test]
+fn paging_ignores_a_stale_focus_request_after_gesture_reset() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world()
+        .write_message(crate::ecs::scroll::PageFocusRequest {
+            direction: crate::commands::Direction::East,
+            generation: 0,
+        });
+    h.advance(Duration::from_millis(20));
+    assert_focused!(h.world(), 0);
+}
+
+#[test]
+fn paging_respects_reversed_direction_and_strip_edges() {
+    let config = Config::try_from(
+        "[swipe.gesture]\nfingers_count = 3\npaging = true\ndirection = 'Reversed'\n",
+    )
+    .unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+    });
+    h.advance(Duration::from_millis(60));
+    assert_focused!(h.world(), 0);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: -0.2,
+        fingers: 3,
+        distance_cm: -2.0,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 1);
+}
+
+#[test]
+fn paging_inactivity_resets_partial_distance() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 1.5,
+    });
+    h.advance(Duration::from_millis(200));
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 0.6,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 0);
+}
+
+#[test]
+fn paging_haptics_default_on_and_off_setting_only_changes_pulses() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = with_paging_haptic_counter(TestHarness::new().with_config(config).with_windows(4));
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 1);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 1);
+
+    let disabled =
+        Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\nhaptics = false\n")
+            .unwrap();
+    h.world().insert_resource(disabled);
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 2);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 1);
+
+    let enabled =
+        Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\nhaptics = true\n")
+            .unwrap();
+    h.world().insert_resource(enabled);
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 3);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 2);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 3);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 2);
+}
+
+#[test]
+fn keyboard_focus_never_requests_paging_haptics() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = with_paging_haptic_counter(TestHarness::new().with_config(config).with_windows(3));
+    h.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+    ]);
+    assert_focused!(h.world(), 1);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 0);
+}
+
+#[test]
+fn keyboard_focus_in_same_frame_does_not_stall_later_pages() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(4);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::East)),
+    });
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+    });
+    h.advance(Duration::from_millis(16));
+    assert_focused!(h.world(), 1);
+
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 2);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 3);
+}
+
+#[test]
 #[allow(clippy::float_cmp)]
 fn test_scrolling_stop() {
     let commands = vec![
@@ -563,6 +877,7 @@ fn test_scrolling_stop() {
         Event::Swipe {
             delta: 0.3,
             fingers: 3,
+            distance_cm: 0.0,
         },
         Event::TouchpadDown,
     ];
@@ -596,6 +911,7 @@ fn test_window_hidden_ratio() {
         Event::Swipe {
             delta: 0.3,
             fingers: 3,
+            distance_cm: 0.0,
         },
         Event::Command {
             command: Command::Window(Operation::Focus(Direction::First)),
@@ -1277,6 +1593,32 @@ fn test_silent_accessibility_list_does_not_fold_visible_windows() {
     assert_eq!(strip.len(), 2, "both windows keep their own column");
 }
 
+/// Without an overlapping column-top pair on the active strip,
+/// `regroup_stray_native_tabs` must not touch `windows_on_screen` or
+/// `ax_window_ids` on its periodic timer.
+#[test]
+fn test_regroup_stray_native_tabs_skips_os_queries_without_overlapping_columns() {
+    use crate::manager::{MockWindowManagerApi, WindowManager};
+    use std::time::Duration;
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.advance(Duration::from_millis(100));
+
+    // Replace WindowManager with a strict mock that panics if
+    // `windows_on_screen` is called when no columns share a frame.
+    let mut wm = MockWindowManagerApi::new();
+    wm.expect_windows_on_screen().never();
+    wm.expect_window_ordered_in().returning(|_| Ok(true));
+    wm.expect_present_displays().returning(Vec::new);
+    harness
+        .app
+        .world_mut()
+        .insert_resource(WindowManager(Box::new(wm)));
+
+    // Advance past the 1-second CLOSED_WINDOW_CHECK_FREQ timer.
+    harness.advance(Duration::from_millis(1100));
+}
+
 /// An app with native tabs answers "which window is focused?" with whichever
 /// member of the tab group it decided to show, so the id on a focus event can
 /// already be out of date. Paneru has to follow the app to that window; drop
@@ -1688,6 +2030,7 @@ fn test_mid_strip_insertion_preserves_window_x() {
         Event::Swipe {
             delta: 0.06,
             fingers: 3,
+            distance_cm: 0.0,
         },
         // Used as a noop to let the scroll settle.
         Event::MenuOpened { window_id: 0 },
@@ -1698,6 +2041,7 @@ fn test_mid_strip_insertion_preserves_window_x() {
         Event::Swipe {
             delta: 0.04,
             fingers: 3,
+            distance_cm: 0.0,
         },
         Event::MenuOpened { window_id: 0 },
         // Change back to VW0 and send one window over to VW1.
@@ -1886,6 +2230,7 @@ fn test_mid_strip_move_does_not_animate() {
     h.app.world_mut().write_message::<Event>(Event::Swipe {
         delta: 0.3,
         fingers: 3,
+        distance_cm: 0.0,
     });
     for _ in 0..6 {
         h.app.update();
@@ -1897,6 +2242,7 @@ fn test_mid_strip_move_does_not_animate() {
     h.app.world_mut().write_message::<Event>(Event::Swipe {
         delta: 0.3,
         fingers: 3,
+        distance_cm: 0.0,
     });
     for _ in 0..6 {
         h.app.update();
@@ -1972,6 +2318,7 @@ fn test_virtual_workspace_switch_no_horizontal_slide_no_animations() {
         Event::Swipe {
             delta: 0.3,
             fingers: 3,
+            distance_cm: 0.0,
         },
     );
 
@@ -2517,6 +2864,7 @@ fn test_virtual_workspace_switch_stops_in_flight_strip_animation() {
     h.app.world_mut().write_message::<Event>(Event::Swipe {
         delta: 0.3,
         fingers: 3,
+        distance_cm: 0.0,
     });
     // One frame to start the animation.
     h.app.update();
@@ -2817,6 +3165,7 @@ fn test_virtual_workspace_switch_preserves_scroll_with_animations() {
         Event::Swipe {
             delta: 0.4,
             fingers: 3,
+            distance_cm: 0.0,
         },
     );
 
@@ -3583,6 +3932,7 @@ fn test_center_dropped_on_user_swipe() {
         Event::Swipe {
             delta: -0.2,
             fingers: 3,
+            distance_cm: 0.0,
         },
     ];
 

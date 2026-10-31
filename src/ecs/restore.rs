@@ -594,7 +594,9 @@ pub(super) fn restore_window_state(
         if is_global_active {
             spawned.insert(RestoredActivation);
         } else {
-            if !is_active {
+            if is_active {
+                spawned.insert(SelectedVirtualMarker);
+            } else {
                 spawned.remove::<SelectedVirtualMarker>();
             }
             if !is_shown {
