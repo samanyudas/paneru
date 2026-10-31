@@ -506,7 +506,7 @@ fn leaving_an_edge_cancels_the_hold_and_reentering_waits_again() {
     harness.advance(ms(300));
     harness
         .world()
-        .write_message(mouse_dragged(Origin::new(40, 500)));
+        .write_message(mouse_dragged(Origin::new(300, 500)));
     harness.advance(ms(400));
     assert_eq!(strip_x(harness.world(), TEST_WORKSPACE_ID), before);
     harness.world().write_message(mouse_dragged(edge));
@@ -518,12 +518,12 @@ fn leaving_an_edge_cancels_the_hold_and_reentering_waits_again() {
 
 #[test]
 fn an_edge_with_a_neighboring_display_does_not_scroll() {
-    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
-    let edge = Origin::new(TEST_DISPLAY_WIDTH - 2, 500);
-    press_and_drag(&mut harness, 0, edge);
-    let before = strip_x(harness.world(), TEST_WORKSPACE_ID);
-    harness.advance(ms(1200));
-    assert_eq!(strip_x(harness.world(), TEST_WORKSPACE_ID), before);
+    let mut harness = overflowing_right_with_display(ext_bounds(EXT_DISPLAY_HEIGHT));
+    assert!(!edge_hold_scrolls(
+        &mut harness,
+        0,
+        Origin::new(TEST_DISPLAY_WIDTH - 2, 500)
+    ));
 }
 
 #[test]
@@ -2146,17 +2146,17 @@ fn a_real_native_move_during_an_engine_animation_applies() {
 
 #[test]
 fn a_neighbor_display_showing_a_fullscreen_space_still_stops_the_edge_scroll() {
-    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    let mut harness = overflowing_right_with_display(ext_bounds(EXT_DISPLAY_HEIGHT));
     // The external display shows a native fullscreen space, which has no
     // managed strip, so the drag snapshot leaves that display out.
     harness
         .mock_state
         .activate_workspace(EXT_DISPLAY_ID, EXT_WORKSPACE_ID + 1, true);
-    let edge = Origin::new(TEST_DISPLAY_WIDTH - 2, 500);
-    press_and_drag(&mut harness, 0, edge);
-    let before = strip_x(harness.world(), TEST_WORKSPACE_ID);
-    harness.advance(ms(1200));
-    assert_eq!(strip_x(harness.world(), TEST_WORKSPACE_ID), before);
+    assert!(!edge_hold_scrolls(
+        &mut harness,
+        0,
+        Origin::new(TEST_DISPLAY_WIDTH - 2, 500)
+    ));
 }
 
 /// The main display above a smaller, empty display, as on the native rig:
@@ -3378,23 +3378,29 @@ fn tile_lifecycle_relative_width_during_a_hold_uses_the_held_slot() {
     assert_eq!(frame(harness.world(), 0), expected);
 }
 
-/// Six columns on the main display, the first focused so the rest overflow
-/// to the right, with the external display at `ext`.
+/// Six columns on the main display, the third focused so it ends at the right
+/// edge and the last three overflow past it, with the external display at
+/// `ext`. No column is cut off at the right edge, so only the edge band can
+/// start a hold there.
 fn overflowing_right_with_display(ext: IRect) -> TestHarness {
     let mut harness = TestHarness::new()
         .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
         .with_windows(6);
     harness.run(vec![Event::MenuOpened { window_id: 0 }]);
     harness.advance(SETTLE);
-    harness.run(vec![command(Operation::Focus(Direction::First))]);
+    harness.run(vec![command(Operation::Focus(Direction::Nth(2)))]);
     harness.advance(SETTLE);
     harness
 }
 
-/// Holds window 0 at `edge` on the main display for 1200ms, and returns
-/// whether the strip scrolled.
-fn edge_hold_scrolls(harness: &mut TestHarness, edge: Origin) -> bool {
-    press_and_drag(harness, 0, edge);
+/// Holds window `window` at `edge` on the main display for 1200ms, and
+/// returns whether the strip scrolled.
+fn edge_hold_scrolls(harness: &mut TestHarness, window: WinID, edge: Origin) -> bool {
+    press_and_drag(harness, window, edge);
+    assert!(
+        matches!(drag_state(harness.world()), DragState::Dragging(_)),
+        "an edge hold needs a confirmed drag"
+    );
     let before = strip_x(harness.world(), TEST_WORKSPACE_ID);
     harness.advance(ms(1200));
     strip_x(harness.world(), TEST_WORKSPACE_ID) != before
@@ -3408,11 +3414,13 @@ fn a_display_diagonally_below_right_is_no_neighbor_at_the_right_edge() {
         TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
         TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
     );
-    let mut harness = overflowing_right_with_display(ext);
-    assert!(edge_hold_scrolls(
-        &mut harness,
-        Origin::new(TEST_DISPLAY_WIDTH - 2, 500)
-    ));
+    for x in [TEST_DISPLAY_WIDTH - 2, TEST_DISPLAY_WIDTH] {
+        let mut harness = overflowing_right_with_display(ext);
+        assert!(
+            edge_hold_scrolls(&mut harness, 0, Origin::new(x, 500)),
+            "x={x}"
+        );
+    }
 }
 
 /// The pointer, not the dragged window's centre, starts an edge hold. A
@@ -3429,7 +3437,7 @@ fn the_pointer_not_the_windows_centre_starts_an_edge_hold() {
     );
     for (grab_right, scrolls) in [(true, true), (false, false)] {
         let mut harness = overflowing_right_with_display(ext);
-        let start = frame(harness.world(), 0);
+        let start = frame(harness.world(), 1);
         let (press, to) = if grab_right {
             let press = Origin::new(start.max.x - 5, start.min.y + 10);
             (press, Origin::new(TEST_DISPLAY_WIDTH - 2, 500))
@@ -3438,7 +3446,7 @@ fn the_pointer_not_the_windows_centre_starts_an_edge_hold() {
             let centre_dx = start.center().x - press.x;
             (press, Origin::new(TEST_DISPLAY_WIDTH - 2 - centre_dx, 500))
         };
-        drag_from(&mut harness, 0, press, to);
+        drag_from(&mut harness, 1, press, to);
         let before = strip_x(harness.world(), TEST_WORKSPACE_ID);
         harness.advance(ms(1200));
         assert_eq!(
@@ -3460,7 +3468,7 @@ fn a_display_beside_part_of_an_edge_is_a_neighbor_only_where_it_touches() {
     for (y, scrolls) in [(200, true), (600, false)] {
         let mut harness = overflowing_right_with_display(ext);
         assert_eq!(
-            edge_hold_scrolls(&mut harness, Origin::new(TEST_DISPLAY_WIDTH - 2, y)),
+            edge_hold_scrolls(&mut harness, 0, Origin::new(TEST_DISPLAY_WIDTH - 2, y)),
             scrolls,
             "y={y}"
         );
@@ -3495,8 +3503,12 @@ fn left_and_right_edge_scrolls_follow_physical_contact_at_pointer_height() {
             let (window, x) = if right {
                 (0, TEST_DISPLAY_WIDTH - 2)
             } else {
-                harness.run(vec![command(Operation::Focus(Direction::Last))]);
-                harness.advance(SETTLE);
+                // From the far end, the fourth column comes into view starting
+                // at the left edge, so no column is cut off there.
+                for column in [Direction::Last, Direction::Nth(3)] {
+                    harness.run(vec![command(Operation::Focus(column))]);
+                    harness.advance(SETTLE);
+                }
                 (5, 2)
             };
             press_and_drag(&mut harness, window, Origin::new(x, y));
@@ -3517,6 +3529,78 @@ fn left_and_right_edge_scrolls_follow_physical_contact_at_pointer_height() {
             }
         }
     }
+}
+
+/// Six columns on the main display with another display touching its left
+/// edge, the last column focused so the fourth is cut off at that edge with
+/// 224 points showing.
+fn cut_off_at_a_shared_left_edge() -> TestHarness {
+    let left = IRect::new(-EXT_DISPLAY_WIDTH, 0, 0, TEST_DISPLAY_HEIGHT);
+    let mut harness = overflowing_right_with_display(left);
+    harness.run(vec![command(Operation::Focus(Direction::Last))]);
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), 3).max.x, 224);
+    harness
+}
+
+#[test]
+fn holding_over_a_column_cut_off_at_a_shared_edge_scrolls_it_into_view_and_repeats() {
+    let mut harness = cut_off_at_a_shared_left_edge();
+    press_and_drag(&mut harness, 5, Origin::new(100, 500));
+    let before = strip_x(harness.world(), TEST_WORKSPACE_ID);
+    harness.advance(ms(440));
+    assert_eq!(strip_x(harness.world(), TEST_WORKSPACE_ID), before);
+    harness.advance(ms(80));
+    let first = strip_x(harness.world(), TEST_WORKSPACE_ID);
+    assert_eq!(
+        first,
+        before + 176,
+        "the cut-off column comes fully into view"
+    );
+    harness.advance(ms(280));
+    assert_eq!(strip_x(harness.world(), TEST_WORKSPACE_ID), first);
+    harness.advance(ms(80));
+    assert!(
+        strip_x(harness.world(), TEST_WORKSPACE_ID) > first,
+        "the hold goes on with the pointer still where it started"
+    );
+}
+
+#[test]
+fn a_cut_off_column_starts_no_hold_farther_than_200_points_from_the_edge() {
+    let mut harness = cut_off_at_a_shared_left_edge();
+    assert!(edge_hold_scrolls(&mut harness, 5, Origin::new(190, 500)));
+    let mut harness = cut_off_at_a_shared_left_edge();
+    assert!(!edge_hold_scrolls(&mut harness, 5, Origin::new(210, 500)));
+}
+
+#[test]
+fn a_cut_off_column_holding_the_dragged_window_starts_no_hold() {
+    let mut harness = cut_off_at_a_shared_left_edge();
+    assert!(!edge_hold_scrolls(&mut harness, 3, Origin::new(100, 500)));
+}
+
+#[test]
+fn leaving_the_zone_a_hold_started_in_stops_the_scrolling() {
+    let mut harness = cut_off_at_a_shared_left_edge();
+    let start = Origin::new(100, 500);
+    press_and_drag(&mut harness, 5, start);
+    let before = strip_x(harness.world(), TEST_WORKSPACE_ID);
+    harness.advance(ms(520));
+    let scrolled = strip_x(harness.world(), TEST_WORKSPACE_ID);
+    assert_ne!(scrolled, before);
+    harness
+        .world()
+        .write_message(mouse_dragged(Origin::new(300, 500)));
+    harness.advance(ms(1200));
+    assert_eq!(strip_x(harness.world(), TEST_WORKSPACE_ID), scrolled);
+    harness.world().write_message(mouse_dragged(start));
+    harness.advance(ms(1200));
+    assert_eq!(
+        strip_x(harness.world(), TEST_WORKSPACE_ID),
+        scrolled,
+        "no column is cut off at the edge any more, so coming back starts no hold"
+    );
 }
 
 fn drop_slot_harness(cross_display: bool, native_tabs: bool) -> TestHarness {
