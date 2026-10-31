@@ -1214,6 +1214,59 @@ fn test_focus_display_returns_to_a_window_moved_there() {
     assert_focused!(harness.world(), 1);
 }
 
+/// A window sent to another display while focus stays behind does not become
+/// the window that display returns to.
+#[test]
+fn test_focus_display_ignores_a_window_sent_there_without_focus() {
+    let mut harness = TestHarness::new()
+        .with_windows(2)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_window(100, |data| {
+            data.workspace_id = EXT_WORKSPACE_ID;
+            data.frame = IRect::new(100, -EXT_DISPLAY_HEIGHT + 100, 900, -100);
+        });
+    harness
+        .world()
+        .write_message::<Event>(Event::MenuOpened { window_id: 0 });
+    harness.advance(Duration::from_millis(300));
+    run_and_land(
+        &mut harness,
+        Operation::Focus(Direction::Last),
+        TEST_DISPLAY_ID,
+    );
+    run_and_land(
+        &mut harness,
+        Operation::FocusDisplay(Direction::North),
+        EXT_DISPLAY_ID,
+    );
+    assert_focused!(harness.world(), 100);
+    run_and_land(
+        &mut harness,
+        Operation::FocusDisplay(Direction::South),
+        TEST_DISPLAY_ID,
+    );
+    assert_focused!(harness.world(), 1);
+    run_and_land(
+        &mut harness,
+        Operation::ToNextDisplay(MoveFocus::Stay),
+        TEST_DISPLAY_ID,
+    );
+    assert_on_workspace!(harness.world(), 1, EXT_WORKSPACE_ID);
+    assert_focused!(harness.world(), 0);
+
+    run_and_land(
+        &mut harness,
+        Operation::FocusDisplay(Direction::North),
+        EXT_DISPLAY_ID,
+    );
+
+    assert_focused!(harness.world(), 100);
+}
+
 /// A display with no window gets its desktop focused, which makes it the
 /// active display without moving the pointer.
 #[test]
