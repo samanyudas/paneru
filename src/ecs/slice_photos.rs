@@ -41,8 +41,11 @@ use crate::types::commands::Side;
 pub(crate) const REFRESH: Duration = Duration::from_secs(2);
 
 /// How long a window heading for a tuck waits for its photo before it tucks
-/// without one. Most photos arrive within 150 ms.
-const PHOTO_WAIT: Duration = Duration::from_millis(250);
+/// without one. Most photos arrive within 150 ms, but the first photo after
+/// the engine starts took a second on Sam's Mac, while the engine laid out
+/// every window. A window that tucks without a photo leaves the desktop
+/// showing on the edge, because some apps draw nothing once tucked.
+const PHOTO_WAIT: Duration = Duration::from_millis(1500);
 
 pub(crate) fn register(app: &mut App) {
     app.init_resource::<SliceAccess>()
@@ -388,13 +391,16 @@ fn refresh_slices(mut slices: ResMut<Slices>, screen: Option<NonSendMut<SliceScr
 }
 
 /// Paints each photo that differs from the one its panel shows, and keeps it.
-/// A blank photo leaves the panel with the photo it shows. A failed photo, or
-/// a blank one for a panel that shows none, closes its panel, and a refused
-/// one closes them all.
+/// A blank photo leaves the panel with the photo it shows. A blank photo of
+/// a window that still waits in view for its first photo asks for another,
+/// as an app that is still starting may not have drawn yet. A failed photo,
+/// or another blank one for a panel that shows none, closes its panel, and a
+/// refused one closes them all.
 fn receive_photos(
     mut messages: MessageReader<Event>,
     mut slices: ResMut<Slices>,
     mut access: ResMut<SliceAccess>,
+    sliding: Query<(&Window, &Slide)>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
     let Some(mut screen) = screen else {
@@ -410,7 +416,11 @@ fn receive_photos(
         else {
             continue;
         };
-        let Slices { showing, kept, .. } = &mut *slices;
+        let Slices {
+            showing,
+            kept,
+            generation: latest,
+        } = &mut *slices;
         let asked = showing
             .iter_mut()
             .find(|(id, _, _)| id == window_id)
@@ -419,10 +429,10 @@ fn receive_photos(
                     generation: asked,
                     last,
                     ..
-                } if asked == *generation => Some((slice.size, photo, last)),
+                } if asked == *generation => Some((*slice, photo, last)),
                 _ => None,
             });
-        let Some((size, photo, last)) = asked else {
+        let Some((slice, photo, last)) = asked else {
             debug!("edge slice photo dropped as stale: window {window_id} generation {generation}");
             continue;
         };
@@ -440,7 +450,7 @@ fn receive_photos(
                     screen.0.paint(*window_id, taken);
                     debug!("edge slice repainted: window {window_id}");
                 }
-                kept.insert(*window_id, (size, taken.clone()));
+                kept.insert(*window_id, (slice.size, taken.clone()));
                 SlicePhoto::Shown {
                     digest: taken.digest,
                 }
@@ -448,6 +458,21 @@ fn receive_photos(
             (Err(PhotoError::Blank), Some(digest)) => {
                 debug!("edge slice photo blank: window {window_id} keeps the photo it shows");
                 SlicePhoto::Shown { digest }
+            }
+            (Err(PhotoError::Blank), None)
+                if sliding.iter().any(|(window, slide)| {
+                    window.id() == *window_id && matches!(slide, Slide::Leaving { .. })
+                }) =>
+            {
+                debug!("edge slice photo blank: window {window_id} still shows, asking again");
+                ask(
+                    screen.0.as_mut(),
+                    latest,
+                    *window_id,
+                    &slice,
+                    None,
+                    Lookup::Reuse,
+                )
             }
             (Err(PhotoError::Refused), _) => {
                 if *access == SliceAccess::On {
