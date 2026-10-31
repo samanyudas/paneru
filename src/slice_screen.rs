@@ -17,7 +17,9 @@ use objc2_app_kit::{
     NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFRetained, CFType, CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{CGDataProvider, CGImage, CGPreflightScreenCaptureAccess};
+use objc2_core_graphics::{
+    CGDataProvider, CGImage, CGImageAlphaInfo, CGPreflightScreenCaptureAccess,
+};
 use objc2_foundation::{NSError, NSPoint, NSRect, NSSize};
 use objc2_quartz_core::CATransaction;
 use objc2_screen_capture_kit::{
@@ -382,8 +384,14 @@ fn capture(filter: &SCContentFilter, crop: IRect, scale: f64, reply: Reply) {
         };
         // SAFETY: a non-null image that ScreenCaptureKit lends to this call.
         let image = unsafe { CFRetained::retain(image) };
+        let pixels = pixels(&image);
+        if blank(&image, &pixels) {
+            debug!("edge slice photo of window {} is blank", reply.window);
+            reply.send(Err(PhotoError::Blank));
+            return;
+        }
         reply.send(Ok(Photo {
-            digest: digest(&image),
+            digest: digest(&image, &pixels),
             image,
         }));
     });
@@ -415,14 +423,96 @@ fn configuration(crop: IRect, scale: f64) -> Retained<SCStreamConfiguration> {
     configuration
 }
 
-fn digest(image: &CGImage) -> Digest {
+/// The bytes of `image`, empty when Core Graphics cannot give them.
+fn pixels(image: &CGImage) -> Vec<u8> {
+    CGImage::data_provider(Some(image))
+        .and_then(|provider| CGDataProvider::data(Some(&provider)))
+        .map(|data| data.to_vec())
+        .unwrap_or_default()
+}
+
+/// Whether nearly all of `image` is clear. Some apps, such as Notion, stop
+/// drawing while their window is off screen, and their photo then shows
+/// only a 1-pixel border. The samples start inside the edges to skip it.
+fn blank(image: &CGImage, pixels: &[u8]) -> bool {
+    const STEP: usize = 8;
+    let alpha = CGImage::alpha_info(Some(image));
+    let width = CGImage::width(Some(image));
+    let row = CGImage::bytes_per_row(Some(image));
+    if (alpha != CGImageAlphaInfo::PremultipliedFirst
+        && alpha != CGImageAlphaInfo::PremultipliedLast)
+        || CGImage::bits_per_pixel(Some(image)) != 32
+        || row < width * 4
+    {
+        return false;
+    }
+    let (mut clear, mut sampled) = (0_usize, 0_usize);
+    for line in pixels.chunks_exact(row).skip(STEP / 2).step_by(STEP) {
+        for x in (STEP / 2..width).step_by(STEP) {
+            sampled += 1;
+            // A premultiplied pixel with no alpha has no colour either.
+            if line[x * 4..x * 4 + 4] == [0; 4] {
+                clear += 1;
+            }
+        }
+    }
+    sampled > 0 && clear * 100 >= sampled * 99
+}
+
+fn digest(image: &CGImage, pixels: &[u8]) -> Digest {
     let mut hasher = DefaultHasher::new();
     CGImage::width(Some(image)).hash(&mut hasher);
     CGImage::height(Some(image)).hash(&mut hasher);
-    if let Some(data) = CGImage::data_provider(Some(image))
-        .and_then(|provider| CGDataProvider::data(Some(&provider)))
-    {
-        data.to_vec().hash(&mut hasher);
-    }
+    pixels.hash(&mut hasher);
     Digest(hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
+    use objc2_core_graphics::{
+        CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGImage,
+        CGImageAlphaInfo,
+    };
+
+    use super::{blank, pixels};
+
+    /// A clear 64 by 48 photo with `width` by `height` pixels drawn opaque
+    /// from its corner.
+    fn photo(width: f64, height: f64) -> CFRetained<CGImage> {
+        let space = CGColorSpace::new_device_rgb();
+        // SAFETY: a null buffer asks Core Graphics to allocate a clear one.
+        let context = unsafe {
+            CGBitmapContextCreate(
+                std::ptr::null_mut(),
+                64,
+                48,
+                8,
+                0,
+                space.as_deref(),
+                CGImageAlphaInfo::PremultipliedLast.0,
+            )
+        }
+        .expect("a bitmap context");
+        CGContext::set_rgb_fill_color(Some(&context), 1.0, 1.0, 1.0, 1.0);
+        CGContext::fill_rect(
+            Some(&context),
+            CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(width, height)),
+        );
+        CGBitmapContextCreateImage(Some(&context)).expect("an image")
+    }
+
+    fn is_blank(image: &CGImage) -> bool {
+        blank(image, &pixels(image))
+    }
+
+    #[test]
+    fn a_photo_that_shows_only_a_border_is_blank() {
+        assert!(is_blank(&photo(1.0, 48.0)));
+    }
+
+    #[test]
+    fn a_photo_with_a_little_drawn_is_not_blank() {
+        assert!(!is_blank(&photo(16.0, 16.0)));
+    }
 }

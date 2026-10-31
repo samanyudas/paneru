@@ -365,6 +365,20 @@ fn an_unchanged_photo_does_not_repaint_and_a_changed_one_does() {
 }
 
 #[test]
+fn a_blank_photo_leaves_the_panel_with_the_photo_it_shows() {
+    let (mut harness, log) = painted_beside();
+
+    harness.advance(REFRESH);
+    arrive(&mut harness, 3, last_ask(&log, 3), Err(PhotoError::Blank));
+
+    assert_eq!(placed_ids(&log), vec![3], "the panel stays");
+    assert_eq!(log.borrow().painted, vec![(3, Digest(7))], "no repaint");
+    let asks = asks_for(&log, 3).len();
+    harness.advance(REFRESH);
+    assert_eq!(asks_for(&log, 3).len(), asks + 1, "photographed again");
+}
+
+#[test]
 fn a_photo_from_an_earlier_ask_is_dropped() {
     let (mut harness, log) = painted_beside();
     let earlier = last_ask(&log, 3);

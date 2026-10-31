@@ -91,6 +91,9 @@ pub(crate) enum PhotoError {
     /// macOS refused to photograph windows for the engine.
     Refused,
     Failed,
+    /// The photo shows almost nothing, as the window of an app that stops
+    /// drawing off screen does.
+    Blank,
 }
 
 /// Tells the capture of one photo whether the engine still wants it. The
@@ -383,7 +386,9 @@ fn refresh_slices(mut slices: ResMut<Slices>, screen: Option<NonSendMut<SliceScr
 }
 
 /// Paints each photo that differs from the one its panel shows, and keeps it.
-/// A failed photo closes its panel, and a refused one closes them all.
+/// A blank photo leaves the panel with the photo it shows. A failed photo, or
+/// a blank one for a panel that shows none, closes its panel, and a refused
+/// one closes them all.
 fn receive_photos(
     mut messages: MessageReader<Event>,
     mut slices: ResMut<Slices>,
@@ -419,11 +424,14 @@ fn receive_photos(
             debug!("edge slice photo dropped as stale: window {window_id} generation {generation}");
             continue;
         };
-        if result.is_err() {
+        if result
+            .as_ref()
+            .is_err_and(|error| *error != PhotoError::Blank)
+        {
             kept.remove(window_id);
         }
-        *photo = match result {
-            Ok(taken) => {
+        *photo = match (result, last) {
+            (Ok(taken), _) => {
                 if Some(taken.digest) == last {
                     debug!("edge slice unchanged: window {window_id}");
                 } else {
@@ -435,7 +443,11 @@ fn receive_photos(
                     digest: taken.digest,
                 }
             }
-            Err(PhotoError::Refused) => {
+            (Err(PhotoError::Blank), Some(digest)) => {
+                debug!("edge slice photo blank: window {window_id} keeps the photo it shows");
+                SlicePhoto::Shown { digest }
+            }
+            (Err(PhotoError::Refused), _) => {
                 if *access == SliceAccess::On {
                     warn!(
                         "macOS refused a photo of window {window_id}: shared edges show nothing until the config or the Screen Recording permission changes"
@@ -446,7 +458,7 @@ fn receive_photos(
                 });
                 SlicePhoto::Ended
             }
-            Err(error) => {
+            (Err(error), _) => {
                 debug!("edge slice photo failed: window {window_id}: {error:?}, closing its panel");
                 ended = true;
                 SlicePhoto::Ended
