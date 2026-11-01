@@ -1812,3 +1812,27 @@ fn a_dock_change_without_a_work_area_change_refits_the_display() {
     harness.advance(Duration::from_secs(3));
     assert_eq!(os_frame(&harness, 1), full);
 }
+
+/// A full-screen Space hides the Dock without changing the desktop's work
+/// area, so a Dock read there does not take the Dock's frame.
+#[test]
+fn a_dock_hidden_by_a_full_screen_space_keeps_the_dock_area() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    let top = TEST_DISPLAY_HEIGHT - 82;
+    harness
+        .mock_state
+        .os_set_dock_frame(Some(DockFrame::Shown(IRect::new(262, top, 762, top + 72))));
+    harness.run(vec![Event::DockDidChangePref { msg: String::new() }]);
+    harness.advance(Duration::from_secs(3));
+    let with_dock = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID, true);
+    harness
+        .mock_state
+        .os_set_dock_frame(Some(DockFrame::Shown(IRect::new(262, 768, 762, 840))));
+    harness.run(vec![Event::DockDidChangePref { msg: String::new() }]);
+    harness.advance(Duration::from_secs(3));
+    assert_eq!(usable_area_of(&mut harness, TEST_DISPLAY_ID), with_dock);
+}

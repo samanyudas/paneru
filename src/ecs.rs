@@ -780,10 +780,31 @@ pub enum DockPosition {
 }
 
 impl DockPosition {
+    /// The most, in points, that two readings of a Dock on the same side may
+    /// differ and still agree.
+    /// Readings of the Dock's frame were within 1 point of macOS's work area
+    /// whenever macOS had published the change.
+    const AGREEMENT: i32 = 8;
+
     /// The Dock position to use, from the one macOS's work area `reported`
-    /// and the one the Dock's own frame `measured`.
+    /// and the one the Dock's own frame `measured`. macOS's reading is exact
+    /// while the two agree. When they plainly disagree, macOS has not
+    /// published a Dock change yet, or never will, so the Dock's frame wins.
     pub fn settle(reported: Option<Self>, measured: Option<Self>) -> Option<Self> {
-        reported.or(measured)
+        match (reported, measured) {
+            (Some(reported), Some(measured)) if reported.agrees_with(measured) => Some(reported),
+            (reported, measured) => measured.or(reported),
+        }
+    }
+
+    fn agrees_with(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Bottom(a), Self::Bottom(b))
+            | (Self::Left(a), Self::Left(b))
+            | (Self::Right(a), Self::Right(b)) => (a - b).abs() <= Self::AGREEMENT,
+            (Self::Hidden, Self::Hidden) => true,
+            _ => false,
+        }
     }
 }
 

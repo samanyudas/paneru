@@ -111,13 +111,30 @@ impl Display {
         self.id
     }
 
-    /// Where the Dock sits, from the macOS work area. The work area leaves
-    /// out the real menu bar, so a configured menu bar height does not count.
-    /// Where the Dock sits on this display by the Dock's own frame.
-    pub fn dock_from_frame(&self, _dock: DockFrame) -> DockPosition {
-        DockPosition::Hidden
+    /// Where the Dock sits on this display by the Dock's own frame. macOS
+    /// reserves the space up to 4 points short of the icon list's inner
+    /// edge, as measured on macOS 27 at two sizes on each side. An
+    /// auto-hidden Dock, or one whose frame lies off this display, reserves
+    /// nothing here.
+    pub fn dock_from_frame(&self, dock: DockFrame) -> DockPosition {
+        const INSET: i32 = 4;
+        let DockFrame::Shown(list) = dock else {
+            return DockPosition::Hidden;
+        };
+        if list.intersect(self.bounds).is_empty() {
+            return DockPosition::Hidden;
+        }
+        if list.width() >= list.height() {
+            DockPosition::Bottom(self.bounds.max.y - list.min.y - INSET)
+        } else if list.center().x < self.bounds.center().x {
+            DockPosition::Left(list.max.x - self.bounds.min.x - INSET)
+        } else {
+            DockPosition::Right(self.bounds.max.x - list.min.x - INSET)
+        }
     }
 
+    /// Where the Dock sits, from the macOS work area. The work area leaves
+    /// out the real menu bar, so a configured menu bar height does not count.
     pub fn locate_dock(&self, visible_frame: &IRect) -> DockPosition {
         let menubar = self.menubar_height.max(self.notch_height);
         if self.bounds.min.x < visible_frame.min.x {

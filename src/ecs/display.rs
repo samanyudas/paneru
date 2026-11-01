@@ -383,6 +383,7 @@ impl Plugin for DisplayEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DisplayReconcileState>()
             .init_resource::<DisplayHomes>()
+            .init_resource::<DockRereads>()
             .add_systems(
                 PreUpdate,
                 (display_change_handler, reconcile_displays)
@@ -1052,22 +1053,44 @@ impl FloatingLayer {
     }
 }
 
+/// How long after the Dock reports a change the engine reads every display
+/// again. The Dock settled within 0.8 s when measured, and macOS can
+/// publish the matching work area later than that or never.
+const DOCK_REREADS: [Duration; 2] = [Duration::from_millis(500), Duration::from_secs(2)];
+
+/// The times still to come at which every display is read again for a Dock
+/// change.
+#[derive(Default, Resource)]
+struct DockRereads(Vec<Duration>);
+
 /// Reads every display's properties again when macOS reports that a
-/// display's parameters changed, so a Dock that shows, hides, or moves while
-/// the engine runs updates the usable area.
+/// display's parameters changed, and after the Dock reports a change, so a
+/// Dock that shows, hides, moves, or resizes while the engine runs updates
+/// the usable area.
 fn screen_parameters_handler(
     mut messages: MessageReader<Event>,
+    mut rereads: ResMut<DockRereads>,
+    time: Res<Time>,
     displays: Query<Entity, With<Display>>,
     mut commands: Commands,
 ) {
-    if !messages
-        .read()
-        .any(|event| matches!(event, Event::ScreenParametersChanged))
-    {
-        return;
+    let now = time.elapsed();
+    let mut read = false;
+    for event in messages.read() {
+        match event {
+            Event::ScreenParametersChanged => read = true,
+            Event::DockDidChangePref { .. } | Event::DockDidRestart { .. } => {
+                rereads.0 = DOCK_REREADS.iter().map(|after| now + *after).collect();
+            }
+            _ => {}
+        }
     }
-    for entity in displays {
-        commands.trigger(ReadDisplayProperties(entity));
+    let pending = rereads.0.len();
+    rereads.0.retain(|at| *at > now);
+    if read || rereads.0.len() < pending {
+        for entity in displays {
+            commands.trigger(ReadDisplayProperties(entity));
+        }
     }
 }
 
@@ -1131,8 +1154,11 @@ fn read_display_properties_trigger(
             display.locate_dock(&irect_from(screen.visibleFrame()))
         })
     });
-    let measured = window_manager
-        .dock_frame()
+    // A full-screen Space hides the Dock without changing the desktop's work
+    // area, so the Dock's frame says nothing about it there.
+    let measured = (!window_manager.is_fullscreen_space(display_id))
+        .then(|| window_manager.dock_frame())
+        .flatten()
         .map(|frame| display.dock_from_frame(frame));
     if let Some(dock) = DockPosition::settle(reported, measured) {
         commands.trigger(SetDock {

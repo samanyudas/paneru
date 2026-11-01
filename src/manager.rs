@@ -1,5 +1,6 @@
 use accessibility_sys::{
-    AXIsProcessTrusted, AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt,
+    AXIsProcessTrusted, AXIsProcessTrustedWithOptions, AXUIElementCreateApplication,
+    kAXChildrenAttribute, kAXListRole, kAXTrustedCheckOptionPrompt,
 };
 use bevy::ecs::resource::Resource;
 use bevy::math::{IRect, IVec2};
@@ -9,8 +10,9 @@ use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
 use notify::{RecursiveMode, Watcher};
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFDictionary, CFMutableData, CFNumber, CFNumberType, CFRetained, CFString,
-    CFType, CGPoint, CGRect, CGSize, kCFBooleanTrue,
+    CFArray, CFBoolean, CFDictionary, CFMutableData, CFNumber, CFNumberType,
+    CFPreferencesAppSynchronize, CFPreferencesGetAppBooleanValue, CFRetained, CFString, CFType,
+    CGPoint, CGRect, CGSize, kCFBooleanTrue,
 };
 use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGEventSource,
@@ -36,7 +38,7 @@ use crate::events::{Event, EventSender};
 use crate::manager::skylight::SLSSetWindowListBrightness;
 use crate::platform::slice_tap::{self, SlicePress};
 use crate::platform::{ConnID, Pid, ProcessSerialNumber, WinID, WorkspaceId};
-use crate::util::{AXUIWrapper, MacResult, create_array, round_px, symlink_target};
+use crate::util::{AXUIAttributes, AXUIWrapper, MacResult, create_array, round_px, symlink_target};
 use app::ApplicationOS;
 pub use app::{Application, ApplicationApi};
 pub use display::{Display, DockFrame};
@@ -620,7 +622,27 @@ impl WindowManagerApi for WindowManagerOS {
     }
 
     fn dock_frame(&self) -> Option<DockFrame> {
-        None
+        let dock = CFString::from_static_str("com.apple.dock");
+        CFPreferencesAppSynchronize(&dock);
+        let autohide = CFString::from_static_str("autohide");
+        if unsafe { CFPreferencesGetAppBooleanValue(&autohide, &dock, null_mut()) } {
+            return Some(DockFrame::AutoHidden);
+        }
+        let pid = objc2_app_kit::NSRunningApplication::runningApplicationsWithBundleIdentifier(
+            objc2_foundation::ns_string!("com.apple.dock"),
+        )
+        .iter()
+        .next()?
+        .processIdentifier();
+        let app = AXUIWrapper::from_retained(unsafe { AXUIElementCreateApplication(pid) }).ok()?;
+        let children = CFString::from_static_str(kAXChildrenAttribute);
+        app.get_attribute::<CFArray<AXUIWrapper>>(&children)
+            .ok()?
+            .to_vec()
+            .into_iter()
+            .find(|child| child.role().is_ok_and(|role| role == kAXListRole))
+            .and_then(|list| windows::ax_frame(&list).ok())
+            .map(DockFrame::Shown)
     }
 
     fn quit(&self) -> Result<()> {
