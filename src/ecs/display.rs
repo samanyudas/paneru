@@ -10,7 +10,7 @@ use bevy::ecs::query::{Has, With};
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Commands, NonSend, Query, Res, SystemParam};
 use bevy::ecs::world::World;
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2};
 use bevy::platform::collections::HashSet;
 use bevy::time::{Time, Timer, TimerMode};
 use objc2_app_kit::NSScreen;
@@ -28,7 +28,7 @@ use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, EnsureVisibleMarker, FocusedMarker,
     LayoutPosition, ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties,
     RefreshWindowSizeOnFocus, RepositionMarker, SelectedVirtualMarker, SendMessageTrigger, SetDock,
-    SpawnCommandsExt, Timeout,
+    SpawnCommandsExt, Timeout, ViewportMoved,
 };
 use crate::events::Event;
 use crate::manager::{Display, Size, Window, WindowManager, irect_from};
@@ -1071,47 +1071,32 @@ fn screen_parameters_handler(
     }
 }
 
-/// Stores a display's Dock position. When a stored one changes, the
-/// display's strips lay out again for the new usable area, shifted as far as
-/// its corner moved, the way a display move shifts them. The first read
-/// comes before the display has strips.
+/// Stores a display's Dock position. When the display already has strips,
+/// it is marked with how far its usable area's corner moved, so the layout
+/// moves its strips for the new area.
 fn set_dock(
     trigger: On<SetDock>,
-    displays: Query<(&Display, Option<&DockPosition>)>,
-    strips: Query<(Entity, &ChildOf), With<LayoutStrip>>,
+    displays: Query<(&Display, Option<&DockPosition>, Option<&ViewportMoved>)>,
+    strips: Query<&ChildOf, With<LayoutStrip>>,
     mut commands: Commands,
 ) {
     let SetDock { display, dock } = *trigger.event();
-    let Ok((found, current)) = displays.get(display) else {
+    let Ok((found, current, moved)) = displays.get(display) else {
         return;
     };
     if current == Some(&dock) {
         return;
     }
     debug!("dock on display {}: {dock:?}", found.id());
-    if let Ok(mut entity_commands) = commands.get_entity(display) {
-        entity_commands.try_insert(dock);
-    }
-    let Some(current) = current else {
+    let Ok(mut entity_commands) = commands.get_entity(display) else {
         return;
     };
-    let moved = found.visible_bounds(Some(&dock)).min - found.visible_bounds(Some(current)).min;
-    let bounds = found.bounds();
-    let previous = IRect::from_corners(bounds.min - moved, bounds.max - moved);
-    let strips = strips
-        .iter()
-        .filter(|(_, child_of)| child_of.parent() == display)
-        .map(|(entity, _)| entity)
-        .collect::<Vec<_>>();
-    commands.queue(move |world: &mut World| {
-        let focused = world
-            .query_filtered::<Entity, With<FocusedMarker>>()
-            .iter(world)
-            .next();
-        for strip in strips {
-            refresh_strip_layout(world, strip, Some(previous), focused);
-        }
-    });
+    entity_commands.try_insert(dock);
+    if strips.iter().any(|child_of| child_of.parent() == display) {
+        let shift = found.visible_bounds(Some(&dock)).min - found.visible_bounds(current).min;
+        let earlier = moved.map_or(IVec2::ZERO, |moved| moved.0);
+        entity_commands.try_insert(ViewportMoved(earlier + shift));
+    }
 }
 
 fn read_display_properties_trigger(

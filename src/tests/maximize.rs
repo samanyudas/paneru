@@ -1534,6 +1534,39 @@ fn a_side_dock_keeps_a_later_maximized_column_in_view() {
     assert_focused!(harness.world(), 2);
 }
 
+/// A side Dock on a display without the focus keeps the maximized column
+/// seen there filling the usable area, after another maximized column.
+#[test]
+fn a_side_dock_keeps_a_later_maximized_column_in_view_without_focus() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    focus(&mut harness, Direction::East);
+    double_click_title_bar(&mut harness, 2);
+    harness.advance(SETTLE);
+    change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Hidden);
+    harness.run(vec![command(Operation::FocusDisplay(Direction::East))]);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 100);
+
+    change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Right(60));
+    assert_eq!(
+        os_frame(&harness, 2),
+        usable_area_of(&mut harness, TEST_DISPLAY_ID)
+    );
+}
+
+/// A display whose first Dock read comes after its strips exist, as when
+/// macOS lists the screen late, lays its strips out for that Dock.
+#[test]
+fn a_first_dock_read_after_the_strips_exist_refits_them() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Left(60));
+    assert_eq!(
+        os_frame(&harness, 1),
+        usable_area_of(&mut harness, TEST_DISPLAY_ID)
+    );
+}
+
 /// The Dock is measured against the real menu bar, so a configured menu bar
 /// height, which a re-read finds already applied, does not count as Dock.
 #[test]

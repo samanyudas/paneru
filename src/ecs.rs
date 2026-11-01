@@ -941,6 +941,12 @@ pub struct SetDock {
     pub dock: DockPosition,
 }
 
+/// Marks a display whose usable area changed after its strips were laid
+/// out, such as when its Dock moved. The value is how far the area's corner
+/// moved. The layout moves the display's strips with it and removes the mark.
+#[derive(Component, Debug)]
+pub struct ViewportMoved(pub bevy::math::IVec2);
+
 #[derive(BevyEvent)]
 pub struct SendMessageTrigger(pub Event);
 
