@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use bevy::ecs::schedule::{Schedules, SingleThreadedExecutor};
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, TaskPoolBuilder};
 use bevy::time::TimeUpdateStrategy;
@@ -249,6 +250,19 @@ impl TestHarness {
     }
 }
 
+/// The multi-threaded executor wakes its worker threads on every frame, which made the
+/// tests about three times slower. Production still uses it, so
+/// `PANERU_TEST_EXECUTOR=multi` runs the tests on it.
+fn multi_threaded_executor() -> bool {
+    static MULTI: OnceLock<bool> = OnceLock::new();
+    *MULTI.get_or_init(|| match std::env::var("PANERU_TEST_EXECUTOR").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("single") => false,
+        Ok("multi") => true,
+        Ok(other) => panic!("PANERU_TEST_EXECUTOR must be single or multi, not {other}"),
+        Err(error) => panic!("PANERU_TEST_EXECUTOR: {error}"),
+    })
+}
+
 fn setup_world() -> App {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
@@ -294,6 +308,12 @@ fn setup_world() -> App {
         .add_plugins((register_triggers, register_systems, register_commands));
 
     bevy_app.insert_resource(TimeUpdateStrategy::ManualDuration(FRAME));
+
+    if !multi_threaded_executor() {
+        for (_, schedule) in bevy_app.world_mut().resource_mut::<Schedules>().iter_mut() {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        }
+    }
 
     bevy_app
 }
