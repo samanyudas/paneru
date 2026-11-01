@@ -9,16 +9,16 @@ use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
 use notify::{RecursiveMode, Watcher};
 use objc2_core_foundation::{
-    CFArray, CFDictionary, CFMutableData, CFNumber, CFNumberType, CFRetained, CFString, CFType,
-    CGPoint, CGRect, CGSize, kCFBooleanTrue,
+    CFArray, CFBoolean, CFDictionary, CFMutableData, CFNumber, CFNumberType, CFRetained, CFString,
+    CFType, CGPoint, CGRect, CGSize, kCFBooleanTrue,
 };
 use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGEventSource,
     CGEventSourceStateID, CGGetActiveDisplayList, CGMouseButton,
-    CGRectMakeWithDictionaryRepresentation, CGWarpMouseCursorPosition, CGWindowLevelForKey,
-    CGWindowLevelKey, CGWindowListCopyWindowInfo, CGWindowListCreateDescriptionFromArray,
-    CGWindowListOption, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowNumber,
-    kCGWindowOwnerPID,
+    CGRectMakeWithDictionaryRepresentation, CGSessionCopyCurrentDictionary,
+    CGWarpMouseCursorPosition, CGWindowLevelForKey, CGWindowLevelKey, CGWindowListCopyWindowInfo,
+    CGWindowListCreateDescriptionFromArray, CGWindowListOption, kCGNullWindowID, kCGWindowBounds,
+    kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use objc2_foundation::NSBundle;
 use std::ffi::c_void;
@@ -211,6 +211,9 @@ pub trait WindowManagerApi: Send + Sync {
     /// Whether the window server has the window ordered in. A failed query is
     /// an `Err`, never an answer: it is no evidence the window exists or is gone.
     fn window_ordered_in(&self, window_id: WinID) -> Result<bool>;
+    /// Whether the screen is locked. While it is, every AX read from another
+    /// process fails, so an AX answer is no evidence a window is gone.
+    fn screen_locked(&self) -> bool;
 
     /// Sends an `Event::Exit` to the event loop, signaling the application to quit.
     ///
@@ -600,6 +603,17 @@ impl WindowManagerApi for WindowManagerOS {
         unsafe { SLSWindowIsOrderedIn(self.main_cid, window_id, &mut ordered_in) }
             .to_result(function_name!())?;
         Ok(ordered_in != 0)
+    }
+
+    fn screen_locked(&self) -> bool {
+        let Some(session) = CGSessionCopyCurrentDictionary() else {
+            return false;
+        };
+        let session = unsafe { session.cast_unchecked::<CFString, CFType>() };
+        session
+            .get(&CFString::from_static_str("CGSSessionScreenIsLocked"))
+            .and_then(|locked| locked.downcast::<CFBoolean>().ok())
+            .is_some_and(|locked| locked.as_bool())
     }
 
     fn quit(&self) -> Result<()> {

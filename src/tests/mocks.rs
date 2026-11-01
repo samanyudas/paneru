@@ -227,6 +227,7 @@ struct MockStateInner {
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
     unordered_windows: HashSet<WinID>,
+    screen_locked: bool,
     /// Windows the app keeps out of its accessibility window list while the
     /// window server still reports them on screen: a background native tab.
     background_tabs: HashSet<WinID>,
@@ -476,6 +477,7 @@ impl MockState {
             event_queue: VecDeque::new(),
             stale_window_ids: HashMap::new(),
             unordered_windows: HashSet::new(),
+            screen_locked: false,
             background_tabs: HashSet::new(),
             raise_count: 0,
             raise_takes_focus: false,
@@ -1063,6 +1065,10 @@ impl MockState {
         let mut inner = self.inner.force_write();
         inner.windows.remove(&id);
         inner.unordered_windows.insert(id);
+    }
+
+    pub fn os_lock_screen(&self, locked: bool) {
+        self.inner.force_write().screen_locked = locked;
     }
 
     /// Lets the app's window list catch up with reality after a close.
@@ -1854,6 +1860,10 @@ impl MockState {
             Ok(inner.windows.contains_key(&window_id)
                 && !inner.unordered_windows.contains(&window_id))
         });
+
+        let s = self.clone();
+        wm.expect_screen_locked()
+            .returning(move || s.inner.force_read().screen_locked);
 
         let s = self.clone();
         wm.expect_active_display_id()

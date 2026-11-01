@@ -1021,7 +1021,15 @@ pub(super) fn recover_window_handles(
     clock: Res<Time>,
     mut commands: Commands,
 ) {
+    // macOS moves windows between Spaces on wake while the lock screen is
+    // still up, and AX fails for every app until the unlock. Each window gets
+    // its full timeout from the unlock instead.
+    let screen_locked = window_manager.screen_locked();
     for (entity, mut window, child, mut deadline, geometry, unmanaged) in awaiting {
+        if screen_locked {
+            deadline.0.reset();
+            continue;
+        }
         deadline.0.tick(clock.delta());
         let window_id = window.id();
         let ordered_in = window_manager.window_ordered_in(window_id);
@@ -2348,6 +2356,51 @@ mod tests {
             .unwrap();
         assert!(harness.world().get::<AwaitingHandle>(entity).is_none());
         assert_eq!(harness.mock_state.create_window(0).frame().width(), 800);
+    }
+
+    #[test]
+    fn test_locked_screen_keeps_a_window_whose_handle_died() {
+        use crate::platform::WorkspaceId;
+        use bevy::ecs::world::World;
+
+        fn column_of(world: &mut World, window_id: WinID) -> Option<(Entity, WorkspaceId, usize)> {
+            let entity = world
+                .query::<(&Window, Entity)>()
+                .iter(world)
+                .find_map(|(window, entity)| (window.id() == window_id).then_some(entity))?;
+            world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .find_map(|strip| Some((entity, strip.id(), strip.index_of(entity).ok()?)))
+        }
+
+        let mut harness = TestHarness::new().with_windows(2);
+        harness.run(vec![Event::MenuOpened { window_id: 1 }]);
+        harness.advance(Duration::from_millis(2000));
+        let before = column_of(harness.world(), 1);
+        assert!(before.is_some(), "window 1 starts in a strip");
+
+        harness.mock_state.os_lock_screen(true);
+        harness
+            .mock_state
+            .os_transfer_window_late(1, crate::tests::TEST_WORKSPACE_ID);
+        harness.advance(Duration::from_millis(3000));
+        assert_eq!(
+            column_of(harness.world(), 1),
+            before,
+            "a locked screen must not close a window whose AX element went dead"
+        );
+
+        harness.mock_state.os_lock_screen(false);
+        harness.mock_state.os_list_window(1);
+        harness.advance(Duration::from_millis(2000));
+        assert_eq!(
+            column_of(harness.world(), 1),
+            before,
+            "the window keeps its entity and column after the unlock"
+        );
+        let (entity, _, _) = before.unwrap();
+        assert!(harness.world().get::<AwaitingHandle>(entity).is_none());
     }
     #[test]
     fn test_size_verification_retries_a_transient_read_failure() {
