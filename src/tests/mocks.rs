@@ -1750,7 +1750,8 @@ impl MockState {
                 let focused_id = inner.apps.get(&pid).and_then(|a| a.focused_window_id)?;
                 inner
                     .windows
-                    .contains_key(&focused_id)
+                    .get(&focused_id)
+                    .is_some_and(|w| !w.ax_unanswered)
                     .then_some(focused_id)
             }?;
             Some(s.create_window(focused_id))
