@@ -599,6 +599,90 @@ fn a_maximized_window_moved_between_side_by_side_displays_fills_them() {
     assert_eq!(os_frame(&harness, 1), test);
 }
 
+/// Shows a Dock at `dock` on display `id`, as the Dock watcher does.
+fn show_dock(harness: &mut TestHarness, id: u32, dock: DockPosition) {
+    let world = harness.world();
+    let display = world
+        .query::<(Entity, &Display)>()
+        .iter(world)
+        .find(|(_, display)| display.id() == id)
+        .expect("the display")
+        .0;
+    world.entity_mut(display).insert(dock);
+    harness
+        .world()
+        .get_mut::<Display>(display)
+        .expect("the display")
+        .set_changed();
+    harness.advance(SETTLE);
+}
+
+/// A maximized window moved to a display with a visible Dock fills only the
+/// area beside the Dock, whichever side the Dock is on.
+#[test]
+fn a_maximized_window_moved_to_a_display_with_a_dock_fills_the_area_beside_it() {
+    for dock in [
+        DockPosition::Bottom(60),
+        DockPosition::Left(60),
+        DockPosition::Right(60),
+    ] {
+        let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+        let without_dock = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+        move_to_display(
+            &mut harness,
+            Direction::East,
+            EXT_DISPLAY_ID,
+            EXT_WORKSPACE_ID,
+        );
+        show_dock(&mut harness, TEST_DISPLAY_ID, dock);
+        let with_dock = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+        assert_ne!(with_dock, without_dock, "the Dock takes space");
+
+        move_to_display(
+            &mut harness,
+            Direction::West,
+            TEST_DISPLAY_ID,
+            TEST_WORKSPACE_ID,
+        );
+        assert_eq!(os_frame(&harness, 1), with_dock);
+        assert_focused!(harness.world(), 1);
+    }
+}
+
+/// A maximized window whose minimum width exceeds the destination's usable
+/// area keeps that width, covers the whole area so every part can be panned
+/// to, and keeps the focus.
+#[test]
+fn a_maximized_window_too_wide_for_the_destination_stays_reachable() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    move_to_display(
+        &mut harness,
+        Direction::East,
+        EXT_DISPLAY_ID,
+        EXT_WORKSPACE_ID,
+    );
+    let minimum = TEST_DISPLAY_WIDTH + 300;
+    harness.mock_state.update_window(1, |window| {
+        window.minimum_size = Some(Size::new(minimum, 200));
+    });
+
+    move_to_display(
+        &mut harness,
+        Direction::West,
+        TEST_DISPLAY_ID,
+        TEST_WORKSPACE_ID,
+    );
+    let area = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    let frame = os_frame(&harness, 1);
+    assert_eq!(frame.width(), minimum, "{frame:?}");
+    assert!(
+        frame.min.x <= area.min.x && frame.max.x >= area.max.x,
+        "{frame:?} leaves part of {area:?} uncovered"
+    );
+    assert_eq!((frame.min.y, frame.max.y), (area.min.y, area.max.y));
+    assert_focused!(harness.world(), 1);
+}
+
 /// A maximized window moved to a display that shows no strip waits there
 /// for macOS to report its space. It is still maximized once that strip
 /// appears, and restores to its earlier share of the viewport.
