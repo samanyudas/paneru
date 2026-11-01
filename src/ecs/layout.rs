@@ -29,8 +29,8 @@ use crate::ecs::{
     LayoutPosition, ManualStripOffset, MaximumHeight, MinimumHeight, MouseHeldMarker,
     PlaceAfterArrival, Position, PresentedOrigin, RefitAfterRemoval, RepositionMarker,
     ReshuffleAroundMarker, ResizeMarker, Scrolling, SelectedVirtualMarker, SkipReshuffle,
-    SpawnCommandsExt, TopBarHeight, TopBarRetry, Unmanaged, VerifyWindowSize, WidthAnchor,
-    WidthLimits, WidthRun,
+    SpawnCommandsExt, TopBarHeight, TopBarRetry, Unmanaged, VerifyWindowSize, ViewportMoved,
+    WidthAnchor, WidthLimits, WidthRun,
 };
 use crate::errors::{Error, Result};
 use crate::events::Event;
@@ -265,6 +265,7 @@ impl Plugin for LayoutEventsPlugin {
                     refresh_top_bars.run_if(top_bars_need_refresh),
                     layout_sizes_changed,
                     relayout_on_edge_padding_change,
+                    relayout_on_viewport_move,
                     layout_strip_changed,
                     fit_maximized_windows,
                     reshuffle_layout_strip,
@@ -2540,25 +2541,28 @@ pub(super) fn layout_strip_changed(
     }
 }
 
+type ViewportStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        &'static ChildOf,
+        &'static Position,
+        Option<&'static RepositionMarker>,
+        Option<&'static Scrolling>,
+        Has<SelectedVirtualMarker>,
+        Has<PreviousStripPosition>,
+    ),
+>;
+
 /// Lays every strip out again when the display edge padding changes, as a
 /// config reload can do: the viewport, and with it every maximized window,
-/// depends on it. Each strip in view on any display moves with its viewport,
-/// so it keeps where the user scrolled it, unless the column the user sees
-/// there is maximized: then that column is placed to fill the new viewport.
-#[allow(clippy::type_complexity)]
+/// depends on it.
 fn relayout_on_edge_padding_change(
     config: Res<Config>,
     mut last: Local<Option<(i32, i32, i32, i32)>>,
-    mut strips: Query<(
-        Entity,
-        &mut LayoutStrip,
-        &ChildOf,
-        &Position,
-        Option<&RepositionMarker>,
-        Option<&Scrolling>,
-        Has<SelectedVirtualMarker>,
-        Has<PreviousStripPosition>,
-    )>,
+    mut strips: ViewportStrips,
     displays: DisplayViewports,
     windows: Windows,
     mut commands: Commands,
@@ -2570,9 +2574,62 @@ fn relayout_on_edge_padding_change(
     let (top, _, _, left) = padding;
     let (old_top, _, _, old_left) = old;
     let shift = IVec2::new(left - old_left, top - old_top);
+    follow_viewport(
+        &mut strips,
+        |_| Some(shift),
+        &displays,
+        &config,
+        &windows,
+        &mut commands,
+    );
+}
+
+/// Lays a display's strips out again when its usable area changed, such as
+/// when its Dock moved.
+fn relayout_on_viewport_move(
+    moved: Query<(Entity, &ViewportMoved)>,
+    config: Res<Config>,
+    mut strips: ViewportStrips,
+    displays: DisplayViewports,
+    windows: Windows,
+    mut commands: Commands,
+) {
+    if moved.is_empty() {
+        return;
+    }
+    let shift = |display| moved.get(display).ok().map(|(_, moved)| moved.0);
+    follow_viewport(
+        &mut strips,
+        shift,
+        &displays,
+        &config,
+        &windows,
+        &mut commands,
+    );
+    for (display, _) in &moved {
+        if let Ok(mut entity_commands) = commands.get_entity(display) {
+            entity_commands.try_remove::<ViewportMoved>();
+        }
+    }
+}
+
+/// Lays out again each strip whose display's viewport moved by
+/// `shift(display)`. Each strip in view moves with its viewport, so it keeps
+/// where the user scrolled it, unless the column the user sees there is
+/// maximized: then that column is placed to fill the new viewport.
+fn follow_viewport(
+    strips: &mut ViewportStrips,
+    shift: impl Fn(Entity) -> Option<IVec2>,
+    displays: &DisplayViewports,
+    config: &Config,
+    windows: &Windows,
+    commands: &mut Commands,
+) {
     let focused = windows.focused().map(|(_, entity)| entity);
-    for (entity, mut strip, child, position, reposition, scrolling, selected, parked) in &mut strips
-    {
+    for (entity, mut strip, child, position, reposition, scrolling, selected, parked) in strips {
+        let Some(shift) = shift(child.parent()) else {
+            continue;
+        };
         strip.set_changed();
         if !selected || parked {
             continue;
@@ -2582,14 +2639,14 @@ fn relayout_on_edge_padding_change(
             .get(child.parent())
             .ok()
             .and_then(|(display, dock)| {
-                let viewport = display.actual_display_bounds(dock, &config);
+                let viewport = display.actual_display_bounds(dock, config);
                 origin_filling_viewport(
                     &strip,
                     destination,
                     display.bounds(),
                     viewport,
                     focused,
-                    &windows,
+                    windows,
                 )
             })
             .unwrap_or(destination + shift);

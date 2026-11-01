@@ -10,7 +10,9 @@ use crate::commands::{Command, Direction, Operation, Side};
 use crate::config::{Config, MainOptions};
 use crate::ecs::drag::{DragFeedback, DragState, OverlayShape};
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::{DockPosition, SelectedVirtualMarker, SpawnWindowTrigger};
+use crate::ecs::{
+    DockPosition, ReadDisplayProperties, SelectedVirtualMarker, SetDock, SpawnWindowTrigger,
+};
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::{Modifiers, WinID, WorkspaceId};
@@ -1535,4 +1537,160 @@ fn a_hidden_maximized_window_stays_off_a_taller_display_beside() {
             && area(hidden.intersect(ext)) <= area(hidden.intersect(own)),
         "window 2 lies on the display beside: {hidden:?}"
     );
+}
+
+/// The entity of display `id`.
+fn display_entity(harness: &mut TestHarness, id: u32) -> Entity {
+    let world = harness.world();
+    world
+        .query::<(Entity, &Display)>()
+        .iter(world)
+        .find(|(_, display)| display.id() == id)
+        .expect("the display")
+        .0
+}
+
+/// Sets the Dock of display `id` as a re-read of the display does, and lets
+/// the layout settle.
+fn change_dock(harness: &mut TestHarness, id: u32, dock: DockPosition) {
+    let display = display_entity(harness, id);
+    harness.world().trigger(SetDock { display, dock });
+    harness.advance(SETTLE);
+}
+
+/// A Dock that shows while the engine runs, on any side, shrinks the
+/// display's usable area at once: its maximized window fits beside the Dock,
+/// the tiled windows lose the Dock's height when it is at the bottom, and
+/// everything returns when the Dock hides again.
+#[test]
+fn a_dock_shown_while_running_refits_the_display_windows() {
+    for dock in [
+        DockPosition::Bottom(60),
+        DockPosition::Left(60),
+        DockPosition::Right(60),
+    ] {
+        let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+        change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Hidden);
+        let without_dock = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+        let before = frames(&harness, &[0, 1, 2]);
+
+        change_dock(&mut harness, TEST_DISPLAY_ID, dock);
+        let with_dock = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+        assert_ne!(with_dock, without_dock, "{dock:?} takes space");
+        assert_eq!(os_frame(&harness, 1), with_dock, "{dock:?}");
+        assert_focused!(harness.world(), 1);
+        if matches!(dock, DockPosition::Bottom(_)) {
+            for (id, frame) in [(0, before[0]), (2, before[2])] {
+                let height = frame.height() - 60;
+                assert_eq!(os_frame(&harness, id).height(), height, "window {id}");
+            }
+        }
+
+        change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Hidden);
+        assert_eq!(
+            frames(&harness, &[0, 1, 2]),
+            before,
+            "{dock:?} hidden again"
+        );
+    }
+}
+
+/// A side Dock narrows every maximized column. The focused one, after
+/// another maximized column, still fills the usable area instead of sliding
+/// by the width the earlier column lost.
+#[test]
+fn a_side_dock_keeps_a_later_maximized_column_in_view() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    focus(&mut harness, Direction::East);
+    double_click_title_bar(&mut harness, 2);
+    harness.advance(SETTLE);
+    change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Hidden);
+    assert_eq!(
+        os_frame(&harness, 2),
+        usable_area_of(&mut harness, TEST_DISPLAY_ID)
+    );
+
+    change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Right(60));
+    assert_eq!(
+        os_frame(&harness, 2),
+        usable_area_of(&mut harness, TEST_DISPLAY_ID)
+    );
+    assert_focused!(harness.world(), 2);
+}
+
+/// A side Dock on a display without the focus keeps the maximized column
+/// seen there filling the usable area, after another maximized column.
+#[test]
+fn a_side_dock_keeps_a_later_maximized_column_in_view_without_focus() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    focus(&mut harness, Direction::East);
+    double_click_title_bar(&mut harness, 2);
+    harness.advance(SETTLE);
+    change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Hidden);
+    harness.run(vec![command(Operation::FocusDisplay(Direction::East))]);
+    harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 100);
+
+    change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Right(60));
+    assert_eq!(
+        os_frame(&harness, 2),
+        usable_area_of(&mut harness, TEST_DISPLAY_ID)
+    );
+}
+
+/// A display whose first Dock read comes after its strips exist, as when
+/// macOS lists the screen late, lays its strips out for that Dock.
+#[test]
+fn a_first_dock_read_after_the_strips_exist_refits_them() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Left(60));
+    assert_eq!(
+        os_frame(&harness, 1),
+        usable_area_of(&mut harness, TEST_DISPLAY_ID)
+    );
+}
+
+/// The Dock is measured against the real menu bar, so a configured menu bar
+/// height, which a re-read finds already applied, does not count as Dock.
+#[test]
+fn a_dock_reading_ignores_a_configured_menu_bar_height() {
+    let bounds = IRect::new(0, 0, 1024, 768);
+    let mut display = Display::new(TEST_DISPLAY_ID, bounds, 24);
+    display.set_menubar_height_override(Some(0));
+    let docked = IRect::new(0, 60, 1024, 744);
+    assert!(matches!(
+        display.locate_dock(&docked),
+        DockPosition::Bottom(60)
+    ));
+    let hidden = IRect::new(0, 0, 1024, 744);
+    assert!(matches!(display.locate_dock(&hidden), DockPosition::Hidden));
+}
+
+#[derive(Resource, Default)]
+struct DisplayReads(Vec<Entity>);
+
+/// macOS reports a change of screen parameters once a new Dock area can be
+/// read, so the engine reads every display's properties again then.
+#[test]
+fn a_screen_parameters_change_reads_every_display_again() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    let displays = [
+        display_entity(&mut harness, TEST_DISPLAY_ID),
+        display_entity(&mut harness, EXT_DISPLAY_ID),
+    ];
+    let world = harness.world();
+    world.init_resource::<DisplayReads>();
+    world.add_observer(
+        |read: On<ReadDisplayProperties>, mut reads: ResMut<DisplayReads>| {
+            reads.0.push(read.event().0);
+        },
+    );
+
+    harness.run(vec![Event::ScreenParametersChanged]);
+    let mut reads = harness.world().resource::<DisplayReads>().0.clone();
+    reads.sort();
+    let mut expected = displays.to_vec();
+    expected.sort();
+    assert_eq!(reads, expected);
 }

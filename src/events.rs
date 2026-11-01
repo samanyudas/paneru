@@ -210,6 +210,11 @@ pub enum Event {
     DisplayConfigured { display_id: CGDirectDisplayID },
     /// The overall display arrangement has changed.
     DisplayChanged,
+    /// A display's usable area may have changed, such as when the Dock
+    /// shows, hides, moves, or resizes. macOS posts this once the new
+    /// `NSScreen.visibleFrame` is readable; the Dock's own notifications
+    /// arrive before it is.
+    ScreenParametersChanged,
 
     /// Mission Control: Show all windows.
     MissionControlShowAllWindows,

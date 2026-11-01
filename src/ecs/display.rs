@@ -10,7 +10,7 @@ use bevy::ecs::query::{Has, With};
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Commands, NonSend, Query, Res, SystemParam};
 use bevy::ecs::world::World;
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2};
 use bevy::platform::collections::HashSet;
 use bevy::time::{Time, Timer, TimerMode};
 use objc2_app_kit::NSScreen;
@@ -27,8 +27,8 @@ use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, EnsureVisibleMarker, FocusedMarker,
     LayoutPosition, ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties,
-    RefreshWindowSizeOnFocus, RepositionMarker, SelectedVirtualMarker, SendMessageTrigger,
-    SpawnCommandsExt, Timeout,
+    RefreshWindowSizeOnFocus, RepositionMarker, SelectedVirtualMarker, SendMessageTrigger, SetDock,
+    SpawnCommandsExt, Timeout, ViewportMoved,
 };
 use crate::events::Event;
 use crate::manager::{Display, Size, Window, WindowManager, irect_from};
@@ -389,7 +389,12 @@ impl Plugin for DisplayEventsPlugin {
                     .chain()
                     .in_set(super::PreUpdateSet::Dispatch),
             )
+            .add_systems(
+                PreUpdate,
+                screen_parameters_handler.in_set(super::PreUpdateSet::Dispatch),
+            )
             .add_observer(read_display_properties_trigger)
+            .add_observer(set_dock)
             .add_observer(cleanup_active_display_marker);
     }
 }
@@ -1047,6 +1052,53 @@ impl FloatingLayer {
     }
 }
 
+/// Reads every display's properties again when macOS reports that a
+/// display's parameters changed, so a Dock that shows, hides, or moves while
+/// the engine runs updates the usable area.
+fn screen_parameters_handler(
+    mut messages: MessageReader<Event>,
+    displays: Query<Entity, With<Display>>,
+    mut commands: Commands,
+) {
+    if !messages
+        .read()
+        .any(|event| matches!(event, Event::ScreenParametersChanged))
+    {
+        return;
+    }
+    for entity in displays {
+        commands.trigger(ReadDisplayProperties(entity));
+    }
+}
+
+/// Stores a display's Dock position. When the display already has strips,
+/// it is marked with how far its usable area's corner moved, so the layout
+/// moves its strips for the new area.
+fn set_dock(
+    trigger: On<SetDock>,
+    displays: Query<(&Display, Option<&DockPosition>, Option<&ViewportMoved>)>,
+    strips: Query<&ChildOf, With<LayoutStrip>>,
+    mut commands: Commands,
+) {
+    let SetDock { display, dock } = *trigger.event();
+    let Ok((found, current, moved)) = displays.get(display) else {
+        return;
+    };
+    if current == Some(&dock) {
+        return;
+    }
+    debug!("dock on display {}: {dock:?}", found.id());
+    let Ok(mut entity_commands) = commands.get_entity(display) else {
+        return;
+    };
+    entity_commands.try_insert(dock);
+    if strips.iter().any(|child_of| child_of.parent() == display) {
+        let shift = found.visible_bounds(Some(&dock)).min - found.visible_bounds(current).min;
+        let earlier = moved.map_or(IVec2::ZERO, |moved| moved.0);
+        entity_commands.try_insert(ViewportMoved(earlier + shift));
+    }
+}
+
 fn read_display_properties_trigger(
     trigger: On<ReadDisplayProperties>,
     mut displays: Query<(&mut Display, Entity)>,
@@ -1079,10 +1131,10 @@ fn read_display_properties_trigger(
         display.locate_dock(&visible_frame)
     });
     if let Some(dock) = dock {
-        debug!("dock on display {display_id}: {:?}", dock);
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_insert(dock);
-        }
+        commands.trigger(SetDock {
+            display: entity,
+            dock,
+        });
     }
 
     if let Some(config) = config {
