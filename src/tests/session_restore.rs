@@ -1553,3 +1553,72 @@ fn an_exit_after_startup_saves_the_session() {
 
     assert_ne!(after, "previous session");
 }
+
+/// macOS switches Spaces with Control-Arrow on the display under the pointer,
+/// which need not be the display with focus. A restored Space that appears there
+/// must show its windows on that display, not leave them parked in its corner,
+/// where Mission Control lists them but the desktop does not show them (#85).
+#[test]
+fn test_space_switch_on_display_without_focus_shows_restored_strip() {
+    let hidden_space = EXT_WORKSPACE_ID + 1;
+    let ext_bounds = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        EXT_DISPLAY_HEIGHT,
+    );
+    let mut harness = TestHarness::new();
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        ext_bounds,
+        vec![EXT_WORKSPACE_ID, hidden_space],
+    );
+    let frame = IRect::from_corners(
+        ext_bounds.min,
+        ext_bounds.min + Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, 100, frame);
+    harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, hidden_space, 200, frame);
+    let saved_workspace = |workspace_id, window_id| SavedWorkspace {
+        workspace_id,
+        display_id: Some(EXT_DISPLAY_ID),
+        active_virtual_index: Some(0),
+        strips: vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved_window(window_id))],
+        }],
+    };
+    harness.world().insert_resource(PaneruState {
+        version: 2,
+        timestamp: 123_456_789,
+        active_display_id: Some(TEST_DISPLAY_ID),
+        displays: vec![
+            saved_display(TEST_DISPLAY_ID, true),
+            saved_display(EXT_DISPLAY_ID, false),
+        ],
+        workspaces: vec![
+            saved_workspace(EXT_WORKSPACE_ID, 100),
+            saved_workspace(hidden_space, 200),
+        ],
+    });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_secs(1));
+    assert_eq!(harness.mock_state.active_display(), TEST_DISPLAY_ID);
+
+    harness
+        .mock_state
+        .activate_workspace(EXT_DISPLAY_ID, hidden_space, false);
+    harness.world().write_message::<Event>(Event::SpaceChanged);
+    harness.advance(Duration::from_secs(1));
+
+    let frame = harness.mock_state.ax_frame(200);
+    assert_eq!(
+        frame.intersect(ext_bounds),
+        frame,
+        "the window of the Space now shown on its display must lie inside that display"
+    );
+}
