@@ -779,6 +779,14 @@ pub enum DockPosition {
     Hidden,
 }
 
+impl DockPosition {
+    /// The Dock position to use, from the one macOS's work area `reported`
+    /// and the one the Dock's own frame `measured`.
+    pub fn settle(reported: Option<Self>, measured: Option<Self>) -> Option<Self> {
+        reported.or(measured)
+    }
+}
+
 /// Where a run of width changes keeps a column: flush against a display edge it
 /// started on, or around the center it started at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

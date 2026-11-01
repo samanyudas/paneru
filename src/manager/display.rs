@@ -12,6 +12,15 @@ use crate::{
     errors::{Error, Result},
 };
 
+/// The Dock as the Dock itself shows it, read apart from the macOS work area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockFrame {
+    /// Auto-hide is on, so the Dock reserves no space.
+    AutoHidden,
+    /// The frame of the Dock's icon list, in global points.
+    Shown(IRect),
+}
+
 /// `Display` represents a physical monitor and manages its associated workspaces and window panes.
 /// Each display has a unique ID, bounds, and a collection of `LayoutStrip`s for different spaces.
 #[derive(Component, Debug)]
@@ -104,6 +113,11 @@ impl Display {
 
     /// Where the Dock sits, from the macOS work area. The work area leaves
     /// out the real menu bar, so a configured menu bar height does not count.
+    /// Where the Dock sits on this display by the Dock's own frame.
+    pub fn dock_from_frame(&self, _dock: DockFrame) -> DockPosition {
+        DockPosition::Hidden
+    }
+
     pub fn locate_dock(&self, visible_frame: &IRect) -> DockPosition {
         let menubar = self.menubar_height.max(self.notch_height);
         if self.bounds.min.x < visible_frame.min.x {

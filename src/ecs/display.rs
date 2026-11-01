@@ -1103,6 +1103,7 @@ fn read_display_properties_trigger(
     trigger: On<ReadDisplayProperties>,
     mut displays: Query<(&mut Display, Entity)>,
     platform: Option<NonSend<Pin<Box<PlatformCallbacks>>>>,
+    window_manager: Res<WindowManager>,
     config: Option<Res<Config>>,
     mut commands: Commands,
 ) {
@@ -1112,29 +1113,35 @@ fn read_display_properties_trigger(
     let display_id = display.id();
 
     // NSScreen::screen needs to run in the main thread, thus we run it in a NonSend trigger.
-    let Some(screens) = platform.map(|platform| NSScreen::screens(platform.main_thread_marker))
-    else {
-        return;
-    };
+    let screens = platform.map(|platform| NSScreen::screens(platform.main_thread_marker));
 
-    let notch = read_screen_property(&screens, display_id, |screen| {
-        let insets = screen.safeAreaInsets();
-        debug!("notch on display {display_id}: {insets:?}");
-        round_px(insets.top)
-    });
-    if let Some(height) = notch {
-        display.set_notch_height(height);
+    if let Some(screens) = &screens {
+        let notch = read_screen_property(screens, display_id, |screen| {
+            let insets = screen.safeAreaInsets();
+            debug!("notch on display {display_id}: {insets:?}");
+            round_px(insets.top)
+        });
+        if let Some(height) = notch {
+            display.set_notch_height(height);
+        }
     }
 
-    let dock = read_screen_property(&screens, display_id, |screen| {
-        let visible_frame = irect_from(screen.visibleFrame());
-        display.locate_dock(&visible_frame)
+    let reported = screens.as_ref().and_then(|screens| {
+        read_screen_property(screens, display_id, |screen| {
+            display.locate_dock(&irect_from(screen.visibleFrame()))
+        })
     });
-    if let Some(dock) = dock {
+    let measured = window_manager
+        .dock_frame()
+        .map(|frame| display.dock_from_frame(frame));
+    if let Some(dock) = DockPosition::settle(reported, measured) {
         commands.trigger(SetDock {
             display: entity,
             dock,
         });
+    }
+    if screens.is_none() {
+        return;
     }
 
     if let Some(config) = config {

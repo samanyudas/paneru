@@ -228,6 +228,7 @@ struct MockStateInner {
     stale_window_ids: HashMap<WinID, Pid>,
     unordered_windows: HashSet<WinID>,
     screen_locked: bool,
+    dock_frame: Option<crate::manager::DockFrame>,
     /// Windows the app keeps out of its accessibility window list while the
     /// window server still reports them on screen: a background native tab.
     background_tabs: HashSet<WinID>,
@@ -478,6 +479,7 @@ impl MockState {
             stale_window_ids: HashMap::new(),
             unordered_windows: HashSet::new(),
             screen_locked: false,
+            dock_frame: None,
             background_tabs: HashSet::new(),
             raise_count: 0,
             raise_takes_focus: false,
@@ -1065,6 +1067,11 @@ impl MockState {
         let mut inner = self.inner.force_write();
         inner.windows.remove(&id);
         inner.unordered_windows.insert(id);
+    }
+
+    /// Shows the Dock as `frame`, without telling the engine.
+    pub fn os_set_dock_frame(&self, frame: Option<crate::manager::DockFrame>) {
+        self.inner.force_write().dock_frame = frame;
     }
 
     pub fn os_lock_screen(&self, locked: bool) {
@@ -1864,6 +1871,10 @@ impl MockState {
         let s = self.clone();
         wm.expect_screen_locked()
             .returning(move || s.inner.force_read().screen_locked);
+
+        let s = self.clone();
+        wm.expect_dock_frame()
+            .returning(move || s.inner.force_read().dock_frame);
 
         let s = self.clone();
         wm.expect_active_display_id()

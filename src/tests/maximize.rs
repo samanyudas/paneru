@@ -14,7 +14,7 @@ use crate::ecs::{
     DockPosition, ReadDisplayProperties, SelectedVirtualMarker, SetDock, SpawnWindowTrigger,
 };
 use crate::events::{Event, MouseButton};
-use crate::manager::{Display, Origin, Size, Window};
+use crate::manager::{Display, DockFrame, Origin, Size, Window};
 use crate::platform::{Modifiers, WinID, WorkspaceId};
 
 use super::*;
@@ -1693,4 +1693,122 @@ fn a_screen_parameters_change_reads_every_display_again() {
     let mut expected = displays.to_vec();
     expected.sort();
     assert_eq!(reads, expected);
+}
+
+/// The 2560x1440 display and the built-in display to its left, as measured
+/// on Sam's Mac on 1 November 2026.
+fn calibration_displays() -> (Display, Display) {
+    (
+        Display::new(3, IRect::new(0, 0, 2560, 1440), 30),
+        Display::new(1, IRect::new(-2048, 108, 0, 1440), 45),
+    )
+}
+
+/// The Dock's own frame gives the space macOS reserves for it, on each side
+/// and at each size measured on macOS 27, and nothing on the other display.
+#[test]
+fn the_dock_frame_gives_the_reserved_space() {
+    let (external, built_in) = calibration_displays();
+    let frame = |x, y, width, height| DockFrame::Shown(IRect::new(x, y, x + width, y + height));
+    for (frame, on_external, on_built_in) in [
+        (
+            frame(727, 1358, 1106, 72),
+            DockPosition::Bottom(78),
+            DockPosition::Hidden,
+        ),
+        (
+            frame(533, 1338, 1494, 92),
+            DockPosition::Bottom(98),
+            DockPosition::Hidden,
+        ),
+        (
+            frame(319, 1316, 1922, 114),
+            DockPosition::Bottom(120),
+            DockPosition::Hidden,
+        ),
+        (
+            frame(-2038, 244, 72, 1105),
+            DockPosition::Hidden,
+            DockPosition::Left(78),
+        ),
+        (
+            frame(-2038, 201, 77, 1193),
+            DockPosition::Hidden,
+            DockPosition::Left(83),
+        ),
+        (
+            frame(2478, 182, 72, 1105),
+            DockPosition::Right(78),
+            DockPosition::Hidden,
+        ),
+        (
+            frame(2468, 82, 82, 1305),
+            DockPosition::Right(88),
+            DockPosition::Hidden,
+        ),
+        (
+            frame(727, 1440, 1106, 72),
+            DockPosition::Hidden,
+            DockPosition::Hidden,
+        ),
+        (
+            DockFrame::AutoHidden,
+            DockPosition::Hidden,
+            DockPosition::Hidden,
+        ),
+    ] {
+        assert_eq!(external.dock_from_frame(frame), on_external, "{frame:?}");
+        assert_eq!(built_in.dock_from_frame(frame), on_built_in, "{frame:?}");
+    }
+}
+
+/// macOS's work area wins while it agrees with the Dock's frame, since it is
+/// exact. When it plainly disagrees, as when macOS publishes a Dock change
+/// late or never, the Dock's frame wins.
+#[test]
+fn the_dock_frame_overrides_a_work_area_that_plainly_disagrees() {
+    use DockPosition::{Bottom, Hidden, Left, Right};
+    for (reported, measured, settled) in [
+        (Some(Right(89)), Some(Right(88)), Some(Right(89))),
+        (Some(Hidden), Some(Hidden), Some(Hidden)),
+        (Some(Bottom(98)), Some(Bottom(120)), Some(Bottom(120))),
+        (Some(Bottom(120)), Some(Hidden), Some(Hidden)),
+        (Some(Hidden), Some(Left(78)), Some(Left(78))),
+        (Some(Bottom(78)), None, Some(Bottom(78))),
+        (None, Some(Bottom(78)), Some(Bottom(78))),
+        (None, None, None),
+    ] {
+        assert_eq!(
+            DockPosition::settle(reported, measured),
+            settled,
+            "{reported:?} against {measured:?}"
+        );
+    }
+}
+
+/// A Dock change that macOS never publishes as a work area change still
+/// refits the display once the Dock reports its preference change: the
+/// engine reads the Dock's own frame again after the Dock settles.
+#[test]
+fn a_dock_change_without_a_work_area_change_refits_the_display() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    let full = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    let dock_pref_changed = || Event::DockDidChangePref { msg: String::new() };
+
+    let top = TEST_DISPLAY_HEIGHT - 82;
+    harness
+        .mock_state
+        .os_set_dock_frame(Some(DockFrame::Shown(IRect::new(262, top, 762, top + 72))));
+    harness.run(vec![dock_pref_changed()]);
+    harness.advance(Duration::from_secs(3));
+    let with_dock = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    assert_eq!(with_dock.max.y, full.max.y - 78);
+    assert_eq!(os_frame(&harness, 1), with_dock);
+
+    harness
+        .mock_state
+        .os_set_dock_frame(Some(DockFrame::AutoHidden));
+    harness.run(vec![dock_pref_changed()]);
+    harness.advance(Duration::from_secs(3));
+    assert_eq!(os_frame(&harness, 1), full);
 }

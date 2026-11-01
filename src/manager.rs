@@ -39,7 +39,7 @@ use crate::platform::{ConnID, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::util::{AXUIWrapper, MacResult, create_array, round_px, symlink_target};
 use app::ApplicationOS;
 pub use app::{Application, ApplicationApi};
-pub use display::Display;
+pub use display::{Display, DockFrame};
 pub use process::{Process, ProcessApi};
 pub use skylight::AXUIElementCopyAttributeValue;
 use skylight::{
@@ -214,6 +214,9 @@ pub trait WindowManagerApi: Send + Sync {
     /// Whether the screen is locked. While it is, every AX read from another
     /// process fails, so an AX answer is no evidence a window is gone.
     fn screen_locked(&self) -> bool;
+    /// The Dock as the Dock itself shows it, or `None` when it cannot be read,
+    /// as while the screen is locked.
+    fn dock_frame(&self) -> Option<DockFrame>;
 
     /// Sends an `Event::Exit` to the event loop, signaling the application to quit.
     ///
@@ -614,6 +617,10 @@ impl WindowManagerApi for WindowManagerOS {
             .get(&CFString::from_static_str("CGSSessionScreenIsLocked"))
             .and_then(|locked| locked.downcast::<CFBoolean>().ok())
             .is_some_and(|locked| locked.as_bool())
+    }
+
+    fn dock_frame(&self) -> Option<DockFrame> {
+        None
     }
 
     fn quit(&self) -> Result<()> {
