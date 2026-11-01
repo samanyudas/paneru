@@ -2142,11 +2142,14 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
         let owner = window_manager
             .window_owner(window_id)
             .and_then(|pid| apps.iter().find(|app| app.pid() == pid));
+        let mut answered = true;
         let discovered = owner.and_then(|app| {
             app.focused_window(&config)
                 .filter(|window| window.id() == window_id)
                 .or_else(|| {
-                    app.window_list(&config)
+                    let listed = app.window_list(&config);
+                    answered = listed.complete;
+                    listed
                         .windows
                         .into_iter()
                         .find(|window| window.id() == window_id)
@@ -2156,6 +2159,10 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
         if let Some(window) = discovered {
             debug!("Discovered unknown focused window {window_id}.");
             commands.trigger(SpawnWindowTrigger(vec![window]));
+        } else if !answered {
+            debug!(
+                "The app of focused window {window_id} did not answer; asking at its next focus."
+            );
         } else {
             trace!(
                 "Failed to discover manageable window for focused ID {window_id}; caching as unmanageable."
