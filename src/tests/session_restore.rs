@@ -1623,3 +1623,77 @@ fn test_space_switch_on_display_without_focus_shows_restored_strip() {
         "the window of the Space now shown on its display must lie inside that display"
     );
 }
+
+/// macOS can renumber Spaces, as it does when the Dock restarts, while every
+/// window stays where it is. A restored strip must follow its windows to the
+/// Space macOS now reports, not rebuild the Space that no longer exists, where
+/// its windows are parked out of sight (#85).
+#[test]
+fn test_startup_restore_follows_windows_to_their_renumbered_space() {
+    let gone_space = EXT_WORKSPACE_ID + 997;
+    let ext_bounds = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        EXT_DISPLAY_HEIGHT,
+    );
+    let mut harness = TestHarness::new();
+    harness
+        .mock_state
+        .add_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID]);
+    let frame = IRect::from_corners(
+        ext_bounds.min,
+        ext_bounds.min + Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    for id in [300, 301] {
+        harness
+            .mock_state
+            .spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, id, frame);
+    }
+    let mut ext_display = saved_display(EXT_DISPLAY_ID, false);
+    ext_display.workspace_ids = vec![gone_space];
+    harness.world().insert_resource(PaneruState {
+        version: 2,
+        timestamp: 123_456_789,
+        active_display_id: Some(TEST_DISPLAY_ID),
+        displays: vec![saved_display(TEST_DISPLAY_ID, true), ext_display],
+        workspaces: vec![SavedWorkspace {
+            workspace_id: gone_space,
+            display_id: Some(EXT_DISPLAY_ID),
+            active_virtual_index: Some(0),
+            strips: vec![SavedStrip {
+                virtual_index: 0,
+                columns: vec![
+                    SavedColumn::Single(saved_window(301)),
+                    SavedColumn::Single(saved_window(300)),
+                ],
+            }],
+        }],
+    });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_secs(1));
+    assert_eq!(harness.mock_state.active_display(), TEST_DISPLAY_ID);
+
+    let world = harness.world();
+    let order = vec![
+        find_window_entity(301, world),
+        find_window_entity(300, world),
+    ];
+    let restored: Vec<(WorkspaceId, Vec<Entity>)> = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|strip| strip.all_windows().contains(&order[1]))
+        .map(|strip| (strip.id(), strip.all_windows()))
+        .collect();
+    assert_eq!(
+        restored,
+        vec![(EXT_WORKSPACE_ID, order)],
+        "the saved order must be rebuilt on the Space that holds the windows"
+    );
+    let shown = harness.mock_state.ax_frame(301);
+    assert_eq!(
+        shown.intersect(ext_bounds),
+        shown,
+        "the first restored window must show on its display, not sit parked"
+    );
+}
