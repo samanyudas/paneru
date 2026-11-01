@@ -520,7 +520,7 @@ impl WindowManagerApi for WindowManagerOS {
         }
         debug!("{app} has global windows: {global_window_list:?}");
 
-        let found_windows = app.window_list(config);
+        let found_windows = app.window_list(config).windows;
         if found_windows.len() == global_window_list.len() {
             debug!("All windows for {:?} are now resolved", app.psn());
             return Ok((found_windows, vec![]));

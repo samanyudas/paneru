@@ -3741,6 +3741,56 @@ fn a_focused_unknown_window_is_found_through_its_own_app() {
     );
 }
 
+/// Focus on a window the engine missed can come while its app is too busy to
+/// answer for it. The engine asks the app again when the window is focused
+/// again, instead of ignoring that window from then on. (#63)
+#[test]
+fn a_focused_window_its_app_did_not_answer_for_is_found_at_its_next_focus() {
+    const BUSY_APP: crate::platform::Pid = 8;
+    const MISSED: WinID = 80;
+    let mut harness =
+        TestHarness::new()
+            .with_windows(1)
+            .with_app(BUSY_APP, "com.example.busy", "Busy", |app| {
+                app.is_frontmost = false;
+            });
+    let state = harness.mock_state.clone();
+    harness.advance(Duration::from_secs(1));
+    state.spawn_window(
+        BUSY_APP,
+        TEST_WORKSPACE_ID,
+        MISSED,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    state.update_window(MISSED, |window| window.ax_unanswered = true);
+    let managed = |harness: &mut TestHarness| {
+        let world = harness.world();
+        world
+            .query::<&Window>()
+            .iter(world)
+            .any(|w| w.id() == MISSED)
+    };
+
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: MISSED });
+    harness.advance(Duration::from_millis(200));
+    assert!(
+        !managed(&mut harness),
+        "an unanswered window is not managed"
+    );
+
+    state.update_window(MISSED, |window| window.ax_unanswered = false);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: MISSED });
+    harness.advance(Duration::from_millis(200));
+    assert!(
+        managed(&mut harness),
+        "the window is managed when it is focused again"
+    );
+}
+
 /// The centering config the manual-offset tests share: `auto_center` off and
 /// `continuous_swipe` off is the combination that arms the edge invariant in
 /// `reshuffle_layout_strip`, which is what used to snap a centered strip back

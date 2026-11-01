@@ -100,6 +100,14 @@ pub static AX_WINDOW_NOTIFICATIONS: LazyLock<Vec<&str>> = LazyLock::new(|| {
     ]
 });
 
+/// The windows an app listed over Accessibility.
+pub struct WindowList {
+    pub windows: Vec<Window>,
+    /// The app answered for the list and for every window in it. When it did
+    /// not, a later list can hold windows that this one missed.
+    pub complete: bool,
+}
+
 #[automock]
 pub trait ApplicationApi: Send + Sync {
     /// Returns the process ID of the application.
@@ -116,16 +124,12 @@ pub trait ApplicationApi: Send + Sync {
     fn focused_window_id(&self) -> Result<WinID>;
     /// Returns the currently focused window for this application, if any.
     fn focused_window(&self, config: &Config) -> Option<Window>;
-    /// Returns a list of all windows belonging to this application.
+    /// Returns the manageable windows of this application.
     ///
     /// # Arguments
     ///
     /// * `config` - The current Paneru configuration, used to evaluate window rules.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `Error` if the window list cannot be retrieved.
-    fn window_list(&self, config: &Config) -> Vec<Window>;
+    fn window_list(&self, config: &Config) -> WindowList;
     /// Returns the IDs of the windows the app currently exposes over
     /// accessibility.
     ///
@@ -322,20 +326,32 @@ impl ApplicationApi for ApplicationOS {
     /// # Returns
     ///
     /// `Ok(Vec<Result<Window>>)` containing the list of window objects if successful, otherwise `Err(Error)`.
-    fn window_list(&self, config: &Config) -> Vec<Window> {
+    fn window_list(&self, config: &Config) -> WindowList {
         let bundle_id = self.bundle_id.as_deref();
-        self.element
-            .windows()
-            .map(|windows| {
-                windows
-                    .into_iter()
-                    .flat_map(|element| {
-                        WindowOS::new_with_config(&element, config, bundle_id)
-                            .map(|window| Window::new(Box::new(window)))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        let elements = match self.element.windows() {
+            Ok(elements) => elements,
+            Err(err) => {
+                return WindowList {
+                    windows: Vec::new(),
+                    complete: !matches!(err, Error::CannotComplete(_)),
+                };
+            }
+        };
+        let mut complete = true;
+        let windows = elements
+            .into_iter()
+            .filter_map(
+                |element| match WindowOS::new_with_config(&element, config, bundle_id) {
+                    Ok(window) => Some(Window::new(Box::new(window))),
+                    Err(Error::CannotComplete(_)) => {
+                        complete = false;
+                        None
+                    }
+                    Err(_) => None,
+                },
+            )
+            .collect();
+        WindowList { windows, complete }
     }
 
     fn ax_window_ids(&self) -> Vec<WinID> {

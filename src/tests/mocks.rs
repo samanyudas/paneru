@@ -9,7 +9,7 @@ use stdext::prelude::RwLockExt;
 
 use crate::errors::Error;
 use crate::events::{DestroySource, Event, MouseButton};
-use crate::manager::app::MockApplicationApi;
+use crate::manager::app::{MockApplicationApi, WindowList};
 use crate::manager::window_writer::{FrameWrites, WindowWriters, WriteSink};
 use crate::manager::{
     Application, Display, Margins, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin,
@@ -115,6 +115,9 @@ pub(crate) struct MockWindowData {
     /// The app has not put the window's current AX element in its window
     /// list yet.
     pub(crate) ax_unlisted: bool,
+    /// The app lists the window but does not answer reads of its details in
+    /// time, like a window asked while its app's main thread is blocked.
+    pub(crate) ax_unanswered: bool,
 }
 
 /// How far above the screen's bottom edge [`MockWindowData::sticky_bottom`]
@@ -184,6 +187,7 @@ impl Default for MockWindowData {
             child_role: false,
             ax_generation: 0,
             ax_unlisted: false,
+            ax_unanswered: false,
         }
     }
 }
@@ -1746,7 +1750,8 @@ impl MockState {
                 let focused_id = inner.apps.get(&pid).and_then(|a| a.focused_window_id)?;
                 inner
                     .windows
-                    .contains_key(&focused_id)
+                    .get(&focused_id)
+                    .is_some_and(|w| !w.ax_unanswered)
                     .then_some(focused_id)
             }?;
             Some(s.create_window(focused_id))
@@ -1822,9 +1827,27 @@ impl MockState {
                 inner.apps.get(&pid).is_some_and(|a| a.ax_busy)
             };
             if busy {
-                return Vec::new();
+                return WindowList {
+                    windows: Vec::new(),
+                    complete: false,
+                };
             }
-            ids().into_iter().map(|id| s.create_window(id)).collect()
+            let unanswered = |id| {
+                s.inner
+                    .force_read()
+                    .windows
+                    .get(&id)
+                    .is_some_and(|w| w.ax_unanswered)
+            };
+            let ids = ids();
+            WindowList {
+                complete: !ids.iter().any(|&id| unanswered(id)),
+                windows: ids
+                    .into_iter()
+                    .filter(|&id| !unanswered(id))
+                    .map(|id| s.create_window(id))
+                    .collect(),
+            }
         });
 
         let (s, ids) = (self.clone(), window_ids.clone());
