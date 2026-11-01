@@ -1110,9 +1110,10 @@ fn test_emptied_baseline_row_is_parked_and_repositions_moved_windows() {
                 workspace_rows_state(world, 200),
                 vec![
                     (0, parked_origin, false, false, Some(visible_origin)),
-                    (1, parked_origin, false, true, Some(visible_origin)),
+                    (1, visible_origin, false, true, None),
                 ],
-                "emptied baseline row 0 must be parked with PreviousStripPosition and not selected"
+                "emptied baseline row 0 must be parked with PreviousStripPosition and not selected, \
+                 while the selected row waits in place for macOS to show its Space"
             );
         })
         .on_iteration(1, |world, _state| {
