@@ -589,11 +589,15 @@ impl Window {
 ///
 /// `Ok(WinID)` with the window ID if successful, otherwise `Err(Error)`.
 pub fn ax_window_id(element_ref: AXUIElementRef) -> Result<WinID> {
-    try_ax_window_id(element_ref).ok_or_else(|| {
-        Error::InvalidInput(format!(
-            "{}: Unable to get window id from element {element_ref:?}.",
-            function_name!()
-        ))
+    read_ax_window_id(element_ref).map_err(|status| {
+        if status == accessibility_sys::kAXErrorCannotComplete {
+            Error::CannotComplete(function_name!().to_string())
+        } else {
+            Error::InvalidInput(format!(
+                "{}: Unable to get window id from element {element_ref:?}.",
+                function_name!()
+            ))
+        }
     })
 }
 
@@ -603,12 +607,18 @@ pub fn ax_window_id(element_ref: AXUIElementRef) -> Result<WinID> {
 /// a row and discards nearly every result, so the error path must not format a
 /// message it will only drop.
 pub fn try_ax_window_id(element_ref: AXUIElementRef) -> Option<WinID> {
-    let ptr = NonNull::new(element_ref)?;
+    read_ax_window_id(element_ref).ok()
+}
+
+/// The window id of `element_ref`, or the status of the failed read. A read
+/// that succeeds without an id fails with status 0.
+fn read_ax_window_id(element_ref: AXUIElementRef) -> std::result::Result<WinID, OSStatus> {
+    let ptr = NonNull::new(element_ref).ok_or(accessibility_sys::kAXErrorIllegalArgument)?;
     let mut window_id: WinID = 0;
-    if unsafe { _AXUIElementGetWindow(ptr.as_ptr(), &mut window_id) } != 0 || window_id == 0 {
-        return None;
+    match unsafe { _AXUIElementGetWindow(ptr.as_ptr(), &mut window_id) } {
+        0 if window_id != 0 => Ok(window_id),
+        status => Err(status),
     }
-    Some(window_id)
 }
 
 /// The window server layer of window `id`, or `None` when it lists no such
