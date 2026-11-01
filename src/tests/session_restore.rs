@@ -1624,10 +1624,10 @@ fn test_space_switch_on_display_without_focus_shows_restored_strip() {
     );
 }
 
-/// macOS can renumber Spaces, as it does when the Dock restarts, while every
-/// window stays where it is. A restored strip must follow its windows to the
-/// Space macOS now reports, not rebuild the Space that no longer exists, where
-/// its windows are parked out of sight (#85).
+/// macOS can give a Space a new ID while every window stays where it is. A
+/// restored strip must follow its windows to the Space macOS now reports, not
+/// rebuild the Space that no longer exists, where its windows are parked out of
+/// sight (#85).
 #[test]
 fn test_startup_restore_follows_windows_to_their_renumbered_space() {
     let gone_space = EXT_WORKSPACE_ID + 997;

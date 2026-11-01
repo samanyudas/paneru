@@ -616,9 +616,8 @@ pub(super) fn restore_window_state(
     );
 }
 
-/// macOS can renumber Spaces, as it does when the Dock restarts, while the
-/// windows stay put. A saved Space is restored as the Space that now holds
-/// most of its windows.
+/// macOS can give a Space a new ID while its windows stay put. A saved Space
+/// is restored as the Space that now holds most of its windows.
 fn follow_windows_to_their_spaces(
     plan: &mut RestorePlan,
     current_spaces: &HashMap<Entity, WorkspaceId>,
