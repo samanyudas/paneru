@@ -576,12 +576,23 @@ pub(super) fn add_launched_application(
     let find_window = |window_id| windows.find(window_id);
 
     for (app, entity, has_children) in app_query {
-        let mut create_windows = app.window_list(&config);
+        let listed = app.window_list(&config);
+        let mut create_windows = listed.windows;
         // Retain the non-existing windows, so they can be created.
         create_windows.retain(|window| find_window(window.id()).is_none());
 
+        // An app that did not answer for every window is listed again on the
+        // next tick, until its launch timeout ends.
+        if !listed.complete {
+            debug!(
+                "{} did not answer for every window; listing it again",
+                app.name()
+            );
+        }
         if !create_windows.is_empty() {
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            if listed.complete
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
                 entity_commands.try_remove::<FreshMarker>();
             }
             debug!(
@@ -589,7 +600,7 @@ pub(super) fn add_launched_application(
                 create_windows.len(),
             );
             commands.trigger(SpawnWindowTrigger(create_windows));
-        } else if has_children {
+        } else if has_children && listed.complete {
             // Windows were already created via AXCreated notification path.
             // Remove FreshMarker so the Timeout gets cleaned up.
             debug!("removing FreshMarker from {entity}: windows already created via AXCreated");
@@ -2136,6 +2147,7 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
                 .filter(|window| window.id() == window_id)
                 .or_else(|| {
                     app.window_list(&config)
+                        .windows
                         .into_iter()
                         .find(|window| window.id() == window_id)
                 })

@@ -9,7 +9,7 @@ use stdext::prelude::RwLockExt;
 
 use crate::errors::Error;
 use crate::events::{DestroySource, Event, MouseButton};
-use crate::manager::app::MockApplicationApi;
+use crate::manager::app::{MockApplicationApi, WindowList};
 use crate::manager::window_writer::{FrameWrites, WindowWriters, WriteSink};
 use crate::manager::{
     Application, Display, Margins, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin,
@@ -1826,7 +1826,10 @@ impl MockState {
                 inner.apps.get(&pid).is_some_and(|a| a.ax_busy)
             };
             if busy {
-                return Vec::new();
+                return WindowList {
+                    windows: Vec::new(),
+                    complete: false,
+                };
             }
             let unanswered = |id| {
                 s.inner
@@ -1835,11 +1838,15 @@ impl MockState {
                     .get(&id)
                     .is_some_and(|w| w.ax_unanswered)
             };
-            ids()
-                .into_iter()
-                .filter(|&id| !unanswered(id))
-                .map(|id| s.create_window(id))
-                .collect()
+            let ids = ids();
+            WindowList {
+                complete: !ids.iter().any(|&id| unanswered(id)),
+                windows: ids
+                    .into_iter()
+                    .filter(|&id| !unanswered(id))
+                    .map(|id| s.create_window(id))
+                    .collect(),
+            }
         });
 
         let (s, ids) = (self.clone(), window_ids.clone());

@@ -1052,6 +1052,12 @@ impl WindowOS {
             above_ordinary: RwLock::new(None),
         };
 
+        // A read the app did not answer says nothing about the window, so
+        // let the caller ask again instead of rejecting it as not real.
+        if let Err(err @ Error::CannotComplete(_)) = window.subrole().and_then(|_| window.role()) {
+            return Err(err);
+        }
+
         let forced = window.is_forced_manage(config, bundle_id);
 
         if window.is_unknown() && !forced {

@@ -1075,6 +1075,7 @@ fn adopt_fresh_handle(window: &mut Window, app: &mut Application, config: &Confi
     let window_id = window.id();
     let Some(old) = app
         .window_list(config)
+        .windows
         .into_iter()
         .filter(|fresh| fresh.id() == window_id && fresh.is_alive())
         .find_map(|fresh| window.replace_handle(fresh).ok())
