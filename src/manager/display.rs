@@ -102,15 +102,16 @@ impl Display {
         self.id
     }
 
+    /// Where the Dock sits, from the macOS work area. The work area leaves
+    /// out the real menu bar, so a configured menu bar height does not count.
     pub fn locate_dock(&self, visible_frame: &IRect) -> DockPosition {
+        let menubar = self.menubar_height.max(self.notch_height);
         if self.bounds.min.x < visible_frame.min.x {
             DockPosition::Left(visible_frame.min.x - self.bounds.min.x)
         } else if visible_frame.width() < self.bounds.width() {
             DockPosition::Right(self.bounds.max.x - visible_frame.max.x)
-        } else if visible_frame.height() < self.bounds.height() - self.menubar_height() {
-            DockPosition::Bottom(
-                self.bounds.height() - visible_frame.height() - self.menubar_height(),
-            )
+        } else if visible_frame.height() < self.bounds.height() - menubar {
+            DockPosition::Bottom(self.bounds.height() - visible_frame.height() - menubar)
         } else {
             DockPosition::Hidden
         }

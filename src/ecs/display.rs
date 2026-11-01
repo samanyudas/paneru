@@ -1071,12 +1071,14 @@ fn screen_parameters_handler(
     }
 }
 
-/// Stores a display's Dock position. When it differs from the stored one,
-/// the display's strips lay out again for the new usable area.
+/// Stores a display's Dock position. When a stored one changes, the
+/// display's strips lay out again for the new usable area, shifted as far as
+/// its corner moved, the way a display move shifts them. The first read
+/// comes before the display has strips.
 fn set_dock(
     trigger: On<SetDock>,
     displays: Query<(&Display, Option<&DockPosition>)>,
-    mut strips: Query<(&mut LayoutStrip, &ChildOf)>,
+    strips: Query<(Entity, &ChildOf), With<LayoutStrip>>,
     mut commands: Commands,
 ) {
     let SetDock { display, dock } = *trigger.event();
@@ -1090,11 +1092,26 @@ fn set_dock(
     if let Ok(mut entity_commands) = commands.get_entity(display) {
         entity_commands.try_insert(dock);
     }
-    for (mut strip, child_of) in &mut strips {
-        if child_of.parent() == display {
-            strip.set_changed();
+    let Some(current) = current else {
+        return;
+    };
+    let moved = found.visible_bounds(Some(&dock)).min - found.visible_bounds(Some(current)).min;
+    let bounds = found.bounds();
+    let previous = IRect::from_corners(bounds.min - moved, bounds.max - moved);
+    let strips = strips
+        .iter()
+        .filter(|(_, child_of)| child_of.parent() == display)
+        .map(|(entity, _)| entity)
+        .collect::<Vec<_>>();
+    commands.queue(move |world: &mut World| {
+        let focused = world
+            .query_filtered::<Entity, With<FocusedMarker>>()
+            .iter(world)
+            .next();
+        for strip in strips {
+            refresh_strip_layout(world, strip, Some(previous), focused);
         }
-    }
+    });
 }
 
 fn read_display_properties_trigger(

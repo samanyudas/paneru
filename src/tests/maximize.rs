@@ -1466,39 +1466,88 @@ fn display_entity(harness: &mut TestHarness, id: u32) -> Entity {
         .0
 }
 
-/// A Dock that shows while the engine runs shrinks the display's usable area
-/// at once: its maximized window and its tiled windows fit beside the Dock,
-/// and they grow back when the Dock hides again.
+/// Sets the Dock of display `id` as a re-read of the display does, and lets
+/// the layout settle.
+fn change_dock(harness: &mut TestHarness, id: u32, dock: DockPosition) {
+    let display = display_entity(harness, id);
+    harness.world().trigger(SetDock { display, dock });
+    harness.advance(SETTLE);
+}
+
+/// A Dock that shows while the engine runs, on any side, shrinks the
+/// display's usable area at once: its maximized window fits beside the Dock,
+/// the tiled windows lose the Dock's height when it is at the bottom, and
+/// everything returns when the Dock hides again.
 #[test]
 fn a_dock_shown_while_running_refits_the_display_windows() {
-    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
-    let display = display_entity(&mut harness, TEST_DISPLAY_ID);
-    let without_dock = usable_area_of(&mut harness, TEST_DISPLAY_ID);
-    let tiled = frames(&harness, &[0, 2]);
+    for dock in [
+        DockPosition::Bottom(60),
+        DockPosition::Left(60),
+        DockPosition::Right(60),
+    ] {
+        let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+        change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Hidden);
+        let without_dock = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+        let before = frames(&harness, &[0, 1, 2]);
 
-    harness.world().trigger(SetDock {
-        display,
-        dock: DockPosition::Bottom(60),
-    });
-    harness.advance(SETTLE);
-    let with_dock = usable_area_of(&mut harness, TEST_DISPLAY_ID);
-    assert_eq!(with_dock.max.y, without_dock.max.y - 60);
-    assert_eq!(os_frame(&harness, 1), with_dock);
-    for (id, before) in [0, 2].into_iter().zip(&tiled) {
+        change_dock(&mut harness, TEST_DISPLAY_ID, dock);
+        let with_dock = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+        assert_ne!(with_dock, without_dock, "{dock:?} takes space");
+        assert_eq!(os_frame(&harness, 1), with_dock, "{dock:?}");
+        assert_focused!(harness.world(), 1);
+        if matches!(dock, DockPosition::Bottom(_)) {
+            for (id, frame) in [(0, before[0]), (2, before[2])] {
+                let height = frame.height() - 60;
+                assert_eq!(os_frame(&harness, id).height(), height, "window {id}");
+            }
+        }
+
+        change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Hidden);
         assert_eq!(
-            os_frame(&harness, id).height(),
-            before.height() - 60,
-            "window {id}"
+            frames(&harness, &[0, 1, 2]),
+            before,
+            "{dock:?} hidden again"
         );
     }
+}
 
-    harness.world().trigger(SetDock {
-        display,
-        dock: DockPosition::Hidden,
-    });
+/// A side Dock narrows every maximized column. The focused one, after
+/// another maximized column, still fills the usable area instead of sliding
+/// by the width the earlier column lost.
+#[test]
+fn a_side_dock_keeps_a_later_maximized_column_in_view() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    focus(&mut harness, Direction::East);
+    double_click_title_bar(&mut harness, 2);
     harness.advance(SETTLE);
-    assert_eq!(os_frame(&harness, 1), without_dock);
-    assert_eq!(frames(&harness, &[0, 2]), tiled);
+    change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Hidden);
+    assert_eq!(
+        os_frame(&harness, 2),
+        usable_area_of(&mut harness, TEST_DISPLAY_ID)
+    );
+
+    change_dock(&mut harness, TEST_DISPLAY_ID, DockPosition::Right(60));
+    assert_eq!(
+        os_frame(&harness, 2),
+        usable_area_of(&mut harness, TEST_DISPLAY_ID)
+    );
+    assert_focused!(harness.world(), 2);
+}
+
+/// The Dock is measured against the real menu bar, so a configured menu bar
+/// height, which a re-read finds already applied, does not count as Dock.
+#[test]
+fn a_dock_reading_ignores_a_configured_menu_bar_height() {
+    let bounds = IRect::new(0, 0, 1024, 768);
+    let mut display = Display::new(TEST_DISPLAY_ID, bounds, 24);
+    display.set_menubar_height_override(Some(0));
+    let docked = IRect::new(0, 60, 1024, 744);
+    assert!(matches!(
+        display.locate_dock(&docked),
+        DockPosition::Bottom(60)
+    ));
+    let hidden = IRect::new(0, 0, 1024, 744);
+    assert!(matches!(display.locate_dock(&hidden), DockPosition::Hidden));
 }
 
 #[derive(Resource, Default)]
