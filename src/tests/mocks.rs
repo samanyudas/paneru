@@ -115,6 +115,9 @@ pub(crate) struct MockWindowData {
     /// The app has not put the window's current AX element in its window
     /// list yet.
     pub(crate) ax_unlisted: bool,
+    /// The app lists the window but does not answer reads of its details in
+    /// time, like a window asked while its app's main thread is blocked.
+    pub(crate) ax_unanswered: bool,
 }
 
 /// How far above the screen's bottom edge [`MockWindowData::sticky_bottom`]
@@ -184,6 +187,7 @@ impl Default for MockWindowData {
             child_role: false,
             ax_generation: 0,
             ax_unlisted: false,
+            ax_unanswered: false,
         }
     }
 }
@@ -1824,7 +1828,18 @@ impl MockState {
             if busy {
                 return Vec::new();
             }
-            ids().into_iter().map(|id| s.create_window(id)).collect()
+            let unanswered = |id| {
+                s.inner
+                    .force_read()
+                    .windows
+                    .get(&id)
+                    .is_some_and(|w| w.ax_unanswered)
+            };
+            ids()
+                .into_iter()
+                .filter(|&id| !unanswered(id))
+                .map(|id| s.create_window(id))
+                .collect()
         });
 
         let (s, ids) = (self.clone(), window_ids.clone());
