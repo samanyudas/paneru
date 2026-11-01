@@ -155,3 +155,50 @@ fn an_app_that_answers_probes_but_stays_busy_is_asked_less_often() {
         "the window is tiled once the app answers"
     );
 }
+
+const PARTLY_BUSY_APP: Pid = 9;
+const ANSWERED: WinID = 90;
+const LATE: WinID = 91;
+
+/// An app whose main thread is blocked for most of each second can answer
+/// for one of its windows and time out on the next one while the engine lists
+/// them at launch. The window that timed out is tiled once the app answers
+/// for it, without the user focusing it. (#63)
+#[test]
+fn a_window_that_answers_late_at_launch_is_tiled() {
+    let mut harness = TestHarness::new().with_windows(1);
+    let state = harness.mock_state.clone();
+    state.spawn_app(PARTLY_BUSY_APP, "com.example.partly-busy", "Partly busy");
+    for (id, x) in [(ANSWERED, 200), (LATE, 400)] {
+        state.spawn_window(
+            PARTLY_BUSY_APP,
+            TEST_WORKSPACE_ID,
+            id,
+            IRect::new(x, 100, x + 700, 600),
+        );
+    }
+    state.update_window(LATE, |window| window.ax_unanswered = true);
+
+    let world = harness.world();
+    let mut commands = world.commands();
+    let watch = launch_watch("Partly busy", &mut commands);
+    commands.spawn((
+        watch,
+        BProcess(Box::new(state.create_process(PARTLY_BUSY_APP))),
+    ));
+    world.flush();
+
+    harness.advance(Duration::from_secs(1));
+    assert!(
+        tiled(&mut harness, ANSWERED),
+        "the answered window is tiled"
+    );
+    assert!(!tiled(&mut harness, LATE), "the unanswered window waits");
+
+    state.update_window(LATE, |window| window.ax_unanswered = false);
+    harness.advance(Duration::from_secs(1));
+    assert!(
+        tiled(&mut harness, LATE),
+        "the window is tiled once the app answers for it"
+    );
+}

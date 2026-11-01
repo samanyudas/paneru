@@ -23,6 +23,10 @@ pub enum Error {
     IO(String),
     /// A generic error with a descriptive message.
     Generic(String),
+    /// The app did not answer an Accessibility call in time
+    /// (`kAXErrorCannotComplete`), as when its main thread is busy, so the
+    /// same call can succeed later.
+    CannotComplete(String),
 }
 
 impl Error {
@@ -53,6 +57,7 @@ impl Display for Error {
             Error::InvalidInput(msg) => format!("Invalid input: {msg}"),
             Error::IO(msg) => format!("IO error: {msg}"),
             Error::Generic(msg) => format!("Generic error: {msg}"),
+            Error::CannotComplete(msg) => format!("App did not answer in time: {msg}"),
         };
         write!(f, "{msg}")
     }

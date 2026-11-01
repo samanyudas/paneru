@@ -370,6 +370,9 @@ impl MacResult for OSStatus {
     fn to_result(self, place: &str) -> Result<()> {
         match self {
             0 => Ok(()),
+            accessibility_sys::kAXErrorCannotComplete => {
+                Err(Error::CannotComplete(place.to_string()))
+            }
             err => Err(Error::Generic(format!("{place}: MacOS Error Code: {err}"))),
         }
     }

@@ -481,7 +481,7 @@ fn discover_unresolved(
         .query::<(Entity, &Application)>()
         .iter(world)
         .filter(|(app, _)| closed_apps.as_ref().is_none_or(|apps| apps.contains(app)))
-        .flat_map(|(_, app)| app.window_list(&config))
+        .flat_map(|(_, app)| app.window_list(&config).windows)
         .filter(|window| unresolved.contains(&window.id()))
         .collect();
     for id in &unresolved {
