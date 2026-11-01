@@ -1021,7 +1021,15 @@ pub(super) fn recover_window_handles(
     clock: Res<Time>,
     mut commands: Commands,
 ) {
+    // macOS moves windows between Spaces on wake while the lock screen is
+    // still up, and AX fails for every app until the unlock. Each window gets
+    // its full timeout from the unlock instead.
+    let screen_locked = window_manager.screen_locked();
     for (entity, mut window, child, mut deadline, geometry, unmanaged) in awaiting {
+        if screen_locked {
+            deadline.0.reset();
+            continue;
+        }
         deadline.0.tick(clock.delta());
         let window_id = window.id();
         let ordered_in = window_manager.window_ordered_in(window_id);
