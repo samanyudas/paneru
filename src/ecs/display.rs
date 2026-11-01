@@ -383,6 +383,7 @@ impl Plugin for DisplayEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DisplayReconcileState>()
             .init_resource::<DisplayHomes>()
+            .init_resource::<DockRereads>()
             .add_systems(
                 PreUpdate,
                 (display_change_handler, reconcile_displays)
@@ -1052,22 +1053,61 @@ impl FloatingLayer {
     }
 }
 
+/// How long after the Dock reports a change the engine reads every display
+/// again. The Dock settled within 0.8 s when measured, and macOS can
+/// publish the matching work area later than that or never.
+const DOCK_REREADS: [Duration; 2] = [Duration::from_millis(500), Duration::from_secs(2)];
+
+/// The rereads of every display for a Dock change.
+#[derive(Default, Resource)]
+enum DockRereads {
+    #[default]
+    None,
+    /// A Dock change arrived this frame. Its rereads count from the next
+    /// frame's time, since the pump may have waited long after this frame's
+    /// time was taken.
+    Requested,
+    /// The times still to come.
+    Due(Vec<Duration>),
+}
+
 /// Reads every display's properties again when macOS reports that a
-/// display's parameters changed, so a Dock that shows, hides, or moves while
-/// the engine runs updates the usable area.
+/// display's parameters changed, and after the Dock reports a change, so a
+/// Dock that shows, hides, moves, or resizes while the engine runs updates
+/// the usable area.
 fn screen_parameters_handler(
     mut messages: MessageReader<Event>,
+    mut rereads: ResMut<DockRereads>,
+    time: Res<Time>,
     displays: Query<Entity, With<Display>>,
     mut commands: Commands,
 ) {
-    if !messages
-        .read()
-        .any(|event| matches!(event, Event::ScreenParametersChanged))
-    {
-        return;
+    let now = time.elapsed();
+    if matches!(*rereads, DockRereads::Requested) {
+        *rereads = DockRereads::Due(DOCK_REREADS.iter().map(|after| now + *after).collect());
     }
-    for entity in displays {
-        commands.trigger(ReadDisplayProperties(entity));
+    let mut read = false;
+    if let DockRereads::Due(times) = &mut *rereads {
+        let pending = times.len();
+        times.retain(|at| *at > now);
+        read = times.len() < pending;
+        if times.is_empty() {
+            *rereads = DockRereads::None;
+        }
+    }
+    for event in messages.read() {
+        match event {
+            Event::ScreenParametersChanged => read = true,
+            Event::DockDidChangePref { .. } | Event::DockDidRestart { .. } => {
+                *rereads = DockRereads::Requested;
+            }
+            _ => {}
+        }
+    }
+    if read {
+        for entity in displays {
+            commands.trigger(ReadDisplayProperties(entity));
+        }
     }
 }
 
@@ -1103,6 +1143,7 @@ fn read_display_properties_trigger(
     trigger: On<ReadDisplayProperties>,
     mut displays: Query<(&mut Display, Entity)>,
     platform: Option<NonSend<Pin<Box<PlatformCallbacks>>>>,
+    window_manager: Res<WindowManager>,
     config: Option<Res<Config>>,
     mut commands: Commands,
 ) {
@@ -1112,29 +1153,38 @@ fn read_display_properties_trigger(
     let display_id = display.id();
 
     // NSScreen::screen needs to run in the main thread, thus we run it in a NonSend trigger.
-    let Some(screens) = platform.map(|platform| NSScreen::screens(platform.main_thread_marker))
-    else {
-        return;
-    };
+    let screens = platform.map(|platform| NSScreen::screens(platform.main_thread_marker));
 
-    let notch = read_screen_property(&screens, display_id, |screen| {
-        let insets = screen.safeAreaInsets();
-        debug!("notch on display {display_id}: {insets:?}");
-        round_px(insets.top)
-    });
-    if let Some(height) = notch {
-        display.set_notch_height(height);
+    if let Some(screens) = &screens {
+        let notch = read_screen_property(screens, display_id, |screen| {
+            let insets = screen.safeAreaInsets();
+            debug!("notch on display {display_id}: {insets:?}");
+            round_px(insets.top)
+        });
+        if let Some(height) = notch {
+            display.set_notch_height(height);
+        }
     }
 
-    let dock = read_screen_property(&screens, display_id, |screen| {
-        let visible_frame = irect_from(screen.visibleFrame());
-        display.locate_dock(&visible_frame)
+    let reported = screens.as_ref().and_then(|screens| {
+        read_screen_property(screens, display_id, |screen| {
+            display.locate_dock(&irect_from(screen.visibleFrame()))
+        })
     });
-    if let Some(dock) = dock {
+    // A full-screen Space hides the Dock without changing the desktop's work
+    // area, so the Dock's frame says nothing about it there.
+    let measured = (!window_manager.is_fullscreen_space(display_id))
+        .then(|| window_manager.dock_frame())
+        .flatten()
+        .map(|frame| display.dock_from_frame(frame));
+    if let Some(dock) = DockPosition::settle(reported, measured) {
         commands.trigger(SetDock {
             display: entity,
             dock,
         });
+    }
+    if screens.is_none() {
+        return;
     }
 
     if let Some(config) = config {

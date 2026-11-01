@@ -12,6 +12,23 @@ use crate::{
     errors::{Error, Result},
 };
 
+/// The Dock as the Dock itself shows it, read apart from the macOS work area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockFrame {
+    /// Auto-hide is on, so the Dock reserves no space.
+    AutoHidden,
+    /// The frame of the Dock's icon list, in global points.
+    Shown(IRect),
+}
+
+impl DockFrame {
+    /// The Dock shown at `frame`, or `None` for an empty frame, which the
+    /// icon list reports right after the Dock restarts.
+    pub fn shown(frame: IRect) -> Option<Self> {
+        (!frame.is_empty()).then_some(Self::Shown(frame))
+    }
+}
+
 /// `Display` represents a physical monitor and manages its associated workspaces and window panes.
 /// Each display has a unique ID, bounds, and a collection of `LayoutStrip`s for different spaces.
 #[derive(Component, Debug)]
@@ -100,6 +117,34 @@ impl Display {
     /// The `CGDirectDisplayID` of the display.
     pub fn id(&self) -> CGDirectDisplayID {
         self.id
+    }
+
+    /// Where the Dock sits on this display by the Dock's own frame. A shown
+    /// Dock lies inside one display, 10 points from the edge it holds to,
+    /// and macOS reserves the space up to 4 points short of its inner edge,
+    /// as measured on macOS 27 at two sizes on each side. An auto-hidden
+    /// Dock, or a frame that does not hold to an edge of this display, as
+    /// while the Dock slides, reserves nothing here.
+    pub fn dock_from_frame(&self, dock: DockFrame) -> DockPosition {
+        const INSET: i32 = 4;
+        const MAX_EDGE_GAP: i32 = 24;
+        let DockFrame::Shown(list) = dock else {
+            return DockPosition::Hidden;
+        };
+        let bounds = self.bounds;
+        if list.intersect(bounds) != list {
+            return DockPosition::Hidden;
+        }
+        if list.width() >= list.height() {
+            if bounds.max.y - list.max.y <= MAX_EDGE_GAP {
+                return DockPosition::Bottom(bounds.max.y - list.min.y - INSET);
+            }
+        } else if list.min.x - bounds.min.x <= MAX_EDGE_GAP {
+            return DockPosition::Left(list.max.x - bounds.min.x - INSET);
+        } else if bounds.max.x - list.max.x <= MAX_EDGE_GAP {
+            return DockPosition::Right(bounds.max.x - list.min.x - INSET);
+        }
+        DockPosition::Hidden
     }
 
     /// Where the Dock sits, from the macOS work area. The work area leaves

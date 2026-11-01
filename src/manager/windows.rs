@@ -625,7 +625,7 @@ fn window_layer(id: WinID) -> Option<i32> {
 }
 
 /// Reads an element's frame through Accessibility.
-fn ax_frame(element: &CFRetained<AXUIWrapper>) -> Result<IRect> {
+pub(super) fn ax_frame(element: &CFRetained<AXUIWrapper>) -> Result<IRect> {
     let read = |attribute: &'static str| unsafe {
         let mut value: *mut CFType = null_mut();
         AXUIElementCopyAttributeValue(
