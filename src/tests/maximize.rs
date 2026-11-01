@@ -1752,6 +1752,11 @@ fn the_dock_frame_gives_the_reserved_space() {
             DockPosition::Hidden,
         ),
         (
+            frame(-500, 1358, 1106, 72),
+            DockPosition::Hidden,
+            DockPosition::Hidden,
+        ),
+        (
             DockFrame::AutoHidden,
             DockPosition::Hidden,
             DockPosition::Hidden,
@@ -1835,4 +1840,56 @@ fn a_dock_hidden_by_a_full_screen_space_keeps_the_dock_area() {
     harness.run(vec![Event::DockDidChangePref { msg: String::new() }]);
     harness.advance(Duration::from_secs(3));
     assert_eq!(usable_area_of(&mut harness, TEST_DISPLAY_ID), with_dock);
+}
+
+/// The pump can wait up to 2 s in low power mode after a frame's time was
+/// set, so a Dock change can arrive long after it. The rereads still wait for
+/// the Dock to settle after the change arrives, not after that time.
+#[test]
+fn a_dock_change_after_a_long_pump_wait_rereads_once_the_dock_settles() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    // The app lets one frame step up to 10 s, so a long pump wait shows in
+    // `Time` in full.
+    harness
+        .app
+        .insert_resource(Time::<bevy::time::Virtual>::from_max_delta(
+            Duration::from_secs(10),
+        ));
+    let full = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    harness
+        .app
+        .world_mut()
+        .write_message(Event::DockDidChangePref { msg: String::new() });
+    harness.app.update();
+    harness
+        .app
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(1800),
+        ));
+    harness.app.update();
+    harness
+        .app
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(20),
+        ));
+    harness.advance(Duration::from_millis(300));
+
+    let top = TEST_DISPLAY_HEIGHT - 82;
+    harness
+        .mock_state
+        .os_set_dock_frame(Some(DockFrame::Shown(IRect::new(262, top, 762, top + 72))));
+    harness.advance(Duration::from_secs(3));
+    assert_eq!(
+        usable_area_of(&mut harness, TEST_DISPLAY_ID).max.y,
+        full.max.y - 78
+    );
+}
+
+/// Right after the Dock restarts, its icon list can read as 0 by 0. That
+/// says nothing about where the Dock is, so it is no reading at all.
+#[test]
+fn an_empty_dock_frame_is_no_reading() {
+    assert_eq!(DockFrame::shown(IRect::new(0, 0, 0, 0)), None);
+    let frame = IRect::new(727, 1358, 1833, 1430);
+    assert_eq!(DockFrame::shown(frame), Some(DockFrame::Shown(frame)));
 }

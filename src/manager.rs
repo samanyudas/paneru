@@ -642,7 +642,7 @@ impl WindowManagerApi for WindowManagerOS {
             .into_iter()
             .find(|child| child.role().is_ok_and(|role| role == kAXListRole))
             .and_then(|list| windows::ax_frame(&list).ok())
-            .map(DockFrame::Shown)
+            .and_then(DockFrame::shown)
     }
 
     fn quit(&self) -> Result<()> {

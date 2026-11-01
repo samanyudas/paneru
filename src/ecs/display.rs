@@ -1058,10 +1058,18 @@ impl FloatingLayer {
 /// publish the matching work area later than that or never.
 const DOCK_REREADS: [Duration; 2] = [Duration::from_millis(500), Duration::from_secs(2)];
 
-/// The times still to come at which every display is read again for a Dock
-/// change.
+/// The rereads of every display for a Dock change.
 #[derive(Default, Resource)]
-struct DockRereads(Vec<Duration>);
+enum DockRereads {
+    #[default]
+    None,
+    /// A Dock change arrived this frame. Its rereads count from the next
+    /// frame's time, since the pump may have waited long after this frame's
+    /// time was taken.
+    Requested,
+    /// The times still to come.
+    Due(Vec<Duration>),
+}
 
 /// Reads every display's properties again when macOS reports that a
 /// display's parameters changed, and after the Dock reports a change, so a
@@ -1075,19 +1083,28 @@ fn screen_parameters_handler(
     mut commands: Commands,
 ) {
     let now = time.elapsed();
+    if matches!(*rereads, DockRereads::Requested) {
+        *rereads = DockRereads::Due(DOCK_REREADS.iter().map(|after| now + *after).collect());
+    }
     let mut read = false;
+    if let DockRereads::Due(times) = &mut *rereads {
+        let pending = times.len();
+        times.retain(|at| *at > now);
+        read = times.len() < pending;
+        if times.is_empty() {
+            *rereads = DockRereads::None;
+        }
+    }
     for event in messages.read() {
         match event {
             Event::ScreenParametersChanged => read = true,
             Event::DockDidChangePref { .. } | Event::DockDidRestart { .. } => {
-                rereads.0 = DOCK_REREADS.iter().map(|after| now + *after).collect();
+                *rereads = DockRereads::Requested;
             }
             _ => {}
         }
     }
-    let pending = rereads.0.len();
-    rereads.0.retain(|at| *at > now);
-    if read || rereads.0.len() < pending {
+    if read {
         for entity in displays {
             commands.trigger(ReadDisplayProperties(entity));
         }
