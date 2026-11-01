@@ -24,7 +24,7 @@ use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, Position, RestoreWindowState,
     SelectedVirtualMarker, SpawnCommandsExt, Unmanaged, WindowProperties,
 };
-use crate::manager::{Application, Display, Window, WindowManager};
+use crate::manager::{Application, Display, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
 use crate::types::commands::Side;
 
@@ -419,7 +419,6 @@ pub(super) fn restore_window_state(
     displays: Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
     docks: Query<&DockPosition>,
     apps: Query<&Application>,
-    window_manager: Res<WindowManager>,
     session: Option<Res<SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
     overrides: Res<TileOverrides>,
@@ -448,7 +447,17 @@ pub(super) fn restore_window_state(
 
     let current =
         current_window_identities(&ctx.windows, &apps, restoration, &ctx.config, &overrides);
-    let plan = RestorePlanner::new(restoration).plan(&current);
+    let mut plan = RestorePlanner::new(restoration).plan(&current);
+    let current_spaces = workspaces
+        .iter()
+        .flat_map(|(_, strip, _, _)| {
+            strip
+                .all_windows()
+                .into_iter()
+                .map(move |entity| (entity, strip.id()))
+        })
+        .collect();
+    follow_windows_to_their_spaces(&mut plan, &current_spaces);
 
     if plan.consumed_entities.is_empty() {
         info!(
@@ -543,13 +552,10 @@ pub(super) fn restore_window_state(
             .get(&planned.workspace_id)
             .is_some_and(|active| *active == planned.virtual_index);
         let is_global_active = is_active && active_workspace_ids.contains(&planned.workspace_id);
-        let is_shown = is_global_active
-            || is_active
-                && window_manager
-                    .active_display_space(display.id())
-                    .is_ok_and(|space| space == planned.workspace_id);
         let viewport = display.actual_display_bounds(docks.get(display_entity).ok(), &ctx.config);
-        let origin = if is_shown {
+        // macOS hides the windows of a Space that is not showing, so only the
+        // rows of a Space that are not selected get parked.
+        let origin = if is_active {
             viewport.min
         } else {
             display.bounds().max - PARKED_STRIP_SLIVER
@@ -582,7 +588,7 @@ pub(super) fn restore_window_state(
             .windows
             .focused()
             .map(|(_, entity)| entity)
-            .filter(|entity| is_shown && strip.contains(*entity));
+            .filter(|entity| is_active && strip.contains(*entity));
         if let Some(entity) = focused {
             ctx.commands.ensure_visible(entity);
         }
@@ -593,15 +599,11 @@ pub(super) fn restore_window_state(
 
         if is_global_active {
             spawned.insert(RestoredActivation);
+        } else if is_active {
+            spawned.insert(SelectedVirtualMarker);
         } else {
-            if is_active {
-                spawned.insert(SelectedVirtualMarker);
-            } else {
-                spawned.remove::<SelectedVirtualMarker>();
-            }
-            if !is_shown {
-                spawned.insert(previous);
-            }
+            spawned.remove::<SelectedVirtualMarker>();
+            spawned.insert(previous);
         }
         restored_strips += 1;
     }
@@ -612,6 +614,42 @@ pub(super) fn restore_window_state(
         plan.ignored_missing_windows,
         plan.skipped_ambiguous_matches
     );
+}
+
+/// macOS can give a Space a new ID while its windows stay put. A saved Space
+/// is restored as the Space that now holds most of its windows.
+fn follow_windows_to_their_spaces(
+    plan: &mut RestorePlan,
+    current_spaces: &HashMap<Entity, WorkspaceId>,
+) {
+    let mut votes: HashMap<WorkspaceId, HashMap<WorkspaceId, usize>> = HashMap::new();
+    for planned in &plan.strips {
+        let tally = votes.entry(planned.workspace_id).or_default();
+        for entity in layout_strip_from_plan(planned, &plan.matched).all_windows() {
+            if let Some(space) = current_spaces.get(&entity) {
+                *tally.entry(*space).or_default() += 1;
+            }
+        }
+    }
+    let renumbered: HashMap<WorkspaceId, WorkspaceId> = votes
+        .into_iter()
+        .filter_map(|(saved, tally)| {
+            let (current, _) = tally
+                .into_iter()
+                .max_by_key(|&(space, count)| (count, space == saved, space))?;
+            (current != saved).then_some((saved, current))
+        })
+        .collect();
+    for planned in &mut plan.strips {
+        if let Some(current) = renumbered.get(&planned.workspace_id) {
+            planned.workspace_id = *current;
+        }
+    }
+    plan.active_virtual_by_workspace = plan
+        .active_virtual_by_workspace
+        .drain()
+        .map(|(saved, index)| (renumbered.get(&saved).copied().unwrap_or(saved), index))
+        .collect();
 }
 
 fn layout_strip_from_plan(planned: &PlannedStrip, matched: &HashMap<WinID, Entity>) -> LayoutStrip {
