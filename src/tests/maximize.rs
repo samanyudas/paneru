@@ -10,7 +10,9 @@ use crate::commands::{Command, Direction, Operation, Side};
 use crate::config::{Config, MainOptions};
 use crate::ecs::drag::{DragFeedback, DragState, OverlayShape};
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::{DockPosition, SelectedVirtualMarker, SpawnWindowTrigger};
+use crate::ecs::{
+    DockPosition, ReadDisplayProperties, SelectedVirtualMarker, SetDock, SpawnWindowTrigger,
+};
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::{Modifiers, WinID, WorkspaceId};
@@ -1451,4 +1453,78 @@ fn a_hidden_maximized_window_stays_off_a_taller_display_beside() {
             && area(hidden.intersect(ext)) <= area(hidden.intersect(own)),
         "window 2 lies on the display beside: {hidden:?}"
     );
+}
+
+/// The entity of display `id`.
+fn display_entity(harness: &mut TestHarness, id: u32) -> Entity {
+    let world = harness.world();
+    world
+        .query::<(Entity, &Display)>()
+        .iter(world)
+        .find(|(_, display)| display.id() == id)
+        .expect("the display")
+        .0
+}
+
+/// A Dock that shows while the engine runs shrinks the display's usable area
+/// at once: its maximized window and its tiled windows fit beside the Dock,
+/// and they grow back when the Dock hides again.
+#[test]
+fn a_dock_shown_while_running_refits_the_display_windows() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    let display = display_entity(&mut harness, TEST_DISPLAY_ID);
+    let without_dock = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    let tiled = frames(&harness, &[0, 2]);
+
+    harness.world().trigger(SetDock {
+        display,
+        dock: DockPosition::Bottom(60),
+    });
+    harness.advance(SETTLE);
+    let with_dock = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    assert_eq!(with_dock.max.y, without_dock.max.y - 60);
+    assert_eq!(os_frame(&harness, 1), with_dock);
+    for (id, before) in [0, 2].into_iter().zip(&tiled) {
+        assert_eq!(
+            os_frame(&harness, id).height(),
+            before.height() - 60,
+            "window {id}"
+        );
+    }
+
+    harness.world().trigger(SetDock {
+        display,
+        dock: DockPosition::Hidden,
+    });
+    harness.advance(SETTLE);
+    assert_eq!(os_frame(&harness, 1), without_dock);
+    assert_eq!(frames(&harness, &[0, 2]), tiled);
+}
+
+#[derive(Resource, Default)]
+struct DisplayReads(Vec<Entity>);
+
+/// macOS reports a change of screen parameters once a new Dock area can be
+/// read, so the engine reads every display's properties again then.
+#[test]
+fn a_screen_parameters_change_reads_every_display_again() {
+    let mut harness = maximized_beside(EAST_EXT_BOUNDS);
+    let displays = [
+        display_entity(&mut harness, TEST_DISPLAY_ID),
+        display_entity(&mut harness, EXT_DISPLAY_ID),
+    ];
+    let world = harness.world();
+    world.init_resource::<DisplayReads>();
+    world.add_observer(
+        |read: On<ReadDisplayProperties>, mut reads: ResMut<DisplayReads>| {
+            reads.0.push(read.event().0);
+        },
+    );
+
+    harness.run(vec![Event::ScreenParametersChanged]);
+    let mut reads = harness.world().resource::<DisplayReads>().0.clone();
+    reads.sort();
+    let mut expected = displays.to_vec();
+    expected.sort();
+    assert_eq!(reads, expected);
 }

@@ -27,7 +27,7 @@ use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, EnsureVisibleMarker, FocusedMarker,
     LayoutPosition, ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties,
-    RefreshWindowSizeOnFocus, RepositionMarker, SelectedVirtualMarker, SendMessageTrigger,
+    RefreshWindowSizeOnFocus, RepositionMarker, SelectedVirtualMarker, SendMessageTrigger, SetDock,
     SpawnCommandsExt, Timeout,
 };
 use crate::events::Event;
@@ -389,7 +389,12 @@ impl Plugin for DisplayEventsPlugin {
                     .chain()
                     .in_set(super::PreUpdateSet::Dispatch),
             )
+            .add_systems(
+                PreUpdate,
+                screen_parameters_handler.in_set(super::PreUpdateSet::Dispatch),
+            )
             .add_observer(read_display_properties_trigger)
+            .add_observer(set_dock)
             .add_observer(cleanup_active_display_marker);
     }
 }
@@ -1047,6 +1052,51 @@ impl FloatingLayer {
     }
 }
 
+/// Reads every display's properties again when macOS reports that a
+/// display's parameters changed, so a Dock that shows, hides, or moves while
+/// the engine runs updates the usable area.
+fn screen_parameters_handler(
+    mut messages: MessageReader<Event>,
+    displays: Query<Entity, With<Display>>,
+    mut commands: Commands,
+) {
+    if !messages
+        .read()
+        .any(|event| matches!(event, Event::ScreenParametersChanged))
+    {
+        return;
+    }
+    for entity in displays {
+        commands.trigger(ReadDisplayProperties(entity));
+    }
+}
+
+/// Stores a display's Dock position. When it differs from the stored one,
+/// the display's strips lay out again for the new usable area.
+fn set_dock(
+    trigger: On<SetDock>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
+    mut strips: Query<(&mut LayoutStrip, &ChildOf)>,
+    mut commands: Commands,
+) {
+    let SetDock { display, dock } = *trigger.event();
+    let Ok((found, current)) = displays.get(display) else {
+        return;
+    };
+    if current == Some(&dock) {
+        return;
+    }
+    debug!("dock on display {}: {dock:?}", found.id());
+    if let Ok(mut entity_commands) = commands.get_entity(display) {
+        entity_commands.try_insert(dock);
+    }
+    for (mut strip, child_of) in &mut strips {
+        if child_of.parent() == display {
+            strip.set_changed();
+        }
+    }
+}
+
 fn read_display_properties_trigger(
     trigger: On<ReadDisplayProperties>,
     mut displays: Query<(&mut Display, Entity)>,
@@ -1079,10 +1129,10 @@ fn read_display_properties_trigger(
         display.locate_dock(&visible_frame)
     });
     if let Some(dock) = dock {
-        debug!("dock on display {display_id}: {:?}", dock);
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_insert(dock);
-        }
+        commands.trigger(SetDock {
+            display: entity,
+            dock,
+        });
     }
 
     if let Some(config) = config {

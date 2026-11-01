@@ -771,7 +771,7 @@ impl AwaitingAccessibility {
     }
 }
 
-#[derive(Component, Debug)]
+#[derive(Clone, Component, Copy, Debug, PartialEq, Eq)]
 pub enum DockPosition {
     Bottom(i32),
     Left(i32),
@@ -931,6 +931,15 @@ pub struct SpawnWindowTrigger(pub Vec<Window>);
 
 #[derive(BevyEvent)]
 pub struct ReadDisplayProperties(pub Entity);
+
+/// Records where the Dock sits on a display, and lays out that display's
+/// strips again when it moved, so tiled and maximized windows fit the new
+/// usable area.
+#[derive(BevyEvent)]
+pub struct SetDock {
+    pub display: Entity,
+    pub dock: DockPosition,
+}
 
 #[derive(BevyEvent)]
 pub struct SendMessageTrigger(pub Event);
