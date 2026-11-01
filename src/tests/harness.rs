@@ -295,6 +295,8 @@ fn setup_world() -> App {
 
     bevy_app.insert_resource(TimeUpdateStrategy::ManualDuration(FRAME));
 
+    crate::ecs::run_frame_schedules_inline(&mut bevy_app);
+
     bevy_app
 }
 

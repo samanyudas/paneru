@@ -1166,6 +1166,30 @@ fn autorelease_runner(mut app: BevyApp) -> bevy::app::AppExit {
     }
 }
 
+/// Run every schedule inline rather than fanning systems out across the task
+/// pool: the task-pool handoff measured ~45% of main-thread time against
+/// ~16% actually spent on accessibility calls, dropping to ~10% once
+/// inlined. The expensive systems here all take `&mut Window` and are
+/// already mutually exclusive, so the fan-out bought little; genuine
+/// parallelism (`par_iter_mut`) still goes through `ComputeTaskPool`
+/// directly. `First`/`Last` are included even though unused because an
+/// empty schedule still costs a task-pool scope per frame.
+///
+/// The tests run their apps through this too, so they match production.
+pub(crate) fn run_frame_schedules_inline(app: &mut BevyApp) {
+    for label in [
+        First.intern(),
+        PreUpdate.intern(),
+        Update.intern(),
+        PostUpdate.intern(),
+        Last.intern(),
+    ] {
+        app.edit_schedule(label, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
     crate::manager::app::bound_ax_messaging_timeout()?;
@@ -1236,25 +1260,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .add_plugins(display::DisplayEventsPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));
 
-    // Run every schedule inline rather than fanning systems out across the task
-    // pool: the task-pool handoff measured ~45% of main-thread time against
-    // ~16% actually spent on accessibility calls, dropping to ~10% once
-    // inlined. The expensive systems here all take `&mut Window` and are
-    // already mutually exclusive, so the fan-out bought little; genuine
-    // parallelism (`par_iter_mut`) still goes through `ComputeTaskPool`
-    // directly. `First`/`Last` are included even though unused because an
-    // empty schedule still costs a task-pool scope per frame.
-    for label in [
-        First.intern(),
-        PreUpdate.intern(),
-        Update.intern(),
-        PostUpdate.intern(),
-        Last.intern(),
-    ] {
-        app.edit_schedule(label, |schedule| {
-            schedule.set_executor(SingleThreadedExecutor::new());
-        });
-    }
+    run_frame_schedules_inline(&mut app);
 
     app.set_runner(autorelease_runner);
 
