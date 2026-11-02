@@ -18,11 +18,12 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use crate::ecs::layout::{Before, Column, LayoutStrip, StackItem, ViewportAnchor, ViewportShare};
 use crate::ecs::params::Windows;
+use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, Initializing, SelectedVirtualMarker,
-    Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, Initializing, Position,
+    SelectedVirtualMarker, Unmanaged,
 };
-use crate::manager::{Application, Display, WindowManager};
+use crate::manager::{Application, Display, Origin, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::types::windowset::WindowSet;
 
@@ -67,6 +68,18 @@ pub struct SavedWorkspace {
 pub struct SavedStrip {
     pub virtual_index: u32,
     pub columns: Vec<SavedColumn>,
+    /// Where the row was scrolled. An engine that does not know the field
+    /// shows the row from its first column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<SavedView>,
+}
+
+/// The window a row keeps in view, and where its column's left edge sits,
+/// measured from the left edge of the row's display.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedView {
+    pub window_id: WinID,
+    pub x: i32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -132,6 +145,20 @@ pub struct SavedStackHome {
     /// The window's place among them.
     pub slot: usize,
 }
+
+/// Each row with its display and whether it is active, and where it is
+/// scrolled: at its position while shown, or at its saved one while parked.
+pub(crate) type SessionStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Option<&'static ChildOf>,
+        &'static LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        Option<&'static Position>,
+        Option<&'static PreviousStripPosition>,
+    ),
+>;
 
 /// Where the engine saves its session. The mock harness has none, so tests
 /// never write the user's file, unless a test sets one.
@@ -217,6 +244,43 @@ impl SavedMaximize {
     }
 }
 
+impl SavedView {
+    /// The view of `strip` with its origin at `origin` on `display`. The
+    /// window kept in view is the focused one, else the one a parked row
+    /// returns to, else the one most on the display.
+    fn of(
+        strip: &LayoutStrip,
+        origin: Origin,
+        remembered: Option<Entity>,
+        display: IRect,
+        windows: &Windows,
+    ) -> Option<Self> {
+        let left = |entity| Some(origin.x + windows.layout_position(entity)?.0.x);
+        let shown = |entity| {
+            let left = left(entity)?;
+            let right = left + windows.moving_frame(entity)?.width();
+            Some(right.min(display.max.x) - left.max(display.min.x))
+        };
+        let focused = windows.focused().map(|(_, entity)| entity);
+        let anchor = [focused, remembered]
+            .into_iter()
+            .flatten()
+            .find(|entity| strip.contains(*entity))
+            .or_else(|| {
+                strip
+                    .columns()
+                    .filter_map(Column::top)
+                    .filter_map(|entity| Some((entity, shown(entity)?)))
+                    .max_by_key(|(_, shown)| *shown)
+                    .map(|(entity, _)| entity)
+            })?;
+        Some(Self {
+            window_id: windows.get(anchor)?.id(),
+            x: left(anchor)? - display.min.x,
+        })
+    }
+}
+
 impl SavedWindow {
     pub fn from_entity(
         entity: Entity,
@@ -249,8 +313,8 @@ impl SavedWindow {
 
 impl PaneruState {
     #[allow(clippy::too_many_lines)]
-    pub fn extract(
-        workspaces: &Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    pub(crate) fn extract(
+        workspaces: &SessionStrips,
         displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
         docks: &Query<&DockPosition>,
         config: &Config,
@@ -270,7 +334,7 @@ impl PaneruState {
             display_workspace_ids.insert(entity, Vec::new());
         }
 
-        for (child, strip, active_workspace) in workspaces {
+        for (child, strip, active_workspace, position, parked) in workspaces {
             let display_entity = child.map(ChildOf::parent);
             let display_id =
                 display_entity.and_then(|entity| display_entity_ids.get(&entity).copied());
@@ -369,9 +433,19 @@ impl PaneruState {
             if active_workspace {
                 workspace.active_virtual_index = Some(strip.virtual_index);
             }
+            let view = display_entity
+                .and_then(|entity| displays.get(entity).ok())
+                .and_then(|(display, _, _)| {
+                    let (origin, remembered) = match parked {
+                        Some(previous) => (previous.origin, previous.focus),
+                        None => (position?.0, None),
+                    };
+                    SavedView::of(strip, origin, remembered, display.bounds(), windows)
+                });
             workspace.strips.push(SavedStrip {
                 virtual_index: strip.virtual_index,
                 columns: saved_columns,
+                view,
             });
         }
 
@@ -939,7 +1013,7 @@ fn now_timestamp() -> u64 {
 
 pub fn periodic_state_save(
     file: Option<Res<StateFile>>,
-    workspaces: Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    workspaces: SessionStrips,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     docks: Query<&DockPosition>,
     config: Res<Config>,
@@ -962,7 +1036,7 @@ pub fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
     file: Option<Res<StateFile>>,
     initializing: Option<Res<Initializing>>,
-    workspaces: Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    workspaces: SessionStrips,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     docks: Query<&DockPosition>,
     config: Res<Config>,

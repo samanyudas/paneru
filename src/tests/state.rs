@@ -4,11 +4,11 @@ use crate::config::Config;
 use crate::ecs::layout::{LayoutStrip, ViewportAnchor, ViewportShare};
 use crate::ecs::params::Windows;
 use crate::ecs::restore::CurrentWindowIdentity;
-use crate::ecs::state::QueryState;
 use crate::ecs::state::{
     PaneruQueryState, PaneruState, SavedColumn, SavedDisplay, SavedMaximize, SavedRect,
     SavedStackHome, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
 };
+use crate::ecs::state::{QueryState, SessionStrips};
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, SelectedVirtualMarker};
 use crate::events::Event;
 use crate::manager::{Application, Display, WindowManager};
@@ -22,15 +22,7 @@ use bevy::ecs::query::Has;
 use bevy::ecs::system::SystemState;
 
 type StateExtractionState<'w, 's> = SystemState<(
-    Query<
-        'w,
-        's,
-        (
-            Option<&'static ChildOf>,
-            &'static LayoutStrip,
-            Has<ActiveWorkspaceMarker>,
-        ),
-    >,
+    SessionStrips<'w, 's>,
     Query<'w, 's, (&'static Display, Entity, Has<ActiveDisplayMarker>)>,
     Query<'w, 's, &'static DockPosition>,
     Res<'w, Config>,
@@ -104,6 +96,7 @@ fn test_state_serialization() {
             display_id: Some(TEST_DISPLAY_ID),
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
+                view: None,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(window)],
             }],
@@ -141,6 +134,7 @@ fn test_state_restoration() {
             display_id: None,
             active_virtual_index: Some(1),
             strips: vec![SavedStrip {
+                view: None,
                 virtual_index: 1,
                 columns: vec![SavedColumn::Single(window)],
             }],
@@ -386,6 +380,7 @@ fn saved_maximize_round_trips() {
         display_id: Some(TEST_DISPLAY_ID),
         active_virtual_index: Some(0),
         strips: vec![SavedStrip {
+            view: None,
             virtual_index: 0,
             columns: vec![SavedColumn::Single(window)],
         }],
@@ -424,6 +419,7 @@ fn restore_plan_compacts_missing_windows_and_preserves_active_virtual_row() {
         active_virtual_index: Some(1),
         strips: vec![
             SavedStrip {
+                view: None,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(saved_window(
                     10,
@@ -433,6 +429,7 @@ fn restore_plan_compacts_missing_windows_and_preserves_active_virtual_row() {
                 ))],
             },
             SavedStrip {
+                view: None,
                 virtual_index: 1,
                 columns: vec![
                     SavedColumn::Tabs(vec![
@@ -505,10 +502,12 @@ fn restore_plan_prefers_later_hard_match_over_earlier_fallback_match() {
         active_virtual_index: Some(0),
         strips: vec![
             SavedStrip {
+                view: None,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(saved_a)],
             },
             SavedStrip {
+                view: None,
                 virtual_index: 1,
                 columns: vec![SavedColumn::Single(saved_b)],
             },
@@ -548,6 +547,7 @@ fn restore_plan_skips_ambiguous_fallback_match() {
         display_id: None,
         active_virtual_index: Some(0),
         strips: vec![SavedStrip {
+            view: None,
             virtual_index: 0,
             columns: vec![SavedColumn::Single(saved)],
         }],

@@ -15,7 +15,7 @@ use crate::config::{Config, MissingWindowBehavior};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, ViewportShare};
 use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{
-    PaneruState, SavedColumn, SavedMaximize, SavedStackItem, SavedStrip, SavedWindow,
+    PaneruState, SavedColumn, SavedMaximize, SavedStackItem, SavedStrip, SavedView, SavedWindow,
     SavedWorkspace,
 };
 use crate::ecs::tile_overrides::TileOverrides;
@@ -134,6 +134,7 @@ pub(crate) struct PlannedStrip {
     pub display_id: Option<CGDirectDisplayID>,
     pub virtual_index: u32,
     pub columns: Vec<PlannedColumn>,
+    pub view: Option<SavedView>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -217,6 +218,7 @@ impl<'a> RestorePlanner<'a> {
             display_id: workspace.display_id,
             virtual_index: strip.virtual_index,
             columns,
+            view: strip.view,
         })
     }
 
@@ -561,10 +563,27 @@ pub(super) fn restore_window_state(
             .is_some_and(|active| *active == planned.virtual_index);
         let is_global_active = is_active && active_workspace_ids.contains(&planned.workspace_id);
         let viewport = display.actual_display_bounds(docks.get(display_entity).ok(), &ctx.config);
+        // The saved window in view goes back where it was on the display.
+        let view = planned.view.and_then(|view| {
+            let anchor = *plan.matched.get(&view.window_id)?;
+            // Columns get their saved widths below, so measure them at those.
+            let frame = |entity| {
+                let mut frame = ctx.windows.moving_frame(entity)?;
+                if let Some(width) = plan.widths.get(&entity) {
+                    frame.max.x = frame.min.x + width.of_viewport(viewport.width());
+                }
+                Some(frame)
+            };
+            let (_, x) = strip
+                .column_positions(&frame, viewport.width())
+                .find(|(column, _)| column.position_of(anchor).is_some())?;
+            Some((anchor, display.bounds().min.x + view.x - x))
+        });
+        let shown = view.map_or(viewport.min, |(_, x)| viewport.min.with_x(x));
         // macOS hides the windows of a Space that is not showing, so only the
         // rows of a Space that are not selected get parked.
         let origin = if is_active {
-            viewport.min
+            shown
         } else {
             display.bounds().max - PARKED_STRIP_SLIVER
         };
@@ -599,8 +618,10 @@ pub(super) fn restore_window_state(
         }
 
         let previous = PreviousStripPosition {
-            origin: viewport.min,
-            focus: strip.all_windows().first().copied(),
+            origin: shown,
+            focus: view
+                .map(|(anchor, _)| anchor)
+                .or_else(|| strip.all_windows().first().copied()),
         };
 
         let focused = ctx
