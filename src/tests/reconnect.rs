@@ -577,3 +577,96 @@ fn a_burst_that_moves_no_space_changes_no_strip() {
 
     assert_eq!(every_strip(harness.world()), before);
 }
+
+/// The built-in display below the external display, each display with more
+/// columns than it shows, so columns park past both side edges of each.
+fn two_displays_with_parked_columns() -> TestHarness {
+    let mut harness = TestHarness::new();
+    harness.mock_state.add_display(
+        BUILTIN,
+        builtin_bounds(),
+        vec![BUILTIN_SPACE, BUILTIN_EMPTY_SPACE],
+    );
+    harness
+        .mock_state
+        .add_display(EXT, ext_bounds(), vec![EXT_SPACE]);
+    harness.mock_state.activate_display(EXT);
+    harness.mock_state.set_spaces_follow_frames(true);
+    spawn_row(
+        &harness,
+        BUILTIN_SPACE,
+        &[10, 11, 12, 13, 14, 15],
+        builtin_bounds(),
+    );
+    spawn_row(&harness, EXT_SPACE, &[50, 51, 52, 53, 54, 55], ext_bounds());
+    harness.advance(Duration::from_secs(2));
+    harness.mock_state.focus_window(12);
+    harness.mock_state.focus_window(53);
+    harness.advance(Duration::from_secs(2));
+    harness
+}
+
+/// Moves the built-in display to `to`, carrying its windows, and files every
+/// window in the current Space of the display that now holds its center, as
+/// macOS does. Returns the windows macOS filed in another display's Space.
+fn move_builtin(harness: &mut TestHarness, from: IRect, to: IRect) -> Vec<WinID> {
+    let builtin = [10, 11, 12, 13, 14, 15];
+    let ext = [50, 51, 52, 53, 54, 55];
+    harness.world().write_message(Event::DisplayMoved {
+        display_id: BUILTIN,
+    });
+    harness.advance(Duration::from_millis(20));
+    harness.mock_state.set_display_bounds(BUILTIN, to);
+    carry(harness, &builtin, from, to);
+    let mut refiled = Vec::new();
+    for id in builtin.into_iter().chain(ext) {
+        let center = harness.mock_state.ax_frame(id).center();
+        let space = if ext_bounds().contains(center) {
+            EXT_SPACE
+        } else if to.contains(center) {
+            BUILTIN_SPACE
+        } else {
+            continue;
+        };
+        if harness.mock_state.space_of(id) != space {
+            harness
+                .mock_state
+                .update_window(id, |window| window.workspace_id = space);
+            refiled.push(id);
+        }
+    }
+    harness.world().write_message(Event::DisplayMoved {
+        display_id: BUILTIN,
+    });
+    harness.advance(SETTLE);
+    refiled
+}
+
+#[test]
+fn moving_a_display_beside_another_keeps_every_window_in_its_strip() {
+    for beside in [
+        IRect::new(-2048, 0, 0, 1332),
+        IRect::new(2560, 0, 4608, 1332),
+    ] {
+        let mut harness = two_displays_with_parked_columns();
+        let before = every_strip(harness.world());
+
+        let refiled = move_builtin(&mut harness, builtin_bounds(), beside);
+        assert!(
+            !refiled.is_empty(),
+            "macOS files a parked window in the other display's Space at {beside:?}"
+        );
+        assert_eq!(
+            every_strip(harness.world()),
+            before,
+            "beside at {beside:?}, after macOS refiled {refiled:?}"
+        );
+
+        move_builtin(&mut harness, beside, builtin_bounds());
+        assert_eq!(
+            every_strip(harness.world()),
+            before,
+            "back below from {beside:?}"
+        );
+    }
+}
