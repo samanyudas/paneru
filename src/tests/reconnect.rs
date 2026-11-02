@@ -565,6 +565,90 @@ fn closing_the_lid_returns_the_windows_of_its_destroyed_space_with_their_stack()
     );
 }
 
+/// The lid closes: macOS removes the built-in display, destroys its Spaces,
+/// and lists their windows in the external display's Space over one read per
+/// slice of `reads`. The first slice moves before the Spaces are destroyed
+/// when `destroy_after_first_read` is set.
+fn close_lid_listing(
+    harness: &mut TestHarness,
+    reads: &[&[WinID]],
+    destroy_after_first_read: bool,
+) {
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: BUILTIN,
+    });
+    harness.advance(Duration::from_millis(20));
+    harness.mock_state.remove_display(BUILTIN);
+    harness
+        .mock_state
+        .add_display(EXT, ext_bounds(), vec![EXT_SPACE]);
+    carry(harness, &[10, 11, 12], builtin_bounds(), ext_bounds());
+    let destroy = |harness: &mut TestHarness| {
+        for space_id in [BUILTIN_SPACE, BUILTIN_EMPTY_SPACE] {
+            harness
+                .world()
+                .write_message(Event::SpaceDestroyed { space_id });
+        }
+        harness.world().write_message(Event::DisplayRemoved {
+            display_id: BUILTIN,
+        });
+    };
+    if !destroy_after_first_read {
+        destroy(harness);
+    }
+    for (index, read) in reads.iter().enumerate() {
+        for &id in *read {
+            harness
+                .mock_state
+                .update_window(id, |window| window.workspace_id = EXT_SPACE);
+        }
+        if index == 0 && destroy_after_first_read {
+            harness.advance(Duration::from_millis(600));
+            destroy(harness);
+        }
+        harness.advance(Duration::from_millis(600));
+    }
+    harness.advance(SETTLE);
+}
+
+fn assert_lid_closed_layout(harness: &mut TestHarness) {
+    assert_eq!(
+        layout_on(harness.world(), EXT_SPACE),
+        (
+            EXT,
+            vec![vec![50], vec![51, 52], vec![53], vec![10], vec![11, 12]]
+        )
+    );
+}
+
+#[test]
+fn closing_the_lid_keeps_its_stack_on_the_external_display() {
+    let mut harness = two_displays();
+    close_lid_listing(&mut harness, &[&[10, 11, 12]], false);
+    assert_lid_closed_layout(&mut harness);
+}
+
+#[test]
+fn a_stack_macos_lists_top_window_first_stays_one_stack() {
+    let mut harness = two_displays();
+    close_lid_listing(&mut harness, &[&[10, 11], &[12]], false);
+    assert_lid_closed_layout(&mut harness);
+}
+
+#[test]
+fn a_stack_macos_lists_bottom_window_first_stays_one_stack() {
+    let mut harness = two_displays();
+    close_lid_listing(&mut harness, &[&[10, 12], &[11]], false);
+    assert_lid_closed_layout(&mut harness);
+}
+
+#[test]
+fn a_stack_split_by_a_read_before_its_space_is_destroyed_stays_one_stack() {
+    let mut harness = two_displays();
+    close_lid_listing(&mut harness, &[&[10, 11], &[12]], true);
+    assert_lid_closed_layout(&mut harness);
+}
+
 #[test]
 fn a_burst_that_moves_no_space_changes_no_strip() {
     let mut harness = two_displays();
