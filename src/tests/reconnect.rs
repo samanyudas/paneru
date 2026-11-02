@@ -650,6 +650,33 @@ fn a_stack_split_by_a_read_before_its_space_is_destroyed_stays_one_stack() {
 }
 
 #[test]
+fn a_three_window_stack_split_before_its_space_is_destroyed_stays_one_stack() {
+    let mut harness = two_displays();
+    let entity = find_window_entity(10, harness.world());
+    let world = harness.world();
+    let mut strips = world.query::<&mut LayoutStrip>();
+    strips
+        .iter_mut(world)
+        .find(|strip| strip.contains(entity))
+        .expect("a strip holding the window")
+        .stack(entity, Side::East)
+        .expect("stacking the window");
+    harness.advance(Duration::from_secs(2));
+    let (_, columns) = layout_on(harness.world(), BUILTIN_SPACE);
+    let [stack] = &columns[..] else {
+        panic!("one stack on the built-in display, got {columns:?}");
+    };
+    let stack = stack.clone();
+
+    close_lid_listing(&mut harness, &[&stack[..1], &stack[1..]], true);
+
+    assert_eq!(
+        layout_on(harness.world(), EXT_SPACE),
+        (EXT, vec![vec![50], vec![51, 52], vec![53], stack])
+    );
+}
+
+#[test]
 fn a_burst_that_moves_no_space_changes_no_strip() {
     let mut harness = two_displays();
     let before = every_strip(harness.world());
