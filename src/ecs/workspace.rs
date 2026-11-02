@@ -10,6 +10,7 @@ use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::ecs::world::World;
+use bevy::time::Time;
 use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -344,6 +345,8 @@ fn workspace_destroyed_handler(
     mut messages: MessageReader<Event>,
     mut workspaces: Populated<(&mut LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     mut focus_history: ResMut<FocusHistory>,
+    mut native: ResMut<NativeMembership>,
+    time: Res<Time>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
@@ -351,6 +354,11 @@ fn workspace_destroyed_handler(
             continue;
         };
         focus_history.forget_workspace(*space_id);
+        for (strip, _, fullscreen) in &workspaces {
+            if fullscreen.is_none() && strip.id() == *space_id {
+                native.space_destroyed(strip, time.elapsed());
+            }
+        }
 
         let Some((entity, fullscreen)) =
             workspaces.iter().find_map(|(strip, entity, fullscreen)| {
