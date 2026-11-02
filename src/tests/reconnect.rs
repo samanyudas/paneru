@@ -730,3 +730,41 @@ fn a_window_its_app_strands_off_every_display_returns_to_its_strip() {
         );
     }
 }
+
+/// macOS carries the built-in display's shown windows with it and reports
+/// their moves before the engine has read the new arrangement. Each carried
+/// window is on the moved display, so none goes back to where it was.
+#[test]
+fn a_window_macos_carries_with_its_display_stays_where_macos_put_it() {
+    let beside = IRect::new(2560, 0, 4608, 1332);
+    let mut harness = two_displays_with_parked_columns();
+    let before = every_strip(harness.world());
+    let shown: Vec<WinID> = [10, 11, 12, 13, 14, 15]
+        .into_iter()
+        .filter(|&id| builtin_bounds().contains(harness.mock_state.ax_frame(id).center()))
+        .collect();
+    assert!(!shown.is_empty(), "the built-in display shows a window");
+    harness.world().write_message(Event::DisplayMoved {
+        display_id: BUILTIN,
+    });
+    harness.mock_state.set_display_bounds(BUILTIN, beside);
+    carry(&harness, &shown, builtin_bounds(), beside);
+    for &id in &shown {
+        harness
+            .world()
+            .write_message(Event::WindowMoved { window_id: id });
+    }
+    harness.advance(Duration::from_millis(100));
+    for &id in &shown {
+        assert!(
+            beside.contains(harness.mock_state.ax_frame(id).center()),
+            "window {id} stays on the moved display, not at {:?}",
+            harness.mock_state.ax_frame(id)
+        );
+    }
+    harness.world().write_message(Event::DisplayMoved {
+        display_id: BUILTIN,
+    });
+    harness.advance(SETTLE);
+    assert_eq!(every_strip(harness.world()), before);
+}

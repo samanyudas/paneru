@@ -18,8 +18,16 @@
 //!    apply counts as at the frame the engine wrote.
 //! 2. A window of a parked virtual workspace is the exception. The engine
 //!    tucks the whole strip into a corner, so its frame is no evidence.
-//! 3. Any other frame is on the display that holds its center. A center on
-//!    no display is no evidence.
+//! 3. Any other frame is on the display that holds its center.
+//! 4. A frame with its center and the middle of its top edge on no display
+//!    is stranded. An app or macOS can leave a window there, as System
+//!    Settings does after you rearrange the displays in it. A stranded
+//!    window is on the display of the strip that holds it, and the engine
+//!    puts it back at its place in that strip. It does so as soon as the app
+//!    reports the move, unless a person is dragging, and otherwise at the
+//!    next report that names the window. Any other frame with its center on no display, and a stranded
+//!    window of a parked virtual workspace or of a strip with no display, is
+//!    no evidence.
 //!
 //! A display change suspends the rule between displays that were present
 //! before the change began. When the arrangement moves, macOS moves the
@@ -550,16 +558,50 @@ fn refiled_by_arrangement(world: &mut World, member: Entity, display: Entity) ->
         .is_some_and(|state| state.both_kept(home, display))
 }
 
-/// Whether a window of `members` is on a display other than `display`.
+/// Where a window is, by the rule in the module docs.
+enum Shown {
+    On(Entity),
+    /// Off every display, and in a strip on this display.
+    Stranded(Entity),
+}
+
+/// Whether a window of `members` is on a display other than `display`. A
+/// window stranded off every display goes back to its strip there.
 fn on_another_display(world: &mut World, members: &[Entity], display: Entity) -> bool {
-    members
-        .iter()
-        .any(|member| window_display(world, *member).is_some_and(|shown| shown != display))
+    let mut elsewhere = false;
+    for &member in members {
+        let shown = match window_display(world, member) {
+            Some(Shown::On(shown)) => shown,
+            Some(Shown::Stranded(home)) => {
+                if home != display {
+                    return_to_strip(world, member);
+                }
+                home
+            }
+            None => continue,
+        };
+        elsewhere |= shown != display;
+    }
+    elsewhere
+}
+
+/// Moves `member` back to the origin its strip placed it at, and checks that
+/// it lands there.
+fn return_to_strip(world: &mut World, member: Entity) {
+    let Some(origin) = world.get::<PresentedOrigin>(member).map(|origin| origin.0) else {
+        return;
+    };
+    if let Some(mut position) = world.get_mut::<Position>(member) {
+        position.0 = origin;
+    }
+    world
+        .entity_mut(member)
+        .insert(VerifyWindowPosition::default());
 }
 
 /// The display `member` is on, by the rule in the module docs. `None` is no
 /// evidence either way.
-fn window_display(world: &mut World, member: Entity) -> Option<Entity> {
+fn window_display(world: &mut World, member: Entity) -> Option<Shown> {
     let frame = {
         let mut window = world.get_mut::<Window>(member)?;
         // The engine's own write is still on its way. The OS frame is the one
@@ -594,13 +636,35 @@ fn window_display(world: &mut World, member: Entity) -> Option<Entity> {
         .find(|(strip, _, _)| strip.contains(member))
         .map(|(_, child, parked)| (child.parent(), parked));
     if written && let Some((display, parked)) = strip {
-        return (!parked).then_some(display);
+        return (!parked).then_some(Shown::On(display));
     }
-    world
+    let displays: Vec<_> = world
         .query::<(Entity, &Display)>()
         .iter(world)
-        .find(|(_, display)| display.bounds().contains(frame.center()))
-        .map(|(shown, _)| shown)
+        .map(|(entity, display)| (entity, display.bounds()))
+        .collect();
+    if let Some(&(shown, _)) = displays
+        .iter()
+        .find(|(_, bounds)| bounds.contains(frame.center()))
+    {
+        return Some(Shown::On(shown));
+    }
+    if !stranded(frame, displays.iter().map(|(_, bounds)| *bounds)) {
+        return None;
+    }
+    match strip {
+        Some((home, false)) if world.get::<Display>(home).is_some() => Some(Shown::Stranded(home)),
+        _ => None,
+    }
+}
+
+/// Whether `frame` is stranded off every display, by rule 4 in the module
+/// docs: its center and the middle of its top edge are on no display.
+pub(crate) fn stranded(frame: IRect, displays: impl IntoIterator<Item = IRect>) -> bool {
+    let top = IVec2::new(frame.center().x, frame.min.y);
+    !displays
+        .into_iter()
+        .any(|bounds| bounds.contains(frame.center()) || bounds.contains(top))
 }
 
 /// Moves the managed windows `ids` lists for `space` into its strips. Returns

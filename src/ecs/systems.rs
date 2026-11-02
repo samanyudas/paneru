@@ -28,10 +28,11 @@ use super::{
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::drag::{
-    DragOverlayHandle, NativeFrame, NativeResizeStart, TilingRestore, tiled_in,
+    DragOverlayHandle, DragState, NativeFrame, NativeResizeStart, TilingRestore, tiled_in,
 };
 use crate::ecs::layout::{Column, LayoutStrip, RestoreTo};
 use crate::ecs::maximize::{FloatingMaximized, FrameHold};
+use crate::ecs::native_membership::stranded;
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::state::{SaveSession, StateFile};
 use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
@@ -967,7 +968,7 @@ type FrameRechecks<'w, 's> = Query<
     Or<(With<NativeResizeStart>, With<DeferredFrameRead>)>,
 >;
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn window_frame_update(
     mut messages: MessageReader<Event>,
@@ -976,6 +977,8 @@ pub(crate) fn window_frame_update(
     rechecks: FrameRechecks,
     swipes: Query<&Scrolling, With<ActiveWorkspaceMarker>>,
     tiling: TilingRestore,
+    window_manager: Res<WindowManager>,
+    drag: Res<DragState>,
     mut commands: Commands,
 ) {
     let swiping = swipes
@@ -1126,7 +1129,28 @@ pub(crate) fn window_frame_update(
             && let Ok((_, _, mut position, ..)) = windows.get_mut(entity)
             && position.0 != new_frame.min
         {
-            position.0 = new_frame.min;
+            let placed = IRect::from_corners(position.0, position.0 + new_frame.size());
+            // The arrangement as it is now. The engine reads a display change
+            // only once it settles, and macOS carries windows with their
+            // display before that.
+            let stranding = || {
+                let bounds: Vec<_> = window_manager
+                    .present_displays()
+                    .into_iter()
+                    .map(|(display, _)| display.bounds())
+                    .collect();
+                stranded(new_frame, bounds.iter().copied()) && !stranded(placed, bounds)
+            };
+            if tiled && *drag == DragState::Idle && stranding() {
+                // An app moved its tiled window off every display, as System
+                // Settings does after you rearrange the displays in it. A
+                // window a person holds goes where the pointer takes it.
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(VerifyWindowPosition::default());
+                }
+            } else {
+                position.0 = new_frame.min;
+            }
         }
     }
 }
