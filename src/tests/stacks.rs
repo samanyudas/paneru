@@ -182,6 +182,35 @@ fn a_last_window_with_a_minimum_height_stays_on_screen() {
     assert_even(&heights(&frames[..2]), COLUMN - 500);
 }
 
+/// Windows with no known minimum shrink below the minimum window height
+/// rather than overlap a tall window, as long as their apps accept it.
+#[test]
+fn windows_shrink_below_the_minimum_window_height_before_a_stack_overlaps() {
+    let mut harness = tall_harness();
+    set_minimum_height(&harness, 1, 900);
+    stack_three(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1, 2]);
+    assert_eq!(frames[1].height(), 900, "{frames:?}");
+    assert_even(&[frames[0].height(), frames[2].height()], COLUMN - 900);
+}
+
+/// A window that refuses the height left for it records its minimum, and the
+/// stack overlaps once the minimums and the top bars no longer fit.
+#[test]
+fn a_stack_overlaps_once_its_real_minimum_heights_do_not_fit() {
+    let mut harness = tall_harness();
+    set_minimum_height(&harness, 1, 900);
+    set_minimum_height(&harness, 2, 400);
+    stack_three(&mut harness);
+
+    // 900 + 400 + window 0's 52 point top bar exceed the 1270 point column.
+    assert_eq!(
+        rows(harness.world(), &[0, 1, 2]),
+        vec![(20, COLUMN), (390, 900), (890, 400)]
+    );
+}
+
 /// A learned minimum is dropped once the window is seen smaller than it, so
 /// an app that now accepts less gets an even share at the next split.
 #[test]
