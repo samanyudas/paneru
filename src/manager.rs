@@ -735,16 +735,29 @@ impl WindowManagerApi for WindowManagerOS {
     }
 }
 
-/// The ID and owner of the on-screen desktop-icon window under `point`.
+/// The ID and owner of Finder's on-screen desktop window under `point`.
 /// Finder draws one over each display's desktop.
+///
+/// Only Finder's counts. macOS 27 also puts a `WindowManager` "Event Shield
+/// Window" at the desktop-icon level, in front of Finder's. Bringing that
+/// one to the front reveals the desktop of the display that has focus, and
+/// focus stays there.
 fn desktop_window_at(point: Origin) -> Option<(WinID, Pid)> {
+    let finder = objc2_app_kit::NSRunningApplication::runningApplicationsWithBundleIdentifier(
+        objc2_foundation::ns_string!("com.apple.finder"),
+    )
+    .iter()
+    .next()?
+    .processIdentifier();
     let level = CGWindowLevelForKey(CGWindowLevelKey::DesktopIconWindowLevelKey);
     let window_list_info =
         CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, kCGNullWindowID)?;
     let array = unsafe { window_list_info.cast_unchecked::<CFDictionary<CFString, CFType>>() };
     array.iter().find_map(|dict| {
         let number = |key: &CFString| dict.get(key)?.downcast::<CFNumber>().ok()?.as_i32();
-        if number(unsafe { kCGWindowLayer })? != level {
+        if number(unsafe { kCGWindowLayer })? != level
+            || number(unsafe { kCGWindowOwnerPID })? != finder
+        {
             return None;
         }
         let bounds = dict
@@ -757,10 +770,7 @@ fn desktop_window_at(point: Origin) -> Option<(WinID, Pid)> {
         if !irect_from(frame).contains(point) {
             return None;
         }
-        Some((
-            number(unsafe { kCGWindowNumber })?,
-            number(unsafe { kCGWindowOwnerPID })?,
-        ))
+        Some((number(unsafe { kCGWindowNumber })?, finder))
     })
 }
 
