@@ -2280,3 +2280,21 @@ fn a_still_drag_line_takes_the_new_color_when_the_config_reloads() {
 
     assert_eq!(log.borrow().last(), Some(&OverlayCall::Line(line, BLUE)));
 }
+
+/// A person drags window 0 by the right end of its top bar past the display's
+/// left edge, so the window's center and the middle of its top bar are on no
+/// display. The window stays under the pointer while the button is down.
+#[test]
+fn a_window_held_past_the_display_edge_stays_under_the_pointer() {
+    let mut harness = harness_with("", 1000, 3);
+    let start = frame(harness.world(), 0);
+    let press = grab_end(start, true);
+    let to = Origin::new(5, press.y);
+    drag_from(&mut harness, 0, press, to);
+    assert_eq!(
+        harness.mock_state.ax_frame(0).min,
+        start.min + (to - press),
+        "the held window follows the pointer"
+    );
+    release(&mut harness, to);
+}
