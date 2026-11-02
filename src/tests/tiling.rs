@@ -1363,6 +1363,37 @@ fn a_rule_can_tile_a_window_above_ordinary_windows() {
     crate::assert_focused!(world, 3);
 }
 
+/// The user drags a left corner of floating window 3, so its origin and size
+/// change together. Its app reports only the resize, and the engine must
+/// leave the window at the frame the user made.
+fn assert_left_corner_resize_holds(min_shift: IVec2, max_shift: IVec2) {
+    let mut harness = spawned_above_ordinary_window(Config::default());
+    harness.mock_state.os_move_window(3, IVec2::new(600, 300));
+    harness.advance(Duration::from_millis(100));
+    let start = harness.mock_state.ax_frame(3);
+
+    let resized = IRect::from_corners(start.min + min_shift, start.max + max_shift);
+    harness
+        .mock_state
+        .update_window(3, |window| window.frame = resized);
+    harness
+        .world()
+        .write_message(Event::WindowResized { window_id: 3 });
+    harness.advance(Duration::from_millis(100));
+
+    assert_eq!(harness.mock_state.ax_frame(3), resized);
+}
+
+#[test]
+fn a_floating_window_keeps_a_bottom_left_resize() {
+    assert_left_corner_resize_holds(IVec2::new(-150, 0), IVec2::new(0, 40));
+}
+
+#[test]
+fn a_floating_window_keeps_a_top_left_resize() {
+    assert_left_corner_resize_holds(IVec2::new(-150, -40), IVec2::ZERO);
+}
+
 /// Spawns window 3 at an ordinary level next to the tiled windows 0 to 2 with
 /// 0 focused, as Chrome shows a Picture-in-Picture window before it raises
 /// it. Returns the frame the window opened with.
