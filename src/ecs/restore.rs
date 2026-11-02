@@ -566,7 +566,14 @@ pub(super) fn restore_window_state(
         // The saved window in view goes back where it was on the display.
         let view = planned.view.and_then(|view| {
             let anchor = *plan.matched.get(&view.window_id)?;
-            let frame = |entity| ctx.windows.moving_frame(entity);
+            // Columns get their saved widths below, so measure them at those.
+            let frame = |entity| {
+                let mut frame = ctx.windows.moving_frame(entity)?;
+                if let Some(width) = plan.widths.get(&entity) {
+                    frame.max.x = frame.min.x + width.of_viewport(viewport.width());
+                }
+                Some(frame)
+            };
             let (_, x) = strip
                 .column_positions(&frame, viewport.width())
                 .find(|(column, _)| column.position_of(anchor).is_some())?;

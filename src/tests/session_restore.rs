@@ -1782,10 +1782,10 @@ fn test_startup_restore_follows_windows_to_their_renumbered_space() {
     );
 }
 
-/// The main display holds a row of three windows wider than the display,
-/// and the external display one window, 300, as macOS lists them to an
-/// engine that starts.
-fn row_beside_a_focused_display() -> TestHarness {
+/// The main display holds a row of three windows `width` wide, wider than the
+/// display, and the external display one window, 300, as macOS lists them to
+/// an engine that starts.
+fn row_beside_a_focused_display(width: i32) -> TestHarness {
     let ext_bounds = IRect::new(
         TEST_DISPLAY_WIDTH,
         0,
@@ -1796,7 +1796,7 @@ fn row_beside_a_focused_display() -> TestHarness {
     harness
         .mock_state
         .add_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID]);
-    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let size = Size::new(width, TEST_WINDOW_HEIGHT);
     for id in 0..3 {
         harness.mock_state.spawn_window(
             TEST_PROCESS_ID,
@@ -1818,7 +1818,21 @@ fn row_beside_a_focused_display() -> TestHarness {
 /// when focus is on another display and so cannot scroll the row (Miri #69).
 #[test]
 fn a_restart_keeps_where_a_row_was_scrolled() {
-    let mut before = row_beside_a_focused_display();
+    restart_keeps_where_a_row_was_scrolled(TEST_WINDOW_WIDTH);
+}
+
+/// Exit cleanup gives each window back its width from before the engine
+/// started, and the restore then resizes the columns to their saved widths.
+/// The row must be scrolled for the saved widths, not the returned ones.
+#[test]
+fn a_restart_keeps_where_a_row_was_scrolled_when_widths_come_back() {
+    restart_keeps_where_a_row_was_scrolled(TEST_WINDOW_WIDTH + 200);
+}
+
+/// Scrolls a row of `TEST_WINDOW_WIDTH` columns to its last column, restarts
+/// with the windows `returned_width` wide, and checks the last column.
+fn restart_keeps_where_a_row_was_scrolled(returned_width: i32) {
+    let mut before = row_beside_a_focused_display(TEST_WINDOW_WIDTH);
     before.run(vec![Event::MenuOpened { window_id: 0 }]);
     before.advance(Duration::from_secs(1));
     let world = before.world();
@@ -1846,11 +1860,12 @@ fn a_restart_keeps_where_a_row_was_scrolled() {
         scrolled.max.x <= TEST_DISPLAY_WIDTH && scrolled.min.x > 0,
         "the row must be scrolled to its last column {scrolled:?} before the restart"
     );
-    let saved = session_after_exit(&mut before, "scrolled", "", |world| {
+    let name = format!("scrolled-{returned_width}");
+    let saved = session_after_exit(&mut before, &name, "", |world| {
         world.write_message(AppExit::Success);
     });
 
-    let mut after = row_beside_a_focused_display()
+    let mut after = row_beside_a_focused_display(returned_width)
         .with_state(serde_json::from_str(&saved).expect("the saved session parses"));
     after.mock_state.activate_display(EXT_DISPLAY_ID);
     after.mock_state.focus_window(300);
