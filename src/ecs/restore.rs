@@ -12,7 +12,7 @@ use objc2_core_graphics::CGDirectDisplayID;
 use tracing::{Level, info, instrument, warn};
 
 use crate::config::{Config, MissingWindowBehavior};
-use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
+use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, ViewportShare};
 use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{
     PaneruState, SavedColumn, SavedMaximize, SavedStackItem, SavedStrip, SavedView, SavedWindow,
@@ -24,7 +24,7 @@ use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, Position, RestoreWindowState,
     SelectedVirtualMarker, SpawnCommandsExt, Unmanaged, WindowProperties,
 };
-use crate::manager::{Application, Display, Window};
+use crate::manager::{Application, Display, Size, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
 use crate::types::commands::Side;
 
@@ -144,8 +144,22 @@ pub(crate) struct RestorePlan {
     pub consumed_entities: HashSet<Entity>,
     /// The window each saved window id matched.
     pub matched: HashMap<WinID, Entity>,
+    /// The saved width of each matched window that has one.
+    pub widths: HashMap<Entity, ViewportShare>,
     pub ignored_missing_windows: usize,
     pub skipped_ambiguous_matches: usize,
+}
+
+impl RestorePlan {
+    /// Records that `entity` is the window `saved` describes.
+    fn claim(&mut self, saved: &SavedWindow, entity: Entity) -> Entity {
+        self.consumed_entities.insert(entity);
+        self.matched.insert(saved.window_id, entity);
+        if let Some(width) = saved.width {
+            self.widths.insert(entity, width);
+        }
+        entity
+    }
 }
 
 pub(crate) struct RestorePlanner<'a> {
@@ -264,9 +278,7 @@ impl<'a> RestorePlanner<'a> {
             !plan.consumed_entities.contains(&window.entity)
                 && saved.hard_match(window.window_id, window.pid, &window.bundle_id)
         }) {
-            plan.consumed_entities.insert(window.entity);
-            plan.matched.insert(saved.window_id, window.entity);
-            return Some(window.entity);
+            return Some(plan.claim(saved, window.entity));
         }
 
         let fallback_matches = current
@@ -279,11 +291,7 @@ impl<'a> RestorePlanner<'a> {
             .collect::<Vec<_>>();
 
         match fallback_matches.as_slice() {
-            [window] => {
-                plan.consumed_entities.insert(window.entity);
-                plan.matched.insert(saved.window_id, window.entity);
-                Some(window.entity)
-            }
+            [window] => Some(plan.claim(saved, window.entity)),
             [] => {
                 plan.ignored_missing_windows += 1;
                 None
@@ -588,6 +596,17 @@ pub(super) fn restore_window_state(
                         .try_remove::<SelectedVirtualMarker>()
                         .try_insert((Position(parked), existing_previous));
                 }
+            }
+        }
+
+        for entity in strip.all_windows() {
+            if let Some(width) = plan.widths.get(&entity)
+                && let Some(frame) = ctx.windows.frame(entity)
+            {
+                ctx.commands.resize_entity(
+                    entity,
+                    Size::new(width.of_viewport(viewport.width()), frame.height()),
+                );
             }
         }
 

@@ -1044,6 +1044,64 @@ fn test_startup_restore_keeps_stack_heights() {
     assert_eq!(heights, [450, TEST_DISPLAY_HEIGHT - top - 450]);
 }
 
+/// Exit cleanup returns each window to its frame from before the engine
+/// started, so the next engine finds the windows at those widths. The session
+/// saved at exit gives each column its width back.
+#[test]
+fn a_restart_keeps_column_widths() {
+    use bevy::app::AppExit;
+    use bevy::ecs::system::RunSystemOnce;
+
+    let os_width = |harness: &TestHarness, id| {
+        let mut width = 0;
+        harness
+            .mock_state
+            .update_window(id, |window| width = window.frame.width());
+        width
+    };
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    for _ in 0..2 {
+        harness.run(vec![Event::Command {
+            command: Command::Window(Operation::SetWidth(0.25)),
+        }]);
+        harness.advance(Duration::from_secs(2));
+        harness.run(vec![Event::Command {
+            command: Command::Window(Operation::Focus(crate::commands::Direction::East)),
+        }]);
+        harness.advance(Duration::from_secs(1));
+    }
+    let widths = [0, 1].map(|id| os_width(&harness, id));
+
+    let path =
+        std::env::temp_dir().join(format!("paneru-column-widths-{}.json", std::process::id()));
+    harness
+        .world()
+        .insert_resource(crate::ecs::state::StateFile(path.clone()));
+    harness.world().write_message(AppExit::Success);
+    harness
+        .world()
+        .run_system_once(crate::ecs::state::cleanup_on_exit)
+        .expect("running the exit save");
+    let state = PaneruState::load_from_file(&path).expect("a saved session");
+    _ = std::fs::remove_file(&path);
+
+    let top = TEST_MENUBAR_HEIGHT;
+    let full_width = IRect::new(0, top, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+    assert!(
+        widths.iter().all(|width| *width < full_width.width()),
+        "the windows were narrowed before the restart: {widths:?}"
+    );
+    let mut restarted = TestHarness::new()
+        .with_window(0, move |window| window.frame = full_width)
+        .with_window(1, move |window| window.frame = full_width)
+        .with_state(state);
+    restarted.advance(Duration::from_secs(2));
+
+    assert_eq!([0, 1].map(|id| os_width(&restarted, id)), widths);
+}
+
 /// When session restore keeps an emptied baseline row 0 on a workspace whose
 /// active virtual row is > 0, row 0 must be parked off-screen with a
 /// `PreviousStripPosition` (and without `SelectedVirtualMarker`), so that
@@ -1264,6 +1322,7 @@ fn saved_window(window_id: i32) -> SavedWindow {
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
         maximized: None,
+        width: None,
     }
 }
 

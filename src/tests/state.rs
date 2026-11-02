@@ -9,7 +9,7 @@ use crate::ecs::state::{
     SavedStackHome, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
 };
 use crate::ecs::state::{QueryState, SessionStrips};
-use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker};
+use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, SelectedVirtualMarker};
 use crate::events::Event;
 use crate::manager::{Application, Display, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID};
@@ -24,6 +24,8 @@ use bevy::ecs::system::SystemState;
 type StateExtractionState<'w, 's> = SystemState<(
     SessionStrips<'w, 's>,
     Query<'w, 's, (&'static Display, Entity, Has<ActiveDisplayMarker>)>,
+    Query<'w, 's, &'static DockPosition>,
+    Res<'w, Config>,
     Windows<'w, 's>,
     Query<'w, 's, &'static Application>,
 )>;
@@ -71,6 +73,7 @@ fn test_state_serialization() {
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
         maximized: None,
+        width: None,
     };
 
     let state = PaneruState {
@@ -118,6 +121,7 @@ fn test_state_restoration() {
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
         maximized: None,
+        width: None,
     };
 
     let state = PaneruState {
@@ -158,10 +162,10 @@ fn test_state_extraction() {
 
     let world = harness.world();
     let mut system_state: StateExtractionState<'_, '_> = SystemState::new(world);
-    let (workspaces, displays, windows, apps) =
+    let (workspaces, displays, docks, config, windows, apps) =
         system_state.get(world).expect("failed to get world state");
 
-    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
+    let state = PaneruState::extract(&workspaces, &displays, &docks, &config, &windows, &apps);
 
     assert_eq!(state.workspaces.len(), 1);
     assert_eq!(state.active_display_id, Some(TEST_DISPLAY_ID));
@@ -202,10 +206,10 @@ fn test_state_serializes_display_and_active_virtual_workspace() {
     ));
 
     let mut system_state: StateExtractionState<'_, '_> = SystemState::new(world);
-    let (workspaces, displays, windows, apps) =
+    let (workspaces, displays, docks, config, windows, apps) =
         system_state.get(world).expect("failed to get world state");
 
-    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
+    let state = PaneruState::extract(&workspaces, &displays, &docks, &config, &windows, &apps);
 
     assert_eq!(state.version, 2);
     assert_eq!(state.active_display_id, Some(TEST_DISPLAY_ID));
@@ -252,10 +256,10 @@ fn test_state_extraction_includes_parentless_layout_strips() {
     world.spawn(LayoutStrip::new(parentless_workspace_id, 0));
 
     let mut system_state: StateExtractionState<'_, '_> = SystemState::new(world);
-    let (workspaces, displays, windows, apps) =
+    let (workspaces, displays, docks, config, windows, apps) =
         system_state.get(world).expect("failed to get world state");
 
-    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
+    let state = PaneruState::extract(&workspaces, &displays, &docks, &config, &windows, &apps);
 
     let parentless_workspace = state
         .workspaces
@@ -583,6 +587,7 @@ fn saved_window(window_id: WinID, pid: Pid, bundle_id: &str, title: &str) -> Sav
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
         maximized: None,
+        width: None,
     }
 }
 
