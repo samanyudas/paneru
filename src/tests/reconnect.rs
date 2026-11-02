@@ -670,3 +670,63 @@ fn moving_a_display_beside_another_keeps_every_window_in_its_strip() {
         );
     }
 }
+
+/// After the built-in display moves beside the external display, one of its
+/// shown windows moves itself back toward where it was, as System Settings
+/// does after you click Done in Arrange. Its frame then overlaps the external
+/// display by 44 pt with its center on no display, and macOS files it in the
+/// external display's Space. With `notify`, the window's app reports the
+/// move. Without it, the report is lost, as when it lands during an animation.
+fn strand_beside(harness: &mut TestHarness, id: WinID, notify: bool) {
+    harness.mock_state.update_window(id, |window| {
+        let shift = IVec2::new(44 - window.frame.max.x, 0);
+        window.frame.min += shift;
+        window.frame.max += shift;
+        window.workspace_id = EXT_SPACE;
+    });
+    if notify {
+        harness
+            .world()
+            .write_message(Event::WindowMoved { window_id: id });
+    }
+    harness.advance(Duration::from_millis(500));
+}
+
+#[test]
+fn a_window_its_app_strands_off_every_display_returns_to_its_strip() {
+    let beside = IRect::new(2560, 0, 4608, 1332);
+    for notify in [true, false] {
+        let mut harness = two_displays_with_parked_columns();
+        let before = every_strip(harness.world());
+        move_builtin(&mut harness, builtin_bounds(), beside);
+        assert_eq!(every_strip(harness.world()), before, "notify {notify}");
+
+        strand_beside(&mut harness, 12, notify);
+        if notify {
+            assert!(
+                beside.contains(harness.mock_state.ax_frame(12).center()),
+                "the reported move is undone at once, not at {:?}",
+                harness.mock_state.ax_frame(12)
+            );
+        }
+        harness.world().write_message(Event::SpaceChanged);
+        harness.advance(SETTLE);
+        assert_eq!(
+            every_strip(harness.world()),
+            before,
+            "notify {notify}: the stranded window keeps its strip"
+        );
+        assert!(
+            beside.contains(harness.mock_state.ax_frame(12).center()),
+            "notify {notify}: the stranded window is back on the built-in display at {:?}",
+            harness.mock_state.ax_frame(12)
+        );
+
+        move_builtin(&mut harness, beside, builtin_bounds());
+        assert_eq!(
+            every_strip(harness.world()),
+            before,
+            "notify {notify}: back below"
+        );
+    }
+}
