@@ -753,13 +753,8 @@ fn desktop_window_at(point: Origin) -> Option<(WinID, Pid)> {
     let window_list_info =
         CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, kCGNullWindowID)?;
     let array = unsafe { window_list_info.cast_unchecked::<CFDictionary<CFString, CFType>>() };
-    array.iter().find_map(|dict| {
+    let windows = array.iter().filter_map(|dict| {
         let number = |key: &CFString| dict.get(key)?.downcast::<CFNumber>().ok()?.as_i32();
-        if number(unsafe { kCGWindowLayer })? != level
-            || number(unsafe { kCGWindowOwnerPID })? != finder
-        {
-            return None;
-        }
         let bounds = dict
             .get(unsafe { kCGWindowBounds })?
             .downcast::<CFDictionary>()
@@ -767,11 +762,38 @@ fn desktop_window_at(point: Origin) -> Option<(WinID, Pid)> {
         let mut frame = CGRect::default();
         unsafe { CGRectMakeWithDictionaryRepresentation(Some(&bounds), &raw mut frame) }
             .then_some(())?;
-        if !irect_from(frame).contains(point) {
-            return None;
-        }
-        Some((number(unsafe { kCGWindowNumber })?, finder))
-    })
+        Some(ListedWindow {
+            id: number(unsafe { kCGWindowNumber })?,
+            owner: number(unsafe { kCGWindowOwnerPID })?,
+            level: number(unsafe { kCGWindowLayer })?,
+            frame: irect_from(frame),
+        })
+    });
+    finder_desktop_window(windows, finder, level, point).map(|id| (id, finder))
+}
+
+/// A window as the window server lists it.
+struct ListedWindow {
+    id: WinID,
+    owner: Pid,
+    level: i32,
+    frame: IRect,
+}
+
+/// The first of `windows`, listed front to back, that `finder` owns at the
+/// desktop-icon `level` and that covers `point`.
+fn finder_desktop_window(
+    windows: impl IntoIterator<Item = ListedWindow>,
+    finder: Pid,
+    level: i32,
+    point: Origin,
+) -> Option<WinID> {
+    windows
+        .into_iter()
+        .find(|window| {
+            window.owner == finder && window.level == level && window.frame.contains(point)
+        })
+        .map(|window| window.id)
 }
 
 /// The frames the window server shows windows `ids` at, which is what the
@@ -1280,11 +1302,74 @@ mod tests {
 
     use std::time::{Duration, Instant};
 
+    use bevy::math::IRect;
+
     use super::{
-        BRUTEFORCE_TRAILING_GAP, ScanEnd, accessibility_reset_command, claim_unresolved_window,
-        irect_from, scan_elements,
+        BRUTEFORCE_TRAILING_GAP, ListedWindow, ScanEnd, accessibility_reset_command,
+        claim_unresolved_window, finder_desktop_window, irect_from, scan_elements,
     };
-    use crate::platform::WinID;
+    use crate::platform::{Pid, WinID};
+
+    /// macOS 27 lists a `WindowManager` "Event Shield Window" over each
+    /// display at the desktop-icon level, in front of Finder's desktop
+    /// windows. Focus on the empty built-in display must go to Finder's
+    /// desktop window there, not to a shield.
+    #[test]
+    fn an_empty_display_focuses_finders_desktop_window_not_a_shield_in_front_of_it() {
+        const DESKTOP_ICON_LEVEL: i32 = -2_147_483_603;
+        const FINDER: Pid = 400;
+        const WINDOW_MANAGER: Pid = 500;
+        let built_in = IRect::new(0, 0, 2048, 1332);
+        let external = IRect::new(2048, 0, 3968, 1080);
+        let listed = |id: WinID, owner, level, frame| ListedWindow {
+            id,
+            owner,
+            level,
+            frame,
+        };
+        let front_to_back = || {
+            [
+                listed(10, WINDOW_MANAGER, DESKTOP_ICON_LEVEL - 1, built_in),
+                listed(11, WINDOW_MANAGER, DESKTOP_ICON_LEVEL, built_in),
+                listed(12, WINDOW_MANAGER, DESKTOP_ICON_LEVEL, external),
+                listed(13, FINDER, DESKTOP_ICON_LEVEL, external),
+                listed(14, FINDER, DESKTOP_ICON_LEVEL, built_in),
+            ]
+        };
+
+        assert_eq!(
+            finder_desktop_window(
+                front_to_back(),
+                FINDER,
+                DESKTOP_ICON_LEVEL,
+                built_in.center()
+            ),
+            Some(14),
+            "Finder's desktop window on the built-in display"
+        );
+        assert_eq!(
+            finder_desktop_window(
+                front_to_back(),
+                FINDER,
+                DESKTOP_ICON_LEVEL,
+                external.center()
+            ),
+            Some(13),
+            "Finder's desktop window on the external display"
+        );
+        assert_eq!(
+            finder_desktop_window(
+                front_to_back()
+                    .into_iter()
+                    .filter(|window| window.owner != FINDER),
+                FINDER,
+                DESKTOP_ICON_LEVEL,
+                built_in.center()
+            ),
+            None,
+            "no desktop to focus without Finder's window"
+        );
+    }
 
     #[test]
     fn accessibility_reset_targets_embedded_bundle_identity() {
