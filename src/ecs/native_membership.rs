@@ -249,7 +249,12 @@ impl NativeMembership {
     fn scatter(&mut self, columns: impl IntoIterator<Item = DetachedColumn>, now: Duration) {
         for column in columns {
             let windows = column.windows();
-            if windows.len() < 2 {
+            // The rest of a column macOS is already moving stays part of it.
+            let known = self.scattered.iter().any(|scattered| {
+                let remembered = scattered.column.windows();
+                windows.iter().all(|window| remembered.contains(window))
+            });
+            if windows.len() < 2 || known {
                 continue;
             }
             self.scattered.retain(|scattered| {
