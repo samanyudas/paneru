@@ -1697,3 +1697,85 @@ fn test_startup_restore_follows_windows_to_their_renumbered_space() {
         "the first restored window must show on its display, not sit parked"
     );
 }
+
+/// The main display holds a row of three windows wider than the display,
+/// and the external display one window, 300, as macOS lists them to an
+/// engine that starts.
+fn row_beside_a_focused_display() -> TestHarness {
+    let ext_bounds = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        EXT_DISPLAY_HEIGHT,
+    );
+    let mut harness = TestHarness::new();
+    harness
+        .mock_state
+        .add_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID]);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    for id in 0..3 {
+        harness.mock_state.spawn_window(
+            TEST_PROCESS_ID,
+            TEST_WORKSPACE_ID,
+            id,
+            IRect::from_corners(Origin::ZERO, size),
+        );
+    }
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        EXT_WORKSPACE_ID,
+        300,
+        IRect::from_corners(ext_bounds.min, ext_bounds.min + size),
+    );
+    harness
+}
+
+/// After a restart, a row comes back scrolled where the user left it, also
+/// when focus is on another display and so cannot scroll the row (Miri #69).
+#[test]
+fn a_restart_keeps_where_a_row_was_scrolled() {
+    let mut before = row_beside_a_focused_display();
+    before.run(vec![Event::MenuOpened { window_id: 0 }]);
+    before.advance(Duration::from_secs(1));
+    let world = before.world();
+    let row = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .find(|strip| strip.id() == TEST_WORKSPACE_ID && !strip.all_windows().is_empty())
+        .expect("the main display has a row");
+    let last = row
+        .columns()
+        .filter_map(Column::top)
+        .last()
+        .expect("the row has columns");
+    let last = world
+        .entity(last)
+        .get::<crate::manager::Window>()
+        .expect("the last column holds a window")
+        .id();
+    before.mock_state.focus_window(last);
+    before.advance(Duration::from_secs(1));
+    before.mock_state.focus_window(300);
+    before.advance(Duration::from_secs(1));
+    let scrolled = before.mock_state.ax_frame(last);
+    assert!(
+        scrolled.max.x <= TEST_DISPLAY_WIDTH && scrolled.min.x > 0,
+        "the row must be scrolled to its last column {scrolled:?} before the restart"
+    );
+    let saved = session_after_exit(&mut before, "scrolled", "", |world| {
+        world.write_message(AppExit::Success);
+    });
+
+    let mut after = row_beside_a_focused_display()
+        .with_state(serde_json::from_str(&saved).expect("the saved session parses"));
+    after.mock_state.activate_display(EXT_DISPLAY_ID);
+    after.mock_state.focus_window(300);
+    after.run(vec![Event::MenuOpened { window_id: 300 }]);
+    after.advance(Duration::from_secs(1));
+
+    assert_eq!(
+        after.mock_state.ax_frame(last),
+        scrolled,
+        "the last column must be where it was before the restart"
+    );
+}
