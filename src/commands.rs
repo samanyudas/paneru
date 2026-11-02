@@ -2060,7 +2060,7 @@ fn equalize_column(
                     .map_or(0, |minimum| minimum.0)
             })
             .collect::<Vec<_>>();
-        hold_minimum_heights(&mut heights, &minimums, total);
+        hold_minimum_heights(&mut heights, &minimums, MIN_WINDOW_HEIGHT, total);
 
         for (item, height) in stack.iter().zip(heights) {
             for entity in item.window_iter() {
