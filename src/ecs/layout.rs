@@ -1678,7 +1678,26 @@ impl LayoutStrip {
                                 .map_or(FALLBACK_TOP_BAR_HEIGHT, get_top_bar_height)
                         })
                         .collect::<Vec<_>>();
-                    overlapping_rows(layout_strip_height, &floors, &top_bars)
+                    // A window with no known minimum may shrink below the
+                    // minimum window height to its top bar. One that refuses
+                    // records its minimum, and the next layout decides again.
+                    let real_floors = minimums
+                        .iter()
+                        .zip(&maximums)
+                        .zip(&top_bars)
+                        .map(|((minimum, maximum), top_bar)| {
+                            let floor = (*minimum).max(*top_bar);
+                            maximum.map_or(floor, |maximum| floor.min(maximum))
+                        })
+                        .collect::<Vec<_>>();
+                    if real_floors.iter().sum::<i32>() > layout_strip_height {
+                        overlapping_rows(layout_strip_height, &floors, &top_bars)
+                    } else {
+                        let mut heights = even_heights(items.len(), layout_strip_height);
+                        hold_maximum_heights(&mut heights, &maximums);
+                        hold_minimum_heights(&mut heights, &real_floors, 0, layout_strip_height);
+                        stacked_rows(&heights)
+                    }
                 } else {
                     // A column a stack item joined or left starts from full
                     // height for every item, which binpack splits evenly.
@@ -1702,7 +1721,12 @@ impl LayoutStrip {
                     // keeps binpack from taking it all from the last window.
                     let mut current_heights = current_heights;
                     if !splits_evenly && minimums.iter().any(|minimum| *minimum > 0) {
-                        hold_minimum_heights(&mut current_heights, &minimums, layout_strip_height);
+                        hold_minimum_heights(
+                            &mut current_heights,
+                            &minimums,
+                            MIN_WINDOW_HEIGHT,
+                            layout_strip_height,
+                        );
                     }
                     // Binpack gives up when the heights it keeps leave too
                     // little for the rest, though every floor fits an even split.
@@ -1714,7 +1738,12 @@ impl LayoutStrip {
                     // Capped first, so the spare height reaches the windows
                     // that can use it before any minimum takes its share.
                     hold_maximum_heights(&mut heights, &maximums);
-                    hold_minimum_heights(&mut heights, &minimums, layout_strip_height);
+                    hold_minimum_heights(
+                        &mut heights,
+                        &minimums,
+                        MIN_WINDOW_HEIGHT,
+                        layout_strip_height,
+                    );
                     stacked_rows(&heights)
                 };
 
@@ -2232,15 +2261,14 @@ pub(crate) fn overlapping_rows(column_height: i32, floors: &[i32], top_bars: &[i
 
 /// Raises every stacked height below its window's minimum to that minimum,
 /// and takes the extra from the tallest of the other windows first, none going
-/// below its own minimum or `MIN_WINDOW_HEIGHT`. Windows that give end up
-/// level, so a window with a smaller minimum keeps an even share. Minimums
-/// that cannot all fit are left for [`overlapping_rows`], which the layout
-/// uses instead.
-pub(crate) fn hold_minimum_heights(heights: &mut [i32], minimums: &[i32], total: i32) {
+/// below its own minimum or `floor`. Windows that give end up level, so a
+/// window with a smaller minimum keeps an even share. Minimums that cannot all
+/// fit are left for [`overlapping_rows`], which the layout uses instead.
+pub(crate) fn hold_minimum_heights(heights: &mut [i32], minimums: &[i32], floor: i32, total: i32) {
     for (height, minimum) in heights.iter_mut().zip(minimums) {
         *height = (*height).max(*minimum);
     }
-    let floor = |index: usize| minimums[index].max(MIN_WINDOW_HEIGHT);
+    let floor = |index: usize| minimums[index].max(floor);
     let mut excess = heights.iter().sum::<i32>() - total;
     // One pixel at a time from the tallest window above its floor, which
     // levels the givers instead of leaving rounding steps.
@@ -4562,22 +4590,22 @@ mod tests {
     #[test]
     fn minimum_heights_take_room_evenly_from_the_other_windows() {
         let mut heights = vec![423, 423, 424];
-        hold_minimum_heights(&mut heights, &[0, 0, 500], 1270);
+        hold_minimum_heights(&mut heights, &[0, 0, 500], MIN_WINDOW_HEIGHT, 1270);
         assert_eq!(heights, vec![385, 385, 500]);
 
         // A window already at the floor gives nothing.
         let mut heights = vec![200, 500, 570];
-        hold_minimum_heights(&mut heights, &[0, 0, 700], 1270);
+        hold_minimum_heights(&mut heights, &[0, 0, 700], MIN_WINDOW_HEIGHT, 1270);
         assert_eq!(heights, vec![200, 370, 700]);
 
         // A window with a smaller minimum above its share keeps an even share.
         let mut heights = vec![426, 426, 426];
-        hold_minimum_heights(&mut heights, &[308, 628, 0], 1278);
+        hold_minimum_heights(&mut heights, &[308, 628, 0], MIN_WINDOW_HEIGHT, 1278);
         assert_eq!(heights, vec![325, 628, 325]);
 
         // Minimums that cannot all fit overflow instead of overlapping.
         let mut heights = vec![400, 400];
-        hold_minimum_heights(&mut heights, &[600, 600], 800);
+        hold_minimum_heights(&mut heights, &[600, 600], MIN_WINDOW_HEIGHT, 800);
         assert_eq!(heights, vec![600, 600]);
     }
 
@@ -4681,8 +4709,8 @@ mod tests {
         );
     }
 
-    /// Windows too many for the minimum window height overlap instead of
-    /// leaving the layout.
+    /// Windows too many for the minimum window height shrink below it, with
+    /// no known minimum of their own, instead of leaving the layout.
     #[test]
     fn a_stack_too_tall_for_the_minimum_window_height_is_laid_out() {
         let mut world = World::new();
@@ -4701,12 +4729,11 @@ mod tests {
         let out = strip
             .relative_positions(Size::new(1000, 700), &frame)
             .collect::<Vec<_>>();
-        // 500 above the last window: 156 of top bars, 344 shared.
         assert_eq!(
             out.iter()
                 .map(|(_, frame)| (frame.min.y, frame.height()))
                 .collect::<Vec<_>>(),
-            vec![(0, 700), (167, 533), (334, 366), (500, 200)]
+            vec![(0, 175), (175, 175), (350, 175), (525, 175)]
         );
     }
 

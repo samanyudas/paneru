@@ -182,6 +182,35 @@ fn a_last_window_with_a_minimum_height_stays_on_screen() {
     assert_even(&heights(&frames[..2]), COLUMN - 500);
 }
 
+/// Windows with no known minimum shrink below the minimum window height
+/// rather than overlap a tall window, as long as their apps accept it.
+#[test]
+fn windows_shrink_below_the_minimum_window_height_before_a_stack_overlaps() {
+    let mut harness = tall_harness();
+    set_minimum_height(&harness, 1, 900);
+    stack_three(&mut harness);
+
+    let frames = column(harness.world(), &[0, 1, 2]);
+    assert_eq!(frames[1].height(), 900, "{frames:?}");
+    assert_even(&[frames[0].height(), frames[2].height()], COLUMN - 900);
+}
+
+/// A window that refuses the height left for it records its minimum, and the
+/// stack overlaps once the minimums and the top bars no longer fit.
+#[test]
+fn a_stack_overlaps_once_its_real_minimum_heights_do_not_fit() {
+    let mut harness = tall_harness();
+    set_minimum_height(&harness, 1, 900);
+    set_minimum_height(&harness, 2, 400);
+    stack_three(&mut harness);
+
+    // 900 + 400 + window 0's 52 point top bar exceed the 1270 point column.
+    assert_eq!(
+        rows(harness.world(), &[0, 1, 2]),
+        vec![(20, COLUMN), (390, 900), (890, 400)]
+    );
+}
+
 /// A learned minimum is dropped once the window is seen smaller than it, so
 /// an app that now accepts less gets an even share at the next split.
 #[test]
@@ -528,13 +557,16 @@ fn set_top_bar(harness: &TestHarness, id: WinID, height: i32) {
     });
 }
 
-/// More windows than fit at the minimum window height used to drop the whole
+/// More windows than fit at their minimum heights used to drop the whole
 /// column from the layout, leaving every window where it was. They overlap
 /// instead: the last window ends at the display bottom, and each window above
 /// shows its top bar and an even share of the rest.
 #[test]
-fn a_stack_too_tall_for_the_minimum_window_height_overlaps() {
+fn a_stack_too_tall_for_its_minimum_heights_overlaps() {
     let mut harness = harness_with("", TALL, 5);
+    for id in 0..5 {
+        set_minimum_height(&harness, id, 200);
+    }
     stack_all(&mut harness, 5);
     assert_eq!(layout(harness.world()), vec![vec![0, 1, 2, 3, 4]]);
     harness.mock_state.set_display_bounds(
@@ -560,7 +592,9 @@ fn a_stack_too_tall_for_the_minimum_window_height_overlaps() {
 #[test]
 fn an_overflowing_stack_overlaps_only_below_each_top_bar() {
     let mut harness = tall_harness();
-    set_minimum_height(&harness, 1, 900);
+    for (id, minimum) in [(0, 200), (1, 900), (2, 200)] {
+        set_minimum_height(&harness, id, minimum);
+    }
     for (id, top_bar) in [(0, 60), (1, 40), (2, 52)] {
         set_top_bar(&harness, id, top_bar);
     }
@@ -636,7 +670,9 @@ fn a_stack_extends_past_the_bottom_only_when_its_top_bars_do_not_fit() {
 #[test]
 fn focus_brings_an_overlapped_window_to_the_front_until_it_leaves() {
     let mut harness = TestHarness::new().with_windows(4);
-    set_minimum_height(&harness, 1, 500);
+    for (id, minimum) in [(0, 200), (1, 500), (2, 200)] {
+        set_minimum_height(&harness, id, minimum);
+    }
     stack_all(&mut harness, 3);
     let stack = [0, 1, 2];
     assert!(
@@ -662,7 +698,9 @@ fn focus_brings_an_overlapped_window_to_the_front_until_it_leaves() {
 #[test]
 fn ordering_an_overlapping_stack_settles_when_raising_takes_focus() {
     let mut harness = TestHarness::new().with_windows(4);
-    set_minimum_height(&harness, 1, 500);
+    for (id, minimum) in [(0, 200), (1, 500), (2, 200)] {
+        set_minimum_height(&harness, id, minimum);
+    }
     stack_all(&mut harness, 3);
     let stack = [0, 1, 2];
     harness.mock_state.set_raise_takes_focus(true);
@@ -722,7 +760,9 @@ fn an_overlapping_stack_of_several_apps_waits_for_the_focused_window() {
     harness
         .world()
         .trigger(crate::ecs::SpawnWindowTrigger(windows));
-    set_minimum_height(&harness, 1, 500);
+    for (id, minimum) in [(0, 200), (1, 500), (2, 200)] {
+        set_minimum_height(&harness, id, minimum);
+    }
     stack_all(&mut harness, 3);
     let stack = [0, 1, 2];
     assert_eq!(state.window_order(&stack), vec![0, 1, 2]);
