@@ -348,11 +348,20 @@ pub(crate) struct DisplayReconcileState {
     pending: Option<Timer>,
     retries_left: u8,
     verify_again: bool,
+    /// The displays present when the latest burst began. macOS refiles a
+    /// window between two of them only because the arrangement changed.
+    kept: EntityHashSet,
 }
 
 impl DisplayReconcileState {
     pub(crate) fn is_settling(&self) -> bool {
         self.pending.is_some() && self.verify_again
+    }
+
+    /// Whether `a` and `b` are two displays that were present when the
+    /// latest burst began.
+    pub(crate) fn both_kept(&self, a: Entity, b: Entity) -> bool {
+        a != b && self.kept.contains(&a) && self.kept.contains(&b)
     }
 
     /// Starts a burst, or restarts the settle delay of the one in progress.
@@ -361,6 +370,13 @@ impl DisplayReconcileState {
         // homes are taken before macOS moves or destroys any Space.
         if self.pending.is_none() {
             commands.queue(DisplayHomes::freeze);
+            commands.queue(|world: &mut World| {
+                let kept = world
+                    .query_filtered::<Entity, With<Display>>()
+                    .iter(world)
+                    .collect();
+                world.resource_mut::<Self>().kept = kept;
+            });
         }
         self.pending = Some(Timer::new(DISPLAY_SETTLE_DELAY, TimerMode::Once));
         self.retries_left = DISPLAY_RETRIES;

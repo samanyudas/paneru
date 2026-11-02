@@ -21,6 +21,14 @@
 //! 3. Any other frame is on the display that holds its center. A center on
 //!    no display is no evidence.
 //!
+//! A display change suspends the rule between displays that were present
+//! before the change began. When the arrangement moves, macOS moves the
+//! parked slivers too, and files each one in the Space of whichever display
+//! now holds its center. Neither its frame nor that report says where the
+//! window belongs, so the report never moves a window from a strip on one such
+//! display to a Space on another. A display that appeared during the change
+//! gets the windows macOS files on it.
+//!
 //! A report with no evidence against it moves the window. A stale report for
 //! another display, such as after a refused drop returned the window,
 //! therefore changes nothing, however long macOS keeps it, while macOS's
@@ -522,6 +530,26 @@ fn stripless(world: &mut World, member: Entity) -> bool {
             .any(|strip| strip.contains(member))
 }
 
+/// Whether macOS filed `member` in a space on `display` only because a
+/// display moved: its strip is on another display, and both displays were
+/// present before the display change began. macOS moves the off-screen
+/// columns the engine parks past a display's edge, so their frames are no
+/// evidence either way. A display that appeared since then gets the windows
+/// macOS files on it.
+fn refiled_by_arrangement(world: &mut World, member: Entity, display: Entity) -> bool {
+    let Some(home) = world
+        .query::<(&LayoutStrip, &ChildOf)>()
+        .iter(world)
+        .find(|(strip, _)| strip.contains(member))
+        .map(|(_, child)| child.parent())
+    else {
+        return false;
+    };
+    world
+        .get_resource::<super::display::DisplayReconcileState>()
+        .is_some_and(|state| state.both_kept(home, display))
+}
+
 /// Whether a window of `members` is on a display other than `display`.
 fn on_another_display(world: &mut World, members: &[Entity], display: Entity) -> bool {
     members
@@ -611,6 +639,13 @@ fn reconcile_space(
         }
         if members.iter().any(|member| native.owned(*member)) {
             held = true;
+            continue;
+        }
+        if topology && refiled_by_arrangement(world, candidate, display) {
+            debug!(
+                ?members,
+                space, "Ignoring a native report that only follows the new display arrangement"
+            );
             continue;
         }
         if on_another_display(world, &members, display) {
