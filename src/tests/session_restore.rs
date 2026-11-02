@@ -1300,6 +1300,7 @@ fn saved_window(window_id: i32) -> SavedWindow {
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
         maximized: None,
+        width: None,
     }
 }
 

@@ -215,8 +215,8 @@ Paneru saves managed window layout state to the user state directory
 (`$XDG_STATE_HOME/paneru/state.json`, usually
 `~/.local/state/paneru/state.json`) and loads it when Paneru starts. During the
 startup restore window, Paneru matches reopened windows to the saved session and
-restores their layout placement, virtual workspace row, and display assignment
-where possible.
+restores their layout placement, column width, virtual workspace row, and
+display assignment where possible.
 
 Restore is startup-only. After the configured startup grace period expires, new
 or unmatched windows follow the normal configuration and window-rule behavior.
