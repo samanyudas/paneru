@@ -27,6 +27,7 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, ExposeFocusedSurvivorAfterRemoval, LayoutStrip, anchored_origin};
 use crate::ecs::maximize::EDGE_RELEASE;
 use crate::ecs::maximize::FloatingMaximized;
+use crate::ecs::native_membership::{NativeMembership, NativeScope};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::systems::launch_watch;
@@ -453,6 +454,7 @@ pub(super) fn mission_control_trigger(
     )>,
     mut mission_control_active: ResMut<MissionControlActive>,
     window_manager: Res<WindowManager>,
+    mut native: ResMut<NativeMembership>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
@@ -471,6 +473,7 @@ pub(super) fn mission_control_trigger(
             }
             Event::MissionControlExit => {
                 mission_control_active.as_mut().0 = false;
+                native.request(NativeScope::EverySpace);
 
                 // Check if some windows disappeared from the current workspace
                 // - e.g. they were moved away during mission control.

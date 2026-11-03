@@ -88,6 +88,9 @@ const IGNORE_FOR: Duration = Duration::from_secs(30);
 
 pub(crate) enum NativeScope {
     ActivatedSpace(WorkspaceId),
+    /// Every live space, after Mission Control, where a person can drop a
+    /// window on any desktop of any display.
+    EverySpace,
     DisplayTopology,
 }
 
@@ -199,6 +202,7 @@ impl NativeMembership {
             NativeScope::ActivatedSpace(space) => {
                 self.dirty.entry(space).or_default().retry = QueryRetry::Ready;
             }
+            NativeScope::EverySpace => self.all_spaces = true,
             NativeScope::DisplayTopology => {
                 self.all_spaces = true;
                 self.topology = true;
