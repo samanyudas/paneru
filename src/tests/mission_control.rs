@@ -176,6 +176,70 @@ fn a_window_dragged_to_the_other_display_joins_its_strip_whichever_display_has_f
     }
 }
 
+/// What macOS 27 did in the live trace on issue 143. The drop files the
+/// window in the built-in display's Space and makes that display active while
+/// Mission Control still shows. The window's new frame on the built-in display
+/// reaches the engine only about 300 ms after that Space report, too late for
+/// the report to pass the frame check. The window must join the built-in strip
+/// once its frame arrives, as any layout of its old strip writes it back to
+/// the external display's Space.
+#[test]
+fn a_window_dropped_on_the_other_display_stays_when_its_frame_follows_the_space_report() {
+    for focused in [10, 50] {
+        let mut harness = two_displays(focused);
+        harness
+            .world()
+            .write_message(Event::MissionControlShowAllWindows);
+        harness.advance(Duration::from_millis(500));
+
+        harness.mock_state.update_window(51, |window| {
+            window.workspace_id = BUILTIN_SPACE;
+        });
+        harness.mock_state.os_activate_display(BUILTIN);
+        harness.advance(Duration::from_millis(300));
+        let shift = to_builtin() - harness.mock_state.ax_frame(51).min;
+        harness.mock_state.update_window(51, |window| {
+            window.frame.min += shift;
+            window.frame.max += shift;
+        });
+        harness
+            .world()
+            .write_message(Event::WindowMoved { window_id: 51 });
+        harness.advance(Duration::from_secs(1));
+        // Any layout of the old strip from here would write the window back
+        // and send it to the external display's Space.
+        assert_eq!(
+            strip_of(harness.world(), 51),
+            Some((BUILTIN_SPACE, BUILTIN)),
+            "focus on {focused}: the window joins the built-in strip while Mission Control \
+             shows, strips {:?}",
+            strips(harness.world())
+        );
+        harness.mock_state.os_activate_display(EXT);
+        harness.advance(Duration::from_secs(1));
+        harness.world().write_message(Event::MissionControlExit);
+        harness.advance(SETTLE);
+
+        assert_eq!(
+            harness.mock_state.space_of(51),
+            BUILTIN_SPACE,
+            "focus on {focused}: the window stays in the Space it was dropped in at {:?}",
+            harness.mock_state.ax_frame(51)
+        );
+        assert_eq!(
+            strip_of(harness.world(), 51),
+            Some((BUILTIN_SPACE, BUILTIN)),
+            "focus on {focused}: the window joins the built-in strip, strips {:?}",
+            strips(harness.world())
+        );
+        assert!(
+            builtin_bounds().contains(harness.mock_state.ax_frame(51).center()),
+            "focus on {focused}: the window is on the built-in display at {:?}",
+            harness.mock_state.ax_frame(51)
+        );
+    }
+}
+
 #[test]
 fn a_window_dragged_to_another_desktop_of_its_display_joins_that_desktops_strip() {
     let mut harness = two_displays(50);
