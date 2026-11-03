@@ -40,7 +40,10 @@
 //! A report with no evidence against it moves the window. A stale report for
 //! another display, such as after a refused drop returned the window,
 //! therefore changes nothing, however long macOS keeps it, while macOS's
-//! own moves change the frame and pass.
+//! own moves change the frame and pass. macOS can report the Space before the
+//! frame, as it does for a Mission Control drop on another display, so a
+//! native move that carries a window onto another display reads every Space
+//! again.
 //!
 //! Two trades follow from the rule:
 //!
@@ -88,8 +91,10 @@ const IGNORE_FOR: Duration = Duration::from_secs(30);
 
 pub(crate) enum NativeScope {
     ActivatedSpace(WorkspaceId),
-    /// Every live space, after Mission Control, where a person can drop a
-    /// window on any desktop of any display.
+    /// Every live space. Mission Control lets a person drop a window on any
+    /// desktop of any display, and a window that a native move carried onto
+    /// another display can be in a Space whose report was refused before
+    /// its frame moved.
     EverySpace,
     DisplayTopology,
 }

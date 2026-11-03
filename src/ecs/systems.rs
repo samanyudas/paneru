@@ -32,7 +32,7 @@ use crate::ecs::drag::{
 };
 use crate::ecs::layout::{Column, LayoutStrip, RestoreTo};
 use crate::ecs::maximize::{FloatingMaximized, FrameHold};
-use crate::ecs::native_membership::stranded;
+use crate::ecs::native_membership::{NativeMembership, NativeScope, stranded};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::state::{SaveSession, StateFile};
 use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
@@ -979,6 +979,8 @@ pub(crate) fn window_frame_update(
     tiling: TilingRestore,
     window_manager: Res<WindowManager>,
     drag: Res<DragState>,
+    displays: Query<&Display>,
+    mut native: ResMut<NativeMembership>,
     mut commands: Commands,
 ) {
     let swiping = swipes
@@ -1149,6 +1151,22 @@ pub(crate) fn window_frame_update(
                     entity_commands.try_insert(VerifyWindowPosition::default());
                 }
             } else {
+                // macOS reports a window's new Space before its new frame, as
+                // a Mission Control drop onto another display does. Native
+                // membership refused that report while the frame was still on
+                // the old display, and no second report comes, so the frame
+                // that arrives on the other display must reopen it.
+                let display_of = |frame: IRect| {
+                    displays
+                        .iter()
+                        .find(|display| display.bounds().contains(frame.center()))
+                        .map(Display::id)
+                };
+                if *drag == DragState::Idle
+                    && display_of(new_frame).is_some_and(|to| display_of(placed) != Some(to))
+                {
+                    native.request(NativeScope::EverySpace);
+                }
                 position.0 = new_frame.min;
             }
         }
