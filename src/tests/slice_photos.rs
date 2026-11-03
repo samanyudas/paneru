@@ -898,6 +898,120 @@ fn a_window_whose_photo_never_arrives_tucks_after_a_wait_of_a_second_and_a_half(
     assert!(seen[waited..].iter().all(|frame| !in_view(frame.window)));
 }
 
+/// Window `id`, with the switch off, slides out past the shared edge with
+/// the row until most of it would leave its display, then tucks.
+fn assert_slides_to_the_edge(laid_out: (TestHarness, ScreenLog), id: WinID) {
+    let focus = (Direction::Last, Direction::First);
+    let (seen, start, _) = leave(laid_out, id, focus, None, None);
+
+    let on_display = |frame: IRect| frame.intersect(DISPLAY).width();
+    let sliding = seen
+        .iter()
+        .take_while(|frame| in_view(frame.window))
+        .map(|frame| on_display(frame.window))
+        .collect::<Vec<_>>();
+    assert!(
+        !sliding.is_empty(),
+        "window {id} slides with the row before it tucks: {sliding:?} from {}",
+        on_display(start)
+    );
+    let mut places = vec![on_display(start)];
+    places.extend(&sliding);
+    for pair in places.windows(2) {
+        assert!(pair[1] < pair[0], "window {id} only moves out: {places:?}");
+    }
+    let rest = &seen[sliding.len()..];
+    assert!(!rest.is_empty(), "window {id} tucks");
+    assert!(
+        rest.iter()
+            .all(|frame| !in_view(frame.window) && frame.photo.is_none()),
+        "window {id} stays tucked with no photo"
+    );
+}
+
+#[test]
+fn with_the_switch_off_a_window_slides_to_the_shared_edge_then_tucks() {
+    let off = (
+        MainOptions {
+            shared_edge_slices: Some(false),
+            animation_speed: Some(14.0),
+            ..MainOptions::default()
+        },
+        vec![],
+    )
+        .into();
+    assert_slides_to_the_edge(beside(off, Screen::default()), 3);
+}
+
+/// Sam's run: the column coming in belongs to an app that takes its first
+/// move late, so pacing holds the leaving column still for a few frames. A
+/// held column has not reached the edge, so it waits in view, then slides.
+#[test]
+fn with_the_switch_off_a_column_held_by_a_slow_neighbour_waits_in_view() {
+    const OTHER_APP: crate::platform::Pid = 2;
+    let off = (
+        MainOptions {
+            shared_edge_slices: Some(false),
+            animation_speed: Some(14.0),
+            ..MainOptions::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(off)
+        .with_display(EXT_DISPLAY_ID, LEFT, vec![EXT_WORKSPACE_ID])
+        .with_app(OTHER_APP, "other", "OtherApp", |_| {});
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    for (id, width) in (0..).zip([800, 800, 300]) {
+        let pid = if id == 1 { TEST_PROCESS_ID } else { OTHER_APP };
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+        harness.mock_state.flush_writes(Duration::from_secs(1));
+    }
+    let start = harness.mock_state.ax_frame(0);
+    assert!(in_view(start), "window 0 rests in view at {start:?}");
+
+    harness.mock_state.hold_writes(TEST_PROCESS_ID);
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::East)));
+    for frame in 0..5 {
+        harness.advance(Duration::from_millis(20));
+        let held = harness.mock_state.ax_frame(0);
+        assert!(
+            in_view(held),
+            "window 0 waits in view after frame {frame}: {held:?}"
+        );
+    }
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    let mut sliding = 0;
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+        harness.mock_state.flush_writes(Duration::from_secs(1));
+        let frame = harness.mock_state.ax_frame(0);
+        if in_view(frame) && frame.min.x < start.min.x {
+            sliding += 1;
+        }
+    }
+    assert!(sliding > 0, "window 0 slides out in view");
+    let end = harness.mock_state.ax_frame(0);
+    assert!(!in_view(end), "window 0 tucks: {end:?}");
+}
+
 /// An app that is still starting may draw nothing yet, so its first photo
 /// comes out blank while its window still shows.
 #[test]
