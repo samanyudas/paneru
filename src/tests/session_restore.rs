@@ -22,6 +22,100 @@ use crate::tests::{
 };
 
 #[test]
+fn test_startup_focus_preserves_the_focused_window_when_restoring_a_session() {
+    let harness = TestHarness::new()
+        .with_windows(2)
+        .with_state(state_with_strips(vec![SavedStrip {
+            view: None,
+            virtual_index: 0,
+            columns: vec![
+                SavedColumn::Single(saved_window(0)),
+                SavedColumn::Single(saved_window(1)),
+            ],
+        }]));
+    harness.mock_state.focus_window_unreported(1);
+
+    harness
+        .on_iteration(0, |world, state| {
+            assert_eq!(
+                state.focused_window_id(TEST_PROCESS_ID),
+                Some(1),
+                "restoring a session must keep the app's existing focused window"
+            );
+            crate::assert_focused!(world, 1);
+            assert_eq!(state.raise_count(), 0, "restoring must not raise a window");
+        })
+        .run(vec![Event::MenuOpened { window_id: 1 }]);
+}
+
+#[test]
+fn test_startup_focus_preserves_a_frontmost_floating_app_when_restoring_a_session() {
+    let settings_pid = TEST_PROCESS_ID + 1;
+    let settings_window_id = 2;
+    let mut harness = TestHarness::new()
+        .with_windows(2)
+        .with_app(settings_pid, "miri.dev", "Miri Settings", |app| {
+            app.focused_window_id = Some(settings_window_id);
+        })
+        .with_state(state_with_strips(vec![SavedStrip {
+            view: None,
+            virtual_index: 0,
+            columns: vec![
+                SavedColumn::Single(saved_window(0)),
+                SavedColumn::Single(saved_window(1)),
+            ],
+        }]));
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.is_frontmost = false);
+    let settings_window = harness.mock_state.spawn_window(
+        settings_pid,
+        TEST_WORKSPACE_ID,
+        settings_window_id,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    harness
+        .mock_state
+        .update_window(settings_window_id, |window| window.fixed_size = true);
+    harness.existed_at_launch([settings_window_id]);
+    harness
+        .world()
+        .trigger(SpawnWindowTrigger(vec![settings_window]));
+
+    harness
+        .on_iteration(0, move |world, state| {
+            assert_eq!(
+                state.raise_count(),
+                0,
+                "restoring behind a floating app must not raise any tiled window"
+            );
+            assert_eq!(
+                state.focused_window_id(settings_pid),
+                Some(settings_window_id)
+            );
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), None);
+            crate::assert_focused!(world, settings_window_id);
+            let entity = find_window_entity(settings_window_id, world);
+            assert!(world.entity(entity).contains::<Unmanaged>());
+        })
+        .run(vec![Event::MenuOpened {
+            window_id: settings_window_id,
+        }]);
+}
+
+#[test]
+fn test_startup_focus_selects_the_first_window_without_a_saved_session() {
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(0, |world, state| {
+            assert_eq!(state.focused_window_id(TEST_PROCESS_ID), Some(0));
+            crate::assert_focused!(world, 0);
+            assert!(state.raise_count() > 0);
+        })
+        .run(vec![Event::MenuOpened { window_id: 0 }]);
+}
+
+#[test]
 fn test_startup_restore_rebuilds_virtual_workspace_layout() {
     let state = PaneruState {
         version: 2,
