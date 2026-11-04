@@ -735,7 +735,7 @@ impl InputHandler {
             return false;
         };
 
-        let mask = get_modifiers(eventflags);
+        let mask = binding_modifiers(eventflags);
 
         // On a native fullscreen space, keybindings are still intercepted so
         // that paneru can actively switch back to the previous workspace.
@@ -780,6 +780,13 @@ fn gesture_should_intercept(configured_fingers: Option<usize>, actual_fingers: u
 
 fn should_reset_swipe_anchors(actual_fingers: usize, anchored_fingers: usize) -> bool {
     actual_fingers != 0 && actual_fingers != anchored_fingers
+}
+
+// The mask a key binding is matched against.
+// Today this is only the left and right device bits. A later change has to
+// teach it about group flags before the tests below can pass.
+fn binding_modifiers(eventflags: CGEventFlags) -> Modifiers {
+    get_modifiers(eventflags)
 }
 
 // Remote mouse tools can send group flags without left or right flags.
@@ -1234,6 +1241,32 @@ mod tests {
     fn device_independent_flags_ignored() {
         let generic_alt: u64 = 0x0008_0000;
         assert_eq!(get_modifiers(CGEventFlags(generic_alt)), Modifiers::empty());
+    }
+
+    // kCGEventFlagMaskControl and kCGEventFlagMaskAlternate, with no device bit.
+    // AppleScript `key code ... using {control down, option down}` posts these.
+    const GENERIC_CONTROL: u64 = 0x0004_0000;
+    const GENERIC_OPTION: u64 = 0x0008_0000;
+
+    #[test]
+    fn generic_control_option_flags_match_a_control_option_shortcut() {
+        let event = binding_modifiers(CGEventFlags(GENERIC_CONTROL | GENERIC_OPTION));
+        let shortcut = Modifiers::CTRL | Modifiers::ALT;
+        assert!(
+            shortcut.matches(event),
+            "a Control-Option shortcut must match a key event that carries only the generic flags, got {event:?}"
+        );
+    }
+
+    #[test]
+    fn device_bits_still_tell_modifier_sides_apart() {
+        let left = binding_modifiers(CGEventFlags(GENERIC_CONTROL | NX_DEVICELCTLKEYMASK));
+        assert!(Modifiers::LCTRL.matches(left), "{left:?}");
+        assert!(!Modifiers::RCTRL.matches(left), "{left:?}");
+
+        let right = binding_modifiers(CGEventFlags(GENERIC_CONTROL | NX_DEVICERCTLKEYMASK));
+        assert!(Modifiers::RCTRL.matches(right), "{right:?}");
+        assert!(!Modifiers::LCTRL.matches(right), "{right:?}");
     }
 
     #[test]
