@@ -801,7 +801,7 @@ impl InputHandler {
                 }
                 self.config.find_keybind(keycode, mask)
             })
-            .map(|command| if repeat { command.repeated() } else { command })
+            .map(|command| command.for_keypress(repeat))
             .and_then(|command| {
                 events
                     .send(Event::Command { command })
@@ -1058,9 +1058,14 @@ mod tests {
         } else {
             "ctrl+alt"
         };
+        let (key, code) = if side == crate::commands::Side::West {
+            ("leftarrow", 123)
+        } else {
+            ("rightarrow", 124)
+        };
         let config = Config::try_from(
             format!(
-                "[options]\n[bindings]\nwindow_{verb}_{} = '{chord}-rightarrow'\n",
+                "[options]\n[bindings]\nwindow_{verb}_{} = '{chord}-{key}'\n",
                 side.token()
             )
             .as_str(),
@@ -1068,8 +1073,12 @@ mod tests {
         .expect("valid keyboard config");
         let (sender, receiver) = EventSender::new();
         let handler = InputHandler::new(sender, config);
-        let flags = if verb == "swap" { 0xae0023 } else { 0xac0021 };
-        assert!(handler.handle_keypress(124, CGEventFlags(flags), repeat));
+        let flags = if verb == "swap" {
+            0x00ae_0023
+        } else {
+            0x00ac_0021
+        };
+        assert!(handler.handle_keypress(code, CGEventFlags(flags), repeat));
         receiver.try_recv().expect("keyboard command")
     }
 
@@ -1138,6 +1147,47 @@ mod tests {
                 "plain move crosses {side:?}"
             );
             crate::assert_focused!(world, 0);
+        }
+    }
+
+    #[test]
+    fn repeated_plain_keyboard_events_do_not_cross_a_touching_display() {
+        use crate::commands::Side;
+        use crate::ecs::layout::LayoutStrip;
+        use crate::tests::*;
+        use bevy::math::{IRect, IVec2};
+        for side in [Side::West, Side::East] {
+            for verb in ["focus", "swap"] {
+                let x = if side == Side::West {
+                    -EXT_DISPLAY_WIDTH
+                } else {
+                    TEST_DISPLAY_WIDTH
+                };
+                let bounds = IRect::from_corners(
+                    IVec2::new(x, 0),
+                    IVec2::new(x + EXT_DISPLAY_WIDTH, EXT_DISPLAY_HEIGHT),
+                );
+                let mut harness = TestHarness::new()
+                    .with_windows(1)
+                    .with_display(EXT_DISPLAY_ID, bounds, vec![EXT_WORKSPACE_ID])
+                    .with_window(100, |window| {
+                        window.workspace_id = EXT_WORKSPACE_ID;
+                        window.frame = bounds;
+                    });
+                harness.run(vec![
+                    Event::MenuOpened { window_id: 0 },
+                    horizontal_key(verb, side, true),
+                ]);
+                let world = harness.world();
+                let entity = find_window_entity(0, world);
+                assert!(
+                    world
+                        .query::<&LayoutStrip>()
+                        .iter(world)
+                        .any(|strip| strip.id() == TEST_WORKSPACE_ID && strip.contains(entity))
+                );
+                crate::assert_focused!(world, 0);
+            }
         }
     }
 
