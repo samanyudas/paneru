@@ -33,8 +33,8 @@ use crate::ecs::drag::{
 use crate::ecs::layout::{Column, LayoutStrip, RestoreTo};
 use crate::ecs::maximize::{FloatingMaximized, FrameHold};
 use crate::ecs::native_membership::{NativeMembership, NativeScope, stranded};
-use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
-use crate::ecs::state::{SaveSession, StateFile};
+use crate::ecs::params::{ActiveDisplay, FrameActivity, WindowCtx, Windows};
+use crate::ecs::state::{PaneruState, SaveSession, StateFile};
 use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
@@ -288,8 +288,7 @@ pub(crate) fn add_existing_application(
 }
 
 /// Finishes the initialization process once all initial windows are loaded.
-/// This system refreshes displays, assigns the `FocusedMarker` to the first window of the active space,
-/// and logs the total number of managed windows.
+/// Refreshes displays and initializes focus, preserving native focus when restoring a session.
 ///
 /// # Arguments
 ///
@@ -300,13 +299,18 @@ pub(crate) fn add_existing_application(
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(crate) fn finish_setup(
     process_query: Query<Entity, With<ExistingMarker>>,
-    windows: Windows,
     applications: Query<&Application>,
     mut bruteforce_tasks: Query<(Entity, &mut BruteforceWindows)>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>, &ChildOf)>,
     window_manager: Res<WindowManager>,
-    mut commands: Commands,
+    restoration: Option<Res<PaneruState>>,
+    ctx: WindowCtx,
 ) {
+    let WindowCtx {
+        windows,
+        config,
+        mut commands,
+    } = ctx;
     if !process_query.is_empty() {
         // The other two add_* functions are still running..
         return;
@@ -331,6 +335,7 @@ pub(crate) fn finish_setup(
         windows.iter().size_hint()
     );
 
+    let restoring = restoration.is_some() && config.restore_enabled();
     let mut focused_managed_window = false;
     for (mut strip, active_strip, _) in &mut workspaces {
         if strip.virtual_index != 0 {
@@ -376,15 +381,17 @@ pub(crate) fn finish_setup(
         }
         debug!("space {}: after refresh {strip:?}", strip.id());
 
-        if active_strip && let Some(entity) = strip.first().ok().and_then(|column| column.top()) {
+        if !restoring
+            && active_strip
+            && let Some(entity) = strip.first().ok().and_then(|column| column.top())
+        {
             commands.focus_entity(entity, true);
             focused_managed_window = true;
         }
     }
 
-    // An all-floating workspace has no strip member to receive the initial
-    // focus marker. Mirror the frontmost app's AX focus so menu actions such as
-    // Toggle Managed work immediately after launch.
+    // Restoring a session must not activate or raise a window. Mirror native
+    // focus instead, as for an all-floating workspace on a fresh launch.
     if !focused_managed_window
         && let Some(focused_window_id) = applications
             .iter()

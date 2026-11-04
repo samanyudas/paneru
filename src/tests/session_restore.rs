@@ -547,6 +547,7 @@ fn test_startup_restore_shows_focused_last_column_of_a_wide_strip() {
                 }],
             }],
         });
+    harness.mock_state.focus_window_unreported(0);
 
     let viewport = IRect::new(
         PAD,
@@ -1240,6 +1241,7 @@ fn test_emptied_baseline_row_is_parked_and_repositions_moved_windows() {
         .with_workspace_window(0, TEST_WORKSPACE_ID, |_| {})
         .with_workspace_window(1, TEST_WORKSPACE_ID, |_| {})
         .with_workspace_window(2, 200, |_| {});
+    harness.mock_state.focus_window_unreported(0);
     harness.world().insert_resource(PaneruState {
         version: 2,
         timestamp: 123_456_789,
