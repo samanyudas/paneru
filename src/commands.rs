@@ -133,13 +133,14 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // once it knows whether a Lua script took over the configuration.
     app.init_resource::<SnippetDialect>();
     app.init_resource::<HeldEdge>();
+    app.add_message::<DisplayFocusRequest>();
     app.init_resource::<DesktopFocusCheck>();
     app.add_systems(
         PreUpdate,
         (
             copy_window_rule,
             toggle_tabbed_display_handler,
-            focus_display,
+            focus_display.after(command_move_focus),
             check_desktop_focus.after(focus_display),
             end_width_runs.before(resize_window),
         )
@@ -280,6 +281,27 @@ pub(crate) fn display_in_direction<T>(
         .map(|(display, _, _)| display)
 }
 
+fn touching_display<T>(
+    side: Side,
+    from: IRect,
+    displays: impl IntoIterator<Item = (T, IRect)>,
+) -> Option<T> {
+    display_in_direction(
+        &side.direction(),
+        from,
+        displays.into_iter().filter(|(_, bounds)| {
+            let touches = match side {
+                Side::West => bounds.max.x == from.min.x,
+                Side::East => bounds.min.x == from.max.x,
+            };
+            touches && bounds.min.y < from.max.y && from.min.y < bounds.max.y
+        }),
+    )
+}
+
+#[derive(bevy::ecs::message::Message)]
+struct DisplayFocusRequest(u32);
+
 fn visible_floating_entities(
     windows: &Windows,
     window_manager: &WindowManager,
@@ -402,7 +424,7 @@ fn active_focus_candidate(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn command_move_focus(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -411,24 +433,25 @@ fn command_move_focus(
     window_manager: Res<WindowManager>,
     focus_history: Res<FocusHistory>,
     mut paging: PagingFocusParams,
+    mut display_requests: MessageWriter<DisplayFocusRequest>,
     mut commands: Commands,
 ) {
-    let Some((direction, is_page)) =
-        filter_window_operations(&mut messages, |op| matches!(op, Operation::Focus(_)))
-            .find_map(|op| match op {
-                Operation::Focus(direction) => Some((direction.clone(), false)),
-                _ => None,
-            })
-            .or_else(|| {
-                let generation = paging.page_state.generation;
-                let dispatched =
-                    matches!(paging.page_state.in_flight, Some(PageInFlight::Dispatched));
-                paging.page_requests.read().find_map(|req| {
-                    (dispatched && req.generation == generation)
-                        .then(|| (req.direction.clone(), true))
-                })
-            })
-    else {
+    let Some((direction, is_page, step)) = filter_window_operations(&mut messages, |op| {
+        matches!(op, Operation::Focus(_) | Operation::FocusStep(..))
+    })
+    .find_map(|op| match op {
+        Operation::Focus(direction) => Some((direction.clone(), false, None)),
+        Operation::FocusStep(side, reach) => Some((side.direction(), false, Some((*side, *reach)))),
+        _ => None,
+    })
+    .or_else(|| {
+        let generation = paging.page_state.generation;
+        let dispatched = matches!(paging.page_state.in_flight, Some(PageInFlight::Dispatched));
+        paging.page_requests.read().find_map(|req| {
+            (dispatched && req.generation == generation)
+                .then(|| (req.direction.clone(), true, None))
+        })
+    }) else {
         return;
     };
     let direction = &direction;
@@ -475,6 +498,21 @@ fn command_move_focus(
                 &mut commands,
             );
         }
+        return;
+    }
+
+    if let Some((side, Reach::Display)) = step
+        && active_strip.contains(focused_entity)
+        && edge_step(active_strip, Some(focused_entity), side) == EdgeStep::Display
+        && let Some(target) = touching_display(
+            side,
+            active_display.bounds(),
+            active_display
+                .other()
+                .map(|display| (display, display.bounds())),
+        )
+    {
+        display_requests.write(DisplayFocusRequest(target.id()));
         return;
     }
 
@@ -1612,8 +1650,20 @@ fn copy_window_rule(
     }
 }
 
+#[derive(Debug)]
+enum DisplayTarget {
+    Next,
+    Direction(Direction),
+    Touching(Side),
+}
+
+struct DisplayMove {
+    focus: MoveFocus,
+    target: DisplayTarget,
+}
+
 /// Whether `operation` moves the focused window `entity` to a display, with
-/// the focus rule and the direction of that display, `None` for the next one.
+/// the focus rule and destination policy.
 /// An edge move away from its strip's end takes the column to that end
 /// instead, and returns `None`, as for anything else that crosses no display.
 fn display_move(
@@ -1622,10 +1672,26 @@ fn display_move(
     moves: &mut DisplayMoves,
     held: &mut HeldEdge,
     commands: &mut Commands,
-) -> Option<(MoveFocus, Option<Direction>)> {
-    match operation {
-        Operation::ToNextDisplay(move_focus) => Some((move_focus, None)),
-        Operation::MoveToDisplay(direction) => Some((MoveFocus::Follow, Some(direction))),
+) -> Option<DisplayMove> {
+    let (focus, target) = match operation {
+        Operation::ToNextDisplay(move_focus) => (move_focus, DisplayTarget::Next),
+        Operation::MoveToDisplay(direction) => {
+            (MoveFocus::Follow, DisplayTarget::Direction(direction))
+        }
+        Operation::MoveStep(side, reach) => {
+            let (_, mut strip, _, _, _) = moves
+                .strips
+                .iter_mut()
+                .find(|(_, strip, _, _, _)| strip.contains(entity))?;
+            if swap_in_strip(&mut strip, entity, &side.direction()).is_some() {
+                commands.ensure_visible(entity);
+                return None;
+            }
+            if reach == Reach::Strip {
+                return None;
+            }
+            (MoveFocus::Follow, DisplayTarget::Touching(side))
+        }
         Operation::MoveEdge(side, reach) => {
             let (_, mut strip, _, _, _) = moves
                 .strips
@@ -1641,10 +1707,17 @@ fn display_move(
                 }
                 return None;
             }
-            (reach == Reach::Display).then_some((MoveFocus::Follow, Some(side.direction())))
+            if reach == Reach::Strip {
+                return None;
+            }
+            (
+                MoveFocus::Follow,
+                DisplayTarget::Direction(side.direction()),
+            )
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(DisplayMove { focus, target })
 }
 
 /// The gap a column arriving in `strip`, shown on display `bounds`, takes:
@@ -1667,8 +1740,8 @@ fn arrival_index(
 /// Moves the focused window's whole column to another display: the next one,
 /// or the one in a compass direction. An edge move first takes the column to
 /// its strip's end on that side, and crosses only from there. The column
-/// lands right after the destination's active column, the window
-/// `focus_display` would focus there.
+/// lands at the crossed edge for a plain keyboard step, otherwise right after
+/// the destination's active column, the window `focus_display` would focus there.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn to_next_display(
     mut messages: MessageReader<Event>,
@@ -1684,7 +1757,10 @@ fn to_next_display(
     let Some(operation) = filter_window_operations(&mut messages, |op| {
         matches!(
             op,
-            Operation::ToNextDisplay(_) | Operation::MoveToDisplay(_) | Operation::MoveEdge(..)
+            Operation::ToNextDisplay(_)
+                | Operation::MoveToDisplay(_)
+                | Operation::MoveEdge(..)
+                | Operation::MoveStep(..)
         )
     })
     .next()
@@ -1702,8 +1778,7 @@ fn to_next_display(
         return;
     }
 
-    let Some((move_focus, direction)) =
-        display_move(operation, entity, &mut moves, &mut held, &mut commands)
+    let Some(request) = display_move(operation, entity, &mut moves, &mut held, &mut commands)
     else {
         return;
     };
@@ -1711,10 +1786,18 @@ fn to_next_display(
     let Some(source_bounds) = moves.active_display().map(Display::bounds) else {
         return;
     };
-    let target = match &direction {
-        None => moves.other_displays().next(),
-        Some(direction) => display_in_direction(
+    let move_focus = request.focus;
+    let target = match &request.target {
+        DisplayTarget::Next => moves.other_displays().next(),
+        DisplayTarget::Direction(direction) => display_in_direction(
             direction,
+            source_bounds,
+            moves
+                .other_displays()
+                .map(|display| (display, display.bounds())),
+        ),
+        DisplayTarget::Touching(side) => touching_display(
+            *side,
             source_bounds,
             moves
                 .other_displays()
@@ -1723,7 +1806,7 @@ fn to_next_display(
     };
     let Some((target_id, target_bounds)) = target.map(|display| (display.id(), display.bounds()))
     else {
-        debug!("no display to move window to ({direction:?}).");
+        debug!("no display to move window to ({:?}).", request.target);
         return;
     };
     let Some(size) = windows.size(entity) else {
@@ -1747,10 +1830,12 @@ fn to_next_display(
         );
         return;
     }
-    let index = shown.and_then(|strip| {
-        arrival_index(strip, target_bounds, &focus_history, |entity| {
+    let index = shown.and_then(|strip| match request.target {
+        DisplayTarget::Touching(Side::East) => Some(0),
+        DisplayTarget::Touching(Side::West) => Some(strip.len()),
+        _ => arrival_index(strip, target_bounds, &focus_history, |entity| {
             windows.frame(entity)
-        })
+        }),
     });
     let window_id = window.id();
     let Some(arrival) = moves.move_column_to_display(
@@ -1806,6 +1891,7 @@ fn to_next_display(
 #[allow(clippy::too_many_arguments)]
 fn focus_display(
     mut messages: MessageReader<Event>,
+    mut requests: MessageReader<DisplayFocusRequest>,
     windows: Windows,
     active_display: ActiveDisplay,
     layout_strips: Query<&LayoutStrip, With<SelectedVirtualMarker>>,
@@ -1817,51 +1903,56 @@ fn focus_display(
     clock: Res<Time<Real>>,
     mut commands: Commands,
 ) {
-    let Some(operation) = filter_window_operations(&mut messages, |op| {
-        matches!(op, Operation::FocusDisplay(_) | Operation::FocusEdge(..))
-    })
-    .next()
-    .cloned() else {
-        return;
-    };
-    let direction = match operation {
-        Operation::FocusDisplay(direction) => direction,
-        Operation::FocusEdge(side, reach) => {
-            let strip = active_display.active_strip();
-            let focused = windows.focused().map(|(_, entity)| entity);
-            let step = edge_step(strip, focused, side);
-            if !held.allows(reach, step) {
-                return;
-            }
-            if let EdgeStep::Column(index) = step {
-                // A newer focus replaces the request the check waits on.
-                desktop_check.0 = None;
-                if let Some(entity) = strip
-                    .get(index)
-                    .ok()
-                    .and_then(|column| focus_history.last_focused_in(&column))
-                {
-                    focus_with_verification(entity, focused, None, &mut commands);
-                    commands.reshuffle_around(entity);
+    let requested = requests.read().next().map(|request| request.0);
+    let target = if let Some(id) = requested {
+        active_display.other().find(|display| display.id() == id)
+    } else {
+        let Some(operation) = filter_window_operations(&mut messages, |op| {
+            matches!(op, Operation::FocusDisplay(_) | Operation::FocusEdge(..))
+        })
+        .next()
+        .cloned() else {
+            return;
+        };
+        let direction = match operation {
+            Operation::FocusDisplay(direction) => direction,
+            Operation::FocusEdge(side, reach) => {
+                let strip = active_display.active_strip();
+                let focused = windows.focused().map(|(_, entity)| entity);
+                let step = edge_step(strip, focused, side);
+                if !held.allows(reach, step) {
+                    return;
                 }
-                return;
+                if let EdgeStep::Column(index) = step {
+                    // A newer focus replaces the request the check waits on.
+                    desktop_check.0 = None;
+                    if let Some(entity) = strip
+                        .get(index)
+                        .ok()
+                        .and_then(|column| focus_history.last_focused_in(&column))
+                    {
+                        focus_with_verification(entity, focused, None, &mut commands);
+                        commands.reshuffle_around(entity);
+                    }
+                    return;
+                }
+                if reach == Reach::Strip {
+                    return;
+                }
+                side.direction()
             }
-            if reach == Reach::Strip {
-                return;
-            }
-            side.direction()
-        }
-        _ => return,
-    };
+            _ => return,
+        };
 
-    let Some(target) = display_in_direction(
-        &direction,
-        active_display.bounds(),
-        active_display
-            .other()
-            .map(|display| (display, display.bounds())),
-    ) else {
-        debug!("no display {direction:?} of the active one.");
+        display_in_direction(
+            &direction,
+            active_display.bounds(),
+            active_display
+                .other()
+                .map(|display| (display, display.bounds())),
+        )
+    };
+    let Some(target) = target else {
         return;
     };
     let target_bounds = target.bounds();

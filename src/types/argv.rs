@@ -175,6 +175,7 @@ fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
 impl Command {
     /// The argv encoding of this command, as understood by [`parse_command`].
     ///
+    /// Keyboard stepping intent and repeat scope are omitted from this encoding.
     /// [`Command::Lua`] and [`Command::Layout`] have no encoding — they are
     /// only ever issued in-process — and yield `None`.
     #[must_use]
@@ -207,6 +208,8 @@ impl Operation {
         match self {
             Operation::Focus(direction) => vec!["focus".to_string(), direction.token()],
             Operation::Swap(direction) => vec!["swap".to_string(), direction.token()],
+            Operation::FocusStep(side, _) => owned(&["focus", side.token()]),
+            Operation::MoveStep(side, _) => owned(&["swap", side.token()]),
             Operation::Center => owned(&["center"]),
             Operation::Resize(direction) => owned(&["resize", direction.token()]),
             Operation::ResizeVertical(direction) => {
