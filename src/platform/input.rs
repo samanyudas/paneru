@@ -549,7 +549,7 @@ impl InputHandler {
         }
 
         let flags = CGEvent::flags(Some(event));
-        let modifiers = get_scroll_modifiers(flags);
+        let modifiers = get_binding_modifiers(flags);
 
         let target_modifier = self.config.swipe_scroll_modifier();
         let vertical_mod = self.config.swipe_scroll_vertical_modifier();
@@ -735,7 +735,7 @@ impl InputHandler {
             return false;
         };
 
-        let mask = binding_modifiers(eventflags);
+        let mask = get_binding_modifiers(eventflags);
 
         // On a native fullscreen space, keybindings are still intercepted so
         // that paneru can actively switch back to the previous workspace.
@@ -782,16 +782,9 @@ fn should_reset_swipe_anchors(actual_fingers: usize, anchored_fingers: usize) ->
     actual_fingers != 0 && actual_fingers != anchored_fingers
 }
 
-// The mask a key binding is matched against.
-// Today this is only the left and right device bits. A later change has to
-// teach it about group flags before the tests below can pass.
-fn binding_modifiers(eventflags: CGEventFlags) -> Modifiers {
-    get_modifiers(eventflags)
-}
-
-// Remote mouse tools can send group flags without left or right flags.
+// Automation and remote input can send group flags without left or right flags.
 // Use the group only when the event does not specify a side.
-fn get_scroll_modifiers(eventflags: CGEventFlags) -> Modifiers {
+fn get_binding_modifiers(eventflags: CGEventFlags) -> Modifiers {
     const GROUP_FLAGS: [(Modifiers, u64); 4] = [
         (Modifiers::ALT, CGEventFlags::MaskAlternate.0),
         (Modifiers::SHIFT, CGEventFlags::MaskShift.0),
@@ -1244,13 +1237,12 @@ mod tests {
     }
 
     // kCGEventFlagMaskControl and kCGEventFlagMaskAlternate, with no device bit.
-    // AppleScript `key code ... using {control down, option down}` posts these.
     const GENERIC_CONTROL: u64 = 0x0004_0000;
     const GENERIC_OPTION: u64 = 0x0008_0000;
 
     #[test]
     fn generic_control_option_flags_match_a_control_option_shortcut() {
-        let event = binding_modifiers(CGEventFlags(GENERIC_CONTROL | GENERIC_OPTION));
+        let event = get_binding_modifiers(CGEventFlags(GENERIC_CONTROL | GENERIC_OPTION));
         let shortcut = Modifiers::CTRL | Modifiers::ALT;
         assert!(
             shortcut.matches(event),
@@ -1260,11 +1252,11 @@ mod tests {
 
     #[test]
     fn device_bits_still_tell_modifier_sides_apart() {
-        let left = binding_modifiers(CGEventFlags(GENERIC_CONTROL | NX_DEVICELCTLKEYMASK));
+        let left = get_binding_modifiers(CGEventFlags(GENERIC_CONTROL | NX_DEVICELCTLKEYMASK));
         assert!(Modifiers::LCTRL.matches(left), "{left:?}");
         assert!(!Modifiers::RCTRL.matches(left), "{left:?}");
 
-        let right = binding_modifiers(CGEventFlags(GENERIC_CONTROL | NX_DEVICERCTLKEYMASK));
+        let right = get_binding_modifiers(CGEventFlags(GENERIC_CONTROL | NX_DEVICERCTLKEYMASK));
         assert!(Modifiers::RCTRL.matches(right), "{right:?}");
         assert!(!Modifiers::LCTRL.matches(right), "{right:?}");
     }
@@ -1272,7 +1264,7 @@ mod tests {
     #[test]
     fn shared_mouse_alt_scroll_matches_generic_binding() {
         // Deskflow uses the group flag for scroll events from Windows Alt.
-        let modifiers = get_scroll_modifiers(CGEventFlags(0x2008_0000));
+        let modifiers = get_binding_modifiers(CGEventFlags(0x2008_0000));
         assert!(Modifiers::ALT.matches(modifiers));
         // The event does not identify a side. Do not select one.
         assert!(!Modifiers::LALT.matches(modifiers));
@@ -1281,14 +1273,14 @@ mod tests {
 
     #[test]
     fn shared_mouse_extra_modifier_does_not_trigger_alt_scroll() {
-        let modifiers = get_scroll_modifiers(CGEventFlags(0x200c_0000));
+        let modifiers = get_binding_modifiers(CGEventFlags(0x200c_0000));
         assert!(!Modifiers::ALT.matches(modifiers));
         assert!((Modifiers::ALT | Modifiers::CTRL).matches(modifiers));
     }
 
     #[test]
     fn physical_scroll_keeps_the_reported_modifier_side() {
-        let modifiers = get_scroll_modifiers(CGEventFlags(0x0008_0000 | NX_DEVICERALTKEYMASK));
+        let modifiers = get_binding_modifiers(CGEventFlags(0x0008_0000 | NX_DEVICERALTKEYMASK));
         assert!(Modifiers::ALT.matches(modifiers));
         assert!(Modifiers::RALT.matches(modifiers));
         assert!(!Modifiers::LALT.matches(modifiers));
@@ -1296,7 +1288,7 @@ mod tests {
 
     #[test]
     fn ordinary_scroll_does_not_trigger_alt_scroll() {
-        assert!(!Modifiers::ALT.matches(get_scroll_modifiers(CGEventFlags(0x2000_0000))));
+        assert!(!Modifiers::ALT.matches(get_binding_modifiers(CGEventFlags(0x2000_0000))));
     }
 
     #[test]
@@ -1306,7 +1298,7 @@ mod tests {
             (Modifiers::CTRL, 0x0004_0000),
             (Modifiers::CMD, 0x0010_0000),
         ] {
-            assert!(group.matches(get_scroll_modifiers(CGEventFlags(flag))));
+            assert!(group.matches(get_binding_modifiers(CGEventFlags(flag))));
         }
     }
 
