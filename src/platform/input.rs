@@ -1052,6 +1052,95 @@ mod tests {
         assert!((delta + 0.006).abs() < 1e-12);
     }
 
+    fn horizontal_key(verb: &str, side: crate::commands::Side, repeat: bool) -> Event {
+        let chord = if verb == "swap" {
+            "ctrl+alt+shift"
+        } else {
+            "ctrl+alt"
+        };
+        let config = Config::try_from(
+            format!(
+                "[options]\n[bindings]\nwindow_{verb}_{} = '{chord}-rightarrow'\n",
+                side.token()
+            )
+            .as_str(),
+        )
+        .expect("valid keyboard config");
+        let (sender, receiver) = EventSender::new();
+        let handler = InputHandler::new(sender, config);
+        let flags = if verb == "swap" { 0xae0023 } else { 0xac0021 };
+        assert!(handler.handle_keypress(124, CGEventFlags(flags), repeat));
+        receiver.try_recv().expect("keyboard command")
+    }
+
+    #[test]
+    fn plain_focus_key_crosses_a_touching_display_at_the_strip_end() {
+        use crate::commands::Side;
+        use crate::tests::*;
+        use bevy::math::{IRect, IVec2};
+        for side in [Side::West, Side::East] {
+            let x = if side == Side::West {
+                -EXT_DISPLAY_WIDTH
+            } else {
+                TEST_DISPLAY_WIDTH
+            };
+            let bounds = IRect::from_corners(
+                IVec2::new(x, 0),
+                IVec2::new(x + EXT_DISPLAY_WIDTH, EXT_DISPLAY_HEIGHT),
+            );
+            let mut harness = TestHarness::new()
+                .with_windows(1)
+                .with_display(EXT_DISPLAY_ID, bounds, vec![EXT_WORKSPACE_ID])
+                .with_window(100, |window| {
+                    window.workspace_id = EXT_WORKSPACE_ID;
+                    window.frame = bounds;
+                });
+            harness.run(vec![
+                Event::MenuOpened { window_id: 0 },
+                horizontal_key("focus", side, false),
+            ]);
+            crate::assert_focused!(harness.world(), 100);
+        }
+    }
+
+    #[test]
+    fn plain_move_key_crosses_a_touching_display_at_the_strip_end() {
+        use crate::commands::Side;
+        use crate::ecs::layout::LayoutStrip;
+        use crate::tests::*;
+        use bevy::math::{IRect, IVec2};
+        for side in [Side::West, Side::East] {
+            let x = if side == Side::West {
+                -EXT_DISPLAY_WIDTH
+            } else {
+                TEST_DISPLAY_WIDTH
+            };
+            let bounds = IRect::from_corners(
+                IVec2::new(x, 0),
+                IVec2::new(x + EXT_DISPLAY_WIDTH, EXT_DISPLAY_HEIGHT),
+            );
+            let mut harness = TestHarness::new().with_windows(1).with_display(
+                EXT_DISPLAY_ID,
+                bounds,
+                vec![EXT_WORKSPACE_ID],
+            );
+            harness.run(vec![
+                Event::MenuOpened { window_id: 0 },
+                horizontal_key("swap", side, false),
+            ]);
+            let world = harness.world();
+            let entity = find_window_entity(0, world);
+            assert!(
+                world
+                    .query::<&LayoutStrip>()
+                    .iter(world)
+                    .any(|strip| strip.id() == EXT_WORKSPACE_ID && strip.contains(entity)),
+                "plain move crosses {side:?}"
+            );
+            crate::assert_focused!(world, 0);
+        }
+    }
+
     fn step_config(extra: &str) -> Config {
         Config::try_from(format!(
             "[options]\n[bindings]\n[swipe.scroll]\nmodifier = 'alt'\nwindow_step = true\n{extra}"
