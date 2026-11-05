@@ -282,11 +282,12 @@ impl NativeMembership {
         }
     }
 
-    /// Forgets each scattered column whose windows are one column again
-    /// without a native read, as a display pass puts them back, so a person
-    /// can split them again.
-    pub(crate) fn forget_rejoined(world: &mut World) {
+    /// After a display pass placed windows: forgets each scattered column
+    /// whose windows that pass put back in one column, so a person can split
+    /// them again, and reads every Space as a topology read.
+    pub(crate) fn display_pass(world: &mut World) {
         world.resource_scope(|world, mut native: Mut<NativeMembership>| {
+            native.request(NativeScope::DisplayTopology);
             native.scattered.retain(|scattered| {
                 let Some(column) = scattered
                     .column
