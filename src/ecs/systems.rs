@@ -716,34 +716,47 @@ const MAX_ANIMATION_STEP_SECS: f64 = 1.0 / 30.0;
 
 /// The animation time of this pass, in seconds, which every ease steps by.
 ///
-/// A pass that follows one with nothing in motion can come after an idle
-/// sleep of up to 500ms (2s in low power mode), and `Time::delta_secs_f64()`
-/// reports that whole sleep. None of it is animation time: counted, it made
-/// the first step of every keyboard slide cover 37% of the move at speed 14
-/// where each later frame covers 20%. Such a pass counts at most one active
-/// frame instead, so a slide's first step is the same share as any other.
+/// With nothing in motion the pump sleeps up to 500ms (2s in low power mode)
+/// until an event, such as a key press, wakes it. `Time` is sampled before
+/// the pump, so that sleep shows up in the delta of the next two passes: the
+/// sleep of the pass before the key in the key's pass, and the sleep the key
+/// cut short in the pass after. None of it is animation time. Counted, capped
+/// at a 30fps tick, it made each of a keyboard slide's first two steps cover
+/// 37% of what was left at speed 14, where a 16 ms frame covers 20%.
 #[derive(Clone, Copy, Debug, Default, Resource)]
-pub(crate) struct AnimationStep(f64);
+pub(crate) struct AnimationStep {
+    secs: f64,
+    /// How long the last pump slept with nothing in motion.
+    idle_sleep: f64,
+}
 
 impl AnimationStep {
     pub(crate) fn secs(self) -> f64 {
-        self.0
+        self.secs
+    }
+}
+
+/// How much of a pass's `delta` an ease steps by. A pass that starts with
+/// nothing in motion counts at most one active frame, so a slide's first
+/// step is one frame's share. Once motion runs, the idle sleep that the
+/// starting pass's pump took is left out, and a late pass counts its whole
+/// time up to a 30fps tick, so the slide keeps its pace.
+fn animation_step(delta: f64, idle_sleep: f64, moving: bool) -> f64 {
+    if moving {
+        (delta - idle_sleep).clamp(0.0, MAX_ANIMATION_STEP_SECS)
+    } else {
+        delta.min(f64::from(LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS) / 1000.0)
     }
 }
 
 /// Sets [`AnimationStep`] before the pump, while [`FrameActivity`] still
-/// describes how the previous pass ended, and so how long the engine slept.
+/// describes how the previous pass ended.
 pub(crate) fn step_animation_clock(
     activity: FrameActivity,
     time: Res<Time>,
     mut step: ResMut<AnimationStep>,
 ) {
-    let limit = if activity.mid_frame() {
-        MAX_ANIMATION_STEP_SECS
-    } else {
-        f64::from(LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS) / 1000.0
-    };
-    step.0 = time.delta_secs_f64().min(limit);
+    step.secs = animation_step(time.delta_secs_f64(), step.idle_sleep, activity.mid_frame());
 }
 
 /// Fraction of the remaining distance an exponential ease-out consumes in a
@@ -890,6 +903,7 @@ pub(crate) fn pump_events(
     incoming_events: Option<NonSend<Receiver<Event>>>,
     platform: Option<NonSendMut<Pin<Box<PlatformCallbacks>>>>,
     activity: FrameActivity,
+    mut step: ResMut<AnimationStep>,
     mut timeout: Local<u32>,
     mut last_tap_check: Local<Option<Instant>>,
 ) {
@@ -902,7 +916,14 @@ pub(crate) fn pump_events(
     // floor under how soon a pump could start, so an event landing right after
     // one returned had to wait out the rest of it. That latency is worse than
     // the redundant work skipping the wait costs.
+    let moving = activity.mid_frame();
+    let slept_from = Instant::now();
     platform.pump_cocoa_event_loop(f64::from(*timeout) / 1000.0);
+    step.idle_sleep = if moving {
+        0.0
+    } else {
+        slept_from.elapsed().as_secs_f64()
+    };
 
     let deadline = Instant::now() + PUMP_BUDGET;
     let mut received_events = Vec::new();
@@ -2413,6 +2434,34 @@ mod startup_tests {
         app.update();
 
         assert_eq!(app.should_exit(), Some(AppExit::Success));
+    }
+}
+
+#[cfg(test)]
+mod animation_step_tests {
+    use super::animation_step;
+
+    fn assert_secs(got: f64, want: f64) {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "stepped {got} s, expected {want} s"
+        );
+    }
+
+    #[test]
+    fn the_pass_that_starts_a_move_counts_one_frame_of_its_idle_sleep() {
+        assert_secs(animation_step(0.5, 0.48, false), 0.016);
+    }
+
+    #[test]
+    fn the_pass_after_a_key_cut_a_200_ms_sleep_short_counts_only_its_own_5_ms() {
+        assert_secs(animation_step(0.205, 0.2, true), 0.005);
+    }
+
+    #[test]
+    fn a_pass_mid_slide_counts_its_whole_time_up_to_a_30fps_tick() {
+        assert_secs(animation_step(0.025, 0.0, true), 0.025);
+        assert_secs(animation_step(0.5, 0.0, true), 1.0 / 30.0);
     }
 }
 

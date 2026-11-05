@@ -518,6 +518,7 @@ type Sliding<'w, 's> = Query<
 /// after [`LANDING_TIMEOUT`] if it does not. Until then the window holds
 /// under the photo, and then it moves on to where layout puts it. A window
 /// whose photo does not show moves at once.
+#[allow(clippy::too_many_arguments)]
 fn slide_photos(
     mut sliding: Sliding,
     displays: Query<&Display>,
