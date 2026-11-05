@@ -719,15 +719,16 @@ pub struct VerifyFocus {
 #[derive(Component)]
 pub struct AwaitingHandle(pub Timer);
 
-/// Reads a newly tiled window's level again each frame until the timer ends.
+/// Reads a new window's level again each frame until the timer ends.
 /// Chrome shows its Picture-in-Picture window at the normal level and raises
-/// it a few tens of milliseconds later, after the engine has tiled it.
+/// it a few tens of milliseconds later.
 #[derive(Component)]
 pub struct AboveOrdinaryCheck {
     pub timer: Timer,
-    /// The frame the window opened with, before the engine tiled it. When it
-    /// is empty, the engine has not tiled the window yet.
-    pub opened: bevy::math::IRect,
+    /// The frame the window opened with, when the engine tiled it without
+    /// waiting for the check. `None` while the window waits for the check to
+    /// tile.
+    pub tiled_from: Option<bevy::math::IRect>,
 }
 
 #[derive(Component)]

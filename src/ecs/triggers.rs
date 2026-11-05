@@ -1479,7 +1479,7 @@ const ABOVE_ORDINARY_CHECK: Duration = Duration::from_secs(1);
 /// windows, as [`apply_window_positions`] would have if the raise had come
 /// first: the window gets back the frame it opened with and takes focus once.
 /// A rule that decides whether the window floats still wins. A window that
-/// opened without a size tiles only when its check ends without it floating.
+/// waits for its check tiles only when the check ends without it floating.
 pub(super) fn recheck_window_level(
     mut checks: Query<(Entity, &mut AboveOrdinaryCheck)>,
     windows: Windows,
@@ -1510,10 +1510,8 @@ pub(super) fn recheck_window_level(
             .map(|app| WindowProperties::new(app, window, &config));
         let Some(properties) = properties.filter(|properties| raised && properties.floating())
         else {
-            // A window that opened without a size waited for this check to
-            // tile.
             if !floated
-                && check.opened.is_empty()
+                && check.tiled_from.is_none()
                 && let Some(mut strip) = workspaces
                     .iter_mut()
                     .find_map(|(strip, active)| active.then_some(strip))
@@ -1528,11 +1526,12 @@ pub(super) fn recheck_window_level(
             window.id()
         );
         entity_commands.try_insert(Unmanaged::Floating);
-        // A window that opened without a size was never tiled, so the frame
-        // its app gave it stands.
-        if !check.opened.is_empty() {
-            commands.reposition_entity(entity, check.opened.min);
-            commands.resize_entity(entity, check.opened.size());
+        // A window that waited was never tiled, so the frame its app gave it
+        // stands. Any write makes Chrome's own resize of its
+        // Picture-in-Picture window fall behind the pointer.
+        if let Some(opened) = check.tiled_from {
+            commands.reposition_entity(entity, opened.min);
+            commands.resize_entity(entity, opened.size());
         }
         if !properties.dont_focus() {
             commands.focus_entity(entity, true);
@@ -1542,18 +1541,25 @@ pub(super) fn recheck_window_level(
 
 /// Starts reading a new window's level again, because the read on arrival
 /// can come too early for an app that raises the window just after it shows
-/// it. Returns whether the window waits for the check to tile: a window
+/// it. Returns whether the window waits for the check to tile. A window
 /// without a size yet may get its size and its level in one step, and tiling
-/// it now would write over that size.
-fn start_level_check(entity: Entity, opened: Option<IRect>, commands: &mut Commands) -> bool {
+/// it now would write over that size. A window without a full-screen button
+/// may be a Picture-in-Picture window, and tiling it would move it.
+fn start_level_check(
+    entity: Entity,
+    window: &Window,
+    opened: Option<IRect>,
+    commands: &mut Commands,
+) -> bool {
     let (Some(opened), Ok(mut entity_commands)) = (opened, commands.get_entity(entity)) else {
         return false;
     };
+    let waits = opened.is_empty() || !window.has_full_screen_button();
     entity_commands.try_insert(AboveOrdinaryCheck {
         timer: Timer::new(ABOVE_ORDINARY_CHECK, TimerMode::Once),
-        opened,
+        tiled_from: (!waits).then_some(opened),
     });
-    opened.is_empty()
+    waits
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1618,7 +1624,7 @@ pub(super) fn apply_window_positions(
         if initializing.is_none()
             && !properties.above_ordinary()
             && !window.is_minimized()
-            && start_level_check(entity, ctx.windows.frame(entity), &mut ctx.commands)
+            && start_level_check(entity, window, ctx.windows.frame(entity), &mut ctx.commands)
         {
             continue;
         }

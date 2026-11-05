@@ -1130,7 +1130,11 @@ pub(crate) fn window_frame_update(
                 // current `Position`, so overwriting it with the echoed frame
                 // mid-animation restarts each step from behind, and the two
                 // chase each other.
-                moved && !repositioning
+                // A left-corner resize of a floating window moves its origin,
+                // and its app can report only the resize. The new `Bounds`
+                // writes the frame back, so a stale `Position` would undo
+                // the move.
+                (moved || !tiled) && !repositioning
             }
             NativeFrame::Moved => moved && !repositioning,
         };
