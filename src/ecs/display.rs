@@ -358,6 +358,12 @@ impl DisplayReconcileState {
         self.pending.is_some() && self.verify_again
     }
 
+    /// Whether a display change is still in progress: its burst began, and
+    /// its last pass has not run yet.
+    pub(crate) fn is_reconciling(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// Whether `a` and `b` are two displays that were present when the
     /// latest burst began.
     pub(crate) fn both_kept(&self, a: Entity, b: Entity) -> bool {

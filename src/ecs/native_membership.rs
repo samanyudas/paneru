@@ -207,9 +207,10 @@ pub(crate) struct NativeMembership {
 }
 
 /// A column whose windows macOS is moving to another Space: the columns of a
-/// destroyed Space, and a column a topology read moved only part of. macOS
-/// can list the windows in their new Space over several reads, so each read
-/// joins the ones that landed in one strip back into one column.
+/// destroyed Space, and a column a read moved only part of while a display
+/// change is in progress. macOS can list the windows in their new Space over
+/// several reads, so each read joins the ones that landed in one strip back
+/// into one column.
 struct ScatteredColumn {
     column: DetachedColumn,
     until: Duration,
@@ -807,7 +808,14 @@ fn apply_native_move(
     topology: bool,
 ) {
     let admitted: EntityHashSet = groups.iter().flatten().copied().collect();
-    if topology {
+    // When a display returns, macOS can file a stack's windows back in the
+    // Space they left, then list them in the new Space one ordinary read at
+    // a time.
+    let reconciling = topology
+        || world
+            .get_resource::<super::display::DisplayReconcileState>()
+            .is_some_and(super::display::DisplayReconcileState::is_reconciling);
+    if reconciling {
         let split = split_columns(world, space, &admitted);
         let now = world.resource::<Time>().elapsed();
         native.scatter(split, now);
@@ -902,10 +910,7 @@ fn rejoin_scattered(world: &mut World, scattered: &mut Vec<ScatteredColumn>, spa
         if let (Some(gap), Some(column)) = (gap, column)
             && !strip.column_is(gap, &column)
         {
-            debug!(
-                ?present,
-                space, "Rejoining a column macOS moved over several reads"
-            );
+            debug!(?present, space, "Rejoining a column macOS moved apart");
             for window in &present {
                 strip.remove(*window);
             }
