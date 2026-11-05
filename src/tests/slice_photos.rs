@@ -1920,9 +1920,14 @@ fn a_press_while_a_revealed_photo_waits_never_shows_its_window_beside_it() {
         .world()
         .write_message(command(Operation::Focus(Direction::Nth(1))));
     queued_frame(&mut harness, false);
+    // Seen while the app is still held, so a handover in the first frame
+    // after the release counts too, however late that frame runs.
+    let mut seen = vec![Seen {
+        window: harness.mock_state.ax_frame(3),
+        photo: photo_of_three(&log),
+    }];
     harness.mock_state.set_write_delay(TEST_PROCESS_ID, WRITE);
     harness.mock_state.release_writes(TEST_PROCESS_ID);
-    let mut seen = Vec::new();
     for _ in 0..50 {
         // Real time keeps pace with engine time, so the app answers before
         // the landing times out.
