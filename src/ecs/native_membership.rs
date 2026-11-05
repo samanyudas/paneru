@@ -282,6 +282,29 @@ impl NativeMembership {
         }
     }
 
+    /// Forgets each scattered column whose windows are one column again
+    /// without a native read, as a display pass puts them back, so a person
+    /// can split them again.
+    pub(crate) fn forget_rejoined(world: &mut World) {
+        world.resource_scope(|world, mut native: Mut<NativeMembership>| {
+            native.scattered.retain(|scattered| {
+                let Some(column) = scattered
+                    .column
+                    .clone()
+                    .retain(|window| world.get::<Window>(window).is_some())
+                else {
+                    return false;
+                };
+                let first = column.windows()[0];
+                !world.query::<&LayoutStrip>().iter(world).any(|strip| {
+                    strip
+                        .index_of(first)
+                        .is_ok_and(|index| strip.column_is(index, &column))
+                })
+            });
+        });
+    }
+
     pub(crate) fn needs_frame(&self, now: Duration) -> bool {
         !self.placing.is_empty()
             || self.all_spaces

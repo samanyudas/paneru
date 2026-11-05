@@ -598,6 +598,7 @@ pub(crate) fn reconcile_displays(
     let pass = state.pass();
     commands.queue(move |world: &mut World| {
         DisplayHomes::settle(world, pass);
+        super::native_membership::NativeMembership::forget_rejoined(world);
         world
             .resource_mut::<super::native_membership::NativeMembership>()
             .request(super::native_membership::NativeScope::DisplayTopology);
