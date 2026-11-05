@@ -900,12 +900,11 @@ fn refile(harness: &mut TestHarness, ids: &[WinID], space: WorkspaceId, to: IRec
 /// As seen with a real lid on 5 November 2026: the engine sends the
 /// built-in display's windows home when the lid opens, macOS files them back
 /// in the external display's Space, then lists the stack's windows in the
-/// built-in display's new Space one read at a time.
-#[test]
-fn a_stack_macos_returns_one_window_at_a_time_when_the_lid_opens_stays_one_stack() {
-    let mut harness = two_displays();
-    close_lid_listing(&mut harness, &[&[10, 11, 12]], false);
-    assert_lid_closed_layout(&mut harness);
+/// built-in display's new Space one read at a time. This lists 10 and 11, and
+/// leaves 12 in the external display's Space.
+fn open_lid_returning_one_stack_window(harness: &mut TestHarness) {
+    close_lid_listing(harness, &[&[10, 11, 12]], false);
+    assert_lid_closed_layout(harness);
     harness.world().write_message(Event::DisplayConfigured {
         display_id: BUILTIN,
     });
@@ -926,8 +925,14 @@ fn a_stack_macos_returns_one_window_at_a_time_when_the_lid_opens_stays_one_stack
         "the engine sends the windows home"
     );
 
-    refile(&mut harness, &[10, 11, 12], EXT_SPACE, ext_bounds());
-    refile(&mut harness, &[10, 11], NEW_BUILTIN_SPACE, builtin_bounds());
+    refile(harness, &[10, 11, 12], EXT_SPACE, ext_bounds());
+    refile(harness, &[10, 11], NEW_BUILTIN_SPACE, builtin_bounds());
+}
+
+#[test]
+fn a_stack_macos_returns_one_window_at_a_time_when_the_lid_opens_stays_one_stack() {
+    let mut harness = two_displays();
+    open_lid_returning_one_stack_window(&mut harness);
     refile(&mut harness, &[12], NEW_BUILTIN_SPACE, builtin_bounds());
 
     assert_eq!(
@@ -940,5 +945,36 @@ fn a_stack_macos_returns_one_window_at_a_time_when_the_lid_opens_stays_one_stack
         &mut harness,
         &[vec![10], vec![11, 12]],
         &[vec![50], vec![51, 52], vec![53]],
+    );
+}
+
+#[test]
+fn a_stack_the_display_change_puts_back_stays_unstacked_after_a_person_unstacks_it() {
+    let mut harness = two_displays();
+    open_lid_returning_one_stack_window(&mut harness);
+    harness.advance(SETTLE);
+    assert_back_home(
+        &mut harness,
+        &[vec![10], vec![11, 12]],
+        &[vec![50], vec![51, 52], vec![53]],
+    );
+
+    let entity = find_window_entity(12, harness.world());
+    let world = harness.world();
+    let mut strips = world.query::<&mut LayoutStrip>();
+    strips
+        .iter_mut(world)
+        .find(|strip| strip.contains(entity))
+        .expect("a strip holding the window")
+        .unstack(entity, Side::East)
+        .expect("unstacking the window");
+    harness.advance(Duration::from_secs(1));
+    refile(&mut harness, &[53], NEW_BUILTIN_SPACE, builtin_bounds());
+    harness.advance(Duration::from_secs(1));
+
+    let (_, columns) = layout_on(harness.world(), NEW_BUILTIN_SPACE);
+    assert!(
+        columns.contains(&vec![11]) && columns.contains(&vec![12]),
+        "11 and 12 stay apart, got {columns:?}"
     );
 }
