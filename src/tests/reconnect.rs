@@ -879,3 +879,66 @@ fn a_window_macos_carries_with_its_display_stays_where_macos_put_it() {
     harness.advance(SETTLE);
     assert_eq!(every_strip(harness.world()), before);
 }
+
+/// macOS moves `ids` into `space` and onto the display at `to`, and the
+/// engine sees each window's new frame.
+fn refile(harness: &mut TestHarness, ids: &[WinID], space: WorkspaceId, to: IRect) {
+    for (i, &id) in (0..).zip(ids) {
+        let x = to.min.x + i * WIDTH;
+        let y = to.min.y + TEST_MENUBAR_HEIGHT;
+        harness.mock_state.update_window(id, |window| {
+            window.workspace_id = space;
+            window.frame = IRect::new(x, y, x + WIDTH, y + HEIGHT);
+        });
+        harness
+            .world()
+            .write_message(Event::WindowMoved { window_id: id });
+    }
+    harness.advance(Duration::from_millis(250));
+}
+
+/// As seen with a real lid on 5 November 2026: the engine sends the
+/// built-in display's windows home when the lid opens, macOS files them back
+/// in the external display's Space, then lists the stack's windows in the
+/// built-in display's new Space one read at a time.
+#[test]
+fn a_stack_macos_returns_one_window_at_a_time_when_the_lid_opens_stays_one_stack() {
+    let mut harness = two_displays();
+    close_lid_listing(&mut harness, &[&[10, 11, 12]], false);
+    assert_lid_closed_layout(&mut harness);
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: BUILTIN,
+    });
+    harness.advance(Duration::from_millis(20));
+    harness
+        .mock_state
+        .add_display(BUILTIN, builtin_bounds(), vec![NEW_BUILTIN_SPACE]);
+    harness.world().write_message(Event::SpaceCreated {
+        space_id: NEW_BUILTIN_SPACE,
+    });
+    harness.world().write_message(Event::DisplayAdded {
+        display_id: BUILTIN,
+    });
+    harness.advance(Duration::from_millis(400));
+    assert_eq!(
+        layout_on(harness.world(), NEW_BUILTIN_SPACE),
+        (BUILTIN, vec![vec![10], vec![11, 12]]),
+        "the engine sends the windows home"
+    );
+
+    refile(&mut harness, &[10, 11, 12], EXT_SPACE, ext_bounds());
+    refile(&mut harness, &[10, 11], NEW_BUILTIN_SPACE, builtin_bounds());
+    refile(&mut harness, &[12], NEW_BUILTIN_SPACE, builtin_bounds());
+
+    assert_eq!(
+        layout_on(harness.world(), NEW_BUILTIN_SPACE),
+        (BUILTIN, vec![vec![10], vec![11, 12]]),
+        "the stack is one column as soon as its windows are back"
+    );
+    harness.advance(SETTLE);
+    assert_back_home(
+        &mut harness,
+        &[vec![10], vec![11, 12]],
+        &[vec![50], vec![51, 52], vec![53]],
+    );
+}
