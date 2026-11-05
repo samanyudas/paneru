@@ -588,9 +588,10 @@ fn slide_photos(
 /// on its display, until its photo shows in its place. Then the window tucks
 /// under the photo, and once macOS has taken that, the photo slides on to
 /// the slice. A window whose photo does not show within [`PHOTO_WAIT`] of
-/// the frame after it was asked for tucks at once. A photo never slides further past the edge than its place
-/// in the row beside a nearer window that waits, so no wallpaper shows
-/// between them.
+/// the frame after it was asked for tucks at once. With the switch off, the
+/// window tucks once its next step would put most of it on another display.
+/// A photo never slides further past the edge than its place in the row
+/// beside a nearer window that waits, so no wallpaper shows between them.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn slide_photos_out(
     mut sliding: Sliding,
@@ -638,12 +639,14 @@ fn slide_photos_out(
                 // After its first step, a slice with no photo on its way does
                 // not show, so it never gets one.
                 let on_its_way = photo.is_some_and(|photo| !matches!(photo, SlicePhoto::Ended));
-                let waits = *access == SliceAccess::On
-                    && match wait {
-                        PhotoWait::Unasked => true,
-                        PhotoWait::Asked => on_its_way,
-                        PhotoWait::Until(until) => now < until && on_its_way,
-                    };
+                let no_photos = !config.shared_edge_slices();
+                let waits = no_photos
+                    || *access == SliceAccess::On
+                        && match wait {
+                            PhotoWait::Unasked => true,
+                            PhotoWait::Asked => on_its_way,
+                            PhotoWait::Until(until) => now < until && on_its_way,
+                        };
                 let own = displays.get(slice.slice.display).map(Display::bounds);
                 let (true, Ok(own)) = (waits, own) else {
                     let waited = match wait {
@@ -661,9 +664,17 @@ fn slide_photos_out(
                     continue;
                 };
                 let all = displays.iter().map(Display::bounds).collect::<Vec<_>>();
-                let (at, moved) = step_in_view(&slice, at, to, t, own, &all, |next| {
+                let (at, moved, stopped) = step_in_view(&slice, at, to, t, own, &all, |next| {
                     holds.limit(entity, at, next)
                 });
+                if no_photos && stopped {
+                    debug!("edge slice: window {id} reached the edge with no photo and tucks");
+                    position.0 = presented.0;
+                    entity_commands
+                        .try_insert(slice.slice)
+                        .try_remove::<Slide>();
+                    continue;
+                }
                 if position.0 != at {
                     position.0 = at;
                 }
@@ -798,7 +809,7 @@ impl Out {
 /// it shows `slice`, on the display with bounds `own`, among the displays
 /// with bounds `all`. Stays at `at` when the step would put most of the
 /// window on another display. Returns where the window is, with its slice
-/// there.
+/// there, and whether the step stopped because of that.
 fn step_in_view(
     slice: &Hold,
     at: IVec2,
@@ -807,7 +818,7 @@ fn step_in_view(
     own: IRect,
     all: &[IRect],
     held: impl Fn(IVec2) -> IVec2,
-) -> (IVec2, EdgeSlice) {
+) -> (IVec2, EdgeSlice, bool) {
     let others = all
         .iter()
         .copied()
@@ -821,7 +832,7 @@ fn step_in_view(
     let (next, _) = ease_step(at, to, t);
     let next = held(next);
     match shows_at(next) {
-        Some(moved) => (next, moved),
-        None => (at, shows_at(at).unwrap_or(slice.slice)),
+        Some(moved) => (next, moved, false),
+        None => (at, shows_at(at).unwrap_or(slice.slice), true),
     }
 }
