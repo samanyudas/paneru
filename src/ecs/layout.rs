@@ -3325,7 +3325,13 @@ fn position_layout_windows(
         if resize.is_none() && bounds.0 != frame.size() {
             bounds.0 = frame.size();
         }
-        let may_slide = config.shared_edge_slices() && !context.swiping && !context.snap_settling;
+        let slides = if context.swiping || context.snap_settling {
+            Slides::None
+        } else if config.shared_edge_slices() {
+            Slides::All
+        } else {
+            Slides::Out
+        };
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(PresentedOrigin(frame.min));
             if present_tuck(
@@ -3333,7 +3339,7 @@ fn position_layout_windows(
                 slice.map(|slice| Hold::of(slice, margins)),
                 tucked.map(|tucked| Hold::of(*tucked, margins)),
                 sliding,
-                may_slide,
+                slides,
                 shown_at(position.0, frame, margins, park_row, display, &displays),
                 row,
             ) {
@@ -3407,8 +3413,20 @@ impl RowPlace {
     }
 }
 
+/// Which slides a window at an edge shared with another display may make.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slides {
+    /// None: a swipe or a strip restore moves every window at once.
+    None,
+    /// Out to the edge only: with the switch off, no photo slides on past
+    /// it or back in.
+    Out,
+    /// Out and in, with photos.
+    All,
+}
+
 /// Writes a window's tuck: `slice` when its new frame is tucked, else none.
-/// With `may_slide`, a window that tucks from `shown_at`, where it shows on
+/// As `slides` allows, a window that tucks from `shown_at`, where it shows on
 /// its display now, slides out, one that leaves its tuck `tucked` slides in,
 /// and a tucked one whose slice moves slides to it. Each starts from its
 /// place in the `row`. A slide in progress keeps going, or turns back.
@@ -3419,7 +3437,7 @@ fn present_tuck(
     slice: Option<Hold>,
     tucked: Option<Hold>,
     sliding: Option<&Slide>,
-    may_slide: bool,
+    slides: Slides,
     shown_at: Option<Origin>,
     row: RowPlace,
 ) -> bool {
@@ -3455,7 +3473,12 @@ fn present_tuck(
                 Some(_) => None,
             },
         };
-        if let Some(out) = out.filter(|_| may_slide) {
+        let allowed = |out: &Slide| match slides {
+            Slides::None => false,
+            Slides::Out => matches!(out, Slide::Leaving { .. }),
+            Slides::All => true,
+        };
+        if let Some(out) = out.filter(allowed) {
             entity_commands
                 .try_insert(out)
                 .try_remove::<RepositionMarker>();
@@ -3478,7 +3501,7 @@ fn present_tuck(
             return false;
         }
     };
-    if !may_slide {
+    if slides != Slides::All {
         entity_commands.try_remove::<(Slide, EdgeSlice)>();
         return false;
     }

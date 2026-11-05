@@ -150,9 +150,9 @@ pub(crate) enum Slide {
     /// layout puts it.
     Landing { until: Duration },
     /// The window heads for a tuck that shows `slice`, at its place `to`
-    /// in the row, and its photo is on its way. The window shows itself at
-    /// `at`, as far toward `to` as it stays mostly on its display, and
-    /// waits for the photo as `wait` says.
+    /// in the row, and its photo is on its way if the switch is on. The
+    /// window shows itself at `at`, as far toward `to` as it stays mostly on
+    /// its display, and waits for the photo as `wait` says.
     Leaving {
         at: IVec2,
         to: IVec2,
