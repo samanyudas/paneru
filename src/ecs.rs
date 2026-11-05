@@ -162,6 +162,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
 
     native_membership::register(app);
     app.init_resource::<pacing::SlideHolds>();
+    app.init_resource::<systems::AnimationStep>();
     shared_edge::register(app);
     slice_photos::register(app);
     slice_input::register(app);
@@ -240,6 +241,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_systems(
         PreUpdate,
         (
+            systems::step_animation_clock
+                .in_set(PreUpdateSet::Pump)
+                .before(systems::pump_events),
             systems::pump_events.in_set(PreUpdateSet::Pump),
             systems::demux_input_events.in_set(PreUpdateSet::Demux),
             // Read creation notifications in the same frame that pumps them.
