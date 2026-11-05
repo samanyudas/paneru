@@ -211,13 +211,13 @@ impl Side {
     }
 }
 
-/// How far an edge command may go once its strip's end column has focus.
+/// How far a keyboard step or edge command may go at its strip's end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reach {
     /// On to the display on that side.
     Display,
-    /// No farther: a held edge key runs this, so only a fresh press crosses.
+    /// No farther. Key auto-repeat runs this, so only a fresh press crosses.
     Strip,
 }
 
@@ -383,6 +383,11 @@ pub enum Operation {
     /// Copies a `[windows]` configuration rule for the focused window to the
     /// clipboard.
     CopyRule,
+    /// One horizontal keyboard focus step, crossing a touching display only
+    /// from the strip's end when `reach` allows it.
+    FocusStep(Side, Reach),
+    /// One horizontal keyboard column move, arriving at the crossed edge.
+    MoveStep(Side, Reach),
 }
 
 /// Defines operations that can be performed on the mouse.
@@ -418,8 +423,29 @@ pub enum Command {
 }
 
 impl Command {
-    /// The command a key auto-repeat of this one runs: an edge command that
-    /// stops at its strip's end. Every other command repeats unchanged.
+    /// Adds keyboard stepping intent without changing wheel or socket commands.
+    #[must_use]
+    pub fn for_keypress(self, repeat: bool) -> Self {
+        let command = match self {
+            Command::Window(Operation::Focus(Direction::West)) => {
+                Command::Window(Operation::FocusStep(Side::West, Reach::Display))
+            }
+            Command::Window(Operation::Focus(Direction::East)) => {
+                Command::Window(Operation::FocusStep(Side::East, Reach::Display))
+            }
+            Command::Window(Operation::Swap(Direction::West)) => {
+                Command::Window(Operation::MoveStep(Side::West, Reach::Display))
+            }
+            Command::Window(Operation::Swap(Direction::East)) => {
+                Command::Window(Operation::MoveStep(Side::East, Reach::Display))
+            }
+            other => other,
+        };
+        if repeat { command.repeated() } else { command }
+    }
+
+    /// Restricts keyboard steps and edge commands to their strip on auto-repeat.
+    /// Every other command repeats unchanged.
     #[must_use]
     pub fn repeated(self) -> Self {
         match self {
@@ -428,6 +454,12 @@ impl Command {
             }
             Command::Window(Operation::MoveEdge(side, _)) => {
                 Command::Window(Operation::MoveEdge(side, Reach::Strip))
+            }
+            Command::Window(Operation::FocusStep(side, _)) => {
+                Command::Window(Operation::FocusStep(side, Reach::Strip))
+            }
+            Command::Window(Operation::MoveStep(side, _)) => {
+                Command::Window(Operation::MoveStep(side, Reach::Strip))
             }
             other => other,
         }

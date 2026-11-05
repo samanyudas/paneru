@@ -602,3 +602,234 @@ fn a_tabbed_stack_stays_tabbed_across_displays() {
     assert!(tabbed, "every member stays tabbed");
     assert_focused!(world, 1);
 }
+
+fn plain(operation: Operation, repeat: bool) -> Event {
+    Event::Command {
+        command: Command::Window(operation).for_keypress(repeat),
+    }
+}
+
+#[test]
+fn plain_moves_land_at_the_crossed_edge_and_reverse_with_the_whole_stack() {
+    for side in [Side::West, Side::East] {
+        let mut harness = stacked_beside(external_bounds(&side.direction()), &[100, 101, 102]);
+        let active = find_window_entity(101, harness.world());
+        harness
+            .world()
+            .resource_mut::<FocusHistory>()
+            .record(EXT_WORKSPACE_ID, active, None);
+        if side == Side::East {
+            harness.run(vec![command(Operation::Swap(Direction::Last))]);
+        }
+        let before = columns(harness.world(), TEST_WORKSPACE_ID);
+        harness.run(vec![plain(Operation::Swap(side.direction()), false)]);
+        settle_on_external(&mut harness, &[0, 1, 2]);
+        let expected = if side == Side::East {
+            vec![vec![0, 1, 2], vec![100], vec![101], vec![102]]
+        } else {
+            vec![vec![100], vec![101], vec![102], vec![0, 1, 2]]
+        };
+        assert_eq!(columns(harness.world(), EXT_WORKSPACE_ID), expected);
+        assert_eq!(columns(harness.world(), TEST_WORKSPACE_ID), [vec![3]]);
+        assert_focused!(harness.world(), 1);
+        let reverse = if side == Side::East {
+            Direction::West
+        } else {
+            Direction::East
+        };
+        harness.run(vec![plain(Operation::Swap(reverse), false)]);
+        for id in [0, 1, 2] {
+            harness
+                .mock_state
+                .update_window(id, |window| window.workspace_id = TEST_WORKSPACE_ID);
+        }
+        harness.mock_state.os_activate_display(TEST_DISPLAY_ID);
+        harness.advance(SETTLE);
+        assert_eq!(columns(harness.world(), TEST_WORKSPACE_ID), before);
+        assert_eq!(
+            columns(harness.world(), EXT_WORKSPACE_ID),
+            [vec![100], vec![101], vec![102]]
+        );
+        assert_focused!(harness.world(), 1);
+    }
+}
+
+#[test]
+fn plain_keys_step_once_before_crossing_and_repeats_stay_in_each_strip() {
+    for side in [Side::West, Side::East] {
+        for moving in [false, true] {
+            let op = || {
+                if moving {
+                    Operation::Swap(side.direction())
+                } else {
+                    Operation::Focus(side.direction())
+                }
+            };
+            let ext = external_bounds(&side.direction());
+            let mut harness = TestHarness::new().with_windows(4).with_display(
+                EXT_DISPLAY_ID,
+                ext,
+                vec![EXT_WORKSPACE_ID],
+            );
+            for id in [100, 101, 102] {
+                harness = harness.with_window(id, |window| {
+                    window.workspace_id = EXT_WORKSPACE_ID;
+                    window.frame = ext;
+                });
+            }
+            harness.run(vec![
+                Event::MenuOpened { window_id: 0 },
+                command(Operation::Focus(Direction::First)),
+                command(Operation::Focus(Direction::East)),
+            ]);
+            assert_focused!(harness.world(), 1);
+            harness.run(vec![plain(op(), false)]);
+            let expected = if moving {
+                1
+            } else if side == Side::West {
+                0
+            } else {
+                2
+            };
+            assert_focused!(harness.world(), expected);
+            assert_eq!(columns(harness.world(), EXT_WORKSPACE_ID).len(), 3);
+            for _ in 0..8 {
+                harness.run(vec![plain(op(), true)]);
+            }
+            let focused = if moving {
+                1
+            } else if side == Side::West {
+                0
+            } else {
+                3
+            };
+            assert_focused!(harness.world(), focused);
+            assert_eq!(columns(harness.world(), TEST_WORKSPACE_ID).len(), 4);
+            assert_eq!(columns(harness.world(), EXT_WORKSPACE_ID).len(), 3);
+            harness.run(vec![plain(op(), false)]);
+            if moving {
+                settle_on_external(&mut harness, &[focused]);
+            } else {
+                harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+                harness.advance(SETTLE);
+            }
+            for _ in 0..8 {
+                harness.run(vec![plain(op(), true)]);
+            }
+            let source = columns(harness.world(), TEST_WORKSPACE_ID);
+            let destination = columns(harness.world(), EXT_WORKSPACE_ID);
+            assert_eq!(source.len(), if moving { 3 } else { 4 });
+            assert_eq!(destination.len(), if moving { 4 } else { 3 });
+            if moving {
+                assert_focused!(harness.world(), focused);
+            }
+        }
+    }
+}
+
+#[test]
+fn plain_keys_require_a_touching_horizontal_neighbor() {
+    for side in [Side::West, Side::East] {
+        let touching = external_bounds(&side.direction());
+        let away = if side == Side::West { -10 } else { 10 };
+        let cases = [
+            None,
+            Some(IRect::from_corners(
+                touching.min + IVec2::new(away, 0),
+                touching.max + IVec2::new(away, 0),
+            )),
+            Some(IRect::from_corners(
+                touching.min.with_y(BUILT_IN.y),
+                touching.max.with_y(BUILT_IN.y + EXT_DISPLAY_HEIGHT),
+            )),
+            Some(external_bounds(&Direction::North)),
+            Some(IRect::from_corners(
+                touching.min + IVec2::new(0, BUILT_IN.y + 10),
+                touching.max + IVec2::new(0, BUILT_IN.y + 10),
+            )),
+        ];
+        for ext in cases {
+            for moving in [false, true] {
+                let mut harness = TestHarness::new().with_windows(1);
+                if let Some(ext) = ext {
+                    harness = harness
+                        .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
+                        .with_window(100, |window| {
+                            window.workspace_id = EXT_WORKSPACE_ID;
+                            window.frame = ext;
+                        });
+                }
+                let op = if moving {
+                    Operation::Swap(side.direction())
+                } else {
+                    Operation::Focus(side.direction())
+                };
+                harness.run(vec![Event::MenuOpened { window_id: 0 }, plain(op, false)]);
+                assert_eq!(columns(harness.world(), TEST_WORKSPACE_ID), [vec![0]]);
+                assert_focused!(harness.world(), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn plain_crossing_preserves_the_dedicated_move_width_and_maximize_rules() {
+    for side in [Side::West, Side::East] {
+        for maximized in [false, true] {
+            let mut results = Vec::new();
+            for keyboard in [false, true] {
+                let mut harness = stacked_beside(external_bounds(&side.direction()), &[100]);
+                harness.run(vec![command(Operation::Focus(Direction::East))]);
+                if maximized {
+                    harness.run(vec![command(Operation::Maximize)]);
+                }
+                harness.run(vec![command(Operation::Swap(side.end()))]);
+                harness.advance(SETTLE);
+                let event = if keyboard {
+                    plain(Operation::Swap(side.direction()), false)
+                } else {
+                    command(Operation::MoveToDisplay(side.direction()))
+                };
+                harness.run(vec![event]);
+                settle_on_external(&mut harness, &[3]);
+                let entity = find_window_entity(3, harness.world());
+                let is_maximized = harness
+                    .world()
+                    .query::<&LayoutStrip>()
+                    .iter(harness.world())
+                    .any(|strip| strip.maximized(entity).is_some());
+                assert_eq!(is_maximized, maximized);
+                assert_focused!(harness.world(), 3);
+                let arrived = frame(harness.world(), 3).size();
+                if maximized {
+                    harness.run(vec![command(Operation::Maximize)]);
+                    harness.advance(SETTLE);
+                }
+                results.push((arrived, frame(harness.world(), 3).size()));
+            }
+            assert_eq!(
+                results[0], results[1],
+                "plain and dedicated {side:?}, maximize={maximized}"
+            );
+        }
+    }
+}
+
+#[test]
+fn wheel_and_direct_horizontal_operations_stay_in_the_strip() {
+    for side in [Side::West, Side::East] {
+        let mut harness = stacked_beside(external_bounds(&side.direction()), &[100]);
+        if side == Side::East {
+            harness.run(vec![command(Operation::Focus(Direction::Last))]);
+        }
+        let before = columns(harness.world(), TEST_WORKSPACE_ID);
+        let focused = if side == Side::West { 1 } else { 3 };
+        harness.run(vec![
+            command(Operation::Focus(side.direction())),
+            command(Operation::Swap(side.direction())),
+        ]);
+        assert_eq!(columns(harness.world(), TEST_WORKSPACE_ID), before);
+        assert_eq!(columns(harness.world(), EXT_WORKSPACE_ID), [vec![100]]);
+        assert_focused!(harness.world(), focused);
+    }
+}

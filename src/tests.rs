@@ -6,6 +6,7 @@ mod harness;
 mod interaction;
 mod launch;
 mod maximize;
+mod mission_control;
 mod mocks;
 mod mouse_focus;
 mod pacing;
