@@ -470,6 +470,11 @@ pub trait WindowApi: Send + Sync {
     fn is_alive(&self) -> bool;
     fn is_minimized(&self) -> bool;
     fn is_full_screen(&self) -> bool;
+    /// Whether the window has a full-screen button. Every resizable standard
+    /// window of the apps checked has one, and Chrome's Picture-in-Picture
+    /// window has none, so a window without one may still rise above
+    /// ordinary windows just after it opens.
+    fn has_full_screen_button(&self) -> bool;
     /// Whether the app lets the window's size change at all. A window that
     /// does not, such as a fixed-size panel, floats unless a rule says
     /// otherwise. A failed read counts as resizable.
@@ -1259,6 +1264,10 @@ impl WindowApi for WindowOS {
 
     fn is_full_screen(&self) -> bool {
         self.ax_element.full_screen().unwrap_or(false)
+    }
+
+    fn has_full_screen_button(&self) -> bool {
+        self.ax_element.full_screen_button().is_ok()
     }
 
     fn is_resizable(&self) -> bool {

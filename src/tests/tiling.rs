@@ -1363,14 +1363,30 @@ fn a_rule_can_tile_a_window_above_ordinary_windows() {
     crate::assert_focused!(world, 3);
 }
 
-/// The user drags a left corner of floating window 3, so its origin and size
-/// change together. Its app reports only the resize, and the engine must
-/// leave the window at the frame the user made.
-fn assert_left_corner_resize_holds(min_shift: IVec2, max_shift: IVec2) {
-    let mut harness = spawned_above_ordinary_window(Config::default());
-    harness.mock_state.os_move_window(3, IVec2::new(600, 300));
-    harness.advance(Duration::from_millis(100));
+/// The user drags a corner of floating window 3, so its size changes and,
+/// for a left or top corner, its origin too. Its app reports only the
+/// resize. The engine must leave the window at the frame the user made and
+/// write nothing to it, because a write lands after the drag has moved on.
+fn assert_corner_resize_holds(min_shift: IVec2, max_shift: IVec2) {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    harness.advance(Duration::from_millis(500));
+    // The engine's own writer skips a frame the window already has, as it
+    // does for a real app.
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        3,
+        IRect::new(600, 300, 1150, 1340),
+    );
+    harness
+        .mock_state
+        .update_window(3, |window| window.above_ordinary = true);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_millis(500));
+    assert!(harness.mock_state.flush_writes(Duration::from_secs(1)));
     let start = harness.mock_state.ax_frame(3);
+    let before = frame_writes(&harness, 3);
 
     let resized = IRect::from_corners(start.min + min_shift, start.max + max_shift);
     harness
@@ -1380,29 +1396,59 @@ fn assert_left_corner_resize_holds(min_shift: IVec2, max_shift: IVec2) {
         .world()
         .write_message(Event::WindowResized { window_id: 3 });
     harness.advance(Duration::from_millis(100));
+    assert!(harness.mock_state.flush_writes(Duration::from_secs(1)));
 
     assert_eq!(harness.mock_state.ax_frame(3), resized);
+    assert_eq!(
+        frame_writes(&harness, 3),
+        before,
+        "the engine wrote to the window"
+    );
+}
+
+/// How many position and size writes window `id` received.
+fn frame_writes(harness: &TestHarness, id: i32) -> (usize, usize) {
+    let mut writes = (0, 0);
+    harness.mock_state.update_window(id, |window| {
+        writes = (window.position_writes, window.resize_writes);
+    });
+    writes
 }
 
 #[test]
 fn a_floating_window_keeps_a_bottom_left_resize() {
-    assert_left_corner_resize_holds(IVec2::new(-150, 0), IVec2::new(0, 40));
+    assert_corner_resize_holds(IVec2::new(-150, 0), IVec2::new(0, 40));
 }
 
 #[test]
 fn a_floating_window_keeps_a_top_left_resize() {
-    assert_left_corner_resize_holds(IVec2::new(-150, -40), IVec2::ZERO);
+    assert_corner_resize_holds(IVec2::new(-150, -40), IVec2::ZERO);
+}
+
+#[test]
+fn a_floating_window_keeps_a_bottom_right_resize() {
+    assert_corner_resize_holds(IVec2::ZERO, IVec2::new(-150, -20));
 }
 
 /// Spawns window 3 at an ordinary level next to the tiled windows 0 to 2 with
 /// 0 focused, as Chrome shows a Picture-in-Picture window before it raises
 /// it. Returns the frame the window opened with.
 fn spawned_ordinary_window(harness: &mut TestHarness) -> IRect {
+    spawned_ordinary_window_with(harness, |_| {})
+}
+
+/// As [`spawned_ordinary_window`], with `setup` applied to window 3 before
+/// the engine sees it.
+fn spawned_ordinary_window_with(
+    harness: &mut TestHarness,
+    setup: impl FnOnce(&mut crate::tests::mocks::MockWindowData),
+) -> IRect {
     harness.advance(Duration::from_millis(500));
     let frame = IRect::new(1000, 500, 400, 225);
     let window = harness
         .mock_state
         .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 3, frame);
+    harness.mock_state.update_window(3, setup);
     harness.world().trigger(SpawnWindowTrigger(vec![window]));
     harness.advance(Duration::from_millis(40));
     frame
@@ -1475,6 +1521,58 @@ fn a_window_that_stays_ordinary_stays_tiled() {
     let entity = find_window_entity(3, world);
     let mut query = world.query::<&LayoutStrip>();
     assert!(query.iter(world).any(|strip| strip.contains(entity)));
+}
+
+/// A Picture-in-Picture window has no full-screen button, so it waits for its
+/// level before it tiles. When its app raises it, it floats at the frame it
+/// opened with and gets no write, because any write makes Chrome's own resize
+/// of the window fall behind the pointer.
+#[test]
+fn a_window_without_a_full_screen_button_floats_untouched_when_raised() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    let opened = spawned_ordinary_window_with(&mut harness, |window| {
+        window.no_full_screen_button = true;
+    });
+    assert!(!in_a_strip(harness.world(), 3));
+
+    harness
+        .mock_state
+        .update_window(3, |window| window.above_ordinary = true);
+    harness.advance(Duration::from_millis(500));
+    assert!(harness.mock_state.flush_writes(Duration::from_secs(1)));
+
+    let world = harness.world();
+    let entity = find_window_entity(3, world);
+    assert!(matches!(
+        world.entity(entity).get::<crate::ecs::Unmanaged>(),
+        Some(crate::ecs::Unmanaged::Floating)
+    ));
+    assert!(!in_a_strip(world, 3));
+    crate::assert_focused!(world, 3);
+    assert_eq!(harness.mock_state.ax_frame(3), opened);
+    assert_eq!(frame_writes(&harness, 3), (0, 0));
+}
+
+/// A window without a full-screen button that stays at the ordinary level
+/// tiles once the check ends.
+#[test]
+fn a_window_without_a_full_screen_button_tiles_when_it_stays_ordinary() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    spawned_ordinary_window_with(&mut harness, |window| {
+        window.no_full_screen_button = true;
+    });
+    harness.advance(Duration::from_secs(2));
+
+    let world = harness.world();
+    let entity = find_window_entity(3, world);
+    assert!(
+        world
+            .entity(entity)
+            .get::<crate::ecs::Unmanaged>()
+            .is_none()
+    );
+    assert!(in_a_strip(world, 3));
 }
 
 /// Spawns window 3 without a size next to the tiled windows 0 to 2 with 0

@@ -86,6 +86,8 @@ pub(crate) struct MockWindowData {
     pub(crate) subrole: String,
     pub(crate) identifier: String,
     pub(crate) is_full_screen: bool,
+    /// The window has no full-screen button, as a Picture-in-Picture window.
+    pub(crate) no_full_screen_button: bool,
     /// The app does not let the window's size change.
     pub(crate) fixed_size: bool,
     /// The app keeps the window above ordinary windows.
@@ -173,6 +175,7 @@ impl Default for MockWindowData {
             subrole: "AXStandardWindow".to_string(),
             identifier: "testid".to_string(),
             is_full_screen: false,
+            no_full_screen_button: false,
             fixed_size: false,
             above_ordinary: false,
             border_radius: None,
@@ -1627,6 +1630,15 @@ impl MockState {
                 .windows
                 .get(&id)
                 .is_some_and(|w| w.is_full_screen)
+        });
+
+        let s = self.clone();
+        mw.expect_has_full_screen_button().returning(move || {
+            !s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .is_some_and(|w| w.no_full_screen_button)
         });
 
         let s = self.clone();
