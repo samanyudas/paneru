@@ -68,7 +68,7 @@ use tracing::{debug, warn};
 
 use super::display::migrate_windows_to_space;
 use super::drag::DragState;
-use super::layout::{Before, LayoutStrip};
+use super::layout::{Before, DetachedColumn, LayoutStrip};
 use super::workspace::PreviousStripPosition;
 use super::{
     ActiveWorkspaceMarker, AwaitingHandle, Bounds, Initializing, NativeFullscreenMarker, Position,
@@ -88,6 +88,10 @@ const FRAME_TOLERANCE: i32 = 2;
 /// resolved. After that, a native list that still reports it is checked
 /// again.
 const IGNORE_FOR: Duration = Duration::from_secs(30);
+/// How long the windows of a scattered column rejoin each other where macOS
+/// lists them. After that, a window that lands beside the others was moved
+/// on its own.
+const REJOIN_FOR: Duration = Duration::from_secs(30);
 
 pub(crate) enum NativeScope {
     ActivatedSpace(WorkspaceId),
@@ -198,7 +202,18 @@ pub(crate) struct NativeMembership {
     held: Option<HeldDragGroup>,
     placing: Vec<Placing>,
     stripless: Vec<Stripless>,
+    scattered: Vec<ScatteredColumn>,
     ignored: HashMap<WinID, IgnoredWindow>,
+}
+
+/// A column whose windows macOS is moving to another Space: the columns of a
+/// destroyed Space, and a column a read moved only part of while a display
+/// change is in progress. macOS can list the windows in their new Space over
+/// several reads, so each read joins the ones that landed in one strip back
+/// into one column.
+struct ScatteredColumn {
+    column: DetachedColumn,
+    until: Duration,
 }
 
 impl NativeMembership {
@@ -231,6 +246,63 @@ impl NativeMembership {
             members,
             targets: Vec::new(),
             maximized,
+        });
+    }
+
+    /// Remembers the columns of `strip`, whose Space macOS destroyed, so its
+    /// windows form the same columns where macOS lists them next.
+    pub(crate) fn space_destroyed(&mut self, strip: &LayoutStrip, now: Duration) {
+        let columns = (0..strip.len()).filter_map(|index| strip.copy_column(index));
+        self.scatter(columns, now);
+    }
+
+    fn scatter(&mut self, columns: impl IntoIterator<Item = DetachedColumn>, now: Duration) {
+        self.scattered.retain(|scattered| now <= scattered.until);
+        for column in columns {
+            let windows = column.windows();
+            // The rest of a column macOS is already moving stays part of it.
+            let known = self.scattered.iter().any(|scattered| {
+                let remembered = scattered.column.windows();
+                windows.iter().all(|window| remembered.contains(window))
+            });
+            if windows.len() < 2 || known {
+                continue;
+            }
+            self.scattered.retain(|scattered| {
+                !scattered
+                    .column
+                    .windows()
+                    .iter()
+                    .any(|window| windows.contains(window))
+            });
+            self.scattered.push(ScatteredColumn {
+                column,
+                until: now + REJOIN_FOR,
+            });
+        }
+    }
+
+    /// After a display pass placed windows: forgets each scattered column
+    /// whose windows that pass put back in one column, so a person can split
+    /// them again, and reads every Space as a topology read.
+    pub(crate) fn display_pass(world: &mut World) {
+        world.resource_scope(|world, mut native: Mut<NativeMembership>| {
+            native.request(NativeScope::DisplayTopology);
+            native.scattered.retain(|scattered| {
+                let Some(column) = scattered
+                    .column
+                    .clone()
+                    .retain(|window| world.get::<Window>(window).is_some())
+                else {
+                    return false;
+                };
+                let first = column.windows()[0];
+                !world.query::<&LayoutStrip>().iter(world).any(|strip| {
+                    strip
+                        .index_of(first)
+                        .is_ok_and(|index| strip.column_is(index, &column))
+                })
+            });
         });
     }
 
@@ -450,7 +522,7 @@ fn reconcile(world: &mut World) {
                 Ok(ids) => {
                     let unresolved = discover_unresolved(world, &ids, &mut native.ignored, now);
                     let held =
-                        reconcile_space(world, &native, space, display, &ids, dirty.topology);
+                        reconcile_space(world, &mut native, space, display, &ids, dirty.topology);
                     if unresolved {
                         dirty.retry.failed(now, space);
                     } else if held {
@@ -681,7 +753,7 @@ pub(crate) fn stranded(frame: IRect, displays: impl IntoIterator<Item = IRect>) 
 /// full.
 fn reconcile_space(
     world: &mut World,
-    native: &NativeMembership,
+    native: &mut NativeMembership,
     space: WorkspaceId,
     display: Entity,
     ids: &[WinID],
@@ -731,7 +803,7 @@ fn reconcile_space(
         admitted.push(members);
     }
     if !admitted.is_empty() {
-        apply_native_move(world, space, display, &admitted, topology);
+        apply_native_move(world, native, space, display, &admitted, topology);
         for members in &admitted {
             let maximized = native
                 .stripless
@@ -753,12 +825,25 @@ fn reconcile_space(
 
 fn apply_native_move(
     world: &mut World,
+    native: &mut NativeMembership,
     space: WorkspaceId,
     display: Entity,
     groups: &[Vec<Entity>],
     topology: bool,
 ) {
     let admitted: EntityHashSet = groups.iter().flatten().copied().collect();
+    // When a display returns, macOS can file a stack's windows back in the
+    // Space they left, then list them in the new Space one ordinary read at
+    // a time.
+    let reconciling = topology
+        || world
+            .get_resource::<super::display::DisplayReconcileState>()
+            .is_some_and(super::display::DisplayReconcileState::is_reconciling);
+    if reconciling {
+        let split = split_columns(world, space, &admitted);
+        let now = world.resource::<Time>().elapsed();
+        native.scatter(split, now);
+    }
     let batch = topology
         || world
             .query::<(&LayoutStrip, Option<&ChildOf>, Has<NativeFullscreenMarker>)>()
@@ -790,6 +875,73 @@ fn apply_native_move(
             append_native_group(world, space, members);
         }
     }
+    rejoin_scattered(world, &mut native.scattered, space);
+}
+
+/// The columns outside `space` that `admitted` takes only part of.
+fn split_columns(
+    world: &mut World,
+    space: WorkspaceId,
+    admitted: &EntityHashSet,
+) -> Vec<DetachedColumn> {
+    world
+        .query::<(&LayoutStrip, Has<NativeFullscreenMarker>)>()
+        .iter(world)
+        .filter(|(strip, fullscreen)| !fullscreen && strip.id() != space)
+        .flat_map(|(strip, _)| (0..strip.len()).filter_map(|index| strip.copy_column(index)))
+        .filter(|column| {
+            let windows = column.windows();
+            let moving = windows
+                .iter()
+                .filter(|window| admitted.contains(*window))
+                .count();
+            moving > 0 && moving < windows.len()
+        })
+        .collect()
+}
+
+/// Joins the windows of each scattered column that sit in one strip of
+/// `space` back into one column, at the leftmost of their columns. A scattered
+/// column is forgotten once all its windows are back together, once none of
+/// them is managed, or once its time is up.
+fn rejoin_scattered(world: &mut World, scattered: &mut Vec<ScatteredColumn>, space: WorkspaceId) {
+    let now = world.resource::<Time>().elapsed();
+    scattered.retain(|scattered| {
+        let windows = scattered.column.windows();
+        if now > scattered.until || !windows.iter().any(|w| world.get::<Window>(*w).is_some()) {
+            return false;
+        }
+        let Some(mut strip) = world
+            .query::<&mut LayoutStrip>()
+            .iter_mut(world)
+            .find(|strip| strip.id() == space && windows.iter().any(|w| strip.contains(*w)))
+        else {
+            return true;
+        };
+        let present: Vec<_> = windows
+            .iter()
+            .copied()
+            .filter(|window| strip.contains(*window))
+            .collect();
+        let gap = present
+            .iter()
+            .filter_map(|window| strip.index_of(*window).ok())
+            .min();
+        let column = scattered
+            .column
+            .clone()
+            .retain(|window| present.contains(&window));
+        if let (Some(gap), Some(column)) = (gap, column)
+            && !strip.column_is(gap, &column)
+        {
+            debug!(?present, space, "Rejoining a column macOS moved apart");
+            for window in &present {
+                strip.remove(*window);
+            }
+            strip.insert_column(gap, column);
+        }
+        present.len() < windows.len()
+    });
 }
 
 fn append_native_group(world: &mut World, space: WorkspaceId, members: &[Entity]) {

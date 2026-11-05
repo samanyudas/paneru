@@ -358,6 +358,12 @@ impl DisplayReconcileState {
         self.pending.is_some() && self.verify_again
     }
 
+    /// Whether a display change is still in progress: its burst began, and
+    /// its last pass has not run yet.
+    pub(crate) fn is_reconciling(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// Whether `a` and `b` are two displays that were present when the
     /// latest burst began.
     pub(crate) fn both_kept(&self, a: Entity, b: Entity) -> bool {
@@ -592,9 +598,7 @@ pub(crate) fn reconcile_displays(
     let pass = state.pass();
     commands.queue(move |world: &mut World| {
         DisplayHomes::settle(world, pass);
-        world
-            .resource_mut::<super::native_membership::NativeMembership>()
-            .request(super::native_membership::NativeScope::DisplayTopology);
+        super::native_membership::NativeMembership::display_pass(world);
         refresh_display_layout(world, &previous_parents);
     });
     commands.trigger(SendMessageTrigger(Event::DisplayChanged));
