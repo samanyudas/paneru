@@ -204,6 +204,11 @@ pub trait AXUIAttributes {
             .map(|value| CFBoolean::value(&value))
     }
 
+    fn full_screen_button(&self) -> Result<CFRetained<AXUIWrapper>> {
+        let axname = CFString::from_str("AXFullScreenButton");
+        self.get_attribute::<AXUIWrapper>(&axname)
+    }
+
     fn focused_window_element(&self) -> Result<CFRetained<AXUIWrapper>> {
         let axname = CFString::from_static_str(kAXFocusedWindowAttribute);
         self.get_attribute::<AXUIWrapper>(&axname)
