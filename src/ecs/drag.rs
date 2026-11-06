@@ -749,8 +749,10 @@ fn pressed(
         DragInput::WindowMoved { window, frame } if window == press.window => {
             let moved = if frame.size() == press.frame.size() {
                 frame.min - press.frame.min
-            } else if kept_an_edge(press.frame, frame) {
-                // An edge or corner resize keeps the opposite edge in place.
+            } else if on_resize_edge(press.frame, press.point) || kept_an_edge(press.frame, frame) {
+                // A press on an edge may resize the window, from its center
+                // with Option held, and a resize from an edge or a corner
+                // keeps the opposite edge in place.
                 return DragState::Unconfirmed(press);
             } else {
                 // macOS gives a window it tiled its earlier size back as the
@@ -798,6 +800,12 @@ fn pressed(
 fn kept_an_edge(pressed: IRect, frame: IRect) -> bool {
     (frame.min.x == pressed.min.x || frame.max.x == pressed.max.x)
         && (frame.min.y == pressed.min.y || frame.max.y == pressed.max.y)
+}
+
+/// Whether `point` is in the band along the edges of `frame` where a press
+/// can resize the window.
+fn on_resize_edge(frame: IRect, point: IVec2) -> bool {
+    !frame.inflate(-tiling::EDGE_TOLERANCE).contains(point)
 }
 
 /// Where the point grabbed at the press is in `frame`, at the same share of

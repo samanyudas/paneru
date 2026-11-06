@@ -20,7 +20,7 @@ use crate::ecs::{
 use crate::events::{Event, MouseButton};
 use crate::manager::{Display, Margins, Origin, Window, WindowManager, origin_from};
 
-const EDGE_TOLERANCE: i32 = 6;
+pub(crate) const EDGE_TOLERANCE: i32 = 6;
 const TILE_TOLERANCE: i32 = 2;
 const RESIZE_RELEASE_GRACE: Duration = Duration::from_millis(600);
 const NATIVE_RESIZE_SETTLE: Duration = Duration::from_millis(200);

@@ -238,6 +238,24 @@ fn a_resize_is_not_a_drag() {
         is_unconfirmed(&state),
         "a move that changes the size: {state:?}"
     );
+
+    // With Option held, a corner resize grows the window from its center, so
+    // no edge stays in place and the grabbed corner follows the pointer.
+    let corner = FRAME_RECT.min + IVec2::new(2, 2);
+    let (state, _) = run(&[
+        down(w, corner),
+        DragInput::Dragged {
+            point: corner - IVec2::splat(40),
+        },
+        DragInput::WindowMoved {
+            window: w,
+            frame: FRAME_RECT.inflate(40),
+        },
+    ]);
+    assert!(
+        is_unconfirmed(&state),
+        "a symmetric corner resize: {state:?}"
+    );
 }
 
 /// macOS gives a window it tiled its earlier size back as the next title-bar
