@@ -4100,3 +4100,80 @@ fn drop_slot_same_display_preserves_bounds_when_retiring_a_settling_resize() {
 fn drop_slot_cross_display_preserves_bounds_when_retiring_a_settling_resize() {
     drop_slot_survives_an_adopting_resize(true, true);
 }
+
+/// macOS moves window `id` into the main display's space, as it does once a
+/// drag or a display command puts the window there.
+fn macos_moves_to_main(harness: &mut TestHarness, id: WinID) {
+    harness
+        .mock_state
+        .update_window(id, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    harness.mock_state.os_activate_display(TEST_DISPLAY_ID);
+}
+
+fn main_frames(world: &mut World) -> Vec<IRect> {
+    [0, 1, 2].map(|id| frame(world, id)).to_vec()
+}
+
+/// Drags window 100 from the external display and drops it at `to` on the
+/// main display, then checks that it pushed the main strip's columns aside.
+fn drop_from_ext(harness: &mut TestHarness, to: Origin) {
+    let before = main_frames(harness.world());
+    press_and_drag(harness, 100, to);
+    release(harness, to);
+    macos_moves_to_main(harness, 100);
+    harness.advance(SETTLE);
+    assert!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID)
+            .iter()
+            .any(|column| column == &[100]),
+        "window 100 is a new column on the main display"
+    );
+    assert_ne!(
+        main_frames(harness.world()),
+        before,
+        "the dropped column pushes the main strip's columns aside"
+    );
+}
+
+fn empty_space_on_ext() -> Origin {
+    Origin::new(TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH - 30, 600)
+}
+
+#[test]
+fn a_window_dragged_back_off_a_strip_lets_its_columns_slide_back() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    let before = main_frames(harness.world());
+    for round in 1..=3 {
+        drop_from_ext(&mut harness, Origin::new(20, 600));
+        title_drag_to_ext(&mut harness, 100, empty_space_on_ext());
+        assert_eq!(
+            layout_on(harness.world(), TEST_WORKSPACE_ID),
+            vec![vec![0], vec![1], vec![2]]
+        );
+        assert_eq!(
+            main_frames(harness.world()),
+            before,
+            "drag back {round}: the main strip's columns return to where they were before the drop"
+        );
+    }
+}
+
+#[test]
+fn a_window_moved_off_a_strip_by_keyboard_lets_its_columns_slide_back() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    let before = main_frames(harness.world());
+    drop_from_ext(&mut harness, Origin::new(20, 600));
+    crate::assert_focused!(harness.world(), 100);
+    harness.run(vec![command(Operation::MoveToDisplay(Direction::East))]);
+    macos_moves_to_ext(&mut harness, 100);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    assert_eq!(
+        main_frames(harness.world()),
+        before,
+        "the main strip's columns return to where they were before the drop"
+    );
+}
