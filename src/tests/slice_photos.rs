@@ -2121,3 +2121,110 @@ fn the_column_ahead_waits_for_a_slow_window_leaving_past_the_edge() {
         "windows 0 and 1 tuck once the row has moved"
     );
 }
+
+/// A slow window that comes back from its tuck lands under its photo, and
+/// a press moves the row on before its app shows it there. The column ahead
+/// of it waits beside the photo until the slow window moves on. A landing
+/// window still has its way to go, so the column ahead paces from where the
+/// photo shows it, not as if the landing window were at rest.
+#[test]
+fn the_column_ahead_waits_for_a_slow_window_landing_under_its_photo() {
+    const FAST_APP: crate::platform::Pid = 2;
+    const SLOW: WinID = 2;
+    let ids = [0, 1, 2, 3];
+    let log = Rc::new(RefCell::new(Screen::default()));
+    let mut harness = TestHarness::new()
+        .with_config(animated())
+        .with_display(EXT_DISPLAY_ID, LEFT, vec![EXT_WORKSPACE_ID])
+        .with_app(FAST_APP, "fast", "FastApp", |_| {});
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    harness
+        .mock_state
+        .set_write_delay(TEST_PROCESS_ID, Duration::from_millis(40));
+    for (id, width) in (0..).zip([300, 300, 300, 900]) {
+        let pid = if id == SLOW {
+            TEST_PROCESS_ID
+        } else {
+            FAST_APP
+        };
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness
+        .world()
+        .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::Last)),
+    ]);
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+        paint_asked(&mut harness, &log, &ids);
+        harness.mock_state.flush_writes(Duration::from_secs(1));
+    }
+    assert!(
+        !in_view(harness.mock_state.ax_frame(SLOW)),
+        "window 2 rests tucked"
+    );
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::West)));
+    let rest = (0..60)
+        .find_map(|_| {
+            let photo = scanline(&harness, &log, &ids)
+                .into_iter()
+                .find(|run| run.window == SLOW && run.photo);
+            let near_rest = photo.is_some_and(|photo| photo.shown.min.x > -60);
+            if near_rest {
+                harness.mock_state.hold_writes(TEST_PROCESS_ID);
+            }
+            harness.advance(Duration::from_millis(20));
+            paint_asked(&mut harness, &log, &ids);
+            if !near_rest {
+                harness.mock_state.flush_writes(Duration::from_secs(1));
+            }
+            scanline(&harness, &log, &ids)
+                .into_iter()
+                .find(|run| run.window == SLOW && run.photo && run.shown.min.x == 0)
+        })
+        .expect("the photo of window 2 slides in to rest at the edge");
+    assert!(
+        !in_view(harness.mock_state.ax_frame(SLOW)),
+        "the slow app has yet to show window 2 where its photo rests"
+    );
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::West)));
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    let mut seen = Vec::new();
+    for _ in 0..80 {
+        harness.advance(Duration::from_millis(20));
+        paint_asked(&mut harness, &log, &ids);
+        std::thread::sleep(Duration::from_millis(20));
+        seen.push(scanline(&harness, &log, &ids));
+    }
+    assert!(harness.mock_state.flush_writes(Duration::from_secs(5)));
+
+    for (frame, runs) in seen.iter().enumerate() {
+        let slow = runs.iter().find(|run| run.window == SLOW);
+        let ahead = runs.iter().find(|run| run.window == 3);
+        if let (Some(slow), Some(ahead)) = (slow, ahead) {
+            assert_eq!(
+                slow.to, ahead.from,
+                "the slow window 2, or its photo, shows beside window 3 after frame {frame}: {runs:?}"
+            );
+        }
+    }
+    assert!(
+        harness.mock_state.ax_frame(SLOW).min.x > rest.shown.min.x,
+        "window 2 moved on from where its photo rested, to {:?}",
+        harness.mock_state.ax_frame(SLOW)
+    );
+}
