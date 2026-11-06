@@ -303,3 +303,82 @@ fn the_window_ahead_does_not_snap_past_a_slow_window_on_a_short_move() {
         "the row scrolled by 6 points"
     );
 }
+
+/// Owns no window the engine tracks, like Finder showing only the desktop.
+const DESKTOP_APP: Pid = 3;
+
+fn window(operation: Operation) -> Event {
+    Event::Command {
+        command: Command::Window(operation),
+    }
+}
+
+/// [`harness`] with window 1 focused, its app at the front and counted as
+/// prompt after showing every move of one motion in time.
+fn prompt_window_1() -> TestHarness {
+    let mut harness = harness().with_app(DESKTOP_APP, "com.apple.finder", "Finder", |_| {});
+    harness.mock_state.set_write_delay(SLOW_APP, Duration::ZERO);
+    harness.world().write_message(focus(Direction::East));
+    settle_beside(&mut harness, 0, 1, i32::MAX);
+    settle(&mut harness);
+    harness
+}
+
+/// Runs `operation`, which moves the focused window 1 left, while the slow
+/// app holds its writes, asserting that window 0 ahead waits beside it.
+fn assert_window_0_waits(harness: &mut TestHarness, operation: Operation) {
+    let rest = gap(harness, 0, 1);
+    let start = harness.mock_state.ax_frame(1);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(window(operation));
+    for frame in 0..10 {
+        harness.advance(FRAME);
+        assert!(
+            gap(harness, 0, 1) <= rest,
+            "desktop shows between windows 0 and 1 after frame {frame}: {:?} {:?}",
+            harness.mock_state.ax_frame(0),
+            harness.mock_state.ax_frame(1)
+        );
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle_beside(harness, 0, 1, rest);
+    settle(harness);
+
+    assert_landed(harness);
+    assert!(
+        harness.mock_state.ax_frame(1).min.x < start.min.x,
+        "window 1 moved left from {start:?}"
+    );
+}
+
+/// Focus on an empty display brings Finder to the front with only its
+/// desktop window, which the engine does not track, so window 1 keeps focus.
+/// Its app left the front all the same and can turn slow: window 0 ahead
+/// waits for it from the first step of the next move.
+#[test]
+fn the_window_ahead_waits_for_a_prompt_window_whose_app_leaves_the_front() {
+    let mut harness = prompt_window_1();
+    harness.mock_state.activate_app(DESKTOP_APP);
+    settle(&mut harness);
+
+    assert_window_0_waits(&mut harness, Operation::Center);
+}
+
+/// The slow app shows every move in time while Finder is at the front, then
+/// comes back to it, as focus back from an empty display brings it, though
+/// no tracked window gains or loses focus. Coming to the front can turn it
+/// slow: window 0 ahead waits for it from the first step of the next move.
+#[test]
+fn the_window_ahead_waits_for_a_prompt_window_whose_app_comes_back_to_the_front() {
+    let mut harness = prompt_window_1();
+    harness.mock_state.activate_app(DESKTOP_APP);
+    settle(&mut harness);
+    harness.world().write_message(window(Operation::Center));
+    settle_beside(&mut harness, 0, 1, i32::MAX);
+    settle(&mut harness);
+    harness.mock_state.activate_app(SLOW_APP);
+    settle(&mut harness);
+
+    assert_window_0_waits(&mut harness, Operation::Maximize);
+}
