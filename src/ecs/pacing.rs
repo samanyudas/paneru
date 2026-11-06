@@ -441,43 +441,7 @@ pub(super) fn pace_rows(
             .map(|column| {
                 column
                     .into_iter()
-                    .filter_map(|entity| {
-                        let (window, position, to, slide) = windows.get(entity).ok()?;
-                        let id = window.id();
-                        if let Some((at, heading_to)) =
-                            slide.and_then(|(slide, presented)| heading(slide, presented.0))
-                        {
-                            // A photo shows at once where it steps to this frame.
-                            let (step, _) = ease_step(at, heading_to, t);
-                            return Some(Member {
-                                entity,
-                                id,
-                                eased: step.x,
-                                x: step.x,
-                                target: heading_to.x,
-                                asked: at.x,
-                                pacer: Pacer::Asked,
-                                paced: true,
-                                slides: true,
-                            });
-                        }
-                        let asked = window.frame().min.x;
-                        let shown_x = shown
-                            .frames
-                            .get(&id)
-                            .map(|&frame| window.margins().tracked(frame).min.x);
-                        Some(Member {
-                            entity,
-                            id,
-                            eased: position.0.x,
-                            x: position.0.x,
-                            target: to.map_or(position.0.x, |to| to.0.x),
-                            asked,
-                            pacer: tracked.entry(entity).or_default().see(asked, shown_x, now),
-                            paced: to.is_some() && slide.is_none(),
-                            slides: false,
-                        })
-                    })
+                    .filter_map(|entity| member(entity, &windows, &shown, &mut tracked, t, now))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -503,6 +467,52 @@ pub(super) fn pace_rows(
             }
         }
     }
+}
+
+/// The row window `entity` as pacing sees it this frame, with `t` the
+/// row's ease this frame and `tracked` what the engine has seen of each app.
+fn member(
+    entity: Entity,
+    windows: &RowWindows,
+    shown: &Shown,
+    tracked: &mut EntityHashMap<Tracked>,
+    t: f32,
+    now: Duration,
+) -> Option<Member> {
+    let (window, position, to, slide) = windows.get(entity).ok()?;
+    let id = window.id();
+    let asked = window.frame().min.x;
+    let shown_x = shown
+        .frames
+        .get(&id)
+        .map(|&frame| window.margins().tracked(frame).min.x);
+    if let Some((at, heading_to)) = slide.and_then(|(slide, presented)| heading(slide, presented.0))
+    {
+        // A photo shows at once where it steps to this frame.
+        let (step, _) = ease_step(at, heading_to, t);
+        return Some(Member {
+            entity,
+            id,
+            eased: step.x,
+            x: step.x,
+            target: heading_to.x,
+            asked: at.x,
+            pacer: Pacer::Asked,
+            paced: true,
+            slides: true,
+        });
+    }
+    Some(Member {
+        entity,
+        id,
+        eased: position.0.x,
+        x: position.0.x,
+        target: to.map_or(position.0.x, |to| to.0.x),
+        asked,
+        pacer: tracked.entry(entity).or_default().see(asked, shown_x, now),
+        paced: to.is_some() && slide.is_none(),
+        slides: false,
+    })
 }
 
 /// Forgets what the engine has seen of the apps that gained focus from
