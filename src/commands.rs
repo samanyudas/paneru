@@ -142,7 +142,11 @@ pub fn register_commands(app: &mut bevy::app::App) {
             toggle_tabbed_display_handler,
             focus_display.after(command_move_focus),
             check_desktop_focus.after(focus_display),
-            end_width_runs.before(resize_window),
+            // A width command and a maximize restore each start a run, which
+            // the command would otherwise end in the same pass.
+            end_width_runs
+                .before(resize_window)
+                .before(crate::ecs::maximize::command_toggle),
         )
             .in_set(crate::ecs::PreUpdateSet::Dispatch),
     );
