@@ -1920,9 +1920,19 @@ fn a_press_while_a_revealed_photo_waits_never_shows_its_window_beside_it() {
         .world()
         .write_message(command(Operation::Focus(Direction::Nth(1))));
     queued_frame(&mut harness, false);
+    // The app has taken no move yet, so the photo still shows. On a loaded
+    // machine the app can take every queued move before the next frame, so
+    // this frame is the only one that shows the photo before it hands over.
+    let mut seen = vec![Seen {
+        window: harness.mock_state.ax_frame(3),
+        photo: photo_of_three(&log),
+    }];
+    assert!(
+        seen[0].photo.is_some(),
+        "the photo of window 3 shows while its app is held"
+    );
     harness.mock_state.set_write_delay(TEST_PROCESS_ID, WRITE);
     harness.mock_state.release_writes(TEST_PROCESS_ID);
-    let mut seen = Vec::new();
     for _ in 0..50 {
         // Real time keeps pace with engine time, so the app answers before
         // the landing times out.
