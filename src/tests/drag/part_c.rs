@@ -4177,3 +4177,34 @@ fn a_window_moved_off_a_strip_by_keyboard_lets_its_columns_slide_back() {
         "the main strip's columns return to where they were before the drop"
     );
 }
+
+/// A column that reaches the end of a strip wider than its display scrolls
+/// the strip to show itself. When it leaves, the strip keeps its scroll but
+/// never leaves empty space past its end, so no band shows at the display
+/// edge.
+#[test]
+fn a_window_leaving_the_end_of_an_overflowing_strip_leaves_no_empty_space() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    drop_from_ext(&mut harness, Origin::new(20, 600));
+    for _ in 0..3 {
+        harness.run(vec![command(Operation::Swap(Direction::East))]);
+        harness.advance(SETTLE);
+    }
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2], vec![100]],
+        "window 100 is the strip's last column"
+    );
+    harness.run(vec![command(Operation::MoveToDisplay(Direction::East))]);
+    macos_moves_to_ext(&mut harness, 100);
+    harness.advance(SETTLE);
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    let last = frame(harness.world(), 2);
+    assert!(
+        last.max.x >= TEST_DISPLAY_WIDTH,
+        "the strip's last column reaches the display's right edge: {last:?}"
+    );
+}

@@ -2150,11 +2150,21 @@ fn test_source_refit_preserves_overflow_and_auto_center_anchoring() {
         harness.run(vec![window_command(Operation::MoveToDisplay(
             Direction::North,
         ))]);
-        assert_eq!(
-            source_frames(&harness),
-            before,
-            "source neighbour anchoring must remain unchanged"
-        );
+        let after = source_frames(&harness);
+        if auto_center {
+            assert_eq!(
+                after, before,
+                "source neighbour anchoring must remain unchanged"
+            );
+        } else {
+            // The strip still overflows, so it closes the space the column
+            // left at its end instead of leaving an empty band (#320).
+            assert_eq!(after[2].max.x, 2044, "{after:?}");
+            assert_eq!(
+                after.map(|frame| frame.width()),
+                before.map(|frame| frame.width())
+            );
+        }
     }
 }
 
