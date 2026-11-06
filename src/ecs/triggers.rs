@@ -316,6 +316,23 @@ pub(super) fn window_focused_trigger(
                             "app {} reports window {current} focused, not {window_id}; following it",
                             app.name()
                         );
+                        // An app can put a floating window of its own, such as
+                        // a dialog that opens with a document, in front of the
+                        // tiled window the event is for. That window keeps the
+                        // focus, but the tiled one still comes into view under
+                        // it and counts as the strip's last focus, so the
+                        // dialog does not leave it parked off screen.
+                        let floating = ctx.windows.get_managed(current_entity).is_some_and(
+                            |(_, _, managed)| matches!(managed, Some(Unmanaged::Floating)),
+                        );
+                        if floating
+                            && let Some((_, strip, _)) = workspaces
+                                .iter()
+                                .find(|(_, strip, _)| strip.contains(entity))
+                        {
+                            focus_history.record(strip.id(), entity, None);
+                            ctx.commands.ensure_visible(entity);
+                        }
                         (current_window, current_entity, current)
                     }
                     // Nothing we track answers to that id, so the event really
@@ -1114,6 +1131,7 @@ pub(super) fn window_destroyed_trigger(
     mut global_state: GlobalState,
     windows: Windows,
     awaiting: Query<(), With<AwaitingHandle>>,
+    focus_history: Res<FocusHistory>,
     mut overrides: ResMut<TileOverrides>,
     mut commands: Commands,
 ) {
@@ -1164,11 +1182,24 @@ pub(super) fn window_destroyed_trigger(
             .focused()
             .and_then(|(_, focused)| windows.get_managed(focused))
             .is_some_and(|(_, focused, unmanaged)| focused != entity && unmanaged.is_none());
-        if !has_focused_survivor {
+        // A closing floating window, such as a dialog, hands the focus back
+        // to the strip window that had it last, which is the one its app
+        // returns to, rather than to whichever column sits mid-display.
+        let strip = active_display.active_strip();
+        let returns_to = windows
+            .get_managed(entity)
+            .is_some_and(|(_, _, managed)| matches!(managed, Some(Unmanaged::Floating)))
+            .then(|| focus_history.last_managed(strip.id()))
+            .flatten()
+            .filter(|&last| strip.contains(last) && windows.get(last).is_some());
+        if let Some(last) = returns_to.filter(|_| !has_focused_survivor) {
+            global_state.set_ffm_flag(None);
+            commands.focus_entity(last, true);
+        } else if !has_focused_survivor {
             give_away_focus(
                 entity,
                 &windows,
-                active_display.active_strip(),
+                strip,
                 &active_display.bounds(),
                 &mut global_state,
                 &mut commands,
