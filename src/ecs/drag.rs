@@ -103,21 +103,15 @@ pub(crate) struct LayoutSnapshot {
 
 impl LayoutSnapshot {
     /// The display under `pointer`. Displays that touch share an edge row or
-    /// column, so that row belongs to the display it starts, and only a
-    /// display's far edges count for it alone.
+    /// column, which belongs to the display it starts, so a display's far
+    /// edges count for it only where no other display starts.
     pub(crate) fn display_under(&self, pointer: IVec2) -> Option<&DisplaySnap> {
-        let displays = &self.managed_strip_displays;
-        displays
+        self.managed_strip_displays
             .iter()
-            .find(|display| {
-                let bounds = display.bounds;
-                (bounds.min.x..bounds.max.x).contains(&pointer.x)
-                    && (bounds.min.y..bounds.max.y).contains(&pointer.y)
-            })
-            .or_else(|| {
-                displays
-                    .iter()
-                    .find(|display| display.bounds.contains(pointer))
+            .filter(|display| display.bounds.contains(pointer))
+            .min_by_key(|display| {
+                u8::from(pointer.x == display.bounds.max.x)
+                    + u8::from(pointer.y == display.bounds.max.y)
             })
     }
 }

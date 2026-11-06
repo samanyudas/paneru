@@ -799,6 +799,8 @@ fn a_shared_display_edge_belongs_to_the_display_it_starts() {
         assert_eq!(at(-1), Some(DISPLAY), "the upper display's last row");
         assert_eq!(at(-768), Some(DISPLAY), "the upper display's top edge");
         assert_eq!(at(768), Some(LOWER), "the lower display's bottom edge");
+        let corner = display_of(hit_test(&snap, e[2], IVec2::new(1024, 0), |_| 5));
+        assert_eq!(corner, Some(LOWER), "the shared row at the far right edge");
     }
 }
 
