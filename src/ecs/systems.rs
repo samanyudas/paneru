@@ -5,6 +5,7 @@ use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
+use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{
     Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
 };
@@ -708,26 +709,64 @@ pub(super) fn retry_front_switch(
     }
 }
 
-/// Upper bound on the timestep fed into [`ease_out_factor`].
-///
-/// When the event loop wakes from an idle sleep (up to 500ms, or 2s in low
-/// power mode), `Time::delta_secs_f64()` reports the entire sleep duration on
-/// the wakeup frame. Feeding that straight into the exponential decay would
-/// consume almost the entire distance on Frame 0 and turn the animation into a
-/// single-frame jump. Cap each frame's step to a 30fps tick (matching the
-/// scroll integrator's `MAX_STEP_SECS`) so the wakeup frame steps smoothly.
+/// Upper bound on a pass's animation time while motion is already running:
+/// a 30fps tick, matching the scroll integrator's `MAX_STEP_SECS`, so a
+/// stalled pass steps on instead of jumping.
 const MAX_ANIMATION_STEP_SECS: f64 = 1.0 / 30.0;
 
-/// Animates window movement.
+/// The animation time of this pass, in seconds, which every ease steps by.
+///
+/// With nothing in motion the pump sleeps up to 500ms (2s in low power mode)
+/// until an event, such as a key press, wakes it. `Time` is sampled before
+/// the pump, so that sleep shows up in the delta of the next two passes: the
+/// sleep of the pass before the key in the key's pass, and the sleep the key
+/// cut short in the pass after. None of it is animation time. Counted, capped
+/// at a 30fps tick, it made each of a keyboard slide's first two steps cover
+/// 37% of what was left at speed 14, where a 16 ms frame covers 20%.
+#[derive(Clone, Copy, Debug, Default, Resource)]
+pub(crate) struct AnimationStep {
+    secs: f64,
+    /// How long the last pump slept with nothing in motion.
+    idle_sleep: f64,
+}
+
+impl AnimationStep {
+    pub(crate) fn secs(self) -> f64 {
+        self.secs
+    }
+}
+
+/// How much of a pass's `delta` an ease steps by. A pass that starts with
+/// nothing in motion counts at most one active frame, so a slide's first
+/// step is one frame's share. Once motion runs, the idle sleep that the
+/// starting pass's pump took is left out, and a late pass counts its whole
+/// time up to a 30fps tick, so the slide keeps its pace.
+fn animation_step(delta: f64, idle_sleep: f64, moving: bool) -> f64 {
+    if moving {
+        (delta - idle_sleep).clamp(0.0, MAX_ANIMATION_STEP_SECS)
+    } else {
+        delta.min(f64::from(LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS) / 1000.0)
+    }
+}
+
+/// Sets [`AnimationStep`] before the pump, while [`FrameActivity`] still
+/// describes how the previous pass ended.
+pub(crate) fn step_animation_clock(
+    activity: FrameActivity,
+    time: Res<Time>,
+    mut step: ResMut<AnimationStep>,
+) {
+    step.secs = animation_step(time.delta_secs_f64(), step.idle_sleep, activity.mid_frame());
+}
+
 /// Fraction of the remaining distance an exponential ease-out consumes in a
-/// frame, given a decay `rate` (per second) and the frame's `delta` in seconds.
-/// Shared by the reposition and resize animators so the two never drift out of step.
+/// frame, given a decay `rate` (per second) and the pass's [`AnimationStep`]
+/// `delta` in seconds. Shared by every animator so they never drift out of step.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "clamped to [0, 1], well within f32's range; only sub-pixel precision is lost"
 )]
 pub(crate) fn ease_out_factor(rate: f64, delta: f64) -> f32 {
-    let delta = delta.min(MAX_ANIMATION_STEP_SECS);
     (1.0 - (-rate * delta).exp()).clamp(0.0, 1.0) as f32
 }
 
@@ -753,19 +792,19 @@ pub(crate) fn ease_step(current: Origin, target: Origin, t: f32) -> (Origin, boo
 ///
 /// * `windows` - A `Populated` query for `(&mut Window, Entity, &RepositionMarker)` components.
 /// * `displays` - A query for all `Display` entities, used to get display bounds and menubar height.
-/// * `time` - The Bevy `Time` resource for calculating delta time.
+/// * `step` - The pass's [`AnimationStep`], the time each ease steps by.
 /// * `config` - The `Config` resource, used for animation speed.
 ///
 /// [`finish_repositions`] ends the move once the window is at its target.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
     animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
-    time: Res<Time>,
+    step: Res<AnimationStep>,
     config: Res<Config>,
 ) {
     // Frame-rate-independent exponential smoothing (ease-out).
     // `animation_speed` is the decay rate (per second); higher = snappier.
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = ease_out_factor(config.animation_speed(), step.secs());
 
     animate
         .into_iter()
@@ -808,12 +847,12 @@ pub(super) fn finish_repositions(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
     animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
-    time: Res<Time>,
+    step: Res<AnimationStep>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
     // Matches animate_entities: exponential ease-out, frame-rate independent.
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = ease_out_factor(config.animation_speed(), step.secs());
 
     animate
         .into_iter()
@@ -864,6 +903,7 @@ pub(crate) fn pump_events(
     incoming_events: Option<NonSend<Receiver<Event>>>,
     platform: Option<NonSendMut<Pin<Box<PlatformCallbacks>>>>,
     activity: FrameActivity,
+    mut step: ResMut<AnimationStep>,
     mut timeout: Local<u32>,
     mut last_tap_check: Local<Option<Instant>>,
 ) {
@@ -876,7 +916,14 @@ pub(crate) fn pump_events(
     // floor under how soon a pump could start, so an event landing right after
     // one returned had to wait out the rest of it. That latency is worse than
     // the redundant work skipping the wait costs.
+    let moving = activity.mid_frame();
+    let slept_from = Instant::now();
     platform.pump_cocoa_event_loop(f64::from(*timeout) / 1000.0);
+    step.idle_sleep = if moving {
+        0.0
+    } else {
+        slept_from.elapsed().as_secs_f64()
+    };
 
     let deadline = Instant::now() + PUMP_BUDGET;
     let mut received_events = Vec::new();
@@ -2387,6 +2434,34 @@ mod startup_tests {
         app.update();
 
         assert_eq!(app.should_exit(), Some(AppExit::Success));
+    }
+}
+
+#[cfg(test)]
+mod animation_step_tests {
+    use super::animation_step;
+
+    fn assert_secs(got: f64, want: f64) {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "stepped {got} s, expected {want} s"
+        );
+    }
+
+    #[test]
+    fn the_pass_that_starts_a_move_counts_one_frame_of_its_idle_sleep() {
+        assert_secs(animation_step(0.5, 0.48, false), 0.016);
+    }
+
+    #[test]
+    fn the_pass_after_a_key_cut_a_200_ms_sleep_short_counts_only_its_own_5_ms() {
+        assert_secs(animation_step(0.205, 0.2, true), 0.005);
+    }
+
+    #[test]
+    fn a_pass_mid_slide_counts_its_whole_time_up_to_a_30fps_tick() {
+        assert_secs(animation_step(0.025, 0.0, true), 0.025);
+        assert_secs(animation_step(0.5, 0.0, true), 1.0 / 30.0);
     }
 }
 

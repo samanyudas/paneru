@@ -17,6 +17,7 @@ mod shared_edge;
 mod side_by_side;
 mod slice_input;
 mod slice_photos;
+mod slide_ease;
 mod stacks;
 mod state;
 mod tabbed_display;

@@ -29,7 +29,7 @@ use crate::ecs::pacing::{self, SlideHolds};
 use crate::ecs::shared_edge::{
     EdgeSlice, Hold, PhotoWait, Slide, showing_edge_slices, showing_may_change,
 };
-use crate::ecs::systems::{self, ease_out_factor, ease_step};
+use crate::ecs::systems::{self, AnimationStep, ease_out_factor, ease_step};
 use crate::ecs::{Position, PostUpdateSet, PresentedOrigin, RepositionMarker};
 use crate::events::Event;
 use crate::manager::window_writer::LANDING_TIMEOUT;
@@ -518,16 +518,18 @@ type Sliding<'w, 's> = Query<
 /// after [`LANDING_TIMEOUT`] if it does not. Until then the window holds
 /// under the photo, and then it moves on to where layout puts it. A window
 /// whose photo does not show moves at once.
+#[allow(clippy::too_many_arguments)]
 fn slide_photos(
     mut sliding: Sliding,
     displays: Query<&Display>,
     slices: Res<Slices>,
     holds: Res<SlideHolds>,
     time: Res<Time>,
+    step: Res<AnimationStep>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = ease_out_factor(config.animation_speed(), step.secs());
     for (entity, window, mut slide, mut position, presented, tucked) in &mut sliding {
         let id = window.id();
         let Ok(mut entity_commands) = commands.get_entity(entity) else {
@@ -600,10 +602,11 @@ fn slide_photos_out(
     holds: Res<SlideHolds>,
     access: Res<SliceAccess>,
     time: Res<Time>,
+    step: Res<AnimationStep>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = ease_out_factor(config.animation_speed(), step.secs());
     let mut moved_out = Vec::<Out>::new();
     for entity in Out::nearest_first(&sliding) {
         let Ok((entity, window, mut slide, mut position, presented, _)) = sliding.get_mut(entity)

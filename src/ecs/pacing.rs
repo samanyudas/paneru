@@ -39,7 +39,7 @@ use tracing::{debug, warn};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::shared_edge::Slide;
-use crate::ecs::systems::{ease_out_factor, ease_step};
+use crate::ecs::systems::{AnimationStep, ease_out_factor, ease_step};
 use crate::ecs::{FocusedMarker, Position, PresentedOrigin, RepositionMarker};
 use crate::manager::Window;
 use crate::manager::window_writer::LANDING_TIMEOUT;
@@ -397,6 +397,7 @@ pub(super) fn pace_rows(
     strips: Query<&LayoutStrip>,
     mut windows: RowWindows,
     time: Res<Time>,
+    step: Res<AnimationStep>,
     config: Res<Config>,
     mut slide_holds: ResMut<SlideHolds>,
     mut tracked: Local<EntityHashMap<Tracked>>,
@@ -434,7 +435,7 @@ pub(super) fn pace_rows(
     slide_holds.landed = landed(&rows, &windows, &shown);
 
     let now = time.elapsed();
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = ease_out_factor(config.animation_speed(), step.secs());
     for row in rows {
         let mut row = row
             .into_iter()
