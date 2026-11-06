@@ -101,6 +101,27 @@ pub(crate) struct LayoutSnapshot {
     pub managed_strip_displays: Vec<DisplaySnap>,
 }
 
+impl LayoutSnapshot {
+    /// The display under `pointer`. Displays that touch share an edge row or
+    /// column, so that row belongs to the display it starts, and only a
+    /// display's far edges count for it alone.
+    pub(crate) fn display_under(&self, pointer: IVec2) -> Option<&DisplaySnap> {
+        let displays = &self.managed_strip_displays;
+        displays
+            .iter()
+            .find(|display| {
+                let bounds = display.bounds;
+                (bounds.min.x..bounds.max.x).contains(&pointer.x)
+                    && (bounds.min.y..bounds.max.y).contains(&pointer.y)
+            })
+            .or_else(|| {
+                displays
+                    .iter()
+                    .find(|display| display.bounds.contains(pointer))
+            })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DisplaySnap {
     pub id: DisplayId,
@@ -176,11 +197,7 @@ pub(crate) fn hit_test(
     pointer: IVec2,
     limit: impl Fn(DisplayId) -> usize,
 ) -> DropTarget {
-    let Some(display) = snapshot
-        .managed_strip_displays
-        .iter()
-        .find(|display| display.bounds.contains(pointer))
-    else {
+    let Some(display) = snapshot.display_under(pointer) else {
         return DropTarget::Home;
     };
     // A window alone in its column, or a native tab group alone in it,
@@ -886,10 +903,7 @@ fn hold_zone(
     physical_displays: &[(DisplayId, IRect)],
     pointer: IVec2,
 ) -> Option<HoldZone> {
-    let display = snapshot
-        .managed_strip_displays
-        .iter()
-        .find(|display| display.bounds.contains(pointer))?;
+    let display = snapshot.display_under(pointer)?;
     let (bounds, viewport) = (display.bounds, display.viewport);
     let band = |side: EdgeSide| {
         let touches = |other: &IRect| {
@@ -987,9 +1001,8 @@ fn drag_edge_scroll(
     );
     let mut current = None;
     for (entity, hold) in &mut holds {
-        let held = snapshot.managed_strip_displays.iter().any(|display| {
+        let held = snapshot.display_under(drag.pointer).is_some_and(|display| {
             display.id == hold.zone.display
-                && display.bounds.contains(drag.pointer)
                 && hold.zone.x.contains(&x_on(display.bounds, drag.pointer))
         });
         if held {

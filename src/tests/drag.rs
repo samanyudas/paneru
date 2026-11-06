@@ -762,6 +762,46 @@ fn between_displays_the_target_is_under_the_pointer_on_its_display() {
     );
 }
 
+/// Stacked displays share one row. It belongs to the display it starts, so
+/// a pointer in the lower display's menu bar picks the lower display, in
+/// whichever order the displays are listed.
+#[test]
+fn a_shared_display_edge_belongs_to_the_display_it_starts() {
+    const LOWER: u32 = 2;
+    let e = entities(3);
+    let upper = DisplaySnap {
+        id: DISPLAY,
+        bounds: IRect::new(0, -768, 1024, 0),
+        viewport: IRect::new(0, -748, 1024, 0),
+        columns: vec![column(0, 0..1024, vec![band(&[e[0]], -748..0)])],
+    };
+    let lower = DisplaySnap {
+        id: LOWER,
+        bounds: IRect::new(0, 0, 1024, 768),
+        viewport: IRect::new(0, 20, 1024, 768),
+        columns: vec![column(0, 0..1024, vec![band(&[e[1]], 20..768)])],
+    };
+    let display_of = |target: DropTarget| match target {
+        DropTarget::IntoColumn { display, .. }
+        | DropTarget::NewColumn { display, .. }
+        | DropTarget::Refused { display, .. } => Some(display),
+        DropTarget::Home => None,
+    };
+    for displays in [
+        vec![upper.clone(), lower.clone()],
+        vec![lower.clone(), upper.clone()],
+    ] {
+        let snap = LayoutSnapshot {
+            managed_strip_displays: displays,
+        };
+        let at = |y| display_of(hit_test(&snap, e[2], IVec2::new(500, y), |_| 5));
+        assert_eq!(at(0), Some(LOWER), "the shared row");
+        assert_eq!(at(-1), Some(DISPLAY), "the upper display's last row");
+        assert_eq!(at(-768), Some(DISPLAY), "the upper display's top edge");
+        assert_eq!(at(768), Some(LOWER), "the lower display's bottom edge");
+    }
+}
+
 #[test]
 fn empty_space_opens_a_new_column_at_the_nearest_end() {
     let e = entities(3);
