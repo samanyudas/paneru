@@ -209,6 +209,21 @@ fn fitting_origin_x(
     (minimum <= maximum).then(|| target.clamp(minimum, maximum))
 }
 
+/// For a strip wider than its viewport, the origin closest to `target` that
+/// leaves no empty space past either end, when `target` would leave some.
+/// A column that leaves a strip keeps the strip's scroll, so the strip moves
+/// only to close a gap at an end.
+fn closing_end_gap_x(
+    target: i32,
+    content: std::ops::Range<i32>,
+    viewport: std::ops::Range<i32>,
+) -> Option<i32> {
+    let right_end_on_edge = viewport.end - content.end;
+    let left_end_on_edge = viewport.start - content.start;
+    let clamped = target.clamp(right_end_on_edge, left_end_on_edge);
+    (clamped != target).then_some(clamped)
+}
+
 /// How far a stored width may drift before a [`ManualStripOffset`] counts as
 /// stale. `window_frame_update` writes back the OS geometry, which can
 /// land a pixel or two off the size the layout asked for.
@@ -2892,7 +2907,9 @@ pub(super) fn reshuffle_layout_strip(
             }
         }
 
-        let mut desired_min = if refit || arrival.is_some() {
+        // A refit keeps the strip's scroll, so the columns past the one that
+        // left slide into its space instead of holding their pushed place.
+        let mut desired_min = if arrival.is_some() {
             frame.min
         } else {
             projected_min
@@ -2929,15 +2946,14 @@ pub(super) fn reshuffle_layout_strip(
 
         let refitted_x = if refit && !config.auto_center() {
             content.and_then(|range| {
-                fitting_origin_x(
-                    if config.continuous_swipe() {
-                        strip_target.x
-                    } else {
-                        strip_position.x
-                    },
-                    range,
-                    display_bounds.min.x..display_bounds.max.x,
-                )
+                let target = if config.continuous_swipe() {
+                    strip_target.x
+                } else {
+                    strip_position.x
+                };
+                let viewport = display_bounds.min.x..display_bounds.max.x;
+                fitting_origin_x(target, range.clone(), viewport.clone())
+                    .or_else(|| closing_end_gap_x(target, range, viewport))
             })
         } else {
             None
