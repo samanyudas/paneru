@@ -1086,7 +1086,10 @@ pub(crate) fn window_frame_update(
         {
             entity_commands.try_remove::<DeferredFrameRead>();
         }
-        if swiping || hidden || !(moved || resized || (tiled && tiling.due(entity))) {
+        if swiping
+            || hidden
+            || !(moved || resized || (tiled && tiling.due(entity, strip.map(|(strip, _)| strip))))
+        {
             continue;
         }
         // The engine's own write is still on its way. A tile restore or a
@@ -1115,7 +1118,7 @@ pub(crate) fn window_frame_update(
                 entity,
                 new_frame,
                 IRect::from_corners(position.0, position.0 + bounds.0),
-                strip.map(|(_, position)| position.0.x),
+                strip.map(|(strip, position)| (strip, position.0.x)),
                 window.margins(),
                 &mut commands,
             )

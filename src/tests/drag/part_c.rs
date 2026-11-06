@@ -637,6 +637,125 @@ fn macos_half_quarter_and_fill_after_a_drop_return_to_the_windows_place() {
     }
 }
 
+/// A snapping app such as Magnet sets frames that macOS never tiles to, such
+/// as thirds, right after a drop at the screen's bottom edge. The window
+/// still goes back to its place with its own size.
+#[test]
+fn a_snapping_apps_third_after_a_drop_returns_to_the_windows_place() {
+    for snap in [IRect::new(341, 20, 683, 768), IRect::new(0, 394, 683, 768)] {
+        let mut harness = three_columns();
+        let start = frame(harness.world(), 2);
+        let point = Origin::new(grab(start).x, TEST_DISPLAY_HEIGHT - 1);
+        press_and_drag(&mut harness, 2, point);
+        release(&mut harness, point);
+        macos_tile(&mut harness, 2, snap);
+        harness.advance(SETTLE);
+        assert_eq!(
+            layout(harness.world()),
+            vec![vec![0], vec![1], vec![2]],
+            "{snap:?}"
+        );
+        assert_eq!(frame(harness.world(), 2).size(), start.size(), "{snap:?}");
+        crate::assert_focused!(harness.world(), 2);
+    }
+}
+
+/// An app's own resize well after a drop is still the app's size.
+#[test]
+fn an_apps_resize_long_after_a_drop_keeps_its_width() {
+    let mut harness = three_columns();
+    let start = frame(harness.world(), 2);
+    let point = grab(start) + IVec2::new(0, 200);
+    press_and_drag(&mut harness, 2, point);
+    release(&mut harness, point);
+    harness.advance(SETTLE);
+    let home = frame(harness.world(), 2);
+    assert_eq!(home.size(), start.size());
+    let mut resized = home;
+    resized.max.x = resized.min.x + 300;
+    macos_tile(&mut harness, 2, resized);
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), 2).width(), 300);
+}
+
+/// An app like T3 Code can apply the engine's writes well after the engine
+/// sent them, one by one with pauses, and cut each size write short so that
+/// its bottom edge stays on screen. The frames it reports meanwhile are not
+/// its own size, so the engine never starts the move home again from one of
+/// them, and the window ends in its column's frame.
+#[test]
+fn frames_an_app_reports_while_it_lags_behind_the_engine_are_not_its_size() {
+    let mut harness = harness_with(
+        "[options]\nanimation_speed = 14.0\n",
+        TEST_DISPLAY_HEIGHT,
+        3,
+    );
+    let id = 2;
+    let start = frame(harness.world(), id);
+    let low = grab(start) + IVec2::new(0, 380);
+    press_and_drag(&mut harness, id, low);
+    harness.mock_state.update_window(id, |window| {
+        window.resize_bottom_limit = Some(TEST_DISPLAY_HEIGHT);
+        window.late_writes = Some(Vec::new());
+    });
+    release(&mut harness, low);
+    // The app reports a frame cut short at the screen's bottom edge while
+    // the engine moves the window home.
+    let dropped = frame(harness.world(), id);
+    let cut = IRect::from_corners(dropped.min, Origin::new(dropped.max.x, TEST_DISPLAY_HEIGHT));
+    harness
+        .mock_state
+        .update_window(id, |window| window.frame = cut);
+    harness
+        .world()
+        .write_message(Event::WindowResized { window_id: id });
+    for _ in 0..30 {
+        harness.advance(FRAME);
+    }
+    harness.mock_state.update_window(id, |window| {
+        assert!(
+            window
+                .late_writes
+                .as_ref()
+                .is_some_and(|late| !late.is_empty()),
+            "the engine moved the window home"
+        );
+    });
+    // The app catches up in bursts of 20 writes every 300 ms, and its
+    // frame holds still between them. The window only ever rises toward
+    // its slot: the engine never starts the move again from a lower place.
+    let mut top = cut.min.y;
+    for _ in 0..20 {
+        for _ in 0..20 {
+            harness.mock_state.os_apply_late_write(id);
+        }
+        for _ in 0..15 {
+            harness.advance(FRAME);
+        }
+        let mut now = 0;
+        harness
+            .mock_state
+            .update_window(id, |window| now = window.frame.min.y);
+        assert!(now <= top, "the window went back down from {top} to {now}");
+        top = now;
+    }
+    harness.mock_state.os_apply_late_writes(id);
+    harness.advance(SETTLE);
+    let writes = |harness: &TestHarness| {
+        let mut writes = 0;
+        harness.mock_state.update_window(id, |window| {
+            writes = window.position_writes + window.resize_writes;
+        });
+        writes
+    };
+    let settled = writes(&harness);
+    harness.advance(SETTLE);
+    assert_eq!(writes(&harness), settled, "the engine is done writing");
+    let home = frame(harness.world(), id);
+    assert_eq!(home.size(), start.size());
+    assert_eq!(home.min.y, start.min.y);
+}
+
 /// The menu bar belongs to its display, so a pointer there picks the
 /// column below it, as one point lower does.
 #[test]
@@ -3981,7 +4100,9 @@ fn drop_slot_same_display_replaces_a_preexisting_tile_hold() {
     drop_slot_survives_a_preexisting_tile_hold(false);
 }
 
-fn drop_slot_survives_an_adopting_resize(cross_display: bool, settling: bool) {
+/// A size macOS reports while a drag holds the window waits for the drop,
+/// which retires it and keeps the drop's slot.
+fn drop_slot_survives_an_adopting_resize(cross_display: bool) {
     for native_tabs in [false, true] {
         let config =
             crate::config::Config::try_from("[options]\nauto_center = false\nstack_limit = 2\n")
@@ -4021,27 +4142,15 @@ fn drop_slot_survives_an_adopting_resize(cross_display: bool, settling: bool) {
             let native =
                 IRect::from_corners(current.min, current.min + IVec2::new(560 + id * 10, 748));
             macos_tile(&mut harness, id, native);
-            if settling {
-                harness.mock_state.update_window(id, |window| {
-                    window.frame_read_failures = u8::MAX;
-                });
-            }
         }
-        if settling {
-            harness.advance(ms(240));
-            for &id in &members {
-                harness.mock_state.update_window(id, |window| {
-                    window.frame_read_failures = 0;
-                });
-            }
-        }
+        harness.advance(ms(240));
         for &id in &members {
             let entity = window_entity(&mut harness, id);
             let start = harness
                 .world()
                 .get::<crate::ecs::drag::NativeResizeStart>(entity)
                 .expect("native resize remains pending at drop");
-            assert_eq!(start.needs_frame(), !settling);
+            assert!(start.needs_frame());
         }
         release(&mut harness, point);
         if cross_display {
@@ -4055,7 +4164,7 @@ fn drop_slot_survives_an_adopting_resize(cross_display: bool, settling: bool) {
             assert_eq!(
                 frame(harness.world(), id),
                 accepted,
-                "accepted cached frame, cross={cross_display}, settling={settling}, tabs={native_tabs}, id={id}"
+                "accepted cached frame, cross={cross_display}, tabs={native_tabs}, id={id}"
             );
             harness.mock_state.update_window(id, |window| {
                 assert_eq!(window.frame, accepted, "accepted mock frame, id={id}");
@@ -4083,22 +4192,12 @@ fn drop_slot_survives_an_adopting_resize(cross_display: bool, settling: bool) {
 
 #[test]
 fn drop_slot_same_display_preserves_bounds_when_retiring_an_observing_resize() {
-    drop_slot_survives_an_adopting_resize(false, false);
+    drop_slot_survives_an_adopting_resize(false);
 }
 
 #[test]
 fn drop_slot_cross_display_preserves_bounds_when_retiring_an_observing_resize() {
-    drop_slot_survives_an_adopting_resize(true, false);
-}
-
-#[test]
-fn drop_slot_same_display_preserves_bounds_when_retiring_a_settling_resize() {
-    drop_slot_survives_an_adopting_resize(false, true);
-}
-
-#[test]
-fn drop_slot_cross_display_preserves_bounds_when_retiring_a_settling_resize() {
-    drop_slot_survives_an_adopting_resize(true, true);
+    drop_slot_survives_an_adopting_resize(true);
 }
 
 /// macOS moves window `id` into the main display's space, as it does once a
