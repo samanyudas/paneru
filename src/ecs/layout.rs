@@ -2892,7 +2892,9 @@ pub(super) fn reshuffle_layout_strip(
             }
         }
 
-        let mut desired_min = if refit || arrival.is_some() {
+        // A refit keeps the strip's scroll, so the columns past the one that
+        // left slide into its space instead of holding their pushed place.
+        let mut desired_min = if arrival.is_some() {
             frame.min
         } else {
             projected_min
