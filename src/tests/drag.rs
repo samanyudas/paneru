@@ -61,6 +61,27 @@ fn down(window: Entity, point: IVec2) -> DragInput {
             top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: true,
             screen_edges: bevy::math::BVec2::FALSE,
+            on_resize_edge: false,
+        }),
+    }
+}
+
+/// A press that [`PointerResize`] tracks as able to resize the window.
+fn down_on_edge(window: Entity, point: IVec2) -> DragInput {
+    let DragInput::Down {
+        point,
+        button,
+        window: Some(pressed),
+    } = down(window, point)
+    else {
+        unreachable!("down always presses a window");
+    };
+    DragInput::Down {
+        point,
+        button,
+        window: Some(PressedWindow {
+            on_resize_edge: true,
+            ..pressed
         }),
     }
 }
@@ -127,6 +148,7 @@ fn other_presses_never_start_a_drag() {
             top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: false,
             screen_edges: bevy::math::BVec2::FALSE,
+            on_resize_edge: false,
         }),
     };
     let right_button = DragInput::Down {
@@ -138,6 +160,7 @@ fn other_presses_never_start_a_drag() {
             top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: true,
             screen_edges: bevy::math::BVec2::FALSE,
+            on_resize_edge: false,
         }),
     };
     let no_window = DragInput::Down {
@@ -243,7 +266,7 @@ fn a_resize_is_not_a_drag() {
     // no edge stays in place and the grabbed corner follows the pointer.
     let corner = FRAME_RECT.min + IVec2::new(2, 2);
     let (state, _) = run(&[
-        down(w, corner),
+        down_on_edge(w, corner),
         DragInput::Dragged {
             point: corner - IVec2::splat(40),
         },

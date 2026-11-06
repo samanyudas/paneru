@@ -1163,6 +1163,46 @@ fn tiling_restore_matches_the_native_frame_of_a_padded_window() {
     }
 }
 
+/// With Option held, a corner resize grows the window from its center, so
+/// no edge stays in place. A press two points inside the visible corner of a
+/// padded window is on the resize edge, and the gesture never becomes a drag.
+#[test]
+fn a_symmetric_corner_resize_of_a_padded_window_is_not_a_drag() {
+    let mut harness = three_columns();
+    let padding = (14, 12);
+    harness.mock_state.update_window(1, |window| {
+        window.horizontal_padding = padding.0;
+        window.vertical_padding = padding.1;
+    });
+    harness.advance(SETTLE);
+    let before = frame(harness.world(), 1);
+    let corner = before.min + Origin::new(padding.0 + 2, padding.1 + 2);
+    press_at(&mut harness, corner);
+    harness.advance(FRAME);
+    for grown in [8, 16, 24, 32, 40] {
+        harness
+            .world()
+            .write_message(mouse_dragged(corner - Origin::splat(grown)));
+        harness
+            .mock_state
+            .update_window(1, |window| window.frame = before.inflate(grown));
+        for event in [
+            Event::WindowMoved { window_id: 1 },
+            Event::WindowResized { window_id: 1 },
+        ] {
+            harness.world().write_message(event);
+        }
+        harness.advance(FRAME);
+        assert!(
+            !matches!(drag_state(harness.world()), DragState::Dragging(_)),
+            "grown by {grown}"
+        );
+    }
+    release(&mut harness, corner - Origin::splat(40));
+    harness.advance(SETTLE);
+    assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
+}
+
 #[test]
 fn a_lost_mouse_up_keeps_grace_for_a_delayed_manual_edge_resize() {
     for pointer_moved in [false, true] {

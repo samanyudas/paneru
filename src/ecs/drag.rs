@@ -398,6 +398,9 @@ pub(crate) struct PressedWindow {
     /// Per axis, whether the window's frame touches a display edge on that
     /// axis, so macOS can hold the window on it while the pointer moves.
     pub screen_edges: BVec2,
+    /// Whether the press is on an edge of the window's visible frame, where
+    /// it can resize the window, as [`PointerResize`] tracks it.
+    pub on_resize_edge: bool,
 }
 
 /// One thing that happened, as the drag state machine sees it.
@@ -456,6 +459,8 @@ pub(crate) struct Press {
     pub button_up_since: Option<Duration>,
     /// Per axis, whether a display edge can hold the window on that axis.
     pub screen_edges: BVec2,
+    /// Whether the press can resize the window by an edge.
+    pub on_resize_edge: bool,
     /// When the button went down.
     pub at: Duration,
 }
@@ -717,6 +722,7 @@ fn press(
         window_moved: None,
         button_up_since: None,
         screen_edges: window.screen_edges,
+        on_resize_edge: window.on_resize_edge,
         at: now,
     })
 }
@@ -749,7 +755,7 @@ fn pressed(
         DragInput::WindowMoved { window, frame } if window == press.window => {
             let moved = if frame.size() == press.frame.size() {
                 frame.min - press.frame.min
-            } else if on_resize_edge(press.frame, press.point) || kept_an_edge(press.frame, frame) {
+            } else if press.on_resize_edge || kept_an_edge(press.frame, frame) {
                 // A press on an edge may resize the window, from its center
                 // with Option held, and a resize from an edge or a corner
                 // keeps the opposite edge in place.
@@ -800,12 +806,6 @@ fn pressed(
 fn kept_an_edge(pressed: IRect, frame: IRect) -> bool {
     (frame.min.x == pressed.min.x || frame.max.x == pressed.max.x)
         && (frame.min.y == pressed.min.y || frame.max.y == pressed.max.y)
-}
-
-/// Whether `point` is in the band along the edges of `frame` where a press
-/// can resize the window.
-fn on_resize_edge(frame: IRect, point: IVec2) -> bool {
-    !frame.inflate(-tiling::EDGE_TOLERANCE).contains(point)
 }
 
 /// Where the point grabbed at the press is in `frame`, at the same share of
@@ -1246,6 +1246,7 @@ pub(super) fn drag_events(
     config: Res<Config>,
     mut native: ResMut<NativeMembership>,
     mut undo: ResMut<DropUndo>,
+    resize: Res<PointerResize>,
     mut commands: Commands,
 ) {
     let now = time.elapsed();
@@ -1253,6 +1254,8 @@ pub(super) fn drag_events(
         let Some(input) = drag_input(
             event,
             &state,
+            &resize,
+            now,
             &window_manager,
             &windows,
             &moves,
@@ -1312,9 +1315,12 @@ pub(super) fn drag_events(
 }
 
 /// The drag input `event` makes, if it makes one.
+#[allow(clippy::too_many_arguments)]
 fn drag_input(
     event: &Event,
     state: &DragState,
+    resize: &PointerResize,
+    now: Duration,
     window_manager: &WindowManager,
     windows: &WindowInfo,
     moves: &DisplayMoves,
@@ -1359,7 +1365,11 @@ fn drag_input(
             DragInput::Down {
                 point: origin_from(*point),
                 button: *button,
-                window: pressed_window(origin_from(*point), on_top, moves, presented, placements),
+                window: pressed_window(origin_from(*point), on_top, moves, presented, placements)
+                    .map(|window| PressedWindow {
+                        on_resize_edge: resize.resizes(window.entity, now),
+                        ..window
+                    }),
             }
         }
         Event::MouseDragged {
@@ -1449,6 +1459,7 @@ fn pressed_window(
         top_bar_height,
         tiled: true,
         screen_edges: screen_edges(frame, moves),
+        on_resize_edge: false,
     };
 
     if let Some((entity, window, unmanaged, _)) = on_top {
@@ -1469,6 +1480,7 @@ fn pressed_window(
                 top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
                 tiled: false,
                 screen_edges: BVec2::FALSE,
+                on_resize_edge: false,
             });
         }
     }
