@@ -114,7 +114,7 @@ impl Plugin for MaximizePlugin {
 }
 
 /// Toggles the focused window on the maximize command.
-fn command_toggle(
+pub(crate) fn command_toggle(
     mut messages: MessageReader<Event>,
     focused: Query<Entity, With<FocusedMarker>>,
     mut commands: Commands,
