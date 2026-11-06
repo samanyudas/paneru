@@ -747,18 +747,22 @@ fn pressed(
             }
         }
         DragInput::WindowMoved { window, frame } if window == press.window => {
-            if frame.size() != press.frame.size() {
+            let moved = if frame.size() == press.frame.size() {
+                frame.min - press.frame.min
+            } else if kept_an_edge(press.frame, frame) {
+                // An edge or corner resize keeps the opposite edge in place.
                 return DragState::Unconfirmed(press);
-            }
-            let moved = frame.min - press.frame.min;
+            } else {
+                // macOS gives a window it tiled its earlier size back as the
+                // next title-bar drag starts, and keeps the grabbed point at
+                // the same share of the title bar.
+                grabbed_point(&press, frame) - press.point
+            };
             // An app reporting a move it did not make, or a move too small to
             // tell apart from a click, says nothing about a drag.
             if past_threshold(moved) {
                 press.window_moved = Some(moved);
             }
-        }
-        DragInput::WindowResized { window } if window == press.window => {
-            return DragState::Unconfirmed(press);
         }
         DragInput::Up { .. } | DragInput::Moved { .. } => return DragState::Idle,
         _ => return DragState::Pressed(press),
@@ -787,6 +791,25 @@ fn pressed(
         }),
         _ => DragState::Pressed(press),
     }
+}
+
+/// Whether `frame` kept an edge of `pressed` in place on each axis, as a
+/// resize from an edge or a corner does.
+fn kept_an_edge(pressed: IRect, frame: IRect) -> bool {
+    (frame.min.x == pressed.min.x || frame.max.x == pressed.max.x)
+        && (frame.min.y == pressed.min.y || frame.max.y == pressed.max.y)
+}
+
+/// Where the point grabbed at the press is in `frame`, at the same share of
+/// the window's width and the same distance below its top.
+fn grabbed_point(press: &Press, frame: IRect) -> IVec2 {
+    let width = i64::from(press.frame.width().max(1));
+    let along = i64::from(press.point.x - press.frame.min.x);
+    let x = along * i64::from(frame.width()) / width;
+    IVec2::new(
+        frame.min.x + i32::try_from(x).unwrap_or(i32::MAX),
+        frame.min.y + (press.point.y - press.frame.min.y),
+    )
 }
 
 /// Whether a window move of `moved` follows a pointer move of `pointer`.

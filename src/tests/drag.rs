@@ -219,12 +219,14 @@ fn a_resize_is_not_a_drag() {
         point: PRESS + IVec2::new(0, 30),
     };
 
+    // A resize notification alone neither confirms a drag nor ends the
+    // press, because macOS also resizes a window it tiled as a drag starts.
     let (state, _) = run(&[
         down(w, PRESS),
         dragged,
         DragInput::WindowResized { window: w },
     ]);
-    assert!(is_unconfirmed(&state), "a resize notification: {state:?}");
+    assert!(is_pressed(&state), "a resize notification: {state:?}");
 
     // Dragging the top edge moves the origin and changes the size together.
     let top_edge = DragInput::WindowMoved {
@@ -236,6 +238,30 @@ fn a_resize_is_not_a_drag() {
         is_unconfirmed(&state),
         "a move that changes the size: {state:?}"
     );
+}
+
+/// macOS gives a window it tiled its earlier size back as the next title-bar
+/// drag starts, keeping the grabbed point at the same share of the title
+/// bar. The drag is confirmed by that point, not by the window's corner.
+#[test]
+fn a_window_macos_resizes_as_a_drag_starts_is_dragged_by_its_grabbed_point() {
+    let w = entities(1)[0];
+    let pointer = PRESS + IVec2::new(200, 0);
+    let after = |frame: IRect| {
+        run(&[
+            down(w, PRESS),
+            DragInput::Dragged { point: pointer },
+            DragInput::WindowResized { window: w },
+            DragInput::WindowMoved { window: w, frame },
+        ])
+        .0
+    };
+    // Twice as wide, with the grabbed point a quarter of the way across.
+    let state = after(IRect::new(100, 20, 900, 620));
+    assert!(matches!(state, DragState::Dragging(_)), "{state:?}");
+    // The same size, but the grabbed point is not under the pointer.
+    let state = after(IRect::new(400, 20, 1200, 620));
+    assert!(!matches!(state, DragState::Dragging(_)), "{state:?}");
 }
 
 #[test]
@@ -393,14 +419,23 @@ fn a_released_unconfirmed_drag_can_expire_or_be_cancelled() {
         DragInput::Dragged { point: sample },
         DragInput::Up { point: sample },
     ]);
-    for input in [
-        DragInput::WindowResized { window: w },
+    let (state, effects) = step(
+        released.clone(),
         DragInput::WindowGone { window: w },
-    ] {
-        let (state, effects) = step(released.clone(), input, ms(60), &hit_at);
-        assert_eq!(state, DragState::Idle);
-        assert_eq!(effects, Vec::<DragEffect>::new());
-    }
+        ms(60),
+        &hit_at,
+    );
+    assert_eq!(state, DragState::Idle);
+    assert_eq!(effects, Vec::<DragEffect>::new());
+    // A resize alone keeps waiting for the window's move.
+    let (state, effects) = step(
+        released.clone(),
+        DragInput::WindowResized { window: w },
+        ms(60),
+        &hit_at,
+    );
+    assert!(matches!(state, DragState::Released { .. }), "{state:?}");
+    assert_eq!(effects, Vec::<DragEffect>::new());
     let (state, effects) = step(released.clone(), down(w, PRESS), ms(60), &hit_at);
     assert!(is_pressed(&state));
     assert_eq!(effects, Vec::<DragEffect>::new());
