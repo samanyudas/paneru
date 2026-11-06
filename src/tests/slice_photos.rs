@@ -2148,9 +2148,6 @@ fn the_column_ahead_waits_for_a_slow_window_landing_under_its_photo() {
         .with_display(EXT_DISPLAY_ID, LEFT, vec![EXT_WORKSPACE_ID])
         .with_app(FAST_APP, "fast", "FastApp", |_| {});
     harness.mock_state.queue_writes(TEST_PROCESS_ID);
-    harness
-        .mock_state
-        .set_write_delay(TEST_PROCESS_ID, Duration::from_millis(40));
     for (id, width) in (0..).zip([300, 300, 300, 900]) {
         let pid = if id == SLOW {
             TEST_PROCESS_ID
@@ -2212,15 +2209,20 @@ fn the_column_ahead_waits_for_a_slow_window_landing_under_its_photo() {
     harness
         .world()
         .write_message(command(Operation::Focus(Direction::West)));
-    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    // The slow app's writes stay held through each pass and land after it,
+    // so it shows each move one pass late on any machine. A real write
+    // delay let a loaded machine run the frames past `LANDING_TIMEOUT`,
+    // where the row stops waiting for an app that has stalled.
     let mut seen = Vec::new();
     for _ in 0..80 {
         harness.advance(Duration::from_millis(20));
         paint_asked(&mut harness, &log, &ids);
-        std::thread::sleep(Duration::from_millis(20));
         seen.push(scanline(&harness, &log, &ids));
+        harness.mock_state.release_writes(TEST_PROCESS_ID);
+        assert!(harness.mock_state.flush_writes(Duration::from_secs(5)));
+        harness.mock_state.hold_writes(TEST_PROCESS_ID);
     }
-    assert!(harness.mock_state.flush_writes(Duration::from_secs(5)));
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
 
     for (frame, runs) in seen.iter().enumerate() {
         let slow = runs.iter().find(|run| run.window == SLOW);
