@@ -776,6 +776,76 @@ fn a_drop_on_another_display_that_macos_tiles_keeps_the_drops_place() {
     assert!(failures.is_empty(), "{failures:?}");
 }
 
+/// Drags window `id` by its title bar to `to`, as [`press_and_drag`] does,
+/// while macOS gives the window `untiled` at the first move. A window that
+/// macOS tiled gets its size from before that tile back as soon as a
+/// title-bar drag moves it, even after the engine resized it since.
+fn press_and_drag_untiling(harness: &mut TestHarness, id: WinID, to: Origin, untiled: IVec2) {
+    let start = frame(harness.world(), id);
+    let press = grab(start);
+    press_at(harness, press);
+    harness.advance(FRAME);
+    let steps = 6;
+    for at in 1..=steps {
+        let point = press + (to - press) * at / steps;
+        harness.world().write_message(mouse_dragged(point));
+        harness
+            .mock_state
+            .os_move_window(id, start.min + (point - press));
+        if at == 1 {
+            harness.mock_state.os_resize_window(id, untiled);
+        }
+        harness.advance(FRAME);
+    }
+}
+
+/// #123: Sam's drops that still ended on the source display were drags of
+/// a window that macOS had tiled at an earlier drop. macOS gave the window
+/// its size from before that tile at the first move of the next drag, and
+/// the drop counted as no drag. A drop on another display ends where the
+/// same drop ends when macOS leaves the window's size alone, whether or not
+/// macOS then tiles it.
+#[test]
+fn a_drop_on_another_display_keeps_its_place_when_macos_untiles_the_window_at_the_first_move() {
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    let visible_top = ext.min.y + TEST_MENUBAR_HEIGHT;
+    let bottom_right_quarter = IRect::new(
+        ext.center().x,
+        i32::midpoint(visible_top, ext.max.y),
+        ext.max.x,
+        ext.max.y,
+    );
+    let far_corner = Origin::new(ext.max.x - 1, ext.max.y - 1);
+    let expected = drop_on_ext_that_macos_tiles(far_corner, bottom_right_quarter, None);
+    assert_eq!(expected.ext, vec![vec![100], vec![2]]);
+    let mut failures = Vec::new();
+    for tiled in [false, true] {
+        let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+        let start = frame(harness.world(), 2);
+        let untiled = start.size() - IVec2::new(0, 100);
+        press_and_drag_untiling(&mut harness, 2, far_corner, untiled);
+        macos_moves_to_ext(&mut harness, 2);
+        release(&mut harness, far_corner);
+        if tiled {
+            macos_tile(&mut harness, 2, bottom_right_quarter);
+        }
+        harness.advance(SETTLE);
+        let world = harness.world();
+        let actual = DropOutcome {
+            frame: frame(world, 2),
+            ext: layout_on(world, EXT_WORKSPACE_ID),
+            main: layout_on(world, TEST_WORKSPACE_ID),
+        };
+        if actual != expected {
+            failures.push((if tiled { "tiled" } else { "not tiled" }, actual));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "expected {expected:?}, got {failures:?}"
+    );
+}
+
 #[test]
 fn green_button_tiling_without_a_drag_restores_the_existing_frame() {
     for tile in [
