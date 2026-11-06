@@ -61,6 +61,27 @@ fn down(window: Entity, point: IVec2) -> DragInput {
             top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: true,
             screen_edges: bevy::math::BVec2::FALSE,
+            on_resize_edge: false,
+        }),
+    }
+}
+
+/// A press that [`PointerResize`] tracks as able to resize the window.
+fn down_on_edge(window: Entity, point: IVec2) -> DragInput {
+    let DragInput::Down {
+        point,
+        button,
+        window: Some(pressed),
+    } = down(window, point)
+    else {
+        unreachable!("down always presses a window");
+    };
+    DragInput::Down {
+        point,
+        button,
+        window: Some(PressedWindow {
+            on_resize_edge: true,
+            ..pressed
         }),
     }
 }
@@ -127,6 +148,7 @@ fn other_presses_never_start_a_drag() {
             top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: false,
             screen_edges: bevy::math::BVec2::FALSE,
+            on_resize_edge: false,
         }),
     };
     let right_button = DragInput::Down {
@@ -138,6 +160,7 @@ fn other_presses_never_start_a_drag() {
             top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
             tiled: true,
             screen_edges: bevy::math::BVec2::FALSE,
+            on_resize_edge: false,
         }),
     };
     let no_window = DragInput::Down {
@@ -219,12 +242,14 @@ fn a_resize_is_not_a_drag() {
         point: PRESS + IVec2::new(0, 30),
     };
 
+    // A resize notification alone neither confirms a drag nor ends the
+    // press, because macOS also resizes a window it tiled as a drag starts.
     let (state, _) = run(&[
         down(w, PRESS),
         dragged,
         DragInput::WindowResized { window: w },
     ]);
-    assert!(is_unconfirmed(&state), "a resize notification: {state:?}");
+    assert!(is_pressed(&state), "a resize notification: {state:?}");
 
     // Dragging the top edge moves the origin and changes the size together.
     let top_edge = DragInput::WindowMoved {
@@ -236,6 +261,48 @@ fn a_resize_is_not_a_drag() {
         is_unconfirmed(&state),
         "a move that changes the size: {state:?}"
     );
+
+    // With Option held, a corner resize grows the window from its center, so
+    // no edge stays in place and the grabbed corner follows the pointer.
+    let corner = FRAME_RECT.min + IVec2::new(2, 2);
+    let (state, _) = run(&[
+        down_on_edge(w, corner),
+        DragInput::Dragged {
+            point: corner - IVec2::splat(40),
+        },
+        DragInput::WindowMoved {
+            window: w,
+            frame: FRAME_RECT.inflate(40),
+        },
+    ]);
+    assert!(
+        is_unconfirmed(&state),
+        "a symmetric corner resize: {state:?}"
+    );
+}
+
+/// macOS gives a window it tiled its earlier size back as the next title-bar
+/// drag starts, keeping the grabbed point at the same share of the title
+/// bar. The drag is confirmed by that point, not by the window's corner.
+#[test]
+fn a_window_macos_resizes_as_a_drag_starts_is_dragged_by_its_grabbed_point() {
+    let w = entities(1)[0];
+    let pointer = PRESS + IVec2::new(200, 0);
+    let after = |frame: IRect| {
+        run(&[
+            down(w, PRESS),
+            DragInput::Dragged { point: pointer },
+            DragInput::WindowResized { window: w },
+            DragInput::WindowMoved { window: w, frame },
+        ])
+        .0
+    };
+    // Twice as wide, with the grabbed point a quarter of the way across.
+    let state = after(IRect::new(100, 20, 900, 620));
+    assert!(matches!(state, DragState::Dragging(_)), "{state:?}");
+    // The same size, but the grabbed point is not under the pointer.
+    let state = after(IRect::new(400, 20, 1200, 620));
+    assert!(!matches!(state, DragState::Dragging(_)), "{state:?}");
 }
 
 #[test]
@@ -393,14 +460,23 @@ fn a_released_unconfirmed_drag_can_expire_or_be_cancelled() {
         DragInput::Dragged { point: sample },
         DragInput::Up { point: sample },
     ]);
-    for input in [
-        DragInput::WindowResized { window: w },
+    let (state, effects) = step(
+        released.clone(),
         DragInput::WindowGone { window: w },
-    ] {
-        let (state, effects) = step(released.clone(), input, ms(60), &hit_at);
-        assert_eq!(state, DragState::Idle);
-        assert_eq!(effects, Vec::<DragEffect>::new());
-    }
+        ms(60),
+        &hit_at,
+    );
+    assert_eq!(state, DragState::Idle);
+    assert_eq!(effects, Vec::<DragEffect>::new());
+    // A resize alone keeps waiting for the window's move.
+    let (state, effects) = step(
+        released.clone(),
+        DragInput::WindowResized { window: w },
+        ms(60),
+        &hit_at,
+    );
+    assert!(matches!(state, DragState::Released { .. }), "{state:?}");
+    assert_eq!(effects, Vec::<DragEffect>::new());
     let (state, effects) = step(released.clone(), down(w, PRESS), ms(60), &hit_at);
     assert!(is_pressed(&state));
     assert_eq!(effects, Vec::<DragEffect>::new());
@@ -760,6 +836,48 @@ fn between_displays_the_target_is_under_the_pointer_on_its_display() {
         },
         "the middle of that column"
     );
+}
+
+/// Stacked displays share one row. It belongs to the display it starts, so
+/// a pointer in the lower display's menu bar picks the lower display, in
+/// whichever order the displays are listed.
+#[test]
+fn a_shared_display_edge_belongs_to_the_display_it_starts() {
+    const LOWER: u32 = 2;
+    let e = entities(3);
+    let upper = DisplaySnap {
+        id: DISPLAY,
+        bounds: IRect::new(0, -768, 1024, 0),
+        viewport: IRect::new(0, -748, 1024, 0),
+        columns: vec![column(0, 0..1024, vec![band(&[e[0]], -748..0)])],
+    };
+    let lower = DisplaySnap {
+        id: LOWER,
+        bounds: IRect::new(0, 0, 1024, 768),
+        viewport: IRect::new(0, 20, 1024, 768),
+        columns: vec![column(0, 0..1024, vec![band(&[e[1]], 20..768)])],
+    };
+    let display_of = |target: DropTarget| match target {
+        DropTarget::IntoColumn { display, .. }
+        | DropTarget::NewColumn { display, .. }
+        | DropTarget::Refused { display, .. } => Some(display),
+        DropTarget::Home => None,
+    };
+    for displays in [
+        vec![upper.clone(), lower.clone()],
+        vec![lower.clone(), upper.clone()],
+    ] {
+        let snap = LayoutSnapshot {
+            managed_strip_displays: displays,
+        };
+        let at = |y| display_of(hit_test(&snap, e[2], IVec2::new(500, y), |_| 5));
+        assert_eq!(at(0), Some(LOWER), "the shared row");
+        assert_eq!(at(-1), Some(DISPLAY), "the upper display's last row");
+        assert_eq!(at(-768), Some(DISPLAY), "the upper display's top edge");
+        assert_eq!(at(768), Some(LOWER), "the lower display's bottom edge");
+        let corner = display_of(hit_test(&snap, e[2], IVec2::new(1024, 0), |_| 5));
+        assert_eq!(corner, Some(LOWER), "the shared row at the far right edge");
+    }
 }
 
 #[test]

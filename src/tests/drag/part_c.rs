@@ -637,6 +637,23 @@ fn macos_half_quarter_and_fill_after_a_drop_return_to_the_windows_place() {
     }
 }
 
+/// The menu bar belongs to its display, so a pointer there picks the
+/// column below it, as one point lower does.
+#[test]
+fn a_drop_with_the_pointer_in_the_menu_bar_lands_as_just_below_it() {
+    let drop_at = |y: i32| {
+        let mut harness = three_columns();
+        let point = middle_of(harness.world(), 0, y);
+        press_and_drag(&mut harness, 2, point);
+        release(&mut harness, point);
+        harness.advance(SETTLE);
+        (layout(harness.world()), frame(harness.world(), 2))
+    };
+    let below = drop_at(20);
+    assert_ne!(below.0, vec![vec![0], vec![1], vec![2]]);
+    assert_eq!(drop_at(5), below);
+}
+
 #[test]
 fn a_drag_that_macos_tiles_at_a_screen_edge_returns_to_its_column() {
     for (to, tile) in [
@@ -667,6 +684,166 @@ fn a_drag_that_macos_tiles_at_a_screen_edge_returns_to_its_column() {
         assert_eq!(frame(harness.world(), 1).size(), start.size(), "{to:?}");
         crate::assert_focused!(harness.world(), 1);
     }
+}
+
+/// Where window 2 and both strips end after a title-bar drop at `to` on
+/// the external display, with macOS tiling it to `tile` there. `order`
+/// says when the engine reads the tile: `None` never, as with the macOS
+/// tiling options off.
+fn drop_on_ext_that_macos_tiles(to: Origin, tile: IRect, order: Option<&str>) -> DropOutcome {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    press_and_drag(&mut harness, 2, to);
+    // The drag already carried the window onto the external display, so
+    // macOS files it in that display's space before the release.
+    macos_moves_to_ext(&mut harness, 2);
+    match order {
+        None => release(&mut harness, to),
+        // macOS applies the tile on mouse-up, so its move and resize can
+        // reach the engine in the same frame as the release.
+        Some("same frame as the release") => {
+            harness
+                .mock_state
+                .update_window(2, |window| window.frame = tile);
+            for event in [
+                Event::WindowMoved { window_id: 2 },
+                Event::WindowResized { window_id: 2 },
+            ] {
+                harness.world().write_message(event);
+            }
+            release(&mut harness, to);
+        }
+        Some("frame after the release") => {
+            release(&mut harness, to);
+            macos_tile(&mut harness, 2, tile);
+        }
+        Some(other) => panic!("unknown order {other}"),
+    }
+    harness.advance(SETTLE);
+    let world = harness.world();
+    DropOutcome {
+        frame: frame(world, 2),
+        ext: layout_on(world, EXT_WORKSPACE_ID),
+        main: layout_on(world, TEST_WORKSPACE_ID),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct DropOutcome {
+    frame: IRect,
+    ext: Vec<Vec<WinID>>,
+    main: Vec<Vec<WinID>>,
+}
+
+/// #123: a drop on another display that macOS then tiles ends where the
+/// same drop ends with the macOS tiling options off. macOS tiles a quarter
+/// when the pointer reaches a top corner, which puts it in the menu bar,
+/// while the window stays below it.
+#[test]
+fn a_drop_on_another_display_that_macos_tiles_keeps_the_drops_place() {
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    let visible_top = ext.min.y + TEST_MENUBAR_HEIGHT;
+    let top_right_quarter = IRect::new(
+        ext.center().x,
+        visible_top,
+        ext.max.x,
+        i32::midpoint(visible_top, ext.max.y),
+    );
+    let mut failures = Vec::new();
+    for (pointer, y) in [
+        ("below the menu bar", 300),
+        ("in the menu bar", ext.min.y + 5),
+    ] {
+        let far_corner = Origin::new(ext.max.x - 1, y);
+        let below_the_menu_bar = Origin::new(far_corner.x, y.max(visible_top));
+        let expected = drop_on_ext_that_macos_tiles(below_the_menu_bar, top_right_quarter, None);
+        assert_eq!(expected.ext, vec![vec![100], vec![2]], "{pointer}");
+        assert!(
+            ext.contains(expected.frame.center()),
+            "{pointer}: {expected:?}"
+        );
+        assert_ne!(expected.frame, top_right_quarter, "{pointer}");
+        for order in [
+            None,
+            Some("frame after the release"),
+            Some("same frame as the release"),
+        ] {
+            let actual = drop_on_ext_that_macos_tiles(far_corner, top_right_quarter, order);
+            if actual != expected {
+                failures.push((pointer, order, expected.frame, actual));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+/// Drags window `id` by its title bar to `to`, as [`press_and_drag`] does,
+/// while macOS gives the window `untiled` at the first move. A window that
+/// macOS tiled gets its size from before that tile back as soon as a
+/// title-bar drag moves it, even after the engine resized it since.
+fn press_and_drag_untiling(harness: &mut TestHarness, id: WinID, to: Origin, untiled: IVec2) {
+    let start = frame(harness.world(), id);
+    let press = grab(start);
+    press_at(harness, press);
+    harness.advance(FRAME);
+    let steps = 6;
+    for at in 1..=steps {
+        let point = press + (to - press) * at / steps;
+        harness.world().write_message(mouse_dragged(point));
+        harness
+            .mock_state
+            .os_move_window(id, start.min + (point - press));
+        if at == 1 {
+            harness.mock_state.os_resize_window(id, untiled);
+        }
+        harness.advance(FRAME);
+    }
+}
+
+/// #123: Sam's drops that still ended on the source display were drags of
+/// a window that macOS had tiled at an earlier drop. macOS gave the window
+/// its size from before that tile at the first move of the next drag, and
+/// the drop counted as no drag. A drop on another display ends where the
+/// same drop ends when macOS leaves the window's size alone, whether or not
+/// macOS then tiles it.
+#[test]
+fn a_drop_on_another_display_keeps_its_place_when_macos_untiles_the_window_at_the_first_move() {
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    let visible_top = ext.min.y + TEST_MENUBAR_HEIGHT;
+    let bottom_right_quarter = IRect::new(
+        ext.center().x,
+        i32::midpoint(visible_top, ext.max.y),
+        ext.max.x,
+        ext.max.y,
+    );
+    let far_corner = Origin::new(ext.max.x - 1, ext.max.y - 1);
+    let expected = drop_on_ext_that_macos_tiles(far_corner, bottom_right_quarter, None);
+    assert_eq!(expected.ext, vec![vec![100], vec![2]]);
+    let mut failures = Vec::new();
+    for tiled in [false, true] {
+        let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+        let start = frame(harness.world(), 2);
+        let untiled = start.size() - IVec2::new(0, 100);
+        press_and_drag_untiling(&mut harness, 2, far_corner, untiled);
+        macos_moves_to_ext(&mut harness, 2);
+        release(&mut harness, far_corner);
+        if tiled {
+            macos_tile(&mut harness, 2, bottom_right_quarter);
+        }
+        harness.advance(SETTLE);
+        let world = harness.world();
+        let actual = DropOutcome {
+            frame: frame(world, 2),
+            ext: layout_on(world, EXT_WORKSPACE_ID),
+            main: layout_on(world, TEST_WORKSPACE_ID),
+        };
+        if actual != expected {
+            failures.push((if tiled { "tiled" } else { "not tiled" }, actual));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "expected {expected:?}, got {failures:?}"
+    );
 }
 
 #[test]
@@ -984,6 +1161,46 @@ fn tiling_restore_matches_the_native_frame_of_a_padded_window() {
             assert_eq!(frame(harness.world(), 0), before);
         }
     }
+}
+
+/// With Option held, a corner resize grows the window from its center, so
+/// no edge stays in place. A press two points inside the visible corner of a
+/// padded window is on the resize edge, and the gesture never becomes a drag.
+#[test]
+fn a_symmetric_corner_resize_of_a_padded_window_is_not_a_drag() {
+    let mut harness = three_columns();
+    let padding = (14, 12);
+    harness.mock_state.update_window(1, |window| {
+        window.horizontal_padding = padding.0;
+        window.vertical_padding = padding.1;
+    });
+    harness.advance(SETTLE);
+    let before = frame(harness.world(), 1);
+    let corner = before.min + Origin::new(padding.0 + 2, padding.1 + 2);
+    press_at(&mut harness, corner);
+    harness.advance(FRAME);
+    for grown in [8, 16, 24, 32, 40] {
+        harness
+            .world()
+            .write_message(mouse_dragged(corner - Origin::splat(grown)));
+        harness
+            .mock_state
+            .update_window(1, |window| window.frame = before.inflate(grown));
+        for event in [
+            Event::WindowMoved { window_id: 1 },
+            Event::WindowResized { window_id: 1 },
+        ] {
+            harness.world().write_message(event);
+        }
+        harness.advance(FRAME);
+        assert!(
+            !matches!(drag_state(harness.world()), DragState::Dragging(_)),
+            "grown by {grown}"
+        );
+    }
+    release(&mut harness, corner - Origin::splat(40));
+    harness.advance(SETTLE);
+    assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
 }
 
 #[test]

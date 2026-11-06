@@ -101,6 +101,21 @@ pub(crate) struct LayoutSnapshot {
     pub managed_strip_displays: Vec<DisplaySnap>,
 }
 
+impl LayoutSnapshot {
+    /// The display under `pointer`. Displays that touch share an edge row or
+    /// column, which belongs to the display it starts, so a display's far
+    /// edges count for it only where no other display starts.
+    pub(crate) fn display_under(&self, pointer: IVec2) -> Option<&DisplaySnap> {
+        self.managed_strip_displays
+            .iter()
+            .filter(|display| display.bounds.contains(pointer))
+            .min_by_key(|display| {
+                u8::from(pointer.x == display.bounds.max.x)
+                    + u8::from(pointer.y == display.bounds.max.y)
+            })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DisplaySnap {
     pub id: DisplayId,
@@ -176,11 +191,7 @@ pub(crate) fn hit_test(
     pointer: IVec2,
     limit: impl Fn(DisplayId) -> usize,
 ) -> DropTarget {
-    let Some(display) = snapshot
-        .managed_strip_displays
-        .iter()
-        .find(|display| display.bounds.contains(pointer))
-    else {
+    let Some(display) = snapshot.display_under(pointer) else {
         return DropTarget::Home;
     };
     // A window alone in its column, or a native tab group alone in it,
@@ -387,6 +398,9 @@ pub(crate) struct PressedWindow {
     /// Per axis, whether the window's frame touches a display edge on that
     /// axis, so macOS can hold the window on it while the pointer moves.
     pub screen_edges: BVec2,
+    /// Whether the press is on an edge of the window's visible frame, where
+    /// it can resize the window, as [`PointerResize`] tracks it.
+    pub on_resize_edge: bool,
 }
 
 /// One thing that happened, as the drag state machine sees it.
@@ -445,6 +459,8 @@ pub(crate) struct Press {
     pub button_up_since: Option<Duration>,
     /// Per axis, whether a display edge can hold the window on that axis.
     pub screen_edges: BVec2,
+    /// Whether the press can resize the window by an edge.
+    pub on_resize_edge: bool,
     /// When the button went down.
     pub at: Duration,
 }
@@ -706,6 +722,7 @@ fn press(
         window_moved: None,
         button_up_since: None,
         screen_edges: window.screen_edges,
+        on_resize_edge: window.on_resize_edge,
         at: now,
     })
 }
@@ -736,18 +753,24 @@ fn pressed(
             }
         }
         DragInput::WindowMoved { window, frame } if window == press.window => {
-            if frame.size() != press.frame.size() {
+            let moved = if frame.size() == press.frame.size() {
+                frame.min - press.frame.min
+            } else if press.on_resize_edge || kept_an_edge(press.frame, frame) {
+                // A press on an edge may resize the window, from its center
+                // with Option held, and a resize from an edge or a corner
+                // keeps the opposite edge in place.
                 return DragState::Unconfirmed(press);
-            }
-            let moved = frame.min - press.frame.min;
+            } else {
+                // macOS gives a window it tiled its earlier size back as the
+                // next title-bar drag starts, and keeps the grabbed point at
+                // the same share of the title bar.
+                grabbed_point(&press, frame) - press.point
+            };
             // An app reporting a move it did not make, or a move too small to
             // tell apart from a click, says nothing about a drag.
             if past_threshold(moved) {
                 press.window_moved = Some(moved);
             }
-        }
-        DragInput::WindowResized { window } if window == press.window => {
-            return DragState::Unconfirmed(press);
         }
         DragInput::Up { .. } | DragInput::Moved { .. } => return DragState::Idle,
         _ => return DragState::Pressed(press),
@@ -776,6 +799,25 @@ fn pressed(
         }),
         _ => DragState::Pressed(press),
     }
+}
+
+/// Whether `frame` kept an edge of `pressed` in place on each axis, as a
+/// resize from an edge or a corner does.
+fn kept_an_edge(pressed: IRect, frame: IRect) -> bool {
+    (frame.min.x == pressed.min.x || frame.max.x == pressed.max.x)
+        && (frame.min.y == pressed.min.y || frame.max.y == pressed.max.y)
+}
+
+/// Where the point grabbed at the press is in `frame`, at the same share of
+/// the window's width and the same distance below its top.
+fn grabbed_point(press: &Press, frame: IRect) -> IVec2 {
+    let width = i64::from(press.frame.width().max(1));
+    let along = i64::from(press.point.x - press.frame.min.x);
+    let x = along * i64::from(frame.width()) / width;
+    IVec2::new(
+        frame.min.x + i32::try_from(x).unwrap_or(i32::MAX),
+        frame.min.y + (press.point.y - press.frame.min.y),
+    )
 }
 
 /// Whether a window move of `moved` follows a pointer move of `pointer`.
@@ -886,10 +928,7 @@ fn hold_zone(
     physical_displays: &[(DisplayId, IRect)],
     pointer: IVec2,
 ) -> Option<HoldZone> {
-    let display = snapshot
-        .managed_strip_displays
-        .iter()
-        .find(|display| display.bounds.contains(pointer))?;
+    let display = snapshot.display_under(pointer)?;
     let (bounds, viewport) = (display.bounds, display.viewport);
     let band = |side: EdgeSide| {
         let touches = |other: &IRect| {
@@ -987,9 +1026,8 @@ fn drag_edge_scroll(
     );
     let mut current = None;
     for (entity, hold) in &mut holds {
-        let held = snapshot.managed_strip_displays.iter().any(|display| {
+        let held = snapshot.display_under(drag.pointer).is_some_and(|display| {
             display.id == hold.zone.display
-                && display.bounds.contains(drag.pointer)
                 && hold.zone.x.contains(&x_on(display.bounds, drag.pointer))
         });
         if held {
@@ -1208,6 +1246,7 @@ pub(super) fn drag_events(
     config: Res<Config>,
     mut native: ResMut<NativeMembership>,
     mut undo: ResMut<DropUndo>,
+    resize: Res<PointerResize>,
     mut commands: Commands,
 ) {
     let now = time.elapsed();
@@ -1215,6 +1254,8 @@ pub(super) fn drag_events(
         let Some(input) = drag_input(
             event,
             &state,
+            &resize,
+            now,
             &window_manager,
             &windows,
             &moves,
@@ -1274,9 +1315,12 @@ pub(super) fn drag_events(
 }
 
 /// The drag input `event` makes, if it makes one.
+#[allow(clippy::too_many_arguments)]
 fn drag_input(
     event: &Event,
     state: &DragState,
+    resize: &PointerResize,
+    now: Duration,
     window_manager: &WindowManager,
     windows: &WindowInfo,
     moves: &DisplayMoves,
@@ -1321,7 +1365,11 @@ fn drag_input(
             DragInput::Down {
                 point: origin_from(*point),
                 button: *button,
-                window: pressed_window(origin_from(*point), on_top, moves, presented, placements),
+                window: pressed_window(origin_from(*point), on_top, moves, presented, placements)
+                    .map(|window| PressedWindow {
+                        on_resize_edge: resize.resizes(window.entity, now),
+                        ..window
+                    }),
             }
         }
         Event::MouseDragged {
@@ -1411,6 +1459,7 @@ fn pressed_window(
         top_bar_height,
         tiled: true,
         screen_edges: screen_edges(frame, moves),
+        on_resize_edge: false,
     };
 
     if let Some((entity, window, unmanaged, _)) = on_top {
@@ -1431,6 +1480,7 @@ fn pressed_window(
                 top_bar_height: FALLBACK_TOP_BAR_HEIGHT,
                 tiled: false,
                 screen_edges: BVec2::FALSE,
+                on_resize_edge: false,
             });
         }
     }
@@ -1711,7 +1761,7 @@ fn snapshot_of(
 
                 Some(DisplaySnap {
                     id: display.id(),
-                    bounds: display.bounds(),
+                    bounds: display.physical_bounds(),
                     viewport,
                     columns,
                 })
