@@ -669,6 +669,96 @@ fn a_drag_that_macos_tiles_at_a_screen_edge_returns_to_its_column() {
     }
 }
 
+/// Where window 2 and both strips end after a title-bar drop at `to` on
+/// the external display, with macOS tiling it to `tile` there. `order`
+/// says when the engine reads the tile: `None` never, as with the macOS
+/// tiling options off.
+fn drop_on_ext_that_macos_tiles(to: Origin, tile: IRect, order: Option<&str>) -> DropOutcome {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    press_and_drag(&mut harness, 2, to);
+    // The drag already carried the window onto the external display, so
+    // macOS files it in that display's space before the release.
+    macos_moves_to_ext(&mut harness, 2);
+    match order {
+        None => release(&mut harness, to),
+        // macOS applies the tile on mouse-up, so its move and resize can
+        // reach the engine in the same frame as the release.
+        Some("same frame as the release") => {
+            harness
+                .mock_state
+                .update_window(2, |window| window.frame = tile);
+            for event in [
+                Event::WindowMoved { window_id: 2 },
+                Event::WindowResized { window_id: 2 },
+            ] {
+                harness.world().write_message(event);
+            }
+            release(&mut harness, to);
+        }
+        Some("frame after the release") => {
+            release(&mut harness, to);
+            macos_tile(&mut harness, 2, tile);
+        }
+        Some(other) => panic!("unknown order {other}"),
+    }
+    harness.advance(SETTLE);
+    let world = harness.world();
+    DropOutcome {
+        frame: frame(world, 2),
+        ext: layout_on(world, EXT_WORKSPACE_ID),
+        main: layout_on(world, TEST_WORKSPACE_ID),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct DropOutcome {
+    frame: IRect,
+    ext: Vec<Vec<WinID>>,
+    main: Vec<Vec<WinID>>,
+}
+
+/// #123: a drop on another display that macOS then tiles ends where the
+/// same drop ends with the macOS tiling options off. macOS tiles a quarter
+/// when the pointer reaches a top corner, which puts it in the menu bar,
+/// while the window stays below it.
+#[test]
+fn a_drop_on_another_display_that_macos_tiles_keeps_the_drops_place() {
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    let visible_top = ext.min.y + TEST_MENUBAR_HEIGHT;
+    let top_right_quarter = IRect::new(
+        ext.center().x,
+        visible_top,
+        ext.max.x,
+        (visible_top + ext.max.y) / 2,
+    );
+    let mut failures = Vec::new();
+    for (pointer, y) in [
+        ("below the menu bar", 300),
+        ("in the menu bar", ext.min.y + 5),
+    ] {
+        let far_corner = Origin::new(ext.max.x - 1, y);
+        let below_the_menu_bar = Origin::new(far_corner.x, y.max(visible_top));
+        let expected = drop_on_ext_that_macos_tiles(below_the_menu_bar, top_right_quarter, None);
+        assert_eq!(expected.ext, vec![vec![100], vec![2]], "{pointer}");
+        assert!(
+            ext.contains(expected.frame.center()),
+            "{pointer}: {expected:?}"
+        );
+        assert_ne!(expected.frame, top_right_quarter, "{pointer}");
+        for order in [
+            None,
+            Some("frame after the release"),
+            Some("same frame as the release"),
+        ] {
+            let actual = drop_on_ext_that_macos_tiles(far_corner, top_right_quarter, order);
+            if actual != expected {
+                failures.push((pointer, order, expected.frame, actual));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
 #[test]
 fn green_button_tiling_without_a_drag_restores_the_existing_frame() {
     for tile in [
