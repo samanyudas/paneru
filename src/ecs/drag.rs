@@ -1711,7 +1711,7 @@ fn snapshot_of(
 
                 Some(DisplaySnap {
                     id: display.id(),
-                    bounds: display.bounds(),
+                    bounds: display.physical_bounds(),
                     viewport,
                     columns,
                 })

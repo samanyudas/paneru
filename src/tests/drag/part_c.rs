@@ -637,6 +637,23 @@ fn macos_half_quarter_and_fill_after_a_drop_return_to_the_windows_place() {
     }
 }
 
+/// The menu bar belongs to its display, so a pointer there picks the
+/// column below it, as one point lower does.
+#[test]
+fn a_drop_with_the_pointer_in_the_menu_bar_lands_as_just_below_it() {
+    let drop_at = |y: i32| {
+        let mut harness = three_columns();
+        let point = middle_of(harness.world(), 0, y);
+        press_and_drag(&mut harness, 2, point);
+        release(&mut harness, point);
+        harness.advance(SETTLE);
+        (layout(harness.world()), frame(harness.world(), 2))
+    };
+    let below = drop_at(20);
+    assert_ne!(below.0, vec![vec![0], vec![1], vec![2]]);
+    assert_eq!(drop_at(5), below);
+}
+
 #[test]
 fn a_drag_that_macos_tiles_at_a_screen_edge_returns_to_its_column() {
     for (to, tile) in [
@@ -729,7 +746,7 @@ fn a_drop_on_another_display_that_macos_tiles_keeps_the_drops_place() {
         ext.center().x,
         visible_top,
         ext.max.x,
-        (visible_top + ext.max.y) / 2,
+        i32::midpoint(visible_top, ext.max.y),
     );
     let mut failures = Vec::new();
     for (pointer, y) in [
