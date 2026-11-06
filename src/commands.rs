@@ -801,7 +801,7 @@ fn command_swap_focus(
 /// Toward another column, the whole column moves past every column between
 /// the two. Within a stack, the window trades places with the item in
 /// `direction`. Returns `None`, changing nothing, when nothing lies in
-/// `direction`.
+/// `direction`, or when the column already holds the place it names.
 fn swap_in_strip(strip: &mut LayoutStrip, current: Entity, direction: &Direction) -> Option<()> {
     let index = strip.index_of(current).ok()?;
     let other_window = get_window_in_direction(direction, current, strip)?;
@@ -811,18 +811,24 @@ fn swap_in_strip(strip: &mut LayoutStrip, current: Entity, direction: &Direction
         strip.len()
     );
 
-    if index == new_index
-        && let Some(Column::Stack(stack)) = strip.get_column_mut(index)
-    {
-        let pos_a = stack.iter().position(|i| i.contains(current))?;
-        let pos_b = stack.iter().position(|i| i.contains(other_window))?;
-        stack.swap(pos_a, pos_b);
-    } else if index < new_index {
-        (index..new_index).for_each(|idx| strip.swap(idx, idx + 1));
-    } else {
-        (new_index..index)
-            .rev()
-            .for_each(|idx| strip.swap(idx, idx + 1));
+    match index.cmp(&new_index) {
+        std::cmp::Ordering::Less => {
+            (index..new_index).for_each(|idx| strip.swap(idx, idx + 1));
+        }
+        std::cmp::Ordering::Greater => {
+            (new_index..index)
+                .rev()
+                .for_each(|idx| strip.swap(idx, idx + 1));
+        }
+        std::cmp::Ordering::Equal if matches!(direction, Direction::North | Direction::South) => {
+            let Some(Column::Stack(stack)) = strip.get_column_mut(index) else {
+                return None;
+            };
+            let pos_a = stack.iter().position(|i| i.contains(current))?;
+            let pos_b = stack.iter().position(|i| i.contains(other_window))?;
+            stack.swap(pos_a, pos_b);
+        }
+        std::cmp::Ordering::Equal => return None,
     }
     Some(())
 }

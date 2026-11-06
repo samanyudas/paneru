@@ -6,9 +6,9 @@ use std::time::Duration;
 use bevy::prelude::*;
 
 use crate::commands::{Command, Direction, MoveFocus, Operation, Reach, Side};
-use crate::ecs::SelectedVirtualMarker;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::LayoutStrip;
+use crate::ecs::{FocusedMarker, SelectedVirtualMarker};
 use crate::events::Event;
 use crate::manager::{Origin, Window};
 use crate::platform::{WinID, WorkspaceId};
@@ -832,4 +832,92 @@ fn wheel_and_direct_horizontal_operations_stay_in_the_strip() {
         assert_eq!(columns(harness.world(), EXT_WORKSPACE_ID), [vec![100]]);
         assert_focused!(harness.world(), focused);
     }
+}
+
+/// The columns of the strip and the focused window after a swap toward each
+/// of `ends`, each from a fresh strip that `setup` builds.
+fn after_each_swap(
+    ends: [Direction; 2],
+    setup: impl Fn() -> TestHarness,
+) -> Vec<(Direction, Vec<Vec<WinID>>, Vec<WinID>)> {
+    ends.into_iter()
+        .map(|end| {
+            let mut harness = setup();
+            harness.run(vec![command(Operation::Swap(end.clone()))]);
+            let world = harness.world();
+            let focused = world
+                .query_filtered::<&Window, With<FocusedMarker>>()
+                .iter(world)
+                .map(|window| window.id())
+                .collect();
+            (end, columns(world, TEST_WORKSPACE_ID), focused)
+        })
+        .collect()
+}
+
+/// From a lower member of a stack in the first column, a swap to the first
+/// place changes nothing.
+#[test]
+fn swapping_the_first_column_first_does_nothing() {
+    let setup = || stacked_beside(external_bounds(&Direction::North), &[]);
+    let unchanged = vec![vec![0, 1, 2], vec![3]];
+    assert_eq!(
+        after_each_swap([Direction::First, Direction::Nth(0)], setup),
+        [
+            (Direction::First, unchanged.clone(), vec![1]),
+            (Direction::Nth(0), unchanged, vec![1]),
+        ]
+    );
+}
+
+/// From a lower member of a stack in the last column, a swap to the last
+/// place changes nothing.
+#[test]
+fn swapping_the_last_column_last_does_nothing() {
+    let setup = || {
+        let mut harness = stacked_beside(external_bounds(&Direction::North), &[]);
+        harness.run(vec![command(Operation::Swap(Direction::Last))]);
+        harness.advance(SETTLE);
+        assert_eq!(
+            columns(harness.world(), TEST_WORKSPACE_ID),
+            [vec![3], vec![0, 1, 2]]
+        );
+        harness
+    };
+    let unchanged = vec![vec![3], vec![0, 1, 2]];
+    assert_eq!(
+        after_each_swap([Direction::Last, Direction::Nth(1)], setup),
+        [
+            (Direction::Last, unchanged.clone(), vec![1]),
+            (Direction::Nth(1), unchanged, vec![1]),
+        ]
+    );
+}
+
+/// A stacked column in the middle of the strip moves to the first place
+/// whole, its members in order.
+#[test]
+fn swapping_a_middle_stack_first_moves_the_whole_column() {
+    let mut harness = TestHarness::new().with_windows(5);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    harness.advance(SETTLE);
+    assert_eq!(
+        columns(harness.world(), TEST_WORKSPACE_ID),
+        [vec![0], vec![1], vec![2, 3], vec![4]]
+    );
+    assert_focused!(harness.world(), 3);
+
+    harness.run(vec![command(Operation::Swap(Direction::First))]);
+    assert_eq!(
+        columns(harness.world(), TEST_WORKSPACE_ID),
+        [vec![2, 3], vec![0], vec![1], vec![4]]
+    );
+    assert_focused!(harness.world(), 3);
 }
