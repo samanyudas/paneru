@@ -1088,6 +1088,65 @@ fn test_stale_focus_event_ignored() {
         .run(commands);
 }
 
+/// An office app opens a document together with its tip-of-the-day dialog and
+/// reports the dialog as its focused window. The dialog floats and keeps the
+/// focus, but the document must still come into view under it, and closing the
+/// dialog must hand the focus to the document rather than to whichever column
+/// sits in the middle of the display.
+#[test]
+fn a_window_opened_with_a_focused_dialog_comes_into_view_and_takes_focus_when_it_closes() {
+    const DIALOG_PID: i32 = TEST_PROCESS_ID + 1;
+    const DOCUMENT: WinID = 10;
+    const DIALOG: WinID = 11;
+
+    let mut harness = TestHarness::new().with_windows(4).with_app(
+        DIALOG_PID,
+        "org.libreoffice.script",
+        "LibreOffice",
+        |_| {},
+    );
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    assert_focused!(harness.world(), 3);
+
+    let state = harness.mock_state.clone();
+    let document = state.spawn_window(
+        DIALOG_PID,
+        TEST_WORKSPACE_ID,
+        DOCUMENT,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    let dialog = state.spawn_window(
+        DIALOG_PID,
+        TEST_WORKSPACE_ID,
+        DIALOG,
+        IRect::new(300, 300, 300 + 300, 300 + 150),
+    );
+    state.update_window(DIALOG, |window| window.fixed_size = true);
+    state.set_focused_window(DIALOG);
+    harness
+        .world()
+        .trigger(SpawnWindowTrigger(vec![document, dialog]));
+    harness.advance(Duration::from_secs(2));
+
+    assert_focused!(harness.world(), DIALOG);
+    let frame = state.create_window(DOCUMENT).frame();
+    assert!(
+        frame.min.x >= 0 && frame.max.x <= TEST_DISPLAY_WIDTH,
+        "the document should be in view under its dialog, got {frame:?}"
+    );
+
+    state.os_close_window(DIALOG);
+    state.set_focused_window(DOCUMENT);
+    harness.advance(Duration::from_secs(1));
+
+    assert_focused!(harness.world(), DOCUMENT);
+}
+
 #[test]
 fn test_repeated_external_focus_reshuffles_already_focused_window() {
     let commands = vec![
