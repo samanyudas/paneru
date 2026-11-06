@@ -488,8 +488,16 @@ fn member(
         .map(|&frame| window.margins().tracked(frame).min.x);
     if let Some((at, heading_to)) = slide.and_then(|(slide, presented)| heading(slide, presented.0))
     {
-        // A photo shows at once where it steps to this frame.
         let (step, _) = ease_step(at, heading_to, t);
+        // A photo shows at once where it steps to this frame. A window
+        // leaving for its tuck moves itself, as late as its app takes the
+        // move.
+        let pacer = match slide {
+            Some((Slide::Leaving { .. }, _)) => {
+                tracked.entry(entity).or_default().see(asked, shown_x, now)
+            }
+            _ => Pacer::Asked,
+        };
         return Some(Member {
             entity,
             id,
@@ -497,7 +505,7 @@ fn member(
             x: step.x,
             target: heading_to.x,
             asked: at.x,
-            pacer: Pacer::Asked,
+            pacer,
             paced: true,
             slides: true,
         });
