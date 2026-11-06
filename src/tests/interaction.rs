@@ -1147,6 +1147,80 @@ fn a_window_opened_with_a_focused_dialog_comes_into_view_and_takes_focus_when_it
     assert_focused!(harness.world(), DOCUMENT);
 }
 
+/// Opens four columns of one app with the last focused, then a second app's
+/// document together with a dialog that app reports as its focused window.
+/// The engine never receives the dialog, as when it ignores an `AXDialog`
+/// window, so the dialog has no entity.
+fn open_document_with_unmanaged_dialog(harness: &mut TestHarness) -> MockState {
+    const DIALOG_PID: i32 = TEST_PROCESS_ID + 1;
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ]);
+    assert_focused!(harness.world(), 3);
+
+    let state = harness.mock_state.clone();
+    let document = state.spawn_window(
+        DIALOG_PID,
+        TEST_WORKSPACE_ID,
+        20,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    state.spawn_window(
+        DIALOG_PID,
+        TEST_WORKSPACE_ID,
+        21,
+        IRect::new(300, 300, 300 + 300, 300 + 150),
+    );
+    state.update_window(21, |window| window.subrole = "AXDialog".to_string());
+    state.set_focused_window(21);
+    harness.world().trigger(SpawnWindowTrigger(vec![document]));
+    harness.advance(Duration::from_secs(2));
+    let mut windows = harness.world().query::<&Window>();
+    assert!(
+        windows
+            .iter(harness.world())
+            .all(|window| window.id() != 21),
+        "the engine must not track the dialog"
+    );
+    state
+}
+
+fn unmanaged_dialog_harness() -> TestHarness {
+    TestHarness::new().with_windows(4).with_app(
+        TEST_PROCESS_ID + 1,
+        "com.example.dialogs",
+        "Dialogs",
+        |_| {},
+    )
+}
+
+/// While the dialog shows, the document stays where the strip parked it,
+/// which `docs/limitations.md` in Miri records. Once the dialog closes and
+/// the app reports the document as focused, the document takes the focus and
+/// comes into view.
+#[test]
+fn a_window_opened_with_an_unmanaged_dialog_takes_focus_when_the_dialog_closes() {
+    let mut harness = unmanaged_dialog_harness();
+    let state = open_document_with_unmanaged_dialog(&mut harness);
+
+    state.os_close_window(21);
+    state.set_focused_window(20);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 20 });
+    harness.advance(Duration::from_secs(1));
+
+    assert_focused!(harness.world(), 20);
+    let frame = state.create_window(20).frame();
+    assert!(
+        frame.min.x >= 0 && frame.max.x <= TEST_DISPLAY_WIDTH,
+        "the document should be in view once its dialog closes, got {frame:?}"
+    );
+}
+
 #[test]
 fn test_repeated_external_focus_reshuffles_already_focused_window() {
     let commands = vec![
