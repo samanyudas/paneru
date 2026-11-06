@@ -607,13 +607,21 @@ fn distrust_fronted_apps<'a>(
             .filter(|(_, app)| app.psn() == psn || Some(app.psn()) == left)
             .map(|(entity, _)| entity)
             .collect::<Vec<_>>();
+        let mut distrusted = 0;
         for (entity, window) in tracked.iter_mut() {
-            if apps
-                .get(*entity)
-                .is_ok_and(|app| switched.contains(&app.parent()))
+            if window.prompt
+                && apps
+                    .get(*entity)
+                    .is_ok_and(|app| switched.contains(&app.parent()))
             {
                 window.prompt = false;
+                distrusted += 1;
             }
+        }
+        if distrusted > 0 {
+            debug!(
+                "a front switch ends pacing's trust in {distrusted} windows of the apps that came to or left the front"
+            );
         }
     }
 }
