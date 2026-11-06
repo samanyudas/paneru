@@ -510,14 +510,22 @@ fn member(
             slides: true,
         });
     }
+    let pacer = tracked.entry(entity).or_default().see(asked, shown_x, now);
+    // A window landing under its photo shows where its photo rests, however
+    // far its app has yet to take it, and has no move of its own yet but
+    // still heads where layout puts it.
+    let (target, pacer) = match slide {
+        Some((_, presented)) => (presented.0.x, Pacer::Shown(asked)),
+        None => (to.map_or(position.0.x, |to| to.0.x), pacer),
+    };
     Some(Member {
         entity,
         id,
         eased: position.0.x,
         x: position.0.x,
-        target: to.map_or(position.0.x, |to| to.0.x),
+        target,
         asked,
-        pacer: tracked.entry(entity).or_default().see(asked, shown_x, now),
+        pacer,
         paced: to.is_some() && slide.is_none(),
         slides: false,
     })
