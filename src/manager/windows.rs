@@ -1,7 +1,8 @@
 use accessibility_sys::{
-    AXUIElementCopyElementAtPosition, AXUIElementCreateApplication, AXUIElementIsAttributeSettable,
-    AXUIElementRef, AXValueCreate, AXValueGetValue, kAXChildrenAttribute, kAXCloseButtonAttribute,
-    kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXErrorNotImplemented, kAXErrorSuccess,
+    AXError, AXUIElementCopyElementAtPosition, AXUIElementCreateApplication,
+    AXUIElementIsAttributeSettable, AXUIElementRef, AXValueCreate, AXValueGetValue,
+    kAXChildrenAttribute, kAXCloseButtonAttribute, kAXErrorAttributeUnsupported,
+    kAXErrorCannotComplete, kAXErrorNoValue, kAXErrorNotImplemented, kAXErrorSuccess,
     kAXFloatingWindowSubrole, kAXParentAttribute, kAXPositionAttribute, kAXRaiseAction,
     kAXRoleAttribute, kAXSizeAttribute, kAXStandardWindowSubrole, kAXToolbarRole, kAXUnknownRole,
     kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
@@ -285,6 +286,8 @@ struct AxApp {
     /// Held from [`WriteSink::begin`] to [`WriteSink::finish`], so the app
     /// keeps `AXEnhancedUserInterface` off for a whole motion of writes.
     enhanced_ui: Option<EnhancedUiGuard<RestoreEnhancedUi>>,
+    /// The app did not answer a position or size write in time.
+    unanswered: bool,
 }
 
 /// A window as its app's writer addresses it.
@@ -304,6 +307,7 @@ impl AxApp {
             pid,
             app,
             enhanced_ui: None,
+            unanswered: false,
         }
     }
 
@@ -347,14 +351,20 @@ impl WriteSink for AxApp {
     }
 
     fn set_position(&mut self, window: &AxWindow, origin: Origin) {
-        set_ax_position(&window.element, origin + window.margins.min);
+        let result = set_ax_position(&window.element, origin + window.margins.min);
+        self.unanswered |= result == kAXErrorCannotComplete;
     }
 
     fn set_size(&mut self, window: &AxWindow, size: Size) {
-        set_ax_size(
+        let result = set_ax_size(
             &window.element,
             size - window.margins.min - window.margins.max,
         );
+        self.unanswered |= result == kAXErrorCannotComplete;
+    }
+
+    fn take_unanswered(&mut self) -> bool {
+        std::mem::take(&mut self.unanswered)
     }
 
     fn read_frame(&mut self, window: &AxWindow) -> Option<IRect> {
@@ -367,7 +377,8 @@ impl WriteSink for AxApp {
     }
 }
 
-fn set_ax_position(element: &AXUIWrapper, origin: Origin) {
+/// Returns the app's answer, or success when no value could be made.
+fn set_ax_position(element: &AXUIWrapper, origin: Origin) -> AXError {
     let mut point = CGPoint::new(f64::from(origin.x), f64::from(origin.y));
     let position_ref = unsafe {
         AXValueCreate(
@@ -375,18 +386,17 @@ fn set_ax_position(element: &AXUIWrapper, origin: Origin) {
             NonNull::from(&mut point).as_ptr().cast(),
         )
     };
-    if let Ok(position) = AXUIWrapper::from_retained(position_ref) {
-        unsafe {
-            AXUIElementSetAttributeValue(
-                element.as_ptr(),
-                CFString::from_static_str(kAXPositionAttribute).as_ref(),
-                position.as_ref(),
-            )
-        };
-    }
+    AXUIWrapper::from_retained(position_ref).map_or(kAXErrorSuccess, |position| unsafe {
+        AXUIElementSetAttributeValue(
+            element.as_ptr(),
+            CFString::from_static_str(kAXPositionAttribute).as_ref(),
+            position.as_ref(),
+        )
+    })
 }
 
-fn set_ax_size(element: &AXUIWrapper, size: Size) {
+/// Returns the app's answer, or success when no value could be made.
+fn set_ax_size(element: &AXUIWrapper, size: Size) -> AXError {
     let mut cgsize = CGSize::new(f64::from(size.x), f64::from(size.y));
     let size_ref = unsafe {
         AXValueCreate(
@@ -394,15 +404,13 @@ fn set_ax_size(element: &AXUIWrapper, size: Size) {
             NonNull::from(&mut cgsize).as_ptr().cast(),
         )
     };
-    if let Ok(size_value) = AXUIWrapper::from_retained(size_ref) {
-        unsafe {
-            AXUIElementSetAttributeValue(
-                element.as_ptr(),
-                CFString::from_static_str(kAXSizeAttribute).as_ref(),
-                size_value.as_ref(),
-            )
-        };
-    }
+    AXUIWrapper::from_retained(size_ref).map_or(kAXErrorSuccess, |size_value| unsafe {
+        AXUIElementSetAttributeValue(
+            element.as_ptr(),
+            CFString::from_static_str(kAXSizeAttribute).as_ref(),
+            size_value.as_ref(),
+        )
+    })
 }
 
 #[derive(Debug)]
