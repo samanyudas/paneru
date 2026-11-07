@@ -23,7 +23,10 @@ use bevy::time::{Time, Timer, TimerMode};
 use std::pin::Pin;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
-use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, VerifyFocus};
+use super::{
+    FocusedMarker, MouseHeldMarker, PointerFollowsFocus, SystemTheme, Timeout, Unmanaged,
+    VerifyFocus,
+};
 use crate::config::Config;
 use crate::ecs::drag::DragState;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
@@ -174,6 +177,9 @@ impl Plugin for FocusEventsPlugin {
                     ),
                 clear_pending_focus_layout.in_set(super::PostUpdateSet::Bookkeeping),
                 mouse_follows_focus.in_set(super::PostUpdateSet::Ui),
+                clear_pointer_follows_focus
+                    .in_set(super::PostUpdateSet::Bookkeeping)
+                    .after(mouse_follows_focus),
                 recover_lost_focus
                     .in_set(super::PostUpdateSet::Bookkeeping)
                     .run_if(on_timer(Duration::from_millis(
@@ -634,19 +640,27 @@ fn autocenter_window_on_focus(
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 #[allow(clippy::too_many_arguments)]
 fn mouse_follows_focus(
-    focused: Single<Entity, Added<FocusedMarker>>,
+    focused: Single<(Entity, Has<PointerFollowsFocus>), Added<FocusedMarker>>,
     windows: Windows,
-    global_state: GlobalState,
     config: Res<Config>,
     window_manager: Res<WindowManager>,
     displays: Query<&Display>,
     workspaces: MouseFocusStrips,
     restored: Query<&RestoreFocusMarker>,
 ) {
-    let entity = *focused;
+    let (entity, from_command) = *focused;
     let Some(window) = windows.get(entity) else {
         return;
     };
+    // Only a Miri command moves the pointer. A click, an app that brings its
+    // own window forward, Cmd-Tab, and focus-follows-mouse leave it in place.
+    if !from_command {
+        trace!(
+            "window {}: focus did not come from a command, pointer stays",
+            window.id()
+        );
+        return;
+    }
     if workspaces
         .iter()
         .find_map(|(_, _, scrolling, active, _, _)| if active { scrolling } else { None })
@@ -656,15 +670,7 @@ fn mouse_follows_focus(
         return;
     }
 
-    trace!(
-        "window {}, skip_reshuffle {}, ffm flag {:?}.",
-        window.id(),
-        global_state.skip_reshuffle(),
-        global_state.ffm_flag()
-    );
     if config.mouse_follows_focus()
-        && !global_state.skip_reshuffle()
-        && global_state.ffm_flag().is_none_or(|id| id != window.id())
         && let Some(frame) = windows.moving_frame(entity)
         && let Some((_, child, _, _, position, reposition)) = workspaces
             .into_iter()
@@ -689,6 +695,21 @@ fn mouse_follows_focus(
             let origin = visible.center();
             debug!("centering on {} {origin}", window.id());
             window_manager.warp_mouse(origin);
+        }
+    }
+}
+
+/// Drops every [`PointerFollowsFocus`] tag once `mouse_follows_focus` has seen
+/// the frame's focus change. A tag whose focus never changed, such as a
+/// command that focused the window that already had focus, must not make a
+/// later click move the pointer.
+fn clear_pointer_follows_focus(
+    tagged: Query<Entity, With<PointerFollowsFocus>>,
+    mut commands: Commands,
+) {
+    for entity in &tagged {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<PointerFollowsFocus>();
         }
     }
 }
@@ -1489,7 +1510,13 @@ mod tests {
         );
 
         let rearm = world.register_system(move |mut commands: Commands| {
-            crate::commands::focus_with_verification(target, None, None, &mut commands);
+            crate::commands::focus_with_verification(
+                target,
+                None,
+                None,
+                crate::commands::FocusSource::Other,
+                &mut commands,
+            );
         });
         world.add_observer(|_: On<FocusWindow>| {});
         _ = world.run_system(rearm);

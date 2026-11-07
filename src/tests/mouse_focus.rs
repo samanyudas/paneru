@@ -4,6 +4,7 @@ use crate::config::{Config, MainOptions};
 use crate::events::Event;
 use crate::manager::{Origin, Window};
 use crate::platform::Modifiers;
+use bevy::math::IRect;
 use objc2_core_foundation::CGPoint;
 use std::time::Duration;
 
@@ -172,12 +173,14 @@ fn keyboard_focus_warps_mouse_to_centered_window() {
             command: Command::PrintState,
         }];
 
-        // Include a jump to a window initially outside the viewport.
+        // Include a jump to a window initially outside the viewport. Window 0
+        // has focus from the start, and starting moves no pointer (#339), so
+        // every step changes focus.
         for (direction, window_id) in [
-            (Direction::First, 0),
             (Direction::Last, 2),
             (Direction::West, 1),
             (Direction::East, 2),
+            (Direction::First, 0),
         ] {
             commands.push(Event::Command {
                 command: Command::Window(Operation::Focus(direction)),
@@ -217,14 +220,21 @@ fn keyboard_focus_warps_mouse_without_auto_center() {
             vec![],
         )
             .into();
-        let mut harness = TestHarness::new().with_config(config).with_windows(4);
+        // Window 0 has focus from the start. Only a command moves the pointer
+        // (#339), so starting leaves it where it was.
+        let mut harness = TestHarness::new()
+            .with_config(config)
+            .with_windows(4)
+            .on_iteration(0, |world, state| {
+                assert_focused!(world, 0);
+                assert_eq!(state.cursor_position(), Origin::ZERO);
+            });
         let mut commands = vec![Event::Command {
             command: Command::PrintState,
         }];
 
         // Include jumps to windows partially and completely outside the viewport.
         for (direction, window_id) in [
-            (Direction::First, 0),
             (Direction::Last, 3),
             (Direction::West, 2),
             (Direction::East, 3),
@@ -331,4 +341,91 @@ fn virtual_workspace_focus_warps_mouse_to_restored_window() {
         }
         harness.run(commands);
     }
+}
+
+/// Focuses window 0 by command, then lets macOS focus window 1 the way a click
+/// or Cmd-Tab does, with the pointer resting at a spot `rest` picks. With
+/// `mouse_follows_focus` on, the pointer must stay at that spot (#339).
+fn assert_outside_focus_keeps_pointer(click: bool, rest: fn(&Window, &Window) -> Origin) {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(true),
+            mouse_follows_focus: Some(true),
+            focus_follows_mouse: Some(false),
+            animation_speed: Some(30.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+    let resting = std::rc::Rc::new(std::cell::Cell::new(Origin::ZERO));
+    let set = resting.clone();
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(1, move |world, state| {
+            assert_focused!(world, 0);
+            let first = find_window_entity(0, world);
+            let second = find_window_entity(1, world);
+            let point = rest(
+                world.get::<Window>(first).unwrap(),
+                world.get::<Window>(second).unwrap(),
+            );
+            set.set(point);
+            state.set_cursor_position(point);
+            if click {
+                state.simulate_click(point);
+            }
+            state.focus_window(1);
+        })
+        .on_iteration(3, move |world, state| {
+            assert_focused!(world, 1);
+            assert_eq!(
+                state.cursor_position(),
+                resting.get(),
+                "click {click}: the pointer moved after an outside focus change"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn clicking_a_window_leaves_the_pointer_where_it_clicked() {
+    // Near the top-left corner of the visible part of window 1, away from
+    // the centre that a warp would pick.
+    assert_outside_focus_keeps_pointer(true, |_, second| {
+        let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+        let visible = display.intersect(second.frame());
+        assert!(
+            visible.width() > 40,
+            "window 1 must be visible: {visible:?}"
+        );
+        visible.min + Origin::new(20, 20)
+    });
+}
+
+#[test]
+fn an_app_focusing_its_window_leaves_the_pointer_in_place() {
+    // Cmd-Tab, or an app that brings its own window forward, while the
+    // pointer rests on window 0.
+    // Away from the screen centre, where a warp to the newly centred window 1
+    // would land.
+    assert_outside_focus_keeps_pointer(false, |first, _| {
+        let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+        display.intersect(first.frame()).min + Origin::new(20, 20)
+    });
 }

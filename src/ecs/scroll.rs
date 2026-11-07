@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tracing::{Level, instrument};
 
-use crate::commands::{Command, Direction, Operation, focus_with_verification};
+use crate::commands::{Command, Direction, FocusSource, Operation, focus_with_verification};
 use crate::config::Config;
 use crate::config::swipe::{SwipeGestureDirection, focus_direction};
 use crate::ecs::focus::FocusHistory;
@@ -718,7 +718,7 @@ fn settle_strip(
         if let Some(window) = focus_history.last_focused_in(&column) {
             let focused = windows.focused().map(|(_, focused)| focused);
             if focused != Some(window) {
-                focus_with_verification(window, focused, None, &mut commands);
+                focus_with_verification(window, focused, None, FocusSource::Other, &mut commands);
             }
         }
         target

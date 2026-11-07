@@ -399,6 +399,16 @@ pub fn register_triggers(app: &mut bevy::app::App) {
 #[derive(Component)]
 pub struct FocusedMarker;
 
+/// Marks a focus change that a Miri command asked for, so that
+/// `mouse_follows_focus` moves the pointer to it.
+///
+/// On a window, it marks the focus that the same frame gives the window. On a
+/// strip, it marks the focus that `show_active_workspace` restores when the
+/// strip becomes active. Clicks, app activation, and pointer-driven focus
+/// never carry it, so they leave the pointer where it is.
+#[derive(Component)]
+pub struct PointerFollowsFocus;
+
 #[derive(Component)]
 pub struct ActiveWorkspaceMarker;
 
@@ -1014,6 +1024,10 @@ pub trait SpawnCommandsExt {
 
     fn focus_entity(&mut self, entity: Entity, raise: bool);
 
+    /// Like [`SpawnCommandsExt::focus_entity`], for a focus change that a Miri
+    /// command asked for. With `mouse_follows_focus`, the pointer follows it.
+    fn focus_entity_for_command(&mut self, entity: Entity, raise: bool);
+
     fn flash_message(&mut self, message: String, duration: f32);
 
     // Spawns a layout strip in a single place, to properly insert all components.
@@ -1083,6 +1097,14 @@ impl SpawnCommandsExt for Commands<'_, '_> {
             entity_commands.try_insert(FocusedMarker);
             self.trigger(focus::FocusWindow { entity, raise });
         }
+    }
+
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn focus_entity_for_command(&mut self, entity: Entity, raise: bool) {
+        if let Ok(mut entity_commands) = self.get_entity(entity) {
+            entity_commands.try_insert(PointerFollowsFocus);
+        }
+        self.focus_entity(entity, raise);
     }
 
     #[instrument(level = Level::TRACE, skip(self))]

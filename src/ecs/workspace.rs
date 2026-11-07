@@ -27,8 +27,8 @@ use crate::ecs::native_membership::{NativeMembership, NativeScope};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, FocusedMarker, ManualStripOffset, NativeFullscreenMarker,
-    Position, RaiseWindow, RepositionMarker, Scrolling, SelectedVirtualMarker, SendMessageTrigger,
-    SpawnCommandsExt, Timeout, Unmanaged,
+    PointerFollowsFocus, Position, RaiseWindow, RepositionMarker, Scrolling, SelectedVirtualMarker,
+    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{Display, Origin, Window, WindowManager};
@@ -787,12 +787,12 @@ fn handle_virtual_window_moves(
         if let Ok(mut entity_commands) = commands.get_entity(target_entity)
             && !stay
         {
-            entity_commands.try_insert(ActiveWorkspaceMarker);
+            entity_commands.try_insert((ActiveWorkspaceMarker, PointerFollowsFocus));
         }
 
         if stay && let Some(neighbour) = source_neighbour {
             // Layout chain repositions the window offscreen with its hidden strip.
-            commands.focus_entity(neighbour, false);
+            commands.focus_entity_for_command(neighbour, false);
 
             // Force position change on the hidden strip, so it hides the moved window.
             if let Ok(mut position) = workspaces
@@ -815,7 +815,7 @@ fn handle_virtual_window_moves(
                 && let Ok(mut entity_commands) = commands.get_entity(window_entity)
             {
                 entity_commands.try_remove::<FocusedMarker>();
-                commands.focus_entity(window_entity, false);
+                commands.focus_entity_for_command(window_entity, false);
             }
         }
         debug!(
@@ -912,7 +912,7 @@ fn switch_virtual_workspace_bind(
                     active_display.active_strip(),
                 )
             {
-                commands.focus_entity(target, true);
+                commands.focus_entity_for_command(target, true);
                 commands.reshuffle_around(target);
                 return;
             }
@@ -999,7 +999,7 @@ fn switch_virtual_workspace_bind(
 
     let new_entity = rows[next_index].0;
     if let Ok(mut entity_commands) = commands.get_entity(new_entity) {
-        entity_commands.try_insert(ActiveWorkspaceMarker);
+        entity_commands.try_insert((ActiveWorkspaceMarker, PointerFollowsFocus));
     }
     debug!(
         "Switched virtual workspace on display {} from {} to {}",
@@ -1122,9 +1122,14 @@ pub(crate) fn show_active_workspace(
     displays: Query<(&Display, Option<&DockPosition>)>,
     focus_markers: Query<Ref<FocusedMarker>>,
     scrollings: Query<&Scrolling>,
+    pointer_follows: Query<(), With<PointerFollowsFocus>>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
+    // A command that switched to this strip moves the pointer to the focus it
+    // restores. `clear_pointer_follows_focus` drops the tag after this frame.
+    let from_command = pointer_follows.contains(*activated);
+
     let Some(workspace_id) = workspaces
         .iter()
         .find_map(|(entity, _, strip, _, _, _)| (entity == *activated).then_some(strip.id()))
@@ -1260,7 +1265,11 @@ pub(crate) fn show_active_workspace(
         {
             spawn_restore_focus_guard(focus, &mut commands);
 
-            commands.focus_entity(focus, false);
+            if from_command {
+                commands.focus_entity_for_command(focus, false);
+            } else {
+                commands.focus_entity(focus, false);
+            }
             commands.trigger(RaiseWindow {
                 entity: focus,
                 with_strip: true,
