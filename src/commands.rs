@@ -368,6 +368,7 @@ pub(crate) fn focus_with_verification(
     entity: Entity,
     focused_entity: Option<Entity>,
     paging: Option<&mut PageGestureState>,
+    source: FocusSource,
     commands: &mut Commands,
 ) {
     if focused_entity != Some(entity)
@@ -383,7 +384,20 @@ pub(crate) fn focus_with_verification(
             ),
         ));
     }
-    commands.focus_entity(entity, true);
+    match source {
+        FocusSource::Command => commands.focus_entity_for_command(entity, true),
+        FocusSource::Other => commands.focus_entity(entity, true),
+    }
+}
+
+/// What asked for a focus change. Only a Miri command moves the pointer
+/// when `mouse_follows_focus` is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusSource {
+    /// A shortcut, a page gesture, or a command sent to the engine.
+    Command,
+    /// A click, a scroll, or anything else the user did with the pointer.
+    Other,
 }
 
 /// A first, last, or numbered column jump lands on the window last focused in
@@ -499,6 +513,7 @@ fn command_move_focus(
                 entity,
                 Some(focused_entity),
                 is_page.then_some(&mut *paging.page_state),
+                FocusSource::Command,
                 &mut commands,
             );
         }
@@ -546,6 +561,7 @@ fn command_move_focus(
             entity,
             Some(focused_entity),
             is_page.then_some(&mut *paging.page_state),
+            FocusSource::Command,
             &mut commands,
         );
         // Explicitly reshuffle so the target window is brought into view.
@@ -578,6 +594,7 @@ fn focus_from_fullscreen(
             entity,
             windows.focused().map(|(_, e)| e),
             is_page.then_some(page_state),
+            FocusSource::Command,
             commands,
         );
     }
@@ -610,7 +627,7 @@ fn command_focus_unmanaged(
         .or_else(|| visible_floats.into_iter().next());
 
     if let Some(entity) = target {
-        commands.focus_entity(entity, true);
+        commands.focus_entity_for_command(entity, true);
     }
 }
 
@@ -636,7 +653,7 @@ fn command_focus_managed(
         .or_else(|| active_strip.all_columns().into_iter().next());
 
     if let Some(entity) = target {
-        commands.focus_entity(entity, true);
+        commands.focus_entity_for_command(entity, true);
         commands.reshuffle_around(entity);
     }
 }
@@ -677,7 +694,7 @@ fn command_raise_floating(
     }
 
     if let Some(entity) = target {
-        commands.focus_entity(entity, true);
+        commands.focus_entity_for_command(entity, true);
     }
 }
 
@@ -1871,7 +1888,7 @@ fn to_next_display(
     if matches!(move_focus, MoveFocus::Stay)
         && let Some(neighbour) = arrival.left_behind
     {
-        commands.focus_entity(neighbour, false);
+        commands.focus_entity_for_command(neighbour, false);
     }
     if let Some(strip) = arrival.strip {
         if matches!(move_focus, MoveFocus::Follow)
@@ -1935,7 +1952,13 @@ fn focus_display(
                         .ok()
                         .and_then(|column| focus_history.last_focused_in(&column))
                     {
-                        focus_with_verification(entity, focused, None, &mut commands);
+                        focus_with_verification(
+                            entity,
+                            focused,
+                            None,
+                            FocusSource::Command,
+                            &mut commands,
+                        );
                         commands.reshuffle_around(entity);
                     }
                     return;
@@ -1974,7 +1997,7 @@ fn focus_display(
         if config.mouse_follows_focus() {
             window_manager.warp_mouse(frame.center());
         }
-        commands.focus_entity(entity, true);
+        commands.focus_entity_for_command(entity, true);
         return;
     }
     match window_manager.focus_desktop(target_bounds) {

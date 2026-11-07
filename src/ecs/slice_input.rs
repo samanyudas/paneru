@@ -11,7 +11,7 @@ use bevy::ecs::schedule::common_conditions::{on_message, resource_exists};
 use bevy::prelude::{Commands, Entity, Has, Query, Res, Resource, Time, With};
 use tracing::debug;
 
-use crate::commands::focus_with_verification;
+use crate::commands::{FocusSource, focus_with_verification};
 use crate::ecs::params::Windows;
 use crate::ecs::shared_edge::Slide;
 use crate::ecs::{PostUpdateSet, RepositionMarker, ResizeMarker, SpawnCommandsExt as _, UpdateSet};
@@ -65,6 +65,7 @@ fn reveal_pressed(
             entity,
             windows.focused().map(|(_, e)| e),
             None,
+            FocusSource::Other,
             &mut commands,
         );
         commands.reshuffle_around(entity);

@@ -321,8 +321,8 @@ fn test_mouse_to_next_display() {
     // harness
     //     .mock_state
     //     .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 100, frame);
-    // Pointer-follows-focus places the pointer on window 100 first, so the
-    // pointer starts inside one display.
+    // The pointer starts on window 100, inside one display. Starting the
+    // engine moves no pointer (#339), so the test puts it there.
     let config: Config = (
         MainOptions {
             mouse_follows_focus: Some(true),
@@ -342,7 +342,7 @@ fn test_mouse_to_next_display() {
         .on_iteration(1, move |world, state| {
             let entity = find_window_entity(100, world);
             let window = world.get::<Window>(entity).expect("need window");
-            assert_eq!(state.cursor_position(), window.frame().center());
+            state.set_cursor_position(window.frame().center());
         })
         .on_iteration(3, move |world, state| {
             let mut query = world.query::<(&Display, Option<&DockPosition>)>();
