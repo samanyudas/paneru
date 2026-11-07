@@ -44,6 +44,11 @@ pub(crate) trait WriteSink: Send + 'static {
     fn set_position(&mut self, window: &Self::Window, origin: Origin);
     fn set_size(&mut self, window: &Self::Window, size: Size);
     fn read_frame(&mut self, window: &Self::Window) -> Option<IRect>;
+    /// Whether the app left a position or size write unanswered since the
+    /// last call. An app that does not answer in time may never apply it.
+    fn take_unanswered(&mut self) -> bool {
+        false
+    }
     /// Runs once no write has come for the writer's settle time, or when a
     /// flush asks for it.
     fn finish(&mut self);
@@ -355,8 +360,9 @@ impl<W> Mailbox<W> {
 
 impl<S: WriteSink> Shared<S> {
     /// Writes one window's frame through `sink`, asking again for a size
-    /// the app limited before.
-    fn write(sink: &mut S, write: PendingWrite<S::Window>) {
+    /// the app limited before. Returns whether the app left a part of it
+    /// unanswered.
+    fn write(sink: &mut S, write: &PendingWrite<S::Window>) -> bool {
         let limited = *lock(&write.size_limited);
         let observed = match limited {
             // The app limited the size at the old position, so ask again
@@ -366,13 +372,14 @@ impl<S: WriteSink> Shared<S> {
                 let moved = IRect::from_corners(write.to.min, write.to.min + taken);
                 resize(sink, &write.window, moved, write.to.size(), write.to.min)
             }
-            _ => apply(sink, &write),
+            _ => apply(sink, write),
         };
         if write.size || limited.is_some() {
             *lock(&write.size_limited) = observed
                 .map(|frame| frame.size())
                 .filter(|&taken| taken != write.to.size());
         }
+        sink.take_unanswered()
     }
 
     fn mailbox(&self, pid: Pid) -> Option<Arc<Mailbox<S::Window>>> {
@@ -404,10 +411,18 @@ impl<S: WriteSink> Shared<S> {
                         if begin {
                             sink.begin();
                         }
-                        let mut writes = batch.into_values().collect::<Vec<_>>();
-                        writes.sort_by_key(PendingWrite::back_first);
-                        for write in writes {
-                            Self::write(&mut sink, write);
+                        let mut writes = batch.into_iter().collect::<Vec<_>>();
+                        writes.sort_by_key(|(_, write)| write.back_first());
+                        for (key, write) in writes {
+                            // An app may never apply a write it left
+                            // unanswered, so it gets the frame once more,
+                            // unless a newer frame for the window came.
+                            if Self::write(&mut sink, &write)
+                                && !lock(&mailbox.queue).pending.contains_key(&key)
+                            {
+                                debug!(pid, to = ?write.to, "writing a frame again that the app left unanswered");
+                                Self::write(&mut sink, &write);
+                            }
                         }
                     });
                     mailbox.land();
@@ -484,7 +499,7 @@ impl<S: WriteSink> WindowWriters<S> {
         let mut sink = (self.shared.open_sink)(pid);
         objc2::rc::autoreleasepool(|_| {
             sink.begin();
-            Shared::write(&mut sink, write);
+            Shared::write(&mut sink, &write);
             sink.finish();
         });
     }
@@ -971,6 +986,8 @@ mod writer_tests {
         released: Condvar,
         entered: Mutex<Sender<Pid>>,
         opened: AtomicUsize,
+        /// How many of the next writes an app leaves unanswered and loses.
+        unanswered: AtomicUsize,
     }
 
     impl Probe {
@@ -982,6 +999,7 @@ mod writer_tests {
                 released: Condvar::new(),
                 entered: Mutex::new(entered),
                 opened: AtomicUsize::new(0),
+                unanswered: AtomicUsize::new(0),
             });
             (probe, receiver)
         }
@@ -1024,6 +1042,22 @@ mod writer_tests {
     struct FakeApp {
         pid: Pid,
         probe: Arc<Probe>,
+        unanswered: bool,
+    }
+
+    impl FakeApp {
+        /// Whether the app leaves this write unanswered and loses it.
+        fn loses(&mut self) -> bool {
+            let lost = self
+                .probe
+                .unanswered
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
+            self.unanswered |= lost;
+            lost
+        }
     }
 
     impl WriteSink for FakeApp {
@@ -1035,16 +1069,24 @@ mod writer_tests {
 
         fn set_position(&mut self, window: &u32, origin: Origin) {
             self.probe.hang_if_held(self.pid);
-            self.probe.record(self.pid, Op::Position(*window, origin));
+            if !self.loses() {
+                self.probe.record(self.pid, Op::Position(*window, origin));
+            }
         }
 
         fn set_size(&mut self, window: &u32, size: Size) {
             self.probe.hang_if_held(self.pid);
-            self.probe.record(self.pid, Op::Size(*window, size));
+            if !self.loses() {
+                self.probe.record(self.pid, Op::Size(*window, size));
+            }
         }
 
         fn read_frame(&mut self, _window: &u32) -> Option<IRect> {
             None
+        }
+
+        fn take_unanswered(&mut self) -> bool {
+            std::mem::take(&mut self.unanswered)
         }
 
         fn finish(&mut self) {
@@ -1059,6 +1101,7 @@ mod writer_tests {
             FakeApp {
                 pid: pid.unwrap_or_default(),
                 probe: probe.clone(),
+                unanswered: false,
             }
         })
     }
@@ -1104,6 +1147,22 @@ mod writer_tests {
             size: true,
             size_limited: Arc::default(),
         }
+    }
+
+    /// A busy app can leave a write unanswered and never apply it. With no
+    /// newer frame for the window, the writer sends the frame once more, so
+    /// the window does not stay where it was.
+    #[test]
+    fn a_write_the_app_left_unanswered_is_sent_again() {
+        let (probe, _entered) = Probe::new();
+        let writers = writers(&probe, SECOND, SETTLE);
+        probe.unanswered.store(1, Ordering::SeqCst);
+        writers.push(1, key(7), moved(7, 10));
+        assert!(writers.flush(SECOND));
+        assert_eq!(
+            probe.log(1),
+            vec![Op::Begin, Op::Position(7, Origin::new(10, 0)), Op::Finish]
+        );
     }
 
     #[test]
