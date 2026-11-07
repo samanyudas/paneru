@@ -756,6 +756,56 @@ fn frames_an_app_reports_while_it_lags_behind_the_engine_are_not_its_size() {
     assert_eq!(home.min.y, start.min.y);
 }
 
+/// An app like T3 Code applies the engine's writes late, and cuts a size
+/// write at the screen's bottom edge, so it can take the move to the slot
+/// while its last size write still waits. A hold that ends in that gap
+/// takes the cut height as a refusal only until that write lands: the window
+/// still ends in its slot, with no minimum height left from the cut.
+#[test]
+fn a_lagging_apps_size_after_the_tile_hold_is_no_refusal() {
+    let mut harness = three_columns();
+    let id = 2;
+    let start = frame(harness.world(), id);
+    let point = Origin::new(grab(start).x, TEST_DISPLAY_HEIGHT - 1);
+    press_and_drag(&mut harness, id, point);
+    release(&mut harness, point);
+    harness.mock_state.update_window(id, |window| {
+        window.resize_bottom_limit = Some(TEST_DISPLAY_HEIGHT);
+        window.late_writes = Some(Vec::new());
+    });
+    let slot = frame(harness.world(), id);
+    assert_eq!(slot.size(), start.size());
+    macos_tile(&mut harness, id, IRect::new(0, 394, 683, 768));
+    harness.advance(FRAME);
+    // The app moves the window to the slot with a size cut at the screen's
+    // bottom edge, and holds its last size write past the hold.
+    let mut shown = IRect::default();
+    for _ in 0..50 {
+        harness
+            .mock_state
+            .update_window(id, |window| shown = window.frame);
+        if shown.min == slot.min {
+            break;
+        }
+        assert!(harness.mock_state.os_apply_late_write(id), "{shown:?}");
+    }
+    assert_eq!(shown.min, slot.min);
+    assert_ne!(shown.size(), slot.size());
+    harness.advance(ms(1100));
+    harness.mock_state.os_apply_late_writes(id);
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), id), slot);
+    assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
+    let entity = window_entity(&mut harness, id);
+    assert!(
+        !harness
+            .world()
+            .entity(entity)
+            .contains::<crate::ecs::MinimumHeight>(),
+        "the cut height is no minimum"
+    );
+}
+
 /// The menu bar belongs to its display, so a pointer there picks the
 /// column below it, as one point lower does.
 #[test]

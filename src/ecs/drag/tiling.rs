@@ -639,6 +639,21 @@ impl TilingRestore<'_, '_> {
                 return NativeFrame::Refused;
             }
             _ if engine || moving || matches!(start.phase, Phase::Holding { .. }) => {
+                // An observation the move began after is the app catching up
+                // from now on.
+                if moving
+                    && let Phase::Observing {
+                        frame,
+                        changed,
+                        echo: None,
+                    } = start.phase
+                {
+                    entity_commands.try_insert(start.with_phase(Phase::Observing {
+                        frame,
+                        changed,
+                        echo: Some(now),
+                    }));
+                }
                 return NativeFrame::Deferred;
             }
             Some(Settlement::Adopt(seen)) if seen == frame => {
