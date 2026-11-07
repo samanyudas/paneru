@@ -70,6 +70,10 @@ pub(crate) struct MockWindowData {
     /// A height whose next size write the app applies late, as one of
     /// [`Self::late_resizes`].
     pub(crate) late_height: Option<i32>,
+    /// The app applies the engine's writes only when
+    /// [`MockState::os_apply_late_writes`] runs, in the order they came,
+    /// like an app busy for a while after the calls returned.
+    pub(crate) late_writes: Option<Vec<LateWrite>>,
     /// How long a frame read takes, like an app slow to answer.
     pub(crate) frame_read_delay: std::time::Duration,
     pub(crate) resize_writes: usize,
@@ -122,6 +126,13 @@ pub(crate) struct MockWindowData {
     pub(crate) ax_unanswered: bool,
 }
 
+/// A write that [`MockWindowData::late_writes`] holds back.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LateWrite {
+    Position(Origin),
+    Size(Size),
+}
+
 /// How far above the screen's bottom edge [`MockWindowData::sticky_bottom`]
 /// holds a window's bottom edge. On a native rig the zone reached between 22
 /// and 42 points.
@@ -161,6 +172,7 @@ impl Default for MockWindowData {
             dropped_resizes: 0,
             late_resizes: Vec::new(),
             late_height: None,
+            late_writes: None,
             frame_read_delay: std::time::Duration::ZERO,
             resize_writes: 0,
             position_writes: 0,
@@ -392,6 +404,10 @@ fn mock_resize(inner: &RwLock<MockStateInner>, id: WinID, ax_generation: u32, si
         .filter(|w| w.ax_generation == ax_generation)
     {
         w.resize_writes += 1;
+        if let Some(late) = &mut w.late_writes {
+            late.push(LateWrite::Size(size));
+            return;
+        }
         if w.late_height == Some(size.y) {
             w.late_height = None;
             w.late_resizes.push(size);
@@ -415,6 +431,10 @@ fn mock_reposition(inner: &RwLock<MockStateInner>, id: WinID, ax_generation: u32
         .filter(|w| w.ax_generation == ax_generation)
     {
         w.position_writes += 1;
+        if let Some(late) = &mut w.late_writes {
+            late.push(LateWrite::Position(origin));
+            return;
+        }
         if w.dropped_positions > 0 {
             w.dropped_positions -= 1;
             return;
@@ -946,6 +966,35 @@ impl MockState {
                 .event_queue
                 .push_back(Event::WindowResized { window_id: id });
         }
+    }
+
+    /// Applies the oldest write that window `id`'s app held back, as an app
+    /// catching up applies one write at a time. Returns whether one was left.
+    pub fn os_apply_late_write(&self, id: WinID) -> bool {
+        let write = self
+            .inner
+            .force_write()
+            .windows
+            .get_mut(&id)
+            .and_then(|w| w.late_writes.as_mut())
+            .filter(|late| !late.is_empty())
+            .map(|late| late.remove(0));
+        match write {
+            Some(LateWrite::Position(origin)) => self.os_move_window(id, origin),
+            Some(LateWrite::Size(size)) => {
+                let size = self.inner.force_read().windows[&id].accepted_size(size);
+                self.os_resize_window(id, size);
+            }
+            None => return false,
+        }
+        true
+    }
+
+    /// Applies, in order, the writes that window `id`'s app held back, and
+    /// applies later writes as they arrive.
+    pub fn os_apply_late_writes(&self, id: WinID) {
+        while self.os_apply_late_write(id) {}
+        self.update_window(id, |w| w.late_writes = None);
     }
 
     /// Applies, in order, the size writes window `id`'s app dropped, and

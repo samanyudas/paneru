@@ -1099,6 +1099,7 @@ impl Plugin for DragEventsPlugin {
             .init_resource::<DragFeedback>()
             .init_resource::<tiling::PointerResize>()
             .init_resource::<DropUndo>()
+            .init_resource::<tiling::DroppedWindow>()
             .add_systems(
                 Update,
                 tiling::track_resize_gesture
@@ -1246,6 +1247,7 @@ pub(super) fn drag_events(
     config: Res<Config>,
     mut native: ResMut<NativeMembership>,
     mut undo: ResMut<DropUndo>,
+    mut dropped: ResMut<tiling::DroppedWindow>,
     resize: Res<PointerResize>,
     mut commands: Commands,
 ) {
@@ -1301,6 +1303,7 @@ pub(super) fn drag_events(
             debug!("dropping {window} at {target:?}");
             let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
             undo.0 = undo_for(window, target, now, &moves, &placements, &presented);
+            dropped.dropped(window, now + TILED_DROP_WINDOW);
             apply_drop(
                 window,
                 target,
@@ -1500,6 +1503,7 @@ pub(super) fn drag_watchdog(
     mut placements: Placements,
     mut moves: DisplayMoves,
     mut native: ResMut<NativeMembership>,
+    mut dropped: ResMut<tiling::DroppedWindow>,
     mut commands: Commands,
 ) {
     let Some(window) = state.window() else {
@@ -1529,6 +1533,7 @@ pub(super) fn drag_watchdog(
     state.set_if_neq(next);
     for DragEffect::Drop { window, target } in effects {
         let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
+        dropped.dropped(window, time.elapsed() + TILED_DROP_WINDOW);
         apply_drop(
             window,
             target,

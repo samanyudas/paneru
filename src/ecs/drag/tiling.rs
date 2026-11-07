@@ -12,6 +12,7 @@ use bevy::ecs::world::World;
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 
+use super::DragState;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::{
     Bounds, DockPosition, PresentedOrigin, RepositionMarker, ResizeMarker, SpawnCommandsExt,
@@ -25,6 +26,12 @@ const TILE_TOLERANCE: i32 = 2;
 const RESIZE_RELEASE_GRACE: Duration = Duration::from_millis(600);
 const NATIVE_RESIZE_SETTLE: Duration = Duration::from_millis(200);
 const TILE_RESTORE_HOLD: Duration = Duration::from_secs(1);
+/// How long a frame an app reports before it catches up with the engine's
+/// writes stays the engine's own. An app like T3 Code applies the writes of
+/// a move one by one, well after the engine sent them, and pauses longer
+/// than [`NATIVE_RESIZE_SETTLE`] between them. Past this, a frame that still
+/// differs is the app's own size.
+const ENGINE_ECHO_LIMIT: Duration = Duration::from_secs(5);
 /// How many times a tile that macOS puts back after the hold is restored
 /// again before its frame counts as the app's own.
 const MAX_RETILES: u8 = 3;
@@ -139,6 +146,23 @@ pub(crate) fn track_resize_gesture(
     }
 }
 
+/// The window dropped last and until when a change of its size counts as a
+/// snapping app's tile. Magnet and Rectangle set their frame on mouse-up,
+/// and their thirds and other layouts are not rectangles macOS tiles to.
+#[derive(Default, Resource)]
+pub(crate) struct DroppedWindow(Option<(Entity, Duration)>);
+
+impl DroppedWindow {
+    pub(crate) fn dropped(&mut self, window: Entity, until: Duration) {
+        self.0 = Some((window, until));
+    }
+
+    fn snaps(&self, entity: Entity, now: Duration) -> bool {
+        self.0
+            .is_some_and(|(window, until)| window == entity && now <= until)
+    }
+}
+
 /// Half, quarter, and fill rectangles in macOS's visible frame. A two-point
 /// tolerance admits rounding between AX and display geometry.
 pub(crate) fn is_macos_tile(frame: IRect, visible: IRect) -> bool {
@@ -184,6 +208,9 @@ pub(crate) struct NativeResizeStart {
     /// this size at the slot the engine moved it back to.
     tile: Option<IVec2>,
     retiles: u8,
+    /// Until when a hold that ended before the app moved the window to the
+    /// slot waits for the app to catch up with the engine's writes.
+    catch_up: Option<Duration>,
 }
 
 #[derive(Clone, Copy)]
@@ -191,6 +218,11 @@ enum Phase {
     Observing {
         frame: IRect,
         changed: Duration,
+        /// When the frames began to come while the engine moved the window
+        /// or a drag held it, if they did. Until the app shows the frame the
+        /// engine wrote, such frames are the app catching up, not its own
+        /// size, for at most [`ENGINE_ECHO_LIMIT`].
+        echo: Option<Duration>,
     },
     Holding {
         until: Duration,
@@ -220,6 +252,7 @@ impl NativeResizeStart {
             reached: false,
             tile: None,
             retiles: 0,
+            catch_up: None,
         }
     }
 
@@ -233,9 +266,13 @@ impl NativeResizeStart {
 
     fn settlement(&self, now: Duration) -> Option<Settlement> {
         match self.phase {
-            Phase::Observing { frame, changed } => {
-                (now >= changed + NATIVE_RESIZE_SETTLE).then_some(Settlement::Adopt(frame))
-            }
+            Phase::Observing {
+                frame,
+                changed,
+                echo,
+            } => (now >= changed + NATIVE_RESIZE_SETTLE
+                && echo.is_none_or(|since| now >= since + ENGINE_ECHO_LIMIT))
+            .then_some(Settlement::Adopt(frame)),
             Phase::Holding { until } => (now >= until).then_some(Settlement::Refused),
             Phase::Settling { settlement, .. } => Some(settlement),
             Phase::Refused { .. } => None,
@@ -257,6 +294,27 @@ impl NativeResizeStart {
                 reached: true,
                 ..self
             })
+    }
+
+    /// This hold, waiting [`NATIVE_RESIZE_SETTLE`] more, when the window at
+    /// `frame` has yet to reach the slot's origin within
+    /// [`ENGINE_ECHO_LIMIT`] of the restore. An app that refuses a size
+    /// still takes the move, so one that has not moved is still applying the
+    /// engine's writes.
+    fn catching_up(self, frame: IRect, now: Duration) -> Option<Self> {
+        let Phase::Holding { until } = self.phase else {
+            return None;
+        };
+        let deadline = self
+            .catch_up
+            .unwrap_or(until + ENGINE_ECHO_LIMIT.saturating_sub(TILE_RESTORE_HOLD));
+        (frame.min != self.origin && now < deadline).then_some(Self {
+            phase: Phase::Holding {
+                until: now + NATIVE_RESIZE_SETTLE,
+            },
+            catch_up: Some(deadline),
+            ..self
+        })
     }
 
     pub(crate) fn misses_only_height(&self, frame: IRect) -> bool {
@@ -290,6 +348,7 @@ impl NativeResizeStart {
                 },
                 reached: false,
                 retiles: self.retiles + 1,
+                catch_up: None,
                 ..self
             },
         )
@@ -330,10 +389,19 @@ impl NativeResizeStart {
         }
     }
 
+    /// When the frames being observed began to come while the engine moved
+    /// the window, if they did.
+    fn echo(&self) -> Option<Duration> {
+        match self.phase {
+            Phase::Observing { echo, .. } => echo,
+            _ => None,
+        }
+    }
+
     fn adopts_when_cancelled(&self) -> bool {
         matches!(
             self.phase,
-            Phase::Observing { .. }
+            Phase::Observing { echo: None, .. }
                 | Phase::Settling {
                     settlement: Settlement::Adopt(_),
                     ..
@@ -398,6 +466,8 @@ pub(crate) struct TilingRestore<'w, 's> {
     displays: Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>,
     presented: Presented<'w, 's>,
     gesture: Res<'w, PointerResize>,
+    drag: Res<'w, DragState>,
+    dropped: Res<'w, DroppedWindow>,
     time: Res<'w, Time>,
 }
 
@@ -417,7 +487,22 @@ impl TilingRestore<'_, '_> {
         self.gesture.resizes(entity, self.time.elapsed())
     }
 
-    pub(crate) fn due(&self, entity: Entity) -> bool {
+    /// Whether a title-bar drag holds `entity` while it follows the
+    /// pointer, itself or as a native tab of the window it drags. `strip`
+    /// is the strip that holds `entity`.
+    fn drags(&self, entity: Entity, strip: Option<&LayoutStrip>) -> bool {
+        let dragged = match &*self.drag {
+            DragState::Dragging(drag) => drag.window,
+            DragState::Unconfirmed(press) => press.window,
+            _ => return false,
+        };
+        dragged == entity
+            || strip
+                .and_then(|strip| strip.tab_group(dragged))
+                .is_some_and(|tabs| tabs.contains(&entity))
+    }
+
+    pub(crate) fn due(&self, entity: Entity, strip: Option<&LayoutStrip>) -> bool {
         let now = self.time.elapsed();
         self.presented
             .get(entity)
@@ -426,6 +511,7 @@ impl TilingRestore<'_, '_> {
                     start.due(now) && !Self::blocks(start, now, resize, reposition, verifying)
                 })
             })
+            && !self.drags(entity, strip)
     }
 
     fn blocks(
@@ -440,7 +526,7 @@ impl TilingRestore<'_, '_> {
                 resize.is_some_and(|resize| resize.0 != start.size)
                     || reposition.is_some_and(|reposition| reposition.0 != start.origin)
             }
-            _ => resize.is_some() || verifying,
+            _ => resize.is_some() || reposition.is_some() || verifying,
         }
     }
 
@@ -450,7 +536,7 @@ impl TilingRestore<'_, '_> {
         entity: Entity,
         frame: IRect,
         managed: IRect,
-        strip_x: Option<i32>,
+        strip: Option<(&LayoutStrip, i32)>,
         margins: Margins,
         commands: &mut Commands,
     ) -> NativeFrame {
@@ -467,10 +553,15 @@ impl TilingRestore<'_, '_> {
             }
             return NativeFrame::Ordinary;
         }
-        let tile = self.displays.iter().any(|(display, dock)| {
-            is_macos_tile(margins.shown(frame), display.visible_bounds(dock))
-        });
         let engine = resize.is_some() || verifying;
+        // Right after a drop, a new size is a snapping app's tile, unless
+        // the engine is resizing the window itself.
+        let tile =
+            self.displays.iter().any(|(display, dock)| {
+                is_macos_tile(margins.shown(frame), display.visible_bounds(dock))
+            }) || (!engine && frame.size() != managed.size() && self.dropped.snaps(entity, now));
+        let strip_x = strip.map(|(_, x)| x);
+        let moving = reposition.is_some() || self.drags(entity, strip.map(|(strip, _)| strip));
         if let Some(refused) = start.and_then(NativeResizeStart::refused) {
             if engine {
                 return NativeFrame::Deferred;
@@ -512,10 +603,16 @@ impl TilingRestore<'_, '_> {
                 Phase::Observing {
                     frame,
                     changed: now,
+                    echo: moving.then_some(now),
                 },
             ));
             return NativeFrame::Deferred;
         };
+        // The app caught up with the engine's writes.
+        if start.echo().is_some() && frame == managed {
+            entity_commands.try_remove::<NativeResizeStart>();
+            return NativeFrame::Moved;
+        }
         let settlement = start.settlement(now);
         if !matches!(settlement, Some(Settlement::Refused))
             && let Some(again) = start.again(tile, frame, now)
@@ -533,11 +630,30 @@ impl TilingRestore<'_, '_> {
                 if let Some(again) = start.retile(tile, frame, now) {
                     return Self::restore(entity, again, commands);
                 }
+                if let Some(waiting) = start.catching_up(frame, now) {
+                    entity_commands.try_insert(waiting);
+                    return NativeFrame::Deferred;
+                }
                 entity_commands.try_remove::<(ResizeMarker, RepositionMarker, VerifyWindowSize)>();
                 entity_commands.try_insert(start.with_phase(Phase::Refused { frame }));
                 return NativeFrame::Refused;
             }
-            _ if engine || matches!(start.phase, Phase::Holding { .. }) => {
+            _ if engine || moving || matches!(start.phase, Phase::Holding { .. }) => {
+                // An observation the move began after is the app catching up
+                // from now on.
+                if moving
+                    && let Phase::Observing {
+                        frame,
+                        changed,
+                        echo: None,
+                    } = start.phase
+                {
+                    entity_commands.try_insert(start.with_phase(Phase::Observing {
+                        frame,
+                        changed,
+                        echo: Some(now),
+                    }));
+                }
                 return NativeFrame::Deferred;
             }
             Some(Settlement::Adopt(seen)) if seen == frame => {
@@ -551,6 +667,7 @@ impl TilingRestore<'_, '_> {
                 phase: Phase::Observing {
                     frame,
                     changed: now,
+                    echo: start.echo().or(moving.then_some(now)),
                 },
                 ..start
             });
