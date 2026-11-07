@@ -806,6 +806,71 @@ fn a_lagging_apps_size_after_the_tile_hold_is_no_refusal() {
     );
 }
 
+/// A busy app can lose the engine's move back to the slot after a snap.
+/// Once the hold ends with the window still off its slot, the engine writes
+/// the slot again instead of waiting for the app.
+#[test]
+fn a_snapped_window_whose_app_lost_the_move_home_is_written_again() {
+    let mut harness = three_columns();
+    let id = 2;
+    let start = frame(harness.world(), id);
+    let point = Origin::new(grab(start).x, TEST_DISPLAY_HEIGHT - 1);
+    press_and_drag(&mut harness, id, point);
+    release(&mut harness, point);
+    let slot = frame(harness.world(), id);
+    harness
+        .mock_state
+        .update_window(id, |window| window.late_writes = Some(Vec::new()));
+    macos_tile(&mut harness, id, IRect::new(0, 394, 683, 768));
+    harness.advance(FRAME);
+    harness
+        .mock_state
+        .update_window(id, |window| window.late_writes = None);
+    harness.advance(ms(1500));
+    assert_eq!(frame(harness.world(), id), slot);
+    assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
+}
+
+/// An app that lags behind the engine can also lose the writes it held, and
+/// then keep a frame the engine never wrote. Once the engine is done writing
+/// and that frame holds still, the engine writes its own frame again instead
+/// of waiting for the app.
+#[test]
+fn a_frame_an_app_keeps_after_losing_the_engines_writes_is_written_again() {
+    let mut harness = harness_with(
+        "[options]\nanimation_speed = 14.0\n",
+        TEST_DISPLAY_HEIGHT,
+        3,
+    );
+    let id = 2;
+    let start = frame(harness.world(), id);
+    let low = grab(start) + IVec2::new(0, 380);
+    press_and_drag(&mut harness, id, low);
+    harness.mock_state.update_window(id, |window| {
+        window.resize_bottom_limit = Some(TEST_DISPLAY_HEIGHT);
+        window.late_writes = Some(Vec::new());
+    });
+    release(&mut harness, low);
+    let dropped = frame(harness.world(), id);
+    let cut = IRect::from_corners(dropped.min, Origin::new(dropped.max.x, TEST_DISPLAY_HEIGHT));
+    harness
+        .mock_state
+        .update_window(id, |window| window.frame = cut);
+    harness
+        .world()
+        .write_message(Event::WindowResized { window_id: id });
+    for _ in 0..30 {
+        harness.advance(FRAME);
+    }
+    harness
+        .mock_state
+        .update_window(id, |window| window.late_writes = None);
+    harness.advance(ms(1500));
+    let home = frame(harness.world(), id);
+    assert_eq!(home.size(), start.size());
+    assert_eq!(home.min.y, start.min.y);
+}
+
 /// The menu bar belongs to its display, so a pointer there picks the
 /// column below it, as one point lower does.
 #[test]

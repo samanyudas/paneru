@@ -211,6 +211,9 @@ pub(crate) struct NativeResizeStart {
     /// Until when a hold that ended before the app moved the window to the
     /// slot waits for the app to catch up with the engine's writes.
     catch_up: Option<Duration>,
+    /// Whether the engine wrote its frame again after the app kept another
+    /// one while the engine was done writing.
+    reasserted: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -253,6 +256,7 @@ impl NativeResizeStart {
             tile: None,
             retiles: 0,
             catch_up: None,
+            reasserted: false,
         }
     }
 
@@ -271,7 +275,7 @@ impl NativeResizeStart {
                 changed,
                 echo,
             } => (now >= changed + NATIVE_RESIZE_SETTLE
-                && echo.is_none_or(|since| now >= since + ENGINE_ECHO_LIMIT))
+                && echo.is_none_or(|since| self.reasserted || now >= since + ENGINE_ECHO_LIMIT))
             .then_some(Settlement::Adopt(frame)),
             Phase::Holding { until } => (now >= until).then_some(Settlement::Refused),
             Phase::Settling { settlement, .. } => Some(settlement),
@@ -283,8 +287,20 @@ impl NativeResizeStart {
         match self.phase {
             Phase::Settling { retry, .. } => now >= retry,
             Phase::Refused { .. } => true,
-            _ => self.settlement(now).is_some(),
+            _ => self.settlement(now).is_some() || self.reasserts(now),
         }
+    }
+
+    /// Whether the app has held a frame for [`NATIVE_RESIZE_SETTLE`] while
+    /// catching up with the engine, so the engine writes its frame again
+    /// instead of waiting out [`ENGINE_ECHO_LIMIT`]. An app can lose writes
+    /// it did not answer in time.
+    fn reasserts(&self, now: Duration) -> bool {
+        !self.reasserted
+            && matches!(
+                self.phase,
+                Phase::Observing { changed, echo: Some(_), .. } if now >= changed + NATIVE_RESIZE_SETTLE
+            )
     }
 
     /// This start, noting that the window showed `size` while it holds.
@@ -631,6 +647,11 @@ impl TilingRestore<'_, '_> {
                     return Self::restore(entity, again, commands);
                 }
                 if let Some(waiting) = start.catching_up(frame, now) {
+                    // The app may have lost the move to the slot, so it gets
+                    // the slot once more when the wait begins.
+                    if start.catch_up.is_none() {
+                        return Self::restore(entity, waiting, commands);
+                    }
                     entity_commands.try_insert(waiting);
                     return NativeFrame::Deferred;
                 }
@@ -654,6 +675,22 @@ impl TilingRestore<'_, '_> {
                         echo: Some(now),
                     }));
                 }
+                return NativeFrame::Deferred;
+            }
+            None if start.reasserts(now)
+                && matches!(start.phase, Phase::Observing { frame: seen, .. } if seen == frame) =>
+            {
+                entity_commands.try_insert(NativeResizeStart {
+                    phase: Phase::Observing {
+                        frame,
+                        changed: now,
+                        echo: start.echo(),
+                    },
+                    reasserted: true,
+                    ..start
+                });
+                commands.reposition_entity(entity, managed.min);
+                commands.resize_entity(entity, managed.size());
                 return NativeFrame::Deferred;
             }
             Some(Settlement::Adopt(seen)) if seen == frame => {
