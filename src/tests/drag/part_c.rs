@@ -752,6 +752,42 @@ fn a_snapping_apps_third_after_a_drop_returns_to_the_windows_place() {
     }
 }
 
+/// #386: Magnet's third reaches below the screen's bottom edge, so it is
+/// taller than the column. macOS ignores a small shrink that leaves a
+/// window's bottom edge near the screen's bottom, so the slot's height does
+/// not land by itself. The window still gets its column's full frame at the
+/// engine's first check after the snap, as Magnet snaps up to 0.6 s after
+/// the release and the frame is due within 1 s of the release.
+#[test]
+fn a_snap_taller_than_the_column_returns_to_the_full_column_within_a_second() {
+    let mut harness = three_columns();
+    let id = 2;
+    let start = frame(harness.world(), id);
+    let point = Origin::new(grab(start).x, TEST_DISPLAY_HEIGHT - 1);
+    press_and_drag(&mut harness, id, point);
+    release(&mut harness, point);
+    let slot = frame(harness.world(), id);
+    harness.mock_state.update_window(id, |window| {
+        window.sticky_bottom = Some(TEST_DISPLAY_HEIGHT);
+    });
+    let third = IRect::new(683, 20, 1024, TEST_DISPLAY_HEIGHT + 8);
+    macos_tile(&mut harness, id, third);
+    let mut shown = third;
+    let mut elapsed = FRAME;
+    while shown != slot && elapsed < ms(3000) {
+        harness.advance(FRAME);
+        elapsed += FRAME;
+        harness
+            .mock_state
+            .update_window(id, |window| shown = window.frame);
+    }
+    assert_eq!(shown, slot);
+    assert!(
+        elapsed <= ms(300),
+        "the column's full frame came {elapsed:?} after the snap"
+    );
+}
+
 /// An app's own resize well after a drop is still the app's size.
 #[test]
 fn an_apps_resize_long_after_a_drop_keeps_its_width() {
