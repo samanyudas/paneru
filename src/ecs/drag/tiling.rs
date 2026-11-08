@@ -227,6 +227,8 @@ pub(crate) struct NativeResizeStart {
     /// Until when a hold that ended before the app moved the window to the
     /// slot waits for the app to catch up with the engine's writes.
     catch_up: Option<Duration>,
+    /// The frame the window showed at the last check of that wait.
+    caught: Option<IRect>,
     /// Whether the engine wrote its frame again after the app kept another
     /// one while the engine was done writing.
     reasserted: bool,
@@ -272,6 +274,7 @@ impl NativeResizeStart {
             tile: None,
             retiles: 0,
             catch_up: None,
+            caught: None,
             reasserted: false,
         }
     }
@@ -329,10 +332,11 @@ impl NativeResizeStart {
     }
 
     /// This hold, waiting [`NATIVE_RESIZE_SETTLE`] more, when the window at
-    /// `frame` has yet to reach the slot's origin within
-    /// [`ENGINE_ECHO_LIMIT`] of the restore. An app that refuses a size
-    /// still takes the move, so one that has not moved is still applying the
-    /// engine's writes.
+    /// `frame` has yet to reach the slot's origin, or is off the slot and
+    /// changed since the last check, within [`ENGINE_ECHO_LIMIT`] of the
+    /// restore. An app that refuses a size still takes the move and then
+    /// holds its frame, so one that has not moved, or still changes its
+    /// frame, is still applying the engine's writes.
     fn catching_up(self, frame: IRect, now: Duration) -> Option<Self> {
         let Phase::Holding { until } = self.phase else {
             return None;
@@ -340,11 +344,13 @@ impl NativeResizeStart {
         let deadline = self
             .catch_up
             .unwrap_or(until + ENGINE_ECHO_LIMIT.saturating_sub(TILE_RESTORE_HOLD));
-        (frame.min != self.origin && now < deadline).then_some(Self {
+        let changing = frame != self.slot() && self.caught != Some(frame);
+        ((frame.min != self.origin || changing) && now < deadline).then_some(Self {
             phase: Phase::Holding {
                 until: now + NATIVE_RESIZE_SETTLE,
             },
             catch_up: Some(deadline),
+            caught: Some(frame),
             ..self
         })
     }
@@ -381,6 +387,7 @@ impl NativeResizeStart {
                 reached: false,
                 retiles: self.retiles + 1,
                 catch_up: None,
+                caught: None,
                 ..self
             },
         )
