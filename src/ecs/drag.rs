@@ -1303,7 +1303,9 @@ pub(super) fn drag_events(
             debug!("dropping {window} at {target:?}");
             let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
             undo.0 = undo_for(window, target, now, &moves, &placements, &presented);
-            dropped.dropped(window, now + TILED_DROP_WINDOW);
+            if let Ok((_, bounds)) = placements.get(window) {
+                dropped.dropped(window, bounds.0, now + TILED_DROP_WINDOW);
+            }
             apply_drop(
                 window,
                 target,
@@ -1533,7 +1535,9 @@ pub(super) fn drag_watchdog(
     state.set_if_neq(next);
     for DragEffect::Drop { window, target } in effects {
         let focused = windows.get(window).is_ok_and(|(_, _, _, focused)| focused);
-        dropped.dropped(window, time.elapsed() + TILED_DROP_WINDOW);
+        if let Ok((_, bounds)) = placements.get(window) {
+            dropped.dropped(window, bounds.0, time.elapsed() + TILED_DROP_WINDOW);
+        }
         apply_drop(
             window,
             target,

@@ -293,6 +293,98 @@ fn a_window_dropped_on_another_display_joins_a_column_there() {
     crate::assert_focused!(harness.world(), 2);
 }
 
+/// A snapping app's third right after a drop on another display returns
+/// the window to the place the same drop gives it without the third, as on
+/// the same display. macOS can report the move to the other display before
+/// the release, between the release and the third, or after the third.
+#[test]
+fn a_snapping_apps_third_after_a_drop_on_another_display_returns_to_the_drops_place() {
+    #[derive(Clone, Copy, Debug)]
+    enum Report {
+        DuringTheDrag,
+        BeforeTheThird,
+        AfterTheThird,
+        RebuiltDuringTheDrag,
+        RebuiltBeforeTheThird,
+        RebuiltAfterTheThird,
+    }
+    // macOS moves the window, and the app rebuilds its AX element, as T3
+    // Code does when a window changes Space.
+    let rebuild = |harness: &mut TestHarness| {
+        harness.mock_state.update_window(2, |window| {
+            let shift = TEST_DISPLAY_WIDTH + 100 - window.frame.min.x;
+            if window.frame.center().x < TEST_DISPLAY_WIDTH {
+                window.frame.min.x += shift;
+                window.frame.max.x += shift;
+            }
+        });
+        harness.mock_state.os_transfer_window(2, EXT_WORKSPACE_ID);
+        harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+    };
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    let third = IRect::new(
+        ext.min.x + EXT_DISPLAY_WIDTH * 2 / 3,
+        ext.min.y + TEST_MENUBAR_HEIGHT,
+        ext.max.x,
+        ext.max.y,
+    );
+    let drop = |report: Report, snap: bool| {
+        let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+        let below_the_middle = middle_of(harness.world(), 100, 900);
+        press_and_drag(&mut harness, 2, below_the_middle);
+        match report {
+            Report::DuringTheDrag => macos_moves_to_ext(&mut harness, 2),
+            Report::RebuiltDuringTheDrag => rebuild(&mut harness),
+            _ => {}
+        }
+        if matches!(report, Report::DuringTheDrag | Report::RebuiltDuringTheDrag) {
+            harness.advance(FRAME);
+        }
+        release(&mut harness, below_the_middle);
+        match report {
+            Report::BeforeTheThird => macos_moves_to_ext(&mut harness, 2),
+            Report::RebuiltBeforeTheThird => rebuild(&mut harness),
+            _ => {}
+        }
+        if matches!(
+            report,
+            Report::BeforeTheThird | Report::RebuiltBeforeTheThird
+        ) {
+            harness.advance(FRAME);
+        }
+        if snap {
+            macos_tile(&mut harness, 2, third);
+        }
+        match report {
+            Report::AfterTheThird => macos_moves_to_ext(&mut harness, 2),
+            Report::RebuiltAfterTheThird => rebuild(&mut harness),
+            _ => {}
+        }
+        harness.advance(SETTLE);
+        (
+            frame(harness.world(), 2),
+            layout_on(harness.world(), EXT_WORKSPACE_ID),
+        )
+    };
+    let mut failures = Vec::new();
+    for report in [
+        Report::DuringTheDrag,
+        Report::BeforeTheThird,
+        Report::AfterTheThird,
+        Report::RebuiltDuringTheDrag,
+        Report::RebuiltBeforeTheThird,
+        Report::RebuiltAfterTheThird,
+    ] {
+        let expected = drop(report, false);
+        assert_eq!(expected.1, vec![vec![100, 2]], "{report:?}");
+        let actual = drop(report, true);
+        if actual != expected {
+            failures.push((report, expected, actual));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
 #[test]
 fn a_window_dropped_above_a_column_on_another_display_becomes_its_top_window() {
     let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
