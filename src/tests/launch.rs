@@ -240,3 +240,57 @@ fn a_window_of_an_app_hidden_before_launch_takes_no_column_until_shown() {
         "the window joins the strip once the app shows"
     );
 }
+
+const HIDDEN_APP: Pid = 11;
+const HIDDEN_WINDOW: WinID = 110;
+
+fn focused_window(harness: &mut TestHarness) -> Option<WinID> {
+    let world = harness.world();
+    world
+        .query_filtered::<&Window, With<crate::ecs::FocusedMarker>>()
+        .iter(world)
+        .next()
+        .map(|window| window.id())
+}
+
+/// A hidden app that opens a window takes no column, so focus stays on the
+/// window the user is in. (#374)
+#[test]
+fn a_hidden_app_opening_a_window_leaves_focus_where_it_is() {
+    let focus = 0;
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.mock_state.focus_window(focus);
+    harness.run(vec![Event::WindowFocused { window_id: focus }]);
+    assert_eq!(focused_window(&mut harness), Some(focus));
+
+    let state = harness.mock_state.clone();
+    state.spawn_app(HIDDEN_APP, "com.example.hidden", "Hidden");
+    state.update_app(HIDDEN_APP, |app| app.is_hidden = true);
+    state.spawn_window(
+        HIDDEN_APP,
+        TEST_WORKSPACE_ID,
+        HIDDEN_WINDOW,
+        IRect::new(200, 100, 900, 600),
+    );
+    let world = harness.world();
+    let mut commands = world.commands();
+    let watch = launch_watch("Hidden", &mut commands);
+    commands.spawn((watch, BProcess(Box::new(state.create_process(HIDDEN_APP)))));
+    world.flush();
+    harness.advance(Duration::from_secs(2));
+
+    assert!(
+        harness
+            .world()
+            .query::<&Window>()
+            .iter(harness.world())
+            .any(|window| window.id() == HIDDEN_WINDOW),
+        "the engine tracks the hidden app's window"
+    );
+    assert!(!tiled(&mut harness, HIDDEN_WINDOW), "it takes no column");
+    assert_eq!(
+        focused_window(&mut harness),
+        Some(focus),
+        "focus stays on window {focus}"
+    );
+}

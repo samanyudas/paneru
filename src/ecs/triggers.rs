@@ -822,9 +822,14 @@ pub(super) fn window_minimized_trigger(
     {
         debug!("Entity {entity} is minimized or hidden.");
         let display_bounds = active_display.bounds();
+        let focused = windows
+            .focused()
+            .is_some_and(|(_, focused)| focused == entity);
 
         for (mut strip, active) in workspaces {
-            if active {
+            // A window of a hidden app that opens in no strip and without focus has no focus to
+            // give away. (#374)
+            if active && (focused || strip.contains(entity)) {
                 give_away_focus(
                     entity,
                     &windows,
