@@ -122,3 +122,64 @@ fn a_second_strip_for_a_space_joins_the_first() {
         "no window is parked: {frames:?}"
     );
 }
+
+/// Windows that arrive already parked, in a strip that merges into the Space's
+/// existing empty strip, come back on screen, although neither that strip's
+/// position nor their slot in it changes.
+#[test]
+fn parked_windows_merged_into_an_existing_empty_strip_come_back_on_screen() {
+    const ELSEWHERE: WorkspaceId = 999;
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_secs(1));
+
+    let parked = Origin::new(
+        TEST_DISPLAY_WIDTH - crate::ecs::layout::PARKED_STRIP_SLIVER,
+        TEST_DISPLAY_HEIGHT - crate::ecs::layout::PARKED_STRIP_SLIVER,
+    );
+    let world = harness.world();
+    let window = find_window_entity(0, world);
+    let display = {
+        let (child, mut strip) = world
+            .query::<(&ChildOf, &mut LayoutStrip)>()
+            .iter_mut(world)
+            .find(|(_, strip)| strip.id() == TEST_WORKSPACE_ID)
+            .expect("the Space's strip");
+        strip.remove(window);
+        child.parent()
+    };
+    let mut elsewhere = LayoutStrip::new(ELSEWHERE, 0);
+    elsewhere.append(window);
+    let elsewhere = world
+        .spawn((elsewhere, crate::ecs::Position(parked), ChildOf(display)))
+        .id();
+    harness.advance(Duration::from_secs(1));
+    assert_eq!(
+        harness.mock_state.ax_frame(0).min,
+        parked,
+        "test setup: the window is parked"
+    );
+
+    let world = harness.world();
+    world
+        .get_mut::<LayoutStrip>(elsewhere)
+        .expect("the parked strip")
+        .remove(window);
+    let mut arriving = LayoutStrip::new(TEST_WORKSPACE_ID, 0);
+    arriving.append(window);
+    world.spawn((arriving, crate::ecs::Position(parked), ChildOf(display)));
+    harness.advance(Duration::from_secs(1));
+
+    let world = harness.world();
+    let strips = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .count();
+    let frame = harness.mock_state.ax_frame(0);
+    assert_eq!(strips, 1, "the Space keeps one strip");
+    assert_eq!(
+        frame.min.y, TEST_MENUBAR_HEIGHT,
+        "the window is back on screen: {frame:?}"
+    );
+}
