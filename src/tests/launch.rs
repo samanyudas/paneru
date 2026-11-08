@@ -202,3 +202,41 @@ fn a_window_that_answers_late_at_launch_is_tiled() {
         "the window is tiled once the app answers for it"
     );
 }
+
+/// An app that was hidden before the engine started still lists its windows
+/// over Accessibility, as an Electron app such as Beeper does. Its window takes
+/// no column, so moving focus along the strip cannot reach it and show the app
+/// again, and it joins the strip when the user shows the app. (#374)
+#[test]
+fn a_window_of_an_app_hidden_before_launch_takes_no_column_until_shown() {
+    let harness = TestHarness::new();
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.is_hidden = true);
+    let mut harness = harness.with_windows(2);
+
+    harness.advance(Duration::from_secs(2));
+    assert!(
+        !tiled(&mut harness, 0),
+        "a hidden app's window takes no column"
+    );
+    assert!(
+        !tiled(&mut harness, 1),
+        "a hidden app's window takes no column"
+    );
+
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.is_hidden = false);
+    harness.run(vec![Event::ApplicationVisible {
+        pid: TEST_PROCESS_ID,
+    }]);
+    assert!(
+        tiled(&mut harness, 0),
+        "the window joins the strip once the app shows"
+    );
+    assert!(
+        tiled(&mut harness, 1),
+        "the window joins the strip once the app shows"
+    );
+}

@@ -7,6 +7,7 @@ use core::ptr::NonNull;
 use crossbeam_channel::Sender;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
+use objc2_app_kit::NSRunningApplication;
 use objc2_core_foundation::{CFRetained, CFString, CFType, kCFRunLoopCommonModes};
 use std::ffi::c_void;
 use std::pin::Pin;
@@ -165,6 +166,8 @@ pub trait ApplicationApi: Send + Sync {
     fn unobserve_window(&mut self, window: &Window);
     /// Checks if the application is currently the frontmost application.
     fn is_frontmost(&self) -> bool;
+    /// Checks if the user hid the application, as with Command-H.
+    fn is_hidden(&self) -> bool;
     /// Returns the bundle identifier of the application.
     fn bundle_id(&self) -> Option<String>;
     /// Returns the display name of the application.
@@ -422,6 +425,11 @@ impl ApplicationApi for ApplicationOS {
             .to_result(function_name!())
             .is_ok()
             && self.psn == psn
+    }
+
+    fn is_hidden(&self) -> bool {
+        NSRunningApplication::runningApplicationWithProcessIdentifier(self.pid)
+            .is_some_and(|app| app.isHidden())
     }
 
     /// Returns the bundle identifier of the application.

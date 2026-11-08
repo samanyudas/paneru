@@ -1391,6 +1391,12 @@ pub(super) fn spawn_window_trigger(
             let pre_launch = margins.shown(frame);
             spawned.insert(PreLaunchFrame(pre_launch));
         }
+        // The hide event reaches only apps that were known when it fired, so an app that was hidden
+        // before the engine started, or that opens a window while hidden, is asked here. (#374)
+        let hidden = app.is_hidden();
+        if hidden {
+            spawned.insert(Unmanaged::Hidden);
+        }
 
         commands.trigger(SendMessageTrigger(Event::WindowSpawned {
             window_id,
@@ -1402,7 +1408,7 @@ pub(super) fn spawn_window_trigger(
             subrole,
             frame: window_frame,
             floating: false,
-            managed: true,
+            managed: !hidden,
         }));
     }
 
@@ -1611,10 +1617,12 @@ pub(super) fn apply_window_positions(
             continue;
         }
 
+        // A window of a hidden app joins a strip when the app shows again.
         let Some((window, _, parent)) = ctx
             .windows
-            .get(entity)
-            .and_then(|window| ctx.windows.find_parent(window.id()))
+            .get_managed(entity)
+            .filter(|(_, _, unmanaged)| !matches!(unmanaged, Some(Unmanaged::Hidden)))
+            .and_then(|(window, _, _)| ctx.windows.find_parent(window.id()))
         else {
             continue;
         };
