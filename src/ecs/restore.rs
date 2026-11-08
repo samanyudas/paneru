@@ -468,6 +468,7 @@ pub(super) fn restore_window_state(
         })
         .collect();
     follow_windows_to_their_spaces(&mut plan, &current_spaces);
+    merge_strips_per_space(&mut plan);
 
     if plan.consumed_entities.is_empty() {
         info!(
@@ -692,11 +693,40 @@ fn follow_windows_to_their_spaces(
         .collect();
 }
 
+/// Each native Space has one strip. A Space's virtual workspace rows from an
+/// older session, and a saved Space that followed its windows onto another
+/// restored Space, join its first strip in saved order. Fullscreen strips stay
+/// on their own.
+fn merge_strips_per_space(plan: &mut RestorePlan) {
+    let mut merged: Vec<PlannedStrip> = Vec::new();
+    for mut planned in plan.strips.drain(..) {
+        planned.virtual_index = 0;
+        if !planned.is_fullscreen()
+            && let Some(first) = merged
+                .iter_mut()
+                .find(|first| first.workspace_id == planned.workspace_id && !first.is_fullscreen())
+        {
+            first.columns.append(&mut planned.columns);
+            first.view = first.view.or(planned.view);
+            continue;
+        }
+        merged.push(planned);
+    }
+    plan.strips = merged;
+    for index in plan.active_virtual_by_workspace.values_mut() {
+        *index = 0;
+    }
+}
+
+impl PlannedStrip {
+    fn is_fullscreen(&self) -> bool {
+        matches!(self.columns.as_slice(), [PlannedColumn::Fullscreen(_)])
+    }
+}
+
 fn layout_strip_from_plan(planned: &PlannedStrip, matched: &HashMap<WinID, Entity>) -> LayoutStrip {
     if let [PlannedColumn::Fullscreen(entity)] = planned.columns.as_slice() {
-        let mut strip = LayoutStrip::fullscreen(planned.workspace_id, *entity);
-        strip.virtual_index = planned.virtual_index;
-        return strip;
+        return LayoutStrip::fullscreen(planned.workspace_id, *entity);
     }
 
     let mut strip = LayoutStrip::new(planned.workspace_id, planned.virtual_index);

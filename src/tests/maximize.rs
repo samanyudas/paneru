@@ -1260,39 +1260,6 @@ fn a_display_move_keeps_a_maximized_window_in_the_new_row() {
     assert_eq!(os_frame(&harness, 1), area);
 }
 
-/// A maximized window moved to another workspace and back stays maximized,
-/// fills the usable area, and focus still scrolls past it.
-#[test]
-fn a_workspace_move_keeps_a_window_maximized() {
-    let mut harness = three_windows_one_focused();
-    double_click_title_bar(&mut harness, 1);
-    let area = usable_area(&mut harness);
-
-    harness.run(vec![command(Operation::VirtualMove(
-        Direction::East,
-        crate::commands::MoveFocus::Follow,
-    ))]);
-    harness.advance(SETTLE);
-    assert_eq!(os_frame(&harness, 1), area);
-
-    harness.run(vec![command(Operation::VirtualMove(
-        Direction::West,
-        crate::commands::MoveFocus::Follow,
-    ))]);
-    harness.advance(SETTLE);
-    assert_eq!(os_frame(&harness, 1), area);
-
-    focus(&mut harness, Direction::West);
-    assert_focused!(harness.world(), 2);
-    assert!(
-        os_frame(&harness, 1).min.x >= os_frame(&harness, 2).max.x,
-        "window 1 slid away to the east: {:?}",
-        os_frame(&harness, 1)
-    );
-    focus(&mut harness, Direction::East);
-    assert_eq!(os_frame(&harness, 1), area);
-}
-
 /// Reloads the config with outer and inner gaps of 16: an edge padding of 8
 /// and a window padding of 8 for windows `ids`.
 fn reload_with_gaps(harness: &mut TestHarness, ids: &[WinID]) {

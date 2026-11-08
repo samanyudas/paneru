@@ -7,14 +7,14 @@ use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::SystemCondition as _;
-use bevy::ecs::system::{Commands, Local, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{Level, instrument};
 
-use crate::commands::{Command, Direction, FocusSource, Operation, focus_with_verification};
+use crate::commands::{Direction, FocusSource, focus_with_verification};
 use crate::config::Config;
 use crate::config::swipe::{SwipeGestureDirection, focus_direction};
 use crate::ecs::focus::FocusHistory;
@@ -126,37 +126,6 @@ fn paging_active(config: Res<Config>, state: Res<PageGestureState>) -> bool {
         || (!config.swipe_gesture_paging() && state.config.as_ref().is_some_and(|c| c.0))
 }
 
-#[cfg(test)]
-mod paging_tests {
-    use super::*;
-
-    #[test]
-    fn large_swipe_preserves_every_earned_step_without_expanding_the_queue() {
-        let mut state = PageGestureState {
-            accumulated_cm: 80.5,
-            ..Default::default()
-        };
-        state.earn_steps(2.0, SwipeGestureDirection::Natural);
-        assert_eq!(state.pending.len(), 1);
-        assert!((state.accumulated_cm - 0.5).abs() < f64::EPSILON);
-
-        let expected = focus_direction(SwipeGestureDirection::Natural, 1.0);
-        for _ in 0..40 {
-            assert_eq!(state.next_step(), Some(expected.clone()));
-        }
-        assert_eq!(state.next_step(), None);
-    }
-
-    #[test]
-    fn in_flight_focus_keeps_paging_system_active_after_finger_lift() {
-        let state = PageGestureState {
-            in_flight: Some(PageInFlight::Dispatched),
-            ..Default::default()
-        };
-        assert!(state.has_work());
-    }
-}
-
 /// Upper bound on the timestep used to *advance* the strip.
 ///
 /// `Time::<Virtual>` is deliberately given a 10s `max_delta` (see [`crate::ecs`])
@@ -226,28 +195,23 @@ impl Plugin for ScrollEventsPlugin {
                 .run_if(on_message::<InputEvent>.or_else(paging_active)),
         );
 
-        // Only the two gesture systems are gated on an input event. The rest of
-        // the chain (inertia, snap force, integrator) must keep running after
-        // the fingers stop sending events, since that's when they take over.
+        // Only the gesture system is gated on an input event. The rest of the
+        // chain (inertia, snap force, integrator) must keep running after the
+        // fingers stop sending events, since that's when they take over.
         app.add_systems(
             Update,
             (
-                vertical_swipe_gesture
+                swipe_gesture
                     .run_if(mission_control_inactive)
                     .run_if(on_message::<InputEvent>),
-                (
-                    swipe_gesture
-                        .run_if(mission_control_inactive)
-                        .run_if(on_message::<InputEvent>),
-                    apply_inertia,
-                    apply_snap_force,
-                    settle_strip,
-                    scrolling_integrator,
-                    apply_scrolling_constraints,
-                    swiping_timeout,
-                )
-                    .chain(),
+                apply_inertia,
+                apply_snap_force,
+                settle_strip,
+                scrolling_integrator,
+                apply_scrolling_constraints,
+                swiping_timeout,
             )
+                .chain()
                 .in_set(UpdateSet::Input),
         );
     }
@@ -871,76 +835,33 @@ where
     )
 }
 
-#[derive(Default)]
-struct VerticalGestureState {
-    accumulated: f64,
-    last_event: Option<Instant>,
-    fired: bool,
-}
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
 
-#[instrument(level = Level::TRACE, skip_all)]
-fn vertical_swipe_gesture(
-    mut messages: MessageReader<InputEvent>,
-    active_display: ActiveDisplay,
-    config: Res<Config>,
-    mut commands: Commands,
-    mut state: Local<VerticalGestureState>,
-) {
-    const GESTURE_TIMEOUT: Duration = Duration::from_millis(150);
+    #[test]
+    fn large_swipe_preserves_every_earned_step_without_expanding_the_queue() {
+        let mut state = PageGestureState {
+            accumulated_cm: 80.5,
+            ..Default::default()
+        };
+        state.earn_steps(2.0, SwipeGestureDirection::Natural);
+        assert_eq!(state.pending.len(), 1);
+        assert!((state.accumulated_cm - 0.5).abs() < f64::EPSILON);
 
-    if active_display.fullscreen().is_some() {
-        return;
-    }
-
-    // Reset state when the gesture times out (fingers lifted).
-    if let Some(last) = state.last_event
-        && last.elapsed() > GESTURE_TIMEOUT
-    {
-        state.accumulated = 0.0;
-        state.fired = false;
-    }
-
-    for InputEvent(event) in messages.read() {
-        match event {
-            Event::VerticalScrollTick { delta } => {
-                switch_virtual_workspace(*delta, &config, &mut commands);
-            }
-            Event::VerticalSwipe { delta, fingers }
-                if config
-                    .swipe_gesture_fingers()
-                    .is_some_and(|fingers_configured| fingers_configured == *fingers) =>
-            {
-                state.last_event = Some(Instant::now());
-
-                if !state.fired {
-                    state.accumulated += delta;
-                }
-            }
-            _ => {}
+        let expected = focus_direction(SwipeGestureDirection::Natural, 1.0);
+        for _ in 0..40 {
+            assert_eq!(state.next_step(), Some(expected.clone()));
         }
+        assert_eq!(state.next_step(), None);
     }
 
-    // Threshold needs to be high enough that incidental vertical movement
-    // during horizontal swipes doesn't trigger a workspace switch.
-    let threshold = 0.15 / config.swipe_sensitivity();
-    if state.accumulated.abs() >= threshold {
-        switch_virtual_workspace(state.accumulated, &config, &mut commands);
-        state.accumulated = 0.0;
-        state.fired = true;
+    #[test]
+    fn in_flight_focus_keeps_paging_system_active_after_finger_lift() {
+        let state = PageGestureState {
+            in_flight: Some(PageInFlight::Dispatched),
+            ..Default::default()
+        };
+        assert!(state.has_work());
     }
-}
-
-fn switch_virtual_workspace(delta: f64, config: &Config, commands: &mut Commands) {
-    let physical_finger_direction = if delta > 0.0 {
-        Direction::South
-    } else {
-        Direction::North
-    };
-    let direction = match config.swipe_gesture_direction() {
-        SwipeGestureDirection::Natural => physical_finger_direction.reverse(),
-        SwipeGestureDirection::Reversed => physical_finger_direction,
-    };
-    commands.trigger(SendMessageTrigger(Event::Command {
-        command: Command::Window(Operation::Virtual(direction)),
-    }));
 }

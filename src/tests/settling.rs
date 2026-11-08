@@ -306,26 +306,6 @@ fn removal_during_settle_uses_current_focus_after_keyboard_switch() {
     assert_eq!(window_x(harness.world(), 3), TEST_DISPLAY_WIDTH - 700);
 }
 
-#[test]
-fn removal_during_settle_preserves_workspace_restore_placement() {
-    let mut harness = terminate_predecessor_after_landing_focus();
-    harness.run(vec![Event::Command {
-        command: Command::Window(Operation::VirtualNumber(1)),
-    }]);
-    harness.advance(SETTLE);
-    harness.run(vec![Event::Command {
-        command: Command::Window(Operation::VirtualNumber(0)),
-    }]);
-    harness.advance(SETTLE);
-
-    assert_focused!(harness.world(), 1);
-    assert_eq!(
-        harness.mock_state.focused_window_id(TEST_PROCESS_ID),
-        Some(1)
-    );
-    assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 1400);
-}
-
 /// The mirror case: a flick back past the start lands on the first column
 /// with the strip start on the left viewport edge.
 #[test]
@@ -482,30 +462,6 @@ fn center_command_still_centers() {
     assert_eq!(window_x(harness.world(), 1), (TEST_DISPLAY_WIDTH - 400) / 2);
 }
 
-/// Switching virtual workspaces mid-settle keeps the landing: the strip
-/// comes back where the settle was headed, not where it was caught.
-#[test]
-fn virtual_switch_mid_settle_restores_the_landing() {
-    // Only an animated settle can be caught partway.
-    let mut harness = harness_with_widths(&[700, 700, 700, 700], Some(14.0));
-
-    send(&mut harness, swipe(0.05));
-    harness.advance(ONE_FRAME * 6);
-    assert!(is_scrolling(harness.world()), "still settling");
-    harness.run(vec![
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(1)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(0)),
-        },
-    ]);
-    harness.advance(SETTLE);
-
-    assert_focused!(harness.world(), 1);
-    assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 700);
-}
-
 /// Fingers that touch down mid-settle catch the strip where it is, and
 /// lifting them again settles from there.
 #[test]
@@ -572,37 +528,5 @@ fn a_strip_that_loses_activation_mid_settle_lands() {
     assert_eq!(
         world.get::<crate::ecs::Position>(strip).unwrap().x,
         crate::util::round_px(target)
-    );
-}
-
-fn swipe_and_maybe_switch_away(switch: bool) -> i32 {
-    let mut harness = harness_with_widths(&[400, 400, 400, 400, 400, 400], Some(14.0));
-    harness.mock_state.set_cursor_position(IVec2::new(1000, 5));
-    send(&mut harness, swipe(0.05));
-    // Late enough that the strip already shows the landed column fully.
-    harness.advance(ONE_FRAME * 10);
-    assert!(is_scrolling(harness.world()), "still settling");
-    if switch {
-        harness.run(vec![
-            Event::Command {
-                command: Command::Window(Operation::VirtualNumber(1)),
-            },
-            Event::Command {
-                command: Command::Window(Operation::VirtualNumber(0)),
-            },
-        ]);
-    }
-    harness.advance(SETTLE);
-    window_x(harness.world(), 0)
-}
-
-/// Switching virtual workspaces mid-settle returns the strip to the landing,
-/// even when the landed column is already fully visible where the settle was
-/// interrupted.
-#[test]
-fn virtual_switch_mid_settle_keeps_a_fully_visible_landing() {
-    assert_eq!(
-        swipe_and_maybe_switch_away(true),
-        swipe_and_maybe_switch_away(false)
     );
 }

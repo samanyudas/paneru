@@ -1,5 +1,5 @@
 use bevy::app::{App, Plugin, PostUpdate, PreUpdate, Update};
-use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut, Ref};
+use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _, Ref};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::ChildOf;
@@ -17,14 +17,12 @@ use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
 use super::ActiveDisplayMarker;
-use crate::commands::{
-    Direction, MoveFocus, Operation, filter_window_operations, get_window_in_direction,
-};
+use crate::commands::{Operation, filter_window_operations};
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, origin_exposing};
 use crate::ecs::native_membership::{NativeMembership, NativeScope};
-use crate::ecs::params::{ActiveDisplay, Windows};
+use crate::ecs::params::Windows;
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, FocusedMarker, ManualStripOffset, NativeFullscreenMarker,
     PointerFollowsFocus, Position, RaiseWindow, RepositionMarker, Scrolling, SelectedVirtualMarker,
@@ -42,22 +40,6 @@ pub struct WorkspaceEventsPlugin;
 #[derive(Component)]
 pub(crate) struct RestoredActivation;
 
-/// The strip, its origin, whether it's visible, and its saved position, as
-/// [`handle_virtual_window_moves`] needs them to slide a strip to/from its
-/// parked position.
-type MovableStrips<'w, 's> = Query<
-    'w,
-    's,
-    (
-        Entity,
-        &'static mut LayoutStrip,
-        &'static mut Position,
-        Has<ActiveWorkspaceMarker>,
-        Option<&'static mut PreviousStripPosition>,
-    ),
-    Without<Window>,
->;
-
 /// The saved origin and any in-flight `RepositionMarker`, as
 /// [`show_active_workspace`] needs them to restore a strip.
 type RestorableStrips<'w, 's> = Query<
@@ -74,14 +56,24 @@ type RestorableStrips<'w, 's> = Query<
     Without<Window>,
 >;
 
-/// `p0`: strips added this tick. `p1`: rewrites indexes of strips sharing
-/// their workspace. Must be a `ParamSet` since `p1` aliases `p0` mutably.
-type RenumberStrips<'w, 's> = ParamSet<
+/// `p0`: strips added this tick. `p1`: every strip, to merge those sharing a
+/// native Space. Must be a `ParamSet` since `p1` aliases `p0` mutably.
+type MergeStrips<'w, 's> = ParamSet<
     'w,
     's,
     (
         Query<'static, 'static, &'static LayoutStrip, Added<LayoutStrip>>,
-        Query<'static, 'static, (Entity, &'static mut LayoutStrip)>,
+        Query<
+            'static,
+            'static,
+            (
+                Entity,
+                &'static mut LayoutStrip,
+                Option<&'static mut Position>,
+                Has<ActiveWorkspaceMarker>,
+                Has<SelectedVirtualMarker>,
+            ),
+        >,
     ),
 >;
 
@@ -114,8 +106,7 @@ impl Plugin for WorkspaceEventsPlugin {
 
         app.add_systems(
             PreUpdate,
-            (switch_virtual_workspace_bind, move_virtual_workspace_bind)
-                .in_set(super::PreUpdateSet::Dispatch),
+            refuse_virtual_workspace_commands.in_set(super::PreUpdateSet::Dispatch),
         );
         app.add_systems(
             PreUpdate,
@@ -127,11 +118,10 @@ impl Plugin for WorkspaceEventsPlugin {
         app.add_systems(
             Update,
             (
-                renumber_virtual_indexes,
+                merge_strips_per_space,
                 reap_empty_virtual_workspaces.run_if(reap_workspaces),
                 workspace_change_handler,
                 workspace_created_handler,
-                handle_virtual_window_moves,
             )
                 .in_set(super::UpdateSet::Events),
         );
@@ -152,13 +142,6 @@ impl Plugin for WorkspaceEventsPlugin {
         app.add_observer(cleanup_active_workspace_marker)
             .add_observer(cleanup_selected_space_marker);
     }
-}
-
-/// Marker component to move a window to a specific virtual index on its current workspace.
-#[derive(Component)]
-pub(super) struct VirtualMoveMarker {
-    pub target_virtual_index: u32,
-    pub move_focus: MoveFocus,
 }
 
 #[derive(Component, Debug)]
@@ -637,460 +620,23 @@ fn cleanup_selected_space_marker(
     });
 }
 
-#[allow(clippy::too_many_lines)]
-fn handle_virtual_window_moves(
-    moved_windows: Populated<(Entity, &VirtualMoveMarker), With<Window>>,
-    mut workspaces: MovableStrips,
-    windows: Windows,
-    mut scrollings: Query<&mut Scrolling>,
-    active_display: Single<(Entity, &Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
-    let Some((workspace_id, source_entity)) = workspaces
-        .iter()
-        .find_map(|(entity, strip, _, active, _)| active.then_some((strip.id(), entity)))
-    else {
-        return;
-    };
-
-    let (display_entity, active_display, dock) = *active_display;
-    let viewport = active_display.actual_display_bounds(dock, &config);
-    for (window_entity, move_marker) in &moved_windows {
-        let moving_entities = workspaces
-            .get(source_entity)
-            .ok()
-            .and_then(|(_, strip, _, _, _)| strip.tab_group(window_entity))
-            .unwrap_or_else(|| vec![window_entity]);
-        for moving_entity in &moving_entities {
-            if let Ok(mut entity_commands) = commands.get_entity(*moving_entity) {
-                entity_commands.try_remove::<VirtualMoveMarker>();
-            }
-        }
-        let follow = matches!(move_marker.move_focus, MoveFocus::Follow);
-
-        let target_idx = move_marker.target_virtual_index;
-        let target = workspaces.iter().find_map(|(entity, strip, _, _, _)| {
-            (strip.id() == workspace_id && strip.virtual_index == target_idx).then_some(entity)
-        });
-
-        // Must be captured before strip.remove below.
-        let maximized = workspaces
-            .get(source_entity)
-            .ok()
-            .and_then(|(_, strip, _, _, _)| strip.maximized(window_entity).cloned());
-        let source_neighbour =
-            workspaces
-                .get(source_entity)
-                .ok()
-                .and_then(|(_, strip, _, _, _)| {
-                    strip
-                        .left_neighbour(window_entity)
-                        .or_else(|| strip.right_neighbour(window_entity))
-                });
-        // If source will be empty after the move, Stay becomes Follow
-        // since there's nothing left to look at.
-        let stay = !follow && source_neighbour.is_some();
-
-        // With `insert_windows_mid_strip`, the window keeps its current on-screen
-        // x. For an existing destination, work out the column slot nearest that x
-        // and the scroll offset that lands it there; for a new strip the lone
-        // window just sits at that x.
-        let moved_left = config
-            .insert_windows_mid_strip()
-            .then(|| windows.moving_frame(window_entity).map(|frame| frame.min.x))
-            .flatten();
-        let mid_placement = moved_left.and_then(|moved_left| {
-            let (_, strip, position, _, previous) = workspaces.get(target?).ok()?;
-            let scroll_x = previous.map_or(position.0.x, |previous| previous.origin.x);
-            Some(mid_strip_slot(strip, scroll_x, moved_left, &windows))
-        });
-
-        let target_entity = if let Some(entity) = target {
-            entity
-        } else {
-            // Stay: spawn offscreen with PreviousStripPosition for later restoration.
-            // Follow (or empty source): spawn visible, user is switching to it.
-            let visible_origin = viewport.min;
-            // mid-strip: keep the lone window at its current x.
-            let shown = Origin::new(moved_left.unwrap_or(visible_origin.x), visible_origin.y);
-            let parked = viewport.max - PARKED_STRIP_SLIVER;
-            let origin = if stay { parked } else { shown };
-            debug!(
-                "Creating new virtual row {target_idx} on workspace {}",
-                workspace_id
-            );
-            let mut new_strip = LayoutStrip::new(workspace_id, target_idx);
-            new_strip.append_tab_group(&moving_entities);
-            if let Some(before) = maximized.clone() {
-                new_strip.adopt_maximized(window_entity, before);
-            }
-
-            let mut spawned = commands.spawn_layout_strip(new_strip, origin, display_entity, false);
-            if stay {
-                // show_active_workspace needs this to restore the strip
-                // onscreen when the user later switches to this workspace.
-                spawned.insert(PreviousStripPosition {
-                    origin: shown,
-                    focus: Some(window_entity),
-                });
-            }
-            spawned.id()
-        };
-
-        // Preserve the source strip's scroll position for when the user returns.
-        if !stay
-            && let Ok(mut entity_commands) = commands.get_entity(source_entity)
-            && let Ok((_, source_strip, position, _, _)) = workspaces.get(source_entity)
-        {
-            let focus = source_strip
-                .left_neighbour(window_entity)
-                .or_else(|| source_strip.right_neighbour(window_entity));
-            entity_commands.try_insert(PreviousStripPosition {
-                origin: position.0,
-                focus,
-            });
-        }
-
-        // Move the window before moving markers to avoid being detected as a moved window.
-        for (entity, mut strip, _, _, _) in &mut workspaces {
-            if entity == target_entity {
-                match mid_placement {
-                    Some((slot, _)) => strip.insert_tab_group_at(slot, &moving_entities),
-                    None => strip.append_tab_group(&moving_entities),
-                }
-                if let Some(before) = maximized.clone() {
-                    strip.adopt_maximized(window_entity, before);
-                }
-            } else {
-                for moving_entity in &moving_entities {
-                    strip.remove(*moving_entity);
-                }
-            }
-        }
-
-        // Scroll the destination so the inserted window keeps its exact x. Done
-        // before the strip is shown so show_active_workspace snaps every window
-        // to its final spot in one go (no horizontal slide). Resetting Scrolling
-        // stops stale momentum from overriding the offset on reactivation.
-        if let Some((_, desired_scroll)) = mid_placement {
-            if let Ok((_, _, _, _, Some(mut previous))) = workspaces.get_mut(target_entity) {
-                previous.origin.x = desired_scroll;
-            }
-            if let Ok(mut scroll) = scrollings.get_mut(target_entity) {
-                scroll.position = f64::from(desired_scroll);
-                scroll.velocity = 0.0;
-            }
-        }
-
-        // Insert new markers. ActiveWorkspaceMarker switches the view.
-        if let Ok(mut entity_commands) = commands.get_entity(target_entity)
-            && !stay
-        {
-            entity_commands.try_insert((ActiveWorkspaceMarker, PointerFollowsFocus));
-        }
-
-        if stay && let Some(neighbour) = source_neighbour {
-            // Layout chain repositions the window offscreen with its hidden strip.
-            commands.focus_entity_for_command(neighbour, false);
-
-            // Force position change on the hidden strip, so it hides the moved window.
-            if let Ok(mut position) = workspaces
-                .get_mut(target_entity)
-                .map(|(_, _, pos, _, _)| pos)
-            {
-                position.set_changed();
-            }
-        } else {
-            let previous_position = workspaces
-                .get_mut(target_entity)
-                .ok()
-                .and_then(|(_, _, _, _, previos_pos)| previos_pos);
-            if let Some(mut previous) = previous_position {
-                previous.focus = Some(window_entity);
-            }
-            commands.reshuffle_around(window_entity);
-
-            if mid_placement.is_none()
-                && let Ok(mut entity_commands) = commands.get_entity(window_entity)
-            {
-                entity_commands.try_remove::<FocusedMarker>();
-                commands.focus_entity_for_command(window_entity, false);
-            }
-        }
-        debug!(
-            "Moved window {} to virtual workspace {}",
-            window_entity, target_idx
-        );
-    }
-}
-
-/// Picks where in `strip` a window currently at on-screen x `moved_left` should
-/// be inserted so it keeps that position. Inserting at column `i` lands the
-/// window at that column's left edge, so we choose the column boundary nearest
-/// `moved_left`, then return the scroll offset that makes that slot sit exactly
-/// at `moved_left`. `scroll_x` is the strip's (intended) scroll offset.
-///
-/// Returns `(insert_index, desired_scroll)`.
-fn mid_strip_slot(
-    strip: &LayoutStrip,
-    scroll_x: i32,
-    moved_left: i32,
-    windows: &Windows,
-) -> (usize, i32) {
-    let columns: Vec<(i32, i32)> = strip
-        .all_columns()
-        .into_iter()
-        .filter_map(|column| {
-            let layout_x = windows.layout_position(column)?.0.x;
-            let width = windows
-                .moving_frame(column)
-                .map_or(0, |frame| frame.width());
-            Some((layout_x, width))
-        })
-        .collect();
-
-    let mut index = columns.len();
-    let mut chosen_layout_x = columns
-        .last()
-        .map_or(0, |(layout_x, width)| layout_x + width);
-    let mut best = (chosen_layout_x + scroll_x - moved_left).abs();
-    for (i, (layout_x, _)) in columns.iter().enumerate() {
-        let dist = (layout_x + scroll_x - moved_left).abs();
-        if dist < best {
-            best = dist;
-            index = i;
-            chosen_layout_x = *layout_x;
-        }
-    }
-    (index, moved_left - chosen_layout_x)
-}
-
-/// Handles the keybinding for switching between virtual workspaces. Moving South
-/// creates a new workspace if the current one is populated and auto-create is on.
-#[allow(clippy::too_many_lines)]
-#[instrument(level = Level::DEBUG, skip_all)]
-fn switch_virtual_workspace_bind(
-    mut messages: MessageReader<Event>,
-    windows: Windows,
-    active_display: ActiveDisplay,
-    workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
-    let Some(operation) = filter_window_operations(&mut messages, |op| {
+/// Each native Space has one strip, so the virtual workspace commands do
+/// nothing. They still parse, so a configuration that binds them loads.
+fn refuse_virtual_workspace_commands(mut messages: MessageReader<Event>) {
+    let virtual_workspace = |operation: &Operation| {
         matches!(
-            op,
+            operation,
             Operation::Virtual(_)
                 | Operation::VirtualNumber(_)
                 | Operation::VirtualAdd
                 | Operation::FocusOrVirtual(_)
+                | Operation::VirtualMove(..)
+                | Operation::VirtualMoveNumber(..)
         )
-    })
-    .next() else {
-        return;
     };
-
-    // `FocusOrVirtual` is a distinct command from `Operation::Virtual` on
-    // purpose: `window_virtual_north/south` must keep meaning exactly
-    // "switch the virtual workspace", unconditionally, for anyone who binds
-    // it that way — this new command is for callers who explicitly want
-    // "focus a stack neighbor above/below first, and only switch workspace
-    // once there's nothing left to focus", the same within-column traversal
-    // `window_focus_north/south` uses. Only North/South are meaningful here
-    // (there's no "focus" reading of East/West/First/Last/Nth to pair with
-    // a workspace switch); anything else is a no-op. Once the focus check
-    // doesn't apply, this reduces to a plain `Operation::Virtual(direction)`
-    // and falls through to the exact same switching logic below.
-    let synthesized_virtual;
-    let operation = match operation {
-        Operation::FocusOrVirtual(direction @ (Direction::North | Direction::South)) => {
-            if let Some((_, focused_entity)) = windows.focused()
-                && let Some(target) = get_window_in_direction(
-                    direction,
-                    focused_entity,
-                    active_display.active_strip(),
-                )
-            {
-                commands.focus_entity_for_command(target, true);
-                commands.reshuffle_around(target);
-                return;
-            }
-            synthesized_virtual = Operation::Virtual(direction.clone());
-            &synthesized_virtual
-        }
-        Operation::FocusOrVirtual(_) => return,
-        operation => operation,
-    };
-
-    let workspace_id = active_display.active_strip().id();
-    let mut rows = workspaces
-        .iter()
-        .filter(|(_, strip, _)| strip.id() == workspace_id)
-        .collect::<Vec<_>>();
-
-    if rows.is_empty() {
-        return;
+    for operation in filter_window_operations(&mut messages, virtual_workspace) {
+        warn!("Virtual workspaces are disabled, so {operation:?} does nothing");
     }
-    rows.sort_by_key(|(_, strip, _)| strip.virtual_index);
-
-    let current_index = rows.iter().position(|(_, _, active)| *active).unwrap_or(0);
-    let next_index = match operation {
-        Operation::Virtual(Direction::South | Direction::East) => {
-            if current_index + 1 < rows.len() {
-                current_index + 1
-            } else if active_display.active_strip().len() != 0
-                && config.create_workspace_automatically()
-            {
-                let target_index = rows[current_index].1.virtual_index + 1;
-                commands.spawn_layout_strip(
-                    LayoutStrip::new(workspace_id, target_index),
-                    active_display.bounds().min,
-                    active_display.entity(),
-                    true,
-                );
-                return;
-            } else {
-                current_index
-            }
-        }
-        Operation::Virtual(Direction::North | Direction::West) => current_index.saturating_sub(1),
-        Operation::Virtual(Direction::First) => 0,
-        Operation::Virtual(Direction::Last) => rows.len().saturating_sub(1),
-        Operation::VirtualNumber(target_virtual_index) => {
-            let Some(index) = rows
-                .iter()
-                .position(|(_, strip, _)| strip.virtual_index == *target_virtual_index)
-            else {
-                commands.spawn_layout_strip(
-                    LayoutStrip::new(workspace_id, *target_virtual_index),
-                    active_display.bounds().min,
-                    active_display.entity(),
-                    true,
-                );
-
-                return;
-            };
-            index
-        }
-        Operation::VirtualAdd => {
-            let next_virtual_index = rows
-                .iter()
-                .map(|(_, strip, _)| strip.virtual_index)
-                .max()
-                .unwrap_or(0)
-                + 1;
-
-            commands.spawn_layout_strip(
-                LayoutStrip::new(workspace_id, next_virtual_index),
-                active_display.bounds().min,
-                active_display.entity(),
-                true,
-            );
-
-            return;
-        }
-        _ => return,
-    };
-
-    if next_index == current_index {
-        return;
-    }
-
-    let new_entity = rows[next_index].0;
-    if let Ok(mut entity_commands) = commands.get_entity(new_entity) {
-        entity_commands.try_insert((ActiveWorkspaceMarker, PointerFollowsFocus));
-    }
-    debug!(
-        "Switched virtual workspace on display {} from {} to {}",
-        active_display.id(),
-        rows[current_index].1.virtual_index,
-        rows[next_index].1.virtual_index
-    );
-}
-
-/// Handles the keybinding to move windows between virtual workspaces.
-/// Missing destinations are created by `handle_virtual_window_moves`. South at
-/// the last row only proceeds when `create_workspace_automatically` is on;
-/// numbered targets always may create, row 0 included.
-#[instrument(level = Level::DEBUG, skip_all)]
-fn move_virtual_workspace_bind(
-    mut messages: MessageReader<Event>,
-    windows: Windows,
-    active_display: ActiveDisplay,
-    workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
-    let Some(operation) = filter_window_operations(&mut messages, |op| {
-        matches!(
-            op,
-            Operation::VirtualMove(_, _) | Operation::VirtualMoveNumber(_, _)
-        )
-    })
-    .next() else {
-        return;
-    };
-
-    let Some((_, focused_entity)) = windows.focused() else {
-        return;
-    };
-
-    let mut rows = workspaces
-        .iter()
-        .filter(|(_, strip, _)| strip.id() == active_display.active_strip().id())
-        .collect::<Vec<_>>();
-    rows.sort_by_key(|(_, strip, _)| strip.virtual_index);
-
-    let current_virtual_index = active_display.active_strip().virtual_index;
-    let current_index = rows.iter().position(|(_, _, active)| *active).unwrap_or(0);
-
-    let (target_virtual_index, move_focus) = match operation {
-        Operation::VirtualMove(Direction::South | Direction::East, move_focus)
-            if active_display.active_strip().len() > 1 =>
-        {
-            if config.create_workspace_automatically() && current_index + 1 < rows.len() {
-                (rows[current_index + 1].1.virtual_index, *move_focus)
-            } else {
-                (current_virtual_index + 1, *move_focus)
-            }
-        }
-        Operation::VirtualMove(Direction::North | Direction::West, move_focus) => {
-            if current_virtual_index == 0 {
-                return;
-            }
-            (current_virtual_index - 1, *move_focus)
-        }
-        Operation::VirtualMove(Direction::First, move_focus) => {
-            if current_virtual_index == 0 {
-                return;
-            }
-            (0, *move_focus)
-        }
-        Operation::VirtualMove(Direction::Last, move_focus) => {
-            let last_virtual_index = rows.last().map_or(0, |(_, strip, _)| strip.virtual_index);
-            if current_virtual_index == last_virtual_index {
-                return;
-            }
-            (last_virtual_index, *move_focus)
-        }
-        Operation::VirtualMoveNumber(target_virtual_index, move_focus) => {
-            if *target_virtual_index == current_virtual_index {
-                return;
-            }
-            (*target_virtual_index, *move_focus)
-        }
-        _ => return,
-    };
-
-    if let Ok(mut entity_commands) = commands.get_entity(focused_entity) {
-        entity_commands.try_insert(VirtualMoveMarker {
-            target_virtual_index,
-            move_focus,
-        });
-    }
-
-    debug!("Moving {focused_entity} to new virtual space {target_virtual_index}");
 }
 
 /// The column of `strip` whose window sits nearest the display's horizontal
@@ -1278,58 +824,47 @@ pub(crate) fn show_active_workspace(
     }
 }
 
-/// Resolves duplicate `virtual_index` values by reassigning each
-/// duplicate to the lowest unused index on its workspace. Triggered by
-/// `Added<LayoutStrip>` — the only event that can introduce a duplicate
-/// (despawning a strip can leave a gap but never collides). Runs
-/// independently of `reap_empty_workspaces` because without it, duplicate
-/// indices silently break navigation: `switch_virtual_workspace_bind`
-/// sorts rows by `virtual_index`, so two rows both at 0 mean South moves
-/// between them while the OSD stays at "1" and North no-ops at the bottom
-/// of the saturating sub.
-///
-/// Sources of duplicate creation we have to defend against:
-/// - `LayoutStrip::fullscreen` pins `virtual_index` to 0 unconditionally.
-/// - Restoration trusts whatever the saved state contained.
-/// - Races in `handle_virtual_window_moves` between checking the target
-///   and spawning a new strip for it.
-///
-/// Gaps in the index sequence are preserved — only duplicates get
-/// renumbered. Single-strip configurations at non-zero indices stay
-/// where they are.
-fn renumber_virtual_indexes(mut set: RenumberStrips) {
-    let affected: HashSet<WorkspaceId> = set.p0().iter().map(LayoutStrip::id).collect();
-    if affected.is_empty() {
+/// Keeps one strip per native Space. A strip added for a Space that already
+/// has one merges with it, the active or selected strip first, instead of
+/// becoming a hidden row. Fullscreen strips stay on their own.
+fn merge_strips_per_space(mut set: MergeStrips, mut commands: Commands) {
+    let added: HashSet<WorkspaceId> = set
+        .p0()
+        .iter()
+        .filter(|strip| !strip.is_fullscreen())
+        .map(LayoutStrip::id)
+        .collect();
+    if added.is_empty() {
         return;
     }
 
     let mut strips = set.p1();
-    for workspace_id in affected {
+    for workspace_id in added {
         let mut rows = strips
             .iter_mut()
-            .filter(|(_, strip)| strip.id() == workspace_id)
+            .filter(|(_, strip, _, _, _)| strip.id() == workspace_id && !strip.is_fullscreen())
             .collect::<Vec<_>>();
-        rows.sort_by_key(|(_, strip)| strip.virtual_index);
-
-        let mut taken: HashSet<u32> = HashSet::new();
-        let mut dups: Vec<usize> = Vec::new();
-        for (i, (_, strip)) in rows.iter().enumerate() {
-            if !taken.insert(strip.virtual_index) {
-                dups.push(i);
-            }
-        }
-        if dups.is_empty() {
+        rows.sort_by_key(|(entity, strip, _, active, selected)| {
+            (!*active, !*selected, strip.virtual_index, *entity)
+        });
+        let Some(((_, kept, kept_position, _, _), others)) = rows.split_first_mut() else {
+            continue;
+        };
+        if others.is_empty() && kept.virtual_index == 0 {
             continue;
         }
-
-        // Reassign each dup to the lowest free index, growing `taken` as
-        // we go so the next dup doesn't pick the same slot.
-        for i in dups {
-            let mut probe = 0u32;
-            while !taken.insert(probe) {
-                probe += 1;
+        kept.virtual_index = 0;
+        for (entity, strip, _, _, _) in others {
+            warn!("Merging a second strip of workspace {workspace_id} into its first");
+            kept.append_strip(strip);
+            if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+                entity_commands.try_despawn();
             }
-            rows[i].1.virtual_index = probe;
+        }
+        // The arriving windows may sit parked with their old strip, in a slot
+        // that the merge leaves the same, so lay the whole strip out again.
+        if let Some(position) = kept_position {
+            position.set_changed();
         }
     }
 }

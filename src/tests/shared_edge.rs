@@ -287,20 +287,6 @@ fn stacked_displays_show_no_slice() {
 }
 
 #[test]
-fn a_strip_the_display_stopped_showing_shows_no_slice() {
-    let mut harness = focused(&[RIGHT], 4, None);
-    assert_eq!(showing_ids(harness.world()), vec![3]);
-
-    harness.run(vec![command(Operation::VirtualNumber(1))]);
-    harness.advance(SETTLE);
-    assert_eq!(showing(harness.world()), vec![]);
-
-    harness.run(vec![command(Operation::VirtualNumber(0))]);
-    harness.advance(SETTLE);
-    assert_eq!(showing_ids(harness.world()), vec![3]);
-}
-
-#[test]
 fn scrolling_a_hidden_column_into_view_removes_its_slice() {
     let mut harness = focused(&[RIGHT], 4, None);
     assert_eq!(showing_ids(harness.world()), vec![3]);
