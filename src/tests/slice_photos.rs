@@ -1480,8 +1480,8 @@ fn rapid_west_presses_that_reveal_two_columns_slide_both_with_the_row() {
     let shown = showing(harness.world());
     assert_eq!(
         shown.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        vec![1, 2],
-        "window 2 shows its sliver, with window 1's behind it"
+        vec![0, 1, 2],
+        "window 2 shows its sliver, with windows 0 and 1 behind it"
     );
 
     let presses = [
@@ -1537,8 +1537,8 @@ fn reveal_three(widths: &[i32]) -> (TestHarness, ScreenLog) {
     harness.advance(SETTLE);
     assert_eq!(
         placed_ids(&log),
-        vec![1, 2],
-        "window 2 shows its slice at rest, with window 1's behind it"
+        vec![0, 1, 2],
+        "window 2 shows its slice at rest, with windows 0 and 1 behind it"
     );
     (harness, log)
 }
@@ -1633,10 +1633,8 @@ fn a_tucked_slice_slides_with_the_row_when_the_row_scrolls_on() {
         widths[3] = 500;
         let (mut harness, log) = wide(beside, &widths, &focus);
         let shown = showing(harness.world());
-        let [(2 | 4, _), (3, crossing)] = shown.as_slice() else {
-            panic!(
-                "window 3 shows part of itself past the edge, the next column behind it: {shown:?}"
-            )
+        let [.., (3, crossing)] = shown.as_slice() else {
+            panic!("window 3 shows part of itself past the edge, in front: {shown:?}")
         };
         assert!(crossing.on_screen.width() > 200, "{crossing:?}");
         paint_asked(&mut harness, &log, &[3]);
@@ -1658,8 +1656,8 @@ fn a_tucked_slice_slides_with_the_row_when_the_row_scrolls_on() {
             "the photo of window 3 only slides out: {widths:?}"
         );
         let shown = showing(harness.world());
-        let [(2 | 4, _), (3, slice)] = shown.as_slice() else {
-            panic!("window 3 shows a slice at rest, the next column behind it: {shown:?}")
+        let [.., (3, slice)] = shown.as_slice() else {
+            panic!("window 3 shows a slice at rest, in front: {shown:?}")
         };
         assert_eq!(slice.on_screen.width(), SLIVER, "{slice:?}");
         assert_eq!(widths.last(), Some(&SLIVER), "the photo rests as the slice");
