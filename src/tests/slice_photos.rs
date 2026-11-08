@@ -46,6 +46,9 @@ pub(super) struct Screen {
     painted: Vec<(WinID, Digest)>,
     /// The panels that show a photo: painted since they were placed.
     showing_photo: HashSet<WinID>,
+    /// If set, the panels that showed a photo after the last frame. The
+    /// window server shows a new panel one frame late, so only these show.
+    shown_last_frame: Option<HashSet<WinID>>,
     /// Counts the position writes apps have taken, if set.
     count_writes: Option<Box<dyn Fn() -> usize>>,
     /// How many position writes apps had taken at each placement.
@@ -1279,6 +1282,12 @@ fn scanline(harness: &TestHarness, log: &ScreenLog, ids: &[WinID]) -> Vec<Run> {
         .placed
         .iter()
         .filter(|(id, _)| screen.showing_photo.contains(id))
+        .filter(|(id, _)| {
+            screen
+                .shown_last_frame
+                .as_ref()
+                .is_none_or(|shown| shown.contains(id))
+        })
         .map(|(id, slice)| (*id, slice.on_screen, slice.shown(), true))
         .collect::<Vec<_>>();
     let windows = ids
@@ -1427,7 +1436,12 @@ fn watch(
                     .write_message(command(Operation::Focus(direction.clone())));
             }
             harness.advance(Duration::from_millis(20));
-            scanline(harness, log, ids)
+            let runs = scanline(harness, log, ids);
+            let mut screen = log.borrow_mut();
+            if screen.shown_last_frame.is_some() {
+                screen.shown_last_frame = Some(screen.showing_photo.clone());
+            }
+            runs
         })
         .collect()
 }
@@ -1499,6 +1513,69 @@ fn rapid_west_presses_that_reveal_two_columns_slide_both_with_the_row() {
         vec![0],
         "at rest only window 0, now nearest the edge, shows its sliver"
     );
+}
+
+/// The layout of #316 on the test display: four columns of `widths`, with
+/// focus on the last, so the first three hide past the shared edge, after
+/// a round of West and East presses that leaves each window a kept photo.
+fn reveal_three(widths: &[i32]) -> (TestHarness, ScreenLog) {
+    let ids = [0, 1, 2, 3];
+    let (mut harness, log) = wide(LEFT, widths, &[Direction::Last]);
+    for direction in [Direction::West, Direction::West, Direction::West]
+        .into_iter()
+        .chain([Direction::East, Direction::East, Direction::East])
+    {
+        paint_asked(&mut harness, &log, &ids);
+        harness.advance(SETTLE);
+        paint_asked(&mut harness, &log, &ids);
+        harness
+            .world()
+            .write_message(command(Operation::Focus(direction)));
+        harness.advance(SETTLE);
+    }
+    paint_asked(&mut harness, &log, &ids);
+    harness.advance(SETTLE);
+    assert_eq!(
+        placed_ids(&log),
+        vec![2],
+        "window 2 shows its slice at rest"
+    );
+    (harness, log)
+}
+
+/// The steps of #316: three West presses bring three columns back across
+/// the shared edge. The window server shows a new panel one frame late, so
+/// the photo of the next column out must already show behind a nearer
+/// photo before a press steps that photo away from the edge. Each round
+/// presses again at a later frame of the slide before.
+#[test]
+fn west_presses_show_the_next_photo_out_before_a_nearer_photo_leaves_the_edge() {
+    let ids = [0, 1, 2, 3];
+    for again in 4..=14 {
+        let (mut harness, log) = reveal_three(&[388, 408, 768, 768]);
+        {
+            let mut screen = log.borrow_mut();
+            screen.shown_last_frame = Some(screen.showing_photo.clone());
+        }
+        let presses = [
+            (0, Direction::West),
+            (again, Direction::West),
+            (2 * again, Direction::West),
+        ];
+        let seen = watch(&mut harness, &log, &ids, &presses, 3 * again + 30);
+
+        for (frame, runs) in seen.iter().enumerate() {
+            assert_eq!(
+                wallpaper_at_edge(&[0, 1, 2], runs),
+                None,
+                "with presses {again} frames apart, a window or a photo covers the shared edge after frame {frame}: {runs:?}"
+            );
+        }
+        assert!(
+            in_view(harness.mock_state.ax_frame(0)),
+            "window 0 rests in view"
+        );
+    }
 }
 
 #[test]
