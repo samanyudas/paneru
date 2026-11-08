@@ -934,6 +934,43 @@ fn an_app_that_reaches_the_slots_origin_mid_resize_keeps_its_column_width() {
     assert_eq!(frame(harness.world(), id).size(), start.size());
 }
 
+/// #388: an app catching up after a tile hold can lose the engine's last
+/// write of the slot and stop at the slot's origin with a size the engine
+/// never wrote. A frame that held still only since after that write is no
+/// refusal yet, so the engine writes the slot once more.
+#[test]
+fn an_app_that_stops_mid_resize_after_losing_the_slots_write_gets_the_slot_again() {
+    let mut harness = three_columns();
+    let id = 2;
+    let start = frame(harness.world(), id);
+    let point = Origin::new(grab(start).x, TEST_DISPLAY_HEIGHT - 1);
+    press_and_drag(&mut harness, id, point);
+    release(&mut harness, point);
+    let slot = frame(harness.world(), id);
+    harness
+        .mock_state
+        .update_window(id, |window| window.late_writes = Some(Vec::new()));
+    let quarter = IRect::new(0, 394, 683, 768);
+    macos_tile(&mut harness, id, quarter);
+    harness.advance(FRAME);
+    // The app keeps the quarter through the hold and the first check of the
+    // wait, and holds every write the engine makes meanwhile.
+    harness.advance(ms(1000));
+    let partial = IRect::from_corners(slot.min, slot.min + (slot.size() + quarter.size()) / 2);
+    harness
+        .mock_state
+        .update_window(id, |window| window.frame = partial);
+    harness.advance(ms(250));
+    // The app loses the writes it held and stays at the partial frame.
+    harness
+        .mock_state
+        .update_window(id, |window| window.late_writes = None);
+    harness.advance(ms(250));
+    harness.advance(SETTLE);
+    assert_eq!(frame(harness.world(), id), slot);
+    assert_eq!(frame(harness.world(), id).size(), start.size());
+}
+
 /// A busy app can lose the engine's move back to the slot after a snap.
 /// Once the hold ends with the window still off its slot, the engine writes
 /// the slot again instead of waiting for the app.
