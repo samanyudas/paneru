@@ -204,6 +204,34 @@ fn a_slice_toward_a_display_beside_matches_the_sliver_with_that_display_below() 
     assert_eq!(showing(beside.world()), vec![(3, slice)]);
 }
 
+/// The next column out shows behind the nearest hidden column only where
+/// that column's slices span its height. A hidden stack has gaps between
+/// its slices, so a single window farther out would show through them.
+#[test]
+fn no_column_shows_behind_a_hidden_stack_through_its_gaps() {
+    let mut harness = arranged(&[LEFT], 7);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    harness.advance(SETTLE);
+    harness.run(vec![
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    harness.advance(SETTLE);
+    focus_last(&mut harness);
+
+    assert!(
+        slice_of(harness.world(), 0).is_some(),
+        "window 0 tucks farther out than the stack"
+    );
+    assert_eq!(showing_ids(harness.world()), vec![1, 2, 3]);
+}
+
 #[test]
 fn a_hidden_stack_shows_one_slice_per_window_with_its_gaps() {
     let mut beside = stacked_first(&[LEFT], 6);
@@ -235,7 +263,7 @@ fn a_hidden_stack_shows_one_slice_per_window_with_its_gaps() {
 }
 
 #[test]
-fn only_the_hidden_column_nearest_a_shared_edge_shows() {
+fn the_hidden_column_nearest_a_shared_edge_shows_with_the_next_one_behind_it() {
     let mut harness = focused(&[RIGHT], 5, None);
 
     assert!(slice_of(harness.world(), 3).is_some());
@@ -243,11 +271,11 @@ fn only_the_hidden_column_nearest_a_shared_edge_shows() {
         slice_of(harness.world(), 4).is_some(),
         "window 4 also tucks off the display beside"
     );
-    assert_eq!(showing_ids(harness.world()), vec![3]);
+    assert_eq!(showing_ids(harness.world()), vec![4, 3]);
 }
 
 #[test]
-fn a_display_between_two_others_shows_one_column_per_side() {
+fn a_display_between_two_others_shows_two_columns_per_side() {
     let mut harness = focused(&[LEFT, RIGHT], 7, Some(Direction::Nth(4)));
 
     let slices = showing(harness.world());
@@ -255,7 +283,15 @@ fn a_display_between_two_others_shows_one_column_per_side() {
         .iter()
         .map(|(id, slice)| (*id, slice.side))
         .collect::<Vec<_>>();
-    assert_eq!(sides, vec![(1, Side::West), (5, Side::East)]);
+    assert_eq!(
+        sides,
+        vec![
+            (0, Side::West),
+            (1, Side::West),
+            (6, Side::East),
+            (5, Side::East)
+        ]
+    );
     assert!(
         slice_of(harness.world(), 0).is_some() && slice_of(harness.world(), 6).is_some(),
         "farther columns tuck too"
