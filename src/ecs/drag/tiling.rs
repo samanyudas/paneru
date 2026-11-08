@@ -146,20 +146,36 @@ pub(crate) fn track_resize_gesture(
     }
 }
 
-/// The window dropped last and until when a change of its size counts as a
-/// snapping app's tile. Magnet and Rectangle set their frame on mouse-up,
-/// and their thirds and other layouts are not rectangles macOS tiles to.
+/// The window dropped last, its size before the drop, and until when a
+/// change of its size counts as a snapping app's tile. Magnet and Rectangle
+/// set their frame on mouse-up, and their thirds and other layouts are not
+/// rectangles macOS tiles to.
 #[derive(Default, Resource)]
-pub(crate) struct DroppedWindow(Option<(Entity, Duration)>);
+pub(crate) struct DroppedWindow(Option<(Entity, IVec2, Duration)>);
+
+/// How far a size may be outside the sizes between a dropped window's size
+/// and the engine's new size and still be the app applying that resize.
+const RESIZE_STEP_TOLERANCE: i32 = 2;
 
 impl DroppedWindow {
-    pub(crate) fn dropped(&mut self, window: Entity, until: Duration) {
-        self.0 = Some((window, until));
+    pub(crate) fn dropped(&mut self, window: Entity, size: IVec2, until: Duration) {
+        self.0 = Some((window, size, until));
     }
 
-    fn snaps(&self, entity: Entity, now: Duration) -> bool {
-        self.0
-            .is_some_and(|(window, until)| window == entity && now <= until)
+    /// Whether `size` on `entity` is a snapping app's tile. While the engine
+    /// resizes the window to `target`, an app that applies the resize in
+    /// steps shows sizes between the size before the drop and `target`, so
+    /// only a size outside them is a tile.
+    fn snaps(&self, entity: Entity, now: Duration, size: IVec2, target: Option<IVec2>) -> bool {
+        self.0.is_some_and(|(window, before, until)| {
+            window == entity
+                && now <= until
+                && target.is_none_or(|target| {
+                    let low = before.min(target) - RESIZE_STEP_TOLERANCE;
+                    let high = before.max(target) + RESIZE_STEP_TOLERANCE;
+                    size.cmplt(low).any() || size.cmpgt(high).any()
+                })
+        })
     }
 }
 
@@ -571,11 +587,12 @@ impl TilingRestore<'_, '_> {
         }
         let engine = resize.is_some() || verifying;
         // Right after a drop, a new size is a snapping app's tile, unless
-        // the engine is resizing the window itself.
-        let tile =
-            self.displays.iter().any(|(display, dock)| {
-                is_macos_tile(margins.shown(frame), display.visible_bounds(dock))
-            }) || (!engine && frame.size() != managed.size() && self.dropped.snaps(entity, now));
+        // it is the app applying the engine's own resize.
+        let target = engine.then(|| resize.map_or(managed.size(), |resize| resize.0));
+        let tile = self.displays.iter().any(|(display, dock)| {
+            is_macos_tile(margins.shown(frame), display.visible_bounds(dock))
+        }) || (frame.size() != managed.size()
+            && self.dropped.snaps(entity, now, frame.size(), target));
         let strip_x = strip.map(|(_, x)| x);
         let moving = reposition.is_some() || self.drags(entity, strip.map(|(strip, _)| strip));
         if let Some(refused) = start.and_then(NativeResizeStart::refused) {
