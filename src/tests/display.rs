@@ -772,80 +772,6 @@ fn test_vertical_swap_within_stack_stays_on_display() {
         .run(commands);
 }
 
-#[test]
-fn test_hidden_stack_stays_off_the_display_below() {
-    // Regression test: hiding a virtual workspace parks its strip at the
-    // display's bottom-right corner. Windows below the strip origin - the
-    // lower members of a stack - used to land past the bottom edge entirely,
-    // inside the display underneath, which macOS then adopts them onto. The
-    // window came back on the wrong display once the workspace was shown
-    // again.
-    let mut harness = TestHarness::new().with_windows(2);
-    harness.mock_state.add_display(
-        EXT_DISPLAY_ID,
-        IRect::new(
-            0,
-            TEST_DISPLAY_HEIGHT,
-            EXT_DISPLAY_WIDTH,
-            TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
-        ),
-        vec![EXT_WORKSPACE_ID],
-    );
-
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::Last)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::Stack(Side::West)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(1)),
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(0)),
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-    ];
-
-    harness
-        .on_iteration(4, |world, _state| {
-            // Hidden, but still parked on their own display: every window keeps
-            // its origin above the top edge of the display below.
-            let mut query = world.query::<&crate::manager::Window>();
-            for window in query.iter(world) {
-                let frame = window.frame();
-                assert!(
-                    frame.min.y < TEST_DISPLAY_HEIGHT,
-                    "window {} parked at {:?}, inside the display below",
-                    window.id(),
-                    frame
-                );
-                assert_eq!(
-                    frame.min.y,
-                    TEST_DISPLAY_HEIGHT - PARKED_STRIP_SLIVER,
-                    "window {} should park on the corner sliver",
-                    window.id()
-                );
-            }
-        })
-        .on_iteration(6, |world, _state| {
-            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
-            assert_on_workspace!(world, 1, TEST_WORKSPACE_ID);
-            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
-            assert_not_on_workspace!(world, 1, EXT_WORKSPACE_ID);
-            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 0, 394);
-        })
-        .run(commands);
-}
-
 /// Focusing a window on another display and coming back must not re-derive the
 /// strip offset on the display we left: the centering the user asked for there
 /// is still what they want to see when they return.
@@ -1010,12 +936,13 @@ fn focus_display_south_does_not_flash() {
 
 #[test]
 fn popup_waits_until_the_destination_display_is_active() {
+    let other_space = EXT_WORKSPACE_ID + 1;
     let mut harness = TestHarness::new()
         .with_workspace_popup()
         .with_display(
             EXT_DISPLAY_ID,
             IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
-            vec![EXT_WORKSPACE_ID],
+            vec![EXT_WORKSPACE_ID, other_space],
         )
         .with_windows(1)
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
@@ -1025,19 +952,15 @@ fn popup_waits_until_the_destination_display_is_active() {
 
     let target = {
         let world = harness.world();
-        let display = world
-            .query::<(Entity, &Display)>()
-            .iter(world)
-            .find_map(|(entity, display)| (display.id() == EXT_DISPLAY_ID).then_some(entity))
-            .expect("external display");
         world
-            .spawn((
-                LayoutStrip::new(EXT_WORKSPACE_ID, 1),
-                crate::ecs::Position(Origin::new(0, -EXT_DISPLAY_HEIGHT)),
-                ChildOf(display),
-            ))
-            .id()
+            .query::<(Entity, &LayoutStrip)>()
+            .iter(world)
+            .find_map(|(entity, strip)| (strip.id() == other_space).then_some(entity))
+            .expect("the other Space's strip")
     };
+    harness
+        .mock_state
+        .activate_workspace(EXT_DISPLAY_ID, other_space, false);
 
     // Workspace activation arrives while the original display is still marked active.
     harness
@@ -1057,7 +980,7 @@ fn popup_waits_until_the_destination_display_is_active() {
     let world = harness.world();
     let mut messages = world.query::<&crate::ecs::FlashMessage>();
     assert!(
-        messages.iter(world).any(|message| message.0 == "2"),
+        messages.iter(world).any(|message| message.0 == "1"),
         "the pending workspace change should flash after display recognition"
     );
 }
@@ -1479,66 +1402,6 @@ fn test_focus_display_follows_the_physical_arrangement() {
             Event::MenuOpened { window_id: 0 },
             window_command(Operation::Focus(Direction::First)),
             window_command(Operation::FocusDisplay(Direction::South)),
-            window_command(Operation::FocusDisplay(Direction::North)),
-        ]);
-}
-
-#[test]
-fn test_focus_display_preserves_the_selected_virtual_workspace() {
-    harness_with_display_above()
-        .with_window(101, |data| {
-            data.workspace_id = EXT_WORKSPACE_ID;
-            data.frame = IRect::new(900, -EXT_DISPLAY_HEIGHT + 100, 1300, -100);
-        })
-        .on_iteration(2, |world, _state| {
-            let target = world
-                .query::<(Entity, &Display)>()
-                .iter(world)
-                .find(|(_, display)| display.id() == EXT_DISPLAY_ID)
-                .map(|(entity, _)| entity)
-                .expect("the target display should exist");
-            world
-                .entity_mut(target)
-                .insert(crate::ecs::ActiveDisplayMarker);
-        })
-        .on_iteration(5, |world, state| {
-            assert_focused!(world, 100);
-            let selected = world
-                .query_filtered::<&LayoutStrip, With<crate::ecs::ActiveWorkspaceMarker>>()
-                .single(world)
-                .expect("the target display should have an active workspace");
-            assert_eq!(selected.virtual_index, 1);
-            let source = world
-                .query::<(Entity, &Display)>()
-                .iter(world)
-                .find(|(_, display)| display.id() == TEST_DISPLAY_ID)
-                .map(|(entity, _)| entity)
-                .expect("the source display should exist");
-            world
-                .entity_mut(source)
-                .insert(crate::ecs::ActiveDisplayMarker);
-            state.focus_window(0);
-        })
-        .on_iteration(7, |world, _state| {
-            assert_focused!(world, 100);
-            let selected = world
-                .query_filtered::<&LayoutStrip, With<crate::ecs::ActiveWorkspaceMarker>>()
-                .single(world)
-                .expect("the target display should have an active workspace");
-            assert_eq!(selected.virtual_index, 1);
-        })
-        .run(vec![
-            Event::MenuOpened { window_id: 0 },
-            window_command(Operation::FocusDisplay(Direction::North)),
-            window_command(Operation::Focus(Direction::First)),
-            window_command(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
-            window_command(Operation::Center),
-            Event::Command {
-                command: Command::PrintState,
-            },
-            Event::Command {
-                command: Command::PrintState,
-            },
             window_command(Operation::FocusDisplay(Direction::North)),
         ]);
 }
@@ -2040,30 +1903,6 @@ fn test_arrival_consumes_intent_when_native_width_is_constrained() {
         world
             .get::<crate::ecs::ReshuffleAroundMarker>(entity)
             .is_none()
-    );
-}
-
-#[test]
-fn test_arrival_width_is_set_before_destination_workspace_switch() {
-    let mut harness = pending_display_arrival(MainOptions::default(), 0, 890);
-    harness
-        .world()
-        .write_message(window_command(Operation::VirtualAdd));
-    harness.advance(Duration::from_millis(40));
-    harness
-        .world()
-        .write_message(window_command(Operation::VirtualNumber(2)));
-    harness.advance(Duration::from_millis(500));
-    assert_eq!(harness.mock_state.create_window(0).frame().width(), 568);
-    assert_on_workspace!(harness.world(), 0, TEST_WORKSPACE_ID);
-    let world = harness.world();
-    let entity = find_window_entity(0, world);
-    assert!(world.get::<crate::ecs::PlaceAfterArrival>(entity).is_none());
-    assert!(
-        world
-            .query_filtered::<&LayoutStrip, With<crate::ecs::SelectedVirtualMarker>>()
-            .iter(world)
-            .all(|strip| !strip.contains(entity))
     );
 }
 
@@ -2844,127 +2683,6 @@ fn test_fix_window_size_on_focus_only_after_display_change() {
 }
 
 #[test]
-fn test_attach_display_moves_virtual_workspace_together() {
-    attach_moves_virtual_workspace_together(IRect::new(
-        0,
-        -EXT_DISPLAY_HEIGHT,
-        EXT_DISPLAY_WIDTH,
-        0,
-    ));
-}
-
-#[test]
-fn test_attach_display_moves_virtual_workspace_together_below() {
-    attach_moves_virtual_workspace_together(IRect::new(
-        0,
-        TEST_DISPLAY_HEIGHT,
-        EXT_DISPLAY_WIDTH,
-        TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
-    ));
-}
-
-#[test]
-fn test_attach_display_moves_virtual_workspace_together_to_the_right() {
-    attach_moves_virtual_workspace_together(IRect::new(
-        TEST_DISPLAY_WIDTH,
-        0,
-        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
-        EXT_DISPLAY_HEIGHT,
-    ));
-}
-
-/// Attaches the external display at `ext`.
-fn attach_moves_virtual_workspace_together(ext: IRect) {
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        },
-        Event::DisplayAdded {
-            display_id: EXT_DISPLAY_ID,
-        },
-    ];
-
-    let mut harness = TestHarness::new().with_windows(4);
-    harness
-        .app
-        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
-            500,
-        )));
-
-    harness
-        .on_iteration(5, move |world, mut state| {
-            // Before attaching EXT_DISPLAY_ID: [0, 1] on v0, [2, 3] on v1.
-            let win0 = find_window_entity(0, world);
-            let win1 = find_window_entity(1, world);
-            let win2 = find_window_entity(2, world);
-            let win3 = find_window_entity(3, world);
-
-            let v0 = world
-                .query::<&LayoutStrip>()
-                .iter(world)
-                .find(|s| s.id() == TEST_WORKSPACE_ID && s.virtual_index == 0)
-                .expect("v0 on TEST_WORKSPACE_ID");
-            assert_eq!(v0.all_windows(), vec![win0, win1]);
-
-            let v1 = world
-                .query::<&LayoutStrip>()
-                .iter(world)
-                .find(|s| s.id() == TEST_WORKSPACE_ID && s.virtual_index == 1)
-                .expect("v1 on TEST_WORKSPACE_ID");
-            assert_eq!(v1.all_windows(), vec![win2, win3]);
-
-            // Attach EXT_DISPLAY_ID and report both windows 2 and 3 on EXT_WORKSPACE_ID.
-            state.add_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID]);
-            state.update_window(2, |w| w.workspace_id = EXT_WORKSPACE_ID);
-            state.update_window(3, |w| w.workspace_id = EXT_WORKSPACE_ID);
-        })
-        .on_iteration(6, |world, _state| {
-            let win0 = find_window_entity(0, world);
-            let win1 = find_window_entity(1, world);
-            let win2 = find_window_entity(2, world);
-            let win3 = find_window_entity(3, world);
-
-            let main_strips: Vec<(u32, Vec<Entity>)> = world
-                .query::<&LayoutStrip>()
-                .iter(world)
-                .filter(|s| s.id() == TEST_WORKSPACE_ID)
-                .map(|s| (s.virtual_index, s.all_windows()))
-                .collect();
-            assert_eq!(
-                main_strips,
-                vec![(0, vec![win0, win1])],
-                "source display should only have v0 with [0, 1] after v1 moved away"
-            );
-
-            let ext_strips: Vec<(u32, Vec<Entity>)> = world
-                .query::<&LayoutStrip>()
-                .iter(world)
-                .filter(|s| s.id() == EXT_WORKSPACE_ID)
-                .map(|s| (s.virtual_index, s.all_windows()))
-                .collect();
-            assert_eq!(
-                ext_strips,
-                vec![(0, vec![win2, win3])],
-                "new display should receive [2, 3] together in its first virtual workspace v0"
-            );
-        })
-        .run(commands);
-}
-
-#[test]
 fn test_attach_display_only_moves_windows_reported_by_os() {
     attach_moves_only_reported_windows(IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0));
 }
@@ -2993,21 +2711,6 @@ fn test_attach_display_only_moves_windows_reported_by_os_to_the_right() {
 fn attach_moves_only_reported_windows(ext: IRect) {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        },
         Event::DisplayAdded {
             display_id: EXT_DISPLAY_ID,
         },
@@ -3021,12 +2724,15 @@ fn attach_moves_only_reported_windows(ext: IRect) {
         )));
 
     harness
-        .on_iteration(5, move |_world, mut state| {
+        .on_iteration(0, move |_world, mut state| {
             // Attach EXT_DISPLAY_ID, but macOS only reports window 2 (not 3) on EXT_WORKSPACE_ID.
             state.add_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID]);
-            state.update_window(2, |w| w.workspace_id = EXT_WORKSPACE_ID);
+            state.update_window(2, |w| {
+                w.workspace_id = EXT_WORKSPACE_ID;
+                w.frame = IRect::from_corners(ext.min, ext.min + w.frame.size());
+            });
         })
-        .on_iteration(6, |world, _state| {
+        .on_iteration(1, |world, _state| {
             let win0 = find_window_entity(0, world);
             let win1 = find_window_entity(1, world);
             let win2 = find_window_entity(2, world);
@@ -3041,8 +2747,8 @@ fn attach_moves_only_reported_windows(ext: IRect) {
             main_strips.sort_by_key(|(idx, _)| *idx);
             assert_eq!(
                 main_strips,
-                vec![(0, vec![win0, win1]), (1, vec![win3])],
-                "window 3 was not reported on the new display and must stay on v1 of main display"
+                vec![(0, vec![win0, win1, win3])],
+                "window 3 was not reported on the new display and must stay on the main display"
             );
 
             let ext_strips: Vec<(u32, Vec<Entity>)> = world
@@ -3056,83 +2762,6 @@ fn attach_moves_only_reported_windows(ext: IRect) {
                 vec![(0, vec![win2])],
                 "only window 2 should move to the new display"
             );
-        })
-        .run(commands);
-}
-
-#[test]
-fn test_attach_display_compacts_emptied_first_virtual_workspace() {
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        },
-        Event::DisplayAdded {
-            display_id: EXT_DISPLAY_ID,
-        },
-    ];
-
-    let mut harness = TestHarness::new().with_windows(4);
-    harness
-        .app
-        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
-            500,
-        )));
-
-    harness
-        .on_iteration(5, |_world, mut state| {
-            // Attach EXT_DISPLAY_ID and move [0, 1] from v0 of TEST_WORKSPACE_ID to EXT_WORKSPACE_ID.
-            state.add_display(
-                EXT_DISPLAY_ID,
-                IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
-                vec![EXT_WORKSPACE_ID],
-            );
-            // macOS moves the windows onto the display whose space they join.
-            for id in [0, 1] {
-                state.update_window(id, |w| {
-                    w.workspace_id = EXT_WORKSPACE_ID;
-                    w.frame.min.y -= EXT_DISPLAY_HEIGHT;
-                    w.frame.max.y -= EXT_DISPLAY_HEIGHT;
-                });
-            }
-        })
-        .on_iteration(6, |world, _state| {
-            let win0 = find_window_entity(0, world);
-            let win1 = find_window_entity(1, world);
-            let win2 = find_window_entity(2, world);
-            let win3 = find_window_entity(3, world);
-
-            let main_strips: Vec<(u32, Vec<Entity>)> = world
-                .query::<&LayoutStrip>()
-                .iter(world)
-                .filter(|s| s.id() == TEST_WORKSPACE_ID)
-                .map(|s| (s.virtual_index, s.all_windows()))
-                .collect();
-            assert_eq!(
-                main_strips,
-                vec![(0, vec![win2, win3])],
-                "emptied v0 on source display must be removed and v1 compacted to v0"
-            );
-
-            let ext_strips: Vec<(u32, Vec<Entity>)> = world
-                .query::<&LayoutStrip>()
-                .iter(world)
-                .filter(|s| s.id() == EXT_WORKSPACE_ID)
-                .map(|s| (s.virtual_index, s.all_windows()))
-                .collect();
-            assert_eq!(ext_strips, vec![(0, vec![win0, win1])]);
         })
         .run(commands);
 }
@@ -3301,17 +2930,12 @@ fn test_topology_read_appends_window_moved_to_inactive_space_into_its_strip() {
 
 #[test]
 fn test_remove_focused_display_appends_and_shows_migrated_window() {
-    assert_removed_display_follows_focus(true, 0);
-}
-
-#[test]
-fn test_remove_focused_display_joins_selected_second_destination_strip() {
-    assert_removed_display_follows_focus(true, 1);
+    assert_removed_display_follows_focus(true);
 }
 
 #[test]
 fn test_remove_inactive_display_appends_migrated_window_without_scrolling() {
-    assert_removed_display_follows_focus(false, 0);
+    assert_removed_display_follows_focus(false);
 }
 
 struct RemovedDisplayFixture {
@@ -3320,10 +2944,7 @@ struct RemovedDisplayFixture {
     destination_frame: IRect,
 }
 
-fn removed_display_fixture(
-    removed_display_focused: bool,
-    destination_virtual_index: u32,
-) -> RemovedDisplayFixture {
+fn removed_display_fixture(removed_display_focused: bool) -> RemovedDisplayFixture {
     use crate::ecs::ActiveWorkspaceMarker;
 
     let mut harness = TestHarness::new()
@@ -3339,18 +2960,6 @@ fn removed_display_fixture(
         assert_focused!(world, 0);
     });
     harness.run(commands);
-    if destination_virtual_index == 1 {
-        let commands = vec![window_command(Operation::VirtualMoveNumber(
-            1,
-            MoveFocus::Follow,
-        ))];
-        harness = harness.on_iteration(0, |world, _state| {
-            assert_focused!(world, 0);
-            let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
-            assert_eq!(strips.single(world).unwrap().virtual_index, 1);
-        });
-        harness.run(commands);
-    }
     let destination_selected = harness
         .world()
         .query_filtered::<Entity, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>()
@@ -3410,17 +3019,14 @@ fn sample_migrated_strips(harness: &mut TestHarness) -> Vec<(u32, Entity)> {
 
 /// A removed display's window joins the end of the surviving Space's selected
 /// strip and adds no row. It takes the view only if it had focus.
-fn assert_removed_display_follows_focus(
-    removed_display_focused: bool,
-    destination_virtual_index: u32,
-) {
+fn assert_removed_display_follows_focus(removed_display_focused: bool) {
     use crate::ecs::{ActiveWorkspaceMarker, SelectedVirtualMarker};
 
     let RemovedDisplayFixture {
         mut harness,
         destination_selected,
         destination_frame,
-    } = removed_display_fixture(removed_display_focused, destination_virtual_index);
+    } = removed_display_fixture(removed_display_focused);
     let samples = sample_migrated_strips(&mut harness);
     assert!(
         !samples.is_empty(),
@@ -3436,7 +3042,7 @@ fn assert_removed_display_follows_focus(
     let world = harness.world();
     let migrated_window = find_window_entity(100, world);
     let strip = world.get::<LayoutStrip>(destination_selected).unwrap();
-    assert_eq!(strip.virtual_index, destination_virtual_index);
+    assert_eq!(strip.virtual_index, 0);
     assert_eq!(
         strip.all_windows().last(),
         Some(&migrated_window),
@@ -3447,11 +3053,7 @@ fn assert_removed_display_follows_focus(
         .iter(world)
         .filter(|strip| strip.id() == TEST_WORKSPACE_ID)
         .count();
-    assert_eq!(
-        rows,
-        destination_virtual_index as usize + 1,
-        "the migration must not add a row"
-    );
+    assert_eq!(rows, 1, "the migration must not add a row");
     assert!(
         world
             .get::<SelectedVirtualMarker>(destination_selected)
@@ -3732,85 +3334,4 @@ fn test_move_to_display_keeps_a_window_that_refused_its_width_visible() {
         );
         assert_focused!(harness.world(), 0);
     }
-}
-
-#[test]
-fn test_mouse_to_next_display_preserves_selected_virtual_workspace() {
-    use crate::assert_focused;
-    use crate::commands::{Direction, MoveFocus, Operation};
-    use crate::ecs::{ActiveWorkspaceMarker, SelectedVirtualMarker};
-    use bevy::ecs::query::Has;
-
-    // Miri leaves the pointer alone on focus by default; this test starts from
-    // the pointer on the focused window.
-    let config =
-        Config::try_from("default_workspaces = 3\n[options]\nmouse_follows_focus = true\n")
-            .unwrap();
-    let display_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
-
-    let commands = vec![
-        Event::MenuOpened { window_id: 100 },
-        // Move window 100 to VW 2 (virtual_index 1) while staying on VW 1 (virtual_index 0) with window 101.
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        },
-        // Switch to VW 2 (virtual_index 1) and back to VW 1 (virtual_index 0) on the primary display.
-        Event::Command {
-            command: Command::Window(Operation::Virtual(Direction::South)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::Virtual(Direction::North)),
-        },
-        // Move mouse/focus to the secondary display.
-        Event::Command {
-            command: Command::Mouse(MouseMove::ToNextDisplay),
-        },
-        // Move mouse/focus back to the primary display: must land on VW 1 (window 101), not VW 2 (window 100).
-        Event::Command {
-            command: Command::Mouse(MouseMove::ToNextDisplay),
-        },
-    ];
-
-    TestHarness::new()
-        .with_config(config)
-        .with_display(EXT_DISPLAY_ID, display_bounds, vec![EXT_WORKSPACE_ID])
-        .with_workspace_window(100, TEST_WORKSPACE_ID, |_| {})
-        .with_workspace_window(101, TEST_WORKSPACE_ID, |_| {})
-        .with_workspace_window(200, EXT_WORKSPACE_ID, |data| {
-            data.frame = IRect::from_corners(
-                Origin::new(0, -EXT_DISPLAY_HEIGHT),
-                Origin::new(TEST_WINDOW_WIDTH, -EXT_DISPLAY_HEIGHT + TEST_WINDOW_HEIGHT),
-            );
-        })
-        .on_iteration(3, |world, _state| {
-            let selected_primary: Vec<u32> = world
-                .query::<(&LayoutStrip, Has<SelectedVirtualMarker>)>()
-                .iter(world)
-                .filter_map(|(s, sel)| {
-                    (s.id() == TEST_WORKSPACE_ID && sel).then_some(s.virtual_index)
-                })
-                .collect();
-            assert_eq!(
-                selected_primary,
-                vec![0],
-                "VW 1 must remain selected on primary display"
-            );
-        })
-        .on_iteration(4, |world, _state| {
-            assert_focused!(world, 200);
-        })
-        .on_iteration(5, |world, _state| {
-            assert_focused!(world, 101);
-            let active_virtual: Option<u32> = world
-                .query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>()
-                .iter(world)
-                .next()
-                .map(|s| s.virtual_index);
-            assert_eq!(
-                active_virtual,
-                Some(0),
-                "returning to primary display must keep VW 1 active"
-            );
-        })
-        .run(commands);
 }

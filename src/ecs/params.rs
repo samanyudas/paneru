@@ -7,7 +7,6 @@ use bevy::{
     },
     math::IRect,
 };
-use objc2_core_graphics::CGDirectDisplayID;
 use tracing::warn;
 
 use super::{ActiveDisplayMarker, FocusFollowsMouse, SkipReshuffle};
@@ -107,11 +106,6 @@ impl ActiveDisplay<'_, '_> {
     /// Returns an immutable reference to the active `Display`.
     pub fn display(&self) -> &Display {
         self.display.0
-    }
-
-    /// Returns the `CGDirectDisplayID` of the active display.
-    pub fn id(&self) -> CGDirectDisplayID {
-        self.display.0.id()
     }
 
     pub fn entity(&self) -> Entity {

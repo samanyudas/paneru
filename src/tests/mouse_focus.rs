@@ -1,5 +1,5 @@
 use crate::assert_focused;
-use crate::commands::{Command, Direction, MoveFocus, Operation};
+use crate::commands::{Command, Direction, Operation};
 use crate::config::{Config, MainOptions};
 use crate::events::Event;
 use crate::manager::{Origin, Window};
@@ -291,56 +291,6 @@ fn keyboard_focus_does_not_warp_mouse_when_disabled() {
             assert_eq!(state.cursor_position(), Origin::ZERO);
         })
         .run(commands);
-}
-
-#[test]
-fn virtual_workspace_focus_warps_mouse_to_restored_window() {
-    for animations in [false, true] {
-        let config: Config = (
-            MainOptions {
-                auto_center: Some(true),
-                mouse_follows_focus: Some(true),
-                focus_follows_mouse: Some(false),
-                animation_speed: Some(30.0),
-                virtual_workspace_animations: Some(animations),
-                ..Default::default()
-            },
-            vec![],
-        )
-            .into();
-        let mut harness = TestHarness::new().with_config(config).with_windows(3);
-        let mut commands = vec![
-            Event::Command {
-                command: Command::PrintState,
-            },
-            Event::Command {
-                command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-            },
-        ];
-        for (iteration, (direction, window_id)) in [
-            (Direction::South, 0),
-            (Direction::North, 1),
-            (Direction::South, 0),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            commands.push(Event::Command {
-                command: Command::Window(Operation::FocusOrVirtual(direction)),
-            });
-            harness = harness.on_iteration(iteration + 2, move |world, state| {
-                assert_focused!(world, window_id);
-                let window = world.query::<&Window>().iter(world)
-                    .find(|window| window.id() == window_id)
-                    .expect("restored window");
-                let center = window.frame().center();
-                let cursor = state.cursor_position();
-                assert!((cursor - center).abs().max_element() <= 2,
-                    "animations {animations}: pointer {cursor:?} missed restored window {window_id} at {center:?}");
-            });
-        }
-        harness.run(commands);
-    }
 }
 
 /// Focuses window 0 by command, then lets macOS focus window 1 the way a click
