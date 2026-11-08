@@ -586,12 +586,15 @@ pub(super) fn application_event_trigger(
 /// * `displays` - A query for the active display.
 /// * `main_cid` - The main connection ID resource.
 /// * `commands` - Bevy commands to spawn or despawn entities.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_application_messages(
     mut messages: MessageReader<Event>,
     windows: Windows,
     applications: Query<(&Application, &Children)>,
     unmanaged_query: Query<&Unmanaged>,
     floats_when_restored: Query<(), With<FloatsWhenRestored>>,
+    config: Res<Config>,
+    overrides: Res<TileOverrides>,
     mut commands: Commands,
 ) {
     let find_window = |window_id| windows.find(window_id);
@@ -642,7 +645,7 @@ pub(super) fn dispatch_application_messages(
             }
 
             Event::ApplicationVisible { pid } => {
-                let Some((_, children)) = applications.iter().find(|(app, _)| app.pid() == *pid)
+                let Some((app, children)) = applications.iter().find(|(app, _)| app.pid() == *pid)
                 else {
                     warn!("Unable to find application with pid {pid}");
                     continue;
@@ -650,9 +653,26 @@ pub(super) fn dispatch_application_messages(
                 for entity in children {
                     // Only restore windows that were hidden by the app hide/show cycle.
                     // Preserve Floating and Minimized states.
-                    if matches!(unmanaged_query.get(*entity), Ok(Unmanaged::Hidden))
-                        && let Ok(mut entity_commands) = commands.get_entity(*entity)
-                    {
+                    if !matches!(unmanaged_query.get(*entity), Ok(Unmanaged::Hidden)) {
+                        continue;
+                    }
+                    let (Some(window), Ok(mut entity_commands)) =
+                        (windows.get(*entity), commands.get_entity(*entity))
+                    else {
+                        continue;
+                    };
+                    // A window that spawned while its app was hidden was never sorted into
+                    // floating or minimized, so it is sorted now. (#380)
+                    let floating = WindowProperties::new(app, window, &config).floating()
+                        && !overrides.contains(window, app);
+                    if window.is_minimized() {
+                        entity_commands.try_insert(Unmanaged::Minimized);
+                        if floating {
+                            entity_commands.try_insert(FloatsWhenRestored);
+                        }
+                    } else if floating {
+                        entity_commands.try_insert(Unmanaged::Floating);
+                    } else {
                         entity_commands.try_remove::<Unmanaged>();
                     }
                 }

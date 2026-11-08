@@ -294,3 +294,66 @@ fn a_hidden_app_opening_a_window_leaves_focus_where_it_is() {
         "focus stays on window {focus}"
     );
 }
+
+fn unmanaged(harness: &mut TestHarness, id: WinID) -> Option<String> {
+    let world = harness.world();
+    world
+        .query::<(&Window, Option<&crate::ecs::Unmanaged>)>()
+        .iter(world)
+        .find(|(window, _)| window.id() == id)
+        .and_then(|(_, unmanaged)| unmanaged.map(|unmanaged| format!("{unmanaged:?}")))
+}
+
+fn show_test_app(harness: &mut TestHarness) {
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.is_hidden = false);
+    harness.run(vec![Event::ApplicationVisible {
+        pid: TEST_PROCESS_ID,
+    }]);
+}
+
+/// A window that a float rule matches and that opened while its app was
+/// hidden floats once the app shows, instead of taking a column. (#380)
+#[test]
+fn a_window_of_a_hidden_app_follows_its_float_rule_when_shown() {
+    let config = crate::config::Config::try_from(
+        "[bindings]\n[windows.float_test]\ntitle = \".*\"\nbundle_id = \"test\"\nfloating = true\n",
+    )
+    .expect("config should parse");
+    let harness = TestHarness::new().with_config(config);
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.is_hidden = true);
+    let mut harness = harness.with_windows(1);
+    harness.advance(Duration::from_secs(2));
+
+    show_test_app(&mut harness);
+    assert!(!tiled(&mut harness, 0), "a floating window takes no column");
+    assert_eq!(unmanaged(&mut harness, 0).as_deref(), Some("Floating"));
+}
+
+/// A window that was minimized while its app was hidden stays out of the strip
+/// once the app shows, because it is still minimized. (#380)
+#[test]
+fn a_minimized_window_of_a_hidden_app_takes_no_column_when_shown() {
+    let harness = TestHarness::new();
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.is_hidden = true);
+    let mut harness = harness
+        .with_window(0, |window| window.minimized = true)
+        .with_window(1, |_| {});
+    harness.advance(Duration::from_secs(2));
+
+    show_test_app(&mut harness);
+    assert!(
+        !tiled(&mut harness, 0),
+        "a minimized window takes no column"
+    );
+    assert_eq!(unmanaged(&mut harness, 0).as_deref(), Some("Minimized"));
+    assert!(
+        tiled(&mut harness, 1),
+        "the app's other window joins the strip"
+    );
+}
