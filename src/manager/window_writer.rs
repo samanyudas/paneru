@@ -414,15 +414,23 @@ impl<S: WriteSink> Shared<S> {
                         let mut writes = batch.into_iter().collect::<Vec<_>>();
                         writes.sort_by_key(|(_, write)| write.back_first());
                         for (key, write) in writes {
+                            let limited = *lock(&write.size_limited);
+                            if !Self::write(&mut sink, &write) {
+                                continue;
+                            }
                             // An app may never apply a write it left
                             // unanswered, so it gets the frame once more,
-                            // unless a newer frame for the window came.
-                            if Self::write(&mut sink, &write)
-                                && !lock(&mailbox.queue).pending.contains_key(&key)
-                            {
-                                debug!(pid, to = ?write.to, "writing a frame again that the app left unanswered");
-                                Self::write(&mut sink, &write);
+                            // with any size it limited before. A newer
+                            // frame for the window takes on this one's
+                            // parts instead.
+                            *lock(&write.size_limited) = limited;
+                            if let Some(newer) = lock(&mailbox.queue).pending.get_mut(&key) {
+                                newer.position |= write.position;
+                                newer.size |= write.size;
+                                continue;
                             }
+                            debug!(pid, to = ?write.to, "writing a frame again that the app left unanswered");
+                            Self::write(&mut sink, &write);
                         }
                     });
                     mailbox.land();
@@ -1162,6 +1170,52 @@ mod writer_tests {
         assert_eq!(
             probe.log(1),
             vec![Op::Begin, Op::Position(7, Origin::new(10, 0)), Op::Finish]
+        );
+    }
+
+    /// A newer frame queued while the app left a move unanswered writes
+    /// the move too, even when the newer frame only resizes.
+    #[test]
+    fn a_newer_resize_takes_on_the_move_the_app_left_unanswered() {
+        let (probe, entered) = Probe::new();
+        let writers = writers(&probe, SECOND, SETTLE);
+        probe.hold(1);
+        writers.push(1, key(7), moved(7, 10));
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+        probe.unanswered.store(1, Ordering::SeqCst);
+        writers.push(1, key(7), resized(7, IRect::new(10, 0, 110, 200)));
+        probe.release(1);
+        assert!(writers.flush(SECOND));
+        assert_eq!(
+            probe.log(1),
+            vec![
+                Op::Begin,
+                Op::Size(7, Size::new(100, 200)),
+                Op::Position(7, Origin::new(10, 0)),
+                Op::Finish,
+            ]
+        );
+    }
+
+    /// A move asks again for a size the app limited before. When the app
+    /// leaves both unanswered, the second try asks for the size too.
+    #[test]
+    fn a_limited_size_the_app_left_unanswered_is_asked_for_again() {
+        let (probe, _entered) = Probe::new();
+        let writers = writers(&probe, SECOND, SETTLE);
+        let write = moved(7, 10);
+        *write.size_limited.lock().unwrap() = Some(Size::new(100, 80));
+        probe.unanswered.store(2, Ordering::SeqCst);
+        writers.push(1, key(7), write);
+        assert!(writers.flush(SECOND));
+        assert_eq!(
+            probe.log(1),
+            vec![
+                Op::Begin,
+                Op::Position(7, Origin::new(10, 0)),
+                Op::Size(7, Size::new(100, 100)),
+                Op::Finish,
+            ]
         );
     }
 
