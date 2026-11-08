@@ -285,6 +285,19 @@ pub(crate) fn display_in_direction<T>(
         .map(|(display, _, _)| display)
 }
 
+/// The display after the one bounded by `from` in screen order: left to right
+/// by left edge, then top to bottom, wrapping from the last to the first.
+fn next_in_screen_order<T>(
+    from: IRect,
+    displays: impl IntoIterator<Item = (T, IRect)>,
+) -> Option<T> {
+    let place = |bounds: IRect| (bounds.min.x, bounds.min.y);
+    displays
+        .into_iter()
+        .min_by_key(|(_, bounds)| (place(*bounds) <= place(from), place(*bounds)))
+        .map(|(display, _)| display)
+}
+
 fn touching_display<T>(
     side: Side,
     from: IRect,
@@ -1764,8 +1777,8 @@ fn arrival_index(
     strip.index_of(active).ok().map(|index| index + 1)
 }
 
-/// Moves the focused window's whole column to another display: the next one,
-/// or the one in a compass direction. An edge move first takes the column to
+/// Moves the focused window's whole column to another display: the next one in
+/// screen order, or the one in a compass direction. An edge move first takes the column to
 /// its strip's end on that side, and crosses only from there. The column
 /// lands at the crossed edge for a plain keyboard step, otherwise right after
 /// the destination's active column, the window `focus_display` would focus there.
@@ -1815,7 +1828,12 @@ fn to_next_display(
     };
     let move_focus = request.focus;
     let target = match &request.target {
-        DisplayTarget::Next => moves.other_displays().next(),
+        DisplayTarget::Next => next_in_screen_order(
+            source_bounds,
+            moves
+                .other_displays()
+                .map(|display| (display, display.bounds())),
+        ),
         DisplayTarget::Direction(direction) => display_in_direction(
             direction,
             source_bounds,
