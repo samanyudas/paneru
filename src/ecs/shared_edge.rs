@@ -190,11 +190,11 @@ pub(crate) enum PhotoWait {
 /// The windows of `strip` that show a slice: on each side, every window of
 /// the hidden column nearest the edge in strip order, and every window
 /// whose photo slides. Behind the nearest column and each column whose
-/// photo slides, the next hidden column out shows too, so its panel is
-/// there before the nearer photo moves away from the edge. The window
-/// server shows a new panel a frame late, and the other panels' moves in
-/// that frame with it. Each comes with the part of its slice no window in
-/// its
+/// photo slides, the next hidden column out shows too, where the nearer
+/// slices span its whole height, so its panel is there, out of sight,
+/// before the nearer photo moves away from the edge. The window server
+/// shows a new panel a frame late, and the other panels' moves in that
+/// frame with it. Each comes with the part of its slice no window in its
 /// column in front of it covers. A native tab group shows its front tab, and
 /// a tabbed stack the tab focused last. They come back to front: a column
 /// further past its edge before a nearer one, whose photo covers it.
@@ -216,13 +216,23 @@ pub(crate) fn showing(
     let shown = |columns: Vec<Vec<(Entity, EdgeSlice)>>| {
         let nearest = columns.iter().rposition(|slices| !slices.is_empty());
         let mut behind = Vec::new();
-        let mut farther = None;
+        let mut farther: Option<usize> = None;
         for (index, slices) in columns.iter().enumerate() {
             if slices.is_empty() {
                 continue;
             }
-            if Some(index) == nearest || slices.iter().any(|(entity, _)| sliding(*entity)) {
-                behind.extend(farther);
+            let front = slices
+                .iter()
+                .filter(|(entity, _)| Some(index) == nearest || sliding(*entity))
+                .map(|(_, slice)| slice.on_screen)
+                .collect::<Vec<_>>();
+            if let Some(farther) = farther
+                && !front.is_empty()
+                && columns[farther]
+                    .iter()
+                    .all(|(_, slice)| spans_height(&front, slice.on_screen))
+            {
+                behind.push(farther);
             }
             farther = Some(index);
         }
@@ -249,6 +259,25 @@ pub(crate) fn showing(
         .collect::<Vec<_>>();
     east.reverse();
     west.into_iter().chain(shown(east)).collect()
+}
+
+/// Whether `front`, taken together, spans the whole height of `back` with no
+/// gap, so a panel at `back` shows nowhere beside them, as a stack's gaps
+/// would show it.
+fn spans_height(front: &[IRect], back: IRect) -> bool {
+    let mut spans = front
+        .iter()
+        .map(|rect| (rect.min.y, rect.max.y))
+        .collect::<Vec<_>>();
+    spans.sort_unstable();
+    let mut reached = back.min.y;
+    for (top, bottom) in spans {
+        if top > reached {
+            break;
+        }
+        reached = reached.max(bottom);
+    }
+    reached >= back.max.y
 }
 
 /// The windows `column` shows, ordered as the stack orders them on screen:

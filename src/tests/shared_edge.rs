@@ -204,6 +204,34 @@ fn a_slice_toward_a_display_beside_matches_the_sliver_with_that_display_below() 
     assert_eq!(showing(beside.world()), vec![(3, slice)]);
 }
 
+/// The next column out shows behind the nearest hidden column only where
+/// that column's slices span its height. A hidden stack has gaps between
+/// its slices, so a single window farther out would show through them.
+#[test]
+fn no_column_shows_behind_a_hidden_stack_through_its_gaps() {
+    let mut harness = arranged(&[LEFT], 7);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    harness.advance(SETTLE);
+    harness.run(vec![
+        command(Operation::Focus(Direction::East)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    harness.advance(SETTLE);
+    focus_last(&mut harness);
+
+    assert!(
+        slice_of(harness.world(), 0).is_some(),
+        "window 0 tucks farther out than the stack"
+    );
+    assert_eq!(showing_ids(harness.world()), vec![1, 2, 3]);
+}
+
 #[test]
 fn a_hidden_stack_shows_one_slice_per_window_with_its_gaps() {
     let mut beside = stacked_first(&[LEFT], 6);
