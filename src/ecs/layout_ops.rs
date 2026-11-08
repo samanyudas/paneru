@@ -15,7 +15,7 @@ use bevy::ecs::query::{Has, Without};
 use bevy::ecs::system::{Commands, Query, Res};
 use bevy::math::IRect;
 use bevy::platform::collections::HashSet;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::commands::{Command, MoveFocus, Operation, Side};
 use crate::config::Config;
@@ -24,7 +24,6 @@ use crate::ecs::focus::FocusWindow;
 use crate::ecs::layout::{Column, LayoutStrip, RestoreTo, StackItem, effective_stack_limit};
 use crate::ecs::maximize::restore_tiled;
 use crate::ecs::params::Windows;
-use crate::ecs::workspace::VirtualMoveMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, SendMessageTrigger, SpawnCommandsExt, Unmanaged,
     WidthRatio, Window,
@@ -138,26 +137,8 @@ fn apply(
             commands.reshuffle_around(entity);
         }
 
-        LayoutOp::MoveToWorkspace {
-            workspace, follow, ..
-        } => {
-            let entity = entity.expect("MoveToWorkspace names a window");
-            // Virtual workspaces are numbered from one for a script and from
-            // zero inside the layout.
-            let Some(target_virtual_index) = workspace.checked_sub(1) else {
-                debug!(target: "paneru::lua", "skipping {op:?}: workspaces are numbered from 1");
-                return;
-            };
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_insert(VirtualMoveMarker {
-                    target_virtual_index,
-                    move_focus: if follow {
-                        MoveFocus::Follow
-                    } else {
-                        MoveFocus::Stay
-                    },
-                });
-            }
+        LayoutOp::MoveToWorkspace { .. } => {
+            warn!(target: "paneru::lua", "Virtual workspaces are disabled, so {op:?} does nothing");
         }
 
         LayoutOp::View { workspace } => {

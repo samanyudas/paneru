@@ -115,8 +115,10 @@ fn test_startup_focus_selects_the_first_window_without_a_saved_session() {
         .run(vec![Event::MenuOpened { window_id: 0 }]);
 }
 
+/// A Space has one strip, so a saved virtual workspace row comes back as that
+/// strip (Miri #364).
 #[test]
-fn test_startup_restore_rebuilds_virtual_workspace_layout() {
+fn test_startup_restore_rebuilds_a_saved_virtual_row_as_the_spaces_strip() {
     let state = PaneruState {
         version: 2,
         timestamp: 123_456_789,
@@ -155,20 +157,15 @@ fn test_startup_restore_rebuilds_virtual_workspace_layout() {
 
     let world = harness.world();
     let mut query = world.query::<(&LayoutStrip, Has<crate::ecs::ActiveWorkspaceMarker>)>();
-    let active_strips = query
+    let strips = query
         .iter(world)
-        .filter(|(strip, active)| strip.id() == TEST_WORKSPACE_ID && *active)
-        .map(|(strip, _)| strip)
+        .filter(|(strip, _)| strip.id() == TEST_WORKSPACE_ID)
         .collect::<Vec<_>>();
 
-    assert_eq!(
-        active_strips.len(),
-        1,
-        "exactly one virtual row should be active for the restored workspace"
-    );
-
-    let restored = active_strips[0];
-    assert_eq!(restored.virtual_index, 1);
+    assert_eq!(strips.len(), 1, "the restored Space should have one strip");
+    let (restored, active) = strips[0];
+    assert!(active);
+    assert_eq!(restored.virtual_index, 0);
 
     let columns = restored.columns().collect::<Vec<_>>();
     assert_eq!(columns.len(), 2);
@@ -793,7 +790,7 @@ fn test_startup_restore_uses_first_restored_row_when_active_metadata_is_missing(
         .collect::<Vec<_>>();
 
     assert_eq!(active_strips.len(), 1);
-    assert_eq!(active_strips[0].virtual_index, 2);
+    assert_eq!(active_strips[0].virtual_index, 0);
     let mut messages = world.query::<&crate::ecs::FlashMessage>();
     assert!(
         messages.iter(world).next().is_none(),
@@ -873,12 +870,6 @@ fn test_late_startup_window_restores_during_grace_period() {
         Event::Command {
             command: Command::PrintState,
         },
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(0)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(1)),
-        },
     ];
 
     harness
@@ -902,7 +893,7 @@ fn test_late_startup_window_restores_during_grace_period() {
                 .iter(world)
                 .find(|(strip, active)| {
                     strip.id() == TEST_WORKSPACE_ID
-                        && strip.virtual_index == 1
+                        && strip.virtual_index == 0
                         && *active
                         && strip.contains(restored_window)
                 })
@@ -917,14 +908,6 @@ fn test_late_startup_window_restores_during_grace_period() {
                 messages.iter(world).next().is_none(),
                 "late startup restoration should not show a workspace switch popup"
             );
-        })
-        .on_iteration(3, |world, _state| {
-            let mut messages = world.query::<&crate::ecs::FlashMessage>();
-            assert!(messages.iter(world).any(|message| message.0 == "1"));
-        })
-        .on_iteration(4, |world, _state| {
-            let mut messages = world.query::<&crate::ecs::FlashMessage>();
-            assert!(messages.iter(world).any(|message| message.0 == "2"));
         })
         .run(commands);
 }
@@ -992,9 +975,12 @@ fn test_late_startup_window_with_floating_rule_is_not_restored() {
         .run(commands);
 }
 
+/// A saved session can hold a second strip for a Space, a virtual workspace
+/// row from an older engine. Its windows join the Space's one strip after the
+/// windows of the first, and none is parked off screen (Miri #364).
 #[test]
-fn test_startup_restore_keeps_one_selected_row_and_hides_inactive_rows() {
-    let mut harness = TestHarness::new().with_windows(2);
+fn test_startup_restore_merges_a_second_saved_row_into_the_first() {
+    let mut harness = TestHarness::new().with_windows(3);
     harness.world().insert_resource(PaneruState {
         version: 2,
         timestamp: 123_456_789,
@@ -1008,57 +994,62 @@ fn test_startup_restore_keeps_one_selected_row_and_hides_inactive_rows() {
                 SavedStrip {
                     view: None,
                     virtual_index: 0,
-                    columns: vec![SavedColumn::Single(saved_window(0))],
+                    columns: vec![SavedColumn::Single(saved_window(2))],
                 },
                 SavedStrip {
                     view: None,
                     virtual_index: 1,
-                    columns: vec![SavedColumn::Single(saved_window(1))],
+                    columns: vec![
+                        SavedColumn::Single(saved_window(1)),
+                        SavedColumn::Single(saved_window(0)),
+                    ],
                 },
             ],
         }],
     });
-
-    for _ in 0..5 {
-        harness.app.update();
-    }
+    harness.advance(Duration::from_secs(1));
 
     let world = harness.world();
+    let order = [2, 1, 0].map(|id| find_window_entity(id, world));
     let mut query = world.query::<(
         &LayoutStrip,
         Has<crate::ecs::ActiveWorkspaceMarker>,
-        Has<crate::ecs::SelectedVirtualMarker>,
         Option<&PreviousStripPosition>,
     )>();
-    let restored = query
+    let strips = query
         .iter(world)
-        .filter(|(strip, _, _, _)| strip.id() == TEST_WORKSPACE_ID)
+        .filter(|(strip, _, _)| strip.id() == TEST_WORKSPACE_ID)
+        .map(|(strip, active, previous)| {
+            (
+                strip.virtual_index,
+                strip.all_windows(),
+                active,
+                previous.is_some(),
+            )
+        })
         .collect::<Vec<_>>();
-    let active = restored
-        .iter()
-        .filter(|(strip, active, _, _)| *active && strip.virtual_index == 1)
-        .count();
-    let selected = restored
-        .iter()
-        .filter(|(_, _, selected, _)| *selected)
-        .count();
-    let inactive = restored.iter().find(|(strip, active, _, previous)| {
-        strip.virtual_index == 0 && !*active && previous.is_some()
-    });
+    assert_eq!(strips, vec![(0, order.to_vec(), true, false)]);
 
-    assert_eq!(active, 1);
-    assert_eq!(selected, 1);
-    assert!(
-        inactive.is_some(),
-        "inactive restored rows should be hidden with previous position"
+    let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+    let parked = IVec2::new(
+        TEST_DISPLAY_WIDTH - crate::ecs::layout::PARKED_STRIP_SLIVER,
+        TEST_DISPLAY_HEIGHT - crate::ecs::layout::PARKED_STRIP_SLIVER,
     );
+    for id in [2, 1, 0] {
+        let frame = harness.mock_state.ax_frame(id);
+        assert_ne!(frame.min, parked, "window {id} must not be parked");
+        assert!(
+            display.contains(frame.min),
+            "window {id} must start on the display, not off screen: {frame:?}"
+        );
+    }
 }
 
-/// Restore consumes row 0's windows onto the saved rows, which empties row 0.
-/// Despawning it there left the restored space numbered from "2", so the
-/// emptied baseline row is kept.
+/// Restore consumes the windows of the strip the Space starts with, which
+/// empties it. The saved row then fills that strip instead of standing beside
+/// it.
 #[test]
-fn test_startup_restore_keeps_emptied_baseline_row() {
+fn test_startup_restore_refills_the_emptied_baseline_row() {
     let mut harness = TestHarness::new().with_windows(2);
     harness.world().insert_resource(PaneruState {
         version: 2,
@@ -1095,8 +1086,8 @@ fn test_startup_restore_keeps_emptied_baseline_row() {
 
     assert_eq!(
         rows,
-        vec![(0, 0, false), (1, 2, true)],
-        "restore should keep the emptied row 0 alongside the restored row 1"
+        vec![(0, 2, true)],
+        "the saved row should fill the Space's one strip"
     );
 }
 
@@ -1195,150 +1186,6 @@ fn a_restart_keeps_column_widths() {
     restarted.advance(Duration::from_secs(2));
 
     assert_eq!([0, 1].map(|id| os_width(&restarted, id)), widths);
-}
-
-/// When session restore keeps an emptied baseline row 0 on a workspace whose
-/// active virtual row is > 0, row 0 must be parked off-screen with a
-/// `PreviousStripPosition` (and without `SelectedVirtualMarker`), so that
-/// moving windows to row 0 positions them properly on or off screen.
-#[test]
-fn test_emptied_baseline_row_is_parked_and_repositions_moved_windows() {
-    let config: Config = (
-        MainOptions {
-            animation_speed: Some(10000.0),
-            auto_center: Some(false),
-            continuous_swipe: Some(true),
-            virtual_workspace_animations: Some(false),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Center),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMove(
-                crate::commands::Direction::South,
-                crate::commands::MoveFocus::Follow,
-            )),
-        },
-    ];
-
-    let mut display = saved_display(TEST_DISPLAY_ID, true);
-    display.workspace_ids = vec![TEST_WORKSPACE_ID, 200];
-
-    let mut harness = TestHarness::new()
-        .with_config(config)
-        .with_display(
-            TEST_DISPLAY_ID,
-            bevy::math::IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
-            vec![TEST_WORKSPACE_ID, 200],
-        )
-        .with_workspace_window(0, TEST_WORKSPACE_ID, |_| {})
-        .with_workspace_window(1, TEST_WORKSPACE_ID, |_| {})
-        .with_workspace_window(2, 200, |_| {});
-    harness.mock_state.focus_window_unreported(0);
-    harness.world().insert_resource(PaneruState {
-        version: 2,
-        timestamp: 123_456_789,
-        active_display_id: Some(TEST_DISPLAY_ID),
-        displays: vec![display],
-        workspaces: vec![
-            SavedWorkspace {
-                workspace_id: TEST_WORKSPACE_ID,
-                display_id: Some(TEST_DISPLAY_ID),
-                active_virtual_index: Some(0),
-                strips: vec![SavedStrip {
-                    view: None,
-                    virtual_index: 0,
-                    columns: vec![
-                        SavedColumn::Single(saved_window(0)),
-                        SavedColumn::Single(saved_window(1)),
-                    ],
-                }],
-            },
-            SavedWorkspace {
-                workspace_id: 200,
-                display_id: Some(TEST_DISPLAY_ID),
-                active_virtual_index: Some(1),
-                strips: vec![SavedStrip {
-                    view: None,
-                    virtual_index: 1,
-                    columns: vec![SavedColumn::Single(saved_window(2))],
-                }],
-            },
-        ],
-    });
-
-    let parked_origin = bevy::math::IVec2::new(
-        TEST_DISPLAY_WIDTH - crate::ecs::layout::PARKED_STRIP_SLIVER,
-        TEST_DISPLAY_HEIGHT - crate::ecs::layout::PARKED_STRIP_SLIVER,
-    );
-    let visible_origin = bevy::math::IVec2::new(0, TEST_MENUBAR_HEIGHT);
-
-    harness
-        .on_iteration(0, move |world, _state| {
-            assert_eq!(
-                workspace_rows_state(world, 200),
-                vec![
-                    (0, parked_origin, false, false, Some(visible_origin)),
-                    (1, visible_origin, false, true, None),
-                ],
-                "emptied baseline row 0 must be parked with PreviousStripPosition and not selected, \
-                 while the selected row waits in place for macOS to show its Space"
-            );
-        })
-        .on_iteration(1, |world, _state| {
-            let win0 = find_window_entity(0, world);
-            assert!(world.get::<crate::ecs::Position>(win0).unwrap().0.x > 0);
-        })
-        .on_iteration(2, move |world, _state| {
-            let win0 = find_window_entity(0, world);
-            assert_eq!(
-                world.get::<crate::ecs::Position>(win0).unwrap().0,
-                visible_origin,
-                "moving window 0 to a new virtual row must reposition it even when relative LayoutPosition stays (0, 0)"
-            );
-        })
-        .run(commands);
-}
-
-fn workspace_rows_state(
-    world: &mut World,
-    workspace_id: WorkspaceId,
-) -> Vec<(
-    u32,
-    bevy::math::IVec2,
-    bool,
-    bool,
-    Option<bevy::math::IVec2>,
-)> {
-    let mut query = world.query::<(
-        &LayoutStrip,
-        &crate::ecs::Position,
-        Has<crate::ecs::ActiveWorkspaceMarker>,
-        Has<crate::ecs::SelectedVirtualMarker>,
-        Option<&PreviousStripPosition>,
-    )>();
-    let mut rows = query
-        .iter(world)
-        .filter(|(strip, _, _, _, _)| strip.id() == workspace_id)
-        .map(|(strip, pos, active, selected, prev)| {
-            (
-                strip.virtual_index,
-                pos.0,
-                active,
-                selected,
-                prev.map(|p| p.origin),
-            )
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by_key(|(idx, ..)| *idx);
-    rows
 }
 
 const PADDING: u16 = 4;
@@ -1876,6 +1723,82 @@ fn test_startup_restore_follows_windows_to_their_renumbered_space() {
         shown,
         "the first restored window must show on its display, not sit parked"
     );
+}
+
+/// A saved Space can follow its window to a Space that another saved Space
+/// also restores, which remaps it to that Space's display. Both saved Spaces
+/// then fill one strip, in saved order, and no window is parked in a second
+/// strip (Miri #364).
+#[test]
+fn test_startup_restore_remapped_onto_a_restored_space_keeps_one_strip() {
+    let ext_bounds = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        EXT_DISPLAY_HEIGHT,
+    );
+    let mut harness = TestHarness::new();
+    harness
+        .mock_state
+        .add_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID]);
+    let frame = IRect::from_corners(
+        ext_bounds.min,
+        ext_bounds.min + Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    for id in [300, 301, 400] {
+        harness
+            .mock_state
+            .spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, id, frame);
+    }
+    let mut ext_display = saved_display(EXT_DISPLAY_ID, false);
+    ext_display.workspace_ids = vec![EXT_WORKSPACE_ID];
+    let saved_workspace = |workspace_id, display_id, window_ids: &[i32]| SavedWorkspace {
+        workspace_id,
+        display_id: Some(display_id),
+        active_virtual_index: Some(0),
+        strips: vec![SavedStrip {
+            view: None,
+            virtual_index: 0,
+            columns: window_ids
+                .iter()
+                .map(|id| SavedColumn::Single(saved_window(*id)))
+                .collect(),
+        }],
+    };
+    harness.world().insert_resource(PaneruState {
+        version: 2,
+        timestamp: 123_456_789,
+        active_display_id: Some(TEST_DISPLAY_ID),
+        displays: vec![saved_display(TEST_DISPLAY_ID, true), ext_display],
+        workspaces: vec![
+            saved_workspace(EXT_WORKSPACE_ID, EXT_DISPLAY_ID, &[300, 301]),
+            saved_workspace(TEST_WORKSPACE_ID, TEST_DISPLAY_ID, &[400]),
+        ],
+    });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_secs(1));
+
+    let world = harness.world();
+    let order = [300, 301, 400].map(|id| find_window_entity(id, world));
+    let strips: Vec<(u32, Vec<Entity>)> = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|strip| strip.id() == EXT_WORKSPACE_ID)
+        .map(|strip| (strip.virtual_index, strip.all_windows()))
+        .collect();
+    assert_eq!(
+        strips,
+        vec![(0, order.to_vec())],
+        "both saved Spaces must restore into the one strip of the Space that holds their windows"
+    );
+    for id in [300, 301, 400] {
+        let shown = harness.mock_state.ax_frame(id);
+        assert_eq!(
+            shown.intersect(ext_bounds),
+            shown,
+            "window {id} must show on its display, not sit parked"
+        );
+    }
 }
 
 /// The main display holds a row of three windows `width` wide, wider than the

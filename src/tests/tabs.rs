@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 use crate::assert_window_size;
-use crate::commands::{Command, MoveFocus, Operation};
+use crate::commands::Command;
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{ActiveWorkspaceMarker, Bounds, SpawnWindowTrigger};
@@ -87,52 +87,6 @@ fn test_native_tab_resize_syncs_sibling_size() {
                 TEST_WINDOW_WIDTH + 160,
                 TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT
             );
-        })
-        .run(commands);
-}
-
-#[test]
-fn test_native_tab_virtual_move_moves_all_tabs() {
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-    ];
-
-    TestHarness::new()
-        .with_windows(1)
-        .on_iteration(0, move |world, state| {
-            spawn_matching_native_tab(world, &state, 0);
-        })
-        .on_iteration(3, move |world, _state| {
-            let tab_zero = find_window_entity(0, world);
-            let tab_one = find_window_entity(1, world);
-            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
-            let active = query
-                .iter(world)
-                .find_map(|(strip, active)| active.then_some(strip))
-                .expect("active strip not found");
-
-            assert_eq!(active.virtual_index, 1);
-            assert_eq!(active.len(), 1);
-            assert_eq!(active.index_of(tab_zero).unwrap(), 0);
-            assert_eq!(active.index_of(tab_one).unwrap(), 0);
-            assert_eq!(active.tab_group(tab_zero), Some(vec![tab_one, tab_zero]));
-
-            let mut query = world.query::<&LayoutStrip>();
-            let source = query
-                .iter(world)
-                .find(|strip| strip.virtual_index == 0)
-                .expect("source strip not found");
-            assert!(!source.contains(tab_zero));
-            assert!(!source.contains(tab_one));
         })
         .run(commands);
 }

@@ -1,7 +1,6 @@
 mod column_moves;
 mod display;
 mod drag;
-mod focus_or_virtual;
 mod harness;
 mod interaction;
 mod launch;
@@ -23,6 +22,7 @@ mod state;
 mod tabbed_display;
 mod tabs;
 mod tiling;
+mod virtual_workspaces;
 mod window_writes;
 
 pub(crate) use harness::*;

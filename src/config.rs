@@ -957,13 +957,14 @@ impl Config {
             .is_some_and(|enabled| enabled)
     }
 
-    /// Number of virtual workspaces to pre-create on each physical space at
-    /// startup. Default: 1 (just the physical space itself, no extra virtual
-    /// workspaces).
+    /// The configured number of virtual workspaces, which scripts can read.
+    /// The engine keeps one strip per native Space, so it creates no others.
+    #[cfg_attr(not(feature = "lua"), allow(dead_code))]
     pub fn default_workspaces(&self) -> u32 {
         self.inner().default_workspaces.unwrap_or(1).max(1)
     }
 
+    #[cfg_attr(not(feature = "lua"), allow(dead_code))]
     pub fn insert_windows_mid_strip(&self) -> bool {
         // Default is disabled: appending to the end of the strip is the
         // expected behaviour, especially when moving several windows.
@@ -972,6 +973,7 @@ impl Config {
             .is_some_and(|enabled| enabled)
     }
 
+    #[cfg_attr(not(feature = "lua"), allow(dead_code))]
     pub fn create_workspace_automatically(&self) -> bool {
         self.options()
             .create_virtual_workspace_automatically
