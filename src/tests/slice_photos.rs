@@ -1578,6 +1578,42 @@ fn west_presses_show_the_next_photo_out_before_a_nearer_photo_leaves_the_edge() 
     }
 }
 
+/// Every hidden column at the shared edge has its panel at rest, so the
+/// West presses of #316 make no panel while photos move. The window server
+/// shows a new panel a frame late, and live runs showed other panels' moves
+/// in that frame late with it, which parted a sliding photo from the window
+/// ahead of it.
+#[test]
+fn west_presses_make_no_panel_while_photos_move() {
+    for again in 4..=14 {
+        let (mut harness, log) = reveal_three(&[388, 408, 768, 768]);
+        let rest = placed_ids(&log);
+        let presses = [
+            (0, Direction::West),
+            (again, Direction::West),
+            (2 * again, Direction::West),
+        ];
+        let mut made: Vec<WinID> = Vec::new();
+        let mut before = rest.clone();
+        for frame in 0..3 * again + 30 {
+            for (_, direction) in presses.iter().filter(|(at, _)| *at == frame) {
+                harness
+                    .world()
+                    .write_message(command(Operation::Focus(direction.clone())));
+            }
+            harness.advance(Duration::from_millis(20));
+            let now = placed_ids(&log);
+            made.extend(now.iter().copied().filter(|id| !before.contains(id)));
+            before = now;
+        }
+        assert_eq!(
+            made,
+            Vec::<WinID>::new(),
+            "with presses {again} frames apart, no panel opens after rest: {rest:?}"
+        );
+    }
+}
+
 #[test]
 fn a_tucked_slice_slides_with_the_row_when_the_row_scrolls_on() {
     let west = (
