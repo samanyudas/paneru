@@ -316,8 +316,34 @@ fn touching_display<T>(
     )
 }
 
+/// Focuses `entity` for a command, and scrolls its strip to show it.
+fn focus_into_view(entity: Entity, focused: Option<Entity>, commands: &mut Commands) {
+    focus_with_verification(entity, focused, None, FocusSource::Command, commands);
+    commands.reshuffle_around(entity);
+}
+
+/// A plain focus step that crossed toward `crossed` to display `display`.
 #[derive(bevy::ecs::message::Message)]
-struct DisplayFocusRequest(u32);
+struct DisplayFocusRequest {
+    display: u32,
+    crossed: Side,
+}
+
+/// The window a plain focus step that crossed toward `crossed` lands on in
+/// `strip`: in the column nearest the crossed edge, the window that last had
+/// focus there.
+fn crossing_landing(
+    strip: &LayoutStrip,
+    crossed: Side,
+    focus_history: &FocusHistory,
+) -> Option<Entity> {
+    let column = match crossed {
+        Side::East => strip.first(),
+        Side::West => strip.last(),
+    }
+    .ok()?;
+    focus_history.last_focused_in(&column)
+}
 
 fn visible_floating_entities(
     windows: &Windows,
@@ -544,7 +570,10 @@ fn command_move_focus(
                 .map(|display| (display, display.bounds())),
         )
     {
-        display_requests.write(DisplayFocusRequest(target.id()));
+        display_requests.write(DisplayFocusRequest {
+            display: target.id(),
+            crossed: side,
+        });
         return;
     }
 
@@ -1930,6 +1959,9 @@ fn to_next_display(
 /// it becomes the active display. The pointer moves only with
 /// `mouse_follows_focus`.
 ///
+/// A plain focus step that crossed to a display lands in its column nearest
+/// the crossed edge instead.
+///
 /// An edge focus first focuses its strip's end column on that side, as
 /// `window_focus_first` and `_last` do, and crosses only from there. From a
 /// window outside the strip, such as a floating one, it focuses the end column.
@@ -1948,8 +1980,11 @@ fn focus_display(
     clock: Res<Time<Real>>,
     mut commands: Commands,
 ) {
-    let requested = requests.read().next().map(|request| request.0);
-    let target = if let Some(id) = requested {
+    let crossed = requests
+        .read()
+        .next()
+        .map(|request| (request.display, request.crossed));
+    let target = if let Some((id, _)) = crossed {
         active_display.other().find(|display| display.id() == id)
     } else {
         let Some(operation) = filter_window_operations(&mut messages, |op| {
@@ -1976,14 +2011,7 @@ fn focus_display(
                         .ok()
                         .and_then(|column| focus_history.last_focused_in(&column))
                     {
-                        focus_with_verification(
-                            entity,
-                            focused,
-                            None,
-                            FocusSource::Command,
-                            &mut commands,
-                        );
-                        commands.reshuffle_around(entity);
+                        focus_into_view(entity, focused, &mut commands);
                     }
                     return;
                 }
@@ -2013,6 +2041,16 @@ fn focus_display(
         .active_display_space(target.id())
         .ok()
         .and_then(|id| layout_strips.iter().find(|strip| strip.id() == id));
+    if let Some(entity) = crossed
+        .and_then(|(_, side)| strip.and_then(|strip| crossing_landing(strip, side, &focus_history)))
+    {
+        focus_into_view(
+            entity,
+            windows.focused().map(|(_, entity)| entity),
+            &mut commands,
+        );
+        return;
+    }
     if let Some((entity, frame)) = strip.and_then(|strip| {
         active_window_on_display(strip, target_bounds, &focus_history, |entity| {
             windows.frame(entity)
