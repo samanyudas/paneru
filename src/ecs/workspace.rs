@@ -1,5 +1,5 @@
 use bevy::app::{App, Plugin, PostUpdate, PreUpdate, Update};
-use bevy::ecs::change_detection::{DetectChanges as _, Ref};
+use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _, Ref};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::ChildOf;
@@ -69,6 +69,7 @@ type MergeStrips<'w, 's> = ParamSet<
             (
                 Entity,
                 &'static mut LayoutStrip,
+                Option<&'static mut Position>,
                 Has<ActiveWorkspaceMarker>,
                 Has<SelectedVirtualMarker>,
             ),
@@ -841,24 +842,29 @@ fn merge_strips_per_space(mut set: MergeStrips, mut commands: Commands) {
     for workspace_id in added {
         let mut rows = strips
             .iter_mut()
-            .filter(|(_, strip, _, _)| strip.id() == workspace_id && !strip.is_fullscreen())
+            .filter(|(_, strip, _, _, _)| strip.id() == workspace_id && !strip.is_fullscreen())
             .collect::<Vec<_>>();
-        rows.sort_by_key(|(entity, strip, active, selected)| {
+        rows.sort_by_key(|(entity, strip, _, active, selected)| {
             (!*active, !*selected, strip.virtual_index, *entity)
         });
-        let Some(((_, kept, _, _), others)) = rows.split_first_mut() else {
+        let Some(((_, kept, kept_position, _, _), others)) = rows.split_first_mut() else {
             continue;
         };
         if others.is_empty() && kept.virtual_index == 0 {
             continue;
         }
         kept.virtual_index = 0;
-        for (entity, strip, _, _) in others {
+        for (entity, strip, _, _, _) in others {
             warn!("Merging a second strip of workspace {workspace_id} into its first");
             kept.append_strip(strip);
             if let Ok(mut entity_commands) = commands.get_entity(*entity) {
                 entity_commands.try_despawn();
             }
+        }
+        // The arriving windows may sit parked with their old strip, in a slot
+        // that the merge leaves the same, so lay the whole strip out again.
+        if let Some(position) = kept_position {
+            position.set_changed();
         }
     }
 }
