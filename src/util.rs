@@ -410,3 +410,13 @@ where
             .then(|| getter(screen))
     })
 }
+
+#[cfg(test)]
+mod ci_failure_probe {
+    // Throwaway: proves the miri/** workflow fails on a failing test. Never merge.
+    #[test]
+    fn ci_failure_probe_fails() {
+        let empty: Vec<u8> = Vec::new();
+        assert_eq!(empty.len(), 1, "deliberate CI failure probe");
+    }
+}
