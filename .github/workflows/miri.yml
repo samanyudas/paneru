@@ -2,7 +2,7 @@ name: Miri branch checks
 
 # Engine changes for Miri land on miri/** branches, which rust.yml does not cover.
 # These jobs run the checks that Miri runs on its engine submodule (engine-lint and engine-test in Miri's Makefile),
-# the format check and default-feature tests from this repository's AGENTS.md, and the release build from rust.yml.
+# the checks in this repository's AGENTS.md, and the release build from rust.yml.
 on:
   push:
     branches: ["miri/**"]
@@ -40,9 +40,11 @@ jobs:
           save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/miri/v') }}
       - run: cargo fmt --check
       # Miri builds the engine without the default lua and vendored features.
-      # Clippy with the default features is left out until it passes on miri/v0.5.2.
       - name: Clippy as Miri builds the engine
         run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+      # This repository's AGENTS.md runs Clippy with the default features.
+      - name: Clippy with the default features
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   test-miri:
     name: Tests as Miri builds the engine
