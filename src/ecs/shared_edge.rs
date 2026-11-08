@@ -189,7 +189,12 @@ pub(crate) enum PhotoWait {
 
 /// The windows of `strip` that show a slice: on each side, every window of
 /// the hidden column nearest the edge in strip order, and every window
-/// whose photo slides, each with the part of its slice no window in its
+/// whose photo slides. Behind the nearest column and each column whose
+/// photo slides, the next hidden column out shows too, so its panel is
+/// there before the nearer photo moves away from the edge. The window
+/// server shows a new panel a frame late, and the other panels' moves in
+/// that frame with it. Each comes with the part of its slice no window in
+/// its
 /// column in front of it covers. A native tab group shows its front tab, and
 /// a tabbed stack the tab focused last. They come back to front: a column
 /// further past its edge before a nearer one, whose photo covers it.
@@ -210,12 +215,24 @@ pub(crate) fn showing(
     };
     let shown = |columns: Vec<Vec<(Entity, EdgeSlice)>>| {
         let nearest = columns.iter().rposition(|slices| !slices.is_empty());
+        let mut behind = Vec::new();
+        let mut farther = None;
+        for (index, slices) in columns.iter().enumerate() {
+            if slices.is_empty() {
+                continue;
+            }
+            if Some(index) == nearest || slices.iter().any(|(entity, _)| sliding(*entity)) {
+                behind.extend(farther);
+            }
+            farther = Some(index);
+        }
         let mut shown = Vec::new();
         for (index, slices) in columns.into_iter().enumerate() {
+            let whole = Some(index) == nearest || behind.contains(&index);
             shown.extend(
                 slices
                     .into_iter()
-                    .filter(|(entity, _)| Some(index) == nearest || sliding(*entity)),
+                    .filter(|(entity, _)| whole || sliding(*entity)),
             );
         }
         shown

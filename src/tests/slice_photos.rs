@@ -482,7 +482,7 @@ fn a_slice_that_stops_showing_closes_its_panel() {
 #[test]
 fn a_window_gone_closes_only_its_panel() {
     let (mut harness, log) = between();
-    assert_eq!(placed_ids(&log), vec![1, 5]);
+    assert_eq!(placed_ids(&log), vec![0, 1, 6, 5]);
     let asks = asks_for(&log, 1).len();
 
     arrive(
@@ -493,7 +493,7 @@ fn a_window_gone_closes_only_its_panel() {
     );
     harness.advance(REFRESH * 2);
 
-    assert_eq!(placed_ids(&log), vec![5]);
+    assert_eq!(placed_ids(&log), vec![0, 6, 5]);
     assert_eq!(asks_for(&log, 1).len(), asks, "no photo of window 1 again");
 }
 
@@ -516,11 +516,11 @@ fn a_refused_photo_closes_every_panel_until_the_config_changes() {
 
     harness.world().insert_resource(switch(true));
     harness.app.update();
-    assert_eq!(placed_ids(&log), vec![1, 5]);
+    assert_eq!(placed_ids(&log), vec![0, 1, 6, 5]);
     assert_eq!(
         log.borrow().asked.len(),
-        asks + 2,
-        "both photographed again"
+        asks + 4,
+        "all four photographed again"
     );
 }
 
@@ -1480,8 +1480,8 @@ fn rapid_west_presses_that_reveal_two_columns_slide_both_with_the_row() {
     let shown = showing(harness.world());
     assert_eq!(
         shown.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        vec![2],
-        "window 2 shows its sliver, window 1 hides behind it"
+        vec![1, 2],
+        "window 2 shows its sliver, with window 1's behind it"
     );
 
     let presses = [
@@ -1537,8 +1537,8 @@ fn reveal_three(widths: &[i32]) -> (TestHarness, ScreenLog) {
     harness.advance(SETTLE);
     assert_eq!(
         placed_ids(&log),
-        vec![2],
-        "window 2 shows its slice at rest"
+        vec![1, 2],
+        "window 2 shows its slice at rest, with window 1's behind it"
     );
     (harness, log)
 }
@@ -1597,8 +1597,10 @@ fn a_tucked_slice_slides_with_the_row_when_the_row_scrolls_on() {
         widths[3] = 500;
         let (mut harness, log) = wide(beside, &widths, &focus);
         let shown = showing(harness.world());
-        let [(3, crossing)] = shown.as_slice() else {
-            panic!("window 3 shows part of itself past the edge: {shown:?}")
+        let [(2 | 4, _), (3, crossing)] = shown.as_slice() else {
+            panic!(
+                "window 3 shows part of itself past the edge, the next column behind it: {shown:?}"
+            )
         };
         assert!(crossing.on_screen.width() > 200, "{crossing:?}");
         paint_asked(&mut harness, &log, &[3]);
@@ -1620,8 +1622,8 @@ fn a_tucked_slice_slides_with_the_row_when_the_row_scrolls_on() {
             "the photo of window 3 only slides out: {widths:?}"
         );
         let shown = showing(harness.world());
-        let [(3, slice)] = shown.as_slice() else {
-            panic!("window 3 shows a slice at rest: {shown:?}")
+        let [(2 | 4, _), (3, slice)] = shown.as_slice() else {
+            panic!("window 3 shows a slice at rest, the next column behind it: {shown:?}")
         };
         assert_eq!(slice.on_screen.width(), SLIVER, "{slice:?}");
         assert_eq!(widths.last(), Some(&SLIVER), "the photo rests as the slice");
@@ -1658,8 +1660,8 @@ fn a_column_a_closed_window_brings_out_slides_its_photo_in_from_its_slice() {
 fn a_tucked_slice_a_new_window_pushes_out_slides_with_the_row() {
     let (mut harness, log) = wide(RIGHT, &[400, 400, 500, 400], &[]);
     let shown = showing(harness.world());
-    let [(2, crossing)] = shown.as_slice() else {
-        panic!("window 2 shows part of itself past the edge: {shown:?}")
+    let [(3, _), (2, crossing)] = shown.as_slice() else {
+        panic!("window 2 shows part of itself past the edge, window 3 behind it: {shown:?}")
     };
     assert!(crossing.on_screen.width() > 200, "{crossing:?}");
     paint_asked(&mut harness, &log, &[2]);
@@ -1678,8 +1680,8 @@ fn a_tucked_slice_a_new_window_pushes_out_slides_with_the_row() {
     }
 
     let shown = showing(harness.world());
-    let [(2, slice)] = shown.as_slice() else {
-        panic!("window 2 shows a slice at rest: {shown:?}")
+    let [.., (2, slice)] = shown.as_slice() else {
+        panic!("window 2 shows a slice at rest, in front: {shown:?}")
     };
     assert_eq!(slice.on_screen.width(), SLIVER, "{slice:?}");
     widths.dedup();
@@ -1811,8 +1813,8 @@ fn rapid_east_presses_that_tuck_two_columns_leave_no_wallpaper_at_the_edge() {
     );
     assert_eq!(
         placed_ids(&log),
-        vec![1],
-        "at rest window 1 shows its slice"
+        vec![0, 1],
+        "at rest window 1 shows its slice, with window 0's behind it"
     );
 }
 
