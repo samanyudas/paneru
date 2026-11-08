@@ -29,6 +29,8 @@ pub(crate) struct MockAppData {
     pub(crate) name: String,
     pub(crate) focused_window_id: Option<WinID>,
     pub(crate) is_frontmost: bool,
+    /// The user hid the app, as with Command-H.
+    pub(crate) is_hidden: bool,
     pub(crate) connection: Option<crate::platform::ConnID>,
     /// The app's window writes go through the engine's per-app writers,
     /// like `WindowOS`'s, instead of landing before each call returns.
@@ -583,6 +585,7 @@ impl MockState {
                 name: name.to_string(),
                 focused_window_id: None,
                 is_frontmost: true,
+                is_hidden: false,
                 connection: Some(0),
                 queued_writes: false,
                 write_delay: std::time::Duration::ZERO,
@@ -1843,6 +1846,15 @@ impl MockState {
                 .apps
                 .get(&pid)
                 .is_some_and(|a| a.is_frontmost)
+        });
+
+        let s = self.clone();
+        ma.expect_is_hidden().returning(move || {
+            s.inner
+                .force_read()
+                .apps
+                .get(&pid)
+                .is_some_and(|a| a.is_hidden)
         });
 
         let s = self.clone();
