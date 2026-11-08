@@ -1,4 +1,5 @@
 mod column_moves;
+mod crossing_focus;
 mod display;
 mod drag;
 mod harness;
