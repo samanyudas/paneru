@@ -1,0 +1,87 @@
+name: Miri branch checks
+
+# Engine changes for Miri land on miri/** branches, which rust.yml does not cover.
+# These jobs run the checks that Miri runs on its engine submodule (engine-lint and engine-test in Miri's Makefile),
+# and the format check, Clippy, and tests with the default features from this repository's AGENTS.md.
+# No release build runs here: Miri Developer ships the debug build, and the release build belongs to the future Miri release path.
+on:
+  # Only base branches such as miri/v0.5.2 run on push. A feature branch such as miri/332-crossing-focus-edge
+  # also matches miri/**, so a push trigger for it ran every job twice, once for the push and once for its pull request.
+  push:
+    branches: ["miri/v*"]
+  pull_request:
+    branches: ["miri/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: miri-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format and Clippy
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the Command Line Tools toolchain
+        run: sudo xcode-select -s /Library/Developer/CommandLineTools
+      - name: Select macOS SDK
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      # rust-toolchain.toml selects stable, as it does for rust.yml.
+      - run: rustup update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Only pushes save, and pushes run only for miri/v* base branches, so pull requests into a base branch restore its cache.
+          save-if: ${{ github.event_name == 'push' }}
+      - run: cargo fmt --check
+      # Miri builds the engine without the default lua and vendored features.
+      - name: Clippy as Miri builds the engine
+        run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+      # This repository's AGENTS.md runs Clippy with the default features.
+      - name: Clippy with the default features
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  test-miri:
+    name: Tests as Miri builds the engine
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the Command Line Tools toolchain
+        run: sudo xcode-select -s /Library/Developer/CommandLineTools
+      - name: Select macOS SDK
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - run: rustup update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      # Miri's .cargo/config.toml builds dependencies at opt-level 1, because each test runs hundreds of Bevy frames.
+      - run: cargo test --locked --no-default-features --config 'profile.dev.package."*".opt-level=1'
+
+  test-default:
+    name: Tests with the default features
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the Command Line Tools toolchain
+        run: sudo xcode-select -s /Library/Developer/CommandLineTools
+      - name: Select macOS SDK
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - run: rustup update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      - run: cargo test --locked --all-targets --config 'profile.dev.package."*".opt-level=1'

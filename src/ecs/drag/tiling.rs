@@ -227,6 +227,10 @@ pub(crate) struct NativeResizeStart {
     /// Until when a hold that ended before the app moved the window to the
     /// slot waits for the app to catch up with the engine's writes.
     catch_up: Option<Duration>,
+    /// The frame the window showed at the last check of that wait.
+    caught: Option<IRect>,
+    /// The frame the window showed when that wait last wrote the slot.
+    written: Option<IRect>,
     /// Whether the engine wrote its frame again after the app kept another
     /// one while the engine was done writing.
     reasserted: bool,
@@ -272,6 +276,8 @@ impl NativeResizeStart {
             tile: None,
             retiles: 0,
             catch_up: None,
+            caught: None,
+            written: None,
             reasserted: false,
         }
     }
@@ -329,24 +335,38 @@ impl NativeResizeStart {
     }
 
     /// This hold, waiting [`NATIVE_RESIZE_SETTLE`] more, when the window at
-    /// `frame` has yet to reach the slot's origin within
-    /// [`ENGINE_ECHO_LIMIT`] of the restore. An app that refuses a size
-    /// still takes the move, so one that has not moved is still applying the
-    /// engine's writes.
-    fn catching_up(self, frame: IRect, now: Duration) -> Option<Self> {
+    /// `frame` has yet to reach the slot's origin, or is off the slot and
+    /// either changed since the last check or kept still only since the
+    /// slot was last written, within [`ENGINE_ECHO_LIMIT`] of the restore.
+    /// An app that refuses a size still takes the move and then keeps its
+    /// frame across a write of the slot, so one that has not moved, still
+    /// changes its frame, or may have lost the last write, is still applying
+    /// the engine's writes. The flag says whether the slot is written again:
+    /// when the wait begins, and when a frame holds still that the last
+    /// write did not see.
+    fn catching_up(self, frame: IRect, now: Duration) -> Option<(Self, bool)> {
         let Phase::Holding { until } = self.phase else {
             return None;
         };
         let deadline = self
             .catch_up
             .unwrap_or(until + ENGINE_ECHO_LIMIT.saturating_sub(TILE_RESTORE_HOLD));
-        (frame.min != self.origin && now < deadline).then_some(Self {
-            phase: Phase::Holding {
-                until: now + NATIVE_RESIZE_SETTLE,
+        let off = frame != self.slot();
+        let changing = off && self.caught != Some(frame);
+        let unconfirmed = off && !changing && self.written != Some(frame);
+        let write = self.catch_up.is_none() || unconfirmed;
+        ((frame.min != self.origin || changing || unconfirmed) && now < deadline).then_some((
+            Self {
+                phase: Phase::Holding {
+                    until: now + NATIVE_RESIZE_SETTLE,
+                },
+                catch_up: Some(deadline),
+                caught: Some(frame),
+                written: if write { Some(frame) } else { self.written },
+                ..self
             },
-            catch_up: Some(deadline),
-            ..self
-        })
+            write,
+        ))
     }
 
     pub(crate) fn misses_only_height(&self, frame: IRect) -> bool {
@@ -381,6 +401,8 @@ impl NativeResizeStart {
                 reached: false,
                 retiles: self.retiles + 1,
                 catch_up: None,
+                caught: None,
+                written: None,
                 ..self
             },
         )
@@ -663,10 +685,10 @@ impl TilingRestore<'_, '_> {
                 if let Some(again) = start.retile(tile, frame, now) {
                     return Self::restore(entity, again, commands);
                 }
-                if let Some(waiting) = start.catching_up(frame, now) {
-                    // The app may have lost the move to the slot, so it gets
-                    // the slot once more when the wait begins.
-                    if start.catch_up.is_none() {
+                if let Some((waiting, write)) = start.catching_up(frame, now) {
+                    // The app may have lost the move to the slot or the
+                    // last write of it, so it gets the slot once more.
+                    if write {
                         return Self::restore(entity, waiting, commands);
                     }
                     entity_commands.try_insert(waiting);
