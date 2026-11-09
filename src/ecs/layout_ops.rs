@@ -17,7 +17,7 @@ use bevy::math::IRect;
 use bevy::platform::collections::HashSet;
 use tracing::{debug, warn};
 
-use crate::commands::{Command, MoveFocus, Operation, Side};
+use crate::commands::{Command, Operation, Side};
 use crate::config::Config;
 use crate::ecs::drag::NativeResizeStart;
 use crate::ecs::focus::FocusWindow;
