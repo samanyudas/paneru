@@ -1,0 +1,100 @@
+name: Miri branch checks
+
+# Engine changes for Miri land on miri/** branches, which rust.yml does not cover.
+# These jobs run the checks that Miri runs on its engine submodule (engine-lint and engine-test in Miri's Makefile),
+# the format check and default-feature tests from this repository's AGENTS.md, and the release build from rust.yml.
+on:
+  push:
+    branches: ["miri/**"]
+  pull_request:
+    branches: ["miri/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: miri-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format and Clippy
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the Command Line Tools toolchain
+        run: sudo xcode-select -s /Library/Developer/CommandLineTools
+      - name: Select macOS SDK
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      # rust-toolchain.toml selects stable, as it does for rust.yml.
+      - run: rustup update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Only pushes to a miri/v* base branch save, so pull requests into it restore that cache.
+          save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/miri/v') }}
+      - run: cargo fmt --check
+      # Miri builds the engine without the default lua and vendored features.
+      # Clippy with the default features is left out until it passes on miri/v0.5.2.
+      - name: Clippy as Miri builds the engine
+        run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+
+  test-miri:
+    name: Tests as Miri builds the engine
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the Command Line Tools toolchain
+        run: sudo xcode-select -s /Library/Developer/CommandLineTools
+      - name: Select macOS SDK
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - run: rustup update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/miri/v') }}
+      # Miri's .cargo/config.toml builds dependencies at opt-level 1, because each test runs hundreds of Bevy frames.
+      - run: cargo test --locked --no-default-features --config 'profile.dev.package."*".opt-level=1'
+
+  test-default:
+    name: Tests with the default features
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the Command Line Tools toolchain
+        run: sudo xcode-select -s /Library/Developer/CommandLineTools
+      - name: Select macOS SDK
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - run: rustup update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/miri/v') }}
+      - run: cargo test --locked --all-targets --config 'profile.dev.package."*".opt-level=1'
+
+  build:
+    name: Release build
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the Command Line Tools toolchain
+        run: sudo xcode-select -s /Library/Developer/CommandLineTools
+      - name: Select macOS SDK
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - run: rustup update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/miri/v') }}
+      - run: cargo build --release --locked --verbose
