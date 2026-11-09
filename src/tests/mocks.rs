@@ -1595,12 +1595,24 @@ impl MockState {
         });
 
         let s = self.clone();
-        mw.expect_is_alive().returning(move || {
-            s.inner
-                .force_read()
+        mw.expect_read_role().returning(move || {
+            let inner = s.inner.force_read();
+            let busy = inner
                 .windows
                 .get(&id)
-                .is_some_and(|window| window.ax_generation == ax_generation)
+                .and_then(|window| inner.apps.get(&window.pid))
+                .is_some_and(|app| app.ax_busy);
+            if busy {
+                return Err(crate::errors::Error::CannotComplete(format!(
+                    "window {id} role"
+                )));
+            }
+            inner
+                .windows
+                .get(&id)
+                .filter(|window| window.ax_generation == ax_generation)
+                .map(|window| window.role.clone())
+                .ok_or_else(|| crate::errors::Error::Generic(format!("window {id} not found")))
         });
 
         let s = self.clone();

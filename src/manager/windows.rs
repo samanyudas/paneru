@@ -470,12 +470,13 @@ pub trait WindowApi: Send + Sync {
     fn identifier(&self) -> Result<String>;
     fn child_role(&self) -> Result<bool>;
     /// Cached after the first successful read. Not a liveness check: use
-    /// [`Self::is_alive`] for that.
+    /// [`Window::is_alive`] for that.
     fn role(&self) -> Result<String>;
     fn subrole(&self) -> Result<String>;
-    /// Whether the window's AX element still answers. Always a fresh
-    /// cross-process read, never cached.
-    fn is_alive(&self) -> bool;
+    /// Reads the window's role straight from its AX element. Always a fresh
+    /// cross-process read, never cached: use [`Window::is_alive`] to ask
+    /// whether the window still exists.
+    fn read_role(&self) -> Result<String>;
     fn is_minimized(&self) -> bool;
     fn is_full_screen(&self) -> bool;
     /// Whether the window has a full-screen button. Every resizable standard
@@ -561,6 +562,15 @@ impl Window {
     /// The frame the user sees, in screen points.
     pub fn shown_frame(&self) -> IRect {
         self.margins().shown(self.frame())
+    }
+
+    /// Whether the window's AX element may still exist. Every window has a
+    /// role, so a read the app answered with an error means the element is
+    /// gone. A read the app left unanswered within the AX timeout
+    /// (`kAXErrorCannotComplete`) says nothing: a busy app, as under load,
+    /// leaves reads of its live windows unanswered too.
+    pub fn is_alive(&self) -> bool {
+        !matches!(self.read_role(), Err(err) if !matches!(err, Error::CannotComplete(_)))
     }
 
     /// Whether `element` is this window's AX element. A window without an
@@ -1258,11 +1268,9 @@ impl WindowApi for WindowOS {
     /// Reads the role straight from AX, deliberately bypassing the `role`
     /// cache. `Self::role` keeps returning its stored value after the window
     /// is gone, so it always looks alive; only a fresh read fails once the
-    /// AX element is torn down. Don't "simplify" this to `self.role().is_ok()`.
-    /// Every window has a role, so a failed read means the element is gone
-    /// rather than that an attribute is missing.
-    fn is_alive(&self) -> bool {
-        self.ax_element.role().is_ok()
+    /// AX element is torn down. Don't "simplify" this to `self.role()`.
+    fn read_role(&self) -> Result<String> {
+        self.ax_element.role()
     }
 
     #[instrument(level = Level::DEBUG, ret)]
