@@ -285,16 +285,19 @@ pub(crate) fn display_in_direction<T>(
         .map(|(display, _, _)| display)
 }
 
-/// The display after the one bounded by `from` in screen order: left to right
-/// by left edge, then top to bottom, wrapping from the last to the first.
+/// The display after `from` in screen order: left to right by left edge, then
+/// top to bottom, wrapping from the last to the first. Displays at the same
+/// origin, such as mirrored ones, follow in display id order.
 fn next_in_screen_order<T>(
-    from: IRect,
-    displays: impl IntoIterator<Item = (T, IRect)>,
+    from: (IRect, u32),
+    displays: impl IntoIterator<Item = (T, IRect, u32)>,
 ) -> Option<T> {
-    let place = |bounds: IRect| (bounds.min.x, bounds.min.y);
+    let place = |bounds: IRect, id: u32| (bounds.min.x, bounds.min.y, id);
+    let from = place(from.0, from.1);
     displays
         .into_iter()
-        .min_by_key(|(_, bounds)| (place(*bounds) <= place(from), place(*bounds)))
+        .map(|(display, bounds, id)| (display, place(bounds, id)))
+        .min_by_key(|(_, place)| (*place <= from, *place))
         .map(|(display, _)| display)
 }
 
@@ -1852,16 +1855,17 @@ fn to_next_display(
         return;
     };
 
-    let Some(source_bounds) = moves.active_display().map(Display::bounds) else {
+    let Some(source) = moves.active_display() else {
         return;
     };
+    let source_bounds = source.bounds();
     let move_focus = request.focus;
     let target = match &request.target {
         DisplayTarget::Next => next_in_screen_order(
-            source_bounds,
+            (source_bounds, source.id()),
             moves
                 .other_displays()
-                .map(|display| (display, display.bounds())),
+                .map(|display| (display, display.bounds(), display.id())),
         ),
         DisplayTarget::Direction(direction) => display_in_direction(
             direction,

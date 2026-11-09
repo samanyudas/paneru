@@ -250,6 +250,31 @@ fn focusing_displays_by_other_commands_keeps_the_screen_order() {
     }
 }
 
+/// Two displays at the same origin, as mirrored displays are, follow in id
+/// order, so each is still visited once per cycle whichever display the
+/// cycle starts from.
+#[test]
+fn displays_at_the_same_origin_are_each_visited_once_per_cycle() {
+    let slots = [
+        rect(0, 0, 1024, 768),
+        rect(0, 0, 1024, 768),
+        rect(1024, 0, 2024, 700),
+    ];
+    for ids in orders(3) {
+        let mut order = ids.clone();
+        order.sort_by_key(|id| {
+            let slot = ids.iter().position(|other| other == id).expect("slot");
+            (slots[slot].min.x, slots[slot].min.y, *id)
+        });
+        let mut harness = arranged(&slots, &ids);
+        assert_eq!(
+            send_around(&mut harness, &ids, 3),
+            screen_order_from_display_1(&order),
+            "displays {ids:?} at {slots:?}"
+        );
+    }
+}
+
 /// With two displays the command switches between them, whether they sit
 /// side by side or one above the other.
 #[test]
