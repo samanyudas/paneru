@@ -1862,10 +1862,10 @@ fn to_next_display(
     let move_focus = request.focus;
     let target = match &request.target {
         DisplayTarget::Next => next_in_screen_order(
-            (source_bounds, source.id()),
+            (source.physical_bounds(), source.id()),
             moves
                 .other_displays()
-                .map(|display| (display, display.bounds(), display.id())),
+                .map(|display| (display, display.physical_bounds(), display.id())),
         ),
         DisplayTarget::Direction(direction) => display_in_direction(
             direction,

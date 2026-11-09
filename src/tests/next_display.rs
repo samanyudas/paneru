@@ -275,6 +275,33 @@ fn displays_at_the_same_origin_are_each_visited_once_per_cycle() {
     }
 }
 
+/// Screen order follows each display's physical top edge, not the top of its
+/// area below the menu bar: a display whose taller menu bar ends lower still
+/// comes first when its top edge is higher.
+#[test]
+fn screen_order_ignores_menu_bar_heights() {
+    let slots = [
+        rect(0, 0, 1024, 768),
+        rect(0, 10, 1024, 778),
+        rect(1024, 0, 2024, 700),
+    ];
+    let menu_bars = [40, 20, 24];
+    for ids in orders(3) {
+        let mut harness = arranged(&slots, &ids);
+        let world = harness.world();
+        let mut displays = world.query::<&mut crate::manager::Display>();
+        for mut display in displays.iter_mut(world) {
+            let slot = ids.iter().position(|&id| id == display.id()).expect("slot");
+            display.set_menubar_height_override(Some(menu_bars[slot]));
+        }
+        assert_eq!(
+            send_around(&mut harness, &ids, 3),
+            screen_order_from_display_1(&ids),
+            "displays {ids:?} at {slots:?} with menu bars {menu_bars:?}"
+        );
+    }
+}
+
 /// With two displays the command switches between them, whether they sit
 /// side by side or one above the other.
 #[test]
