@@ -2,7 +2,8 @@ name: Miri branch checks
 
 # Engine changes for Miri land on miri/** branches, which rust.yml does not cover.
 # These jobs run the checks that Miri runs on its engine submodule (engine-lint and engine-test in Miri's Makefile),
-# the format check and default-feature tests from this repository's AGENTS.md, and the release build from rust.yml.
+# and the format check and default-feature tests from this repository's AGENTS.md.
+# No release build runs here: Miri Developer ships the debug build, and the release build belongs to the future Miri release path.
 on:
   # Only base branches such as miri/v0.5.2 run on push. A feature branch such as miri/332-crossing-focus-edge
   # also matches miri/**, so a push trigger for it ran every job twice, once for the push and once for its pull request.
@@ -82,21 +83,3 @@ jobs:
         with:
           save-if: ${{ github.event_name == 'push' }}
       - run: cargo test --locked --all-targets --config 'profile.dev.package."*".opt-level=1'
-
-  build:
-    name: Release build
-    runs-on: macos-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Use the Command Line Tools toolchain
-        run: sudo xcode-select -s /Library/Developer/CommandLineTools
-      - name: Select macOS SDK
-        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
-      - run: rustup update
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ github.event_name == 'push' }}
-      - run: cargo build --release --locked --verbose
