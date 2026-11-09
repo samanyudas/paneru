@@ -384,7 +384,8 @@ pub enum Operation {
     /// clipboard.
     CopyRule,
     /// One horizontal keyboard focus step, crossing a touching display only
-    /// from the strip's end when `reach` allows it.
+    /// from the strip's end when `reach` allows it. A crossing lands on the
+    /// destination column nearest the crossed edge.
     FocusStep(Side, Reach),
     /// One horizontal keyboard column move, arriving at the crossed edge.
     MoveStep(Side, Reach),
