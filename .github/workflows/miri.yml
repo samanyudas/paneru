@@ -4,8 +4,10 @@ name: Miri branch checks
 # These jobs run the checks that Miri runs on its engine submodule (engine-lint and engine-test in Miri's Makefile),
 # the format check and default-feature tests from this repository's AGENTS.md, and the release build from rust.yml.
 on:
+  # Only base branches such as miri/v0.5.2 run on push. A feature branch such as miri/332-crossing-focus-edge
+  # also matches miri/**, so a push trigger for it ran every job twice, once for the push and once for its pull request.
   push:
-    branches: ["miri/**"]
+    branches: ["miri/v*"]
   pull_request:
     branches: ["miri/**"]
 
@@ -36,8 +38,8 @@ jobs:
       - run: rustup update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Only pushes to a miri/v* base branch save, so pull requests into it restore that cache.
-          save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/miri/v') }}
+          # Only pushes save, and pushes run only for miri/v* base branches, so pull requests into a base branch restore its cache.
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo fmt --check
       # Miri builds the engine without the default lua and vendored features.
       # Clippy with the default features is left out until it passes on miri/v0.5.2.
@@ -59,7 +61,7 @@ jobs:
       - run: rustup update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/miri/v') }}
+          save-if: ${{ github.event_name == 'push' }}
       # Miri's .cargo/config.toml builds dependencies at opt-level 1, because each test runs hundreds of Bevy frames.
       - run: cargo test --locked --no-default-features --config 'profile.dev.package."*".opt-level=1'
 
@@ -78,7 +80,7 @@ jobs:
       - run: rustup update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/miri/v') }}
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo test --locked --all-targets --config 'profile.dev.package."*".opt-level=1'
 
   build:
@@ -96,5 +98,5 @@ jobs:
       - run: rustup update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/miri/v') }}
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo build --release --locked --verbose
