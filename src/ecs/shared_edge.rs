@@ -188,16 +188,16 @@ pub(crate) enum PhotoWait {
 }
 
 /// The windows of `strip` that show a slice: on each side, every window of
-/// the hidden column nearest the edge in strip order, and every window
-/// whose photo slides. Behind the nearest column and each column whose
-/// photo slides, the next hidden column out shows too, where the nearer
-/// slices span its whole height, so its panel is there, out of sight,
-/// before the nearer photo moves away from the edge. The window server
+/// each hidden column, out from the nearest one, while the column in front
+/// shows a slice that spans its whole height, and every window whose photo
+/// slides. A farther column shows under the nearer photos, so its panel is
+/// already there when they move away from the edge. The window server
 /// shows a new panel a frame late, and the other panels' moves in that
-/// frame with it. Each comes with the part of its slice no window in its
-/// column in front of it covers. A native tab group shows its front tab, and
-/// a tabbed stack the tab focused last. They come back to front: a column
-/// further past its edge before a nearer one, whose photo covers it.
+/// frame with it. A hidden stack's slices have gaps, so no column shows
+/// behind one at rest. Each comes with the part of its slice no window in
+/// its column in front of it covers. A native tab group shows its front
+/// tab, and a tabbed stack the tab focused last. They come back to front: a
+/// column further past its edge before a nearer one, whose photo covers it.
 pub(crate) fn showing(
     strip: &LayoutStrip,
     slice_of: impl Fn(Entity) -> Option<EdgeSlice>,
@@ -214,31 +214,28 @@ pub(crate) fn showing(
         )
     };
     let shown = |columns: Vec<Vec<(Entity, EdgeSlice)>>| {
-        let nearest = columns.iter().rposition(|slices| !slices.is_empty());
-        let mut behind = Vec::new();
-        let mut farther: Option<usize> = None;
-        for (index, slices) in columns.iter().enumerate() {
+        let mut whole = vec![false; columns.len()];
+        let mut front: Option<Vec<IRect>> = None;
+        for (index, slices) in columns.iter().enumerate().rev() {
             if slices.is_empty() {
                 continue;
             }
-            let front = slices
-                .iter()
-                .filter(|(entity, _)| Some(index) == nearest || sliding(*entity))
-                .map(|(_, slice)| slice.on_screen)
-                .collect::<Vec<_>>();
-            if let Some(farther) = farther
-                && !front.is_empty()
-                && columns[farther]
+            whole[index] = front.as_ref().is_none_or(|front| {
+                !front.is_empty()
+                    && slices
+                        .iter()
+                        .all(|(_, slice)| spans_height(front, slice.on_screen))
+            });
+            front = Some(
+                slices
                     .iter()
-                    .all(|(_, slice)| spans_height(&front, slice.on_screen))
-            {
-                behind.push(farther);
-            }
-            farther = Some(index);
+                    .filter(|(entity, _)| whole[index] || sliding(*entity))
+                    .map(|(_, slice)| slice.on_screen)
+                    .collect(),
+            );
         }
         let mut shown = Vec::new();
-        for (index, slices) in columns.into_iter().enumerate() {
-            let whole = Some(index) == nearest || behind.contains(&index);
+        for (slices, whole) in columns.into_iter().zip(whole) {
             shown.extend(
                 slices
                     .into_iter()
