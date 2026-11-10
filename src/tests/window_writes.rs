@@ -172,6 +172,43 @@ fn other_apps_get_their_writes_while_one_app_is_stuck() {
     );
 }
 
+/// Focusing a window raises it, and its app answers the raise on its main
+/// thread: a busy app took up to 206 ms (miri#326). The frame that starts
+/// the slide to it does not wait for the answer, and the raise lands once
+/// the app is free.
+#[test]
+fn a_raise_the_app_is_slow_to_answer_does_not_hold_up_the_slide() {
+    let mut harness = harness();
+    let raises = harness.mock_state.raise_count();
+    let other_before = engine_frame(harness.world(), 1);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+    assert_no_frame_waited(&mut harness, 1);
+
+    let other = engine_frame(harness.world(), 1);
+    assert_ne!(
+        other, other_before,
+        "the first frame moved the other app's window"
+    );
+    let landed = eventually(OTHER_APP_LANDING, || {
+        harness.mock_state.ax_frame(1) == other
+    });
+    let raised_while_held = harness.mock_state.raise_count() - raises;
+    harness.mock_state.release_writes(SLOW_APP);
+
+    assert!(landed, "the other app's window reached {other:?}");
+    assert_eq!(
+        raised_while_held, 0,
+        "the held app had not answered the raise"
+    );
+    assert!(harness.mock_state.flush_writes(FLUSH));
+    assert_eq!(harness.mock_state.raise_count() - raises, 1);
+    assert_eq!(harness.mock_state.window_order(&[0, 1, 2]).last(), Some(&2));
+}
+
 /// A held app stays stuck until the test releases it, however long the test
 /// takes in real time, as frames do on a loaded machine.
 #[test]
