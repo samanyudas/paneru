@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 
-use crate::commands::{Command, Direction, Operation};
+use crate::commands::{Command, Direction, Operation, ResizeDirection};
 use crate::config::{Config, MainOptions};
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
@@ -204,6 +204,43 @@ fn the_window_ahead_waits_for_a_slow_window_behind_it_scrolling_right() {
     assert!(
         harness.mock_state.ax_frame(2).min.x > start.min.x,
         "window 2 scrolled right from {start:?}"
+    );
+}
+
+/// The slow window 1 widens between windows 0 and 2. Its right edge moves
+/// right as its left edge moves left, so window 2 ahead on the right waits
+/// for its right edge, as window 0 on the left waits for its left edge.
+#[test]
+fn the_neighbours_wait_beside_a_slow_window_that_widens() {
+    let mut harness = harness_with_widths([WINDOW_WIDTH, 400, WINDOW_WIDTH]);
+    harness.world().write_message(focus(Direction::East));
+    settle(&mut harness);
+    let rest = gap(&harness, 1, 2);
+    let start = harness.mock_state.ax_frame(1);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    for frame in 0..10 {
+        harness.advance(FRAME);
+        for (left, right) in [(0, 1), (1, 2)] {
+            assert!(
+                gap(&harness, left, right) <= rest,
+                "desktop shows between windows {left} and {right} after frame {frame}: {:?} {:?}",
+                harness.mock_state.ax_frame(left),
+                harness.mock_state.ax_frame(right)
+            );
+        }
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle_beside(&mut harness, 1, 2, rest);
+    settle(&mut harness);
+
+    assert_landed(&mut harness);
+    assert!(
+        harness.mock_state.ax_frame(1).width() > start.width(),
+        "window 1 widened from {start:?}"
     );
 }
 
