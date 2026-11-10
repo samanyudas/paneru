@@ -802,6 +802,36 @@ mod tests {
         assert_eq!(ops, vec![Op::Position(target.min), Op::Size(target.size())]);
     }
 
+    /// The app limited the window to 400 points, though the engine asked
+    /// for 1000. A write of 800 points grows the window, so it sets the
+    /// size first like any other growth, rather than moving first as a
+    /// narrowing does.
+    #[test]
+    fn a_write_that_grows_a_limited_window_sets_the_size_first() {
+        fn takes_any(_: IRect, size: Size) -> Size {
+            size
+        }
+        let target = IRect::new(300, 50, 1100, 450);
+        let mut app = Constrained {
+            frame: IRect::new(100, 50, 500, 450),
+            constrain: takes_any as fn(IRect, Size) -> Size,
+            ops: Vec::new(),
+        };
+        Shared::write(
+            &mut app,
+            &PendingWrite {
+                window: (),
+                from: IRect::new(100, 50, 1100, 450),
+                to: target,
+                position: true,
+                size: true,
+                size_limited: Arc::new(Mutex::new(Some(Size::new(400, 400)))),
+            },
+        );
+        assert_eq!(app.frame, target);
+        assert_eq!(app.ops.first(), Some(&Op::Size(target.size())));
+    }
+
     #[test]
     fn a_combined_write_shrinks_a_full_height_window_into_a_lower_slot() {
         let target = IRect::new(640, 735, 1280, 1440);
