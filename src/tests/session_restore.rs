@@ -912,6 +912,51 @@ fn test_late_startup_window_restores_during_grace_period() {
         .run(commands);
 }
 
+/// A window that the restored session places inside the startup grace
+/// period gets its saved width, and never the new-window width on the way.
+#[test]
+fn a_late_restored_window_gets_its_saved_width_not_the_new_window_width() {
+    use crate::ecs::layout::ViewportShare;
+
+    let options = MainOptions {
+        new_window_width: Some(0.5),
+        ..MainOptions::default()
+    };
+    let saved_width = 300;
+    let mut saved = saved_window(99);
+    saved.width = Some(ViewportShare::of(saved_width, TEST_DISPLAY_WIDTH));
+    let mut harness = TestHarness::new()
+        .with_config((options, vec![]).into())
+        .with_state(state_with_strips(vec![SavedStrip {
+            view: None,
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved)],
+        }]));
+    harness.advance(Duration::from_millis(500));
+    assert!(
+        harness
+            .world()
+            .contains_resource::<crate::ecs::restore::SessionRestore>()
+    );
+
+    let opened = IRect::new(100, TEST_MENUBAR_HEIGHT, 480, 700);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 99, opened);
+    harness.mock_state.focus_window(99);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    for _ in 0..150 {
+        harness.advance(Duration::from_millis(20));
+        let width = harness.mock_state.ax_frame(99).width();
+        assert_ne!(
+            width,
+            TEST_DISPLAY_WIDTH / 2,
+            "the restored window must never take the new-window width"
+        );
+    }
+    assert_eq!(harness.mock_state.ax_frame(99).width(), saved_width);
+}
+
 #[test]
 fn test_late_startup_window_with_floating_rule_is_not_restored() {
     let mut params = WindowParams::new("^Window 99$", Some("test".to_string()));

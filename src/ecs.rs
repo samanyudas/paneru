@@ -1437,6 +1437,11 @@ impl WindowProperties {
             .map(|width| width.ratio(focused_ratio))
     }
 
+    /// Whether a `[windows]` rule sets the window's width.
+    pub fn sets_width(&self) -> bool {
+        self.params.iter().any(|props| props.width.is_some())
+    }
+
     pub fn fixed_width_ratio(&self) -> Option<f64> {
         match self.params.iter().find_map(|props| props.width) {
             Some(InitialWindowWidth::Ratio(ratio)) => Some(ratio),

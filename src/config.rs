@@ -878,6 +878,15 @@ impl Config {
             .unwrap_or(0.05)
     }
 
+    /// The share of the display width that a window opening while the engine
+    /// runs starts at, when the option holds a ratio above 0 and up to 1.
+    /// Without it, such a window keeps the width it opened with.
+    pub fn new_window_width(&self) -> Option<f64> {
+        self.options()
+            .new_window_width
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0 && *ratio <= 1.0)
+    }
+
     /// How many windows one stack holds, before capping at what fits on a
     /// display (see `effective_stack_limit`).
     pub fn stack_limit(&self) -> StackLimit {
@@ -1397,6 +1406,12 @@ pub struct MainOptions {
     /// The share of the display width or height (0.0-1.0) that the step
     /// resize commands add or remove. Default: 0.05.
     pub window_resize_step: Option<f64>,
+
+    /// The share of the display width (0.0-1.0) that a window opening while
+    /// the engine runs starts at. A `[windows]` rule's `width` wins. Windows
+    /// found when the engine starts keep their widths. Default: none, so a
+    /// new window keeps the width it opened with.
+    pub new_window_width: Option<f64>,
 
     /// How many windows one stack holds: a whole number from 1, or `"fit"`
     /// for as many as fit in the column at the minimum window height. A
@@ -3329,5 +3344,21 @@ fn gesture_page_distance_rejects_nonpositive_and_nonfinite_values() {
             Config::try_from(source.as_str()).is_err(),
             "accepted {value}"
         );
+    }
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn new_window_width_reads_a_ratio_above_zero_and_up_to_one() {
+    let width = |value: &str| {
+        Config::try_from(format!("[options]\nnew_window_width = {value}\n").as_str())
+            .unwrap()
+            .new_window_width()
+    };
+    assert_eq!(Config::default().new_window_width(), None);
+    assert_eq!(width("0.5"), Some(0.5));
+    assert_eq!(width("1"), Some(1.0));
+    for value in ["0", "-0.5", "1.5", "nan", "inf"] {
+        assert_eq!(width(value), None, "accepted {value}");
     }
 }

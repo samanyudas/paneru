@@ -1543,11 +1543,14 @@ const ABOVE_ORDINARY_CHECK: Duration = Duration::from_secs(1);
 /// first: the window gets back the frame it opened with and takes focus once.
 /// A rule that decides whether the window floats still wins. A window that
 /// waits for its check tiles only when the check ends without it floating.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn recheck_window_level(
     mut checks: Query<(Entity, &mut AboveOrdinaryCheck)>,
     windows: Windows,
     apps: Query<&Application>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    displays: ActiveDisplays,
+    launch_windows: Option<Res<LaunchWindows>>,
     config: Res<Config>,
     time: Res<Time>,
     mut commands: Commands,
@@ -1571,6 +1574,9 @@ pub(super) fn recheck_window_level(
             .find_parent(window.id())
             .and_then(|(_, _, parent)| apps.get(parent).ok())
             .map(|app| WindowProperties::new(app, window, &config));
+        let rule_sets_width = properties
+            .as_ref()
+            .is_some_and(WindowProperties::sets_width);
         let Some(properties) = properties.filter(|properties| raised && properties.floating())
         else {
             if !floated
@@ -1580,6 +1586,16 @@ pub(super) fn recheck_window_level(
                     .find_map(|(strip, active)| active.then_some(strip))
             {
                 strip.append(entity);
+                size_new_column(
+                    entity,
+                    window.id(),
+                    rule_sets_width,
+                    windows.frame(entity),
+                    &displays,
+                    launch_windows.as_deref(),
+                    &config,
+                    &mut commands,
+                );
                 commands.reshuffle_around(entity);
             }
             continue;
@@ -1607,22 +1623,54 @@ pub(super) fn recheck_window_level(
 type ActiveDisplays<'w, 's> =
     Query<'w, 's, (&'static Display, Option<&'static DockPosition>), With<ActiveDisplayMarker>>;
 
-/// Narrows `entity`, a new window that just joined the active strip, to the
-/// active display's tiling area when it opened wider, as an app that
-/// remembers its size from a larger display does. (miri#410)
-fn fit_new_column(
+/// The width a new window that joins the active strip as a column starts
+/// at, or `None` to leave the width it has. A `[windows]` rule's width, which
+/// `apply_window_defaults` already gave it, wins over `new_window_width`, a
+/// share of `display_width`. Either way the column is no wider than the
+/// display's tiling area, as an app that remembers its size from a larger
+/// display would make it. (miri#410, miri#305)
+fn starting_width(
+    width: i32,
+    display_width: i32,
+    tiling_width: i32,
+    new_window_width: Option<f64>,
+    rule_sets_width: bool,
+) -> Option<i32> {
+    let wanted = match new_window_width {
+        Some(ratio) if !rule_sets_width => round_px(f64::from(display_width) * ratio),
+        _ => width,
+    };
+    let starting = wanted.min(tiling_width);
+    (starting != width).then_some(starting)
+}
+
+/// Sizes `entity`, a window that just joined the active strip, to its
+/// [`starting_width`]. A window that was open when the engine started is
+/// not new, however late a scan finds it, so it gets no new-window width.
+#[allow(clippy::too_many_arguments)]
+fn size_new_column(
     entity: Entity,
+    window_id: WinID,
+    rule_sets_width: bool,
     frame: Option<IRect>,
     displays: &ActiveDisplays,
+    launch_windows: Option<&LaunchWindows>,
     config: &Config,
     commands: &mut Commands,
 ) {
-    let Ok((display, dock)) = displays.single() else {
+    let (Ok((display, dock)), Some(frame)) = (displays.single(), frame) else {
         return;
     };
-    let tiling = display.actual_display_bounds(dock, config);
-    if let Some(frame) = frame.filter(|frame| frame.width() > tiling.width()) {
-        size_for_arrival(entity, Size::new(tiling.width(), frame.height()), commands);
+    let launched = launch_windows.is_some_and(|launch| launch.0.contains(&window_id));
+    let width = starting_width(
+        frame.width(),
+        display.bounds().width(),
+        display.actual_display_bounds(dock, config).width(),
+        config.new_window_width().filter(|_| !launched),
+        rule_sets_width,
+    );
+    if let Some(width) = width {
+        size_for_arrival(entity, Size::new(width, frame.height()), commands);
     }
 }
 
@@ -1659,6 +1707,7 @@ pub(super) fn apply_window_positions(
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
+    launch_windows: Option<Res<LaunchWindows>>,
     overrides: Res<TileOverrides>,
     mut ctx: WindowCtx,
 ) {
@@ -1762,10 +1811,13 @@ pub(super) fn apply_window_positions(
                 }
                 None => strip.append(entity),
             }
-            fit_new_column(
+            size_new_column(
                 entity,
+                window.id(),
+                properties.sets_width(),
                 ctx.windows.frame(entity),
                 &displays,
+                launch_windows.as_deref(),
                 &ctx.config,
                 &mut ctx.commands,
             );
@@ -2397,6 +2449,40 @@ mod tests {
     use bevy::ecs::system::RunSystemOnce;
     use bevy::math::IVec2;
     use std::time::Duration;
+
+    #[test]
+    fn a_new_column_starts_at_the_share_of_the_display_width() {
+        assert_eq!(
+            starting_width(380, 2560, 2544, Some(0.5), false),
+            Some(1280)
+        );
+        assert_eq!(
+            starting_width(1500, 2560, 2544, Some(0.5), false),
+            Some(1280)
+        );
+        assert_eq!(starting_width(1280, 2560, 2544, Some(0.5), false), None);
+        assert_eq!(starting_width(333, 1000, 990, Some(1.0 / 3.0), false), None);
+    }
+
+    #[test]
+    fn a_new_column_is_never_wider_than_the_tiling_area() {
+        assert_eq!(
+            starting_width(380, 2560, 2544, Some(1.0), false),
+            Some(2544)
+        );
+        assert_eq!(starting_width(3000, 2560, 2544, None, false), Some(2544));
+        assert_eq!(
+            starting_width(3000, 2560, 2544, Some(0.5), true),
+            Some(2544)
+        );
+    }
+
+    #[test]
+    fn a_rule_width_or_no_option_keeps_the_width_the_window_has() {
+        assert_eq!(starting_width(640, 2560, 2544, Some(0.5), true), None);
+        assert_eq!(starting_width(380, 2560, 2544, None, false), None);
+        assert_eq!(starting_width(2544, 2560, 2544, None, false), None);
+    }
 
     #[test]
     fn test_persistent_frame_refresh_failure_keeps_the_live_window() {
