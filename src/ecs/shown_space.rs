@@ -25,8 +25,9 @@ use crate::platform::WorkspaceId;
 /// How long after the last pass of a burst the check waits, so the native
 /// Space reads that pass queued have filed every window.
 const SETTLE: Duration = Duration::from_secs(1);
-/// How long macOS gets to switch the Space after the focus.
-const SWITCH: Duration = Duration::from_millis(500);
+/// How long macOS gets to switch the Space after the focus. A busy app can
+/// take more than a second to activate.
+const SWITCH: Duration = Duration::from_secs(3);
 
 /// The displays to check after the burst that just ended.
 #[derive(Default, Resource)]
@@ -41,6 +42,8 @@ struct Check {
     focused: Option<Entity>,
     timer: Timer,
     switching: Option<Switch>,
+    /// The engine focused a window to switch a Space, so focus goes back.
+    switched: bool,
 }
 
 struct Switch {
@@ -57,6 +60,7 @@ impl ShownSpaceCheck {
             focused,
             timer: Timer::new(SETTLE, TimerMode::Once),
             switching: None,
+            switched: false,
         });
     }
 }
@@ -154,7 +158,12 @@ pub(crate) fn check_shown_spaces(
     let Some(check) = state.pending.as_mut() else {
         return;
     };
-    if !check.timer.tick(time.delta()).is_finished() {
+    let waited = check.timer.tick(time.delta()).is_finished();
+    let switched = check
+        .switching
+        .as_ref()
+        .is_some_and(|switch| desktops.shown(switch.display_id) == Some(switch.space));
+    if !waited && !switched {
         return;
     }
     let now_focused = focused.iter().next();
@@ -171,7 +180,7 @@ pub(crate) fn check_shown_spaces(
         display_id, space, ..
     }) = check.switching.take()
     {
-        if desktops.shown(display_id) != Some(space) {
+        if !switched {
             warn!(
                 display_id,
                 space, "macOS did not switch the display to its windows' Space"
@@ -203,11 +212,12 @@ pub(crate) fn check_shown_spaces(
             window,
         });
         check.timer = Timer::new(SWITCH, TimerMode::Once);
+        check.switched = true;
         return;
     }
 
-    if let Some(previous) = check.focused
-        && now_focused != Some(previous)
+    if check.switched
+        && let Some(previous) = check.focused
         && desktops.shows(previous)
     {
         commands.trigger(FocusWindow {
