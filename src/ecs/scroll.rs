@@ -7,14 +7,18 @@ use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::SystemCondition as _;
-use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, NonSend, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
 use std::collections::VecDeque;
+use std::pin::Pin;
 use std::time::Duration;
 use tracing::{Level, instrument};
 
-use crate::commands::{Direction, FocusSource, focus_with_verification};
+use crate::commands::{
+    Direction, FocusSource, StripPositions, clipped_page_reveal, focus_with_verification,
+    get_window_in_direction,
+};
 use crate::config::Config;
 use crate::config::swipe::{SwipeGestureDirection, focus_direction};
 use crate::ecs::focus::FocusHistory;
@@ -36,6 +40,14 @@ pub struct ScrollEventsPlugin;
 
 const PAGE_GESTURE_TIMEOUT: Duration = Duration::from_millis(150);
 
+/// The shortest gap between two step pulses. Pulses closer than this feel
+/// like one, so steps a fast flick earns in one frame are spread out.
+pub(crate) const PULSE_INTERVAL: Duration = Duration::from_millis(40);
+
+/// Asks for one trackpad pulse for one page step.
+#[derive(Message)]
+pub(crate) struct PageHapticRequest;
+
 /// One gesture-earned focus step, routed to [`crate::commands::command_move_focus`].
 #[derive(Message, Debug, Clone)]
 pub(crate) struct PageFocusRequest {
@@ -52,6 +64,74 @@ pub(crate) enum PageInFlight {
     },
 }
 
+/// Where the queued page steps will leave focus.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum Projection {
+    /// No step is queued, so the next one starts from the focused window.
+    #[default]
+    Idle,
+    /// The window the queued steps will leave focused.
+    At(Entity),
+    /// The queued steps start from a window outside the active strip, such as
+    /// a floating window, so where they end is not tracked.
+    Untracked,
+}
+
+/// The pulses a swipe owes for the steps it earned, played as the steps are
+/// earned rather than when focus moves.
+#[derive(Default, Debug)]
+struct StepFeedback {
+    projection: Projection,
+    owed_pulses: u64,
+    next_pulse_at: Duration,
+}
+
+impl StepFeedback {
+    /// Moves the projection `steps` columns toward `direction` and returns how
+    /// many of those steps will move the strip. `anchor` gives the focused
+    /// window, and whether the first step reveals it instead of moving focus,
+    /// when no step is queued.
+    fn project(
+        &mut self,
+        direction: &Direction,
+        steps: u64,
+        strip: &LayoutStrip,
+        anchor: impl FnOnce() -> Option<(Entity, bool)>,
+    ) -> u64 {
+        let (mut window, mut moved) = match self.projection {
+            Projection::Untracked => return 0,
+            Projection::At(window) => (window, 0),
+            Projection::Idle => {
+                let Some((focused, reveals)) = anchor() else {
+                    self.projection = Projection::Untracked;
+                    return 0;
+                };
+                (focused, u64::from(reveals))
+            }
+        };
+        while moved < steps {
+            let Some(next) = get_window_in_direction(direction, window, strip) else {
+                break;
+            };
+            window = next;
+            moved += 1;
+        }
+        self.projection = Projection::At(window);
+        moved
+    }
+
+    /// Takes the next owed pulse once [`PULSE_INTERVAL`] has passed since
+    /// the last one.
+    fn take_pulse(&mut self, now: Duration) -> bool {
+        if self.owed_pulses == 0 || now < self.next_pulse_at {
+            return false;
+        }
+        self.owed_pulses -= 1;
+        self.next_pulse_at = now + PULSE_INTERVAL;
+        true
+    }
+}
+
 #[derive(Default, Resource)]
 pub(crate) struct PageGestureState {
     accumulated_cm: f64,
@@ -61,6 +141,7 @@ pub(crate) struct PageGestureState {
     active: bool,
     config: Option<(bool, Option<usize>, SwipeGestureDirection, f64, bool)>,
     pub(crate) generation: u64,
+    feedback: StepFeedback,
 }
 
 impl PageGestureState {
@@ -71,10 +152,14 @@ impl PageGestureState {
         self.in_flight = None;
         self.last_event = None;
         self.active = false;
+        self.feedback = StepFeedback::default();
     }
 
     fn has_work(&self) -> bool {
-        self.active || !self.pending.is_empty() || self.in_flight.is_some()
+        self.active
+            || !self.pending.is_empty()
+            || self.in_flight.is_some()
+            || self.feedback.owed_pulses > 0
     }
 
     pub(crate) fn await_focus(&mut self, target: Entity) {
@@ -84,10 +169,16 @@ impl PageGestureState {
         });
     }
 
-    fn earn_steps(&mut self, threshold_cm: f64, gesture_direction: SwipeGestureDirection) {
+    /// Queues one step per `threshold_cm` of travel and returns the steps
+    /// this call earned.
+    fn earn_steps(
+        &mut self,
+        threshold_cm: f64,
+        gesture_direction: SwipeGestureDirection,
+    ) -> Option<(Direction, u64)> {
         let travel = self.accumulated_cm.abs();
         if travel < threshold_cm {
-            return;
+            return None;
         }
         let direction = focus_direction(gesture_direction, self.accumulated_cm);
         // Saturating float-to-integer conversion bounds an implausibly large
@@ -101,9 +192,10 @@ impl PageGestureState {
             && let Some(merged) = count.checked_add(steps)
         {
             *count = merged;
-            return;
+        } else {
+            self.pending.push_back((direction.clone(), steps));
         }
-        self.pending.push_back((direction, steps));
+        Some((direction, steps))
     }
 
     fn next_step(&mut self) -> Option<Direction> {
@@ -181,6 +273,13 @@ impl Plugin for ScrollEventsPlugin {
         app.add_observer(finish_settle_on_deactivate);
         app.init_resource::<PageGestureState>();
         app.add_message::<PageFocusRequest>();
+        app.add_message::<PageHapticRequest>();
+        app.add_systems(
+            bevy::app::PostUpdate,
+            play_page_haptic
+                .in_set(super::PostUpdateSet::Ui)
+                .run_if(on_message::<PageHapticRequest>),
+        );
         let mission_control_inactive = |mission_control: Option<Res<MissionControlActive>>| {
             mission_control.is_none_or(|active| !active.0)
         };
@@ -217,13 +316,17 @@ impl Plugin for ScrollEventsPlugin {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paging_gesture(
     mut messages: MessageReader<InputEvent>,
-    active_workspace: Single<Entity, With<ActiveWorkspaceMarker>>,
+    active_display: ActiveDisplay,
+    windows: Windows,
+    strip_positions: StripPositions,
     config: Res<Config>,
     time: Res<Time>,
     mut state: ResMut<PageGestureState>,
     mut events: MessageWriter<PageFocusRequest>,
+    mut haptics: MessageWriter<PageHapticRequest>,
     mut commands: Commands,
 ) {
     let current_config = config.swipe_paging_config();
@@ -242,6 +345,9 @@ fn paging_gesture(
         state.accumulated_cm = 0.0;
         state.last_event = None;
         state.active = false;
+    }
+    if state.pending.is_empty() && state.in_flight.is_none() {
+        state.feedback.projection = Projection::Idle;
     }
 
     for InputEvent(event) in messages.read() {
@@ -270,8 +376,39 @@ fn paging_gesture(
                     state.accumulated_cm = 0.0;
                     continue;
                 }
-                commands.entity(*active_workspace).try_remove::<Scrolling>();
-                state.earn_steps(current_config.3, current_config.2.clone());
+                commands
+                    .entity(active_display.active_strip_entity())
+                    .try_remove::<Scrolling>();
+                let Some((direction, steps)) =
+                    state.earn_steps(current_config.3, current_config.2.clone())
+                else {
+                    continue;
+                };
+                let moved = state.feedback.project(
+                    &direction,
+                    steps,
+                    active_display.active_strip(),
+                    || {
+                        let (_, focused) = windows.focused()?;
+                        (active_display.fullscreen().is_none()
+                            && active_display.active_strip().contains(focused))
+                        .then(|| {
+                            let reveals = clipped_page_reveal(
+                                &direction,
+                                focused,
+                                &windows,
+                                &active_display,
+                                &config,
+                                &strip_positions,
+                            )
+                            .is_some();
+                            (focused, reveals)
+                        })
+                    },
+                );
+                if current_config.4 {
+                    state.feedback.owed_pulses += moved;
+                }
             }
             Event::Swipe { .. } => state.reset(),
             _ => {}
@@ -286,6 +423,21 @@ fn paging_gesture(
             direction,
             generation: state.generation,
         });
+    }
+
+    if state.feedback.take_pulse(time.elapsed()) {
+        haptics.write(PageHapticRequest);
+    }
+}
+
+fn play_page_haptic(
+    mut requests: MessageReader<PageHapticRequest>,
+    platform: Option<NonSend<Pin<Box<crate::platform::PlatformCallbacks>>>>,
+) {
+    for _ in requests.read() {
+        if let Some(platform) = &platform {
+            crate::platform::haptics::page_changed(platform.main_thread_marker);
+        }
     }
 }
 

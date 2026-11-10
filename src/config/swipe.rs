@@ -57,7 +57,7 @@ pub struct GestureOptions {
     #[serde(default, deserialize_with = "positive_distance_cm")]
     pub page_distance_cm: Option<f64>,
 
-    /// Play a haptic pulse for each confirmed paging focus change. Default: true.
+    /// Play a haptic pulse as each paging step is earned. Default: true.
     pub haptics: Option<bool>,
 }
 

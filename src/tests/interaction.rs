@@ -208,20 +208,48 @@ fn test_edge_touching_focus_during_center_animation_returns_into_view() {
     );
 }
 
+/// When each paging pulse was requested.
 #[derive(Resource, Default)]
-struct PagingHapticCount(usize);
+struct PagingHaptics(Vec<Duration>);
 
-fn count_paging_haptics(
-    mut requests: MessageReader<crate::ecs::focus::PageHapticRequest>,
-    mut count: ResMut<PagingHapticCount>,
+fn record_paging_haptics(
+    mut requests: MessageReader<crate::ecs::scroll::PageHapticRequest>,
+    time: Res<Time>,
+    mut pulses: ResMut<PagingHaptics>,
 ) {
-    count.0 += requests.read().count();
+    for _ in requests.read() {
+        pulses.0.push(time.elapsed());
+    }
 }
 
 fn with_paging_haptic_counter(mut harness: TestHarness) -> TestHarness {
-    harness.app.init_resource::<PagingHapticCount>();
-    harness.app.add_systems(PostUpdate, count_paging_haptics);
+    harness.app.init_resource::<PagingHaptics>();
+    harness.app.add_systems(PostUpdate, record_paging_haptics);
     harness
+}
+
+fn pulse_count(harness: &mut TestHarness) -> usize {
+    harness.world().resource::<PagingHaptics>().0.len()
+}
+
+fn paging_harness(haptics: bool, windows: i32) -> TestHarness {
+    let config = Config::try_from(
+        format!("[swipe.gesture]\nfingers_count = 3\npaging = true\nhaptics = {haptics}\n")
+            .as_str(),
+    )
+    .unwrap();
+    let mut h =
+        with_paging_haptic_counter(TestHarness::new().with_config(config).with_windows(windows));
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+    h
+}
+
+fn swipe_cm(harness: &mut TestHarness, distance_cm: f64) {
+    harness.world().write_message::<Event>(Event::Swipe {
+        delta: distance_cm / 10.0,
+        fingers: 3,
+        distance_cm,
+    });
 }
 
 #[test]
@@ -645,7 +673,7 @@ fn paging_first_reveals_a_mouse_focused_window_clipped_on_the_swipe_side() {
     h.advance(Duration::from_millis(100));
     assert_focused!(h.world(), 0);
     assert_eq!(window_x(h.world(), 0), 0);
-    assert_eq!(h.world().resource::<PagingHapticCount>().0, 1);
+    assert_eq!(pulse_count(&mut h), 1);
 
     // A further westward page at the strip edge cannot change anything.
     h.world().write_message::<Event>(Event::Swipe {
@@ -655,7 +683,7 @@ fn paging_first_reveals_a_mouse_focused_window_clipped_on_the_swipe_side() {
     });
     h.advance(Duration::from_millis(100));
     assert_focused!(h.world(), 0);
-    assert_eq!(h.world().resource::<PagingHapticCount>().0, 1);
+    assert_eq!(pulse_count(&mut h), 1);
 }
 
 #[test]
@@ -788,7 +816,7 @@ fn paging_haptics_default_on_and_off_setting_only_changes_pulses() {
     });
     h.advance(Duration::from_millis(100));
     assert_focused!(h.world(), 1);
-    assert_eq!(h.world().resource::<PagingHapticCount>().0, 1);
+    assert_eq!(pulse_count(&mut h), 1);
 
     let disabled =
         Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\nhaptics = false\n")
@@ -801,7 +829,7 @@ fn paging_haptics_default_on_and_off_setting_only_changes_pulses() {
     });
     h.advance(Duration::from_millis(100));
     assert_focused!(h.world(), 2);
-    assert_eq!(h.world().resource::<PagingHapticCount>().0, 1);
+    assert_eq!(pulse_count(&mut h), 1);
 
     let enabled =
         Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\nhaptics = true\n")
@@ -814,7 +842,7 @@ fn paging_haptics_default_on_and_off_setting_only_changes_pulses() {
     });
     h.advance(Duration::from_millis(100));
     assert_focused!(h.world(), 3);
-    assert_eq!(h.world().resource::<PagingHapticCount>().0, 2);
+    assert_eq!(pulse_count(&mut h), 2);
 
     h.world().write_message::<Event>(Event::Swipe {
         delta: 0.2,
@@ -823,7 +851,108 @@ fn paging_haptics_default_on_and_off_setting_only_changes_pulses() {
     });
     h.advance(Duration::from_millis(100));
     assert_focused!(h.world(), 3);
-    assert_eq!(h.world().resource::<PagingHapticCount>().0, 2);
+    assert_eq!(pulse_count(&mut h), 2);
+}
+
+#[test]
+fn paging_pulses_each_earned_step_before_focus_moves() {
+    let mut h = paging_harness(true, 5);
+    assert_focused!(h.world(), 0);
+    h.world().write_message::<Event>(Event::TouchpadDown);
+    h.advance(Duration::from_millis(20));
+
+    // The engine marks focus in the same frame it asks for it, so hold the
+    // confirmation the way a slow app does: a step waits on a focus that has
+    // not arrived, and no later step can start.
+    let unanswered = h.world().spawn_empty().id();
+    h.world()
+        .resource_mut::<crate::ecs::scroll::PageGestureState>()
+        .in_flight = Some(crate::ecs::scroll::PageInFlight::AwaitingFocus {
+        target: unanswered,
+        deadline: Some(Duration::MAX),
+    });
+
+    swipe_cm(&mut h, 6.0);
+    h.advance(Duration::from_millis(200));
+    assert_focused!(h.world(), 0);
+    let pulses = h.world().resource::<PagingHaptics>().0.clone();
+    assert_eq!(pulses.len(), 3, "one pulse per earned step: {pulses:?}");
+    assert!(
+        pulses.windows(2).all(|pair| pair[1] > pair[0]
+            && pair[1]
+                .checked_sub(pair[0])
+                .is_some_and(|gap| gap >= crate::ecs::scroll::PULSE_INTERVAL)),
+        "pulses must be spaced apart: {pulses:?}"
+    );
+
+    h.world()
+        .resource_mut::<crate::ecs::scroll::PageGestureState>()
+        .in_flight = None;
+    h.advance(Duration::from_millis(600));
+    assert_focused!(h.world(), 3);
+    assert_eq!(pulse_count(&mut h), 3, "moving focus adds no pulse");
+}
+
+#[test]
+fn paging_pulses_only_for_columns_that_remain() {
+    let mut h = paging_harness(true, 4);
+    h.world().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::East)),
+    });
+    h.advance(Duration::from_millis(200));
+    assert_focused!(h.world(), 1);
+
+    // Five steps east from column 1 of 4 move twice, then one step west
+    // queued behind them moves back once.
+    swipe_cm(&mut h, 10.0);
+    h.app.update();
+    swipe_cm(&mut h, -2.0);
+    h.advance(Duration::from_millis(800));
+    assert_focused!(h.world(), 2);
+    assert_eq!(pulse_count(&mut h), 3);
+
+    swipe_cm(&mut h, -4.0);
+    h.advance(Duration::from_millis(500));
+    assert_focused!(h.world(), 0);
+    assert_eq!(pulse_count(&mut h), 5);
+
+    swipe_cm(&mut h, -4.0);
+    h.advance(Duration::from_millis(500));
+    assert_focused!(h.world(), 0);
+    assert_eq!(pulse_count(&mut h), 5, "no pulse past the strip end");
+}
+
+#[test]
+fn paging_without_haptics_moves_focus_with_no_pulse() {
+    let mut h = paging_harness(false, 5);
+    swipe_cm(&mut h, 6.0);
+    h.advance(Duration::from_millis(600));
+    assert_focused!(h.world(), 3);
+    assert_eq!(pulse_count(&mut h), 0);
+}
+
+#[test]
+fn paging_new_touch_drops_owed_pulses() {
+    let mut h = paging_harness(true, 5);
+    swipe_cm(&mut h, 6.0);
+    h.app.update();
+    assert_eq!(pulse_count(&mut h), 1);
+
+    h.world().write_message::<Event>(Event::TouchpadDown);
+    h.advance(Duration::from_millis(400));
+    assert_eq!(
+        pulse_count(&mut h),
+        1,
+        "the new touch drops the owed pulses"
+    );
+
+    swipe_cm(&mut h, 2.0);
+    h.advance(Duration::from_millis(200));
+    assert_eq!(
+        pulse_count(&mut h),
+        2,
+        "the new gesture pulses for its own step"
+    );
 }
 
 #[test]
@@ -837,7 +966,7 @@ fn keyboard_focus_never_requests_paging_haptics() {
         },
     ]);
     assert_focused!(h.world(), 1);
-    assert_eq!(h.world().resource::<PagingHapticCount>().0, 0);
+    assert_eq!(pulse_count(&mut h), 0);
 }
 
 #[test]

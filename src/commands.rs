@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::config::snippet::{RuleSubject, SnippetDialect, window_rule_snippet};
 use crate::ecs::display::{DisplayMoves, FloatingLayer};
 use crate::ecs::drag::NativeResizeStart;
-use crate::ecs::focus::{FocusHistory, PageHapticRequest};
+use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, RestoreTo, StackItem, anchored_origin,
     clamp_origin_to_viewport, effective_stack_limit, hold_minimum_heights, strip_signature,
@@ -60,14 +60,16 @@ type StripsWithVisibility<'w, 's> = Query<
     ),
 >;
 
+/// Each strip's origin, and the origin it is moving to.
+pub(crate) type StripPositions<'w, 's> =
+    Query<'w, 's, (&'static Position, Option<&'static RepositionMarker>), With<LayoutStrip>>;
+
 #[derive(SystemParam)]
 struct PagingFocusParams<'w, 's> {
     page_requests: MessageReader<'w, 's, PageFocusRequest>,
     page_state: ResMut<'w, PageGestureState>,
     config: Res<'w, Config>,
-    strip_positions:
-        Query<'w, 's, (&'static Position, Option<&'static RepositionMarker>), With<LayoutStrip>>,
-    haptics: MessageWriter<'w, PageHapticRequest>,
+    strip_positions: StripPositions<'w, 's>,
 }
 
 pub fn register_commands(app: &mut bevy::app::App) {
@@ -586,7 +588,7 @@ fn command_move_focus(
             focused_entity,
             &windows,
             &active_display,
-            &mut paging,
+            &paging,
             &mut commands,
         )
     {
@@ -2368,44 +2370,53 @@ fn reveal_clipped_page(
     focused_entity: Entity,
     windows: &Windows,
     active_display: &ActiveDisplay,
-    paging: &mut PagingFocusParams,
+    paging: &PagingFocusParams,
     commands: &mut Commands,
 ) -> bool {
-    if !active_display.active_strip().contains(focused_entity) {
-        return false;
-    }
-    let Some(frame) = windows.moving_frame(focused_entity) else {
+    let Some(target) = clipped_page_reveal(
+        direction,
+        focused_entity,
+        windows,
+        active_display,
+        &paging.config,
+        &paging.strip_positions,
+    ) else {
         return false;
     };
-    let bounds = active_display.actual_bounds(&paging.config);
+    reposition_strip_to_snap(target, active_display, windows, commands);
+    true
+}
+
+/// The strip origin that reveals `focused_entity` when it is clipped on the
+/// side a page step toward `direction` moves to, or `None` when that step
+/// moves focus instead.
+pub(crate) fn clipped_page_reveal(
+    direction: &Direction,
+    focused_entity: Entity,
+    windows: &Windows,
+    active_display: &ActiveDisplay,
+    config: &Config,
+    strip_positions: &StripPositions,
+) -> Option<Origin> {
+    if !active_display.active_strip().contains(focused_entity) {
+        return None;
+    }
+    let frame = windows.moving_frame(focused_entity)?;
+    let bounds = active_display.actual_bounds(config);
     let clipped_on_swipe_side = match direction {
         Direction::West => frame.min.x < bounds.min.x,
         Direction::East => frame.max.x > bounds.max.x,
         _ => false,
     };
     if !clipped_on_swipe_side {
-        return false;
+        return None;
     }
 
-    let Some(target) = snap_strip_position(focused_entity, windows, active_display, &paging.config)
-    else {
-        return false;
-    };
-    let Ok((position, reposition)) = paging
-        .strip_positions
+    let target = snap_strip_position(focused_entity, windows, active_display, config)?;
+    let (position, reposition) = strip_positions
         .get(active_display.active_strip_entity())
-    else {
-        return false;
-    };
-    if target == reposition.map_or(position.0, |pending| pending.0) {
-        return false;
-    }
-
-    reposition_strip_to_snap(target, active_display, windows, commands);
-    if paging.config.swipe_gesture_haptics() {
-        paging.haptics.write(PageHapticRequest);
-    }
-    true
+        .ok()?;
+    (target != reposition.map_or(position.0, |pending| pending.0)).then_some(target)
 }
 
 fn reposition_strip_to_snap(

@@ -82,11 +82,16 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | `vertical` | Boolean | `true` | Interpret the vertical gestures with `fingers_count` or ignore them. Enabling this allows using vertical swipe gestures to change virtual desktops. |
 | `paging` | Boolean | `false` | Focus one adjacent window for each horizontal gesture threshold instead of sliding the strip freely. |
 | `page_distance_cm` | Positive float | `2.0` | Approximate horizontal finger travel in centimeters required for each page when `paging = true`. |
-| `haptics` | Boolean | `true` | Emit a haptic pulse after each confirmed paging focus change. Set to `false` to disable pulses. |
+| `haptics` | Boolean | `true` | Emit one haptic pulse as finger travel earns each paging step that will move the strip. A step at the strip end gives no pulse. Set to `false` to disable pulses. |
 
 When `fingers_count` is omitted or set below 3, Paneru does not intercept native macOS gestures. If macOS uses three-finger horizontal swipes for Spaces, prefer `[swipe.scroll]` with a modifier or configure a different finger count.
 
-Paging estimates physical distance from the trackpad's reported device size. The centimeter threshold may feel slightly different across devices; adjust `page_distance_cm` to suit your trackpad. Haptics require compatible hardware and may be suppressed by macOS when fingers are no longer touching it.
+Paging estimates physical distance from the trackpad's reported device size.
+The centimeter threshold may feel slightly different across devices; adjust `page_distance_cm` to suit your trackpad.
+Haptics require compatible hardware.
+Each pulse plays as the step is earned, while the fingers are still on the trackpad, not when focus reaches the window.
+Steps earned together in one fast movement pulse at least 40 ms apart so that each one is felt.
+macOS may suppress a pulse that plays after the fingers lift.
 
 To move one window at a time with the existing focus animation:
 
@@ -98,7 +103,8 @@ page_distance_cm = 2.0
 haptics = true
 ```
 
-Each additional 2 cm of horizontal finger travel selects another window. Haptics are on by default in paging mode; set `haptics = false` to disable the pulses while keeping the same paging behavior.
+Each additional 2 cm of horizontal finger travel selects another window, with one pulse for that window.
+Haptics are on by default in paging mode; set `haptics = false` to disable the pulses while keeping the same paging behavior.
 
 ### `[swipe.scroll]`
 | Option | Type | Default | Description |

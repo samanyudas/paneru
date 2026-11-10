@@ -8,19 +8,15 @@ use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
-use bevy::ecs::message::{Message, MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Changed, Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{
-    Commands, Local, NonSend, Populated, Query, Res, ResMut, Single, SystemParam,
-};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, ResMut, Single, SystemParam};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
 use bevy::time::{Time, Timer, TimerMode};
-use std::pin::Pin;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
@@ -141,14 +137,10 @@ impl FocusHistory {
 
 pub struct FocusEventsPlugin;
 
-#[derive(Message)]
-pub(crate) struct PageHapticRequest;
-
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
         app.init_resource::<StackOrderWait>();
-        app.add_message::<PageHapticRequest>();
         app.add_systems(
             Update,
             (
@@ -169,12 +161,6 @@ impl Plugin for FocusEventsPlugin {
                 complete_page_focus
                     .in_set(super::PostUpdateSet::Ui)
                     .run_if(|paging: Res<PageGestureState>| paging.in_flight.is_some()),
-                play_page_haptic
-                    .in_set(super::PostUpdateSet::Ui)
-                    .after(complete_page_focus)
-                    .run_if(
-                        bevy::ecs::schedule::common_conditions::on_message::<PageHapticRequest>,
-                    ),
                 clear_pending_focus_layout.in_set(super::PostUpdateSet::Bookkeeping),
                 mouse_follows_focus.in_set(super::PostUpdateSet::Ui),
                 clear_pointer_follows_focus
@@ -202,17 +188,12 @@ fn complete_page_focus(
     focused: Query<Entity, Added<FocusedMarker>>,
     mut paging: ResMut<PageGestureState>,
     time: Res<Time>,
-    config: Res<Config>,
-    mut haptics: MessageWriter<PageHapticRequest>,
 ) {
     let Some(PageInFlight::AwaitingFocus { target, deadline }) = paging.in_flight else {
         return;
     };
     if focused.iter().any(|entity| entity == target) {
         paging.in_flight = None;
-        if config.swipe_gesture_haptics() {
-            haptics.write(PageHapticRequest);
-        }
     } else if let Some(deadline) = deadline {
         if time.elapsed() >= deadline {
             paging.reset();
@@ -225,98 +206,54 @@ fn complete_page_focus(
     }
 }
 
-fn play_page_haptic(
-    mut requests: MessageReader<PageHapticRequest>,
-    platform: Option<NonSend<Pin<Box<crate::platform::PlatformCallbacks>>>>,
-) {
-    for _ in requests.read() {
-        if let Some(platform) = &platform {
-            crate::platform::haptics::page_changed(platform.main_thread_marker);
-        }
-    }
-}
-
 #[cfg(test)]
 mod paging_tests {
     use super::*;
     use bevy::MinimalPlugins;
-    use bevy::ecs::message::{MessageCursor, Messages};
 
-    #[test]
-    fn delayed_page_confirmation_requests_one_haptic() {
+    fn paging_app(deadline: Duration) -> (App, Entity) {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         app.init_resource::<PageGestureState>();
-        app.insert_resource(Config::default());
-        app.add_message::<PageHapticRequest>();
         app.add_systems(PostUpdate, complete_page_focus);
 
         let target = app.world_mut().spawn_empty().id();
         app.world_mut().resource_mut::<PageGestureState>().in_flight =
             Some(PageInFlight::AwaitingFocus {
                 target,
-                deadline: Some(Duration::from_secs(1)),
+                deadline: Some(deadline),
             });
+        (app, target)
+    }
+
+    #[test]
+    fn delayed_page_confirmation_completes_the_step() {
+        let (mut app, target) = paging_app(Duration::from_secs(1));
         app.update();
-        assert!(
-            app.world()
-                .resource::<PageGestureState>()
-                .in_flight
-                .is_some()
-        );
+        let state = app.world().resource::<PageGestureState>();
+        assert!(state.in_flight.is_some());
+        let generation = state.generation;
 
         app.world_mut().entity_mut(target).insert(FocusedMarker);
         app.update();
-        assert!(
-            app.world()
-                .resource::<PageGestureState>()
-                .in_flight
-                .is_none()
-        );
-        let mut cursor = MessageCursor::<PageHapticRequest>::default();
+        let state = app.world().resource::<PageGestureState>();
+        assert!(state.in_flight.is_none());
         assert_eq!(
-            cursor
-                .read(app.world().resource::<Messages<PageHapticRequest>>())
-                .count(),
-            1
-        );
-        app.update();
-        assert_eq!(
-            cursor
-                .read(app.world().resource::<Messages<PageHapticRequest>>())
-                .count(),
-            0
+            state.generation, generation,
+            "a confirmed step keeps the gesture"
         );
     }
 
     #[test]
-    fn timed_out_page_confirmation_requests_no_haptic() {
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins);
-        app.init_resource::<PageGestureState>();
-        app.insert_resource(Config::default());
-        app.add_message::<PageHapticRequest>();
-        app.add_systems(PostUpdate, complete_page_focus);
-
-        let target = app.world_mut().spawn_empty().id();
-        app.world_mut().resource_mut::<PageGestureState>().in_flight =
-            Some(PageInFlight::AwaitingFocus {
-                target,
-                deadline: Some(Duration::ZERO),
-            });
+    fn timed_out_page_confirmation_resets_the_gesture() {
+        let (mut app, _) = paging_app(Duration::ZERO);
+        let generation = app.world().resource::<PageGestureState>().generation;
         app.update();
-        assert!(
-            app.world()
-                .resource::<PageGestureState>()
-                .in_flight
-                .is_none()
-        );
-        let mut cursor = MessageCursor::<PageHapticRequest>::default();
-        assert_eq!(
-            cursor
-                .read(app.world().resource::<Messages<PageHapticRequest>>())
-                .count(),
-            0
+        let state = app.world().resource::<PageGestureState>();
+        assert!(state.in_flight.is_none());
+        assert_ne!(
+            state.generation, generation,
+            "a timed-out step resets the gesture"
         );
     }
 }
