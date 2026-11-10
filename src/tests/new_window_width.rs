@@ -132,3 +132,112 @@ fn without_the_option_a_new_window_keeps_its_width() {
 
     assert_eq!(width(&harness, 2), OPENED_WIDTH);
 }
+
+/// A window that is minimized when the engine first sees it keeps its width,
+/// in the Dock and once it is restored.
+#[test]
+fn a_window_found_minimized_keeps_its_width() {
+    let mut harness = started(half_width_config(vec![]));
+    let opened = IRect::new(100, TEST_MENUBAR_HEIGHT, 100 + OPENED_WIDTH, 700);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 2, opened);
+    harness
+        .mock_state
+        .update_window(2, |window| window.minimized = true);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_secs(2));
+
+    assert_eq!(width(&harness, 2), OPENED_WIDTH);
+}
+
+/// Hides the app of window 2 or shows it again, as Cmd-H and a click on the
+/// app's Dock icon do, and lets the change settle.
+fn set_hidden(harness: &mut TestHarness, hidden: bool) {
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.is_hidden = hidden);
+    let event = if hidden {
+        crate::events::Event::ApplicationHidden {
+            pid: TEST_PROCESS_ID,
+        }
+    } else {
+        crate::events::Event::ApplicationVisible {
+            pid: TEST_PROCESS_ID,
+        }
+    };
+    harness.run(vec![event]);
+    harness.advance(Duration::from_secs(2));
+}
+
+/// A window that its app opens while hidden is new when the app shows, so
+/// it starts at the new-window width then.
+#[test]
+fn a_window_that_a_hidden_app_opens_starts_at_half_the_display_when_shown() {
+    let mut harness = started(half_width_config(vec![]));
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.is_hidden = true);
+    let opened = IRect::new(100, TEST_MENUBAR_HEIGHT, 100 + OPENED_WIDTH, 700);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 2, opened);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_secs(2));
+    assert_eq!(
+        width(&harness, 2),
+        OPENED_WIDTH,
+        "a hidden window keeps its width"
+    );
+
+    set_hidden(&mut harness, false);
+    assert_eq!(width(&harness, 2), HALF_DISPLAY);
+    assert_eq!(
+        width(&harness, 0),
+        TEST_WINDOW_WIDTH,
+        "a startup window keeps its width"
+    );
+}
+
+/// A window that tiled before its app hid is not new when the app shows
+/// again, so it keeps the width it had.
+#[test]
+fn a_window_keeps_its_width_when_its_app_hides_and_shows() {
+    let mut harness = started(half_width_config(vec![]));
+    open_window(&mut harness, 2);
+    harness.run(vec![crate::events::Event::Command {
+        command: crate::commands::Command::Window(crate::commands::Operation::Resize(
+            crate::commands::ResizeDirection::Shrink,
+        )),
+    }]);
+    harness.advance(Duration::from_secs(2));
+    let resized = width(&harness, 2);
+
+    set_hidden(&mut harness, true);
+    set_hidden(&mut harness, false);
+    assert_eq!(width(&harness, 2), resized);
+}
+
+/// A window whose creation macOS never reported joins the strip when the
+/// engine reads its space, and starts at the new-window width like any new
+/// window.
+#[test]
+fn a_window_found_by_a_space_read_starts_at_half_the_display() {
+    let mut harness = started(half_width_config(vec![]));
+    let opened = IRect::new(100, TEST_MENUBAR_HEIGHT, 100 + OPENED_WIDTH, 700);
+    harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 2, opened);
+    harness.run(vec![crate::events::Event::MissionControlExit]);
+    harness.advance(Duration::from_secs(2));
+
+    let entity = find_window_entity(2, harness.world());
+    let mut strips = harness.world().query::<&crate::ecs::layout::LayoutStrip>();
+    assert!(
+        strips
+            .iter(harness.world())
+            .any(|strip| strip.contains(entity)),
+        "the space read tiles the window"
+    );
+    assert_eq!(width(&harness, 2), HALF_DISPLAY);
+}

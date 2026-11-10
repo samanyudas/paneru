@@ -622,6 +622,12 @@ pub enum Unmanaged {
 #[derive(Component, Debug)]
 pub struct FloatsWhenRestored;
 
+/// Marks a window that its app opened while hidden, after the engine
+/// started. It gets the new-window width when it first joins a strip, once
+/// the app shows. (miri#305)
+#[derive(Component, Debug)]
+pub struct OpenedHidden;
+
 /// The strip slot a window left when it stopped being managed, so managing it
 /// again returns it there.
 #[derive(Clone, Component, Copy, Debug)]
