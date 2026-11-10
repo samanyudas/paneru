@@ -654,6 +654,30 @@ fn plain_moves_land_at_the_crossed_edge_and_reverse_with_the_whole_stack() {
     }
 }
 
+/// A plain move that crosses lands flush at the edge it crossed, with no
+/// desktop between that edge and the column, as the strip's first column on
+/// the left edge or its last column on the right edge (miri#430).
+#[test]
+fn a_plain_crossing_lands_flush_at_the_crossed_edge() {
+    for side in [Side::East, Side::West] {
+        let ext = external_bounds(&side.direction());
+        let mut harness = stacked_beside(ext, &[100, 101, 102]);
+        if side == Side::East {
+            harness.run(vec![command(Operation::Swap(Direction::Last))]);
+        }
+        harness.advance(SETTLE);
+        let inset = frame(harness.world(), 100).min.x - ext.min.x;
+        harness.run(vec![plain(Operation::Swap(side.direction()), false)]);
+        settle_on_external(&mut harness, &[0, 1, 2]);
+        let arrived = frame(harness.world(), 1);
+        if side == Side::East {
+            assert_eq!(arrived.min.x, ext.min.x + inset, "{side:?}: {arrived:?}");
+        } else {
+            assert_eq!(arrived.max.x, ext.max.x - inset, "{side:?}: {arrived:?}");
+        }
+    }
+}
+
 #[test]
 fn plain_keys_step_once_before_crossing_and_repeats_stay_in_each_strip() {
     for side in [Side::West, Side::East] {
