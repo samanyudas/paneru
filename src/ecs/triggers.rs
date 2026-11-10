@@ -1579,7 +1579,11 @@ pub(super) fn recheck_window_level(
             .is_some_and(WindowProperties::sets_width);
         let Some(properties) = properties.filter(|properties| raised && properties.floating())
         else {
+            // Session restore may have placed the window while it waited, at
+            // its saved width, and that placement stands.
+            let placed = workspaces.iter().any(|(strip, _)| strip.contains(entity));
             if !floated
+                && !placed
                 && check.tiled_from.is_none()
                 && let Some(mut strip) = workspaces
                     .iter_mut()

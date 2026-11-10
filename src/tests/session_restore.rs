@@ -916,6 +916,31 @@ fn test_late_startup_window_restores_during_grace_period() {
 /// period gets its saved width, and never the new-window width on the way.
 #[test]
 fn a_late_restored_window_gets_its_saved_width_not_the_new_window_width() {
+    assert_late_window_keeps_its_saved_width(saved_window(99), false);
+}
+
+/// The same for a window that waits for its level check before it tiles,
+/// because its app shows it without a full-screen button.
+#[test]
+fn a_late_restored_window_that_waits_for_its_level_check_gets_its_saved_width() {
+    assert_late_window_keeps_its_saved_width(saved_window(99), true);
+}
+
+/// The same for a window that the restored session matches by its title,
+/// because the window id it was saved with is gone.
+#[test]
+fn a_late_window_restored_by_its_title_gets_its_saved_width() {
+    let mut saved = saved_window(50);
+    saved.title = "Window 99".to_string();
+    saved.identifier = "testid".to_string();
+    assert_late_window_keeps_its_saved_width(saved, false);
+}
+
+/// Opens window 99 half a second into the startup grace period, with
+/// `saved` the only window of the restored session, and checks every 20 ms
+/// for 3 s that window 99 never takes the new-window width, ends at its saved
+/// width, and sits in exactly one strip.
+fn assert_late_window_keeps_its_saved_width(mut saved: SavedWindow, waits_for_level_check: bool) {
     use crate::ecs::layout::ViewportShare;
 
     let options = MainOptions {
@@ -923,7 +948,6 @@ fn a_late_restored_window_gets_its_saved_width_not_the_new_window_width() {
         ..MainOptions::default()
     };
     let saved_width = 300;
-    let mut saved = saved_window(99);
     saved.width = Some(ViewportShare::of(saved_width, TEST_DISPLAY_WIDTH));
     let mut harness = TestHarness::new()
         .with_config((options, vec![]).into())
@@ -943,6 +967,11 @@ fn a_late_restored_window_gets_its_saved_width_not_the_new_window_width() {
     let window = harness
         .mock_state
         .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 99, opened);
+    if waits_for_level_check {
+        harness
+            .mock_state
+            .update_window(99, |window| window.no_full_screen_button = true);
+    }
     harness.mock_state.focus_window(99);
     harness.world().trigger(SpawnWindowTrigger(vec![window]));
     for _ in 0..150 {
@@ -955,6 +984,14 @@ fn a_late_restored_window_gets_its_saved_width_not_the_new_window_width() {
         );
     }
     assert_eq!(harness.mock_state.ax_frame(99).width(), saved_width);
+
+    let entity = find_window_entity(99, harness.world());
+    let mut strips = harness.world().query::<&LayoutStrip>();
+    let holding = strips
+        .iter(harness.world())
+        .filter(|strip| strip.contains(entity))
+        .count();
+    assert_eq!(holding, 1, "the restored window sits in exactly one strip");
 }
 
 #[test]
