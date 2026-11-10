@@ -106,15 +106,22 @@ impl<W> PendingWrite<W> {
     }
 }
 
-/// Writes one window's frame. A write of both parts follows the order the
-/// engine has always used: the size at the old position, then the position,
-/// then the size again if the app limited it at the old position.
+/// Writes one window's frame. A write of both parts sets the size at the
+/// old position, then the position, then the size again if the app limited
+/// it at the old position. A write that only narrows a column moves it
+/// first, so the window covers where it lands until the size follows.
 /// Returns the frame read back after a size was written, if any read
 /// succeeded.
 pub(crate) fn apply<S: WriteSink>(sink: &mut S, write: &PendingWrite<S::Window>) -> Option<IRect> {
     let window = &write.window;
     let size = write.to.size();
+    let narrows = write.to.width() < write.from.width() && write.to.min.y == write.from.min.y;
     match (write.position, write.size) {
+        (true, true) if narrows => {
+            sink.set_position(window, write.to.min);
+            let moved = IRect::from_corners(write.to.min, write.to.min + write.from.size());
+            resize(sink, window, moved, size, write.to.min)
+        }
         (true, true) => {
             let observed = resize(sink, window, write.from, size, write.from.min);
             sink.set_position(window, write.to.min);
