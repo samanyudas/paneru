@@ -884,7 +884,7 @@ pub(super) fn window_managed_trigger(
         Without<Window>,
     >,
     previous_strips: Query<&PreviousManagedStrip>,
-    opened_hidden: Query<(), With<OpenedHidden>>,
+    opened_hidden: Query<&Unmanaged, With<OpenedHidden>>,
     launch_windows: Option<Res<LaunchWindows>>,
     initializing: Option<Res<Initializing>>,
     mut ctx: WindowCtx,
@@ -956,10 +956,12 @@ pub(super) fn window_managed_trigger(
         }
 
         // A window that opened while its app was hidden tiles for the first
-        // time now, as a new window. A width rule sized it above.
-        if opened_hidden.contains(entity) {
+        // time now, as a new window, when it goes straight from hidden to
+        // tiled. A window that floated or was minimized in between has a
+        // width of its own by now. A width rule sized it above.
+        if let Ok(unmanaged) = opened_hidden.get(entity) {
             ctx.commands.entity(entity).try_remove::<OpenedHidden>();
-            if properties.fixed_width_ratio().is_none() {
+            if matches!(unmanaged, Unmanaged::Hidden) && properties.fixed_width_ratio().is_none() {
                 size_new_column(
                     entity,
                     window,

@@ -147,8 +147,35 @@ fn a_window_found_minimized_keeps_its_width() {
         .update_window(2, |window| window.minimized = true);
     harness.world().trigger(SpawnWindowTrigger(vec![window]));
     harness.advance(Duration::from_secs(2));
+    assert_eq!(width(&harness, 2), OPENED_WIDTH, "in the Dock");
 
-    assert_eq!(width(&harness, 2), OPENED_WIDTH);
+    restore_from_dock(&mut harness, 2);
+    assert_eq!(width(&harness, 2), OPENED_WIDTH, "once restored");
+}
+
+/// Restores minimized window `id` from the Dock and lets it settle.
+fn restore_from_dock(harness: &mut TestHarness, id: WinID) {
+    harness.mock_state.os_minimize_window(id, false);
+    harness.advance(Duration::from_secs(2));
+}
+
+/// Opens window 2 at `OPENED_WIDTH` while its app is hidden, minimized if
+/// `minimized`, and lets it settle.
+fn open_window_while_hidden(harness: &mut TestHarness, minimized: bool) {
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.is_hidden = true);
+    let opened = IRect::new(100, TEST_MENUBAR_HEIGHT, 100 + OPENED_WIDTH, 700);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 2, opened);
+    if minimized {
+        harness
+            .mock_state
+            .update_window(2, |window| window.minimized = true);
+    }
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_secs(2));
 }
 
 /// Hides the app of window 2 or shows it again, as Cmd-H and a click on the
@@ -175,15 +202,7 @@ fn set_hidden(harness: &mut TestHarness, hidden: bool) {
 #[test]
 fn a_window_that_a_hidden_app_opens_starts_at_half_the_display_when_shown() {
     let mut harness = started(half_width_config(vec![]));
-    harness
-        .mock_state
-        .update_app(TEST_PROCESS_ID, |app| app.is_hidden = true);
-    let opened = IRect::new(100, TEST_MENUBAR_HEIGHT, 100 + OPENED_WIDTH, 700);
-    let window = harness
-        .mock_state
-        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 2, opened);
-    harness.world().trigger(SpawnWindowTrigger(vec![window]));
-    harness.advance(Duration::from_secs(2));
+    open_window_while_hidden(&mut harness, false);
     assert_eq!(
         width(&harness, 2),
         OPENED_WIDTH,
@@ -197,6 +216,59 @@ fn a_window_that_a_hidden_app_opens_starts_at_half_the_display_when_shown() {
         TEST_WINDOW_WIDTH,
         "a startup window keeps its width"
     );
+}
+
+/// A window that a hidden app opens minimized is minimized when the app
+/// shows, and keeps its width once it is restored from the Dock, as a window
+/// first seen minimized does.
+#[test]
+fn a_hidden_app_window_that_opened_minimized_keeps_its_width_when_restored() {
+    let mut harness = started(half_width_config(vec![]));
+    open_window_while_hidden(&mut harness, true);
+    set_hidden(&mut harness, false);
+    assert_eq!(width(&harness, 2), OPENED_WIDTH, "in the Dock");
+
+    restore_from_dock(&mut harness, 2);
+    assert_eq!(width(&harness, 2), OPENED_WIDTH, "once restored");
+}
+
+/// A window that a hidden app opens floats when the app shows, under a
+/// floating rule. Once the user resizes it and tiles it, it keeps the width
+/// the user gave it.
+#[test]
+fn a_hidden_app_window_that_floats_keeps_its_width_when_tiled() {
+    let mut rule = WindowParams::new("^Window 2$", None);
+    rule.floating = Some(true);
+    let mut harness = started(half_width_config(vec![rule]));
+    open_window_while_hidden(&mut harness, false);
+    set_hidden(&mut harness, false);
+
+    let resized = 600;
+    harness
+        .mock_state
+        .os_resize_window(2, crate::manager::Size::new(resized, 500));
+    harness.mock_state.focus_window(2);
+    harness.run(vec![crate::events::Event::WindowFocused { window_id: 2 }]);
+    harness.advance(Duration::from_secs(1));
+    assert_eq!(
+        width(&harness, 2),
+        resized,
+        "the user's width while it floats"
+    );
+
+    harness.run(vec![crate::events::Event::Command {
+        command: crate::commands::Command::Window(crate::commands::Operation::Manage),
+    }]);
+    harness.advance(Duration::from_secs(2));
+    let entity = find_window_entity(2, harness.world());
+    let mut strips = harness.world().query::<&crate::ecs::layout::LayoutStrip>();
+    assert!(
+        strips
+            .iter(harness.world())
+            .any(|strip| strip.contains(entity)),
+        "the window tiles"
+    );
+    assert_eq!(width(&harness, 2), resized);
 }
 
 /// A window that tiled before its app hid is not new when the app shows
