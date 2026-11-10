@@ -783,6 +783,18 @@ mod tests {
         assert_eq!(ops, vec![Op::Size(target.size()), Op::Position(target.min)]);
     }
 
+    /// A column that narrows about its center moves before it shrinks, so
+    /// the app shows its right edge no further left than where it lands,
+    /// rather than leaving the desktop showing beside the column on its
+    /// right until the move follows (miri#308).
+    #[test]
+    fn a_combined_write_that_narrows_moves_before_the_size() {
+        let target = IRect::new(300, 50, 800, 450);
+        let (frame, ops) = place(IRect::new(100, 50, 1100, 450), target, |_, size| size);
+        assert_eq!(frame, target);
+        assert_eq!(ops, vec![Op::Position(target.min), Op::Size(target.size())]);
+    }
+
     #[test]
     fn a_combined_write_shrinks_a_full_height_window_into_a_lower_slot() {
         let target = IRect::new(640, 735, 1280, 1440);
