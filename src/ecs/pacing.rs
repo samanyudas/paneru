@@ -8,9 +8,11 @@
 //!
 //! Instead, while a row animates, no window gets closer to its target than
 //! the window behind it is to its own, as the window server shows that
-//! window. The slowest window then sets the pace for every window ahead of
-//! it. A window that lags into the window ahead only overlaps it, which
-//! shows no desktop, so nothing waits on the windows ahead of the slow one.
+//! window, at the edge the two windows share. A window that changes width
+//! moves its two edges apart, so pacing reads each edge. The slowest window
+//! then sets the pace for every window ahead of it. A window that lags into
+//! the window ahead only overlaps it, which shows no desktop, so nothing
+//! waits on the windows ahead of the slow one.
 //! A photo sliding at a shared edge is held the same way, and closes over
 //! its window only once the window server shows the window where it rests.
 //!
@@ -41,7 +43,9 @@ use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::shared_edge::Slide;
 use crate::ecs::systems::{AnimationStep, ease_out_factor, ease_step};
-use crate::ecs::{FocusedMarker, Position, PresentedOrigin, RepositionMarker};
+use crate::ecs::{
+    Bounds, FocusedMarker, Position, PresentedOrigin, RepositionMarker, ResizeMarker,
+};
 use crate::events::Event;
 use crate::manager::window_writer::LANDING_TIMEOUT;
 use crate::manager::{Application, Window};
@@ -252,11 +256,27 @@ fn heading(slide: &Slide, presented: IVec2) -> Option<(IVec2, IVec2)> {
     }
 }
 
+/// The left and right edges of a window along its row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Edges {
+    left: i32,
+    right: i32,
+}
+
+impl From<IRect> for Edges {
+    fn from(frame: IRect) -> Self {
+        Self {
+            left: frame.min.x,
+            right: frame.max.x,
+        }
+    }
+}
+
 /// What the engine has seen of one row window's app taking its moves.
 #[derive(Default)]
 pub(super) struct Tracked {
     /// Where the engine had asked for the window as of the previous frame.
-    asked: Option<i32>,
+    asked: Option<Edges>,
     /// The app showed each of the engine's moves by the next frame through
     /// a whole motion, and has not been late since, nor gained or lost focus
     /// to another app, nor come to the front or left it, so it takes this
@@ -270,29 +290,29 @@ pub(super) struct Tracked {
     late_this_motion: bool,
     /// Where the window shows away from where the engine asked for it, and
     /// since when it has shown no progress.
-    late: Option<(i32, Duration)>,
+    late: Option<(Edges, Duration)>,
 }
 
 impl Tracked {
     /// Takes in that the engine asked for the window at `asked` last frame
     /// and the window server shows it at `shown`, if it lists it.
-    fn see(&mut self, asked: i32, shown: Option<i32>, now: Duration) -> Pacer {
+    fn see(&mut self, asked: Edges, shown: Option<Edges>, now: Duration) -> Pacer {
         let before = self.asked.replace(asked);
         match shown {
-            Some(x) if x != asked => {
+            Some(edges) if edges != asked => {
                 self.prompt = false;
                 self.late_this_motion = true;
                 let since = match self.late {
-                    Some((at, since)) if at == x => since,
+                    Some((at, since)) if at == edges => since,
                     _ => {
-                        self.late = Some((x, now));
+                        self.late = Some((edges, now));
                         now
                     }
                 };
                 if now.saturating_sub(since) >= LANDING_TIMEOUT {
                     Pacer::Asked
                 } else {
-                    Pacer::Shown(x)
+                    Pacer::Shown(edges)
                 }
             }
             _ => {
@@ -328,7 +348,7 @@ enum Pacer {
     /// stall the row.
     Asked,
     /// From where the window server shows it, or where its photo shows.
-    Shown(i32),
+    Shown(Edges),
 }
 
 /// One window of a moving row, in engine frame coordinates.
@@ -339,9 +359,14 @@ struct Member {
     eased: i32,
     /// Where pacing lets the window go this frame.
     x: i32,
+    /// How wide the animation makes the window this frame.
+    width: i32,
     target: i32,
+    target_right: i32,
     /// Where the engine asked for the window last frame.
     asked: i32,
+    /// The edges of the frame the engine last asked the window's app for.
+    asked_edges: Edges,
     pacer: Pacer,
     paced: bool,
     /// The window's photo slides it at a shared edge: pacing holds the
@@ -350,12 +375,30 @@ struct Member {
 }
 
 impl Member {
-    /// How far the window is from its target, as the windows next to it
-    /// see it.
-    fn lag(&self) -> i32 {
-        match self.pacer {
-            Pacer::Asked => self.x - self.target,
-            Pacer::Shown(x) => x - self.target,
+    /// How far each edge of the window is from its target, as the windows
+    /// next to it see it.
+    fn lag(&self) -> Edges {
+        let edges = match self.pacer {
+            Pacer::Asked => Edges {
+                left: self.x,
+                right: self.x + self.width,
+            },
+            // A write sets the new size at the old position before the new
+            // position, so the edge that a width change moves shows ahead of
+            // where it lands until the position follows. Each edge counts as
+            // no further along than with the shown width and the other edge
+            // where the engine asked for it.
+            Pacer::Shown(edges) => {
+                let width = edges.right - edges.left;
+                Edges {
+                    left: edges.left.max(self.asked_edges.right - width),
+                    right: edges.right.min(self.asked_edges.left + width),
+                }
+            }
+        };
+        Edges {
+            left: edges.left - self.target,
+            right: edges.right - self.target_right,
         }
     }
 
@@ -382,7 +425,9 @@ type RowWindows<'w, 's> = Query<
     (
         &'static Window,
         &'static mut Position,
+        &'static Bounds,
         Option<&'static RepositionMarker>,
+        Option<&'static ResizeMarker>,
         Option<(&'static Slide, &'static PresentedOrigin)>,
     ),
 >;
@@ -493,13 +538,14 @@ fn member(
     t: f32,
     now: Duration,
 ) -> Option<Member> {
-    let (window, position, to, slide) = windows.get(entity).ok()?;
+    let (window, position, bounds, to, resize, slide) = windows.get(entity).ok()?;
     let id = window.id();
-    let asked = window.frame().min.x;
-    let shown_x = shown
+    let asked = Edges::from(window.frame());
+    let shown_edges = shown
         .frames
         .get(&id)
-        .map(|&frame| window.margins().tracked(frame).min.x);
+        .map(|&frame| Edges::from(window.margins().tracked(frame)));
+    let width = bounds.0.x;
     if let Some((at, heading_to)) = slide.and_then(|(slide, presented)| heading(slide, presented.0))
     {
         let (step, _) = ease_step(at, heading_to, t);
@@ -508,7 +554,10 @@ fn member(
         // move.
         let pacer = match slide {
             Some((Slide::Leaving { .. }, _)) => {
-                tracked.entry(entity).or_default().see(asked, shown_x, now)
+                tracked
+                    .entry(entity)
+                    .or_default()
+                    .see(asked, shown_edges, now)
             }
             _ => Pacer::Asked,
         };
@@ -517,14 +566,20 @@ fn member(
             id,
             eased: step.x,
             x: step.x,
+            width,
             target: heading_to.x,
+            target_right: heading_to.x + width,
             asked: at.x,
+            asked_edges: asked,
             pacer,
             paced: true,
             slides: true,
         });
     }
-    let pacer = tracked.entry(entity).or_default().see(asked, shown_x, now);
+    let pacer = tracked
+        .entry(entity)
+        .or_default()
+        .see(asked, shown_edges, now);
     // A window landing under its photo shows where its photo rests, however
     // far its app has yet to take it, and has no move of its own yet but
     // still heads where layout puts it.
@@ -532,13 +587,17 @@ fn member(
         Some((_, presented)) => (presented.0.x, Pacer::Shown(asked)),
         None => (to.map_or(position.0.x, |to| to.0.x), pacer),
     };
+    let target_width = resize.map_or(width, |resize| resize.0.x);
     Some(Member {
         entity,
         id,
         eased: position.0.x,
         x: position.0.x,
+        width,
         target,
-        asked,
+        target_right: target + target_width,
+        asked: asked.left,
+        asked_edges: asked,
         pacer,
         paced: to.is_some() && slide.is_none(),
         slides: false,
@@ -634,7 +693,7 @@ fn landed(rows: &[Vec<Vec<Entity>>], windows: &RowWindows, shown: &Shown) -> Ent
         .flatten()
         .copied()
         .filter(|&entity| {
-            windows.get(entity).is_ok_and(|(window, _, _, slide)| {
+            windows.get(entity).is_ok_and(|(window, .., slide)| {
                 matches!(slide, Some((Slide::Landing { .. }, _)))
                     && !shown.unread.contains(&window.id())
                     && shown
@@ -660,7 +719,7 @@ fn moving_rows(strips: &Query<&LayoutStrip>, windows: &RowWindows) -> Vec<Vec<Ve
         })
         .filter(|row| {
             row.iter().flatten().any(|&entity| {
-                windows.get(entity).is_ok_and(|(_, _, to, slide)| {
+                windows.get(entity).is_ok_and(|(_, _, _, to, _, slide)| {
                     to.is_some()
                         || slide.is_some_and(|(slide, _)| matches!(slide, Slide::Landing { .. }))
                 })
@@ -670,13 +729,13 @@ fn moving_rows(strips: &Query<&LayoutStrip>, windows: &RowWindows) -> Vec<Vec<Ve
 }
 
 /// Holds the columns of `row`, left to right, from behind each one in the
-/// direction of motion to the front, so each column follows where the
-/// column behind it is this frame.
+/// direction of motion to the front, so each column follows where the edge
+/// of the column behind it that faces it is this frame.
 fn pace_row(row: &mut [Vec<Member>]) {
-    // A column right of its target has yet to move left, so the column left
-    // of it, ahead, may get no closer to its own.
+    // A column whose left edge is right of its target has yet to move left,
+    // so the column left of it, ahead, may get no closer to its own.
     for index in (0..row.len().saturating_sub(1)).rev() {
-        let lag = row[index + 1].iter().map(Member::lag).max();
+        let lag = row[index + 1].iter().map(|member| member.lag().left).max();
         if let Some(lag) = lag.filter(|&lag| lag > 0) {
             for member in &mut row[index] {
                 member.hold_right_of(member.target + lag);
@@ -684,7 +743,7 @@ fn pace_row(row: &mut [Vec<Member>]) {
         }
     }
     for index in 1..row.len() {
-        let lag = row[index - 1].iter().map(Member::lag).min();
+        let lag = row[index - 1].iter().map(|member| member.lag().right).min();
         if let Some(lag) = lag.filter(|&lag| lag < 0) {
             for member in &mut row[index] {
                 member.hold_left_of(member.target + lag);
