@@ -405,10 +405,15 @@ impl Plugin for DisplayEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DisplayReconcileState>()
             .init_resource::<DisplayHomes>()
+            .init_resource::<super::shown_space::ShownSpaceCheck>()
             .init_resource::<DockRereads>()
             .add_systems(
                 PreUpdate,
-                (display_change_handler, reconcile_displays)
+                (
+                    display_change_handler,
+                    reconcile_displays,
+                    super::shown_space::check_shown_spaces,
+                )
                     .chain()
                     .in_set(super::PreUpdateSet::Dispatch),
             )

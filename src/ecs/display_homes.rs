@@ -22,9 +22,10 @@ use tracing::{debug, warn};
 use super::display::{compact_workspace_strips, size_for_arrival};
 use super::layout::{DetachedColumn, LayoutStrip, ViewportShare};
 use super::native_membership::NativeMembership;
+use super::shown_space::ShownSpaceCheck;
 use super::{
-    Bounds, DockPosition, Initializing, NativeFullscreenMarker, SelectedVirtualMarker,
-    SpawnCommandsExt, Unmanaged,
+    Bounds, DockPosition, FocusedMarker, Initializing, NativeFullscreenMarker,
+    SelectedVirtualMarker, SpawnCommandsExt, Unmanaged,
 };
 use crate::config::Config;
 use crate::manager::{Display, Size, Window, WindowManager};
@@ -122,7 +123,12 @@ impl DisplayHomes {
         let now = Topology::read(world);
         let mut kept = BTreeMap::new();
         let mut emptied = HashSet::new();
+        let mut check = Vec::new();
         for (id, mut home) in homes {
+            if pass == Pass::Final && now.displays.contains_key(&id) && reshuffled(id, &home, &now)
+            {
+                check.push(id);
+            }
             match plan(id, &home, &now) {
                 Plan::Away => {
                     home.returning |= pass == Pass::Final;
@@ -149,8 +155,25 @@ impl DisplayHomes {
             compact_workspace_strips(world, space);
         }
         world.resource_mut::<Self>().homes = kept;
+        let focused = world
+            .query_filtered::<Entity, With<FocusedMarker>>()
+            .iter(world)
+            .next();
+        world.resource_mut::<ShownSpaceCheck>().arm(check, focused);
         world.flush();
     }
+}
+
+/// Whether macOS moved Spaces of display `id` during the burst: the display
+/// left and came back, or a Space it had is no longer on it. Only then can it
+/// end up showing a Space that holds none of its windows.
+fn reshuffled(id: CGDirectDisplayID, home: &Home, now: &Topology) -> bool {
+    home.returning
+        || home.strips.iter().any(|remembered| {
+            !now.strips
+                .values()
+                .any(|strip| strip.display == Some(id) && strip.space == remembered.space)
+        })
 }
 
 /// What `display`'s strips hold now, minus `held` windows, unmanaged windows,

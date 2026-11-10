@@ -274,6 +274,10 @@ struct MockStateInner {
     /// Whether a position write that puts a window's center on another display
     /// moves it into that display's current Space, as macOS does.
     spaces_follow_frames: bool,
+    /// Whether focusing a window makes its display the active display and
+    /// shows the window's Space there, as macOS does when an app activates
+    /// with a window in a hidden Space.
+    spaces_follow_focus: bool,
     /// Windows the window server still shows at these frames, whatever their
     /// apps have taken since.
     shown_late: HashMap<WinID, IRect>,
@@ -519,6 +523,7 @@ impl MockState {
             activated: Vec::new(),
             pending_raises: Vec::new(),
             spaces_follow_frames: false,
+            spaces_follow_focus: false,
             shown_late: HashMap::new(),
         }));
         let holds = Arc::new(WriteHolds::default());
@@ -734,6 +739,12 @@ impl MockState {
         self.inner.force_write().spaces_follow_frames = follow;
     }
 
+    /// Makes focusing a window show its Space on its display and make that
+    /// display active, as macOS does when an app activates.
+    pub fn set_spaces_follow_focus(&self, follow: bool) {
+        self.inner.force_write().spaces_follow_focus = follow;
+    }
+
     fn show_latest_raise(&self) {
         let latest = self.inner.force_write().pending_raises.pop();
         if let Some(id) = latest {
@@ -795,6 +806,26 @@ impl MockState {
         if inner.lags {
             inner.pending_activations.push(id);
             return;
+        }
+        if inner.spaces_follow_focus
+            && let Some(space) = inner.windows.get(&id).map(|win| win.workspace_id)
+            && let Some(display) = inner
+                .displays
+                .values_mut()
+                .find(|display| display.workspaces.contains(&space))
+        {
+            let switched = display.workspaces.first() != Some(&space);
+            display.workspaces.retain(|&other| other != space);
+            display.workspaces.insert(0, space);
+            let id = display.id;
+            let moved = inner.active_display_id != id;
+            inner.active_display_id = id;
+            if moved {
+                inner.event_queue.push_back(Event::DisplayChanged);
+            }
+            if switched {
+                inner.event_queue.push_back(Event::SpaceChanged);
+            }
         }
         if let Some(win) = inner.windows.get(&id) {
             let pid = win.pid;
@@ -1386,6 +1417,11 @@ impl MockState {
     /// lag the frame the engine asked for.
     pub fn ax_frame(&self, id: WinID) -> IRect {
         self.inner.force_read().windows[&id].frame
+    }
+
+    /// The native Space display `id` shows.
+    pub fn shown_space(&self, id: u32) -> WorkspaceId {
+        self.inner.force_read().displays[&id].workspaces[0]
     }
 
     /// The Space the window server has window `id` in.
