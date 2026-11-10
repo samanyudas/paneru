@@ -63,9 +63,6 @@ pub(crate) struct Home {
     /// windows' widths back. A display that never left keeps the widths its
     /// windows have now.
     returning: bool,
-    /// The display showed windows when the burst began, so it must show
-    /// windows again when the burst ends.
-    showed_windows: bool,
 }
 
 /// One strip, one virtual row of one Space, as it was.
@@ -128,7 +125,8 @@ impl DisplayHomes {
         let mut emptied = HashSet::new();
         let mut check = Vec::new();
         for (id, mut home) in homes {
-            if pass == Pass::Final && home.showed_windows && now.displays.contains_key(&id) {
+            if pass == Pass::Final && now.displays.contains_key(&id) && reshuffled(id, &home, &now)
+            {
                 check.push(id);
             }
             match plan(id, &home, &now) {
@@ -166,6 +164,18 @@ impl DisplayHomes {
     }
 }
 
+/// Whether macOS moved Spaces of display `id` during the burst: the display
+/// left and came back, or a Space it had is no longer on it. Only then can it
+/// end up showing a Space that holds none of its windows.
+fn reshuffled(id: CGDirectDisplayID, home: &Home, now: &Topology) -> bool {
+    home.returning
+        || home.strips.iter().any(|remembered| {
+            !now.strips
+                .values()
+                .any(|strip| strip.display == Some(id) && strip.space == remembered.space)
+        })
+}
+
 /// What `display`'s strips hold now, minus `held` windows, unmanaged windows,
 /// and native fullscreen strips. Strips of a `borrowed` Space, one that
 /// another display's home holds, go after the display's own strips.
@@ -183,15 +193,6 @@ fn remember(
         .resource::<WindowManager>()
         .active_display_space(id)
         .ok();
-    let showed_windows = world
-        .query::<(&LayoutStrip, &ChildOf, Has<SelectedVirtualMarker>)>()
-        .iter(world)
-        .any(|(strip, child, selected)| {
-            selected
-                && child.parent() == display
-                && Some(strip.id()) == shown_space
-                && strip.len() > 0
-        });
     let managed = |world: &World, window: Entity| {
         !held.contains(&window)
             && world.get::<Window>(window).is_some()
@@ -240,7 +241,6 @@ fn remember(
     Home {
         strips: strips.into_iter().map(|(_, strip)| strip).collect(),
         returning: false,
-        showed_windows,
     }
 }
 
@@ -584,7 +584,6 @@ mod tests {
         Home {
             strips: vec![remembered(SPACE, columns)],
             returning: false,
-            showed_windows: true,
         }
     }
 
@@ -689,7 +688,6 @@ mod tests {
                 remembered(OTHER_SPACE, &[&[d]]),
             ],
             returning: false,
-            showed_windows: true,
         };
         let now = Topology::default()
             .display(HOME, Some(shown))
