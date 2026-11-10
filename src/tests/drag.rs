@@ -1672,6 +1672,40 @@ fn a_drop_on_its_own_column_returns_the_window() {
     assert_eq!(frame(harness.world(), 1), start, "back in its place");
 }
 
+/// samanyudas/miri#377: a busy app leaves the engine's AX reads unanswered,
+/// as under load. macOS reports that the window left a Space while it slides
+/// back after the drop, as when the drag carried it over another display.
+/// The unanswered read must not count the window as closed, or the slide
+/// stops where it is and the window drops out of the layout.
+#[test]
+fn a_busy_apps_window_sliding_back_after_a_drop_stays_in_its_column() {
+    let mut harness = three_columns();
+
+    let start = frame(harness.world(), 1);
+    let below = Origin::new(start.center().x, TEST_DISPLAY_HEIGHT / 2);
+    press_and_drag(&mut harness, 1, below);
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.ax_busy = true);
+    release(&mut harness, below);
+    harness.run(vec![Event::WindowDestroyed {
+        window_id: 1,
+        source: crate::events::DestroySource::SpaceNotification,
+    }]);
+    harness.advance(ms(1500));
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.ax_busy = false);
+    harness.advance(SETTLE);
+
+    assert_eq!(layout(harness.world()), vec![vec![0], vec![1], vec![2]]);
+    assert_eq!(
+        harness.mock_state.create_window(1).frame(),
+        start,
+        "back in its place"
+    );
+}
+
 #[test]
 fn a_lost_release_in_the_engine_returns_the_window() {
     let mut harness = three_columns();
