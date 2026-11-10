@@ -23,6 +23,7 @@ use super::{
     SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
+use crate::ecs::display::size_for_arrival;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, ExposeFocusedSurvivorAfterRemoval, LayoutStrip, anchored_origin};
 use crate::ecs::maximize::EDGE_RELEASE;
@@ -1601,6 +1602,30 @@ pub(super) fn recheck_window_level(
     }
 }
 
+/// The active display with the Dock's edge, read without skipping the system
+/// when no display is active.
+type ActiveDisplays<'w, 's> =
+    Query<'w, 's, (&'static Display, Option<&'static DockPosition>), With<ActiveDisplayMarker>>;
+
+/// Narrows `entity`, a new window that just joined the active strip, to the
+/// active display's tiling area when it opened wider, as an app that
+/// remembers its size from a larger display does. (miri#410)
+fn fit_new_column(
+    entity: Entity,
+    frame: Option<IRect>,
+    displays: &ActiveDisplays,
+    config: &Config,
+    commands: &mut Commands,
+) {
+    let Ok((display, dock)) = displays.single() else {
+        return;
+    };
+    let tiling = display.actual_display_bounds(dock, config);
+    if let Some(frame) = frame.filter(|frame| frame.width() > tiling.width()) {
+        size_for_arrival(entity, Size::new(tiling.width(), frame.height()), commands);
+    }
+}
+
 /// Starts reading a new window's level again, because the read on arrival
 /// can come too early for an app that raises the window just after it shows
 /// it. Returns whether the window waits for the check to tile. A window
@@ -1624,11 +1649,12 @@ fn start_level_check(
     waits
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn apply_window_positions(
     added: Populated<Entity, Added<Window>>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    displays: ActiveDisplays,
     apps: Query<&Application>,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
@@ -1736,6 +1762,13 @@ pub(super) fn apply_window_positions(
                 }
                 None => strip.append(entity),
             }
+            fit_new_column(
+                entity,
+                ctx.windows.frame(entity),
+                &displays,
+                &ctx.config,
+                &mut ctx.commands,
+            );
         }
 
         // During init, skip per-window reshuffles. finish_setup does a single
