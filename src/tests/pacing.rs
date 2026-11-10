@@ -244,6 +244,38 @@ fn the_neighbours_wait_beside_a_slow_window_that_widens() {
     );
 }
 
+/// Window 0 narrows beside the slow window 1. Its right edge moves left
+/// ahead of window 1, so it keeps its width until window 1 follows.
+#[test]
+fn a_narrowing_window_waits_for_a_slow_window_on_its_right() {
+    let mut harness = harness();
+    let rest = gap(&harness, 0, 1);
+    let start = harness.mock_state.ax_frame(0);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    for frame in 0..10 {
+        harness.advance(FRAME);
+        assert!(
+            gap(&harness, 0, 1) <= rest,
+            "desktop shows between windows 0 and 1 after frame {frame}: {:?} {:?}",
+            harness.mock_state.ax_frame(0),
+            harness.mock_state.ax_frame(1)
+        );
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle_beside(&mut harness, 0, 1, rest);
+    settle(&mut harness);
+
+    assert_landed(&mut harness);
+    assert!(
+        harness.mock_state.ax_frame(0).width() < start.width(),
+        "window 0 narrowed from {start:?}"
+    );
+}
+
 /// An app that showed every move of one motion in time can turn slow when
 /// one of its windows gains focus, as Helium does: window 2 ahead waits for
 /// window 1 from the first step, rather than trusting it to keep up.
