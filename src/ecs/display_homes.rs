@@ -22,9 +22,10 @@ use tracing::{debug, warn};
 use super::display::{compact_workspace_strips, size_for_arrival};
 use super::layout::{DetachedColumn, LayoutStrip, ViewportShare};
 use super::native_membership::NativeMembership;
+use super::shown_space::ShownSpaceCheck;
 use super::{
-    Bounds, DockPosition, Initializing, NativeFullscreenMarker, SelectedVirtualMarker,
-    SpawnCommandsExt, Unmanaged,
+    Bounds, DockPosition, FocusedMarker, Initializing, NativeFullscreenMarker,
+    SelectedVirtualMarker, SpawnCommandsExt, Unmanaged,
 };
 use crate::config::Config;
 use crate::manager::{Display, Size, Window, WindowManager};
@@ -62,6 +63,9 @@ pub(crate) struct Home {
     /// windows' widths back. A display that never left keeps the widths its
     /// windows have now.
     returning: bool,
+    /// The display showed windows when the burst began, so it must show
+    /// windows again when the burst ends.
+    showed_windows: bool,
 }
 
 /// One strip, one virtual row of one Space, as it was.
@@ -122,7 +126,11 @@ impl DisplayHomes {
         let now = Topology::read(world);
         let mut kept = BTreeMap::new();
         let mut emptied = HashSet::new();
+        let mut check = Vec::new();
         for (id, mut home) in homes {
+            if pass == Pass::Final && home.showed_windows && now.displays.contains_key(&id) {
+                check.push(id);
+            }
             match plan(id, &home, &now) {
                 Plan::Away => {
                     home.returning |= pass == Pass::Final;
@@ -149,6 +157,11 @@ impl DisplayHomes {
             compact_workspace_strips(world, space);
         }
         world.resource_mut::<Self>().homes = kept;
+        let focused = world
+            .query_filtered::<Entity, With<FocusedMarker>>()
+            .iter(world)
+            .next();
+        world.resource_mut::<ShownSpaceCheck>().arm(check, focused);
         world.flush();
     }
 }
@@ -170,6 +183,15 @@ fn remember(
         .resource::<WindowManager>()
         .active_display_space(id)
         .ok();
+    let showed_windows = world
+        .query::<(&LayoutStrip, &ChildOf, Has<SelectedVirtualMarker>)>()
+        .iter(world)
+        .any(|(strip, child, selected)| {
+            selected
+                && child.parent() == display
+                && Some(strip.id()) == shown_space
+                && strip.len() > 0
+        });
     let managed = |world: &World, window: Entity| {
         !held.contains(&window)
             && world.get::<Window>(window).is_some()
@@ -218,6 +240,7 @@ fn remember(
     Home {
         strips: strips.into_iter().map(|(_, strip)| strip).collect(),
         returning: false,
+        showed_windows,
     }
 }
 
@@ -561,6 +584,7 @@ mod tests {
         Home {
             strips: vec![remembered(SPACE, columns)],
             returning: false,
+            showed_windows: true,
         }
     }
 
@@ -665,6 +689,7 @@ mod tests {
                 remembered(OTHER_SPACE, &[&[d]]),
             ],
             returning: false,
+            showed_windows: true,
         };
         let now = Topology::default()
             .display(HOME, Some(shown))

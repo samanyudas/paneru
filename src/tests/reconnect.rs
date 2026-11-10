@@ -1051,7 +1051,6 @@ fn replug_into_a_hidden_space(harness: &mut TestHarness) {
         .write_message(Event::DisplayAdded { display_id: EXT });
     harness.advance(Duration::from_millis(100));
     harness.mock_state.os_activate_display(EXT);
-    harness.advance(SETTLE);
 }
 
 #[test]
@@ -1062,6 +1061,7 @@ fn a_display_left_showing_none_of_its_windows_shows_the_space_that_holds_them() 
     harness.advance(Duration::from_secs(1));
 
     replug_into_a_hidden_space(&mut harness);
+    harness.advance(SETTLE);
 
     assert_eq!(
         harness.mock_state.shown_space(BUILTIN),
@@ -1084,5 +1084,28 @@ fn a_display_left_showing_none_of_its_windows_shows_the_space_that_holds_them() 
         harness.mock_state.focused_window_id(TEST_PROCESS_ID),
         Some(51),
         "focus returns to the window that had it"
+    );
+}
+
+#[test]
+fn a_person_who_focuses_a_window_after_the_replug_keeps_the_spaces_macos_shows() {
+    let mut harness = two_displays();
+    harness.mock_state.set_spaces_follow_focus(true);
+    harness.mock_state.focus_window(51);
+    harness.advance(Duration::from_secs(1));
+
+    replug_into_a_hidden_space(&mut harness);
+    harness.advance(Duration::from_millis(1500));
+    harness.mock_state.focus_window(53);
+    harness.advance(SETTLE);
+
+    assert_eq!(
+        harness.mock_state.shown_space(BUILTIN),
+        EXT_SPACE,
+        "the engine does not switch Spaces after the person moved focus"
+    );
+    assert_eq!(
+        harness.mock_state.focused_window_id(TEST_PROCESS_ID),
+        Some(53)
     );
 }

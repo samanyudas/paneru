@@ -58,6 +58,7 @@ pub(crate) mod restore;
 pub mod script_state;
 pub mod scroll;
 pub(crate) mod shared_edge;
+mod shown_space;
 pub(crate) mod slice_input;
 pub(crate) mod slice_photos;
 pub mod state;
