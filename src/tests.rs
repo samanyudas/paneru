@@ -9,6 +9,7 @@ mod maximize;
 mod mission_control;
 mod mocks;
 mod mouse_focus;
+mod next_display;
 mod pacing;
 mod reconnect;
 mod session_restore;

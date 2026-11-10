@@ -285,6 +285,22 @@ pub(crate) fn display_in_direction<T>(
         .map(|(display, _, _)| display)
 }
 
+/// The display after `from` in screen order: left to right by left edge, then
+/// top to bottom, wrapping from the last to the first. Displays at the same
+/// origin, such as mirrored ones, follow in display id order.
+fn next_in_screen_order<T>(
+    from: (IRect, u32),
+    displays: impl IntoIterator<Item = (T, IRect, u32)>,
+) -> Option<T> {
+    let place = |bounds: IRect, id: u32| (bounds.min.x, bounds.min.y, id);
+    let from = place(from.0, from.1);
+    displays
+        .into_iter()
+        .map(|(display, bounds, id)| (display, place(bounds, id)))
+        .min_by_key(|(_, place)| (*place <= from, *place))
+        .map(|(display, _)| display)
+}
+
 fn touching_display<T>(
     side: Side,
     from: IRect,
@@ -1793,8 +1809,8 @@ fn arrival_index(
     strip.index_of(active).ok().map(|index| index + 1)
 }
 
-/// Moves the focused window's whole column to another display: the next one,
-/// or the one in a compass direction. An edge move first takes the column to
+/// Moves the focused window's whole column to another display: the next one in
+/// screen order, or the one in a compass direction. An edge move first takes the column to
 /// its strip's end on that side, and crosses only from there. The column
 /// lands at the crossed edge for a plain keyboard step, otherwise right after
 /// the destination's active column, the window `focus_display` would focus there.
@@ -1839,12 +1855,18 @@ fn to_next_display(
         return;
     };
 
-    let Some(source_bounds) = moves.active_display().map(Display::bounds) else {
+    let Some(source) = moves.active_display() else {
         return;
     };
+    let source_bounds = source.bounds();
     let move_focus = request.focus;
     let target = match &request.target {
-        DisplayTarget::Next => moves.other_displays().next(),
+        DisplayTarget::Next => next_in_screen_order(
+            (source.physical_bounds(), source.id()),
+            moves
+                .other_displays()
+                .map(|display| (display, display.physical_bounds(), display.id())),
+        ),
         DisplayTarget::Direction(direction) => display_in_direction(
             direction,
             source_bounds,

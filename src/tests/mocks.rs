@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, Weak};
 
@@ -221,7 +221,9 @@ struct MockDisplayData {
 struct MockStateInner {
     apps: HashMap<Pid, MockAppData>,
     windows: HashMap<WinID, MockWindowData>,
-    displays: HashMap<u32, MockDisplayData>,
+    /// Ordered by id, so the engine meets the displays in the same order
+    /// every run.
+    displays: BTreeMap<u32, MockDisplayData>,
     fullscreen_spaces: HashSet<WorkspaceId>,
     membership_failures: HashMap<WorkspaceId, u16>,
     membership_reads: HashMap<WorkspaceId, usize>,
@@ -490,7 +492,7 @@ impl MockState {
         let inner = Arc::new(RwLock::new(MockStateInner {
             apps: HashMap::new(),
             windows: HashMap::new(),
-            displays: HashMap::new(),
+            displays: BTreeMap::new(),
             fullscreen_spaces: HashSet::new(),
             membership_failures: HashMap::new(),
             membership_reads: HashMap::new(),

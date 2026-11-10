@@ -313,7 +313,9 @@ pub enum Operation {
     /// a double-click on its title bar does. `full_width` is its older name.
     #[serde(alias = "full_width")]
     Maximize,
-    /// Moves the focused window's whole column to the next available display.
+    /// Moves the focused window's whole column to the next display in screen
+    /// order: left to right by left edge, then top to bottom, wrapping from the
+    /// last to the first.
     ToNextDisplay(MoveFocus),
     /// Focuses the display that lies north, south, west, or east of the active
     /// display in the physical arrangement.
