@@ -276,6 +276,39 @@ fn a_narrowing_window_waits_for_a_slow_window_on_its_right() {
     );
 }
 
+/// Window 0 narrows by only 6 points, from 518 to 512, beside the slow
+/// window 1. Its first step comes close enough to 512 to snap there, and it
+/// still keeps its right edge beside window 1 until window 1 follows.
+#[test]
+fn a_narrowing_window_that_snaps_still_waits_for_a_slow_window() {
+    let mut harness = harness_with_widths([518, WINDOW_WIDTH, WINDOW_WIDTH]);
+    let rest = gap(&harness, 0, 1);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    for frame in 0..5 {
+        harness.advance(FRAME);
+        assert!(
+            gap(&harness, 0, 1) <= rest,
+            "desktop shows between windows 0 and 1 after frame {frame}: {:?} {:?}",
+            harness.mock_state.ax_frame(0),
+            harness.mock_state.ax_frame(1)
+        );
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle_beside(&mut harness, 0, 1, rest);
+    settle(&mut harness);
+
+    assert_landed(&mut harness);
+    assert_eq!(
+        harness.mock_state.ax_frame(0).width(),
+        512,
+        "window 0 narrowed"
+    );
+}
+
 /// An app that showed every move of one motion in time can turn slow when
 /// one of its windows gains focus, as Helium does: window 2 ahead waits for
 /// window 1 from the first step, rather than trusting it to keep up.
