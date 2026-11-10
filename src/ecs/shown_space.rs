@@ -19,7 +19,7 @@ use super::display::DisplayReconcileState;
 use super::focus::FocusWindow;
 use super::layout::LayoutStrip;
 use super::{FocusedMarker, NativeFullscreenMarker, SelectedVirtualMarker};
-use crate::manager::{Display, WindowManager};
+use crate::manager::{Display, Window, WindowManager};
 use crate::platform::WorkspaceId;
 
 /// How long after the last pass of a burst the check waits, so the native
@@ -79,6 +79,7 @@ pub(crate) struct Desktops<'w, 's> {
             Has<NativeFullscreenMarker>,
         ),
     >,
+    windows: Query<'w, 's, &'static Window>,
     window_manager: Res<'w, WindowManager>,
 }
 
@@ -129,15 +130,16 @@ impl Desktops<'_, '_> {
         Some((space, window))
     }
 
-    /// Whether `window` is in a strip its display shows.
+    /// Whether macOS has `window` in a Space a display shows. Floating
+    /// windows count too, though no strip holds them.
     fn shows(&self, window: Entity) -> bool {
-        self.strips.iter().any(|(strip, child, selected, _)| {
-            selected
-                && strip.contains(window)
-                && self
-                    .displays
-                    .get(child.parent())
-                    .is_ok_and(|(_, display)| self.shown(display.id()) == Some(strip.id()))
+        let Ok(window) = self.windows.get(window) else {
+            return false;
+        };
+        self.displays.iter().any(|(_, display)| {
+            self.shown(display.id())
+                .and_then(|space| self.window_manager.windows_in_workspace(space).ok())
+                .is_some_and(|ids| ids.contains(&window.id()))
         })
     }
 }
@@ -158,14 +160,6 @@ pub(crate) fn check_shown_spaces(
     let Some(check) = state.pending.as_mut() else {
         return;
     };
-    let waited = check.timer.tick(time.delta()).is_finished();
-    let switched = check
-        .switching
-        .as_ref()
-        .is_some_and(|switch| desktops.shown(switch.display_id) == Some(switch.space));
-    if !waited && !switched {
-        return;
-    }
     let now_focused = focused.iter().next();
     let expected = check
         .switching
@@ -174,6 +168,14 @@ pub(crate) fn check_shown_spaces(
     if now_focused != expected && now_focused != check.focused {
         debug!("Focus moved after the display change, so the Space check stops");
         state.pending = None;
+        return;
+    }
+    let waited = check.timer.tick(time.delta()).is_finished();
+    let switched = check
+        .switching
+        .as_ref()
+        .is_some_and(|switch| desktops.shown(switch.display_id) == Some(switch.space));
+    if !waited && !switched {
         return;
     }
     if let Some(Switch {
