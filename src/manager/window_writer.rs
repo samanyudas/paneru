@@ -17,8 +17,10 @@
 //! motion do not each pay for the begin and finish.
 //!
 //! A raise is an accessibility call the app serves the same way, so it
-//! queues on the same writer. Raises keep the order they were asked in, and
-//! each runs before the writes taken with it.
+//! queues on the same writer and runs before the writes taken with it. A
+//! writer keeps only the newest raise asked for, because raising a window
+//! of the frontmost app also focuses it, and an older raise landing late
+//! would take focus back from the newer one.
 
 use bevy::math::IRect;
 use std::collections::hash_map::Entry;
@@ -245,9 +247,9 @@ struct Mailbox<W> {
 struct Queue<W> {
     pending: HashMap<WriteKey, PendingWrite<W>>,
     in_flight: HashSet<WriteKey>,
-    /// Windows to raise, oldest first.
-    raises: Vec<W>,
-    /// The writer is raising windows it took from `raises`.
+    /// The newest window asked to raise.
+    raise: Option<W>,
+    /// The writer is raising the window it took from `raise`.
     raising: bool,
     /// The writer called its sink's `begin` and not yet `finish`.
     begun: bool,
@@ -265,7 +267,7 @@ impl<W> Queue<W> {
     }
 
     fn has_no_raises(&self) -> bool {
-        self.raises.is_empty() && !self.raising
+        self.raise.is_none() && !self.raising
     }
 
     fn is_finished(&self) -> bool {
@@ -275,10 +277,10 @@ impl<W> Queue<W> {
 
 /// What a writer does next.
 enum Next<W> {
-    /// Raises `raises`, then writes a batch, after beginning the sink if
+    /// Raises `raise`, then writes a batch, after beginning the sink if
     /// `begin`.
     Write {
-        raises: Vec<W>,
+        raise: Option<W>,
         batch: HashMap<WriteKey, PendingWrite<W>>,
         begin: bool,
     },
@@ -294,7 +296,7 @@ impl<W> Mailbox<W> {
             queue: Mutex::new(Queue {
                 pending: HashMap::new(),
                 in_flight: HashSet::new(),
-                raises: Vec::new(),
+                raise: None,
                 raising: false,
                 begun: false,
                 finish_now: false,
@@ -310,16 +312,16 @@ impl<W> Mailbox<W> {
         let mut queue = lock(&self.queue);
         let deadline = Instant::now() + if queue.begun { settle } else { idle };
         loop {
-            if !queue.pending.is_empty() || !queue.raises.is_empty() {
-                let raises = std::mem::take(&mut queue.raises);
-                queue.raising = !raises.is_empty();
+            if !queue.pending.is_empty() || queue.raise.is_some() {
+                let raise = queue.raise.take();
+                queue.raising = raise.is_some();
                 let batch = std::mem::take(&mut queue.pending);
                 queue.in_flight.extend(batch.keys().copied());
                 // A raise alone needs no begin.
                 let begin = !batch.is_empty() && !queue.begun;
                 queue.begun |= begin;
                 return Next::Write {
-                    raises,
+                    raise,
                     batch,
                     begin,
                 };
@@ -419,7 +421,7 @@ impl<S: WriteSink> Shared<S> {
     fn retire(&self, pid: Pid, mailbox: &Arc<Mailbox<S::Window>>) -> bool {
         let mut writers = lock(&self.writers);
         let queue = lock(&mailbox.queue);
-        if !queue.pending.is_empty() || !queue.raises.is_empty() {
+        if !queue.pending.is_empty() || queue.raise.is_some() {
             return false;
         }
         drop(queue);
@@ -437,12 +439,12 @@ impl<S: WriteSink> Shared<S> {
         loop {
             match mailbox.next(self.idle, self.settle) {
                 Next::Write {
-                    raises,
+                    raise,
                     batch,
                     begin,
                 } => {
                     objc2::rc::autoreleasepool(|_| {
-                        for window in &raises {
+                        if let Some(window) = &raise {
                             sink.raise(window);
                         }
                         if begin {
@@ -550,7 +552,7 @@ impl<S: WriteSink> WindowWriters<S> {
         mailbox.work.notify_one();
     }
 
-    /// Queues a raise of `window` for `pid`'s writer, after every raise
+    /// Queues a raise of `window` for `pid`'s writer, in place of a raise
     /// still queued. Never waits on the app.
     pub fn raise(&self, pid: Pid, window: S::Window) {
         let mut writers = lock(&self.shared.writers);
@@ -559,7 +561,7 @@ impl<S: WriteSink> WindowWriters<S> {
             self.raise_inline(Some(pid), &window);
             return;
         };
-        lock(&mailbox.queue).raises.push(window);
+        lock(&mailbox.queue).raise = Some(window);
         drop(writers);
         mailbox.work.notify_one();
     }
@@ -1343,8 +1345,8 @@ mod writer_tests {
     }
 
     /// Raising a window is a call its app serves on its main thread, and a
-    /// busy app answers it late. The caller never waits for it, raises keep
-    /// their order, and a raise alone does not begin the app.
+    /// busy app answers it late. The caller never waits for it, a newer raise
+    /// replaces one still queued, and a raise alone does not begin the app.
     #[test]
     fn a_raise_does_not_wait_for_a_hung_app() {
         let (probe, entered) = Probe::new();
@@ -1352,6 +1354,7 @@ mod writer_tests {
         probe.hold(1);
         writers.raise(1, 7);
         assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+        writers.raise(1, 8);
         let started = Instant::now();
         writers.raise(1, 9);
         let raise_took = started.elapsed();
