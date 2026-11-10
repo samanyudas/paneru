@@ -113,13 +113,23 @@ impl<W> PendingWrite<W> {
 /// Returns the frame read back after a size was written, if any read
 /// succeeded.
 pub(crate) fn apply<S: WriteSink>(sink: &mut S, write: &PendingWrite<S::Window>) -> Option<IRect> {
+    apply_from(sink, write, write.from.size())
+}
+
+/// [`apply`] for a window that has the size `taken`, which an app that
+/// limited the size gave it in place of the size in `write.from`.
+fn apply_from<S: WriteSink>(
+    sink: &mut S,
+    write: &PendingWrite<S::Window>,
+    taken: Size,
+) -> Option<IRect> {
     let window = &write.window;
     let size = write.to.size();
-    let narrows = write.to.width() < write.from.width() && write.to.min.y == write.from.min.y;
+    let narrows = size.x < taken.x && write.to.min.y == write.from.min.y;
     match (write.position, write.size) {
         (true, true) if narrows => {
             sink.set_position(window, write.to.min);
-            let moved = IRect::from_corners(write.to.min, write.to.min + write.from.size());
+            let moved = IRect::from_corners(write.to.min, write.to.min + taken);
             resize(sink, window, moved, size, write.to.min)
         }
         (true, true) => {
@@ -379,7 +389,8 @@ impl<S: WriteSink> Shared<S> {
                 let moved = IRect::from_corners(write.to.min, write.to.min + taken);
                 resize(sink, &write.window, moved, write.to.size(), write.to.min)
             }
-            _ => apply(sink, write),
+            Some(taken) => apply_from(sink, write, taken),
+            None => apply(sink, write),
         };
         if write.size || limited.is_some() {
             *lock(&write.size_limited) = observed

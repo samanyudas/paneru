@@ -386,11 +386,11 @@ impl Member {
                 left: self.x,
                 right: self.right(),
             },
-            // A write sets the new size at the old position before the new
-            // position, so the edge that a width change moves shows ahead of
-            // where it lands until the position follows. Each edge counts as
-            // no further along than with the shown width and the other edge
-            // where the engine asked for it.
+            // A write that widens sets the new size at the old position
+            // before the new position, so the edge that a width change moves
+            // shows ahead of where it lands until the position follows. Each
+            // edge counts as no further along than with the shown width and
+            // the other edge where the engine asked for it.
             Pacer::Shown(edges) => {
                 let width = edges.right - edges.left;
                 Edges {
