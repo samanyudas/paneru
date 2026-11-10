@@ -1213,3 +1213,34 @@ fn an_external_display_that_returns_showing_none_of_its_windows_shows_the_space_
         "focus returns to the window that had it"
     );
 }
+
+#[test]
+fn a_floating_window_that_had_focus_gets_it_back_after_the_space_switch() {
+    let mut harness = two_displays();
+    harness.mock_state.set_spaces_follow_focus(true);
+    let origin = ext_bounds().min + IVec2::new(100, TEST_MENUBAR_HEIGHT);
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        EXT_SPACE,
+        54,
+        IRect::from_corners(origin, origin + IVec2::new(WIDTH, HEIGHT)),
+    );
+    harness
+        .mock_state
+        .update_window(54, |window| window.fixed_size = true);
+    harness
+        .world()
+        .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    harness.mock_state.focus_window(54);
+    harness.advance(Duration::from_secs(1));
+
+    replug_showing_an_empty_space_on_the_external(&mut harness);
+    harness.advance(SETTLE);
+
+    assert_eq!(harness.mock_state.shown_space(EXT), EXT_SPACE);
+    assert_eq!(
+        harness.mock_state.focused_window_id(TEST_PROCESS_ID),
+        Some(54),
+        "focus returns to the floating window that had it"
+    );
+}
