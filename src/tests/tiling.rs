@@ -1256,6 +1256,58 @@ fn test_rule_floated_window_does_not_hold_a_slot_in_the_strip() {
         .run(commands);
 }
 
+/// A window that opens wider than its display, as an app that remembers its
+/// size from a larger display does, joins the strip no wider than the
+/// tiling area, so focusing it shows the whole window. (miri#410)
+#[test]
+fn a_new_window_wider_than_the_display_fits_the_tiling_area() {
+    let options = MainOptions {
+        padding_left: Some(4),
+        padding_right: Some(4),
+        padding_top: Some(4),
+        padding_bottom: Some(4),
+        ..MainOptions::default()
+    };
+    let mut params = WindowParams::new(".*", None);
+    params.horizontal_padding = Some(4);
+    params.vertical_padding = Some(4);
+    let config: Config = (options, vec![params]).into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_focused_window(0);
+    harness.advance(Duration::from_millis(500));
+    let opened = IRect::new(
+        0,
+        TEST_MENUBAR_HEIGHT,
+        EXT_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT,
+    );
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 1, opened);
+    harness.mock_state.focus_window(1);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_secs(2));
+
+    let tiling = IRect::new(
+        4,
+        TEST_MENUBAR_HEIGHT + 4,
+        TEST_DISPLAY_WIDTH - 4,
+        TEST_DISPLAY_HEIGHT - 4,
+    );
+    let mut shown = None;
+    harness
+        .mock_state
+        .update_window(1, |window| shown = Some(window.frame));
+    let shown = shown.expect("window 1 exists");
+    crate::assert_focused!(harness.world(), 1);
+    assert!(
+        tiling.contains(shown.min) && shown.max.cmple(tiling.max).all(),
+        "window 1 at {shown:?} must lie inside the tiling area {tiling:?}"
+    );
+}
+
 /// A window that opens floating takes focus like a tiled one, so the float
 /// toggle acts on it. macOS reports the focus before the engine tracks it.
 #[test]
