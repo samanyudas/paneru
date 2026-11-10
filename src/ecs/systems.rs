@@ -805,19 +805,17 @@ pub(super) fn finish_repositions(
 /// Animates window resizing.
 /// This is a Bevy system that runs on `Update`. It resizes windows to their target
 /// dimensions, as indicated by the `ResizeMarker` component.
-/// When a window reaches its target size, the `ResizeMarker` is removed.
+/// [`finish_resizes`] ends the resize once the window has its target size.
 ///
 /// # Arguments
 ///
 /// * `windows` - A `Populated` query for `(&mut Window, Entity, &ResizeMarker)` components.
 /// * `active_display` - An `ActiveDisplay` system parameter providing immutable access to the active display.
-/// * `commands` - Bevy commands to remove the `ResizeMarker` when resizing is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
     animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
     step: Res<AnimationStep>,
     config: Res<Config>,
-    mut commands: Commands,
 ) {
     // Matches animate_entities: exponential ease-out, frame-rate independent.
     let t = ease_out_factor(config.animation_speed(), step.secs());
@@ -841,10 +839,22 @@ pub(super) fn animate_resize_entities(
                 bounds.0,
             );
             bounds.0 = new_size;
-            if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<ResizeMarker>();
-            }
         });
+}
+
+/// Removes the `ResizeMarker` of each entity at its target size. Runs after
+/// pacing, which can hold a window wider than the size its ease snapped to.
+pub(super) fn finish_resizes(
+    resizes: Populated<(Entity, &Bounds, &ResizeMarker)>,
+    mut commands: Commands,
+) {
+    for (entity, bounds, ResizeMarker(target)) in &resizes {
+        if bounds.0 == *target
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<ResizeMarker>();
+        }
+    }
 }
 
 /// Republishes the pointer and gesture events onto [`InputEvent`], so the input
