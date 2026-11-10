@@ -978,3 +978,111 @@ fn a_stack_the_display_change_puts_back_stays_unstacked_after_a_person_unstacks_
         "11 and 12 stay apart, got {columns:?}"
     );
 }
+
+/// As seen on 10 November 2026 with the external display as the main display:
+/// macOS destroys the built-in display's Space on unplug and keeps its windows
+/// in a Space it does not show. On replug it shows the old main Space, which
+/// holds the external display's windows, on the built-in display, and moves the
+/// built-in display's windows into a new Space there that it does not show.
+fn replug_into_a_hidden_space(harness: &mut TestHarness) {
+    harness
+        .world()
+        .write_message(Event::DisplayConfigured { display_id: EXT });
+    harness.advance(Duration::from_millis(20));
+    harness.mock_state.remove_display(EXT);
+    carry(
+        harness,
+        &[50, 51, 52, 53],
+        ext_bounds(),
+        builtin_alone_bounds(),
+    );
+    carry(
+        harness,
+        &[10, 11, 12],
+        builtin_bounds(),
+        builtin_alone_bounds(),
+    );
+    for id in [10, 11, 12] {
+        harness
+            .mock_state
+            .update_window(id, |window| window.workspace_id = BUILTIN_EMPTY_SPACE);
+    }
+    harness.mock_state.add_display(
+        BUILTIN,
+        builtin_alone_bounds(),
+        vec![EXT_SPACE, BUILTIN_EMPTY_SPACE],
+    );
+    harness.world().write_message(Event::SpaceDestroyed {
+        space_id: BUILTIN_SPACE,
+    });
+    harness
+        .world()
+        .write_message(Event::DisplayRemoved { display_id: EXT });
+    harness.advance(SETTLE);
+
+    harness
+        .world()
+        .write_message(Event::DisplayConfigured { display_id: EXT });
+    harness.advance(Duration::from_millis(20));
+    for id in [10, 11, 12] {
+        harness
+            .mock_state
+            .update_window(id, |window| window.workspace_id = NEW_BUILTIN_SPACE);
+    }
+    harness
+        .mock_state
+        .add_display(EXT, ext_bounds(), vec![BUILTIN_EMPTY_SPACE]);
+    harness.mock_state.add_display(
+        BUILTIN,
+        builtin_bounds(),
+        vec![EXT_SPACE, NEW_BUILTIN_SPACE],
+    );
+    carry(
+        harness,
+        &[10, 11, 12, 50, 51, 52, 53],
+        builtin_alone_bounds(),
+        builtin_bounds(),
+    );
+    harness.world().write_message(Event::SpaceCreated {
+        space_id: NEW_BUILTIN_SPACE,
+    });
+    harness
+        .world()
+        .write_message(Event::DisplayAdded { display_id: EXT });
+    harness.advance(Duration::from_millis(100));
+    harness.mock_state.os_activate_display(EXT);
+    harness.advance(SETTLE);
+}
+
+#[test]
+fn a_display_left_showing_none_of_its_windows_shows_the_space_that_holds_them() {
+    let mut harness = two_displays();
+    harness.mock_state.set_spaces_follow_focus(true);
+    harness.mock_state.focus_window(51);
+    harness.advance(Duration::from_secs(1));
+
+    replug_into_a_hidden_space(&mut harness);
+
+    assert_eq!(
+        harness.mock_state.shown_space(BUILTIN),
+        NEW_BUILTIN_SPACE,
+        "the built-in display shows the Space that holds its windows"
+    );
+    assert_eq!(
+        layout_on(harness.world(), NEW_BUILTIN_SPACE),
+        (BUILTIN, vec![vec![10], vec![11, 12]])
+    );
+    let ext_space = harness.mock_state.shown_space(EXT);
+    assert_eq!(
+        layout_on(harness.world(), ext_space),
+        (EXT, vec![vec![50], vec![51, 52], vec![53]])
+    );
+    for id in [50, 51, 52, 53] {
+        assert_eq!(harness.mock_state.space_of(id), ext_space, "window {id}");
+    }
+    assert_eq!(
+        harness.mock_state.focused_window_id(TEST_PROCESS_ID),
+        Some(51),
+        "focus returns to the window that had it"
+    );
+}
