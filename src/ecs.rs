@@ -499,8 +499,8 @@ pub struct Scrolling {
     /// The offset the strip settles on once the swipe has ended. Only set
     /// with `auto_center` off; see `scroll::settle_strip`.
     pub settle: Option<f64>,
-    /// Where the strip was when the settle began, and how long it has run.
-    /// Unset until the settle's first step.
+    /// Where the strip was when the settle began, how long it has run, and
+    /// the speed it carried on. Unset until the settle's first step.
     pub ease: Option<SettleEase>,
     /// The top window of the column a window-landing swipe would land on, as
     /// of its last detent pulse.
@@ -524,6 +524,9 @@ pub struct Scrolling {
 pub struct SettleEase {
     pub from: f64,
     pub elapsed: f64,
+    /// The ease's starting slope, which carries on the strip's speed at the
+    /// lift. See `scroll::handoff_slope`.
+    pub slope: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -749,8 +749,9 @@ pub(super) fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
 /// picks the column [`landing`] gives for that offset, and focuses the window
 /// in it that had focus last. A strip that fits the viewport springs back to
 /// where the swipe began instead, and focus stays. The strip then slides
-/// there on an exponential ease-in-out over [`settle_duration`]: it gathers
-/// speed from where the fingers left it, then slows into the column.
+/// there over [`settle_duration`] on [`settle_curve`]: it carries on at the
+/// speed it had when the fingers lifted, or gathers speed from rest, then
+/// slows into the column.
 ///
 /// A window-landing swipe ignores the momentum: it lands one column on from
 /// where it began, or back there, as [`Step`] decides, and pulses if that is
@@ -829,8 +830,6 @@ fn settle_strip(
         };
         let target = f64::from(target);
         scroll.settle = Some(target);
-        // The ease takes the strip from here, at its own pace.
-        scroll.velocity = 0.0;
         if window_landing {
             // The fingers chose the step. The ease starts from where the
             // resisting strip shows.
@@ -862,11 +861,20 @@ fn settle_strip(
         return;
     }
 
+    let duration = settle_duration(&config);
     let from = scroll.position;
-    let ease = scroll.ease.get_or_insert(SettleEase { from, elapsed: 0.0 });
+    let slope = handoff_slope(scroll.velocity * px_per_velocity, target - from, duration);
+    let ease = scroll.ease.get_or_insert(SettleEase {
+        from,
+        elapsed: 0.0,
+        slope,
+    });
     ease.elapsed += step.secs();
-    let (from, elapsed) = (ease.from, ease.elapsed);
-    let progress = ease_in_out_expo(elapsed / settle_duration(&config));
+    let ease = *ease;
+    // The ease carries the strip's speed from here.
+    scroll.velocity = 0.0;
+    let progress = settle_curve(ease.elapsed / duration, ease.slope);
+    let from = ease.from;
 
     if progress >= 1.0 {
         position.x = round_px(target);
@@ -879,29 +887,38 @@ fn settle_strip(
     scroll.position = from + (target - from) * progress;
 }
 
-/// How many keyboard ease time constants (`1 / animation_speed`) a settle
-/// lasts. At this length the settle's fastest moment, halfway, matches the
-/// speed a keyboard slide starts at, so it is never more abrupt than one.
+/// How long a settle lasts, in keyboard ease time constants
+/// (`1 / animation_speed`).
 const SETTLE_TIME_CONSTANTS: f64 = 7.0;
 
-/// How long a settle lasts: 0.5 s at Miri's `animation_speed` of 14.
+/// How long a settle lasts: 0.5 s at Miri's `animation_speed` of 14. A faster
+/// `animation_speed` settles sooner, as it slides sooner.
 fn settle_duration(config: &Config) -> f64 {
     SETTLE_TIME_CONSTANTS / config.animation_speed()
 }
 
-/// The exponential ease-in-out: the share of a settle covered at `progress`
-/// through its time, from 0 to 1. It is scaled to start at exactly 0 and end
-/// at exactly 1, where the textbook curve jumps by 2^-11 at each end.
-pub(crate) fn ease_in_out_expo(progress: f64) -> f64 {
-    const STEEPNESS: f64 = 10.0;
-    let floor = (-STEEPNESS).exp2();
-    let half = |u: f64| ((STEEPNESS * (2.0 * u - 1.0)).exp2() - floor) / (1.0 - floor) / 2.0;
-    let u = progress.clamp(0.0, 1.0);
-    if u < 0.5 {
-        half(u)
-    } else {
-        1.0 - half(1.0 - u)
+/// The steepest start [`settle_curve`] takes without overshooting.
+const MAX_HANDOFF_SLOPE: f64 = 3.0;
+
+/// The starting slope of [`settle_curve`] that carries on `velocity`, in
+/// points per second, for a settle that moves `distance` points over
+/// `duration` seconds. A strip moving away from its target, or still, starts
+/// from rest. A slope of 1 starts at the settle's average speed, and the slope
+/// is capped where the curve would overshoot.
+pub(crate) fn handoff_slope(velocity: f64, distance: f64, duration: f64) -> f64 {
+    if distance.abs() < f64::EPSILON {
+        return 0.0;
     }
+    (velocity * duration / distance).clamp(0.0, MAX_HANDOFF_SLOPE)
+}
+
+/// The share of a settle covered at `progress` through its time, from 0 to 1:
+/// a cubic that starts at `slope` times the average speed and ends at rest.
+/// From rest it is smoothstep, whose fastest moment, halfway, is 1.5 times the
+/// average speed. At [`MAX_HANDOFF_SLOPE`] it is the cubic ease-out.
+pub(crate) fn settle_curve(progress: f64, slope: f64) -> f64 {
+    let u = progress.clamp(0.0, 1.0);
+    slope * u * (1.0 - u).powi(2) + u * u * (3.0 - 2.0 * u)
 }
 
 /// Focuses `window`, the window a settle lands on, unless it has focus.

@@ -9,7 +9,7 @@ use bevy::time::TimeUpdateStrategy;
 
 use crate::commands::{Command, Direction, Operation};
 use crate::config::{Config, MainOptions};
-use crate::ecs::scroll::ease_in_out_expo;
+use crate::ecs::scroll::{handoff_slope, settle_curve};
 use crate::ecs::systems::ease_out_factor;
 use crate::ecs::{RepositionMarker, Scrolling};
 use crate::events::Event;
@@ -183,11 +183,11 @@ fn swiping(world: &mut World) -> Option<bool> {
         .map(|scrolling| scrolling.is_user_swiping)
 }
 
-/// Once the fingers lift, the strip slides back on an exponential
-/// ease-in-out over 7 / `animation_speed` seconds: it starts from rest, with
-/// no jump at the lift, and slows into where it was.
+/// Once the fingers lift, a strip that fits the display slides back over
+/// 7 / `animation_speed` seconds. It resisted the fingers, so it starts from
+/// rest, with no jump at the lift, and slows into where it was.
 #[test]
-fn a_swipe_settles_on_an_exponential_ease_in_out() {
+fn a_spring_back_eases_in_and_out() {
     let mut harness = harness();
     let rest = x(&harness);
     harness.world().write_message(Event::Swipe {
@@ -215,11 +215,50 @@ fn a_swipe_settles_on_an_exponential_ease_in_out() {
     assert_eq!(left.len(), 32, "the settle lasts {duration} s: {left:?}");
     for (pass, at) in left.iter().enumerate().skip(1) {
         #[allow(clippy::cast_precision_loss, reason = "a few dozen passes")]
-        let progress = ease_in_out_expo(pass as f64 * frame / duration);
+        let progress = settle_curve(pass as f64 * frame / duration, 0.0);
         let want = left[0] * (1.0 - progress);
         assert!(
             (at - want).abs() <= 1.0,
             "pass {pass} left {at:.0}, expected {want:.0}: {left:?}"
         );
     }
+}
+
+/// The settle curve runs from 0 to 1 without overshooting, for every slope
+/// a hand-off can give it, and starts at that slope.
+#[test]
+fn the_settle_curve_starts_at_its_slope_and_never_overshoots() {
+    for slope in [0.0, 0.5, 1.0, 2.0, 3.0] {
+        assert!(settle_curve(0.0, slope).abs() < 1e-12);
+        assert!((settle_curve(1.0, slope) - 1.0).abs() < 1e-12);
+        let h = 1e-6;
+        let start = settle_curve(h, slope) / h;
+        assert!(
+            (start - slope).abs() < 1e-3,
+            "slope {slope} starts at {start}"
+        );
+        let mut previous = 0.0;
+        for step in 1..=1000 {
+            let at = settle_curve(f64::from(step) / 1000.0, slope);
+            assert!(
+                at >= previous && at <= 1.0 + 1e-12,
+                "slope {slope}: {at} after {previous}"
+            );
+            previous = at;
+        }
+    }
+}
+
+/// A strip moving toward its landing carries its speed into the settle. One
+/// moving away, or still, starts from rest, and a fast one is capped where
+/// the curve would overshoot.
+#[test]
+fn a_settle_carries_on_the_speed_toward_its_landing() {
+    // 400 points over 0.5 s averages 800 points per second.
+    assert!((handoff_slope(800.0, 400.0, 0.5) - 1.0).abs() < 1e-12);
+    assert!((handoff_slope(-800.0, -400.0, 0.5) - 1.0).abs() < 1e-12);
+    assert!(handoff_slope(-800.0, 400.0, 0.5).abs() < 1e-12);
+    assert!(handoff_slope(0.0, 400.0, 0.5).abs() < 1e-12);
+    assert!(handoff_slope(800.0, 0.0, 0.5).abs() < 1e-12);
+    assert!((handoff_slope(10_000.0, 400.0, 0.5) - 3.0).abs() < 1e-12);
 }
