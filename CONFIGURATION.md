@@ -82,7 +82,7 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | `vertical` | Boolean | `true` | Interpret the vertical gestures with `fingers_count` or ignore them. Enabling this allows using vertical swipe gestures to change virtual desktops. |
 | `paging` | Boolean | `false` | Focus one adjacent window for each horizontal gesture threshold instead of sliding the strip freely. |
 | `page_distance_cm` | Positive float | `2.0` | Approximate horizontal finger travel in centimeters required for each page when `paging = true`. |
-| `window_landing` | Boolean | `false` | Let the strip follow the fingers, then end the swipe on one window: the one under the display center, or the next one for a quick flick. The swipe never glides past it on momentum. Ignored when `paging = true` or `auto_center = true`. |
+| `window_landing` | Boolean | `false` | Let the strip follow the fingers, then end the swipe one window on from where it began. A swipe steps once the fingers have moved the strip 5% of the display width, about 2 cm on a trackpad, or on a quick flick; a shorter, slower swipe springs back. The swipe never glides further on momentum. Ignored when `paging = true` or `auto_center = true`. |
 | `haptics` | Boolean | `true` | Emit a haptic pulse after each confirmed paging focus change, and each time the window a `window_landing` swipe would land on changes. Set to `false` to disable pulses. |
 
 When `fingers_count` is omitted or set below 3, Paneru does not intercept native macOS gestures. If macOS uses three-finger horizontal swipes for Spaces, prefer `[swipe.scroll]` with a modifier or configure a different finger count.
@@ -109,7 +109,7 @@ fingers_count = 3
 window_landing = true
 ```
 
-The trackpad clicks each time a different window reaches the display center, which is the window the strip lands on if you lift your fingers then.
+The trackpad clicks when the swipe has moved far enough to step, which is the window the strip lands on if you lift your fingers then, and again if you bring it back.
 
 ### `[swipe.scroll]`
 | Option | Type | Default | Description |

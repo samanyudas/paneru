@@ -502,6 +502,9 @@ pub struct Scrolling {
     /// The top window of the column a window-landing swipe would land on, as
     /// of its last detent pulse.
     pub detent: Option<Entity>,
+    /// The strip offset where the fingers touched down. A window-landing
+    /// swipe steps by how far they moved the strip from here.
+    pub origin: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1575,6 +1578,7 @@ mod tests {
                     anchor: 0.0,
                     settle: None,
                     detent: None,
+                    origin: 0.0,
                 });
             }),
             "overlay must rerun to hide when Scrolling starts"

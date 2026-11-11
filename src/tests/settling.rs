@@ -552,6 +552,10 @@ fn record_pulses(
 /// Miri's Window by window swipe on four 700-point columns, with column 0
 /// focused at the left edge.
 fn window_landing_harness(haptics: bool) -> TestHarness {
+    window_landing_harness_with_widths(&[700, 700, 700, 700], haptics)
+}
+
+fn window_landing_harness_with_widths(widths: &[i32], haptics: bool) -> TestHarness {
     let config = Config::try_from(
         format!(
             "[options]\nanimation_speed = 14\n[swipe.gesture]\nfingers_count = 3\nwindow_landing = true\nhaptics = {haptics}\n"
@@ -559,7 +563,7 @@ fn window_landing_harness(haptics: bool) -> TestHarness {
         .as_str(),
     )
     .unwrap();
-    let mut harness = harness_with_config(&[700, 700, 700, 700], config);
+    let mut harness = harness_with_config(widths, config);
     harness.app.init_resource::<Pulses>();
     harness.app.add_systems(PostUpdate, record_pulses);
     // Above every window, so focus follows mouse never picks a window the
@@ -599,11 +603,11 @@ fn window_landing_short_drag_springs_back_to_its_column() {
     assert_eq!(pulses(&mut harness), 0);
 }
 
-/// A slow drag that brings the next column under the viewport center pulses
-/// once as it does, and lands on that column when the fingers lift, flush
-/// with the viewport edge.
+/// A slow drag that moves the strip far enough to step pulses once as it
+/// does, and lands on the next column when the fingers lift, flush with the
+/// viewport edge.
 #[test]
-fn window_landing_drag_pulses_as_the_next_column_takes_the_center() {
+fn window_landing_drag_pulses_once_it_has_moved_far_enough() {
     let mut harness = window_landing_harness(true);
     drag(&mut harness, 0.008, 40);
     assert_eq!(pulses(&mut harness), 1, "one detent while the fingers move");
@@ -660,4 +664,42 @@ fn window_landing_without_haptics_lands_with_no_pulse() {
 
     assert_focused!(harness.world(), 2);
     assert_eq!(pulses(&mut harness), 0);
+}
+
+/// Windows nearly as wide as the display step with the same short drag as
+/// narrow ones, both ways. Waiting for the next one to reach the viewport
+/// center would take most of a trackpad width.
+#[test]
+fn window_landing_steps_between_wide_windows_with_a_short_drag() {
+    let mut harness = window_landing_harness_with_widths(&[820, 820, 820], true);
+    drag(&mut harness, 0.004, 25);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 1);
+    assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 820);
+
+    drag(&mut harness, -0.004, 25);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 0);
+    assert_eq!(window_x(harness.world(), 0), 0);
+    assert_eq!(pulses(&mut harness), 2);
+}
+
+/// A second swipe that catches the first one's settle steps on from where
+/// the first was headed.
+#[test]
+fn window_landing_second_quick_swipe_steps_again() {
+    let mut harness = window_landing_harness(true);
+    drag(&mut harness, 0.03, 3);
+    harness.advance(ONE_FRAME * 4);
+    assert!(
+        is_scrolling(harness.world()),
+        "the first settle is still running"
+    );
+    send(&mut harness, Event::TouchpadDown);
+    drag(&mut harness, 0.03, 3);
+    harness.advance(SETTLE);
+
+    assert_focused!(harness.world(), 2);
+    assert_eq!(window_x(harness.world(), 2), TEST_DISPLAY_WIDTH - 700);
+    assert_eq!(pulses(&mut harness), 2);
 }
