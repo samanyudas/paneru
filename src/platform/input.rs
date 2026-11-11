@@ -59,6 +59,8 @@ struct Touch {
     /// Whether the finger landed this event, which suppresses delta tracking
     /// until every finger is down.
     began: bool,
+    /// Whether the finger left the trackpad this event.
+    lifted: bool,
 }
 
 impl Touch {
@@ -74,6 +76,9 @@ impl Touch {
                     y: position.y,
                     device_width_points: touch.deviceSize().width,
                     began: touch.phase() == NSTouchPhase::Began,
+                    lifted: touch
+                        .phase()
+                        .intersects(NSTouchPhase::Ended | NSTouchPhase::Cancelled),
                 }
             })
             .collect()
@@ -657,6 +662,12 @@ impl InputHandler {
         false
     }
 
+    fn send_touchpad_up(&self) {
+        if let Some(events) = &self.events {
+            _ = events.send(Event::TouchpadUp);
+        }
+    }
+
     /// Handles swipe gesture events. Routes to horizontal `Swipe` or vertical
     /// `VerticalSwipe` based on axis dominance. Returns true to intercept the event.
     fn handle_swipe(&mut self, event: &CGEvent) -> bool {
@@ -697,10 +708,24 @@ impl InputHandler {
                 // AppKit interleaves phase events with an empty touch set
                 // between usable samples. They do not mean the fingers lifted.
                 // That's why empty finger counts don't trigger a reset.
-                if should_reset_swipe_anchors(fingers.len(), self.swipe_accumulator.anchors.len()) {
+                let anchored = self.swipe_accumulator.anchors.len();
+                if should_reset_swipe_anchors(fingers.len(), anchored) {
                     self.swipe_accumulator.reset();
+                    if anchored > 0 {
+                        // The swipe's fingers changed, which ends it.
+                        self.send_touchpad_up();
+                    }
                 }
                 return false;
+            }
+            // The gesture phase can end while the fingers stay down, or never
+            // end, so a finger leaving the trackpad is what ends a swipe.
+            if fingers.iter().any(|finger| finger.lifted) {
+                if !self.swipe_accumulator.anchors.is_empty() {
+                    self.swipe_accumulator.reset();
+                    self.send_touchpad_up();
+                }
+                return true;
             }
             if fingers.iter().any(|finger| finger.began) {
                 self.invalid_device_size_warned = false;
