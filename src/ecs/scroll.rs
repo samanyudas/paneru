@@ -274,24 +274,24 @@ impl Plugin for ScrollEventsPlugin {
         app.init_resource::<PageGestureState>();
         app.add_message::<PageFocusRequest>();
         app.add_message::<PageHapticRequest>();
-        app.add_systems(
-            bevy::app::PostUpdate,
-            play_page_haptic
-                .in_set(super::PostUpdateSet::Ui)
-                .run_if(on_message::<PageHapticRequest>),
-        );
         let mission_control_inactive = |mission_control: Option<Res<MissionControlActive>>| {
             mission_control.is_none_or(|active| !active.0)
         };
 
+        // The pulse plays before Dispatch, so a slow focus raise this frame
+        // cannot hold it back past the finger lift.
         app.add_systems(
             PreUpdate,
-            paging_gesture
-                .in_set(PreUpdateSet::Demux)
-                .after(super::systems::demux_input_events)
-                .run_if(mission_control_inactive)
-                .run_if(paging_enabled)
-                .run_if(on_message::<InputEvent>.or_else(paging_active)),
+            (
+                paging_gesture
+                    .after(super::systems::demux_input_events)
+                    .run_if(mission_control_inactive)
+                    .run_if(paging_enabled)
+                    .run_if(on_message::<InputEvent>.or_else(paging_active)),
+                play_page_haptic.run_if(on_message::<PageHapticRequest>),
+            )
+                .chain()
+                .in_set(PreUpdateSet::Demux),
         );
 
         // Only the gesture system is gated on an input event. The rest of the
