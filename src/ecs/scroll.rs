@@ -349,6 +349,14 @@ fn swipe_gesture(
         && scrolling.fingers_down != *fingers_down
     {
         scrolling.fingers_down = *fingers_down;
+        // Fingers that held still before they lifted made no flick, whatever
+        // speed they moved at before the hold.
+        if !*fingers_down
+            && lands_on_window(&config, scrolling.input)
+            && time.elapsed().abs_diff(scrolling.last_event) > scrolling.input.idle_threshold()
+        {
+            scrolling.velocity = 0.0;
+        }
     }
     if !touchpad_down && !has_scroll_event {
         return;
@@ -449,13 +457,18 @@ pub(super) fn swiping_timeout(
         // Fingers held still on a window-landing swipe keep the strip where
         // they hold it. The longer limit only covers a lift the trackpad never
         // reported.
-        let idle_threshold = if scroll.fingers_down && lands_on_window(&config, scroll.input) {
+        let held = scroll.fingers_down && lands_on_window(&config, scroll.input);
+        let idle_threshold = if held {
             HELD_FINGERS_TIMEOUT
         } else {
             scroll.input.idle_threshold()
         };
         if time.elapsed().abs_diff(scroll.last_event) > idle_threshold {
             scroll.is_user_swiping = false;
+            if held {
+                // Fingers held this long made no flick.
+                scroll.velocity = 0.0;
+            }
             // `settle_strip` owns the active strip from here, and focus goes to
             // the column it lands on, not to whatever slid under the pointer.
             if settling && active {

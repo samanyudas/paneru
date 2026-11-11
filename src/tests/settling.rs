@@ -767,6 +767,22 @@ fn window_landing_waits_for_held_fingers_to_lift() {
     assert_eq!(pulses(&mut harness), 1);
 }
 
+/// A quick move held still before the lift is no flick. Too short to step,
+/// it springs back with no pulse.
+#[test]
+fn window_landing_hold_before_the_lift_is_no_flick() {
+    let mut harness = window_landing_harness(true);
+    send(&mut harness, Event::TouchpadDown);
+    move_fingers(&mut harness, 0.03, 3);
+    harness.advance(Duration::from_millis(500));
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(SETTLE);
+
+    assert_focused!(harness.world(), 0);
+    assert_eq!(window_x(harness.world(), 0), 0);
+    assert_eq!(pulses(&mut harness), 0);
+}
+
 /// Where the next column already shows in full, the strip resists from the
 /// start, so it shows less than the fingers moved. The detent still clicks
 /// at the same finger travel that steps at release.
