@@ -101,7 +101,8 @@ type ChangedWindowFrames<'w, 's> = Populated<
     ),
 >;
 
-const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
+/// How close an ease comes to its target before it snaps there.
+pub(crate) const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
 const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
 // Real events (input, IPC, workspace changes, ...) wake the pump immediately

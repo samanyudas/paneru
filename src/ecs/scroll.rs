@@ -20,6 +20,7 @@ use crate::config::swipe::{SwipeGestureDirection, focus_direction};
 use crate::ecs::focus::{FocusHistory, PageHapticRequest};
 use crate::ecs::layout::{Column, LayoutStrip, strip_content_range};
 use crate::ecs::params::{ActiveDisplay, Windows};
+use crate::ecs::systems::{ANIAMTE_SNAP_THRESHOLD, AnimationStep, ease_out_factor};
 use crate::ecs::{
     ActiveWorkspaceMarker, ManualStripOffset, MissionControlActive, Position, PreUpdateSet,
     RepositionMarker, ScrollInput, Scrolling, SendMessageTrigger, UpdateSet,
@@ -744,10 +745,9 @@ pub(super) fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
 /// On lift it projects the momentum to where the strip would come to rest,
 /// picks the column [`landing`] gives for that offset, and focuses the window
 /// in it that had focus last. A strip that fits the viewport springs back to
-/// where the swipe began instead, and focus stays. The strip then travels
-/// there on a critically damped spring that starts at the glide's velocity:
-/// with the target at the projected rest, at twice the deceleration rate,
-/// it begins without a jolt and lands without overshoot.
+/// where the swipe began instead, and focus stays. The strip then slides
+/// there on the exponential ease-out of a keyboard slide, at the same
+/// `animation_speed`: each frame covers a share of the distance left.
 ///
 /// A window-landing swipe ignores the momentum: it lands one column on from
 /// where it began, or back there, as [`Step`] decides, and pulses if that is
@@ -760,12 +760,10 @@ fn settle_strip(
     windows: Windows,
     focus_history: Res<FocusHistory>,
     config: Res<Config>,
-    time: Res<Time>,
+    step: Res<AnimationStep>,
     mut haptics: MessageWriter<PageHapticRequest>,
     mut commands: Commands,
 ) {
-    const DONE_PX: f64 = 0.5;
-
     if !settles(&config, &active_display) {
         return;
     }
@@ -828,20 +826,12 @@ fn settle_strip(
         };
         let target = f64::from(target);
         scroll.settle = Some(target);
+        // The ease takes the strip from here, at its own pace.
+        scroll.velocity = 0.0;
         if window_landing {
-            // The fingers chose the step. The spring starts from where the
-            // resisting strip shows, and from rest if the fingers were
-            // pulling it away from the target.
+            // The fingers chose the step. The ease starts from where the
+            // resisting strip shows.
             scroll.position = f64::from(position.x);
-            // The spring overshoots when it starts toward the target faster
-            // than it would close the gap itself.
-            let offset = scroll.position - target;
-            let limit = omega_for(deceleration) * offset.abs() / px_per_velocity.abs();
-            scroll.velocity = if scroll.velocity * px_per_velocity * offset < 0.0 {
-                scroll.velocity.clamp(-limit, limit)
-            } else {
-                0.0
-            };
             if config.swipe_gesture_haptics() && column.top() != scroll.detent {
                 haptics.write(PageHapticRequest);
             }
@@ -869,16 +859,10 @@ fn settle_strip(
         return;
     }
 
-    let omega = omega_for(deceleration);
-    let dt = time.delta_secs_f64().min(MAX_STEP_SECS);
-    let offset = scroll.position - target;
-    let velocity = scroll.velocity * px_per_velocity;
-    let decay = (-omega * dt).exp();
-    let drive = velocity + omega * offset;
-    let offset = (offset + drive * dt) * decay;
-    let velocity = (velocity - omega * drive * dt) * decay;
+    let t = f64::from(ease_out_factor(config.animation_speed(), step.secs()));
+    let offset = (scroll.position - target) * (1.0 - t);
 
-    if offset.abs() < DONE_PX && velocity.abs() * MAX_STEP_SECS < DONE_PX {
+    if offset.abs() <= f64::from(ANIAMTE_SNAP_THRESHOLD) {
         position.x = round_px(target);
         if let Some(window) = scroll.landing_focus.take() {
             focus(window, &windows, &mut commands);
@@ -887,7 +871,6 @@ fn settle_strip(
         return;
     }
     scroll.position = target + offset;
-    scroll.velocity = velocity / px_per_velocity;
 }
 
 /// Focuses `window`, the window a settle lands on, unless it has focus.
@@ -896,12 +879,6 @@ fn focus(window: Entity, windows: &Windows, commands: &mut Commands) {
     if focused != Some(window) {
         focus_with_verification(window, focused, None, FocusSource::Other, commands);
     }
-}
-
-/// The settle spring's rate: twice the deceleration rate, so a settle that
-/// starts at the glide's velocity toward its projected rest never overshoots.
-fn omega_for(deceleration: f64) -> f64 {
-    2.0 * deceleration
 }
 
 /// Pulses while the fingers move a window-landing swipe, each time the

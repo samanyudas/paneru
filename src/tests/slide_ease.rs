@@ -9,8 +9,8 @@ use bevy::time::TimeUpdateStrategy;
 
 use crate::commands::{Command, Direction, Operation};
 use crate::config::{Config, MainOptions};
-use crate::ecs::RepositionMarker;
 use crate::ecs::systems::ease_out_factor;
+use crate::ecs::{RepositionMarker, Scrolling};
 use crate::events::Event;
 use crate::platform::WinID;
 
@@ -25,11 +25,13 @@ const ACTIVE_FRAME: Duration = Duration::from_millis(16);
 const IDLE_SLEEP: Duration = Duration::from_millis(500);
 const FOCUSED: WinID = 2;
 
-/// Windows 0, 1 and 2 in a row, at rest with window 2 focused.
+/// Windows 0, 1 and 2 in a row, at rest with window 2 focused. They fill
+/// the display, so a swipe springs back.
 fn harness() -> TestHarness {
     let config: Config = (
         MainOptions {
             animation_speed: Some(SPEED),
+            swipe_gesture_fingers: Some(3),
             ..Default::default()
         },
         vec![],
@@ -169,4 +171,52 @@ fn a_late_frame_during_a_swap_counts_its_whole_time() {
         ease_share(late, steps[0]),
         "the late pass after the start",
     );
+}
+
+/// Whether the fingers are on the trackpad, while a swipe or its settle runs.
+fn swiping(world: &mut World) -> Option<bool> {
+    world
+        .query::<&Scrolling>()
+        .iter(world)
+        .next()
+        .map(|scrolling| scrolling.is_user_swiping)
+}
+
+/// Once the fingers lift, the strip slides back on a keyboard slide's
+/// ease-out: each pass covers the same share of the distance left, so the
+/// first pass moves the farthest and the strip never overshoots.
+#[test]
+fn a_swipe_settles_on_the_keyboard_ease() {
+    let mut harness = harness();
+    let rest = x(&harness);
+    harness.world().write_message(Event::Swipe {
+        delta: 0.3,
+        fingers: 3,
+        distance_cm: 0.0,
+    });
+    let mut left = Vec::new();
+    for _ in 0..200 {
+        pass(&mut harness, ACTIVE_FRAME);
+        match swiping(harness.world()) {
+            None => break,
+            Some(true) => {}
+            Some(false) => left.push(x(&harness) - rest),
+        }
+    }
+    // The windows follow the strip on the next pass.
+    pass(&mut harness, ACTIVE_FRAME);
+    assert_eq!(x(&harness), rest, "the strip springs back to where it was");
+    assert!(left.len() > 3, "the settle took a few passes: {left:?}");
+    assert!(left[0].abs() > 10.0, "the swipe moved the strip: {left:?}");
+
+    let keep = 1.0 - f64::from(ease_out_factor(SPEED, ACTIVE_FRAME.as_secs_f64()));
+    for pair in left.windows(2) {
+        assert!(
+            (pair[1] - pair[0] * keep).abs() <= 1.0,
+            "a pass kept {:.0} of {:.0}, expected {:.0}: {left:?}",
+            pair[1],
+            pair[0],
+            pair[0] * keep
+        );
+    }
 }
