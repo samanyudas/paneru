@@ -499,6 +499,21 @@ pub struct Scrolling {
     /// The offset the strip settles on once the swipe has ended. Only set
     /// with `auto_center` off; see `scroll::settle_strip`.
     pub settle: Option<f64>,
+    /// The top window of the column a window-landing swipe would land on, as
+    /// of its last detent pulse.
+    pub detent: Option<Entity>,
+    /// The strip offset where the fingers touched down. A window-landing
+    /// swipe steps by how far they moved the strip from here.
+    pub origin: f64,
+    /// The window a window-landing settle focuses once it lands.
+    pub landing_focus: Option<Entity>,
+    /// A window in the column a window-landing swipe began on: the focused
+    /// one, or the one a caught settle was headed for.
+    pub start: Option<Entity>,
+    /// Between the trackpad reporting the fingers down and reporting them
+    /// lifted. Fingers held still send no swipe events, so this, not a pause,
+    /// ends a window-landing swipe.
+    pub fingers_down: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1571,6 +1586,11 @@ mod tests {
                     input: super::ScrollInput::Gesture,
                     anchor: 0.0,
                     settle: None,
+                    detent: None,
+                    origin: 0.0,
+                    landing_focus: None,
+                    start: None,
+                    fingers_down: false,
                 });
             }),
             "overlay must rerun to hide when Scrolling starts"
