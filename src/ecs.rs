@@ -505,6 +505,8 @@ pub struct Scrolling {
     /// The strip offset where the fingers touched down. A window-landing
     /// swipe steps by how far they moved the strip from here.
     pub origin: f64,
+    /// The window a window-landing settle focuses once it lands.
+    pub landing_focus: Option<Entity>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1579,6 +1581,7 @@ mod tests {
                     settle: None,
                     detent: None,
                     origin: 0.0,
+                    landing_focus: None,
                 });
             }),
             "overlay must rerun to hide when Scrolling starts"

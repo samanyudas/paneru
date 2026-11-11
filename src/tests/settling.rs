@@ -672,12 +672,12 @@ fn window_landing_without_haptics_lands_with_no_pulse() {
 #[test]
 fn window_landing_steps_between_wide_windows_with_a_short_drag() {
     let mut harness = window_landing_harness_with_widths(&[820, 820, 820], true);
-    drag(&mut harness, 0.004, 25);
+    drag(&mut harness, 0.004, 45);
     harness.advance(SETTLE);
     assert_focused!(harness.world(), 1);
     assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 820);
 
-    drag(&mut harness, -0.004, 25);
+    drag(&mut harness, -0.004, 45);
     harness.advance(SETTLE);
     assert_focused!(harness.world(), 0);
     assert_eq!(window_x(harness.world(), 0), 0);
@@ -702,4 +702,40 @@ fn window_landing_second_quick_swipe_steps_again() {
     assert_focused!(harness.world(), 2);
     assert_eq!(window_x(harness.world(), 2), TEST_DISPLAY_WIDTH - 700);
     assert_eq!(pulses(&mut harness), 2);
+}
+
+/// The strip follows the fingers one to one, and a long drag stretches with
+/// resistance once the next column shows in full, so the landing never jumps
+/// back across columns the fingers pulled past.
+#[test]
+fn window_landing_resists_past_the_next_column() {
+    let mut harness = window_landing_harness(true);
+    drag(&mut harness, 0.002, 10);
+    // Ten moves of 0.002 of the trackpad at the default 0.35 sensitivity.
+    let fingers = 7;
+    assert_eq!(window_x(harness.world(), 0), -fingers, "one to one");
+
+    drag(&mut harness, 0.05, 40);
+    let stretched = window_x(harness.world(), 1);
+    let landed = TEST_DISPLAY_WIDTH - 700;
+    assert!(
+        stretched < landed && stretched > landed - TEST_DISPLAY_WIDTH / 8,
+        "stretched only a little past the landing, got x {stretched}"
+    );
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 1);
+    assert_eq!(window_x(harness.world(), 1), landed);
+}
+
+/// The landing focuses its window once the strip has landed, so an app slow
+/// to take focus never stalls the strip partway.
+#[test]
+fn window_landing_focuses_once_the_strip_lands() {
+    let mut harness = window_landing_harness(true);
+    drag(&mut harness, 0.008, 40);
+    harness.advance(ONE_FRAME * 4);
+    assert!(is_scrolling(harness.world()), "the settle is still running");
+    assert_focused!(harness.world(), 0);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 1);
 }

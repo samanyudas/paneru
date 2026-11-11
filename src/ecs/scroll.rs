@@ -365,6 +365,7 @@ fn swipe_gesture(
         }
         scrolling.origin = scrolling.position;
         scrolling.detent = None;
+        scrolling.landing_focus = None;
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = true;
         scrolling.last_event = time.elapsed();
@@ -412,6 +413,7 @@ fn swipe_gesture(
                 settle: None,
                 detent: None,
                 origin: f64::from(position.0.x),
+                landing_focus: None,
             });
         }
     }
@@ -637,6 +639,9 @@ fn landing(
             index
         }
     };
+    // A step lands where showing the next column from the start leaves it,
+    // wherever the fingers let go.
+    let resting = step.map_or(resting, |step| step.from);
     let (column, slot, width) = &columns[index];
     let far_edge = viewport.max.x - width;
     let shown = (resting + slot).clamp(viewport.min.x.min(far_edge), viewport.min.x.max(far_edge));
@@ -700,7 +705,7 @@ fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
 /// where it began, or back there, as [`Step`] decides, and pulses if that is
 /// not the column the last detent pulse named.
 #[instrument(level = Level::TRACE, skip_all)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn settle_strip(
     strip: Single<SettlingStrip, (With<ActiveWorkspaceMarker>, Without<Window>)>,
     active_display: ActiveDisplay,
@@ -788,9 +793,12 @@ fn settle_strip(
             }
         }
         if let Some(window) = focus_history.last_focused_in(&column) {
-            let focused = windows.focused().map(|(_, focused)| focused);
-            if focused != Some(window) {
-                focus_with_verification(window, focused, None, FocusSource::Other, &mut commands);
+            if window_landing {
+                // An app can take a moment to answer a focus request, which
+                // would stall the landing partway, so it waits for the end.
+                scroll.landing_focus = Some(window);
+            } else {
+                focus(window, &windows, &mut commands);
             }
         }
         target
@@ -800,6 +808,9 @@ fn settle_strip(
     // applies Reduce Motion and its disable-animation setting.
     if config.options().animation_speed.is_none() {
         position.x = round_px(target);
+        if let Some(window) = scroll.landing_focus.take() {
+            focus(window, &windows, &mut commands);
+        }
         finish(&mut commands);
         return;
     }
@@ -815,11 +826,22 @@ fn settle_strip(
 
     if offset.abs() < DONE_PX && velocity.abs() * MAX_STEP_SECS < DONE_PX {
         position.x = round_px(target);
+        if let Some(window) = scroll.landing_focus.take() {
+            focus(window, &windows, &mut commands);
+        }
         finish(&mut commands);
         return;
     }
     scroll.position = target + offset;
     scroll.velocity = velocity / px_per_velocity;
+}
+
+/// Focuses `window`, the window a settle lands on, unless it has focus.
+fn focus(window: Entity, windows: &Windows, commands: &mut Commands) {
+    let focused = windows.focused().map(|(_, focused)| focused);
+    if focused != Some(window) {
+        focus_with_verification(window, focused, None, FocusSource::Other, commands);
+    }
 }
 
 /// The settle spring's rate: twice the deceleration rate, so a settle that
@@ -901,6 +923,11 @@ fn scrolling_integrator(
     let direction = direction_modifier(&config);
 
     let scroll = &mut *strip;
+    // A window-landing swipe keeps the strip under the fingers, so its
+    // velocity only decides a flick, never adds travel of its own.
+    if scroll.is_user_swiping && lands_on_window(&config, scroll.input) {
+        return;
+    }
     if scroll.settle.is_none() && scroll.velocity.abs() > 0.0001 {
         scroll.position += scroll.velocity * dt * viewport_width * direction;
     }
@@ -926,6 +953,35 @@ fn apply_scrolling_constraints(
         let stretch = scroll.position - anchor;
         position.x = round_px(anchor + resist(stretch, f64::from(viewport.width())));
         return;
+    }
+
+    // A window-landing swipe moves one column at most, so the strip follows
+    // the fingers freely only until the next column on either side shows in
+    // full, and resists past that, as it does past the strip ends.
+    if scroll.is_user_swiping
+        && lands_on_window(&config, scroll.input)
+        && settles(&config, &active_display)
+    {
+        let from = round_px(scroll.anchor);
+        let reach = |toward_end| {
+            let step = Step {
+                from,
+                toward_end: Some(toward_end),
+            };
+            landing(from, Some(step), strip, &windows, viewport)
+                .map(|(_, offset)| f64::from(offset))
+        };
+        if let (Some(next), Some(previous)) = (reach(true), reach(false)) {
+            let shown = if scroll.position < next {
+                next + resist(scroll.position - next, f64::from(viewport.width()))
+            } else if scroll.position > previous {
+                previous + resist(scroll.position - previous, f64::from(viewport.width()))
+            } else {
+                scroll.position
+            };
+            position.x = round_px(shown);
+            return;
+        }
     }
 
     let get_window_frame = |entity| windows.moving_frame(entity);
