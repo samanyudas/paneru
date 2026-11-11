@@ -2450,3 +2450,106 @@ fn a_window_held_past_the_display_edge_stays_under_the_pointer() {
     );
     release(&mut harness, to);
 }
+
+fn on_screen(frame: IRect) -> bool {
+    frame.min.x >= 0 && frame.max.x <= TEST_DISPLAY_WIDTH
+}
+
+/// Five columns, where window 4 is the only window of a second app and is
+/// parked off the right edge. The left button goes down in window 0's content,
+/// as when a file drag starts, and the second app is activated, as Command-Tab
+/// does. macOS reports that switch with one front switch and no separate focus
+/// event, because the app's only window already holds its focus.
+fn activate_a_parked_app_while_held() -> (TestHarness, Origin) {
+    let parked_app = 2;
+    let mut harness = TestHarness::new().with_app(parked_app, "parked", "Parked", |app| {
+        app.focused_window_id = Some(4);
+    });
+    let state = harness.mock_state.clone();
+    state.set_display_bounds(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+    );
+    let windows = (0..5)
+        .map(|id| {
+            let pid = if id == 4 { parked_app } else { TEST_PROCESS_ID };
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            state.spawn_window(pid, TEST_WORKSPACE_ID, id, frame)
+        })
+        .collect();
+    harness.existed_at_launch(0..5);
+    harness.world().trigger(SpawnWindowTrigger(windows));
+    state.activate_app(TEST_PROCESS_ID);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(SETTLE);
+    crate::assert_focused!(harness.world(), 0);
+    assert!(
+        !on_screen(frame(harness.world(), 4)),
+        "window 4 starts parked"
+    );
+
+    let point = middle_of(harness.world(), 0, 600);
+    press_at(&mut harness, point);
+    harness.advance(FRAME);
+    state.activate_app(parked_app);
+    harness.advance(SETTLE);
+    crate::assert_focused!(harness.world(), 4);
+    (harness, point)
+}
+
+#[test]
+fn an_app_activated_while_the_button_is_held_in_another_window_shows() {
+    let (mut harness, _) = activate_a_parked_app_while_held();
+    let shown = frame(harness.world(), 4);
+    assert!(
+        on_screen(shown),
+        "window 4 shows while the button is held: {shown:?}"
+    );
+}
+
+#[test]
+fn an_app_activated_while_the_button_is_held_stays_shown_after_the_release() {
+    let (mut harness, point) = activate_a_parked_app_while_held();
+    release(&mut harness, point);
+    harness.advance(SETTLE);
+    crate::assert_focused!(harness.world(), 4);
+    let shown = frame(harness.world(), 4);
+    assert!(
+        on_screen(shown),
+        "window 4 shows after the release: {shown:?}"
+    );
+}
+
+/// A click on a partly hidden window focuses it, but the strip waits for the
+/// release, so the content does not slide out from under the pointer.
+#[test]
+fn a_pressed_partly_hidden_window_waits_for_the_release() {
+    let mut harness = three_columns();
+    let before = frame(harness.world(), 2);
+    assert!(
+        before.min.x < TEST_DISPLAY_WIDTH && before.max.x > TEST_DISPLAY_WIDTH,
+        "window 2 is cut off by the right edge: {before:?}"
+    );
+    let point = Origin::new(before.min.x + 50, 600);
+    press_at(&mut harness, point);
+    harness.advance(FRAME);
+    harness.mock_state.focus_window_unreported(2);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 2 });
+    harness.advance(SETTLE);
+    crate::assert_focused!(harness.world(), 2);
+    assert_eq!(
+        frame(harness.world(), 2),
+        before,
+        "window 2 stays put while held"
+    );
+
+    release(&mut harness, point);
+    harness.advance(SETTLE);
+    let after = frame(harness.world(), 2);
+    assert!(
+        on_screen(after),
+        "window 2 shows after the release: {after:?}"
+    );
+}

@@ -579,7 +579,12 @@ fn autocenter_window_on_focus(
         return;
     }
 
-    if global_state.skip_reshuffle() || global_state.initializing() || !mouse_held.is_empty() {
+    if global_state.skip_reshuffle() || global_state.initializing() {
+        return;
+    }
+    // A pressed window waits for the release. Another window that gains focus
+    // meanwhile, as an app switch during a file drag does, shows now.
+    if mouse_held.iter().any(|held| held.0 == entity) {
         return;
     }
     // Preserve the held window's position and the settling drop's chosen position.
