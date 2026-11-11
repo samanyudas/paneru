@@ -20,9 +20,10 @@ use crate::config::swipe::{SwipeGestureDirection, focus_direction};
 use crate::ecs::focus::{FocusHistory, PageHapticRequest};
 use crate::ecs::layout::{Column, LayoutStrip, strip_content_range};
 use crate::ecs::params::{ActiveDisplay, Windows};
+use crate::ecs::systems::AnimationStep;
 use crate::ecs::{
     ActiveWorkspaceMarker, ManualStripOffset, MissionControlActive, Position, PreUpdateSet,
-    RepositionMarker, ScrollInput, Scrolling, SendMessageTrigger, UpdateSet,
+    RepositionMarker, ScrollInput, Scrolling, SendMessageTrigger, SettleEase, UpdateSet,
 };
 use crate::errors::Result;
 use bevy::ecs::schedule::common_conditions::on_message;
@@ -386,6 +387,7 @@ fn swipe_gesture(
         scrolling.is_user_swiping = true;
         scrolling.last_event = time.elapsed();
         scrolling.settle = None;
+        scrolling.ease = None;
     }
 
     if has_scroll_event {
@@ -414,6 +416,7 @@ fn swipe_gesture(
             scrolling.last_event = time.elapsed();
             scrolling.input = input;
             scrolling.settle = None;
+            scrolling.ease = None;
             scrolling.position += total_delta * viewport_width * direction * swipe_sensitivity;
         } else if let Ok(mut entity_commands) = commands.get_entity(*entity) {
             entity_commands.try_insert(Scrolling {
@@ -427,6 +430,7 @@ fn swipe_gesture(
                 // where it rests.
                 anchor: f64::from(reposition.map_or(position.0.x, |target| target.0.x)),
                 settle: None,
+                ease: None,
                 detent: None,
                 origin: f64::from(position.0.x),
                 landing_focus: None,
@@ -744,10 +748,10 @@ pub(super) fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
 /// On lift it projects the momentum to where the strip would come to rest,
 /// picks the column [`landing`] gives for that offset, and focuses the window
 /// in it that had focus last. A strip that fits the viewport springs back to
-/// where the swipe began instead, and focus stays. The strip then travels
-/// there on a critically damped spring that starts at the glide's velocity:
-/// with the target at the projected rest, at twice the deceleration rate,
-/// it begins without a jolt and lands without overshoot.
+/// where the swipe began instead, and focus stays. The strip then slides
+/// there over [`settle_duration`] on [`settle_curve`]: it carries on at the
+/// speed it had when the fingers lifted, or gathers speed from rest, then
+/// slows into the column.
 ///
 /// A window-landing swipe ignores the momentum: it lands one column on from
 /// where it began, or back there, as [`Step`] decides, and pulses if that is
@@ -760,12 +764,10 @@ fn settle_strip(
     windows: Windows,
     focus_history: Res<FocusHistory>,
     config: Res<Config>,
-    time: Res<Time>,
+    step: Res<AnimationStep>,
     mut haptics: MessageWriter<PageHapticRequest>,
     mut commands: Commands,
 ) {
-    const DONE_PX: f64 = 0.5;
-
     if !settles(&config, &active_display) {
         return;
     }
@@ -829,19 +831,9 @@ fn settle_strip(
         let target = f64::from(target);
         scroll.settle = Some(target);
         if window_landing {
-            // The fingers chose the step. The spring starts from where the
-            // resisting strip shows, and from rest if the fingers were
-            // pulling it away from the target.
+            // The fingers chose the step. The ease starts from where the
+            // resisting strip shows.
             scroll.position = f64::from(position.x);
-            // The spring overshoots when it starts toward the target faster
-            // than it would close the gap itself.
-            let offset = scroll.position - target;
-            let limit = omega_for(deceleration) * offset.abs() / px_per_velocity.abs();
-            scroll.velocity = if scroll.velocity * px_per_velocity * offset < 0.0 {
-                scroll.velocity.clamp(-limit, limit)
-            } else {
-                0.0
-            };
             if config.swipe_gesture_haptics() && column.top() != scroll.detent {
                 haptics.write(PageHapticRequest);
             }
@@ -869,16 +861,22 @@ fn settle_strip(
         return;
     }
 
-    let omega = omega_for(deceleration);
-    let dt = time.delta_secs_f64().min(MAX_STEP_SECS);
-    let offset = scroll.position - target;
-    let velocity = scroll.velocity * px_per_velocity;
-    let decay = (-omega * dt).exp();
-    let drive = velocity + omega * offset;
-    let offset = (offset + drive * dt) * decay;
-    let velocity = (velocity - omega * drive * dt) * decay;
+    let duration = settle_duration(&config);
+    let from = scroll.position;
+    let slope = handoff_slope(scroll.velocity * px_per_velocity, target - from, duration);
+    let ease = scroll.ease.get_or_insert(SettleEase {
+        from,
+        elapsed: 0.0,
+        slope,
+    });
+    ease.elapsed += step.secs();
+    let ease = *ease;
+    // The ease carries the strip's speed from here.
+    scroll.velocity = 0.0;
+    let progress = settle_curve(ease.elapsed / duration, ease.slope);
+    let from = ease.from;
 
-    if offset.abs() < DONE_PX && velocity.abs() * MAX_STEP_SECS < DONE_PX {
+    if progress >= 1.0 {
         position.x = round_px(target);
         if let Some(window) = scroll.landing_focus.take() {
             focus(window, &windows, &mut commands);
@@ -886,8 +884,41 @@ fn settle_strip(
         finish(&mut commands);
         return;
     }
-    scroll.position = target + offset;
-    scroll.velocity = velocity / px_per_velocity;
+    scroll.position = from + (target - from) * progress;
+}
+
+/// How long a settle lasts, in keyboard ease time constants
+/// (`1 / animation_speed`).
+const SETTLE_TIME_CONSTANTS: f64 = 7.0;
+
+/// How long a settle lasts: 0.5 s at Miri's `animation_speed` of 14. A faster
+/// `animation_speed` settles sooner, as it slides sooner.
+fn settle_duration(config: &Config) -> f64 {
+    SETTLE_TIME_CONSTANTS / config.animation_speed()
+}
+
+/// The steepest start [`settle_curve`] takes without overshooting.
+const MAX_HANDOFF_SLOPE: f64 = 3.0;
+
+/// The starting slope of [`settle_curve`] that carries on `velocity`, in
+/// points per second, for a settle that moves `distance` points over
+/// `duration` seconds. A strip moving away from its target, or still, starts
+/// from rest. A slope of 1 starts at the settle's average speed, and the slope
+/// is capped where the curve would overshoot.
+pub(crate) fn handoff_slope(velocity: f64, distance: f64, duration: f64) -> f64 {
+    if distance.abs() < f64::EPSILON {
+        return 0.0;
+    }
+    (velocity * duration / distance).clamp(0.0, MAX_HANDOFF_SLOPE)
+}
+
+/// The share of a settle covered at `progress` through its time, from 0 to 1:
+/// a cubic that starts at `slope` times the average speed and ends at rest.
+/// From rest it is smoothstep, whose fastest moment, halfway, is 1.5 times the
+/// average speed. At [`MAX_HANDOFF_SLOPE`] it is the cubic ease-out.
+pub(crate) fn settle_curve(progress: f64, slope: f64) -> f64 {
+    let u = progress.clamp(0.0, 1.0);
+    slope * u * (1.0 - u).powi(2) + u * u * (3.0 - 2.0 * u)
 }
 
 /// Focuses `window`, the window a settle lands on, unless it has focus.
@@ -896,12 +927,6 @@ fn focus(window: Entity, windows: &Windows, commands: &mut Commands) {
     if focused != Some(window) {
         focus_with_verification(window, focused, None, FocusSource::Other, commands);
     }
-}
-
-/// The settle spring's rate: twice the deceleration rate, so a settle that
-/// starts at the glide's velocity toward its projected rest never overshoots.
-fn omega_for(deceleration: f64) -> f64 {
-    2.0 * deceleration
 }
 
 /// Pulses while the fingers move a window-landing swipe, each time the
