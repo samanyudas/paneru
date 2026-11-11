@@ -365,7 +365,7 @@ fn swipe_gesture(
         }
         scrolling.origin = scrolling.position;
         scrolling.detent = None;
-        scrolling.landing_focus = None;
+        scrolling.start = scrolling.landing_focus.take();
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = true;
         scrolling.last_event = time.elapsed();
@@ -414,6 +414,7 @@ fn swipe_gesture(
                 detent: None,
                 origin: f64::from(position.0.x),
                 landing_focus: None,
+                start: None,
             });
         }
     }
@@ -624,7 +625,16 @@ fn landing(
     let index = match step {
         None => nearest(resting)?,
         Some(step) => {
-            let start = nearest(step.from)?;
+            // The column nearest the center can be a wide neighbor of a
+            // narrow column that landed flush with an edge.
+            let start = step
+                .start
+                .and_then(|window| {
+                    columns
+                        .iter()
+                        .position(|(column, _, _)| column.position_of(window).is_some())
+                })
+                .or_else(|| nearest(step.from))?;
             let index = match step.toward_end {
                 Some(true) => (start + 1).min(columns.len() - 1),
                 Some(false) => start.saturating_sub(1),
@@ -655,6 +665,9 @@ fn landing(
 struct Step {
     /// The strip offset the swipe began at.
     from: i32,
+    /// A window in the column the swipe began on. Without one, that is the
+    /// column nearest the viewport center at `from`.
+    start: Option<Entity>,
     /// Toward the last column, toward the first, or neither.
     toward_end: Option<bool>,
 }
@@ -672,6 +685,7 @@ impl Step {
         };
         Self {
             from: round_px(scroll.anchor),
+            start: scroll.start,
             toward_end,
         }
     }
@@ -962,10 +976,18 @@ fn apply_scrolling_constraints(
         && lands_on_window(&config, scroll.input)
         && settles(&config, &active_display)
     {
+        if scroll.start.is_none() {
+            scroll.start = windows
+                .focused()
+                .map(|(_, focused)| focused)
+                .filter(|focused| strip.contains(*focused));
+        }
         let from = round_px(scroll.anchor);
+        let start = scroll.start;
         let reach = |toward_end| {
             let step = Step {
                 from,
+                start,
                 toward_end: Some(toward_end),
             };
             landing(from, Some(step), strip, &windows, viewport)

@@ -739,3 +739,29 @@ fn window_landing_focuses_once_the_strip_lands() {
     harness.advance(SETTLE);
     assert_focused!(harness.world(), 1);
 }
+
+/// After landing on a narrow last column flush with the edge, the viewport
+/// center still lies over the wide column beside it. A swipe on toward the
+/// end starts from the landed column, so it springs back without a click
+/// instead of clicking and stepping onto the column it already shows.
+#[test]
+fn window_landing_starts_from_the_column_it_landed_on() {
+    let mut harness = window_landing_harness_with_widths(&[900, 400], true);
+    drag(&mut harness, 0.008, 40);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 1);
+    assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 400);
+    assert_eq!(pulses(&mut harness), 1);
+
+    drag(&mut harness, 0.008, 40);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 1);
+    assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 400);
+    assert_eq!(pulses(&mut harness), 1, "the strip end gives no click");
+
+    drag(&mut harness, -0.008, 40);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 0);
+    assert_eq!(window_x(harness.world(), 0), 0);
+    assert_eq!(pulses(&mut harness), 2);
+}

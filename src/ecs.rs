@@ -507,6 +507,9 @@ pub struct Scrolling {
     pub origin: f64,
     /// The window a window-landing settle focuses once it lands.
     pub landing_focus: Option<Entity>,
+    /// A window in the column a window-landing swipe began on: the focused
+    /// one, or the one a caught settle was headed for.
+    pub start: Option<Entity>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1582,6 +1585,7 @@ mod tests {
                     detent: None,
                     origin: 0.0,
                     landing_focus: None,
+                    start: None,
                 });
             }),
             "overlay must rerun to hide when Scrolling starts"
