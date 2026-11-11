@@ -9,6 +9,7 @@ use bevy::time::TimeUpdateStrategy;
 
 use crate::commands::{Command, Direction, Operation};
 use crate::config::{Config, MainOptions};
+use crate::ecs::scroll::ease_in_out_expo;
 use crate::ecs::systems::ease_out_factor;
 use crate::ecs::{RepositionMarker, Scrolling};
 use crate::events::Event;
@@ -182,11 +183,11 @@ fn swiping(world: &mut World) -> Option<bool> {
         .map(|scrolling| scrolling.is_user_swiping)
 }
 
-/// Once the fingers lift, the strip slides back on a keyboard slide's
-/// ease-out: each pass covers the same share of the distance left, so the
-/// first pass moves the farthest and the strip never overshoots.
+/// Once the fingers lift, the strip slides back on an exponential
+/// ease-in-out over 7 / `animation_speed` seconds: it starts from rest, with
+/// no jump at the lift, and slows into where it was.
 #[test]
-fn a_swipe_settles_on_the_keyboard_ease() {
+fn a_swipe_settles_on_an_exponential_ease_in_out() {
     let mut harness = harness();
     let rest = x(&harness);
     harness.world().write_message(Event::Swipe {
@@ -206,17 +207,19 @@ fn a_swipe_settles_on_the_keyboard_ease() {
     // The windows follow the strip on the next pass.
     pass(&mut harness, ACTIVE_FRAME);
     assert_eq!(x(&harness), rest, "the strip springs back to where it was");
-    assert!(left.len() > 3, "the settle took a few passes: {left:?}");
     assert!(left[0].abs() > 10.0, "the swipe moved the strip: {left:?}");
 
-    let keep = 1.0 - f64::from(ease_out_factor(SPEED, ACTIVE_FRAME.as_secs_f64()));
-    for pair in left.windows(2) {
+    let duration = 7.0 / SPEED;
+    let frame = ACTIVE_FRAME.as_secs_f64();
+    // 0.5 s of 16 ms passes.
+    assert_eq!(left.len(), 32, "the settle lasts {duration} s: {left:?}");
+    for (pass, at) in left.iter().enumerate().skip(1) {
+        #[allow(clippy::cast_precision_loss, reason = "a few dozen passes")]
+        let progress = ease_in_out_expo(pass as f64 * frame / duration);
+        let want = left[0] * (1.0 - progress);
         assert!(
-            (pair[1] - pair[0] * keep).abs() <= 1.0,
-            "a pass kept {:.0} of {:.0}, expected {:.0}: {left:?}",
-            pair[1],
-            pair[0],
-            pair[0] * keep
+            (at - want).abs() <= 1.0,
+            "pass {pass} left {at:.0}, expected {want:.0}: {left:?}"
         );
     }
 }

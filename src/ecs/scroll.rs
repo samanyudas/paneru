@@ -20,10 +20,10 @@ use crate::config::swipe::{SwipeGestureDirection, focus_direction};
 use crate::ecs::focus::{FocusHistory, PageHapticRequest};
 use crate::ecs::layout::{Column, LayoutStrip, strip_content_range};
 use crate::ecs::params::{ActiveDisplay, Windows};
-use crate::ecs::systems::{ANIAMTE_SNAP_THRESHOLD, AnimationStep, ease_out_factor};
+use crate::ecs::systems::AnimationStep;
 use crate::ecs::{
     ActiveWorkspaceMarker, ManualStripOffset, MissionControlActive, Position, PreUpdateSet,
-    RepositionMarker, ScrollInput, Scrolling, SendMessageTrigger, UpdateSet,
+    RepositionMarker, ScrollInput, Scrolling, SendMessageTrigger, SettleEase, UpdateSet,
 };
 use crate::errors::Result;
 use bevy::ecs::schedule::common_conditions::on_message;
@@ -387,6 +387,7 @@ fn swipe_gesture(
         scrolling.is_user_swiping = true;
         scrolling.last_event = time.elapsed();
         scrolling.settle = None;
+        scrolling.ease = None;
     }
 
     if has_scroll_event {
@@ -415,6 +416,7 @@ fn swipe_gesture(
             scrolling.last_event = time.elapsed();
             scrolling.input = input;
             scrolling.settle = None;
+            scrolling.ease = None;
             scrolling.position += total_delta * viewport_width * direction * swipe_sensitivity;
         } else if let Ok(mut entity_commands) = commands.get_entity(*entity) {
             entity_commands.try_insert(Scrolling {
@@ -428,6 +430,7 @@ fn swipe_gesture(
                 // where it rests.
                 anchor: f64::from(reposition.map_or(position.0.x, |target| target.0.x)),
                 settle: None,
+                ease: None,
                 detent: None,
                 origin: f64::from(position.0.x),
                 landing_focus: None,
@@ -746,8 +749,8 @@ pub(super) fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
 /// picks the column [`landing`] gives for that offset, and focuses the window
 /// in it that had focus last. A strip that fits the viewport springs back to
 /// where the swipe began instead, and focus stays. The strip then slides
-/// there on the exponential ease-out of a keyboard slide, at the same
-/// `animation_speed`: each frame covers a share of the distance left.
+/// there on an exponential ease-in-out over [`settle_duration`]: it gathers
+/// speed from where the fingers left it, then slows into the column.
 ///
 /// A window-landing swipe ignores the momentum: it lands one column on from
 /// where it began, or back there, as [`Step`] decides, and pulses if that is
@@ -859,10 +862,13 @@ fn settle_strip(
         return;
     }
 
-    let t = f64::from(ease_out_factor(config.animation_speed(), step.secs()));
-    let offset = (scroll.position - target) * (1.0 - t);
+    let from = scroll.position;
+    let ease = scroll.ease.get_or_insert(SettleEase { from, elapsed: 0.0 });
+    ease.elapsed += step.secs();
+    let (from, elapsed) = (ease.from, ease.elapsed);
+    let progress = ease_in_out_expo(elapsed / settle_duration(&config));
 
-    if offset.abs() <= f64::from(ANIAMTE_SNAP_THRESHOLD) {
+    if progress >= 1.0 {
         position.x = round_px(target);
         if let Some(window) = scroll.landing_focus.take() {
             focus(window, &windows, &mut commands);
@@ -870,7 +876,32 @@ fn settle_strip(
         finish(&mut commands);
         return;
     }
-    scroll.position = target + offset;
+    scroll.position = from + (target - from) * progress;
+}
+
+/// How many keyboard ease time constants (`1 / animation_speed`) a settle
+/// lasts. At this length the settle's fastest moment, halfway, matches the
+/// speed a keyboard slide starts at, so it is never more abrupt than one.
+const SETTLE_TIME_CONSTANTS: f64 = 7.0;
+
+/// How long a settle lasts: 0.5 s at Miri's `animation_speed` of 14.
+fn settle_duration(config: &Config) -> f64 {
+    SETTLE_TIME_CONSTANTS / config.animation_speed()
+}
+
+/// The exponential ease-in-out: the share of a settle covered at `progress`
+/// through its time, from 0 to 1. It is scaled to start at exactly 0 and end
+/// at exactly 1, where the textbook curve jumps by 2^-11 at each end.
+pub(crate) fn ease_in_out_expo(progress: f64) -> f64 {
+    const STEEPNESS: f64 = 10.0;
+    let floor = (-STEEPNESS).exp2();
+    let half = |u: f64| ((STEEPNESS * (2.0 * u - 1.0)).exp2() - floor) / (1.0 - floor) / 2.0;
+    let u = progress.clamp(0.0, 1.0);
+    if u < 0.5 {
+        half(u)
+    } else {
+        1.0 - half(1.0 - u)
+    }
 }
 
 /// Focuses `window`, the window a settle lands on, unless it has focus.

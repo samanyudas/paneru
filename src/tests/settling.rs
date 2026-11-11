@@ -474,7 +474,8 @@ fn touch_down_mid_settle_catches_the_strip() {
     let mut harness = harness_with_widths(&[700, 700, 700, 700], Some(14.0));
 
     send(&mut harness, swipe(0.05));
-    harness.advance(ONE_FRAME * 12);
+    // Past the middle of the 0.5 s ease, so the strip is nearer column 1.
+    harness.advance(ONE_FRAME * 16);
     assert!(is_scrolling(harness.world()), "still settling");
     send(&mut harness, Event::TouchpadDown);
     harness.advance(ONE_FRAME);
