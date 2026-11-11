@@ -510,6 +510,10 @@ pub struct Scrolling {
     /// A window in the column a window-landing swipe began on: the focused
     /// one, or the one a caught settle was headed for.
     pub start: Option<Entity>,
+    /// Between the trackpad reporting the fingers down and reporting them
+    /// lifted. Fingers held still send no swipe events, so this, not a pause,
+    /// ends a window-landing swipe.
+    pub fingers_down: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1586,6 +1590,7 @@ mod tests {
                     origin: 0.0,
                     landing_focus: None,
                     start: None,
+                    fingers_down: false,
                 });
             }),
             "overlay must rerun to hide when Scrolling starts"

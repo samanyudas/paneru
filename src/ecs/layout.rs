@@ -2793,7 +2793,7 @@ struct StripScrollContext<'a> {
     display_bounds: IRect,
     raw_display_bounds: IRect,
     is_new_activation: bool,
-    /// Fingers on the trackpad drive the strip.
+    /// Fingers on the trackpad drive a window-landing swipe of the strip.
     user_swiping: bool,
 }
 
@@ -2823,7 +2823,9 @@ fn resolve_strip_scroll_context<'a>(
         display_bounds: display.actual_display_bounds(dock, config),
         raw_display_bounds: display.bounds(),
         is_new_activation: has_previous_position && active_marker.is_some_and(|m| m.is_added()),
-        user_swiping: strip_scrolling.is_some_and(|scrolling| scrolling.is_user_swiping),
+        user_swiping: strip_scrolling.is_some_and(|scrolling| {
+            scrolling.is_user_swiping && super::scroll::lands_on_window(config, scrolling.input)
+        }),
     })
 }
 

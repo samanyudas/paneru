@@ -576,8 +576,16 @@ fn pulses(harness: &mut TestHarness) -> usize {
     harness.world().resource::<Pulses>().0.len()
 }
 
-/// Moves the fingers slowly: one small `delta` per frame, `frames` times.
+/// One swipe: the fingers touch down, move one small `delta` per frame,
+/// `frames` times, and lift.
 fn drag(harness: &mut TestHarness, delta: f64, frames: usize) {
+    send(harness, Event::TouchpadDown);
+    move_fingers(harness, delta, frames);
+    send(harness, Event::TouchpadUp);
+}
+
+/// Moves fingers already down: one small `delta` per frame, `frames` times.
+fn move_fingers(harness: &mut TestHarness, delta: f64, frames: usize) {
     for _ in 0..frames {
         send(harness, swipe(delta));
         harness.advance(ONE_FRAME);
@@ -695,7 +703,6 @@ fn window_landing_second_quick_swipe_steps_again() {
         is_scrolling(harness.world()),
         "the first settle is still running"
     );
-    send(&mut harness, Event::TouchpadDown);
     drag(&mut harness, 0.03, 3);
     harness.advance(SETTLE);
 
@@ -706,25 +713,76 @@ fn window_landing_second_quick_swipe_steps_again() {
 
 /// The strip follows the fingers one to one, and a long drag stretches with
 /// resistance once the next column shows in full, so the landing never jumps
-/// back across columns the fingers pulled past.
+/// back across columns the fingers pulled past. On lift it eases back from
+/// where it shows, never from where the fingers went.
 #[test]
 fn window_landing_resists_past_the_next_column() {
     let mut harness = window_landing_harness(true);
-    drag(&mut harness, 0.002, 10);
+    send(&mut harness, Event::TouchpadDown);
+    move_fingers(&mut harness, 0.002, 10);
     // Ten moves of 0.002 of the trackpad at the default 0.35 sensitivity.
     let fingers = 7;
     assert_eq!(window_x(harness.world(), 0), -fingers, "one to one");
 
-    drag(&mut harness, 0.05, 40);
+    move_fingers(&mut harness, 0.05, 40);
     let stretched = window_x(harness.world(), 1);
     let landed = TEST_DISPLAY_WIDTH - 700;
     assert!(
         stretched < landed && stretched > landed - TEST_DISPLAY_WIDTH / 8,
         "stretched only a little past the landing, got x {stretched}"
     );
+    send(&mut harness, Event::TouchpadUp);
+    let mut shown = stretched;
+    for _ in 0..50 {
+        harness.advance(ONE_FRAME);
+        let x = window_x(harness.world(), 1);
+        assert!(
+            (shown..=landed).contains(&x),
+            "eases from {shown} toward {landed}, got x {x}"
+        );
+        shown = x;
+    }
     harness.advance(SETTLE);
     assert_focused!(harness.world(), 1);
     assert_eq!(window_x(harness.world(), 1), landed);
+}
+
+/// Fingers held still send no swipe events. The strip stays where they hold
+/// it until they lift, and only then lands.
+#[test]
+fn window_landing_waits_for_held_fingers_to_lift() {
+    let mut harness = window_landing_harness(true);
+    send(&mut harness, Event::TouchpadDown);
+    move_fingers(&mut harness, 0.008, 40);
+    let held = window_x(harness.world(), 1);
+    harness.advance(Duration::from_millis(500));
+    assert_eq!(window_x(harness.world(), 1), held, "the strip stays held");
+    assert_focused!(harness.world(), 0);
+    assert_eq!(pulses(&mut harness), 1);
+
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 1);
+    assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 700);
+    assert_eq!(pulses(&mut harness), 1);
+}
+
+/// Where the next column already shows in full, the strip resists from the
+/// start, so it shows less than the fingers moved. The detent still clicks
+/// at the same finger travel that steps at release.
+#[test]
+fn window_landing_detent_clicks_where_the_release_steps() {
+    let mut harness = window_landing_harness_with_widths(&[400, 400, 400], true);
+    send(&mut harness, Event::TouchpadDown);
+    // About 61 points of finger travel, past the 51-point step, which the
+    // resistance shows as about 41.
+    move_fingers(&mut harness, 0.002, 85);
+    assert_eq!(pulses(&mut harness), 1, "the detent clicks before the lift");
+
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 1);
+    assert_eq!(pulses(&mut harness), 1, "the landing adds no pulse");
 }
 
 /// The landing focuses its window once the strip has landed, so an app slow

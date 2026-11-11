@@ -7,7 +7,7 @@ use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::SystemCondition as _;
-use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
 use std::collections::VecDeque;
@@ -291,12 +291,14 @@ fn paging_gesture(
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
+#[allow(clippy::too_many_lines)]
 fn swipe_gesture(
     mut messages: MessageReader<InputEvent>,
     active_display: ActiveDisplay,
     mut active_workspace: Single<SwipedStrip, With<ActiveWorkspaceMarker>>,
     time: Res<Time>,
     config: Res<Config>,
+    mut fingers_down: Local<bool>,
     mut commands: Commands,
 ) {
     let swipe_sensitivity = config.swipe_sensitivity();
@@ -319,8 +321,10 @@ fn swipe_gesture(
         match event {
             Event::TouchpadDown => {
                 touchpad_down = true;
+                *fingers_down = true;
                 total_delta = 0.0;
             }
+            Event::TouchpadUp => *fingers_down = false,
             Event::Scroll { delta } => {
                 total_delta += *delta * scroll_scale;
                 has_scroll_event = true;
@@ -340,11 +344,15 @@ fn swipe_gesture(
         }
     }
 
+    let (entity, position, reposition, scrolling) = &mut *active_workspace;
+    if let Some(scrolling) = scrolling.as_mut()
+        && scrolling.fingers_down != *fingers_down
+    {
+        scrolling.fingers_down = *fingers_down;
+    }
     if !touchpad_down && !has_scroll_event {
         return;
     }
-
-    let (entity, position, reposition, scrolling) = &mut *active_workspace;
     let input = if has_gesture_event {
         ScrollInput::Gesture
     } else {
@@ -415,6 +423,7 @@ fn swipe_gesture(
                 origin: f64::from(position.0.x),
                 landing_focus: None,
                 start: None,
+                fingers_down: *fingers_down,
             });
         }
     }
@@ -437,7 +446,15 @@ pub(super) fn swiping_timeout(
     let viewport_width = f64::from(active_display.bounds().width());
 
     for (entity, mut scroll, active) in strips {
-        if time.elapsed().abs_diff(scroll.last_event) > scroll.input.idle_threshold() {
+        // Fingers held still on a window-landing swipe keep the strip where
+        // they hold it. The longer limit only covers a lift the trackpad never
+        // reported.
+        let idle_threshold = if scroll.fingers_down && lands_on_window(&config, scroll.input) {
+            HELD_FINGERS_TIMEOUT
+        } else {
+            scroll.input.idle_threshold()
+        };
+        if time.elapsed().abs_diff(scroll.last_event) > idle_threshold {
             scroll.is_user_swiping = false;
             // `settle_strip` owns the active strip from here, and focus goes to
             // the column it lands on, not to whatever slid under the pointer.
@@ -700,8 +717,12 @@ const STEP_FRACTION: f64 = 0.05;
 /// window-landing swipe counts as a flick.
 const FLICK_SPEED: f64 = 0.25;
 
+/// How long fingers held still keep a window-landing swipe going, in case
+/// the trackpad never reports them lifting.
+const HELD_FINGERS_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Whether a swipe ends on one window instead of gliding on with momentum.
-fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
+pub(super) fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
     input == ScrollInput::Gesture && config.swipe_gesture_window_landing()
 }
 
@@ -795,13 +816,19 @@ fn settle_strip(
         let target = f64::from(target);
         scroll.settle = Some(target);
         if window_landing {
+            // The fingers chose the step. The spring starts from where the
+            // resisting strip shows, and from rest if the fingers were
+            // pulling it away from the target.
+            scroll.position = f64::from(position.x);
             // The spring overshoots when it starts toward the target faster
             // than it would close the gap itself.
             let offset = scroll.position - target;
             let limit = omega_for(deceleration) * offset.abs() / px_per_velocity.abs();
-            if scroll.velocity * px_per_velocity * offset < 0.0 {
-                scroll.velocity = scroll.velocity.clamp(-limit, limit);
-            }
+            scroll.velocity = if scroll.velocity * px_per_velocity * offset < 0.0 {
+                scroll.velocity.clamp(-limit, limit)
+            } else {
+                0.0
+            };
             if config.swipe_gesture_haptics() && column.top() != scroll.detent {
                 haptics.write(PageHapticRequest);
             }
@@ -886,12 +913,8 @@ fn landing_detents(
     if fitted_offsets(strip, &windows, viewport).is_some() {
         return;
     }
-    let step = Step::of(
-        scroll,
-        f64::from(position.x),
-        None,
-        f64::from(viewport.width()),
-    );
+    // The raw finger travel, as at release, not the resisted strip.
+    let step = Step::of(scroll, scroll.position, None, f64::from(viewport.width()));
     let column_top = |step| {
         landing(position.x, Some(step), strip, &windows, viewport)
             .and_then(|(column, _)| column.top())
@@ -939,7 +962,10 @@ fn scrolling_integrator(
     let scroll = &mut *strip;
     // A window-landing swipe keeps the strip under the fingers, so its
     // velocity only decides a flick, never adds travel of its own.
-    if scroll.is_user_swiping && lands_on_window(&config, scroll.input) {
+    if scroll.is_user_swiping
+        && lands_on_window(&config, scroll.input)
+        && settles(&config, &active_display)
+    {
         return;
     }
     if scroll.settle.is_none() && scroll.velocity.abs() > 0.0001 {
