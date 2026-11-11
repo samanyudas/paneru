@@ -499,6 +499,9 @@ pub struct Scrolling {
     /// The offset the strip settles on once the swipe has ended. Only set
     /// with `auto_center` off; see `scroll::settle_strip`.
     pub settle: Option<f64>,
+    /// The top window of the column a window-landing swipe would land on, as
+    /// of its last detent pulse.
+    pub detent: Option<Entity>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1571,6 +1574,7 @@ mod tests {
                     input: super::ScrollInput::Gesture,
                     anchor: 0.0,
                     settle: None,
+                    detent: None,
                 });
             }),
             "overlay must rerun to hide when Scrolling starts"

@@ -17,7 +17,7 @@ use tracing::{Level, instrument};
 use crate::commands::{Direction, FocusSource, focus_with_verification};
 use crate::config::Config;
 use crate::config::swipe::{SwipeGestureDirection, focus_direction};
-use crate::ecs::focus::FocusHistory;
+use crate::ecs::focus::{FocusHistory, PageHapticRequest};
 use crate::ecs::layout::{Column, LayoutStrip, strip_content_range};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
@@ -209,6 +209,7 @@ impl Plugin for ScrollEventsPlugin {
                 settle_strip,
                 scrolling_integrator,
                 apply_scrolling_constraints,
+                landing_detents,
                 swiping_timeout,
             )
                 .chain()
@@ -402,6 +403,7 @@ fn swipe_gesture(
                 // where it rests.
                 anchor: f64::from(reposition.map_or(position.0.x, |target| target.0.x)),
                 settle: None,
+                detent: None,
             });
         }
     }
@@ -576,8 +578,12 @@ fn resist(stretch: f64, viewport_width: f64) -> f64 {
 /// `ensure_visible_in_strip` makes for keyboard focus. Continuous swipe lets
 /// the fingers pull an end column to the far edge, so the offset is then
 /// held to the range that leaves no empty space beside the overflowing strip.
+///
+/// A `flick` that has not yet left the column it began on lands on the next
+/// column in its direction instead.
 fn landing(
     resting: i32,
+    flick: Option<Flick>,
     strip: &LayoutStrip,
     windows: &Windows,
     viewport: IRect,
@@ -586,7 +592,7 @@ fn landing(
     let edges = (viewport.max.x - content.end).min(viewport.min.x - content.start)
         ..=(viewport.min.x - content.start);
     let center = viewport.center().x;
-    strip
+    let columns: Vec<_> = strip
         .columns()
         .filter_map(|column| {
             let top = column.top()?;
@@ -594,19 +600,49 @@ fn landing(
             let width = windows.moving_frame(top)?.width();
             Some((column, slot, width))
         })
-        .min_by_key(|(_, slot, width)| {
+        .collect();
+    let nearest = |resting: i32| {
+        (0..columns.len()).min_by_key(|&index| {
+            let (_, slot, width) = &columns[index];
             let min = resting + slot;
             let max = min + width;
             let outside = (min - center).max(center - max).max(0);
             (outside, (min + width / 2 - center).abs())
         })
-        .map(|(column, slot, width)| {
-            let far_edge = viewport.max.x - width;
-            let shown =
-                (resting + slot).clamp(viewport.min.x.min(far_edge), viewport.min.x.max(far_edge));
-            let offset = (shown - slot).clamp(*edges.start(), *edges.end());
-            (column.clone(), offset)
-        })
+    };
+    let mut index = nearest(resting)?;
+    if let Some(flick) = flick
+        && nearest(flick.from) == Some(index)
+    {
+        index = if flick.toward_end {
+            (index + 1).min(columns.len() - 1)
+        } else {
+            index.saturating_sub(1)
+        };
+    }
+    let (column, slot, width) = &columns[index];
+    let far_edge = viewport.max.x - width;
+    let shown = (resting + slot).clamp(viewport.min.x.min(far_edge), viewport.min.x.max(far_edge));
+    let offset = (shown - slot).clamp(*edges.start(), *edges.end());
+    Some(((*column).clone(), offset))
+}
+
+/// A quick flick at the end of a window-landing swipe.
+#[derive(Clone, Copy)]
+struct Flick {
+    /// The strip offset the swipe began at.
+    from: i32,
+    /// Whether the strip moves toward its last column.
+    toward_end: bool,
+}
+
+/// The strip speed, in viewport widths per second, above which a lifted
+/// window-landing swipe counts as a flick.
+const FLICK_SPEED: f64 = 0.25;
+
+/// Whether a swipe ends on one window instead of gliding on with momentum.
+fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
+    input == ScrollInput::Gesture && config.swipe_gesture_window_landing()
 }
 
 /// Ends a swipe on a column once the fingers lift, with `auto_center` off.
@@ -618,7 +654,12 @@ fn landing(
 /// there on a critically damped spring that starts at the glide's velocity:
 /// with the target at the projected rest, at twice the deceleration rate,
 /// it begins without a jolt and lands without overshoot.
+///
+/// A window-landing swipe ignores the momentum: it lands on the column under
+/// the fingers, or the next one for a flick, and pulses if that is not the
+/// column the last detent pulse named.
 #[instrument(level = Level::TRACE, skip_all)]
+#[allow(clippy::too_many_arguments)]
 fn settle_strip(
     strip: Single<SettlingStrip, (With<ActiveWorkspaceMarker>, Without<Window>)>,
     active_display: ActiveDisplay,
@@ -626,6 +667,7 @@ fn settle_strip(
     focus_history: Res<FocusHistory>,
     config: Res<Config>,
     time: Res<Time>,
+    mut haptics: MessageWriter<PageHapticRequest>,
     mut commands: Commands,
 ) {
     const DONE_PX: f64 = 0.5;
@@ -663,7 +705,19 @@ fn settle_strip(
         scroll.settle = Some(target);
         target
     } else {
-        let natural = scroll.position + scroll.velocity * px_per_velocity / deceleration;
+        let window_landing = lands_on_window(&config, scroll.input);
+        let (natural, flick) = if window_landing {
+            let flick = (scroll.velocity.abs() > FLICK_SPEED).then(|| Flick {
+                from: round_px(scroll.anchor),
+                toward_end: scroll.velocity * px_per_velocity < 0.0,
+            });
+            (scroll.position, flick)
+        } else {
+            (
+                scroll.position + scroll.velocity * px_per_velocity / deceleration,
+                None,
+            )
+        };
         let get_window_frame = |entity| windows.moving_frame(entity);
         let Some((column, target)) = clamp_viewport_offset(
             round_px(natural),
@@ -673,12 +727,24 @@ fn settle_strip(
             &viewport,
             &config,
         )
-        .and_then(|resting| landing(resting, strip, &windows, viewport)) else {
+        .and_then(|resting| landing(resting, flick, strip, &windows, viewport)) else {
             finish(&mut commands);
             return;
         };
         let target = f64::from(target);
         scroll.settle = Some(target);
+        if window_landing {
+            // The spring overshoots when it starts toward the target faster
+            // than it would close the gap itself.
+            let offset = scroll.position - target;
+            let limit = omega_for(deceleration) * offset.abs() / px_per_velocity.abs();
+            if scroll.velocity * px_per_velocity * offset < 0.0 {
+                scroll.velocity = scroll.velocity.clamp(-limit, limit);
+            }
+            if config.swipe_gesture_haptics() && column.top() != scroll.detent {
+                haptics.write(PageHapticRequest);
+            }
+        }
         if let Some(window) = focus_history.last_focused_in(&column) {
             let focused = windows.focused().map(|(_, focused)| focused);
             if focused != Some(window) {
@@ -696,7 +762,7 @@ fn settle_strip(
         return;
     }
 
-    let omega = 2.0 * deceleration;
+    let omega = omega_for(deceleration);
     let dt = time.delta_secs_f64().min(MAX_STEP_SECS);
     let offset = scroll.position - target;
     let velocity = scroll.velocity * px_per_velocity;
@@ -712,6 +778,46 @@ fn settle_strip(
     }
     scroll.position = target + offset;
     scroll.velocity = velocity / px_per_velocity;
+}
+
+/// The settle spring's rate: twice the deceleration rate, so a settle that
+/// starts at the glide's velocity toward its projected rest never overshoots.
+fn omega_for(deceleration: f64) -> f64 {
+    2.0 * deceleration
+}
+
+/// Pulses while the fingers move a window-landing swipe, each time the
+/// column the strip would land on changes. A strip that fits the viewport
+/// springs back instead, so it has no detents.
+fn landing_detents(
+    mut strip: ScrollingStrip,
+    active_display: ActiveDisplay,
+    windows: Windows,
+    config: Res<Config>,
+    mut haptics: MessageWriter<PageHapticRequest>,
+) {
+    let (strip, ref position, ref mut scroll) = *strip;
+    if !scroll.is_user_swiping
+        || !lands_on_window(&config, scroll.input)
+        || !settles(&config, &active_display)
+    {
+        return;
+    }
+    let viewport = active_display.actual_bounds(&config);
+    if fitted_offsets(strip, &windows, viewport).is_some() {
+        return;
+    }
+    let Some((column, _)) = landing(position.x, None, strip, &windows, viewport) else {
+        return;
+    };
+    let top = column.top();
+    if top == scroll.detent {
+        return;
+    }
+    if scroll.detent.is_some() && config.swipe_gesture_haptics() {
+        haptics.write(PageHapticRequest);
+    }
+    scroll.detent = top;
 }
 
 /// Natural direction moves the strip left (a negative offset) for a positive

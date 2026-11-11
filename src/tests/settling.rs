@@ -34,7 +34,11 @@ fn miri_config(animation_speed: Option<f64>) -> Config {
 }
 
 fn harness_with_widths(widths: &[i32], animation_speed: Option<f64>) -> TestHarness {
-    let mut harness = TestHarness::new().with_config(miri_config(animation_speed));
+    harness_with_config(widths, miri_config(animation_speed))
+}
+
+fn harness_with_config(widths: &[i32], config: Config) -> TestHarness {
+    let mut harness = TestHarness::new().with_config(config);
     for (id, width) in (0..).zip(widths.iter().copied()) {
         harness = harness.with_window(id, move |window| {
             window.frame.max.x = window.frame.min.x + width;
@@ -529,4 +533,131 @@ fn a_strip_that_loses_activation_mid_settle_lands() {
         world.get::<crate::ecs::Position>(strip).unwrap().x,
         crate::util::round_px(target)
     );
+}
+
+/// When each trackpad pulse was requested.
+#[derive(Resource, Default)]
+struct Pulses(Vec<Duration>);
+
+fn record_pulses(
+    mut requests: MessageReader<crate::ecs::focus::PageHapticRequest>,
+    time: Res<Time>,
+    mut pulses: ResMut<Pulses>,
+) {
+    for _ in requests.read() {
+        pulses.0.push(time.elapsed());
+    }
+}
+
+/// Miri's Window by window swipe on four 700-point columns, with column 0
+/// focused at the left edge.
+fn window_landing_harness(haptics: bool) -> TestHarness {
+    let config = Config::try_from(
+        format!(
+            "[options]\nanimation_speed = 14\n[swipe.gesture]\nfingers_count = 3\nwindow_landing = true\nhaptics = {haptics}\n"
+        )
+        .as_str(),
+    )
+    .unwrap();
+    let mut harness = harness_with_config(&[700, 700, 700, 700], config);
+    harness.app.init_resource::<Pulses>();
+    harness.app.add_systems(PostUpdate, record_pulses);
+    // Above every window, so focus follows mouse never picks a window the
+    // strip slides under the pointer.
+    harness.mock_state.set_cursor_position(IVec2::new(1000, 5));
+    harness
+}
+
+fn pulses(harness: &mut TestHarness) -> usize {
+    harness.world().resource::<Pulses>().0.len()
+}
+
+/// Moves the fingers slowly: one small `delta` per frame, `frames` times.
+fn drag(harness: &mut TestHarness, delta: f64, frames: usize) {
+    for _ in 0..frames {
+        send(harness, swipe(delta));
+        harness.advance(ONE_FRAME);
+    }
+}
+
+/// A slow drag that leaves the viewport center on the column it began on
+/// lands back there, with no pulse.
+#[test]
+fn window_landing_short_drag_springs_back_to_its_column() {
+    let mut harness = window_landing_harness(true);
+    drag(&mut harness, 0.002, 10);
+    let dragged = window_x(harness.world(), 0);
+    assert!(
+        dragged < 0,
+        "the strip follows the fingers, got x {dragged}"
+    );
+    harness.advance(SETTLE);
+
+    assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_focused!(harness.world(), 0);
+    assert_eq!(window_x(harness.world(), 0), 0);
+    assert_eq!(pulses(&mut harness), 0);
+}
+
+/// A slow drag that brings the next column under the viewport center pulses
+/// once as it does, and lands on that column when the fingers lift, flush
+/// with the viewport edge.
+#[test]
+fn window_landing_drag_pulses_as_the_next_column_takes_the_center() {
+    let mut harness = window_landing_harness(true);
+    drag(&mut harness, 0.008, 40);
+    assert_eq!(pulses(&mut harness), 1, "one detent while the fingers move");
+    harness.advance(SETTLE);
+
+    assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_focused!(harness.world(), 1);
+    assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 700);
+    assert_eq!(pulses(&mut harness), 1, "the landing adds no pulse");
+}
+
+/// A quick flick lands on the next column even though the fingers barely
+/// moved, and a hard one never glides past it. The landing pulses, since no
+/// detent named that column.
+#[test]
+fn window_landing_flick_lands_on_the_next_column_only() {
+    for (delta, frames) in [(0.03, 3), (0.1, 2)] {
+        let mut harness = window_landing_harness(true);
+        drag(&mut harness, delta, frames);
+        harness.advance(SETTLE);
+
+        assert!(!is_scrolling(harness.world()), "the settle has finished");
+        assert_focused!(harness.world(), 1);
+        assert_eq!(window_x(harness.world(), 1), TEST_DISPLAY_WIDTH - 700);
+        assert_eq!(pulses(&mut harness), 1, "flick of {delta}");
+    }
+}
+
+/// A flick back toward the start lands on the previous column.
+#[test]
+fn window_landing_flick_back_lands_on_the_previous_column() {
+    let mut harness = window_landing_harness(true);
+    harness.run(vec![focus(Direction::Nth(2))]);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 2);
+    let before = pulses(&mut harness);
+
+    drag(&mut harness, -0.03, 3);
+    harness.advance(SETTLE);
+
+    assert_focused!(harness.world(), 1);
+    assert_eq!(window_x(harness.world(), 1), 0);
+    assert_eq!(pulses(&mut harness), before + 1);
+}
+
+/// Turning the pulses off keeps the landing and drops every pulse.
+#[test]
+fn window_landing_without_haptics_lands_with_no_pulse() {
+    let mut harness = window_landing_harness(false);
+    drag(&mut harness, 0.008, 40);
+    harness.advance(SETTLE);
+    drag(&mut harness, 0.03, 3);
+    harness.advance(SETTLE);
+
+    assert_focused!(harness.world(), 2);
+    assert_eq!(pulses(&mut harness), 0);
 }

@@ -580,6 +580,15 @@ impl Config {
             .unwrap_or(2.0)
     }
 
+    pub fn swipe_gesture_window_landing(&self) -> bool {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.gesture.as_ref())
+            .and_then(|gesture| gesture.window_landing)
+            .unwrap_or(false)
+    }
+
     pub fn swipe_gesture_haptics(&self) -> bool {
         self.inner()
             .swipe

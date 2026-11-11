@@ -57,7 +57,14 @@ pub struct GestureOptions {
     #[serde(default, deserialize_with = "positive_distance_cm")]
     pub page_distance_cm: Option<f64>,
 
-    /// Play a haptic pulse for each confirmed paging focus change. Default: true.
+    /// End each swipe on one window: the one under the fingers, or the next
+    /// one for a quick flick, instead of gliding on with momentum. Default:
+    /// false.
+    pub window_landing: Option<bool>,
+
+    /// Play a haptic pulse for each confirmed paging focus change, and each
+    /// time the window a window-landing swipe would land on changes.
+    /// Default: true.
     pub haptics: Option<bool>,
 }
 
