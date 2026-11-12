@@ -623,7 +623,10 @@ fn member(
         eased: position.0.x,
         x: position.0.x,
         width,
-        held_right: (resize.is_some() && slide.is_none()).then_some(position.0.x + width),
+        // With animation off the resize lands in one step, so pacing holds no
+        // width.
+        held_right: (resize.is_some() && slide.is_none() && t < 1.0)
+            .then_some(position.0.x + width),
         target,
         target_right: target + target_width,
         asked: asked.left,
