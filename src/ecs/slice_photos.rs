@@ -231,10 +231,12 @@ impl SlicePhoto {
     }
 }
 
-/// A new photo on its way for a window's kept photo.
+/// A new photo on its way for a window's kept photo, of the window at the
+/// size it has now.
 #[derive(Debug)]
 struct Renewal {
     generation: u32,
+    slice: EdgeSlice,
     _wanted: Wanted,
 }
 
@@ -619,19 +621,29 @@ fn renew_kept(screen: &mut dyn SliceScreen, slices: &mut Slices, in_view: &InVie
         renewing,
         generation,
     } = slices;
-    for (id, (slice, _)) in kept.iter() {
-        let shows_slice = showing.iter().any(|(showing, _, _)| showing == id);
-        if shows_slice || !in_view.iter().any(|window| window.id() == *id) {
+    for window in in_view {
+        let id = window.id();
+        let Some((kept, _)) = kept.get(&id) else {
+            continue;
+        };
+        if showing.iter().any(|(showing, _, _)| *showing == id) {
             continue;
         }
+        // A window resized in view, as by maximizing, would otherwise keep
+        // a photo whose size no later slice of it matches.
+        let slice = EdgeSlice {
+            size: window.frame().size(),
+            ..*kept
+        };
         *generation = generation.wrapping_add(1);
         let ticket = Ticket::default();
-        screen.photograph(*id, slice, *generation, ticket.clone(), Lookup::Reuse);
+        screen.photograph(id, &slice, *generation, ticket.clone(), Lookup::Reuse);
         debug!("edge slice kept photo renewing: window {id} generation {generation}");
         renewing.insert(
-            *id,
+            id,
             Renewal {
                 generation: *generation,
+                slice,
                 _wanted: Wanted(ticket),
             },
         );
@@ -676,19 +688,34 @@ fn receive_renewal(
     {
         return false;
     }
-    slices.renewing.remove(&window);
-    let (Ok(taken), Some((kept_slice, kept))) = (result, slices.kept.get_mut(&window)) else {
+    let Some(renewal) = slices.renewing.remove(&window) else {
+        return true;
+    };
+    let (Ok(taken), Some(kept)) = (result, slices.kept.get_mut(&window)) else {
         debug!("edge slice kept photo not renewed: window {window}");
         return true;
     };
-    let old = kept.digest;
-    *kept = taken.clone();
+    let old = kept.1.digest;
+    *kept = (renewal.slice, taken.clone());
     debug!("edge slice kept photo renewed: window {window}");
-    let size = kept_slice.size;
+    // A slice still showing the old photo, or a swiped one still waiting for
+    // its first, which a tucked window's photo never brings. A window leaving
+    // the screen waits for its own newer photo instead.
+    let replaces = |photo: &SlicePhoto| match *photo {
+        SlicePhoto::Shown { digest } => digest == old && digest != taken.digest,
+        SlicePhoto::Asked {
+            last: Some(last), ..
+        } => last == old && last != taken.digest,
+        SlicePhoto::Asked {
+            last: None,
+            kept_wait,
+            ..
+        } => kept_wait.is_none(),
+        SlicePhoto::Ended => false,
+    };
     if let Some((_, _, photo)) = slices.showing.iter_mut().find(|(id, slice, photo)| {
-        *id == window && slice.size == size && photo.shown() == Some(old)
-    }) && taken.digest != old
-    {
+        *id == window && slice.size == renewal.slice.size && replaces(photo)
+    }) {
         screen.paint(window, taken);
         match photo {
             SlicePhoto::Shown { digest } => *digest = taken.digest,

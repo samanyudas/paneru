@@ -1472,6 +1472,57 @@ fn a_renewal_older_than_the_slice_photo_does_not_replace_it() {
     );
 }
 
+/// Reveals window 3 with swipes on, then grows it, as Sam maximized Helium,
+/// so its kept photo no longer has its size.
+fn revealed_and_grown() -> (TestHarness, ScreenLog) {
+    let (mut harness, log) = revealed(painted_beside_with(animated_swipes()), 3, Direction::Last);
+    let before = harness.mock_state.ax_frame(3).size();
+    harness.world().write_message(command(Operation::Resize(
+        crate::commands::ResizeDirection::Grow,
+    )));
+    harness.advance(SETTLE);
+    assert_ne!(
+        harness.mock_state.ax_frame(3).size(),
+        before,
+        "window 3 grew"
+    );
+    (harness, log)
+}
+
+#[test]
+fn a_window_grown_in_view_swipes_past_the_edge_under_its_renewed_photo() {
+    let (mut harness, log) = revealed_and_grown();
+
+    swipe_back(&mut harness, 1);
+    arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(9)));
+    swipe_back(&mut harness, 30);
+    harness.advance(SETTLE);
+
+    assert!(placed_ids(&log).contains(&3), "window 3 keeps a panel");
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(9))),
+        "its slice shows the photo renewed at its new size"
+    );
+}
+
+#[test]
+fn a_renewal_that_arrives_after_a_grown_window_crossed_paints_its_waiting_slice() {
+    let (mut harness, log) = revealed_and_grown();
+    swipe_back(&mut harness, 1);
+    let renewal = last_ask(&log, 3);
+
+    swipe_back(&mut harness, 30);
+    harness.advance(SETTLE);
+    arrive(&mut harness, 3, renewal, Ok(photo(9)));
+
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(9))),
+        "the renewal paints the slice that waits for a photo"
+    );
+}
+
 #[test]
 fn a_window_in_view_with_a_kept_photo_is_photographed_every_refresh() {
     let (mut harness, log) = revealed(painted_beside_with(animated()), 3, Direction::Last);
