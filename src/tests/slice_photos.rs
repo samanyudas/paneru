@@ -614,10 +614,12 @@ fn focus_on_a_tucked_window_slides_its_photo_in_without_a_new_photo() {
         .world()
         .write_message(command(Operation::Focus(Direction::Last)));
     let mut places = Vec::new();
+    let mut asks_while_sliding = asks;
     for _ in 0..60 {
         harness.advance(Duration::from_millis(20));
         if let Some((_, slice)) = log.borrow().placed.iter().find(|(id, _)| *id == 3) {
             places.push(slice.on_screen);
+            asks_while_sliding = log.borrow().asked.len();
         }
     }
 
@@ -634,7 +636,7 @@ fn focus_on_a_tucked_window_slides_its_photo_in_without_a_new_photo() {
         Some(&rest),
         "the photo stops where window 3 rests"
     );
-    assert_eq!(log.borrow().asked.len(), asks, "the photo it had slides");
+    assert_eq!(asks_while_sliding, asks, "the photo it had slides");
     assert_eq!(log.borrow().painted, vec![(3, Digest(7))]);
 }
 
@@ -1354,6 +1356,96 @@ fn a_window_leaving_whose_new_photo_is_blank_tucks_under_its_kept_photo() {
     seen.extend(drive(&mut harness, &log, 3, &[], 40));
     assert_shown_every_frame(3, &seen);
     assert_rests_tucked(&mut harness, 3, &seen);
+}
+
+/// `animated` with three-finger swipes on.
+fn animated_swipes() -> Config {
+    (
+        MainOptions {
+            shared_edge_slices: Some(true),
+            animation_speed: Some(14.0),
+            swipe_gesture_fingers: Some(3),
+            ..MainOptions::default()
+        },
+        vec![],
+    )
+        .into()
+}
+
+/// Swipes the strip with three fingers for `frames` frames, toward its
+/// start, so the last column moves out past the right edge.
+fn swipe_back(harness: &mut TestHarness, frames: usize) {
+    for _ in 0..frames {
+        harness.world().write_message(Event::Swipe {
+            delta: -0.05,
+            fingers: 3,
+            distance_cm: 0.0,
+        });
+        harness.advance(Duration::from_millis(20));
+    }
+}
+
+/// Sam's Helium window kept an old photo after a swipe, which tucks a window
+/// the moment it crosses the edge, with no time for a new photo (#451).
+#[test]
+fn a_swipe_renews_the_kept_photo_of_a_window_in_view_before_it_crosses() {
+    let (mut harness, log) = revealed(painted_beside_with(animated_swipes()), 3, Direction::Last);
+    let (asks, lookups) = (asks_for(&log, 3).len(), lookups_for(&log, 3));
+
+    swipe_back(&mut harness, 1);
+    assert!(
+        asks_for(&log, 3).len() > asks,
+        "window 3 is photographed as the swipe starts"
+    );
+    assert_eq!(lookups_for(&log, 3), lookups, "without a new lookup");
+    arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(9)));
+
+    swipe_back(&mut harness, 30);
+    harness.advance(SETTLE);
+    assert!(
+        showing(harness.world()).iter().any(|(id, _)| *id == 3),
+        "window 3 shows a slice"
+    );
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(9))),
+        "its slice shows the renewed photo"
+    );
+}
+
+#[test]
+fn a_renewed_photo_that_arrives_after_the_window_crossed_repaints_its_slice() {
+    let (mut harness, log) = revealed(painted_beside_with(animated_swipes()), 3, Direction::Last);
+    swipe_back(&mut harness, 1);
+    let renewal = last_ask(&log, 3);
+
+    swipe_back(&mut harness, 30);
+    harness.advance(SETTLE);
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(7))),
+        "the kept photo shows while the renewal is on its way"
+    );
+
+    arrive(&mut harness, 3, renewal, Ok(photo(9)));
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(9))),
+        "the renewed photo replaces it"
+    );
+}
+
+#[test]
+fn a_window_in_view_with_a_kept_photo_is_photographed_every_refresh() {
+    let (mut harness, log) = revealed(painted_beside_with(animated()), 3, Direction::Last);
+    let asks = asks_for(&log, 3).len();
+
+    harness.advance(REFRESH);
+
+    assert!(
+        asks_for(&log, 3).len() > asks,
+        "window 3 is photographed while in view"
+    );
 }
 
 #[test]
