@@ -9,8 +9,9 @@ use bevy::time::TimeUpdateStrategy;
 
 use crate::commands::{Command, Direction, Operation};
 use crate::config::{Config, MainOptions};
-use crate::ecs::RepositionMarker;
+use crate::ecs::scroll::{handoff_slope, settle_curve};
 use crate::ecs::systems::ease_out_factor;
+use crate::ecs::{RepositionMarker, Scrolling};
 use crate::events::Event;
 use crate::platform::WinID;
 
@@ -25,11 +26,13 @@ const ACTIVE_FRAME: Duration = Duration::from_millis(16);
 const IDLE_SLEEP: Duration = Duration::from_millis(500);
 const FOCUSED: WinID = 2;
 
-/// Windows 0, 1 and 2 in a row, at rest with window 2 focused.
+/// Windows 0, 1 and 2 in a row, at rest with window 2 focused. They fill
+/// the display, so a swipe springs back.
 fn harness() -> TestHarness {
     let config: Config = (
         MainOptions {
             animation_speed: Some(SPEED),
+            swipe_gesture_fingers: Some(3),
             ..Default::default()
         },
         vec![],
@@ -169,4 +172,93 @@ fn a_late_frame_during_a_swap_counts_its_whole_time() {
         ease_share(late, steps[0]),
         "the late pass after the start",
     );
+}
+
+/// Whether the fingers are on the trackpad, while a swipe or its settle runs.
+fn swiping(world: &mut World) -> Option<bool> {
+    world
+        .query::<&Scrolling>()
+        .iter(world)
+        .next()
+        .map(|scrolling| scrolling.is_user_swiping)
+}
+
+/// Once the fingers lift, a strip that fits the display slides back over
+/// 7 / `animation_speed` seconds. It resisted the fingers, so it starts from
+/// rest, with no jump at the lift, and slows into where it was.
+#[test]
+fn a_spring_back_eases_in_and_out() {
+    let mut harness = harness();
+    let rest = x(&harness);
+    harness.world().write_message(Event::Swipe {
+        delta: 0.3,
+        fingers: 3,
+        distance_cm: 0.0,
+    });
+    let mut left = Vec::new();
+    for _ in 0..200 {
+        pass(&mut harness, ACTIVE_FRAME);
+        match swiping(harness.world()) {
+            None => break,
+            Some(true) => {}
+            Some(false) => left.push(x(&harness) - rest),
+        }
+    }
+    // The windows follow the strip on the next pass.
+    pass(&mut harness, ACTIVE_FRAME);
+    assert_eq!(x(&harness), rest, "the strip springs back to where it was");
+    assert!(left[0].abs() > 10.0, "the swipe moved the strip: {left:?}");
+
+    let duration = 7.0 / SPEED;
+    let frame = ACTIVE_FRAME.as_secs_f64();
+    // 0.5 s of 16 ms passes.
+    assert_eq!(left.len(), 32, "the settle lasts {duration} s: {left:?}");
+    for (pass, at) in left.iter().enumerate().skip(1) {
+        #[allow(clippy::cast_precision_loss, reason = "a few dozen passes")]
+        let progress = settle_curve(pass as f64 * frame / duration, 0.0);
+        let want = left[0] * (1.0 - progress);
+        assert!(
+            (at - want).abs() <= 1.0,
+            "pass {pass} left {at:.0}, expected {want:.0}: {left:?}"
+        );
+    }
+}
+
+/// The settle curve runs from 0 to 1 without overshooting, for every slope
+/// a hand-off can give it, and starts at that slope.
+#[test]
+fn the_settle_curve_starts_at_its_slope_and_never_overshoots() {
+    for slope in [0.0, 0.5, 1.0, 2.0, 3.0] {
+        assert!(settle_curve(0.0, slope).abs() < 1e-12);
+        assert!((settle_curve(1.0, slope) - 1.0).abs() < 1e-12);
+        let h = 1e-6;
+        let start = settle_curve(h, slope) / h;
+        assert!(
+            (start - slope).abs() < 1e-3,
+            "slope {slope} starts at {start}"
+        );
+        let mut previous = 0.0;
+        for step in 1..=1000 {
+            let at = settle_curve(f64::from(step) / 1000.0, slope);
+            assert!(
+                at >= previous && at <= 1.0 + 1e-12,
+                "slope {slope}: {at} after {previous}"
+            );
+            previous = at;
+        }
+    }
+}
+
+/// A strip moving toward its landing carries its speed into the settle. One
+/// moving away, or still, starts from rest, and a fast one is capped where
+/// the curve would overshoot.
+#[test]
+fn a_settle_carries_on_the_speed_toward_its_landing() {
+    // 400 points over 0.5 s averages 800 points per second.
+    assert!((handoff_slope(800.0, 400.0, 0.5) - 1.0).abs() < 1e-12);
+    assert!((handoff_slope(-800.0, -400.0, 0.5) - 1.0).abs() < 1e-12);
+    assert!(handoff_slope(-800.0, 400.0, 0.5).abs() < 1e-12);
+    assert!(handoff_slope(0.0, 400.0, 0.5).abs() < 1e-12);
+    assert!(handoff_slope(800.0, 0.0, 0.5).abs() < 1e-12);
+    assert!((handoff_slope(10_000.0, 400.0, 0.5) - 3.0).abs() < 1e-12);
 }

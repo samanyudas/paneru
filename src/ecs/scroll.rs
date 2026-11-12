@@ -1,13 +1,12 @@
 use bevy::app::{App, Plugin, PreUpdate, Update};
 use bevy::ecs::entity::Entity;
-use bevy::ecs::lifecycle::Remove;
+use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::{Message, MessageReader, MessageWriter};
-use bevy::ecs::observer::On;
 use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::SystemCondition as _;
-use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
 use std::collections::VecDeque;
@@ -16,19 +15,22 @@ use tracing::{Level, instrument};
 
 use crate::commands::{Direction, FocusSource, focus_with_verification};
 use crate::config::Config;
-use crate::config::swipe::{SwipeGestureDirection, focus_direction};
-use crate::ecs::focus::FocusHistory;
+use crate::config::swipe::{SwipeGestureDirection, SwipeTarget, focus_direction};
+use crate::ecs::display::shown_strip;
+use crate::ecs::focus::{FocusHistory, PageHapticRequest};
 use crate::ecs::layout::{Column, LayoutStrip, strip_content_range};
-use crate::ecs::params::{ActiveDisplay, Windows};
+use crate::ecs::params::Windows;
+use crate::ecs::systems::AnimationStep;
 use crate::ecs::{
-    ActiveWorkspaceMarker, ManualStripOffset, MissionControlActive, Position, PreUpdateSet,
-    RepositionMarker, ScrollInput, Scrolling, SendMessageTrigger, UpdateSet,
+    ActiveWorkspaceMarker, DockPosition, ManualStripOffset, MissionControlActive,
+    NativeFullscreenMarker, Position, PreUpdateSet, RepositionMarker, ScrollInput, Scrolling,
+    SelectedVirtualMarker, SendMessageTrigger, SettleEase, UpdateSet,
 };
 use crate::errors::Result;
 use bevy::ecs::schedule::common_conditions::on_message;
 
 use crate::events::{Event, InputEvent};
-use crate::manager::{Window, WindowManager};
+use crate::manager::{Display, Window, WindowManager, origin_from};
 use crate::platform::Modifiers;
 use crate::util::round_px;
 
@@ -145,32 +147,64 @@ const MAX_STEP_SECS: f64 = 1.0 / 30.0;
 /// `gesture_delta / dt` diverges.
 const MIN_STEP_SECS: f64 = 1.0 / 1000.0;
 
-/// The on-screen strip, its origin, and the scroll state being applied to it.
-type ScrollingStrip<'w, 's> = Single<
-    'w,
-    's,
-    (
-        &'static LayoutStrip,
-        &'static mut Position,
-        &'static mut Scrolling,
-    ),
-    (With<ActiveWorkspaceMarker>, Without<Window>),
->;
+/// Each display a strip can sit on, with the Dock that narrows its viewport.
+type StripDisplays<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
 
-/// The active strip a swipe drives: its origin, any animation still in
-/// flight, and the scroll state if a swipe is already under way.
+/// The display that holds a strip: its full bounds, and the viewport the strip
+/// scrolls in, which leaves out the Dock and the edge padding. `None` for a
+/// strip whose display is gone.
+fn viewports(
+    child: Option<&ChildOf>,
+    displays: &StripDisplays,
+    config: &Config,
+) -> Option<(IRect, IRect)> {
+    let (display, dock) = displays.get(child?.parent()).ok()?;
+    Some((
+        display.bounds(),
+        display.actual_display_bounds(dock, config),
+    ))
+}
+
+/// A strip a swipe can drive: the strip, whether it is the selected strip of
+/// its Space and the active strip, the display that holds it, its origin, any
+/// animation still in flight, and the scroll state if a swipe is already
+/// under way.
 type SwipedStrip = (
     Entity,
+    &'static LayoutStrip,
+    Has<SelectedVirtualMarker>,
+    Has<ActiveWorkspaceMarker>,
+    Option<&'static ChildOf>,
     &'static Position,
     Option<&'static RepositionMarker>,
     Option<&'static mut Scrolling>,
 );
 
-/// The active strip once a swipe has ended, and whether a deliberate move has
-/// taken it over.
+type SwipedStrips<'w, 's> = Query<'w, 's, SwipedStrip, (With<LayoutStrip>, Without<Window>)>;
+
+/// A strip a swipe has moved: its display, whether it is a native fullscreen
+/// Space, its origin, and its scroll state.
+type ScrollingStrips<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        &'static LayoutStrip,
+        Option<&'static ChildOf>,
+        Has<NativeFullscreenMarker>,
+        &'static mut Position,
+        &'static mut Scrolling,
+    ),
+    (With<LayoutStrip>, Without<Window>),
+>;
+
+/// A strip once a swipe has ended, and whether a deliberate move has taken it
+/// over.
 type SettlingStrip = (
     Entity,
     &'static LayoutStrip,
+    Option<&'static ChildOf>,
+    Has<NativeFullscreenMarker>,
     &'static mut Position,
     &'static mut Scrolling,
     Has<RepositionMarker>,
@@ -178,7 +212,6 @@ type SettlingStrip = (
 
 impl Plugin for ScrollEventsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_observer(finish_settle_on_deactivate);
         app.init_resource::<PageGestureState>();
         app.add_message::<PageFocusRequest>();
         let mission_control_inactive = |mission_control: Option<Res<MissionControlActive>>| {
@@ -204,11 +237,15 @@ impl Plugin for ScrollEventsPlugin {
                 swipe_gesture
                     .run_if(mission_control_inactive)
                     .run_if(on_message::<InputEvent>),
+                // Before the settle, so a settle never focuses a window in a
+                // Space its display has just left.
+                land_unshown_strips.run_if(on_message::<Event>),
                 apply_inertia,
                 apply_snap_force,
                 settle_strip,
                 scrolling_integrator,
                 apply_scrolling_constraints,
+                landing_detents,
                 swiping_timeout,
             )
                 .chain()
@@ -289,13 +326,19 @@ fn paging_gesture(
     }
 }
 
+/// Moves a strip with the fingers or the wheel. A swipe drives the strip it
+/// started on until that strip lands, whatever happens to focus or the active
+/// display meanwhile; [`swiped_strip`] picks it.
 #[instrument(level = Level::TRACE, skip_all)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn swipe_gesture(
     mut messages: MessageReader<InputEvent>,
-    active_display: ActiveDisplay,
-    mut active_workspace: Single<SwipedStrip, With<ActiveWorkspaceMarker>>,
+    mut strips: SwipedStrips,
+    displays: StripDisplays,
+    window_manager: Res<WindowManager>,
     time: Res<Time>,
     config: Res<Config>,
+    mut fingers_down: Local<bool>,
     mut commands: Commands,
 ) {
     let swipe_sensitivity = config.swipe_sensitivity();
@@ -318,8 +361,10 @@ fn swipe_gesture(
         match event {
             Event::TouchpadDown => {
                 touchpad_down = true;
+                *fingers_down = true;
                 total_delta = 0.0;
             }
+            Event::TouchpadUp => *fingers_down = false,
             Event::Scroll { delta } => {
                 total_delta += *delta * scroll_scale;
                 has_scroll_event = true;
@@ -339,11 +384,52 @@ fn swipe_gesture(
         }
     }
 
+    if !*fingers_down {
+        for (.., scrolling) in &mut strips {
+            let Some(mut scrolling) = scrolling.filter(|scrolling| scrolling.fingers_down) else {
+                continue;
+            };
+            scrolling.fingers_down = false;
+            // Fingers that held still before they lifted made no flick,
+            // whatever speed they moved at before the hold.
+            if lands_on_window(&config, scrolling.input)
+                && time.elapsed().abs_diff(scrolling.last_event) > scrolling.input.idle_threshold()
+            {
+                scrolling.velocity = 0.0;
+            }
+        }
+    }
     if !touchpad_down && !has_scroll_event {
         return;
     }
-
-    let (entity, position, reposition, scrolling) = &mut *active_workspace;
+    let Some(target) = swiped_strip(touchpad_down, &strips, &displays, &window_manager, &config)
+    else {
+        return;
+    };
+    if touchpad_down {
+        // Fingers that touch down for a new swipe on another strip leave the
+        // strip the last swipe drove to `settle_strip`.
+        for (entity, .., scrolling) in &mut strips {
+            if entity != target
+                && let Some(mut scrolling) = scrolling.filter(|scrolling| scrolling.is_user_swiping)
+            {
+                scrolling.is_user_swiping = false;
+            }
+        }
+    }
+    let Ok((entity, _, _, _, child, position, reposition, mut scrolling)) = strips.get_mut(target)
+    else {
+        return;
+    };
+    let Some((bounds, _)) = viewports(child, &displays, &config) else {
+        return;
+    };
+    if *fingers_down
+        && let Some(scrolling) = scrolling.as_mut()
+        && !scrolling.fingers_down
+    {
+        scrolling.fingers_down = true;
+    }
     let input = if has_gesture_event {
         ScrollInput::Gesture
     } else {
@@ -352,19 +438,28 @@ fn swipe_gesture(
 
     // The user is driving the strip by hand now, so an earlier deliberate
     // placement (center, snap) no longer describes where they want it.
-    if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
         entity_commands.try_remove::<ManualStripOffset>();
     }
 
     if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
+        // Fingers that catch a settle start a new swipe from where the strip
+        // was headed, so a second quick swipe steps on from there.
+        if let Some(target) = scrolling.settle {
+            scrolling.anchor = target;
+        }
+        scrolling.origin = scrolling.position;
+        scrolling.detent = None;
+        scrolling.start = scrolling.landing_focus.take();
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = true;
         scrolling.last_event = time.elapsed();
         scrolling.settle = None;
+        scrolling.ease = None;
     }
 
     if has_scroll_event {
-        let viewport_width = f64::from(active_display.bounds().width());
+        let viewport_width = f64::from(bounds.width());
         let direction = direction_modifier(&config);
 
         // Floored, not capped: dividing by the real elapsed time is correct
@@ -389,8 +484,9 @@ fn swipe_gesture(
             scrolling.last_event = time.elapsed();
             scrolling.input = input;
             scrolling.settle = None;
+            scrolling.ease = None;
             scrolling.position += total_delta * viewport_width * direction * swipe_sensitivity;
-        } else if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+        } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(Scrolling {
                 velocity: new_velocity,
                 position: f64::from(position.0.x)
@@ -402,36 +498,123 @@ fn swipe_gesture(
                 // where it rests.
                 anchor: f64::from(reposition.map_or(position.0.x, |target| target.0.x)),
                 settle: None,
+                ease: None,
+                detent: None,
+                origin: f64::from(position.0.x),
+                landing_focus: None,
+                start: None,
+                fingers_down: *fingers_down,
             });
         }
     }
 }
 
+/// The strip this frame's swipe input drives. The strip under the fingers
+/// keeps them until they lift, and the strip a wheel scroll or a swipe that
+/// just lifted moved keeps the input until it pauses. A new swipe drives the
+/// strip [`new_swipe_target`] picks.
+fn swiped_strip(
+    touchpad_down: bool,
+    strips: &SwipedStrips,
+    displays: &StripDisplays,
+    window_manager: &WindowManager,
+    config: &Config,
+) -> Option<Entity> {
+    let holding = |holds: fn(&Scrolling) -> bool| {
+        strips
+            .iter()
+            .find_map(|(entity, .., scrolling)| scrolling.is_some_and(holds).then_some(entity))
+    };
+    holding(|scrolling| scrolling.fingers_down)
+        .or_else(|| {
+            (!touchpad_down)
+                .then(|| holding(|scrolling| scrolling.is_user_swiping))
+                .flatten()
+        })
+        .or_else(|| new_swipe_target(strips, displays, window_manager, config))
+}
+
+/// The strip a new swipe drives. With [`SwipeTarget::Pointer`] that is the
+/// strip shown on the display under the pointer, menu bar included, unless
+/// that display shows no strip or a native fullscreen Space. Otherwise it is
+/// the active strip.
+fn new_swipe_target(
+    strips: &SwipedStrips,
+    displays: &StripDisplays,
+    window_manager: &WindowManager,
+    config: &Config,
+) -> Option<Entity> {
+    let active = strips
+        .iter()
+        .find_map(|(entity, _, _, active, ..)| active.then_some(entity));
+    if config.swipe_gesture_target() == SwipeTarget::Focused {
+        return active;
+    }
+    window_manager
+        .cursor_position()
+        .map(origin_from)
+        .and_then(|pointer| {
+            displays
+                .iter()
+                .find(|(display, _)| display.physical_bounds().contains(pointer))
+        })
+        .and_then(|(display, _)| {
+            shown_strip(
+                window_manager,
+                display.id(),
+                strips
+                    .iter()
+                    .map(|(entity, strip, selected, ..)| (entity, strip, selected)),
+            )
+        })
+        .filter(|entity| {
+            strips
+                .get(*entity)
+                .is_ok_and(|(_, strip, ..)| !strip.is_fullscreen())
+        })
+        .or(active)
+}
+
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn swiping_timeout(
-    strips: Populated<(Entity, &mut Scrolling, Has<ActiveWorkspaceMarker>), With<LayoutStrip>>,
-    active_display: ActiveDisplay,
+    strips: ScrollingStrips,
+    displays: StripDisplays,
     time: Res<Time>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
     const MIN_VELOCITY_PX: f64 = 5.0;
-    let settling = settles(&config, &active_display);
     // Predicts the distance the integrator is about to move, so it has to use
     // the same bounded step the integrator does.
     let dt = time.delta_secs_f64().min(MAX_STEP_SECS);
-    let viewport_width = f64::from(active_display.bounds().width());
 
-    for (entity, mut scroll, active) in strips {
-        if time.elapsed().abs_diff(scroll.last_event) > scroll.input.idle_threshold() {
+    for (entity, _, child, fullscreen, _, mut scroll) in strips {
+        // Fingers held still on a window-landing swipe keep the strip where
+        // they hold it. The longer limit only covers a lift the trackpad never
+        // reported.
+        let held = scroll.fingers_down && lands_on_window(&config, scroll.input);
+        let idle_threshold = if held {
+            HELD_FINGERS_TIMEOUT
+        } else {
+            scroll.input.idle_threshold()
+        };
+        if time.elapsed().abs_diff(scroll.last_event) > idle_threshold {
             scroll.is_user_swiping = false;
-            // `settle_strip` owns the active strip from here, and focus goes to
-            // the column it lands on, not to whatever slid under the pointer.
-            if settling && active {
+            if held {
+                // Fingers held this long made no flick.
+                scroll.velocity = 0.0;
+            }
+            // `settle_strip` owns the strip from here, active or not, and
+            // focus goes to the column it lands on, not to whatever slid
+            // under the pointer.
+            if settles(&config, fullscreen) {
                 continue;
             }
 
+            // A strip whose display is gone has nowhere to glide.
+            let viewport_width = viewports(child, &displays, &config)
+                .map_or(0.0, |(bounds, _)| f64::from(bounds.width()));
             if scroll.velocity.abs() * dt * viewport_width < MIN_VELOCITY_PX
                 && let Ok(mut entity_commands) = commands.get_entity(entity)
             {
@@ -447,23 +630,48 @@ pub(super) fn swiping_timeout(
     }
 }
 
-/// A strip that stops being active mid-settle lands at once. `settle_strip`
-/// only drives the active strip, so otherwise its settle would never finish.
-fn finish_settle_on_deactivate(
-    trigger: On<Remove, ActiveWorkspaceMarker>,
-    mut strips: Query<(&mut Position, &Scrolling), With<LayoutStrip>>,
+/// Lands a swiped strip at once when its display stops showing it, as when
+/// the display switches to another Space mid-swipe: the strip is where it was
+/// headed when its Space shows again. A strip whose display is gone stops
+/// where it is.
+fn land_unshown_strips(
+    mut messages: MessageReader<Event>,
+    strips: ScrollingStrips,
+    displays: StripDisplays,
+    windows: Windows,
+    window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
-    let entity = trigger.entity;
-    let Ok((mut position, scroll)) = strips.get_mut(entity) else {
+    if !messages.read().any(|event| {
+        matches!(
+            event,
+            Event::SpaceChanged | Event::DisplayChanged | Event::DisplayRemoved { .. }
+        )
+    }) {
         return;
-    };
-    let Some(target) = scroll.settle else {
-        return;
-    };
-    position.x = round_px(target);
-    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        entity_commands.try_remove::<Scrolling>();
+    }
+    for (entity, strip, child, _, mut position, scroll) in strips {
+        let display = child.and_then(|child| displays.get(child.parent()).ok());
+        if let Some((display, dock)) = display {
+            if window_manager
+                .active_display_space(display.id())
+                .is_ok_and(|space| space == strip.id())
+            {
+                continue;
+            }
+            let viewport = display.actual_display_bounds(dock, &config);
+            if let Some(target) = scroll
+                .settle
+                .map(round_px)
+                .or_else(|| resting_offset(&scroll, strip, &windows, viewport, &config))
+            {
+                position.x = target;
+            }
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<Scrolling>();
+        }
     }
 }
 
@@ -493,8 +701,8 @@ fn apply_inertia(
 
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_snap_force(
-    mut strip: Single<(&LayoutStrip, &Position, &mut Scrolling)>,
-    active_display: ActiveDisplay,
+    strips: ScrollingStrips,
+    displays: StripDisplays,
     windows: Windows,
     config: Res<Config>,
     time: Res<Time>,
@@ -506,48 +714,76 @@ fn apply_snap_force(
         return;
     }
 
-    let viewport = active_display.actual_bounds(&config);
-    let viewport_center = viewport.center().x;
-    let snap_threshold = SNAP_DISPLAY_RATIO * f64::from(viewport.width());
+    for (_, strip, child, _, position, mut scroll) in strips {
+        let Some((_, viewport)) = viewports(child, &displays, &config) else {
+            continue;
+        };
+        let viewport_center = viewport.center().x;
+        let snap_threshold = SNAP_DISPLAY_RATIO * f64::from(viewport.width());
 
-    let (strip, position, ref mut scroll) = *strip;
-    if scroll.is_user_swiping || scroll.velocity.abs() > 0.5 {
-        return;
-    }
+        if scroll.is_user_swiping || scroll.velocity.abs() > 0.5 {
+            continue;
+        }
 
-    let target_offset = strip
-        .all_columns()
-        .into_iter()
-        .filter_map(|entity| {
-            windows
-                .layout_position(entity)
-                .map(|p| p.0.x)
-                .zip(Some(entity))
-        })
-        .map(|(position, entity)| {
-            let col_width = windows.moving_frame(entity).map_or(0, |f| f.width());
-            viewport_center - (position + col_width / 2)
-        })
-        .min_by_key(|target| (position.x - target).abs())
-        .unwrap_or(position.x);
+        let target_offset = strip
+            .all_columns()
+            .into_iter()
+            .filter_map(|entity| {
+                windows
+                    .layout_position(entity)
+                    .map(|p| p.0.x)
+                    .zip(Some(entity))
+            })
+            .map(|(position, entity)| {
+                let col_width = windows.moving_frame(entity).map_or(0, |f| f.width());
+                viewport_center - (position + col_width / 2)
+            })
+            .min_by_key(|target| (position.x - target).abs())
+            .unwrap_or(position.x);
 
-    let dist_to_snap = f64::from(position.x - target_offset);
-    if dist_to_snap.abs() < snap_threshold {
-        // This is an exponential approach, and it only pulls *toward* the
-        // target while the factor stays under 1. Past that it overshoots to the
-        // far side; at a 10s delta it would fling the strip 100x the distance
-        // the wrong way. Clamping the factor rather than `dt` keeps that true
-        // for any timestep and any `CENTER_MAGNETIC_FORCE`.
-        let approach = (time.delta_secs_f64() * CENTER_MAGNETIC_FORCE).min(1.0);
-        scroll.position -= dist_to_snap * approach;
+        let dist_to_snap = f64::from(position.x - target_offset);
+        if dist_to_snap.abs() < snap_threshold {
+            // This is an exponential approach, and it only pulls *toward* the
+            // target while the factor stays under 1. Past that it overshoots to
+            // the far side; at a 10s delta it would fling the strip 100x the
+            // distance the wrong way. Clamping the factor rather than `dt`
+            // keeps that true for any timestep and any `CENTER_MAGNETIC_FORCE`.
+            let approach = (time.delta_secs_f64() * CENTER_MAGNETIC_FORCE).min(1.0);
+            scroll.position -= dist_to_snap * approach;
+        }
     }
 }
 
 /// Whether a swipe ends by settling on a column. `auto_center` keeps
-/// upstream's centering snap instead, and a native fullscreen Space has no
-/// strip to settle.
-fn settles(config: &Config, active_display: &ActiveDisplay) -> bool {
-    !config.auto_center() && active_display.fullscreen().is_none()
+/// upstream's centering snap instead, and a strip in a native fullscreen Space
+/// has nothing to settle.
+fn settles(config: &Config, fullscreen: bool) -> bool {
+    !config.auto_center() && !fullscreen
+}
+
+/// Where a strip comes to rest without momentum: back to where the swipe
+/// began when the strip fits its viewport, else on the column [`landing`]
+/// gives for its offset held to the strip ends.
+fn resting_offset(
+    scroll: &Scrolling,
+    strip: &LayoutStrip,
+    windows: &Windows,
+    viewport: IRect,
+    config: &Config,
+) -> Option<i32> {
+    if let Some(fitted) = fitted_offsets(strip, windows, viewport) {
+        return Some(round_px(scroll.anchor.clamp(fitted.0, fitted.1)));
+    }
+    let get_window_frame = |entity| windows.moving_frame(entity);
+    let resting = clamp_viewport_offset(
+        round_px(scroll.position),
+        strip,
+        windows,
+        &get_window_frame,
+        &viewport,
+        config,
+    )?;
+    Some(landing(resting, None, strip, windows, viewport).map_or(resting, |(_, offset)| offset))
 }
 
 /// The range of strip offsets that show the whole strip, when it fits the
@@ -576,8 +812,13 @@ fn resist(stretch: f64, viewport_width: f64) -> f64 {
 /// `ensure_visible_in_strip` makes for keyboard focus. Continuous swipe lets
 /// the fingers pull an end column to the far edge, so the offset is then
 /// held to the range that leaves no empty space beside the overflowing strip.
+///
+/// A window-landing `step` instead lands one column on from the column the
+/// swipe began on, whatever the column widths, or springs back to where the
+/// swipe began.
 fn landing(
     resting: i32,
+    step: Option<Step>,
     strip: &LayoutStrip,
     windows: &Windows,
     viewport: IRect,
@@ -586,7 +827,7 @@ fn landing(
     let edges = (viewport.max.x - content.end).min(viewport.min.x - content.start)
         ..=(viewport.min.x - content.start);
     let center = viewport.center().x;
-    strip
+    let columns: Vec<_> = strip
         .columns()
         .filter_map(|column| {
             let top = column.top()?;
@@ -594,19 +835,101 @@ fn landing(
             let width = windows.moving_frame(top)?.width();
             Some((column, slot, width))
         })
-        .min_by_key(|(_, slot, width)| {
+        .collect();
+    let nearest = |resting: i32| {
+        (0..columns.len()).min_by_key(|&index| {
+            let (_, slot, width) = &columns[index];
             let min = resting + slot;
             let max = min + width;
             let outside = (min - center).max(center - max).max(0);
             (outside, (min + width / 2 - center).abs())
         })
-        .map(|(column, slot, width)| {
-            let far_edge = viewport.max.x - width;
-            let shown =
-                (resting + slot).clamp(viewport.min.x.min(far_edge), viewport.min.x.max(far_edge));
-            let offset = (shown - slot).clamp(*edges.start(), *edges.end());
-            (column.clone(), offset)
-        })
+    };
+    let index = match step {
+        None => nearest(resting)?,
+        Some(step) => {
+            // The column nearest the center can be a wide neighbor of a
+            // narrow column that landed flush with an edge.
+            let start = step
+                .start
+                .and_then(|window| {
+                    columns
+                        .iter()
+                        .position(|(column, _, _)| column.position_of(window).is_some())
+                })
+                .or_else(|| nearest(step.from))?;
+            let index = match step.toward_end {
+                Some(true) => (start + 1).min(columns.len() - 1),
+                Some(false) => start.saturating_sub(1),
+                None => start,
+            };
+            if index == start {
+                return Some((
+                    columns[start].0.clone(),
+                    step.from.clamp(*edges.start(), *edges.end()),
+                ));
+            }
+            index
+        }
+    };
+    // A step lands where showing the next column from the start leaves it,
+    // wherever the fingers let go.
+    let resting = step.map_or(resting, |step| step.from);
+    let (column, slot, width) = &columns[index];
+    let far_edge = viewport.max.x - width;
+    let shown = (resting + slot).clamp(viewport.min.x.min(far_edge), viewport.min.x.max(far_edge));
+    let offset = (shown - slot).clamp(*edges.start(), *edges.end());
+    Some(((*column).clone(), offset))
+}
+
+/// Where a window-landing swipe goes: one column on from the column it began
+/// on, or back to it.
+#[derive(Clone, Copy, Debug)]
+struct Step {
+    /// The strip offset the swipe began at.
+    from: i32,
+    /// A window in the column the swipe began on. Without one, that is the
+    /// column nearest the viewport center at `from`.
+    start: Option<Entity>,
+    /// Toward the last column, toward the first, or neither.
+    toward_end: Option<bool>,
+}
+
+impl Step {
+    /// The step a window-landing swipe takes from the column it began on: in
+    /// the direction the fingers moved the strip once they have moved it
+    /// `STEP_FRACTION` of the viewport, or in the direction of a `flick`,
+    /// which wins since it is the latest intent.
+    fn of(scroll: &Scrolling, position: f64, flick: Option<f64>, viewport_width: f64) -> Self {
+        let moved = position - scroll.origin;
+        let toward_end = match flick {
+            Some(velocity) => Some(velocity < 0.0),
+            None => (moved.abs() >= STEP_FRACTION * viewport_width).then_some(moved < 0.0),
+        };
+        Self {
+            from: round_px(scroll.anchor),
+            start: scroll.start,
+            toward_end,
+        }
+    }
+}
+
+/// How far, as a fraction of the viewport width, the fingers move the strip
+/// before a window-landing swipe steps to the next column. On a 2560-point
+/// display at the default sensitivity this is about 2 cm of finger travel.
+const STEP_FRACTION: f64 = 0.05;
+
+/// The strip speed, in viewport widths per second, above which a lifted
+/// window-landing swipe counts as a flick.
+const FLICK_SPEED: f64 = 0.25;
+
+/// How long fingers held still keep a window-landing swipe going, in case
+/// the trackpad never reports them lifting.
+const HELD_FINGERS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether a swipe ends on one window instead of gliding on with momentum.
+pub(super) fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
+    input == ScrollInput::Gesture && config.swipe_gesture_window_landing()
 }
 
 /// Ends a swipe on a column once the fingers lift, with `auto_center` off.
@@ -614,104 +937,237 @@ fn landing(
 /// On lift it projects the momentum to where the strip would come to rest,
 /// picks the column [`landing`] gives for that offset, and focuses the window
 /// in it that had focus last. A strip that fits the viewport springs back to
-/// where the swipe began instead, and focus stays. The strip then travels
-/// there on a critically damped spring that starts at the glide's velocity:
-/// with the target at the projected rest, at twice the deceleration rate,
-/// it begins without a jolt and lands without overshoot.
+/// where the swipe began instead, and focus stays. The strip then slides
+/// there over [`settle_duration`] on [`settle_curve`]: it carries on at the
+/// speed it had when the fingers lifted, or gathers speed from rest, then
+/// slows into the column.
+///
+/// A window-landing swipe ignores the momentum: it lands one column on from
+/// where it began, or back there, as [`Step`] decides, and pulses if that is
+/// not the column the last detent pulse named.
 #[instrument(level = Level::TRACE, skip_all)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn settle_strip(
-    strip: Single<SettlingStrip, (With<ActiveWorkspaceMarker>, Without<Window>)>,
-    active_display: ActiveDisplay,
+    strips: Populated<SettlingStrip, (With<LayoutStrip>, Without<Window>)>,
+    displays: StripDisplays,
     windows: Windows,
     focus_history: Res<FocusHistory>,
     config: Res<Config>,
-    time: Res<Time>,
+    step: Res<AnimationStep>,
+    mut haptics: MessageWriter<PageHapticRequest>,
     mut commands: Commands,
 ) {
-    const DONE_PX: f64 = 0.5;
-
-    if !settles(&config, &active_display) {
-        return;
-    }
-    let (entity, strip, mut position, mut scroll, repositioning) = strip.into_inner();
-    if scroll.is_user_swiping {
-        return;
-    }
-    let finish = |commands: &mut Commands| {
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_remove::<Scrolling>();
+    for (entity, strip, child, fullscreen, mut position, mut scroll, repositioning) in strips {
+        if !settles(&config, fullscreen) || scroll.is_user_swiping {
+            continue;
         }
-    };
-    // A deliberate move (keyboard focus, Center) has taken the strip over.
-    if repositioning {
-        finish(&mut commands);
-        return;
-    }
-
-    let viewport = active_display.actual_bounds(&config);
-    let viewport_width = f64::from(viewport.width());
-    let px_per_velocity = viewport_width * direction_modifier(&config);
-    let deceleration = config.swipe_deceleration();
-
-    let target = if let Some(target) = scroll.settle {
-        target
-    } else if let Some(fitted) = fitted_offsets(strip, &windows, viewport) {
-        // Start from where the resisting strip shows, not the raw fingers.
-        scroll.position = f64::from(position.x);
-        scroll.velocity = 0.0;
-        let target = scroll.anchor.clamp(fitted.0, fitted.1);
-        scroll.settle = Some(target);
-        target
-    } else {
-        let natural = scroll.position + scroll.velocity * px_per_velocity / deceleration;
-        let get_window_frame = |entity| windows.moving_frame(entity);
-        let Some((column, target)) = clamp_viewport_offset(
-            round_px(natural),
-            strip,
-            &windows,
-            &get_window_frame,
-            &viewport,
-            &config,
-        )
-        .and_then(|resting| landing(resting, strip, &windows, viewport)) else {
-            finish(&mut commands);
-            return;
-        };
-        let target = f64::from(target);
-        scroll.settle = Some(target);
-        if let Some(window) = focus_history.last_focused_in(&column) {
-            let focused = windows.focused().map(|(_, focused)| focused);
-            if focused != Some(window) {
-                focus_with_verification(window, focused, None, FocusSource::Other, &mut commands);
+        let finish = |commands: &mut Commands| {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<Scrolling>();
             }
+        };
+        // A deliberate move (keyboard focus, Center) has taken the strip over.
+        if repositioning {
+            finish(&mut commands);
+            continue;
         }
-        target
-    };
+        // A strip whose display is gone has nowhere to settle.
+        let Some((_, viewport)) = viewports(child, &displays, &config) else {
+            finish(&mut commands);
+            continue;
+        };
 
-    // An unset animation speed means instant movement, which is how Miri
-    // applies Reduce Motion and its disable-animation setting.
-    if config.options().animation_speed.is_none() {
-        position.x = round_px(target);
-        finish(&mut commands);
-        return;
+        let viewport_width = f64::from(viewport.width());
+        let px_per_velocity = viewport_width * direction_modifier(&config);
+        let deceleration = config.swipe_deceleration();
+
+        let target = if let Some(target) = scroll.settle {
+            target
+        } else if let Some(fitted) = fitted_offsets(strip, &windows, viewport) {
+            // Start from where the resisting strip shows, not the raw fingers.
+            scroll.position = f64::from(position.x);
+            scroll.velocity = 0.0;
+            let target = scroll.anchor.clamp(fitted.0, fitted.1);
+            scroll.settle = Some(target);
+            target
+        } else {
+            let window_landing = lands_on_window(&config, scroll.input);
+            let (natural, step) = if window_landing {
+                let flick = (scroll.velocity.abs() > FLICK_SPEED)
+                    .then(|| scroll.velocity * px_per_velocity);
+                (
+                    scroll.position,
+                    Some(Step::of(&scroll, scroll.position, flick, viewport_width)),
+                )
+            } else {
+                (
+                    scroll.position + scroll.velocity * px_per_velocity / deceleration,
+                    None,
+                )
+            };
+            let get_window_frame = |entity| windows.moving_frame(entity);
+            let Some((column, target)) = clamp_viewport_offset(
+                round_px(natural),
+                strip,
+                &windows,
+                &get_window_frame,
+                &viewport,
+                &config,
+            )
+            .and_then(|resting| landing(resting, step, strip, &windows, viewport)) else {
+                finish(&mut commands);
+                continue;
+            };
+            let target = f64::from(target);
+            scroll.settle = Some(target);
+            if window_landing {
+                // The fingers chose the step. The ease starts from where the
+                // resisting strip shows.
+                scroll.position = f64::from(position.x);
+                if config.swipe_gesture_haptics() && column.top() != scroll.detent {
+                    haptics.write(PageHapticRequest);
+                }
+            }
+            if let Some(window) = focus_history.last_focused_in(&column) {
+                if window_landing {
+                    // An app can take a moment to answer a focus request,
+                    // which would stall the landing partway, so it waits for
+                    // the end.
+                    scroll.landing_focus = Some(window);
+                } else {
+                    focus(window, &windows, &mut commands);
+                }
+            }
+            target
+        };
+
+        // An unset animation speed means instant movement, which is how Miri
+        // applies Reduce Motion and its disable-animation setting.
+        if config.options().animation_speed.is_none() {
+            position.x = round_px(target);
+            if let Some(window) = scroll.landing_focus.take() {
+                focus(window, &windows, &mut commands);
+            }
+            finish(&mut commands);
+            continue;
+        }
+
+        let duration = settle_duration(&config);
+        let from = scroll.position;
+        let slope = handoff_slope(scroll.velocity * px_per_velocity, target - from, duration);
+        let ease = scroll.ease.get_or_insert(SettleEase {
+            from,
+            elapsed: 0.0,
+            slope,
+        });
+        ease.elapsed += step.secs();
+        let ease = *ease;
+        // The ease carries the strip's speed from here.
+        scroll.velocity = 0.0;
+        let progress = settle_curve(ease.elapsed / duration, ease.slope);
+        let from = ease.from;
+
+        if progress >= 1.0 {
+            position.x = round_px(target);
+            if let Some(window) = scroll.landing_focus.take() {
+                focus(window, &windows, &mut commands);
+            }
+            finish(&mut commands);
+            continue;
+        }
+        scroll.position = from + (target - from) * progress;
     }
+}
 
-    let omega = 2.0 * deceleration;
-    let dt = time.delta_secs_f64().min(MAX_STEP_SECS);
-    let offset = scroll.position - target;
-    let velocity = scroll.velocity * px_per_velocity;
-    let decay = (-omega * dt).exp();
-    let drive = velocity + omega * offset;
-    let offset = (offset + drive * dt) * decay;
-    let velocity = (velocity - omega * drive * dt) * decay;
+/// How long a settle lasts, in keyboard ease time constants
+/// (`1 / animation_speed`).
+const SETTLE_TIME_CONSTANTS: f64 = 7.0;
 
-    if offset.abs() < DONE_PX && velocity.abs() * MAX_STEP_SECS < DONE_PX {
-        position.x = round_px(target);
-        finish(&mut commands);
-        return;
+/// How long a settle lasts: 0.5 s at Miri's `animation_speed` of 14. A faster
+/// `animation_speed` settles sooner, as it slides sooner.
+fn settle_duration(config: &Config) -> f64 {
+    SETTLE_TIME_CONSTANTS / config.animation_speed()
+}
+
+/// The steepest start [`settle_curve`] takes without overshooting.
+const MAX_HANDOFF_SLOPE: f64 = 3.0;
+
+/// The starting slope of [`settle_curve`] that carries on `velocity`, in
+/// points per second, for a settle that moves `distance` points over
+/// `duration` seconds. A strip moving away from its target, or still, starts
+/// from rest. A slope of 1 starts at the settle's average speed, and the slope
+/// is capped where the curve would overshoot.
+pub(crate) fn handoff_slope(velocity: f64, distance: f64, duration: f64) -> f64 {
+    if distance.abs() < f64::EPSILON {
+        return 0.0;
     }
-    scroll.position = target + offset;
-    scroll.velocity = velocity / px_per_velocity;
+    (velocity * duration / distance).clamp(0.0, MAX_HANDOFF_SLOPE)
+}
+
+/// The share of a settle covered at `progress` through its time, from 0 to 1:
+/// a cubic that starts at `slope` times the average speed and ends at rest.
+/// From rest it is smoothstep, whose fastest moment, halfway, is 1.5 times the
+/// average speed. At [`MAX_HANDOFF_SLOPE`] it is the cubic ease-out.
+pub(crate) fn settle_curve(progress: f64, slope: f64) -> f64 {
+    let u = progress.clamp(0.0, 1.0);
+    slope * u * (1.0 - u).powi(2) + u * u * (3.0 - 2.0 * u)
+}
+
+/// Focuses `window`, the window a settle lands on, unless it has focus.
+fn focus(window: Entity, windows: &Windows, commands: &mut Commands) {
+    let focused = windows.focused().map(|(_, focused)| focused);
+    if focused != Some(window) {
+        focus_with_verification(window, focused, None, FocusSource::Other, commands);
+    }
+}
+
+/// Pulses while the fingers move a window-landing swipe, each time the
+/// column the strip would land on changes: once the fingers have moved it far
+/// enough to step, and again if they bring it back. A strip that fits the
+/// viewport springs back instead, so it has no detents.
+fn landing_detents(
+    strips: ScrollingStrips,
+    displays: StripDisplays,
+    windows: Windows,
+    config: Res<Config>,
+    mut haptics: MessageWriter<PageHapticRequest>,
+) {
+    for (_, strip, child, fullscreen, position, mut scroll) in strips {
+        if !scroll.is_user_swiping
+            || !lands_on_window(&config, scroll.input)
+            || !settles(&config, fullscreen)
+        {
+            continue;
+        }
+        let Some((_, viewport)) = viewports(child, &displays, &config) else {
+            continue;
+        };
+        if fitted_offsets(strip, &windows, viewport).is_some() {
+            continue;
+        }
+        // The raw finger travel, as at release, not the resisted strip.
+        let step = Step::of(&scroll, scroll.position, None, f64::from(viewport.width()));
+        let column_top = |step| {
+            landing(position.x, Some(step), strip, &windows, viewport)
+                .and_then(|(column, _)| column.top())
+        };
+        // A swipe starts on the column it began on, even when its first frame
+        // already moved the strip far enough to step.
+        if scroll.detent.is_none() {
+            scroll.detent = column_top(Step {
+                toward_end: None,
+                ..step
+            });
+        }
+        let top = column_top(step);
+        if top.is_none() || top == scroll.detent {
+            continue;
+        }
+        if config.swipe_gesture_haptics() {
+            haptics.write(PageHapticRequest);
+        }
+        scroll.detent = top;
+    }
 }
 
 /// Natural direction moves the strip left (a negative offset) for a positive
@@ -725,36 +1181,70 @@ fn direction_modifier(config: &Config) -> f64 {
 
 #[instrument(level = Level::TRACE, skip_all)]
 fn scrolling_integrator(
-    mut strip: Single<&mut Scrolling, With<LayoutStrip>>,
+    strips: ScrollingStrips,
+    displays: StripDisplays,
     time: Res<Time>,
-    active_display: ActiveDisplay,
     config: Res<Config>,
 ) {
     let dt = time.delta_secs_f64().min(MAX_STEP_SECS);
-    let viewport = active_display.actual_bounds(&config);
-    let viewport_width = f64::from(viewport.width());
-
     let direction = direction_modifier(&config);
 
-    let scroll = &mut *strip;
-    if scroll.settle.is_none() && scroll.velocity.abs() > 0.0001 {
-        scroll.position += scroll.velocity * dt * viewport_width * direction;
+    for (_, _, child, fullscreen, _, mut scroll) in strips {
+        let Some((_, viewport)) = viewports(child, &displays, &config) else {
+            continue;
+        };
+        let viewport_width = f64::from(viewport.width());
+        // A window-landing swipe keeps the strip under the fingers, so its
+        // velocity only decides a flick, never adds travel of its own.
+        if scroll.is_user_swiping
+            && lands_on_window(&config, scroll.input)
+            && settles(&config, fullscreen)
+        {
+            continue;
+        }
+        if scroll.settle.is_none() && scroll.velocity.abs() > 0.0001 {
+            scroll.position += scroll.velocity * dt * viewport_width * direction;
+        }
     }
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_scrolling_constraints(
-    mut strip: ScrollingStrip,
-    active_display: ActiveDisplay,
+    strips: ScrollingStrips,
+    displays: StripDisplays,
     windows: Windows,
     config: Res<Config>,
 ) {
-    let viewport = active_display.actual_bounds(&config);
-    let (strip, ref mut position, ref mut scroll) = *strip;
+    for (_, strip, child, fullscreen, mut position, mut scroll) in strips {
+        let Some((_, viewport)) = viewports(child, &displays, &config) else {
+            continue;
+        };
+        constrain(
+            strip,
+            &mut position,
+            &mut scroll,
+            settles(&config, fullscreen),
+            viewport,
+            &windows,
+            &config,
+        );
+    }
+}
 
+/// Shows the strip where its scroll state puts it, held to what the strip
+/// ends and a window-landing swipe allow.
+fn constrain(
+    strip: &LayoutStrip,
+    position: &mut Position,
+    scroll: &mut Scrolling,
+    settling: bool,
+    viewport: IRect,
+    windows: &Windows,
+    config: &Config,
+) {
     if scroll.is_user_swiping
-        && settles(&config, &active_display)
-        && let Some(fitted) = fitted_offsets(strip, &windows, viewport)
+        && settling
+        && let Some(fitted) = fitted_offsets(strip, windows, viewport)
     {
         // Keep the raw finger position in `scroll.position`, so the stretch
         // eases off along the same curve when the fingers turn back.
@@ -764,14 +1254,47 @@ fn apply_scrolling_constraints(
         return;
     }
 
+    // A window-landing swipe moves one column at most, so the strip follows
+    // the fingers freely only until the next column on either side shows in
+    // full, and resists past that, as it does past the strip ends.
+    if scroll.is_user_swiping && lands_on_window(config, scroll.input) && settling {
+        if scroll.start.is_none() {
+            scroll.start = windows
+                .focused()
+                .map(|(_, focused)| focused)
+                .filter(|focused| strip.contains(*focused));
+        }
+        let from = round_px(scroll.anchor);
+        let start = scroll.start;
+        let reach = |toward_end| {
+            let step = Step {
+                from,
+                start,
+                toward_end: Some(toward_end),
+            };
+            landing(from, Some(step), strip, windows, viewport).map(|(_, offset)| f64::from(offset))
+        };
+        if let (Some(next), Some(previous)) = (reach(true), reach(false)) {
+            let shown = if scroll.position < next {
+                next + resist(scroll.position - next, f64::from(viewport.width()))
+            } else if scroll.position > previous {
+                previous + resist(scroll.position - previous, f64::from(viewport.width()))
+            } else {
+                scroll.position
+            };
+            position.x = round_px(shown);
+            return;
+        }
+    }
+
     let get_window_frame = |entity| windows.moving_frame(entity);
     if let Some(clamped_offset) = clamp_viewport_offset(
         round_px(scroll.position),
         strip,
-        &windows,
+        windows,
         &get_window_frame,
         &viewport,
-        &config,
+        config,
     ) {
         position.x = clamped_offset;
         // A settle's last pixels move less than one per frame, so it keeps

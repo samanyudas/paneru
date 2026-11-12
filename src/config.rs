@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 use self::decorations::{
     BorderRadiusOption, DescriptorStyle, IndicatorFormat, IndicatorStyle, MenubarOrientation,
 };
-use self::swipe::SwipeGestureDirection;
+use self::swipe::{SwipeGestureDirection, SwipeTarget};
 
 #[cfg(test)]
 use crate::commands::{MoveFocus, Operation, ResizeDirection, Side};
@@ -578,6 +578,24 @@ impl Config {
             .and_then(|swipe| swipe.gesture.as_ref())
             .and_then(|gesture| gesture.page_distance_cm)
             .unwrap_or(2.0)
+    }
+
+    pub fn swipe_gesture_window_landing(&self) -> bool {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.gesture.as_ref())
+            .and_then(|gesture| gesture.window_landing)
+            .unwrap_or(false)
+    }
+
+    pub fn swipe_gesture_target(&self) -> SwipeTarget {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.gesture.as_ref())
+            .and_then(|gesture| gesture.target)
+            .unwrap_or_default()
     }
 
     pub fn swipe_gesture_haptics(&self) -> bool {
@@ -3319,6 +3337,27 @@ fn gesture_paging_defaults_and_overrides_are_resolved() {
     let disabled = Config::try_from("[swipe.gesture]\npaging = false\nhaptics = true\n").unwrap();
     assert!(!disabled.swipe_gesture_paging());
     assert!(disabled.swipe_gesture_haptics());
+}
+
+#[test]
+fn gesture_target_defaults_to_the_pointer_and_rejects_unknown_values() {
+    assert_eq!(
+        Config::default().swipe_gesture_target(),
+        SwipeTarget::Pointer
+    );
+    for (value, target) in [
+        ("pointer", SwipeTarget::Pointer),
+        ("focused", SwipeTarget::Focused),
+    ] {
+        let source = format!("[swipe.gesture]\ntarget = \"{value}\"\n");
+        assert_eq!(
+            Config::try_from(source.as_str())
+                .unwrap()
+                .swipe_gesture_target(),
+            target
+        );
+    }
+    assert!(Config::try_from("[swipe.gesture]\ntarget = \"display\"\n").is_err());
 }
 
 #[test]

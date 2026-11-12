@@ -905,42 +905,6 @@ fn test_scrolling_stop() {
 }
 
 #[test]
-fn test_window_hidden_ratio() {
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Swipe {
-            delta: 0.3,
-            fingers: 3,
-            distance_cm: 0.0,
-        },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::First)),
-        },
-    ];
-
-    let config: Config = (
-        MainOptions {
-            window_hidden_ratio: Some(0.5),
-            animation_speed: Some(10000.0),
-            swipe_gesture_fingers: Some(3),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    TestHarness::new()
-        .with_config(config)
-        .with_windows(2)
-        .on_iteration(2, |world, _state| {
-            let entity = find_window_entity(0, world);
-            let window = world.get::<Window>(entity).expect("finding window");
-            assert!(window.frame().min.x < 0);
-        })
-        .run(commands);
-}
-
-#[test]
 fn test_window_swap_brings_focused_into_view() {
     // After Center, id=4 is at the centered position. Swap(Last) bubbles
     // id=4 to column 4 (layout x=1600); with the strip at +312 that would
