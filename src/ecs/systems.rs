@@ -997,7 +997,7 @@ pub(crate) fn window_frame_update(
     mut windows: NativeFrameWindows,
     mut workspaces: Query<(&mut LayoutStrip, &mut Position)>,
     rechecks: FrameRechecks,
-    swipes: Query<&Scrolling, With<ActiveWorkspaceMarker>>,
+    swipes: Query<&Scrolling>,
     tiling: TilingRestore,
     window_manager: Res<WindowManager>,
     drag: Res<DragState>,
@@ -1005,10 +1005,7 @@ pub(crate) fn window_frame_update(
     mut native: ResMut<NativeMembership>,
     mut commands: Commands,
 ) {
-    let swiping = swipes
-        .iter()
-        .next()
-        .is_some_and(|scrolling| scrolling.is_user_swiping);
+    let swiping = swipes.iter().any(|scrolling| scrolling.is_user_swiping);
     let mut notified = if swiping {
         Vec::new()
     } else {

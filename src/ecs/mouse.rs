@@ -235,7 +235,7 @@ fn mouse_moved_trigger(
 fn mouse_down_trigger(
     mut messages: MessageReader<InputEvent>,
     windows: Windows,
-    active_workspace: Query<(Entity, Option<&Scrolling>), With<ActiveWorkspaceMarker>>,
+    scrolling: Query<(Entity, &LayoutStrip), With<Scrolling>>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
@@ -264,10 +264,12 @@ fn mouse_down_trigger(
             continue;
         };
 
-        // Stop any ongoing scroll.
-        for (entity, scroll) in active_workspace {
-            if scroll.is_some()
-                && let Ok(mut entity_commands) = commands.get_entity(entity)
+        // Stop the scroll of the clicked window's strip, which the mouse-up
+        // reshuffle then places. A strip settling on another display keeps
+        // settling, so it never stays stretched past its end.
+        for (strip_entity, strip) in &scrolling {
+            if strip.contains(entity)
+                && let Ok(mut entity_commands) = commands.get_entity(strip_entity)
             {
                 entity_commands.try_remove::<Scrolling>();
             }

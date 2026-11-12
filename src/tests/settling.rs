@@ -11,7 +11,7 @@ use crate::config::{Config, MainOptions};
 use crate::ecs::Scrolling;
 use crate::events::Event;
 use crate::manager::Window;
-use crate::platform::WinID;
+use crate::platform::{WinID, WorkspaceId};
 
 use super::*;
 
@@ -508,9 +508,9 @@ fn swipe_settles_instantly_without_animation() {
 }
 
 /// A strip that stops being active mid-settle, as when focus moves to another
-/// display, lands at once instead of keeping a settle no system drives.
+/// display, still settles: the settle owns the strip until it lands.
 #[test]
-fn a_strip_that_loses_activation_mid_settle_lands() {
+fn a_strip_that_loses_activation_mid_settle_still_settles() {
     let mut harness = harness_with_widths(&[700, 700, 700, 700], Some(14.0));
     send(&mut harness, swipe(0.05));
     harness.advance(ONE_FRAME * 6);
@@ -525,7 +525,13 @@ fn a_strip_that_loses_activation_mid_settle_lands() {
         .entity_mut(strip)
         .remove::<crate::ecs::ActiveWorkspaceMarker>();
     world.flush();
+    assert!(
+        world.get::<Scrolling>(strip).is_some(),
+        "the settle goes on"
+    );
 
+    harness.advance(SETTLE);
+    let world = harness.world();
     assert!(
         world.get::<Scrolling>(strip).is_none(),
         "no settle is left behind"
@@ -534,6 +540,362 @@ fn a_strip_that_loses_activation_mid_settle_lands() {
         world.get::<crate::ecs::Position>(strip).unwrap().x,
         crate::util::round_px(target)
     );
+}
+
+/// The external display, right of the test display.
+fn ext_bounds() -> IRect {
+    IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        EXT_DISPLAY_HEIGHT,
+    )
+}
+
+/// Above the windows on the test display, so focus follows mouse would never
+/// pick a window a strip slides under the pointer.
+const POINTER_ON_TEST: IVec2 = IVec2::new(500, 5);
+/// Above the windows on the external display.
+const POINTER_ON_EXT: IVec2 = IVec2::new(TEST_DISPLAY_WIDTH + 900, 5);
+
+/// Five 400-point windows, 0 to 4, on the test display and five 600-point
+/// windows, 100 to 104, on the external display, each strip at its first
+/// column, with window 0 focused and the test display active. The external
+/// display shows `ext_spaces[0]`.
+fn two_displays(config: Config, ext_spaces: Vec<WorkspaceId>) -> TestHarness {
+    let mut harness = TestHarness::new().with_config(config).with_display(
+        EXT_DISPLAY_ID,
+        ext_bounds(),
+        ext_spaces,
+    );
+    for id in 0..5 {
+        harness = harness.with_workspace_window(id, TEST_WORKSPACE_ID, |window| {
+            let x = id * 400;
+            window.frame = IRect::new(x, TEST_MENUBAR_HEIGHT, x + 400, TEST_DISPLAY_HEIGHT);
+        });
+    }
+    for id in 100..105 {
+        harness = harness.with_workspace_window(id, EXT_WORKSPACE_ID, |window| {
+            let x = TEST_DISPLAY_WIDTH + (id - 100) * 600;
+            window.frame = IRect::new(x, TEST_MENUBAR_HEIGHT, x + 600, EXT_DISPLAY_HEIGHT);
+        });
+    }
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        focus(Direction::First),
+    ]);
+    harness.advance(SETTLE);
+    assert_focused!(harness.world(), 0);
+    assert_eq!(window_x(harness.world(), 0), 0);
+    assert_eq!(window_x(harness.world(), 100), TEST_DISPLAY_WIDTH);
+    harness
+}
+
+fn swipe_target_config(target: &str, animation_speed: Option<f64>) -> Config {
+    let speed = animation_speed.map_or(String::new(), |speed| {
+        format!("animation_speed = {speed}\n")
+    });
+    Config::try_from(
+        format!(
+            "[options]\n{speed}[swipe.gesture]\nfingers_count = 3\ntarget = \"{target}\"\n[bindings]\n"
+        )
+        .as_str(),
+    )
+    .expect("config should parse")
+}
+
+/// The right edge of the external display, where its strip ends once it
+/// settles on its last column.
+const EXT_LAST_COLUMN_X: i32 = TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH - 600;
+
+/// A swipe moves the strip on the display under the pointer, not the strip
+/// with focus, and the window it lands on takes focus.
+#[test]
+fn swipe_moves_the_strip_under_the_pointer() {
+    for animation_speed in [None, Some(14.0)] {
+        let mut harness = two_displays(
+            swipe_target_config("pointer", animation_speed),
+            vec![EXT_WORKSPACE_ID],
+        );
+        harness.mock_state.set_cursor_position(POINTER_ON_EXT);
+
+        send(&mut harness, swipe(0.3));
+        harness.advance(SETTLE);
+
+        assert!(!is_scrolling(harness.world()), "the settle has finished");
+        assert_eq!(window_x(harness.world(), 0), 0, "the focused strip stays");
+        assert_eq!(window_x(harness.world(), 104), EXT_LAST_COLUMN_X);
+        assert_focused!(harness.world(), 104);
+    }
+}
+
+/// With `target = "focused"`, a swipe moves the strip with focus, wherever
+/// the pointer is.
+#[test]
+fn swipe_with_focused_target_moves_the_focused_strip() {
+    let mut harness = two_displays(swipe_target_config("focused", None), vec![EXT_WORKSPACE_ID]);
+    harness.mock_state.set_cursor_position(POINTER_ON_EXT);
+
+    send(&mut harness, swipe(0.3));
+    harness.advance(SETTLE);
+
+    assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_eq!(
+        window_x(harness.world(), 100),
+        TEST_DISPLAY_WIDTH,
+        "the strip under the pointer stays"
+    );
+    assert_eq!(window_x(harness.world(), 4), TEST_DISPLAY_WIDTH - 400);
+    assert_focused!(harness.world(), 4);
+}
+
+/// miri#443: focus moves to the other display while the fingers still hold a
+/// swipe past the end of the strip. The swiped strip still settles with its
+/// end on the viewport edge, and no swipe is left on it.
+#[test]
+fn swipe_settles_when_the_active_display_changes_mid_swipe() {
+    for animation_speed in [None, Some(14.0)] {
+        let mut harness = two_displays(
+            swipe_target_config("pointer", animation_speed),
+            vec![EXT_WORKSPACE_ID],
+        );
+        harness.mock_state.set_cursor_position(POINTER_ON_TEST);
+
+        send(&mut harness, Event::TouchpadDown);
+        harness.advance(ONE_FRAME);
+        // Far enough to pull the last column to the far edge.
+        for frame in 0..15 {
+            if frame == 10 {
+                harness.mock_state.focus_window(100);
+                harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+            }
+            send(&mut harness, swipe(0.2));
+            harness.advance(ONE_FRAME);
+        }
+        assert_focused!(harness.world(), 100);
+        assert_eq!(
+            harness.mock_state.active_display(),
+            EXT_DISPLAY_ID,
+            "the other display is active"
+        );
+        assert!(
+            window_x(harness.world(), 4) < TEST_DISPLAY_WIDTH - 400,
+            "the fingers pulled the strip past its end"
+        );
+        send(&mut harness, Event::TouchpadUp);
+        harness.advance(SETTLE);
+
+        assert!(!is_scrolling(harness.world()), "no swipe is left behind");
+        assert_eq!(
+            window_x(harness.world(), 4),
+            TEST_DISPLAY_WIDTH - 400,
+            "the strip end is on the viewport edge"
+        );
+        assert_eq!(window_x(harness.world(), 100), TEST_DISPLAY_WIDTH);
+        // The settle focuses the window it lands on, as it always has.
+        assert_focused!(harness.world(), 4);
+    }
+}
+
+/// miri#443, inside the pause before a lifted swipe settles: focus moves to
+/// the other display before the swipe counts as ended.
+#[test]
+fn swipe_settles_when_the_active_display_changes_before_the_settle() {
+    for animation_speed in [None, Some(14.0)] {
+        let mut harness = two_displays(
+            swipe_target_config("pointer", animation_speed),
+            vec![EXT_WORKSPACE_ID],
+        );
+        harness.mock_state.set_cursor_position(POINTER_ON_TEST);
+
+        send(&mut harness, swipe(0.3));
+        harness.advance(ONE_FRAME);
+        harness.mock_state.focus_window(100);
+        harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+        harness.advance(SETTLE);
+
+        assert!(!is_scrolling(harness.world()), "no swipe is left behind");
+        assert_eq!(
+            window_x(harness.world(), 4),
+            TEST_DISPLAY_WIDTH - 400,
+            "the strip end is on the viewport edge"
+        );
+        assert_eq!(window_x(harness.world(), 100), TEST_DISPLAY_WIDTH);
+    }
+}
+
+/// Modifier-scroll with a mouse wheel moves the strip under the pointer too.
+#[test]
+fn wheel_scroll_moves_the_strip_under_the_pointer() {
+    let mut harness = two_displays(swipe_target_config("pointer", None), vec![EXT_WORKSPACE_ID]);
+    harness.mock_state.set_cursor_position(POINTER_ON_EXT);
+
+    for _ in 0..4 {
+        send(&mut harness, Event::Scroll { delta: 30.0 });
+        harness.advance(ONE_FRAME);
+    }
+    assert!(
+        window_x(harness.world(), 100) < TEST_DISPLAY_WIDTH,
+        "the strip under the pointer moves"
+    );
+    harness.advance(SETTLE);
+
+    assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_eq!(window_x(harness.world(), 0), 0, "the focused strip stays");
+    let focused = harness
+        .world()
+        .query_filtered::<&Window, With<crate::ecs::FocusedMarker>>()
+        .single(harness.world())
+        .expect("a window has focus")
+        .id();
+    assert!(
+        (100..105).contains(&focused),
+        "a window on the external display has focus, not {focused}"
+    );
+}
+
+/// The pointer moving to the other display mid-swipe does not take the swipe
+/// with it.
+#[test]
+fn swipe_keeps_its_strip_when_the_pointer_moves_to_another_display() {
+    let mut harness = two_displays(swipe_target_config("pointer", None), vec![EXT_WORKSPACE_ID]);
+    harness.mock_state.set_cursor_position(POINTER_ON_EXT);
+
+    send(&mut harness, Event::TouchpadDown);
+    harness.advance(ONE_FRAME);
+    for frame in 0..10 {
+        if frame == 3 {
+            harness.mock_state.set_cursor_position(POINTER_ON_TEST);
+        }
+        send(&mut harness, swipe(0.05));
+        harness.advance(ONE_FRAME);
+    }
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(SETTLE);
+
+    assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_eq!(
+        window_x(harness.world(), 0),
+        0,
+        "the strip now under the pointer stays"
+    );
+    assert_eq!(window_x(harness.world(), 104), EXT_LAST_COLUMN_X);
+}
+
+/// A new swipe on the other display, while the last swipe's strip still
+/// settles, leaves that settle to finish where it was headed.
+#[test]
+fn swipe_on_another_display_leaves_a_settle_to_finish() {
+    let mut harness = two_displays(
+        swipe_target_config("pointer", Some(14.0)),
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.mock_state.set_cursor_position(POINTER_ON_TEST);
+    send(&mut harness, swipe(0.3));
+    harness.advance(ONE_FRAME * 6);
+    assert!(is_scrolling(harness.world()), "still settling");
+
+    harness.mock_state.set_cursor_position(POINTER_ON_EXT);
+    send(&mut harness, Event::TouchpadDown);
+    harness.advance(ONE_FRAME);
+    send(&mut harness, swipe(0.05));
+    harness.advance(ONE_FRAME);
+    let world = harness.world();
+    assert_eq!(
+        world.query::<&Scrolling>().iter(world).count(),
+        2,
+        "one strip settles while the other follows the fingers"
+    );
+    for _ in 0..4 {
+        send(&mut harness, swipe(0.05));
+        harness.advance(ONE_FRAME);
+    }
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(SETTLE);
+
+    assert!(!is_scrolling(harness.world()), "both settles have finished");
+    assert_eq!(window_x(harness.world(), 4), TEST_DISPLAY_WIDTH - 400);
+    assert!(
+        window_x(harness.world(), 100) < TEST_DISPLAY_WIDTH,
+        "the second swipe moved the other strip"
+    );
+}
+
+/// A click on another display, while a swiped strip still settles, leaves
+/// that settle to finish, so the strip never stays stretched past its end.
+#[test]
+fn click_on_another_display_leaves_a_settle_to_finish() {
+    let mut harness = two_displays(
+        swipe_target_config("pointer", Some(14.0)),
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.mock_state.set_cursor_position(POINTER_ON_TEST);
+    send(&mut harness, swipe(0.3));
+    harness.advance(ONE_FRAME * 6);
+    assert!(is_scrolling(harness.world()), "still settling");
+
+    let point = POINTER_ON_EXT + IVec2::new(0, 300);
+    send(
+        &mut harness,
+        Event::MouseDown {
+            point: objc2_core_foundation::CGPoint::new(point.x.into(), point.y.into()),
+            modifiers: crate::platform::Modifiers::empty(),
+            button: crate::events::MouseButton::Left,
+            window_id: Some(101),
+            clicks: 1,
+        },
+    );
+    harness.advance(SETTLE);
+
+    assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_eq!(window_x(harness.world(), 4), TEST_DISPLAY_WIDTH - 400);
+}
+
+/// A display that switches to another Space mid-swipe lands its swiped strip
+/// at once, with no empty space beside it, and leaves no swipe on it.
+#[test]
+fn swipe_lands_when_its_display_switches_space() {
+    let other_space = EXT_WORKSPACE_ID + 1;
+    let mut harness = two_displays(
+        swipe_target_config("pointer", Some(14.0)),
+        vec![EXT_WORKSPACE_ID, other_space],
+    );
+    harness.mock_state.set_cursor_position(POINTER_ON_EXT);
+
+    send(&mut harness, Event::TouchpadDown);
+    harness.advance(ONE_FRAME);
+    // Far enough to pull the last column to the far edge.
+    for _ in 0..15 {
+        send(&mut harness, swipe(0.2));
+        harness.advance(ONE_FRAME);
+    }
+    assert!(is_scrolling(harness.world()), "the fingers hold the swipe");
+    assert!(
+        window_x(harness.world(), 104) < EXT_LAST_COLUMN_X,
+        "the fingers pulled the strip past its end"
+    );
+    harness
+        .mock_state
+        .activate_workspace(EXT_DISPLAY_ID, other_space, false);
+    send(&mut harness, Event::SpaceChanged);
+    harness.advance(ONE_FRAME);
+
+    assert!(!is_scrolling(harness.world()), "no swipe is left behind");
+    let world = harness.world();
+    let strip_x = world
+        .query::<(&crate::ecs::layout::LayoutStrip, &crate::ecs::Position)>()
+        .iter(world)
+        .find_map(|(strip, position)| (strip.id() == EXT_WORKSPACE_ID).then_some(position.x))
+        .expect("the swiped strip");
+    // Window 104 sits 2400 points into its strip.
+    assert_eq!(
+        strip_x + 2400,
+        EXT_LAST_COLUMN_X,
+        "the strip landed at once"
+    );
+    harness.advance(SETTLE);
+    assert_eq!(window_x(harness.world(), 104), EXT_LAST_COLUMN_X);
+    assert_eq!(window_x(harness.world(), 0), 0);
 }
 
 /// When each trackpad pulse was requested.
