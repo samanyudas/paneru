@@ -18,9 +18,9 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    AboveOrdinaryCheck, ActiveDisplayMarker, AwaitingHandle, BProcess, FloatsWhenRestored,
-    FocusedMarker, MissionControlActive, OpenedHidden, PreviousManagedStrip, Rejoin,
-    RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    AboveOrdinaryCheck, ActiveDisplayMarker, AwaitingHandle, AwaitsTitleMatch, BProcess,
+    FloatsWhenRestored, FocusedMarker, MissionControlActive, OpenedHidden, PreviousManagedStrip,
+    Rejoin, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::display::size_for_arrival;
@@ -886,6 +886,7 @@ pub(super) fn window_managed_trigger(
     previous_strips: Query<&PreviousManagedStrip>,
     opened_hidden: Query<&Unmanaged, With<OpenedHidden>>,
     launch_windows: Option<Res<LaunchWindows>>,
+    restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     initializing: Option<Res<Initializing>>,
     mut ctx: WindowCtx,
 ) {
@@ -965,10 +966,11 @@ pub(super) fn window_managed_trigger(
                 size_new_column(
                     entity,
                     window,
-                    properties.sets_width(),
+                    app,
                     ctx.windows.frame(entity),
                     (display, dock),
                     launch_windows.as_deref(),
+                    restore.as_deref(),
                     &ctx.config,
                     &mut ctx.commands,
                 );
@@ -1576,6 +1578,7 @@ pub(super) fn recheck_window_level(
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     displays: ActiveDisplays,
     launch_windows: Option<Res<LaunchWindows>>,
+    restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     config: Res<Config>,
     time: Res<Time>,
     mut commands: Commands,
@@ -1595,13 +1598,10 @@ pub(super) fn recheck_window_level(
             continue;
         };
         entity_commands.try_remove::<AboveOrdinaryCheck>();
-        let properties = windows
+        let app = windows
             .find_parent(window.id())
-            .and_then(|(_, _, parent)| apps.get(parent).ok())
-            .map(|app| WindowProperties::new(app, window, &config));
-        let rule_sets_width = properties
-            .as_ref()
-            .is_some_and(WindowProperties::sets_width);
+            .and_then(|(_, _, parent)| apps.get(parent).ok());
+        let properties = app.map(|app| WindowProperties::new(app, window, &config));
         let Some(properties) = properties.filter(|properties| raised && properties.floating())
         else {
             // Session restore may have placed the window while it waited, at
@@ -1615,14 +1615,17 @@ pub(super) fn recheck_window_level(
                     .find_map(|(strip, active)| active.then_some(strip))
             {
                 strip.append(entity);
-                if let Ok(display) = displays.single() {
+                if let Ok(display) = displays.single()
+                    && let Some(app) = app
+                {
                     size_new_column(
                         entity,
                         window,
-                        rule_sets_width,
+                        app,
                         windows.frame(entity),
                         display,
                         launch_windows.as_deref(),
+                        restore.as_deref(),
                         &config,
                         &mut commands,
                     );
@@ -1651,6 +1654,58 @@ pub(super) fn recheck_window_level(
 
 /// The active display with the Dock's edge, read without skipping the system
 /// when no display is active.
+/// Gives each window that waited for a match by its title the new-window
+/// width, once the startup restore's grace period ends without a match, as
+/// it would have had when it joined its strip. A window that floats or is
+/// minimized by then keeps the width it has.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn size_windows_restore_did_not_match(
+    waiting: Query<Entity, With<AwaitsTitleMatch>>,
+    restore: Option<Res<crate::ecs::restore::SessionRestore>>,
+    workspaces: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
+    apps: Query<&Application>,
+    launch_windows: Option<Res<LaunchWindows>>,
+    windows: Windows,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    if restore.is_some() {
+        return;
+    }
+    for entity in &waiting {
+        commands.entity(entity).try_remove::<AwaitsTitleMatch>();
+        let Some((window, _, None)) = windows.get_managed(entity) else {
+            continue;
+        };
+        let Some(app) = windows
+            .find_parent(window.id())
+            .and_then(|(_, _, parent)| apps.get(parent).ok())
+        else {
+            continue;
+        };
+        let Some(display) = workspaces
+            .iter()
+            .find_map(|(strip, child)| strip.contains(entity).then(|| child.parent()))
+            .and_then(|display| displays.get(display).ok())
+        else {
+            continue;
+        };
+        size_new_column(
+            entity,
+            window,
+            app,
+            windows.frame(entity),
+            display,
+            launch_windows.as_deref(),
+            None,
+            &config,
+            &mut commands,
+        );
+        commands.reshuffle_around(entity);
+    }
+}
+
 type ActiveDisplays<'w, 's> =
     Query<'w, 's, (&'static Display, Option<&'static DockPosition>), With<ActiveDisplayMarker>>;
 
@@ -1675,18 +1730,22 @@ fn starting_width(
     (starting != width).then_some(starting)
 }
 
-/// Sizes `entity`, a window that just joined the active strip, to its
-/// [`starting_width`]. A window that was open when the engine started is
-/// not new, however late a scan finds it, so it gets no new-window width.
-/// A minimized window keeps its width.
+/// Sizes `entity`, a window of `app` that just joined a strip on `display`,
+/// to its [`starting_width`]. A window that was open when the engine started
+/// is not new, however late a scan finds it, so it gets no new-window width.
+/// A minimized window keeps its width. A window that the startup `restore`
+/// may still match by its title waits for the grace period to end before it
+/// gets the new-window width, so it does not take that width on the way to
+/// its saved one.
 #[allow(clippy::too_many_arguments)]
 fn size_new_column(
     entity: Entity,
     window: &Window,
-    rule_sets_width: bool,
+    app: &Application,
     frame: Option<IRect>,
     (display, dock): (&Display, Option<&DockPosition>),
     launch_windows: Option<&LaunchWindows>,
+    restore: Option<&crate::ecs::restore::SessionRestore>,
     config: &Config,
     commands: &mut Commands,
 ) {
@@ -1694,12 +1753,20 @@ fn size_new_column(
         return;
     };
     let launched = launch_windows.is_some_and(|launch| launch.0.contains(&window.id()));
+    let mut new_window_width = config.new_window_width().filter(|_| !launched);
+    if new_window_width.is_some()
+        && crate::ecs::restore::may_match_by_title_later(window, app, restore)
+        && let Ok(mut entity_commands) = commands.get_entity(entity)
+    {
+        entity_commands.try_insert(AwaitsTitleMatch);
+        new_window_width = None;
+    }
     let width = starting_width(
         frame.width(),
         display.bounds().width(),
         display.actual_display_bounds(dock, config).width(),
-        config.new_window_width().filter(|_| !launched),
-        rule_sets_width,
+        new_window_width,
+        WindowProperties::new(app, window, config).sets_width(),
     );
     if let Some(width) = width {
         size_for_arrival(entity, Size::new(width, frame.height()), commands);
@@ -1847,10 +1914,11 @@ pub(super) fn apply_window_positions(
                 size_new_column(
                     entity,
                     window,
-                    properties.sets_width(),
+                    app,
                     ctx.windows.frame(entity),
                     display,
                     launch_windows.as_deref(),
+                    restore.as_deref(),
                     &ctx.config,
                     &mut ctx.commands,
                 );

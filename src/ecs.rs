@@ -294,6 +294,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
             triggers::recheck_window_level
                 .after(triggers::apply_window_positions)
                 .run_if(any_with_component::<AboveOrdinaryCheck>),
+            triggers::size_windows_restore_did_not_match
+                .after(triggers::recheck_window_level)
+                .run_if(any_with_component::<AwaitsTitleMatch>),
         )
             .in_set(UpdateSet::Spawn),
     );
@@ -627,6 +630,14 @@ pub struct FloatsWhenRestored;
 /// the app shows. (miri#305)
 #[derive(Component, Debug)]
 pub struct OpenedHidden;
+
+/// Marks a new window that opened in the startup grace period before its
+/// title arrived, while a saved window of its app has a title. A later
+/// restore pass may still match it by that title and give it its saved
+/// width, so it gets the new-window width only when the grace period ends
+/// without a match. (miri#305)
+#[derive(Component, Debug)]
+pub struct AwaitsTitleMatch;
 
 /// The strip slot a window left when it stopped being managed, so managing it
 /// again returns it there.

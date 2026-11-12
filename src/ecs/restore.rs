@@ -21,8 +21,8 @@ use crate::ecs::state::{
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::{PreviousStripPosition, RestoredActivation};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, Position, RestoreWindowState,
-    SelectedVirtualMarker, SpawnCommandsExt, Unmanaged, WindowProperties,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, AwaitsTitleMatch, DockPosition, Position,
+    RestoreWindowState, SelectedVirtualMarker, SpawnCommandsExt, Unmanaged, WindowProperties,
 };
 use crate::manager::{Application, Display, Size, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
@@ -389,6 +389,25 @@ fn has_saved_fallback_windows(state: &PaneruState) -> bool {
     saved_windows_in_state(state).any(|window| !window.title.is_empty())
 }
 
+/// Whether a later pass of the startup restore `session` may still match
+/// `window` by its title: the window has no title yet, and a saved window of
+/// its app has one.
+pub(crate) fn may_match_by_title_later(
+    window: &Window,
+    app: &Application,
+    session: Option<&SessionRestore>,
+) -> bool {
+    let Some(session) = session else {
+        return false;
+    };
+    if !window.title().unwrap_or_default().is_empty() {
+        return false;
+    }
+    let bundle_id = app.bundle_id().unwrap_or_default();
+    saved_windows_in_state(&session.state)
+        .any(|saved| !saved.title.is_empty() && saved.bundle_id == bundle_id)
+}
+
 pub(crate) fn matches_startup_restore_state(
     window: &Window,
     app: &Application,
@@ -516,7 +535,9 @@ pub(super) fn restore_window_state(
 
     for entity in &plan.consumed_entities {
         if let Ok(mut entity_commands) = ctx.commands.get_entity(*entity) {
-            entity_commands.try_remove::<Unmanaged>();
+            entity_commands
+                .try_remove::<Unmanaged>()
+                .try_remove::<AwaitsTitleMatch>();
         }
     }
 
