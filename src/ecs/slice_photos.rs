@@ -48,9 +48,12 @@ pub(crate) const REFRESH: Duration = Duration::from_secs(2);
 const PHOTO_WAIT: Duration = Duration::from_millis(1500);
 
 /// How long a window leaving the screen waits for a new photo before its
-/// kept photo shows instead. A new photo took 120 ms on Sam's Mac, and a kept
-/// one can show what the window looked like before it came on screen (#451).
-const KEPT_WAIT: Duration = Duration::from_millis(250);
+/// kept photo shows instead. A kept photo can show what the window looked
+/// like before it came on screen, and a photo taken once the window tucks
+/// comes back blank, so a late photo leaves the old one up (#451). On Sam's
+/// Mac a new photo of a test window took 120 ms, and one of a Helium window
+/// that needed a lookup took 256 to 276 ms.
+const KEPT_WAIT: Duration = Duration::from_millis(750);
 
 pub(crate) fn register(app: &mut App) {
     app.init_resource::<SliceAccess>()
@@ -148,13 +151,14 @@ pub(crate) trait SliceScreen {
     /// Gives each of `slices` a panel at its place on screen, showing the
     /// slice's part of the window's photo, and closes every other panel.
     /// Each panel shows above the ones before it. A panel stays out of sight
-    /// until its first paint.
-    fn place(&mut self, slices: &[(WinID, EdgeSlice)]);
+    /// until its first paint. Forgets the lookups of windows that get no
+    /// slice and are not `remembered`.
+    fn place(&mut self, slices: &[(WinID, EdgeSlice)], remembered: &[WinID]);
     /// Starts a photo of the whole of `window`, which shows a frame of
     /// `slice.size` and gives the panel `slice`, unless `ticket` is called off
     /// before the capture. The result arrives as [`Event::SlicePhoto`]
-    /// carrying `generation`. `place` forgets the lookups of windows it gets
-    /// no slice for.
+    /// carrying `generation`. `Lookup::Reuse` reuses the window's last
+    /// lookup that `place` still remembers.
     fn photograph(
         &mut self,
         window: WinID,
@@ -238,6 +242,12 @@ impl Slices {
             .filter(|(_, _, photo)| !matches!(photo, SlicePhoto::Ended))
             .map(|(id, slice, _)| (*id, *slice))
             .collect()
+    }
+
+    /// The windows with a kept photo, whose lookups the screen remembers so
+    /// their next photo can skip the lookup.
+    fn remembered(&self) -> Vec<WinID> {
+        self.kept.keys().copied().collect()
     }
 
     fn photo(&self, window: WinID) -> Option<&SlicePhoto> {
@@ -370,7 +380,7 @@ fn present_slices(
                             id,
                             &slice,
                             None,
-                            Lookup::Fresh,
+                            Lookup::Reuse,
                         );
                         if let SlicePhoto::Asked { kept_wait, .. } = &mut asked {
                             *kept_wait = Some(PhotoWait::Asked);
@@ -396,7 +406,7 @@ fn present_slices(
         };
         shown.push((id, slice, photo));
     }
-    screen.0.place(&slices.placed());
+    screen.0.place(&slices.placed(), &slices.remembered());
     for id in from_kept {
         if let Some((_, photo)) = slices.kept.get(&id) {
             screen.0.paint(id, photo);
@@ -549,7 +559,7 @@ fn receive_photos(
         };
     }
     if ended {
-        screen.0.place(&slices.placed());
+        screen.0.place(&slices.placed(), &slices.remembered());
     }
 }
 

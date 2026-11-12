@@ -53,6 +53,8 @@ pub(super) struct Screen {
     count_writes: Option<Box<dyn Fn() -> usize>>,
     /// How many position writes apps had taken at each placement.
     writes_at_place: Vec<usize>,
+    /// The windows whose lookups the last placement kept without a slice.
+    remembered: Vec<WinID>,
 }
 
 pub(super) type ScreenLog = Rc<RefCell<Screen>>;
@@ -64,7 +66,7 @@ impl SliceScreen for RecordingScreen {
         !self.0.borrow().denied
     }
 
-    fn place(&mut self, slices: &[(WinID, EdgeSlice)]) {
+    fn place(&mut self, slices: &[(WinID, EdgeSlice)], remembered: &[WinID]) {
         let mut screen = self.0.borrow_mut();
         if let Some(writes) = screen.count_writes.as_ref().map(|count| count()) {
             screen.writes_at_place.push(writes);
@@ -73,6 +75,7 @@ impl SliceScreen for RecordingScreen {
             .showing_photo
             .retain(|id| slices.iter().any(|(placed, _)| placed == id));
         screen.placed = slices.to_vec();
+        screen.remembered = remembered.to_vec();
     }
 
     fn photograph(
@@ -1257,14 +1260,34 @@ fn a_window_that_slid_in_slides_back_out_under_a_new_photo() {
     }
 }
 
+/// Helium's photo took up to 276 ms with a lookup on Sam's Mac, and 110 ms
+/// without one (#451).
+#[test]
+fn a_window_that_slid_in_keeps_its_lookup_and_reuses_it_as_it_leaves() {
+    let (mut harness, log) = revealed(painted_beside_with(animated()), 3, Direction::Last);
+    assert!(
+        log.borrow().remembered.contains(&3),
+        "the screen remembers the lookup of window 3 while it is in view"
+    );
+    let (asks, lookups) = (asks_for(&log, 3).len(), lookups_for(&log, 3));
+
+    drive(&mut harness, &log, 3, &[(0, Direction::First)], 5);
+
+    assert!(
+        asks_for(&log, 3).len() > asks,
+        "window 3 is photographed again"
+    );
+    assert_eq!(lookups_for(&log, 3), lookups, "without a new lookup");
+}
+
 #[test]
 fn a_window_leaving_whose_new_photo_is_late_tucks_under_its_kept_photo_until_it_arrives() {
     let (mut harness, log) = revealed(painted_beside_with(animated()), 3, Direction::Last);
 
-    let mut seen = drive(&mut harness, &log, 3, &[(0, Direction::First)], 10);
+    let mut seen = drive(&mut harness, &log, 3, &[(0, Direction::First)], 30);
     assert!(
-        seen.iter().take(10).all(|frame| frame.photo.is_none()),
-        "the kept photo waits 250 ms for a new one: {seen:?}"
+        seen.iter().all(|frame| frame.photo.is_none()),
+        "the kept photo waits 750 ms for a new one: {seen:?}"
     );
     seen.extend(drive(&mut harness, &log, 3, &[], 40));
     assert_shown_every_frame(3, &seen);

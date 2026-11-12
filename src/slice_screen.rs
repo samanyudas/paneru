@@ -43,7 +43,8 @@ pub struct SliceScreenOS {
     stack: Vec<WinID>,
     /// The painted panels in the order they were last brought to the front.
     fronted: Vec<WinID>,
-    /// The filter of each placed window's last lookup, once it arrives.
+    /// The filter of each placed or remembered window's last lookup, once it
+    /// arrives.
     filters: HashMap<WinID, Arc<OnceLock<Filter>>>,
 }
 
@@ -203,9 +204,10 @@ impl SliceScreen for SliceScreenOS {
         CGPreflightScreenCaptureAccess()
     }
 
-    fn place(&mut self, slices: &[(WinID, EdgeSlice)]) {
-        self.filters
-            .retain(|id, _| slices.iter().any(|(showing, _)| showing == id));
+    fn place(&mut self, slices: &[(WinID, EdgeSlice)], remembered: &[WinID]) {
+        self.filters.retain(|id, _| {
+            remembered.contains(id) || slices.iter().any(|(showing, _)| showing == id)
+        });
         self.panels.retain(|id, panel| {
             let keep = slices.iter().any(|(showing, _)| showing == id);
             if !keep {
