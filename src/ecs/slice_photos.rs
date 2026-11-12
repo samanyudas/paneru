@@ -632,7 +632,7 @@ fn renew_kept(screen: &mut dyn SliceScreen, slices: &mut Slices, in_view: &InVie
         // A window resized in view, as by maximizing, would otherwise keep
         // a photo whose size no later slice of it matches.
         let slice = EdgeSlice {
-            size: window.frame().size(),
+            size: window.shown_frame().size(),
             ..*kept
         };
         *generation = generation.wrapping_add(1);
@@ -699,8 +699,9 @@ fn receive_renewal(
     *kept = (renewal.slice, taken.clone());
     debug!("edge slice kept photo renewed: window {window}");
     // A slice still showing the old photo, or a swiped one still waiting for
-    // its first, which a tucked window's photo never brings. A window leaving
-    // the screen waits for its own newer photo instead.
+    // its first, or closed because that photo came back blank, as a tucked
+    // window's photo does. A window leaving the screen waits for its own
+    // newer photo instead.
     let replaces = |photo: &SlicePhoto| match *photo {
         SlicePhoto::Shown { digest } => digest == old && digest != taken.digest,
         SlicePhoto::Asked {
@@ -711,19 +712,27 @@ fn receive_renewal(
             kept_wait,
             ..
         } => kept_wait.is_none(),
-        SlicePhoto::Ended => false,
+        SlicePhoto::Ended => true,
     };
-    if let Some((_, _, photo)) = slices.showing.iter_mut().find(|(id, slice, photo)| {
+    let Some((_, _, photo)) = slices.showing.iter_mut().find(|(id, slice, photo)| {
         *id == window && slice.size == renewal.slice.size && replaces(photo)
-    }) {
-        screen.paint(window, taken);
-        match photo {
-            SlicePhoto::Shown { digest } => *digest = taken.digest,
-            SlicePhoto::Asked { last, .. } => *last = Some(taken.digest),
-            SlicePhoto::Ended => {}
+    }) else {
+        return true;
+    };
+    let reopened = matches!(photo, SlicePhoto::Ended);
+    match photo {
+        SlicePhoto::Asked { last, .. } => *last = Some(taken.digest),
+        _ => {
+            *photo = SlicePhoto::Shown {
+                digest: taken.digest,
+            };
         }
-        debug!("edge slice repainted with the renewed photo: window {window}");
     }
+    if reopened {
+        screen.place(&slices.placed(), &slices.remembered());
+    }
+    screen.paint(window, taken);
+    debug!("edge slice repainted with the renewed photo: window {window}");
     true
 }
 

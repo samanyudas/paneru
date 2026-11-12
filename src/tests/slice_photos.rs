@@ -147,6 +147,18 @@ fn laid_out(
     count: i32,
     focus: Option<Direction>,
 ) -> (TestHarness, ScreenLog) {
+    laid_out_padded(config, screen, others, count, focus, 0)
+}
+
+/// `laid_out` with each window's padding `pad`, as Miri's gaps set it.
+fn laid_out_padded(
+    config: Config,
+    screen: Screen,
+    others: &[IRect],
+    count: i32,
+    focus: Option<Direction>,
+    pad: i32,
+) -> (TestHarness, ScreenLog) {
     let log = Rc::new(RefCell::new(screen));
     let mut harness = TestHarness::new().with_config(config);
     for (offset, bounds) in (0..).zip(others) {
@@ -157,6 +169,12 @@ fn laid_out(
         );
     }
     let mut harness = harness.with_windows(count);
+    for id in 0..count {
+        harness.mock_state.update_window(id, |window| {
+            window.horizontal_padding = pad;
+            window.vertical_padding = pad;
+        });
+    }
     harness
         .world()
         .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
@@ -1520,6 +1538,47 @@ fn a_renewal_that_arrives_after_a_grown_window_crossed_paints_its_waiting_slice(
         log.borrow().painted.last(),
         Some(&(3, Digest(9))),
         "the renewal paints the slice that waits for a photo"
+    );
+}
+
+#[test]
+fn a_renewal_reopens_a_grown_window_slice_its_blank_photo_closed() {
+    let (mut harness, log) = revealed_and_grown();
+    swipe_back(&mut harness, 1);
+    let renewal = last_ask(&log, 3);
+    swipe_back(&mut harness, 30);
+    harness.advance(SETTLE);
+    let own = last_ask(&log, 3);
+    assert_ne!(own, renewal, "the slice asked for its own photo");
+
+    arrive(&mut harness, 3, own, Err(PhotoError::Blank));
+    assert!(
+        !placed_ids(&log).contains(&3),
+        "the blank photo closed the panel"
+    );
+    arrive(&mut harness, 3, renewal, Ok(photo(9)));
+
+    assert!(placed_ids(&log).contains(&3), "the renewal reopens it");
+    assert_eq!(log.borrow().painted.last(), Some(&(3, Digest(9))));
+}
+
+/// Sam's windows have Miri's 4-point padding, so a slice is the size of the
+/// window's shown frame, not its frame.
+#[test]
+fn a_padded_window_swipes_past_the_edge_under_its_renewed_photo() {
+    let laid_out = laid_out_padded(animated_swipes(), Screen::default(), &[RIGHT], 4, None, 4);
+    let (mut harness, log) = revealed(painted(laid_out, 3), 3, Direction::Last);
+
+    swipe_back(&mut harness, 1);
+    arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(9)));
+    swipe_back(&mut harness, 30);
+    harness.advance(SETTLE);
+
+    assert!(placed_ids(&log).contains(&3), "window 3 keeps a panel");
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(9))),
+        "its slice shows the renewed photo"
     );
 }
 
