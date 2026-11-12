@@ -760,6 +760,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         paging: _,
         page_distance_cm: _,
         window_landing: _,
+        target: _,
         haptics: _,
     } = GestureOptions::default();
     let gesture = lua.create_table()?;
@@ -773,6 +774,11 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     gesture.set("paging", config.swipe_gesture_paging())?;
     gesture.set("page_distance_cm", config.swipe_gesture_page_distance_cm())?;
     gesture.set("window_landing", config.swipe_gesture_window_landing())?;
+    let target_str = match config.swipe_gesture_target() {
+        crate::config::swipe::SwipeTarget::Pointer => "pointer",
+        crate::config::swipe::SwipeTarget::Focused => "focused",
+    };
+    gesture.set("target", target_str)?;
     gesture.set("haptics", config.swipe_gesture_haptics())?;
     swipe.set("gesture", gesture)?;
 

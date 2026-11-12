@@ -235,7 +235,7 @@ fn mouse_moved_trigger(
 fn mouse_down_trigger(
     mut messages: MessageReader<InputEvent>,
     windows: Windows,
-    active_workspace: Query<(Entity, Option<&Scrolling>), With<ActiveWorkspaceMarker>>,
+    scrolling: Query<Entity, With<Scrolling>>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
@@ -264,11 +264,9 @@ fn mouse_down_trigger(
             continue;
         };
 
-        // Stop any ongoing scroll.
-        for (entity, scroll) in active_workspace {
-            if scroll.is_some()
-                && let Ok(mut entity_commands) = commands.get_entity(entity)
-            {
+        // Stop any ongoing scroll, on any display.
+        for entity in &scrolling {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<Scrolling>();
             }
         }

@@ -1813,6 +1813,11 @@ fn test_arrival_allows_free_panning_after_placement() {
         890,
     );
     assert_eq!(harness.mock_state.create_window(0).frame().max.x, 2044);
+    // A swipe moves the strip under the pointer, so the pointer is on the
+    // display the window arrived on.
+    harness
+        .mock_state
+        .set_cursor_position(IVec2::new(1000, 1450));
     harness.run(vec![Event::Swipe {
         delta: -0.04,
         fingers: 3,
@@ -1826,6 +1831,11 @@ fn test_arrival_allows_free_panning_after_placement() {
 #[test]
 fn test_arrival_preserves_a_completed_modifier_scroll() {
     let mut harness = pending_display_arrival(MainOptions::default(), 0, 890);
+    // A scroll moves the strip under the pointer, so the pointer is on the
+    // display the window arrives on.
+    harness
+        .mock_state
+        .set_cursor_position(IVec2::new(1000, 1450));
     harness.world().write_message(Event::Scroll { delta: -0.1 });
     // A wheel tick counts as finished after a 150 ms pause.
     harness.advance(Duration::from_millis(160));

@@ -84,6 +84,21 @@ type DisplaysWithDocks<'w, 's> = Query<
     ),
 >;
 
+/// The strip shown on display `id`: the selected strip of the Space macOS
+/// shows there. `strips` gives each strip with its entity and whether it is
+/// the selected strip of its Space.
+pub(crate) fn shown_strip<'a>(
+    window_manager: &WindowManager,
+    id: CGDirectDisplayID,
+    strips: impl IntoIterator<Item = (Entity, &'a LayoutStrip, bool)>,
+) -> Option<Entity> {
+    let space = window_manager.active_display_space(id).ok()?;
+    strips
+        .into_iter()
+        .find(|(_, strip, selected)| *selected && strip.id() == space)
+        .map(|(entity, _, _)| entity)
+}
+
 #[derive(SystemParam)]
 pub(crate) struct DisplayMoves<'w, 's> {
     pub strips: MovableStrips<'w, 's>,
@@ -108,11 +123,13 @@ impl DisplayMoves<'_, '_> {
     /// The strip shown on display `id`: the selected strip of the space macOS
     /// shows there.
     pub(crate) fn shown_strip(&self, id: CGDirectDisplayID) -> Option<Entity> {
-        let space = self.window_manager.active_display_space(id).ok()?;
-        self.strips
-            .iter()
-            .find(|(_, strip, _, _, selected)| *selected && strip.id() == space)
-            .map(|(entity, _, _, _, _)| entity)
+        shown_strip(
+            &self.window_manager,
+            id,
+            self.strips
+                .iter()
+                .map(|(entity, strip, _, _, selected)| (entity, strip, selected)),
+        )
     }
 
     pub(crate) fn viewport(&self, display_entity: Entity) -> Option<IRect> {
