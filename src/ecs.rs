@@ -445,6 +445,11 @@ pub struct RefitAfterRemoval;
 #[derive(Component)]
 pub struct PlaceAfterArrival {
     pub destination: Entity,
+    /// A plain keyboard step crossed to the display beside, so the
+    /// destination strip gets the edge invariant even when continuous swipe
+    /// is on: no desktop beside the ends of a strip wider than the display,
+    /// and a strip that fits pinned to the left edge.
+    pub at_crossed_edge: bool,
 }
 
 /// Marker component requesting that the strip scroll *minimally* to keep the
@@ -1037,7 +1042,7 @@ pub trait SpawnCommandsExt {
 
     fn refit_after_removal(&mut self, entity: Entity);
 
-    fn place_after_arrival(&mut self, entity: Entity, destination: Entity);
+    fn place_after_arrival(&mut self, entity: Entity, destination: Entity, at_crossed_edge: bool);
 
     fn ensure_visible(&mut self, entity: Entity);
 
@@ -1098,9 +1103,15 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     }
 
     #[instrument(level = Level::TRACE, skip(self))]
-    fn place_after_arrival(&mut self, entity: Entity, destination: Entity) {
+    fn place_after_arrival(&mut self, entity: Entity, destination: Entity, at_crossed_edge: bool) {
         if let Ok(mut entity_commands) = self.get_entity(entity) {
-            entity_commands.try_insert((ReshuffleAroundMarker, PlaceAfterArrival { destination }));
+            entity_commands.try_insert((
+                ReshuffleAroundMarker,
+                PlaceAfterArrival {
+                    destination,
+                    at_crossed_edge,
+                },
+            ));
         }
     }
 

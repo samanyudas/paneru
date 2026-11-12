@@ -1915,6 +1915,7 @@ fn to_next_display(
             windows.frame(entity)
         }),
     });
+    let at_crossed_edge = matches!(request.target, DisplayTarget::Touching(_));
     let window_id = window.id();
     let Some(arrival) = moves.move_column_to_display(
         entity,
@@ -1953,7 +1954,7 @@ fn to_next_display(
         {
             focus_history.record(layout.id(), entity, unmanaged);
         }
-        commands.place_after_arrival(entity, strip);
+        commands.place_after_arrival(entity, strip, at_crossed_edge);
     }
 }
 
