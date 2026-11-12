@@ -385,6 +385,13 @@ impl WriteSink for MockApp {
             .map(|frame| margins.tracked(frame))
     }
 
+    fn raise(&mut self, &(id, _, _): &Self::Window) {
+        if let Some(inner) = self.inner.upgrade() {
+            self.busy(&inner);
+            mock_raise(&inner, id);
+        }
+    }
+
     fn finish(&mut self) {}
 }
 
@@ -401,6 +408,37 @@ fn fill_margins(inner: &RwLock<MockStateInner>, id: WinID) -> Margins {
         .and_then(|w| w.fill)
         .map(Margins::filling)
         .unwrap_or_default()
+}
+
+/// Moves window `id` to the front of the window order, as its app would.
+/// See [`MockState::raise_window`].
+fn mock_raise(inner: &RwLock<MockStateInner>, id: WinID) {
+    let mut inner = inner.force_write();
+    inner.raised.retain(|raised| *raised != id);
+    let frontmost = |inner: &MockStateInner, id: &WinID| {
+        inner
+            .windows
+            .get(id)
+            .and_then(|window| inner.apps.get(&window.pid))
+            .is_some_and(|app| app.is_frontmost)
+    };
+    let index = if frontmost(&inner, &id) {
+        inner.raised.len()
+    } else {
+        inner
+            .raised
+            .iter()
+            .position(|raised| {
+                inner.windows.get(raised).is_some_and(|window| {
+                    inner.apps.get(&window.pid).is_some_and(|app| {
+                        app.is_frontmost && app.focused_window_id == Some(*raised)
+                    })
+                })
+            })
+            .unwrap_or(inner.raised.len())
+    };
+    inner.raised.insert(index, id);
+    inner.raise_count += 1;
 }
 
 /// Applies a size write to window `id`, as its app would.
@@ -654,32 +692,7 @@ impl MockState {
     /// that is not frontmost goes just below the frontmost app's focused
     /// window, as observed with mixed-app overlapping stacks on macOS.
     pub fn raise_window(&self, id: WinID) {
-        let mut inner = self.inner.force_write();
-        inner.raised.retain(|raised| *raised != id);
-        let frontmost = |inner: &MockStateInner, id: &WinID| {
-            inner
-                .windows
-                .get(id)
-                .and_then(|window| inner.apps.get(&window.pid))
-                .is_some_and(|app| app.is_frontmost)
-        };
-        let index = if frontmost(&inner, &id) {
-            inner.raised.len()
-        } else {
-            inner
-                .raised
-                .iter()
-                .position(|raised| {
-                    inner.windows.get(raised).is_some_and(|window| {
-                        inner.apps.get(&window.pid).is_some_and(|app| {
-                            app.is_frontmost && app.focused_window_id == Some(*raised)
-                        })
-                    })
-                })
-                .unwrap_or(inner.raised.len())
-        };
-        inner.raised.insert(index, id);
-        inner.raise_count += 1;
+        mock_raise(&self.inner, id);
     }
 
     /// Makes `pid` the only frontmost app, and makes apps answer late.
@@ -1481,8 +1494,9 @@ impl MockState {
         mw.expect_write_pending().return_const(false);
     }
 
-    /// Frame expectations for a window whose app gets its writes through
-    /// the engine's per-app writers, the way `WindowOS` writes them.
+    /// Frame and raise expectations for a window whose app gets its writes
+    /// and raises through the engine's per-app writers, the way `WindowOS`
+    /// sends them.
     fn expect_queued_writes(
         &self,
         mw: &mut MockWindowApi,
@@ -1509,6 +1523,15 @@ impl MockState {
         let w = writes.clone();
         mw.expect_write_pending()
             .returning(move || lock(&w).write_pending(Some(pid)));
+        let s = self.clone();
+        let w = writes.clone();
+        let to = window.clone();
+        mw.expect_focus_with_raise().returning(move |_psn| {
+            s.focus_window(id);
+            if !s.inner.force_read().lags {
+                lock(&w).raise(Some(pid), to());
+            }
+        });
         let w = writes.clone();
         mw.expect_place()
             .returning(move |frame: IRect| lock(&w).place(Some(pid), &window, frame));
@@ -1568,15 +1591,14 @@ impl MockState {
             self.expect_queued_writes(&mut mw, id, pid, ax_generation);
         } else {
             self.expect_inline_writes(&mut mw, id, ax_generation);
+            let s = self.clone();
+            mw.expect_focus_with_raise().returning(move |_psn| {
+                if !s.inner.force_read().lags {
+                    s.raise_window(id);
+                }
+                s.focus_window(id);
+            });
         }
-
-        let s = self.clone();
-        mw.expect_focus_with_raise().returning(move |_psn| {
-            if !s.inner.force_read().lags {
-                s.raise_window(id);
-            }
-            s.focus_window(id);
-        });
 
         let s = self.clone();
         mw.expect_title().returning(move || {

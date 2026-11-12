@@ -2286,6 +2286,8 @@ mod frame_commit_tests {
             Some(*self.frame.lock().unwrap())
         }
 
+        fn raise(&mut self, _window: &()) {}
+
         fn finish(&mut self) {}
     }
 

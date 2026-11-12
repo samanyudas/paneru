@@ -372,8 +372,22 @@ impl WriteSink for AxApp {
         Some(window.margins.tracked(frame))
     }
 
+    fn raise(&mut self, window: &AxWindow) {
+        ax_raise(&window.element);
+    }
+
     fn finish(&mut self) {
         self.enhanced_ui = None;
+    }
+}
+
+/// Asks the app to bring the window in front of its other windows. The app
+/// answers on its main thread, so a busy app holds the caller until it does.
+fn ax_raise(element: &AXUIWrapper) {
+    let action = CFString::from_static_str(kAXRaiseAction);
+    let result = unsafe { AXUIElementPerformAction(element.as_ptr(), &action) };
+    if result != kAXErrorSuccess {
+        debug!("AXRaise answered {result}");
     }
 }
 
@@ -1400,7 +1414,10 @@ impl WindowApi for WindowOS {
         make_key_window(&psn, window_id);
     }
 
-    /// Focuses the window and raises it to the front.
+    /// Focuses the window and raises it to the front. The app answers the
+    /// raise on its main thread, up to 206 ms later when busy (miri#326), so the
+    /// raise goes to the app's writer and the frame that starts the slide
+    /// does not wait for it.
     #[instrument(level = Level::DEBUG)]
     fn focus_with_raise(&self, psn: ProcessSerialNumber) {
         let window_id = self.id();
@@ -1408,16 +1425,12 @@ impl WindowApi for WindowOS {
             _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
         }
         make_key_window(&psn, window_id);
-        let element_ref = self.ax_element.as_ptr();
-        let action = CFString::from_static_str(kAXRaiseAction);
-        unsafe { AXUIElementPerformAction(element_ref, &action) };
+        self.writes.raise(self.pid().ok(), self.ax_window());
     }
 
     #[instrument(level = Level::DEBUG)]
     fn raise_without_focus(&self) {
-        let element_ref = self.ax_element.as_ptr();
-        let action = CFString::from_static_str(kAXRaiseAction);
-        unsafe { AXUIElementPerformAction(element_ref, &action) };
+        ax_raise(&self.ax_element);
     }
 
     fn pid(&self) -> Result<Pid> {
