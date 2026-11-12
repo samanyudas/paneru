@@ -36,9 +36,15 @@ fn harness() -> TestHarness {
 
 /// [`harness`], with windows 0, 1 and 2 `widths` wide.
 fn harness_with_widths(widths: [i32; 3]) -> TestHarness {
+    harness_with(widths, Some(14.0))
+}
+
+/// [`harness_with_widths`] at `animation_speed`, where `None` turns
+/// animation off.
+fn harness_with(widths: [i32; 3], animation_speed: Option<f64>) -> TestHarness {
     let config: Config = (
         MainOptions {
-            animation_speed: Some(14.0),
+            animation_speed,
             ..Default::default()
         },
         vec![],
@@ -306,6 +312,34 @@ fn a_narrowing_window_that_snaps_still_waits_for_a_slow_window() {
         harness.mock_state.ax_frame(0).width(),
         512,
         "window 0 narrowed"
+    );
+}
+
+/// With animation off, window 0 narrows beside the slow window 1 at once,
+/// in one write, rather than keeping its width until window 1 follows.
+#[test]
+fn with_animation_off_a_narrowing_window_takes_its_width_at_once() {
+    let mut harness = harness_with([WINDOW_WIDTH; 3], None);
+    let start = harness.mock_state.ax_frame(0);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    harness.advance(FRAME);
+    let first = harness.mock_state.ax_frame(0);
+    harness.mock_state.release_writes(SLOW_APP);
+    settle(&mut harness);
+
+    assert_landed(&mut harness);
+    let landed = harness.mock_state.ax_frame(0);
+    assert!(
+        landed.width() < start.width(),
+        "window 0 narrowed from {start:?}"
+    );
+    assert_eq!(
+        first, landed,
+        "window 0 took its narrowed frame in the first frame"
     );
 }
 
