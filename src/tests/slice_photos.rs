@@ -1284,6 +1284,40 @@ fn a_window_leaving_whose_new_photo_is_late_tucks_under_its_kept_photo_until_it_
 }
 
 #[test]
+fn a_window_leaving_in_a_long_frame_still_waits_for_its_new_photo() {
+    let (mut harness, log) = revealed(painted_beside_with(animated()), 3, Direction::Last);
+    let asks = asks_for(&log, 3).len();
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::First)));
+    while asks_for(&log, 3).len() == asks {
+        harness.advance(Duration::from_millis(20));
+    }
+    harness
+        .app
+        .world_mut()
+        .resource_mut::<Time<Virtual>>()
+        .set_max_delta(Duration::from_secs(2));
+    let frame = std::mem::replace(
+        &mut *harness.app.world_mut().resource_mut::<TimeUpdateStrategy>(),
+        TimeUpdateStrategy::ManualDuration(Duration::from_millis(600)),
+    );
+    harness.app.update();
+    *harness.app.world_mut().resource_mut::<TimeUpdateStrategy>() = frame;
+    harness.advance(Duration::from_millis(60));
+    assert_eq!(
+        log.borrow().painted,
+        vec![(3, Digest(7))],
+        "the kept photo waits for the new one"
+    );
+
+    arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(8)));
+    harness.advance(SETTLE);
+    assert_eq!(log.borrow().painted.last(), Some(&(3, Digest(8))));
+}
+
+#[test]
 fn a_window_leaving_whose_new_photo_is_blank_tucks_under_its_kept_photo() {
     let (mut harness, log) = revealed(painted_beside_with(animated()), 3, Direction::Last);
 

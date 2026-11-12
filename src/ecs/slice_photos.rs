@@ -190,12 +190,12 @@ enum SliceAccess {
 #[derive(Debug)]
 enum SlicePhoto {
     /// A photo is on its way. `last` is the photo the panel shows now. A
-    /// window leaving the screen shows its kept photo from the engine time
-    /// `kept_at` if the new one has not arrived.
+    /// window leaving the screen shows its kept photo once `kept_wait` ends
+    /// if the new one has not arrived.
     Asked {
         generation: u32,
         last: Option<Digest>,
-        kept_at: Option<Duration>,
+        kept_wait: Option<PhotoWait>,
         _wanted: Wanted,
     },
     /// The panel shows the photo with this digest.
@@ -286,7 +286,7 @@ fn ask(
     SlicePhoto::Asked {
         generation: *generation,
         last,
-        kept_at: None,
+        kept_wait: None,
         _wanted: Wanted(ticket),
     }
 }
@@ -325,7 +325,6 @@ fn present_slices(
     access: Res<SliceAccess>,
     mut slices: ResMut<Slices>,
     windows: Query<(&Window, Option<&Slide>)>,
-    time: Res<Time>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
     let Some(mut screen) = screen else {
@@ -373,8 +372,8 @@ fn present_slices(
                             None,
                             Lookup::Fresh,
                         );
-                        if let SlicePhoto::Asked { kept_at, .. } = &mut asked {
-                            *kept_at = Some(time.elapsed() + KEPT_WAIT);
+                        if let SlicePhoto::Asked { kept_wait, .. } = &mut asked {
+                            *kept_wait = Some(PhotoWait::Asked);
                         }
                         asked
                     }
@@ -556,7 +555,8 @@ fn receive_photos(
 
 /// Paints the kept photo of each window leaving the screen whose new photo
 /// is later than [`KEPT_WAIT`], so it can tuck, and keeps the new photo on
-/// its way to replace it.
+/// its way to replace it. The wait counts from the frame after the ask, as
+/// [`PhotoWait`] explains.
 fn show_kept_when_late(
     mut slices: ResMut<Slices>,
     time: Res<Time>,
@@ -569,16 +569,21 @@ fn show_kept_when_late(
     for (id, slice, photo) in showing.iter_mut() {
         let SlicePhoto::Asked {
             last: last @ None,
-            kept_at: kept_at @ Some(_),
+            kept_wait: kept_wait @ Some(_),
             ..
         } = photo
         else {
             continue;
         };
-        if kept_at.is_some_and(|at| time.elapsed() < at) {
-            continue;
+        let now = time.elapsed();
+        match *kept_wait {
+            Some(PhotoWait::Until(until)) if now >= until => *kept_wait = None,
+            Some(PhotoWait::Until(_)) => continue,
+            _ => {
+                *kept_wait = Some(PhotoWait::Until(now + KEPT_WAIT));
+                continue;
+            }
         }
-        *kept_at = None;
         if let Some(photo) = kept_photo(kept, *id, slice.size) {
             screen.0.paint(*id, photo);
             *last = Some(photo.digest);
