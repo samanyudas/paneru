@@ -1657,8 +1657,8 @@ pub(super) fn recheck_window_level(
 /// Gives each window that waited for a match by its title the new-window
 /// width, once the startup restore's grace period ends without a match, as
 /// it would have had when it joined its strip. A window that floats or is
-/// minimized by then keeps the width it has, and so does one whose width
-/// changed while it waited, as when the user resized it.
+/// minimized by then keeps the width it has, and so does a native tab, and
+/// one whose width changed while it waited, as when the user resized it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn size_windows_restore_did_not_match(
     waiting: Query<(Entity, &AwaitsTitleMatch)>,
@@ -1689,9 +1689,12 @@ pub(super) fn size_windows_restore_did_not_match(
         else {
             continue;
         };
+        // A native tab takes its group's width, as it does when it opens.
         let Some(display) = workspaces
             .iter()
-            .find_map(|(strip, child)| strip.contains(entity).then(|| child.parent()))
+            .find_map(|(strip, child)| {
+                (strip.contains(entity) && !strip.tabbed(entity)).then(|| child.parent())
+            })
             .and_then(|display| displays.get(display).ok())
         else {
             continue;

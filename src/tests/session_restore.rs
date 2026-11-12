@@ -1084,6 +1084,43 @@ fn a_width_the_user_sets_while_the_window_waits_for_a_title_match_stands() {
     assert_eq!(harness.mock_state.ax_frame(99).width(), set);
 }
 
+/// A waiting window that becomes a native tab before the grace period ends
+/// keeps its tab group's width, as a new native tab does.
+#[test]
+fn a_waiting_window_that_becomes_a_native_tab_keeps_its_group_width() {
+    let mut harness = untitled_window_in_grace_period(vec![]);
+    let frame = harness.mock_state.ax_frame(99);
+    let tab = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 100, frame);
+    harness.mock_state.window_visible(99, false);
+    harness.world().trigger(SpawnWindowTrigger(vec![tab]));
+    harness.advance(Duration::from_millis(500));
+    let entity = find_window_entity(99, harness.world());
+    let mut strips = harness.world().query::<&LayoutStrip>();
+    assert!(
+        strips
+            .iter(harness.world())
+            .any(|strip| strip.tabbed(entity)),
+        "window 99 joins a native tab group"
+    );
+    let widths = [99, 100].map(|id| harness.mock_state.ax_frame(id).width());
+
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+        assert_eq!(
+            [99, 100].map(|id| harness.mock_state.ax_frame(id).width()),
+            widths,
+            "the tab group keeps its width when the grace period ends"
+        );
+    }
+    assert!(
+        !harness
+            .world()
+            .contains_resource::<crate::ecs::restore::SessionRestore>()
+    );
+}
+
 /// A window whose width rule sized it does not wait for a title match, so a
 /// title that arrives later and no longer matches the rule leaves its width.
 #[test]
