@@ -678,6 +678,27 @@ fn a_plain_crossing_lands_flush_at_the_crossed_edge() {
     }
 }
 
+/// A plain move west into a strip that fits on the display keeps the strip
+/// at the left edge, the way every strip that fits sits, with the column
+/// right after the strip's old last column (miri#430).
+#[test]
+fn a_plain_crossing_into_a_strip_that_fits_keeps_it_at_the_left_edge() {
+    let ext = external_bounds(&Direction::West);
+    let mut harness = stacked_beside(ext, &[100]);
+    harness.advance(SETTLE);
+    let inset = frame(harness.world(), 100).min.x - ext.min.x;
+    harness.run(vec![plain(Operation::Swap(Direction::West), false)]);
+    settle_on_external(&mut harness, &[0, 1, 2]);
+    let first = frame(harness.world(), 100);
+    let arrived = frame(harness.world(), 1);
+    assert_eq!(first.min.x, ext.min.x + inset, "{first:?}");
+    assert!(arrived.min.x >= first.max.x, "{first:?} then {arrived:?}");
+    assert!(
+        arrived.max.x < ext.max.x - inset,
+        "{arrived:?} fits on {ext:?}"
+    );
+}
+
 #[test]
 fn plain_keys_step_once_before_crossing_and_repeats_stay_in_each_strip() {
     for side in [Side::West, Side::East] {

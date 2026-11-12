@@ -2936,9 +2936,9 @@ pub(super) fn reshuffle_layout_strip(
         // Enforce the edge invariant when auto-center is off: the leftmost
         // window must touch the left edge and the rightmost the right edge
         // if more than 1 windows in workspace. Continuous swipe lets a swipe
-        // leave the strip anywhere, but a column that a plain step brought
-        // across from the display beside lands at the crossed edge, with no
-        // desktop beside the strip's ends (miri#430).
+        // leave the strip anywhere, but a strip that a plain step brought a
+        // column into from the display beside gets the invariant too
+        // (miri#430).
         if !config.auto_center()
             && (!config.continuous_swipe()
                 || arrival.is_some_and(|arrival| {

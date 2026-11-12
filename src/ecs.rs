@@ -445,9 +445,10 @@ pub struct RefitAfterRemoval;
 #[derive(Component)]
 pub struct PlaceAfterArrival {
     pub destination: Entity,
-    /// A plain keyboard step crossed to the display beside, so the column
-    /// lands at the crossed edge of the destination strip, with no desktop
-    /// beside the strip's ends, even when continuous swipe is on.
+    /// A plain keyboard step crossed to the display beside, so the
+    /// destination strip gets the edge invariant even when continuous swipe
+    /// is on: no desktop beside the ends of a strip wider than the display,
+    /// and a strip that fits pinned to the left edge.
     pub at_crossed_edge: bool,
 }
 
