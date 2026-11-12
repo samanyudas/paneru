@@ -361,6 +361,9 @@ struct Member {
     x: i32,
     /// How wide the animation makes the window this frame.
     width: i32,
+    /// Where pacing lets the right edge of a window that changes width go
+    /// this frame. A window that only moves keeps its width.
+    held_right: Option<i32>,
     target: i32,
     target_right: i32,
     /// Where the engine asked for the window last frame.
@@ -381,13 +384,13 @@ impl Member {
         let edges = match self.pacer {
             Pacer::Asked => Edges {
                 left: self.x,
-                right: self.x + self.width,
+                right: self.right(),
             },
-            // A write sets the new size at the old position before the new
-            // position, so the edge that a width change moves shows ahead of
-            // where it lands until the position follows. Each edge counts as
-            // no further along than with the shown width and the other edge
-            // where the engine asked for it.
+            // A write that widens sets the new size at the old position
+            // before the new position, so the edge that a width change moves
+            // shows ahead of where it lands until the position follows. Each
+            // edge counts as no further along than with the shown width and
+            // the other edge where the engine asked for it.
             Pacer::Shown(edges) => {
                 let width = edges.right - edges.left;
                 Edges {
@@ -399,6 +402,23 @@ impl Member {
         Edges {
             left: edges.left - self.target,
             right: edges.right - self.target_right,
+        }
+    }
+
+    /// Where pacing lets the window's right edge go this frame.
+    fn right(&self) -> i32 {
+        self.held_right.unwrap_or(self.x + self.width)
+    }
+
+    /// Keeps the right edge of a window that narrows from the right at
+    /// `bound` or right of it, but never further right than where the engine
+    /// last asked for it, so the window keeps its width a while.
+    fn hold_right_edge_right_of(&mut self, bound: i32) {
+        let asked = self.asked_edges.right;
+        if let Some(right) = &mut self.held_right
+            && self.eased + self.width < asked
+        {
+            *right = (*right).max(bound).min(asked);
         }
     }
 
@@ -425,7 +445,7 @@ type RowWindows<'w, 's> = Query<
     (
         &'static Window,
         &'static mut Position,
-        &'static Bounds,
+        &'static mut Bounds,
         Option<&'static RepositionMarker>,
         Option<&'static ResizeMarker>,
         Option<(&'static Slide, &'static PresentedOrigin)>,
@@ -506,23 +526,31 @@ pub(super) fn pace_rows(
             .collect::<Vec<_>>();
         pace_row(&mut row);
 
-        for member in row
-            .iter()
-            .flatten()
-            .filter(|member| member.x != member.eased)
-        {
+        for member in row.iter().flatten().filter(|member| {
+            member.x != member.eased || member.right() != member.eased + member.width
+        }) {
             if member.slides {
                 debug!(
                     "pacing holds the photo of window {} at x {} on its way to {}",
                     member.id, member.x, member.target
                 );
                 slide_holds.bounds.insert(member.entity, member.x);
-            } else if let Ok((_, mut position, ..)) = windows.get_mut(member.entity) {
+            } else if let Ok((_, mut position, mut bounds, ..)) = windows.get_mut(member.entity) {
                 debug!(
-                    "pacing holds window {} at x {} short of {} on its way to {}",
-                    member.id, member.x, member.eased, member.target
+                    "pacing holds window {} at x {} right {} short of {} right {} on its way to {} right {}",
+                    member.id,
+                    member.x,
+                    member.right(),
+                    member.eased,
+                    member.eased + member.width,
+                    member.target,
+                    member.target_right
                 );
                 position.0.x = member.x;
+                let width = member.right() - member.x;
+                if bounds.0.x != width {
+                    bounds.0.x = width;
+                }
             }
         }
     }
@@ -567,6 +595,7 @@ fn member(
             eased: step.x,
             x: step.x,
             width,
+            held_right: None,
             target: heading_to.x,
             target_right: heading_to.x + width,
             asked: at.x,
@@ -594,6 +623,10 @@ fn member(
         eased: position.0.x,
         x: position.0.x,
         width,
+        // With animation off the resize lands in one step, so pacing holds no
+        // width.
+        held_right: (resize.is_some() && slide.is_none() && t < 1.0)
+            .then_some(position.0.x + width),
         target,
         target_right: target + target_width,
         asked: asked.left,
@@ -706,8 +739,9 @@ fn landed(rows: &[Vec<Vec<Entity>>], windows: &RowWindows, shown: &Shown) -> Ent
         .collect()
 }
 
-/// The windows of each strip that has a window on its way somewhere or
-/// landing under its photo, column by column, left to right.
+/// The windows of each strip that has a window on its way somewhere,
+/// changing width, or landing under its photo, column by column, left to
+/// right.
 fn moving_rows(strips: &Query<&LayoutStrip>, windows: &RowWindows) -> Vec<Vec<Vec<Entity>>> {
     strips
         .iter()
@@ -719,10 +753,14 @@ fn moving_rows(strips: &Query<&LayoutStrip>, windows: &RowWindows) -> Vec<Vec<Ve
         })
         .filter(|row| {
             row.iter().flatten().any(|&entity| {
-                windows.get(entity).is_ok_and(|(_, _, _, to, _, slide)| {
-                    to.is_some()
-                        || slide.is_some_and(|(slide, _)| matches!(slide, Slide::Landing { .. }))
-                })
+                windows
+                    .get(entity)
+                    .is_ok_and(|(_, _, _, to, resize, slide)| {
+                        to.is_some()
+                            || resize.is_some()
+                            || slide
+                                .is_some_and(|(slide, _)| matches!(slide, Slide::Landing { .. }))
+                    })
             })
         })
         .collect()
@@ -739,6 +777,7 @@ fn pace_row(row: &mut [Vec<Member>]) {
         if let Some(lag) = lag.filter(|&lag| lag > 0) {
             for member in &mut row[index] {
                 member.hold_right_of(member.target + lag);
+                member.hold_right_edge_right_of(member.target_right + lag);
             }
         }
     }

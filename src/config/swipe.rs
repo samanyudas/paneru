@@ -9,6 +9,18 @@ pub enum SwipeGestureDirection {
     Reversed,
 }
 
+/// Which strip a swipe or a modifier-scroll drives.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "lowercase")]
+pub enum SwipeTarget {
+    /// The strip on the display under the pointer.
+    #[default]
+    Pointer,
+    /// The strip that holds the focused window.
+    Focused,
+}
+
 pub(crate) fn focus_direction(gesture_direction: SwipeGestureDirection, delta: f64) -> Direction {
     let natural = matches!(gesture_direction, SwipeGestureDirection::Natural);
     if (delta > 0.0) == natural {
@@ -57,7 +69,18 @@ pub struct GestureOptions {
     #[serde(default, deserialize_with = "positive_distance_cm")]
     pub page_distance_cm: Option<f64>,
 
-    /// Play a haptic pulse for each confirmed paging focus change. Default: true.
+    /// Let the strip follow the fingers, then end each swipe one window on
+    /// from where it began, or back there, instead of gliding on with
+    /// momentum. Default: false.
+    pub window_landing: Option<bool>,
+
+    /// Which strip a swipe drives: the one on the display under the pointer,
+    /// or the one that holds the focused window. Default: pointer.
+    pub target: Option<SwipeTarget>,
+
+    /// Play a haptic pulse for each confirmed paging focus change, and each
+    /// time the window a window-landing swipe would land on changes.
+    /// Default: true.
     pub haptics: Option<bool>,
 }
 

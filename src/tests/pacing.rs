@@ -36,9 +36,15 @@ fn harness() -> TestHarness {
 
 /// [`harness`], with windows 0, 1 and 2 `widths` wide.
 fn harness_with_widths(widths: [i32; 3]) -> TestHarness {
+    harness_with(widths, Some(14.0))
+}
+
+/// [`harness_with_widths`] at `animation_speed`, where `None` turns
+/// animation off.
+fn harness_with(widths: [i32; 3], animation_speed: Option<f64>) -> TestHarness {
     let config: Config = (
         MainOptions {
-            animation_speed: Some(14.0),
+            animation_speed,
             ..Default::default()
         },
         vec![],
@@ -241,6 +247,99 @@ fn the_neighbours_wait_beside_a_slow_window_that_widens() {
     assert!(
         harness.mock_state.ax_frame(1).width() > start.width(),
         "window 1 widened from {start:?}"
+    );
+}
+
+/// Window 0 narrows beside the slow window 1. Its right edge moves left
+/// ahead of window 1, so it keeps its width until window 1 follows.
+#[test]
+fn a_narrowing_window_waits_for_a_slow_window_on_its_right() {
+    let mut harness = harness();
+    let rest = gap(&harness, 0, 1);
+    let start = harness.mock_state.ax_frame(0);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    for frame in 0..10 {
+        harness.advance(FRAME);
+        assert!(
+            gap(&harness, 0, 1) <= rest,
+            "desktop shows between windows 0 and 1 after frame {frame}: {:?} {:?}",
+            harness.mock_state.ax_frame(0),
+            harness.mock_state.ax_frame(1)
+        );
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle_beside(&mut harness, 0, 1, rest);
+    settle(&mut harness);
+
+    assert_landed(&mut harness);
+    assert!(
+        harness.mock_state.ax_frame(0).width() < start.width(),
+        "window 0 narrowed from {start:?}"
+    );
+}
+
+/// Window 0 narrows by only 6 points, from 518 to 512, beside the slow
+/// window 1. Its first step comes close enough to 512 to snap there, and it
+/// still keeps its right edge beside window 1 until window 1 follows.
+#[test]
+fn a_narrowing_window_that_snaps_still_waits_for_a_slow_window() {
+    let mut harness = harness_with_widths([518, WINDOW_WIDTH, WINDOW_WIDTH]);
+    let rest = gap(&harness, 0, 1);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    for frame in 0..5 {
+        harness.advance(FRAME);
+        assert!(
+            gap(&harness, 0, 1) <= rest,
+            "desktop shows between windows 0 and 1 after frame {frame}: {:?} {:?}",
+            harness.mock_state.ax_frame(0),
+            harness.mock_state.ax_frame(1)
+        );
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle_beside(&mut harness, 0, 1, rest);
+    settle(&mut harness);
+
+    assert_landed(&mut harness);
+    assert_eq!(
+        harness.mock_state.ax_frame(0).width(),
+        512,
+        "window 0 narrowed"
+    );
+}
+
+/// With animation off, window 0 narrows beside the slow window 1 at once,
+/// in one write, rather than keeping its width until window 1 follows.
+#[test]
+fn with_animation_off_a_narrowing_window_takes_its_width_at_once() {
+    let mut harness = harness_with([WINDOW_WIDTH; 3], None);
+    let start = harness.mock_state.ax_frame(0);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    harness.advance(FRAME);
+    let first = harness.mock_state.ax_frame(0);
+    harness.mock_state.release_writes(SLOW_APP);
+    settle(&mut harness);
+
+    assert_landed(&mut harness);
+    let landed = harness.mock_state.ax_frame(0);
+    assert!(
+        landed.width() < start.width(),
+        "window 0 narrowed from {start:?}"
+    );
+    assert_eq!(
+        first, landed,
+        "window 0 took its narrowed frame in the first frame"
     );
 }
 

@@ -47,6 +47,11 @@ pub(crate) const REFRESH: Duration = Duration::from_secs(2);
 /// showing on the edge, because some apps draw nothing once tucked.
 const PHOTO_WAIT: Duration = Duration::from_millis(1500);
 
+/// How long a window leaving the screen waits for a new photo before its
+/// kept photo shows instead. A new photo took 120 ms on Sam's Mac, and a kept
+/// one can show what the window looked like before it came on screen (#451).
+const KEPT_WAIT: Duration = Duration::from_millis(250);
+
 pub(crate) fn register(app: &mut App) {
     app.init_resource::<SliceAccess>()
         .init_resource::<Slices>()
@@ -65,6 +70,7 @@ pub(crate) fn register(app: &mut App) {
             (
                 update_access.run_if(resource_changed::<Config>.or_eager(on_timer(REFRESH))),
                 receive_photos,
+                show_kept_when_late,
                 showing_edge_slices
                     .pipe(present_slices)
                     .run_if(showing_may_change.or_eager(resource_changed::<SliceAccess>)),
@@ -183,10 +189,13 @@ enum SliceAccess {
 /// The photo of one slice with a panel.
 #[derive(Debug)]
 enum SlicePhoto {
-    /// A photo is on its way. `last` is the photo the panel shows now.
+    /// A photo is on its way. `last` is the photo the panel shows now. A
+    /// window leaving the screen shows its kept photo once `kept_wait` ends
+    /// if the new one has not arrived.
     Asked {
         generation: u32,
         last: Option<Digest>,
+        kept_wait: Option<PhotoWait>,
         _wanted: Wanted,
     },
     /// The panel shows the photo with this digest.
@@ -211,9 +220,11 @@ impl SlicePhoto {
 struct Slices {
     showing: Vec<(WinID, EdgeSlice, SlicePhoto)>,
     /// The latest photo of each window, with the size of the frame it shows,
-    /// kept after its slice stops showing. A window that crosses the shared
-    /// edge again shows it at once, rather than waiting for a new photo that
-    /// can take 700 ms.
+    /// kept after its slice stops showing. A slice that shows again for a
+    /// window still past the edge shows it at once, rather than waiting for a
+    /// new photo that can take 700 ms. A window leaving the screen gets a new
+    /// photo instead, because it may have changed while on screen, and macOS
+    /// photographs a tucked window blank, so no later refresh could repair it.
     kept: BTreeMap<WinID, (IVec2, Photo)>,
     /// The generation of the latest photo asked for, so a photo of an
     /// earlier ask is told apart.
@@ -237,15 +248,27 @@ impl Slices {
     }
 
     /// Whether a photo of `window` that shows `size` can show now: its panel
-    /// shows one, or one is kept.
+    /// shows one, or it has no panel and one is kept.
     fn has_photo(&self, window: WinID, size: IVec2) -> bool {
-        self.photo(window)
-            .is_some_and(|photo| photo.shown().is_some())
-            || self
+        match self.photo(window) {
+            Some(photo) => photo.shown().is_some(),
+            None => self
                 .kept
                 .get(&window)
-                .is_some_and(|(kept, _)| *kept == size)
+                .is_some_and(|(kept, _)| *kept == size),
+        }
     }
+}
+
+/// The kept photo of `window`, if it shows a frame of `size`.
+fn kept_photo(
+    kept: &BTreeMap<WinID, (IVec2, Photo)>,
+    window: WinID,
+    size: IVec2,
+) -> Option<&Photo> {
+    kept.get(&window)
+        .filter(|(kept, _)| *kept == size)
+        .map(|(_, photo)| photo)
 }
 
 fn ask(
@@ -263,6 +286,7 @@ fn ask(
     SlicePhoto::Asked {
         generation: *generation,
         last,
+        kept_wait: None,
         _wanted: Wanted(ticket),
     }
 }
@@ -291,18 +315,25 @@ fn update_access(
 /// whose window changed size after looking their windows up, and closes the
 /// panels of slices that stopped showing. A photo shows the whole window, so
 /// a slice that only moved keeps it, and a new slice shows its window's kept
-/// photo of the same size at once. A slice whose painted panel no one can
+/// photo of the same size at once. A window leaving the screen may have
+/// changed while on screen, so it waits for a new photo first, for at most
+/// [`KEPT_WAIT`]. A slice whose painted panel no one can
 /// see waits for the next refresh that sees it. A panel never painted is out
 /// of sight, so its first photo never waits.
 fn present_slices(
     In(showing): In<Vec<(WinID, EdgeSlice)>>,
     access: Res<SliceAccess>,
     mut slices: ResMut<Slices>,
-    windows: Query<&Window>,
+    windows: Query<(&Window, Option<&Slide>)>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
     let Some(mut screen) = screen else {
         return;
+    };
+    let leaving = |id: WinID| {
+        windows.iter().any(|(window, slide)| {
+            window.id() == id && matches!(slide, Some(Slide::Leaving { .. }))
+        })
     };
     let Slices {
         showing: shown,
@@ -310,7 +341,7 @@ fn present_slices(
         generation,
     } = &mut *slices;
     let showing = if *access == SliceAccess::On {
-        kept.retain(|id, _| windows.iter().any(|window| window.id() == *id));
+        kept.retain(|id, _| windows.iter().any(|(window, _)| window.id() == *id));
         showing
     } else {
         kept.clear();
@@ -331,8 +362,22 @@ fn present_slices(
                     debug!("edge slice photo deferred, panel unseen: window {id}");
                     SlicePhoto::Shown { digest }
                 }
-                last => match kept.get(&id).filter(|(size, _)| *size == slice.size) {
-                    Some((_, photo)) => {
+                last => match kept_photo(kept, id, slice.size) {
+                    Some(_) if leaving(id) => {
+                        let mut asked = ask(
+                            screen.0.as_mut(),
+                            generation,
+                            id,
+                            &slice,
+                            None,
+                            Lookup::Fresh,
+                        );
+                        if let SlicePhoto::Asked { kept_wait, .. } = &mut asked {
+                            *kept_wait = Some(PhotoWait::Asked);
+                        }
+                        asked
+                    }
+                    Some(photo) => {
                         from_kept.push(id);
                         SlicePhoto::Shown {
                             digest: photo.digest,
@@ -391,11 +436,13 @@ fn refresh_slices(mut slices: ResMut<Slices>, screen: Option<NonSendMut<SliceScr
 }
 
 /// Paints each photo that differs from the one its panel shows, and keeps it.
-/// A blank photo leaves the panel with the photo it shows. A blank photo of
-/// a window that still waits in view for its first photo asks for another,
-/// as an app that is still starting may not have drawn yet. A failed photo,
-/// or another blank one for a panel that shows none, closes its panel, and a
-/// refused one closes them all.
+/// A blank photo leaves the panel with the photo it shows, or paints the
+/// window's kept photo if the panel shows none. A blank photo of a window
+/// that still waits in view for its first photo asks for another, as an app
+/// that is still starting may not have drawn yet. A failed photo, or another
+/// blank one for a panel that shows none, closes its panel, and a refused one
+/// closes them all.
+#[allow(clippy::too_many_lines)]
 fn receive_photos(
     mut messages: MessageReader<Event>,
     mut slices: ResMut<Slices>,
@@ -460,6 +507,15 @@ fn receive_photos(
                 SlicePhoto::Shown { digest }
             }
             (Err(PhotoError::Blank), None)
+                if let Some(kept) = kept_photo(kept, *window_id, slice.size) =>
+            {
+                screen.0.paint(*window_id, kept);
+                debug!("edge slice photo blank: window {window_id} shows its kept photo");
+                SlicePhoto::Shown {
+                    digest: kept.digest,
+                }
+            }
+            (Err(PhotoError::Blank), None)
                 if sliding.iter().any(|(window, slide)| {
                     window.id() == *window_id && matches!(slide, Slide::Leaving { .. })
                 }) =>
@@ -494,6 +550,45 @@ fn receive_photos(
     }
     if ended {
         screen.0.place(&slices.placed());
+    }
+}
+
+/// Paints the kept photo of each window leaving the screen whose new photo
+/// is later than [`KEPT_WAIT`], so it can tuck, and keeps the new photo on
+/// its way to replace it. The wait counts from the frame after the ask, as
+/// [`PhotoWait`] explains.
+fn show_kept_when_late(
+    mut slices: ResMut<Slices>,
+    time: Res<Time>,
+    screen: Option<NonSendMut<SliceScreenHandle>>,
+) {
+    let Some(mut screen) = screen else {
+        return;
+    };
+    let Slices { showing, kept, .. } = &mut *slices;
+    for (id, slice, photo) in showing.iter_mut() {
+        let SlicePhoto::Asked {
+            last: last @ None,
+            kept_wait: kept_wait @ Some(_),
+            ..
+        } = photo
+        else {
+            continue;
+        };
+        let now = time.elapsed();
+        match *kept_wait {
+            Some(PhotoWait::Until(until)) if now >= until => *kept_wait = None,
+            Some(PhotoWait::Until(_)) => continue,
+            _ => {
+                *kept_wait = Some(PhotoWait::Until(now + KEPT_WAIT));
+                continue;
+            }
+        }
+        if let Some(photo) = kept_photo(kept, *id, slice.size) {
+            screen.0.paint(*id, photo);
+            *last = Some(photo.digest);
+            debug!("edge slice photo late: window {id} shows its kept photo");
+        }
     }
 }
 

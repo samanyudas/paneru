@@ -516,7 +516,8 @@ pub trait WindowApi: Send + Sync {
     fn resize(&mut self, size: Size);
     /// Moves and resizes the window in one write: the size at the old
     /// position, then the position, then the size again if the app limited
-    /// it at the old position.
+    /// it at the old position. A write that only narrows the window moves it
+    /// first.
     fn place(&mut self, frame: IRect);
     /// Reads the window's frame back from the OS. Waits first, up to
     /// `LANDING_TIMEOUT`, for any move or resize the engine asked for to

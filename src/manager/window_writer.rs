@@ -114,15 +114,32 @@ impl<W> PendingWrite<W> {
     }
 }
 
-/// Writes one window's frame. A write of both parts follows the order the
-/// engine has always used: the size at the old position, then the position,
-/// then the size again if the app limited it at the old position.
+/// Writes one window's frame. A write of both parts sets the size at the
+/// old position, then the position, then the size again if the app limited
+/// it at the old position. A write that only narrows a column moves it
+/// first, so the window covers where it lands until the size follows.
 /// Returns the frame read back after a size was written, if any read
 /// succeeded.
 pub(crate) fn apply<S: WriteSink>(sink: &mut S, write: &PendingWrite<S::Window>) -> Option<IRect> {
+    apply_from(sink, write, write.from.size())
+}
+
+/// [`apply`] for a window that has the size `taken`, which an app that
+/// limited the size gave it in place of the size in `write.from`.
+fn apply_from<S: WriteSink>(
+    sink: &mut S,
+    write: &PendingWrite<S::Window>,
+    taken: Size,
+) -> Option<IRect> {
     let window = &write.window;
     let size = write.to.size();
+    let narrows = size.x < taken.x && write.to.min.y == write.from.min.y;
     match (write.position, write.size) {
+        (true, true) if narrows => {
+            sink.set_position(window, write.to.min);
+            let moved = IRect::from_corners(write.to.min, write.to.min + taken);
+            resize(sink, window, moved, size, write.to.min)
+        }
         (true, true) => {
             let observed = resize(sink, window, write.from, size, write.from.min);
             sink.set_position(window, write.to.min);
@@ -402,7 +419,8 @@ impl<S: WriteSink> Shared<S> {
                 let moved = IRect::from_corners(write.to.min, write.to.min + taken);
                 resize(sink, &write.window, moved, write.to.size(), write.to.min)
             }
-            _ => apply(sink, write),
+            Some(taken) => apply_from(sink, write, taken),
+            None => apply(sink, write),
         };
         if write.size || limited.is_some() {
             *lock(&write.size_limited) = observed
@@ -862,6 +880,48 @@ mod tests {
         let (frame, ops) = place(IRect::new(0, 0, 400, 400), target, |_, size| size);
         assert_eq!(frame, target);
         assert_eq!(ops, vec![Op::Size(target.size()), Op::Position(target.min)]);
+    }
+
+    /// A column that narrows about its center moves before it shrinks, so
+    /// the app shows its right edge no further left than where it lands,
+    /// rather than leaving the desktop showing beside the column on its
+    /// right until the move follows (miri#308).
+    #[test]
+    fn a_combined_write_that_narrows_moves_before_the_size() {
+        let target = IRect::new(300, 50, 800, 450);
+        let (frame, ops) = place(IRect::new(100, 50, 1100, 450), target, |_, size| size);
+        assert_eq!(frame, target);
+        assert_eq!(ops, vec![Op::Position(target.min), Op::Size(target.size())]);
+    }
+
+    /// The app limited the window to 400 points, though the engine asked
+    /// for 1000. A write of 800 points grows the window, so it sets the
+    /// size first like any other growth, rather than moving first as a
+    /// narrowing does.
+    #[test]
+    fn a_write_that_grows_a_limited_window_sets_the_size_first() {
+        fn takes_any(_: IRect, size: Size) -> Size {
+            size
+        }
+        let target = IRect::new(300, 50, 1100, 450);
+        let mut app = Constrained {
+            frame: IRect::new(100, 50, 500, 450),
+            constrain: takes_any as fn(IRect, Size) -> Size,
+            ops: Vec::new(),
+        };
+        Shared::write(
+            &mut app,
+            &PendingWrite {
+                window: (),
+                from: IRect::new(100, 50, 1100, 450),
+                to: target,
+                position: true,
+                size: true,
+                size_limited: Arc::new(Mutex::new(Some(Size::new(400, 400)))),
+            },
+        );
+        assert_eq!(app.frame, target);
+        assert_eq!(app.ops.first(), Some(&Op::Size(target.size())));
     }
 
     #[test]

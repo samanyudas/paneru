@@ -2793,6 +2793,8 @@ struct StripScrollContext<'a> {
     display_bounds: IRect,
     raw_display_bounds: IRect,
     is_new_activation: bool,
+    /// Fingers on the trackpad drive a window-landing swipe of the strip.
+    user_swiping: bool,
 }
 
 fn resolve_strip_scroll_context<'a>(
@@ -2821,6 +2823,9 @@ fn resolve_strip_scroll_context<'a>(
         display_bounds: display.actual_display_bounds(dock, config),
         raw_display_bounds: display.bounds(),
         is_new_activation: has_previous_position && active_marker.is_some_and(|m| m.is_added()),
+        user_swiping: strip_scrolling.is_some_and(|scrolling| {
+            scrolling.is_user_swiping && super::scroll::lands_on_window(config, scrolling.input)
+        }),
     })
 }
 
@@ -3023,7 +3028,7 @@ fn ensure_visible_in_strip(
         // before the `&mut Position` query below is touched — Bevy treats
         // the two queries as conflicting system params even though they're
         // never live at the same time here.
-        let Some((strip_entity, strip_target, viewport, is_new_activation)) =
+        let Some((strip_entity, strip_target, viewport, is_new_activation, user_swiping)) =
             resolve_strip_scroll_context(entity, &strip_params.p0(), &displays, &config).map(
                 |ctx| {
                     (
@@ -3031,12 +3036,19 @@ fn ensure_visible_in_strip(
                         ctx.strip_target,
                         ctx.display_bounds,
                         ctx.is_new_activation,
+                        ctx.user_swiping,
                     )
                 },
             )
         else {
             continue;
         };
+        // Fingers on the trackpad own the strip. A focus that a swipe's landing
+        // asked for can arrive after the next swipe began, and scrolling to it
+        // then would fight the fingers; that swipe lands and focuses itself.
+        if user_swiping {
+            continue;
+        }
 
         if is_new_activation {
             trace!("ensure_visible_in_strip: skipping newly active workspace {strip_entity}");

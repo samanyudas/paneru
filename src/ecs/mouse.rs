@@ -15,8 +15,8 @@ use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{GlobalState, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, RepositionMarker,
-    Scrolling, SpawnCommandsExt, UpdateSet,
+    ActiveWorkspaceMarker, DockPosition, FocusedMarker, MissionControlActive, Position,
+    RepositionMarker, Scrolling, SpawnCommandsExt, UpdateSet,
 };
 use bevy::ecs::schedule::common_conditions::on_message;
 
@@ -235,7 +235,7 @@ fn mouse_moved_trigger(
 fn mouse_down_trigger(
     mut messages: MessageReader<InputEvent>,
     windows: Windows,
-    active_workspace: Query<(Entity, Option<&Scrolling>), With<ActiveWorkspaceMarker>>,
+    scrolling: Query<(Entity, &LayoutStrip), With<Scrolling>>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
@@ -264,10 +264,12 @@ fn mouse_down_trigger(
             continue;
         };
 
-        // Stop any ongoing scroll.
-        for (entity, scroll) in active_workspace {
-            if scroll.is_some()
-                && let Ok(mut entity_commands) = commands.get_entity(entity)
+        // Stop the scroll of the clicked window's strip, which the mouse-up
+        // reshuffle then places. A strip settling on another display keeps
+        // settling, so it never stays stretched past its end.
+        for (strip_entity, strip) in &scrolling {
+            if strip.contains(entity)
+                && let Ok(mut entity_commands) = commands.get_entity(strip_entity)
             {
                 entity_commands.try_remove::<Scrolling>();
             }
@@ -293,10 +295,12 @@ fn mouse_down_trigger(
 
 /// Handles mouse-up events. Triggers the deferred reshuffle so the clicked
 /// window slides into view after the user releases the button. A title-bar
-/// drop that awaits confirmation or just finished owns its placement.
+/// drop that awaits confirmation or just finished owns its placement, and a
+/// window that lost focus while held leaves the strip to the window that has it.
 pub(super) fn mouse_up_trigger(
     mut messages: MessageReader<InputEvent>,
     mouse_held: Query<(Entity, &MouseHeldMarker)>,
+    focused: Query<(), With<FocusedMarker>>,
     drag: Option<Res<DragState>>,
     mut commands: Commands,
 ) {
@@ -310,7 +314,7 @@ pub(super) fn mouse_up_trigger(
             _ => drag.settling_window(),
         });
         for (held_entity, marker) in &mouse_held {
-            if dropped != Some(marker.0) {
+            if dropped != Some(marker.0) && focused.contains(marker.0) {
                 commands.reshuffle_around(marker.0);
             }
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {

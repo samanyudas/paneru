@@ -734,6 +734,7 @@ fn in_view(frame: IRect) -> bool {
 
 /// What the user sees of a window after one frame: where it is, and its
 /// panel if the panel shows a photo.
+#[derive(Debug)]
 struct Seen {
     window: IRect,
     photo: Option<IRect>,
@@ -1214,8 +1215,11 @@ fn assert_rests_tucked(harness: &mut TestHarness, id: WinID, seen: &[Seen]) {
     );
 }
 
+/// Sam switched a browser tab while its window was on screen, and its slice
+/// went on showing the tab from before (#451): a tucked window photographs
+/// blank, so only a photo taken as it leaves can show what it shows now.
 #[test]
-fn a_window_that_slid_in_slides_back_out_under_the_photo_it_had() {
+fn a_window_that_slid_in_slides_back_out_under_a_new_photo() {
     for (laid_out, id, (reveal, leave)) in [
         (
             painted_beside_with(animated()),
@@ -1229,28 +1233,104 @@ fn a_window_that_slid_in_slides_back_out_under_the_photo_it_had() {
         ),
     ] {
         let (mut harness, log) = revealed(laid_out, id, reveal);
+        let asked = asks_for(&log, id).len();
 
-        let seen = drive(&mut harness, &log, id, &[(0, leave)], 40);
+        let mut seen = drive(&mut harness, &log, id, &[(0, leave)], 5);
+        assert!(
+            asks_for(&log, id).len() > asked,
+            "window {id} is photographed again as it leaves"
+        );
+        assert!(
+            seen.iter().all(|frame| frame.photo.is_none()),
+            "the photo from before never covers window {id}: {seen:?}"
+        );
+        arrive(&mut harness, id, last_ask(&log, id), Ok(photo(8)));
+        seen.extend(drive(&mut harness, &log, id, &[], 40));
 
         assert_shown_every_frame(id, &seen);
-        let covered = seen.iter().position(|frame| frame.photo.is_some());
-        assert!(
-            covered.is_some_and(|frame| frame <= 1),
-            "the photo of window {id} shows at once: after frame {covered:?}"
-        );
         assert_rests_tucked(&mut harness, id, &seen);
-        let mut places = seen
-            .iter()
-            .filter_map(|frame| frame.photo)
-            .collect::<Vec<_>>();
-        places.dedup();
-        assert!(places.len() >= 5, "the photo slides through {places:?}");
         assert_eq!(
             log.borrow().painted.last(),
-            Some(&(id, Digest(7))),
-            "the photo it had shows"
+            Some(&(id, Digest(8))),
+            "the new photo shows"
         );
     }
+}
+
+#[test]
+fn a_window_leaving_whose_new_photo_is_late_tucks_under_its_kept_photo_until_it_arrives() {
+    let (mut harness, log) = revealed(painted_beside_with(animated()), 3, Direction::Last);
+
+    let mut seen = drive(&mut harness, &log, 3, &[(0, Direction::First)], 10);
+    assert!(
+        seen.iter().take(10).all(|frame| frame.photo.is_none()),
+        "the kept photo waits 250 ms for a new one: {seen:?}"
+    );
+    seen.extend(drive(&mut harness, &log, 3, &[], 40));
+    assert_shown_every_frame(3, &seen);
+    assert_rests_tucked(&mut harness, 3, &seen);
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(7))),
+        "the kept photo shows once the new one is late"
+    );
+
+    arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(9)));
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(9))),
+        "the late new photo replaces it"
+    );
+}
+
+#[test]
+fn a_window_leaving_in_a_long_frame_still_waits_for_its_new_photo() {
+    let (mut harness, log) = revealed(painted_beside_with(animated()), 3, Direction::Last);
+    let asks = asks_for(&log, 3).len();
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::First)));
+    while asks_for(&log, 3).len() == asks {
+        harness.advance(Duration::from_millis(20));
+    }
+    harness
+        .app
+        .world_mut()
+        .resource_mut::<Time<Virtual>>()
+        .set_max_delta(Duration::from_secs(2));
+    let frame = std::mem::replace(
+        &mut *harness.app.world_mut().resource_mut::<TimeUpdateStrategy>(),
+        TimeUpdateStrategy::ManualDuration(Duration::from_millis(600)),
+    );
+    harness.app.update();
+    *harness.app.world_mut().resource_mut::<TimeUpdateStrategy>() = frame;
+    harness.advance(Duration::from_millis(60));
+    assert_eq!(
+        log.borrow().painted,
+        vec![(3, Digest(7))],
+        "the kept photo waits for the new one"
+    );
+
+    arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(8)));
+    harness.advance(SETTLE);
+    assert_eq!(log.borrow().painted.last(), Some(&(3, Digest(8))));
+}
+
+#[test]
+fn a_window_leaving_whose_new_photo_is_blank_tucks_under_its_kept_photo() {
+    let (mut harness, log) = revealed(painted_beside_with(animated()), 3, Direction::Last);
+
+    let mut seen = drive(&mut harness, &log, 3, &[(0, Direction::First)], 2);
+    arrive(&mut harness, 3, last_ask(&log, 3), Err(PhotoError::Blank));
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(7))),
+        "the kept photo shows at once"
+    );
+    seen.extend(drive(&mut harness, &log, 3, &[], 40));
+    assert_shown_every_frame(3, &seen);
+    assert_rests_tucked(&mut harness, 3, &seen);
 }
 
 #[test]
