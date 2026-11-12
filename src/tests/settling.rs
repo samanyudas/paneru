@@ -821,6 +821,36 @@ fn swipe_on_another_display_leaves_a_settle_to_finish() {
     );
 }
 
+/// A click on another display, while a swiped strip still settles, leaves
+/// that settle to finish, so the strip never stays stretched past its end.
+#[test]
+fn click_on_another_display_leaves_a_settle_to_finish() {
+    let mut harness = two_displays(
+        swipe_target_config("pointer", Some(14.0)),
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.mock_state.set_cursor_position(POINTER_ON_TEST);
+    send(&mut harness, swipe(0.3));
+    harness.advance(ONE_FRAME * 6);
+    assert!(is_scrolling(harness.world()), "still settling");
+
+    let point = POINTER_ON_EXT + IVec2::new(0, 300);
+    send(
+        &mut harness,
+        Event::MouseDown {
+            point: objc2_core_foundation::CGPoint::new(point.x.into(), point.y.into()),
+            modifiers: crate::platform::Modifiers::empty(),
+            button: crate::events::MouseButton::Left,
+            window_id: Some(101),
+            clicks: 1,
+        },
+    );
+    harness.advance(SETTLE);
+
+    assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_eq!(window_x(harness.world(), 4), TEST_DISPLAY_WIDTH - 400);
+}
+
 /// A display that switches to another Space mid-swipe lands its swiped strip
 /// at once, with no empty space beside it, and leaves no swipe on it.
 #[test]

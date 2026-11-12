@@ -237,6 +237,9 @@ impl Plugin for ScrollEventsPlugin {
                 swipe_gesture
                     .run_if(mission_control_inactive)
                     .run_if(on_message::<InputEvent>),
+                // Before the settle, so a settle never focuses a window in a
+                // Space its display has just left.
+                land_unshown_strips.run_if(on_message::<Event>),
                 apply_inertia,
                 apply_snap_force,
                 settle_strip,
@@ -244,7 +247,6 @@ impl Plugin for ScrollEventsPlugin {
                 apply_scrolling_constraints,
                 landing_detents,
                 swiping_timeout,
-                land_unshown_strips.run_if(on_message::<Event>),
             )
                 .chain()
                 .in_set(UpdateSet::Input),
