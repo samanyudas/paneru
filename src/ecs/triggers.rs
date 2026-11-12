@@ -18,9 +18,9 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    AboveOrdinaryCheck, ActiveDisplayMarker, AwaitingHandle, BProcess, FloatsWhenRestored,
-    FocusedMarker, MissionControlActive, PreviousManagedStrip, Rejoin, RetryFrontSwitch,
-    SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    AboveOrdinaryCheck, ActiveDisplayMarker, AwaitingHandle, AwaitsTitleMatch, BProcess,
+    FloatsWhenRestored, FocusedMarker, MissionControlActive, OpenedHidden, PreviousManagedStrip,
+    Rejoin, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::display::size_for_arrival;
@@ -868,7 +868,7 @@ pub(super) fn window_minimized_trigger(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_managed_trigger(
     trigger: On<Remove, Unmanaged>,
@@ -884,6 +884,9 @@ pub(super) fn window_managed_trigger(
         Without<Window>,
     >,
     previous_strips: Query<&PreviousManagedStrip>,
+    opened_hidden: Query<&Unmanaged, With<OpenedHidden>>,
+    launch_windows: Option<Res<LaunchWindows>>,
+    restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     initializing: Option<Res<Initializing>>,
     mut ctx: WindowCtx,
 ) {
@@ -951,6 +954,27 @@ pub(super) fn window_managed_trigger(
         // A rule's index places a new window, not a floated one that left a slot.
         if previous.is_none_or(|previous| previous.rejoin == Rejoin::AnyRow) {
             insert_at = properties.insertion().or(insert_at);
+        }
+
+        // A window that opened while its app was hidden tiles for the first
+        // time now, as a new window, when it goes straight from hidden to
+        // tiled. A window that floated or was minimized in between has a
+        // width of its own by now. A width rule sized it above.
+        if let Ok(unmanaged) = opened_hidden.get(entity) {
+            ctx.commands.entity(entity).try_remove::<OpenedHidden>();
+            if matches!(unmanaged, Unmanaged::Hidden) && properties.fixed_width_ratio().is_none() {
+                size_new_column(
+                    entity,
+                    window,
+                    app,
+                    ctx.windows.frame(entity),
+                    (display, dock),
+                    launch_windows.as_deref(),
+                    restore.as_deref(),
+                    &ctx.config,
+                    &mut ctx.commands,
+                );
+            }
         }
     }
 
@@ -1422,6 +1446,9 @@ pub(super) fn spawn_window_trigger(
         let hidden = app.is_hidden();
         if hidden {
             spawned.insert(Unmanaged::Hidden);
+            if initializing.is_none() {
+                spawned.insert(OpenedHidden);
+            }
         }
 
         commands.trigger(SendMessageTrigger(Event::WindowSpawned {
@@ -1543,11 +1570,15 @@ const ABOVE_ORDINARY_CHECK: Duration = Duration::from_secs(1);
 /// first: the window gets back the frame it opened with and takes focus once.
 /// A rule that decides whether the window floats still wins. A window that
 /// waits for its check tiles only when the check ends without it floating.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn recheck_window_level(
     mut checks: Query<(Entity, &mut AboveOrdinaryCheck)>,
     windows: Windows,
     apps: Query<&Application>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    displays: ActiveDisplays,
+    launch_windows: Option<Res<LaunchWindows>>,
+    restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     config: Res<Config>,
     time: Res<Time>,
     mut commands: Commands,
@@ -1567,19 +1598,38 @@ pub(super) fn recheck_window_level(
             continue;
         };
         entity_commands.try_remove::<AboveOrdinaryCheck>();
-        let properties = windows
+        let app = windows
             .find_parent(window.id())
-            .and_then(|(_, _, parent)| apps.get(parent).ok())
-            .map(|app| WindowProperties::new(app, window, &config));
+            .and_then(|(_, _, parent)| apps.get(parent).ok());
+        let properties = app.map(|app| WindowProperties::new(app, window, &config));
         let Some(properties) = properties.filter(|properties| raised && properties.floating())
         else {
+            // Session restore may have placed the window while it waited, at
+            // its saved width, and that placement stands.
+            let placed = workspaces.iter().any(|(strip, _)| strip.contains(entity));
             if !floated
+                && !placed
                 && check.tiled_from.is_none()
                 && let Some(mut strip) = workspaces
                     .iter_mut()
                     .find_map(|(strip, active)| active.then_some(strip))
             {
                 strip.append(entity);
+                if let Ok(display) = displays.single()
+                    && let Some(app) = app
+                {
+                    size_new_column(
+                        entity,
+                        window,
+                        app,
+                        windows.frame(entity),
+                        display,
+                        launch_windows.as_deref(),
+                        restore.as_deref(),
+                        &config,
+                        &mut commands,
+                    );
+                }
                 commands.reshuffle_around(entity);
             }
             continue;
@@ -1604,25 +1654,135 @@ pub(super) fn recheck_window_level(
 
 /// The active display with the Dock's edge, read without skipping the system
 /// when no display is active.
+/// Gives each window that waited for a match by its title the new-window
+/// width, once the startup restore's grace period ends without a match, as
+/// it would have had when it joined its strip. A window that floats or is
+/// minimized by then keeps the width it has, and so does a native tab, and
+/// one whose width changed while it waited, as when the user resized it.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn size_windows_restore_did_not_match(
+    waiting: Query<(Entity, &AwaitsTitleMatch)>,
+    restore: Option<Res<crate::ecs::restore::SessionRestore>>,
+    workspaces: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
+    apps: Query<&Application>,
+    launch_windows: Option<Res<LaunchWindows>>,
+    windows: Windows,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    if restore.is_some() {
+        return;
+    }
+    for (entity, awaits) in &waiting {
+        commands.entity(entity).try_remove::<AwaitsTitleMatch>();
+        let Some((window, _, None)) = windows.get_managed(entity) else {
+            continue;
+        };
+        let frame = windows.frame(entity);
+        if frame.is_none_or(|frame| frame.width() != awaits.width) {
+            continue;
+        }
+        let Some(app) = windows
+            .find_parent(window.id())
+            .and_then(|(_, _, parent)| apps.get(parent).ok())
+        else {
+            continue;
+        };
+        // A native tab takes its group's width, as it does when it opens.
+        let Some(display) = workspaces
+            .iter()
+            .find_map(|(strip, child)| {
+                (strip.contains(entity) && !strip.tabbed(entity)).then(|| child.parent())
+            })
+            .and_then(|display| displays.get(display).ok())
+        else {
+            continue;
+        };
+        size_new_column(
+            entity,
+            window,
+            app,
+            frame,
+            display,
+            launch_windows.as_deref(),
+            None,
+            &config,
+            &mut commands,
+        );
+        commands.reshuffle_around(entity);
+    }
+}
+
 type ActiveDisplays<'w, 's> =
     Query<'w, 's, (&'static Display, Option<&'static DockPosition>), With<ActiveDisplayMarker>>;
 
-/// Narrows `entity`, a new window that just joined the active strip, to the
-/// active display's tiling area when it opened wider, as an app that
-/// remembers its size from a larger display does. (miri#410)
-fn fit_new_column(
+/// The width a new window that joins the active strip as a column starts
+/// at, or `None` to leave the width it has. A `[windows]` rule's width, which
+/// `apply_window_defaults` already gave it, wins over `new_window_width`, a
+/// share of `display_width`. Either way the column is no wider than the
+/// display's tiling area, as an app that remembers its size from a larger
+/// display would make it. (miri#410, miri#305)
+fn starting_width(
+    width: i32,
+    display_width: i32,
+    tiling_width: i32,
+    new_window_width: Option<f64>,
+    rule_sets_width: bool,
+) -> Option<i32> {
+    let wanted = match new_window_width {
+        Some(ratio) if !rule_sets_width => round_px(f64::from(display_width) * ratio),
+        _ => width,
+    };
+    let starting = wanted.min(tiling_width);
+    (starting != width).then_some(starting)
+}
+
+/// Sizes `entity`, a window of `app` that just joined a strip on `display`,
+/// to its [`starting_width`]. A window that was open when the engine started
+/// is not new, however late a scan finds it, so it gets no new-window width.
+/// A minimized window keeps its width. A window without a width rule that the
+/// startup `restore` may still match by its title waits for the grace period
+/// to end before it gets the new-window width, so it does not take that width
+/// on the way to its saved one.
+#[allow(clippy::too_many_arguments)]
+fn size_new_column(
     entity: Entity,
+    window: &Window,
+    app: &Application,
     frame: Option<IRect>,
-    displays: &ActiveDisplays,
+    (display, dock): (&Display, Option<&DockPosition>),
+    launch_windows: Option<&LaunchWindows>,
+    restore: Option<&crate::ecs::restore::SessionRestore>,
     config: &Config,
     commands: &mut Commands,
 ) {
-    let Ok((display, dock)) = displays.single() else {
+    let Some(frame) = frame.filter(|_| !window.is_minimized()) else {
         return;
     };
-    let tiling = display.actual_display_bounds(dock, config);
-    if let Some(frame) = frame.filter(|frame| frame.width() > tiling.width()) {
-        size_for_arrival(entity, Size::new(tiling.width(), frame.height()), commands);
+    let launched = launch_windows.is_some_and(|launch| launch.0.contains(&window.id()));
+    let rule_sets_width = WindowProperties::new(app, window, config).sets_width();
+    let mut new_window_width = config.new_window_width().filter(|_| !launched);
+    let awaits_title_match = new_window_width.is_some()
+        && !rule_sets_width
+        && crate::ecs::restore::may_match_by_title_later(window, app, restore);
+    if awaits_title_match {
+        new_window_width = None;
+    }
+    let width = starting_width(
+        frame.width(),
+        display.bounds().width(),
+        display.actual_display_bounds(dock, config).width(),
+        new_window_width,
+        rule_sets_width,
+    );
+    if awaits_title_match && let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_insert(AwaitsTitleMatch {
+            width: width.unwrap_or(frame.width()),
+        });
+    }
+    if let Some(width) = width {
+        size_for_arrival(entity, Size::new(width, frame.height()), commands);
     }
 }
 
@@ -1659,6 +1819,7 @@ pub(super) fn apply_window_positions(
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
+    launch_windows: Option<Res<LaunchWindows>>,
     overrides: Res<TileOverrides>,
     mut ctx: WindowCtx,
 ) {
@@ -1762,13 +1923,19 @@ pub(super) fn apply_window_positions(
                 }
                 None => strip.append(entity),
             }
-            fit_new_column(
-                entity,
-                ctx.windows.frame(entity),
-                &displays,
-                &ctx.config,
-                &mut ctx.commands,
-            );
+            if let Ok(display) = displays.single() {
+                size_new_column(
+                    entity,
+                    window,
+                    app,
+                    ctx.windows.frame(entity),
+                    display,
+                    launch_windows.as_deref(),
+                    restore.as_deref(),
+                    &ctx.config,
+                    &mut ctx.commands,
+                );
+            }
         }
 
         // During init, skip per-window reshuffles. finish_setup does a single
@@ -2397,6 +2564,40 @@ mod tests {
     use bevy::ecs::system::RunSystemOnce;
     use bevy::math::IVec2;
     use std::time::Duration;
+
+    #[test]
+    fn a_new_column_starts_at_the_share_of_the_display_width() {
+        assert_eq!(
+            starting_width(380, 2560, 2544, Some(0.5), false),
+            Some(1280)
+        );
+        assert_eq!(
+            starting_width(1500, 2560, 2544, Some(0.5), false),
+            Some(1280)
+        );
+        assert_eq!(starting_width(1280, 2560, 2544, Some(0.5), false), None);
+        assert_eq!(starting_width(333, 1000, 990, Some(1.0 / 3.0), false), None);
+    }
+
+    #[test]
+    fn a_new_column_is_never_wider_than_the_tiling_area() {
+        assert_eq!(
+            starting_width(380, 2560, 2544, Some(1.0), false),
+            Some(2544)
+        );
+        assert_eq!(starting_width(3000, 2560, 2544, None, false), Some(2544));
+        assert_eq!(
+            starting_width(3000, 2560, 2544, Some(0.5), true),
+            Some(2544)
+        );
+    }
+
+    #[test]
+    fn a_rule_width_or_no_option_keeps_the_width_the_window_has() {
+        assert_eq!(starting_width(640, 2560, 2544, Some(0.5), true), None);
+        assert_eq!(starting_width(380, 2560, 2544, None, false), None);
+        assert_eq!(starting_width(2544, 2560, 2544, None, false), None);
+    }
 
     #[test]
     fn test_persistent_frame_refresh_failure_keeps_the_live_window() {

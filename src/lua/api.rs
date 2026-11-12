@@ -669,6 +669,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         window_hidden_ratio: _,
         window_resize_cycle: _,
         window_resize_step: _,
+        new_window_width: _,
         stack_limit: _,
         maximized_window_side: _,
         reap_empty_workspaces: _,
@@ -700,6 +701,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     options.set("window_hidden_ratio", config.window_hidden_ratio())?;
     options.set("window_resize_cycle", config.window_resize_cycle())?;
     options.set("window_resize_step", config.window_resize_step())?;
+    options.set("new_window_width", config.new_window_width())?;
     let stack_limit = match config.stack_limit() {
         StackLimit::Count(count) => count.get().into_lua(lua)?,
         StackLimit::Fit => "fit".into_lua(lua)?,
@@ -918,6 +920,7 @@ mod tests {
             animation_speed = 12.0
             mouse_resize_modifier = "alt"
             menubar_height = 24
+            new_window_width = 0.5
 
             [swipe.gesture]
             fingers_count = 3
@@ -949,6 +952,7 @@ mod tests {
         }
 
         assert_eq!(options_table.get::<i64>("stack_limit").unwrap(), 5);
+        assert_eq!(options_table.get::<f64>("new_window_width").unwrap(), 0.5);
 
         let padding_table: Table = root.get("padding").unwrap();
         for field in struct_field_names::<PaddingOptions>() {

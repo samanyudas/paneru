@@ -912,6 +912,290 @@ fn test_late_startup_window_restores_during_grace_period() {
         .run(commands);
 }
 
+/// A window that the restored session places inside the startup grace
+/// period gets its saved width, and never the new-window width on the way.
+#[test]
+fn a_late_restored_window_gets_its_saved_width_not_the_new_window_width() {
+    assert_late_window_keeps_its_saved_width(saved_window(99), false);
+}
+
+/// The same for a window that waits for its level check before it tiles,
+/// because its app shows it without a full-screen button.
+#[test]
+fn a_late_restored_window_that_waits_for_its_level_check_gets_its_saved_width() {
+    assert_late_window_keeps_its_saved_width(saved_window(99), true);
+}
+
+/// The same for a window that the restored session matches by its title,
+/// because the window id it was saved with is gone.
+#[test]
+fn a_late_window_restored_by_its_title_gets_its_saved_width() {
+    let mut saved = saved_window(50);
+    saved.title = "Window 99".to_string();
+    saved.identifier = "testid".to_string();
+    assert_late_window_keeps_its_saved_width(saved, false);
+}
+
+/// A window that the restored session can match only by its title, and only
+/// once that title arrives, tiles first as an unmatched window. A later
+/// restore pass, which the next window to open starts, then matches it. It
+/// keeps the width it opened with until then, and never takes the new-window
+/// width on the way to its saved width.
+#[test]
+fn a_late_window_matched_by_a_title_that_arrives_later_gets_its_saved_width() {
+    use crate::ecs::layout::ViewportShare;
+
+    let options = MainOptions {
+        new_window_width: Some(0.5),
+        ..MainOptions::default()
+    };
+    let saved_width = 300;
+    let mut saved = saved_window(50);
+    saved.title = "Window 99".to_string();
+    saved.identifier = "testid".to_string();
+    saved.width = Some(ViewportShare::of(saved_width, TEST_DISPLAY_WIDTH));
+    let mut harness = TestHarness::new()
+        .with_config((options, vec![]).into())
+        .with_state(state_with_strips(vec![SavedStrip {
+            view: None,
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved)],
+        }]));
+    harness.advance(Duration::from_millis(500));
+
+    let opened = IRect::new(100, TEST_MENUBAR_HEIGHT, 480, 700);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 99, opened);
+    harness
+        .mock_state
+        .update_window(99, |window| window.title = String::new());
+    harness.mock_state.focus_window(99);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    let mut widths = Vec::new();
+    for _ in 0..25 {
+        harness.advance(Duration::from_millis(20));
+        widths.push(harness.mock_state.ax_frame(99).width());
+    }
+    assert!(
+        widths.iter().all(|width| *width == opened.width()),
+        "the window keeps the width it opened with until restore matches it: {widths:?}"
+    );
+
+    harness
+        .mock_state
+        .update_window(99, |window| window.title = "Window 99".to_string());
+    let next = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        100,
+        IRect::new(200, TEST_MENUBAR_HEIGHT, 580, 700),
+    );
+    harness.world().trigger(SpawnWindowTrigger(vec![next]));
+    for _ in 0..125 {
+        harness.advance(Duration::from_millis(20));
+        widths.push(harness.mock_state.ax_frame(99).width());
+    }
+
+    assert!(
+        !widths.contains(&(TEST_DISPLAY_WIDTH / 2)),
+        "the restored window must never take the new-window width: {widths:?}"
+    );
+    assert_eq!(harness.mock_state.ax_frame(99).width(), saved_width);
+}
+
+/// Opens window 99, 380 pt wide and with no title, half a second into the
+/// startup grace period, with `new_window_width = 0.5` and `rules`. The only
+/// saved window is window 50 of the same app, titled "Some other window", so
+/// restore never matches window 99 by its title.
+fn untitled_window_in_grace_period(rules: Vec<WindowParams>) -> TestHarness {
+    let options = MainOptions {
+        new_window_width: Some(0.5),
+        ..MainOptions::default()
+    };
+    let mut saved = saved_window(50);
+    saved.title = "Some other window".to_string();
+    let mut harness = TestHarness::new()
+        .with_config((options, rules).into())
+        .with_state(state_with_strips(vec![SavedStrip {
+            view: None,
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved)],
+        }]));
+    harness.advance(Duration::from_millis(500));
+
+    let opened = IRect::new(100, TEST_MENUBAR_HEIGHT, 480, 700);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 99, opened);
+    harness
+        .mock_state
+        .update_window(99, |window| window.title = String::new());
+    harness.mock_state.focus_window(99);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_millis(500));
+    harness
+}
+
+/// Lets the startup grace period end, with time to spare for the layout.
+fn end_grace_period(harness: &mut TestHarness) {
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+    }
+    assert!(
+        !harness
+            .world()
+            .contains_resource::<crate::ecs::restore::SessionRestore>()
+    );
+}
+
+/// A window that opens with no title in the startup grace period, while a
+/// saved window of its app has one, and that restore never matches, gets the
+/// new-window width when the grace period ends.
+#[test]
+fn an_untitled_window_restore_never_matches_gets_the_new_width_after_the_grace_period() {
+    let mut harness = untitled_window_in_grace_period(vec![]);
+    assert_eq!(
+        harness.mock_state.ax_frame(99).width(),
+        380,
+        "the window waits for a match while the grace period runs"
+    );
+
+    end_grace_period(&mut harness);
+    assert_eq!(
+        harness.mock_state.ax_frame(99).width(),
+        TEST_DISPLAY_WIDTH / 2
+    );
+}
+
+/// A width the user gives such a window while it waits stands when the grace
+/// period ends.
+#[test]
+fn a_width_the_user_sets_while_the_window_waits_for_a_title_match_stands() {
+    let mut harness = untitled_window_in_grace_period(vec![]);
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::SetWidth(0.75)),
+    }]);
+    harness.advance(Duration::from_millis(200));
+    let set = harness.mock_state.ax_frame(99).width();
+    assert_ne!(set, 380, "the command resizes the window");
+
+    end_grace_period(&mut harness);
+    assert_eq!(harness.mock_state.ax_frame(99).width(), set);
+}
+
+/// A waiting window that becomes a native tab before the grace period ends
+/// keeps its tab group's width, as a new native tab does.
+#[test]
+fn a_waiting_window_that_becomes_a_native_tab_keeps_its_group_width() {
+    let mut harness = untitled_window_in_grace_period(vec![]);
+    let frame = harness.mock_state.ax_frame(99);
+    let tab = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 100, frame);
+    harness.mock_state.window_visible(99, false);
+    harness.world().trigger(SpawnWindowTrigger(vec![tab]));
+    harness.advance(Duration::from_millis(500));
+    let entity = find_window_entity(99, harness.world());
+    let mut strips = harness.world().query::<&LayoutStrip>();
+    assert!(
+        strips
+            .iter(harness.world())
+            .any(|strip| strip.tabbed(entity)),
+        "window 99 joins a native tab group"
+    );
+    let widths = [99, 100].map(|id| harness.mock_state.ax_frame(id).width());
+
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+        assert_eq!(
+            [99, 100].map(|id| harness.mock_state.ax_frame(id).width()),
+            widths,
+            "the tab group keeps its width when the grace period ends"
+        );
+    }
+    assert!(
+        !harness
+            .world()
+            .contains_resource::<crate::ecs::restore::SessionRestore>()
+    );
+}
+
+/// A window whose width rule sized it does not wait for a title match, so a
+/// title that arrives later and no longer matches the rule leaves its width.
+#[test]
+fn a_window_a_width_rule_sized_keeps_that_width_after_the_grace_period() {
+    let mut rule = WindowParams::new("^$", None);
+    rule.width = Some(crate::config::InitialWindowWidth::Ratio(0.25));
+    let mut harness = untitled_window_in_grace_period(vec![rule]);
+    let ruled = harness.mock_state.ax_frame(99).width();
+    assert_ne!(ruled, 380, "the rule sizes the window");
+
+    harness
+        .mock_state
+        .update_window(99, |window| window.title = "Unsaved".to_string());
+    end_grace_period(&mut harness);
+    assert_eq!(harness.mock_state.ax_frame(99).width(), ruled);
+}
+
+/// Opens window 99 half a second into the startup grace period, with
+/// `saved` the only window of the restored session, and checks every 20 ms
+/// for 3 s that window 99 never takes the new-window width, ends at its saved
+/// width, and sits in exactly one strip.
+fn assert_late_window_keeps_its_saved_width(mut saved: SavedWindow, waits_for_level_check: bool) {
+    use crate::ecs::layout::ViewportShare;
+
+    let options = MainOptions {
+        new_window_width: Some(0.5),
+        ..MainOptions::default()
+    };
+    let saved_width = 300;
+    saved.width = Some(ViewportShare::of(saved_width, TEST_DISPLAY_WIDTH));
+    let mut harness = TestHarness::new()
+        .with_config((options, vec![]).into())
+        .with_state(state_with_strips(vec![SavedStrip {
+            view: None,
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved)],
+        }]));
+    harness.advance(Duration::from_millis(500));
+    assert!(
+        harness
+            .world()
+            .contains_resource::<crate::ecs::restore::SessionRestore>()
+    );
+
+    let opened = IRect::new(100, TEST_MENUBAR_HEIGHT, 480, 700);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 99, opened);
+    if waits_for_level_check {
+        harness
+            .mock_state
+            .update_window(99, |window| window.no_full_screen_button = true);
+    }
+    harness.mock_state.focus_window(99);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    for _ in 0..150 {
+        harness.advance(Duration::from_millis(20));
+        let width = harness.mock_state.ax_frame(99).width();
+        assert_ne!(
+            width,
+            TEST_DISPLAY_WIDTH / 2,
+            "the restored window must never take the new-window width"
+        );
+    }
+    assert_eq!(harness.mock_state.ax_frame(99).width(), saved_width);
+
+    let entity = find_window_entity(99, harness.world());
+    let mut strips = harness.world().query::<&LayoutStrip>();
+    let holding = strips
+        .iter(harness.world())
+        .filter(|strip| strip.contains(entity))
+        .count();
+    assert_eq!(holding, 1, "the restored window sits in exactly one strip");
+}
+
 #[test]
 fn test_late_startup_window_with_floating_rule_is_not_restored() {
     let mut params = WindowParams::new("^Window 99$", Some("test".to_string()));
