@@ -1436,6 +1436,43 @@ fn a_renewed_photo_that_arrives_after_the_window_crossed_repaints_its_slice() {
 }
 
 #[test]
+fn a_swipe_whose_first_step_carries_a_window_past_the_edge_still_renews_its_photo() {
+    let (mut harness, log) = revealed(painted_beside_with(animated_swipes()), 3, Direction::Last);
+    let asks = asks_for(&log, 3).len();
+
+    harness.world().write_message(Event::Swipe {
+        delta: -0.6,
+        fingers: 3,
+        distance_cm: 0.0,
+    });
+    harness.advance(Duration::from_millis(20));
+
+    assert!(
+        asks_for(&log, 3).len() > asks,
+        "window 3 is photographed as the swipe starts"
+    );
+}
+
+#[test]
+fn a_renewal_older_than_the_slice_photo_does_not_replace_it() {
+    let (mut harness, log) = revealed(painted_beside_with(animated()), 3, Direction::Last);
+    harness.advance(REFRESH);
+    let renewal = last_ask(&log, 3);
+
+    drive(&mut harness, &log, 3, &[(0, Direction::First)], 3);
+    let leave = last_ask(&log, 3);
+    assert_ne!(leave, renewal, "window 3 is photographed as it leaves");
+    arrive(&mut harness, 3, leave, Ok(photo(8)));
+    arrive(&mut harness, 3, renewal, Ok(photo(9)));
+
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(8))),
+        "the photo taken as it left stays"
+    );
+}
+
+#[test]
 fn a_window_in_view_with_a_kept_photo_is_photographed_every_refresh() {
     let (mut harness, log) = revealed(painted_beside_with(animated()), 3, Direction::Last);
     let asks = asks_for(&log, 3).len();

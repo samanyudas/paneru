@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bevy::app::{App, PostUpdate};
+use bevy::app::{App, PostUpdate, Update};
 use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
@@ -32,7 +32,9 @@ use crate::ecs::shared_edge::{
     EdgeSlice, Hold, PhotoWait, Slide, showing_edge_slices, showing_may_change,
 };
 use crate::ecs::systems::{self, AnimationStep, ease_out_factor, ease_step};
-use crate::ecs::{Position, PostUpdateSet, PresentedOrigin, RepositionMarker, Scrolling};
+use crate::ecs::{
+    Position, PostUpdateSet, PresentedOrigin, RepositionMarker, Scrolling, UpdateSet,
+};
 use crate::events::Event;
 use crate::manager::window_writer::LANDING_TIMEOUT;
 use crate::manager::{Display, Window};
@@ -60,6 +62,14 @@ const KEPT_WAIT: Duration = Duration::from_millis(750);
 pub(crate) fn register(app: &mut App) {
     app.init_resource::<SliceAccess>()
         .init_resource::<Slices>()
+        // Between the swipe's input and layout, which tucks a window that the
+        // swipe's first step carries past the edge.
+        .add_systems(
+            Update,
+            renew_kept_on_swipe
+                .after(UpdateSet::Input)
+                .before(UpdateSet::Layout),
+        )
         .add_systems(
             PostUpdate,
             (slide_photos, slide_photos_out)
@@ -76,7 +86,6 @@ pub(crate) fn register(app: &mut App) {
                 update_access.run_if(resource_changed::<Config>.or_eager(on_timer(REFRESH))),
                 receive_photos,
                 show_kept_when_late,
-                renew_kept_on_swipe,
                 showing_edge_slices
                     .pipe(present_slices)
                     .run_if(showing_may_change.or_eager(resource_changed::<SliceAccess>)),
@@ -541,6 +550,7 @@ fn receive_photos(
                     debug!("edge slice repainted: window {window_id}");
                 }
                 kept.insert(*window_id, (slice, taken.clone()));
+                renewing.remove(window_id);
                 SlicePhoto::Shown {
                     digest: taken.digest,
                 }
