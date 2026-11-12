@@ -109,6 +109,5 @@ Before concluding a task, creating a commit, or presenting work as complete, age
 
 *   **Testing branch:** Use the `testing` branch as a base for the PR, unless the change is very small or is an urgent fix for an issue in the `main` branch. This way the changes get additional baking before unleashin them into the `main` population.
 *   **Research:** Before implementing, check `src/ecs/...` to see if a similar system already exists.
-*   **Implementation:** Follow the **Plan -> Act -> Validate** cycle.
 *   **Verification:** Execute the cleanup and verification steps in Section 6. If changes affect window tiling or animation, verify that existing layout interactions continue to work as expected.
 
