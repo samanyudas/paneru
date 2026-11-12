@@ -1657,10 +1657,11 @@ pub(super) fn recheck_window_level(
 /// Gives each window that waited for a match by its title the new-window
 /// width, once the startup restore's grace period ends without a match, as
 /// it would have had when it joined its strip. A window that floats or is
-/// minimized by then keeps the width it has.
+/// minimized by then keeps the width it has, and so does one whose width
+/// changed while it waited, as when the user resized it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn size_windows_restore_did_not_match(
-    waiting: Query<Entity, With<AwaitsTitleMatch>>,
+    waiting: Query<(Entity, &AwaitsTitleMatch)>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     workspaces: Query<(&LayoutStrip, &ChildOf)>,
     displays: Query<(&Display, Option<&DockPosition>)>,
@@ -1673,11 +1674,15 @@ pub(super) fn size_windows_restore_did_not_match(
     if restore.is_some() {
         return;
     }
-    for entity in &waiting {
+    for (entity, awaits) in &waiting {
         commands.entity(entity).try_remove::<AwaitsTitleMatch>();
         let Some((window, _, None)) = windows.get_managed(entity) else {
             continue;
         };
+        let frame = windows.frame(entity);
+        if frame.is_none_or(|frame| frame.width() != awaits.width) {
+            continue;
+        }
         let Some(app) = windows
             .find_parent(window.id())
             .and_then(|(_, _, parent)| apps.get(parent).ok())
@@ -1695,7 +1700,7 @@ pub(super) fn size_windows_restore_did_not_match(
             entity,
             window,
             app,
-            windows.frame(entity),
+            frame,
             display,
             launch_windows.as_deref(),
             None,
@@ -1733,10 +1738,10 @@ fn starting_width(
 /// Sizes `entity`, a window of `app` that just joined a strip on `display`,
 /// to its [`starting_width`]. A window that was open when the engine started
 /// is not new, however late a scan finds it, so it gets no new-window width.
-/// A minimized window keeps its width. A window that the startup `restore`
-/// may still match by its title waits for the grace period to end before it
-/// gets the new-window width, so it does not take that width on the way to
-/// its saved one.
+/// A minimized window keeps its width. A window without a width rule that the
+/// startup `restore` may still match by its title waits for the grace period
+/// to end before it gets the new-window width, so it does not take that width
+/// on the way to its saved one.
 #[allow(clippy::too_many_arguments)]
 fn size_new_column(
     entity: Entity,
@@ -1753,12 +1758,12 @@ fn size_new_column(
         return;
     };
     let launched = launch_windows.is_some_and(|launch| launch.0.contains(&window.id()));
+    let rule_sets_width = WindowProperties::new(app, window, config).sets_width();
     let mut new_window_width = config.new_window_width().filter(|_| !launched);
-    if new_window_width.is_some()
-        && crate::ecs::restore::may_match_by_title_later(window, app, restore)
-        && let Ok(mut entity_commands) = commands.get_entity(entity)
-    {
-        entity_commands.try_insert(AwaitsTitleMatch);
+    let awaits_title_match = new_window_width.is_some()
+        && !rule_sets_width
+        && crate::ecs::restore::may_match_by_title_later(window, app, restore);
+    if awaits_title_match {
         new_window_width = None;
     }
     let width = starting_width(
@@ -1766,8 +1771,13 @@ fn size_new_column(
         display.bounds().width(),
         display.actual_display_bounds(dock, config).width(),
         new_window_width,
-        WindowProperties::new(app, window, config).sets_width(),
+        rule_sets_width,
     );
+    if awaits_title_match && let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_insert(AwaitsTitleMatch {
+            width: width.unwrap_or(frame.width()),
+        });
+    }
     if let Some(width) = width {
         size_for_arrival(entity, Size::new(width, frame.height()), commands);
     }

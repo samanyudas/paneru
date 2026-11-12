@@ -635,9 +635,12 @@ pub struct OpenedHidden;
 /// title arrived, while a saved window of its app has a title. A later
 /// restore pass may still match it by that title and give it its saved
 /// width, so it gets the new-window width only when the grace period ends
-/// without a match. (miri#305)
+/// without a match, and only if its width is still `width`, the width it
+/// had when it started to wait. (miri#305)
 #[derive(Component, Debug)]
-pub struct AwaitsTitleMatch;
+pub struct AwaitsTitleMatch {
+    pub width: i32,
+}
 
 /// The strip slot a window left when it stopped being managed, so managing it
 /// again returns it there.

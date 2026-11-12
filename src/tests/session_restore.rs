@@ -1004,11 +1004,11 @@ fn a_late_window_matched_by_a_title_that_arrives_later_gets_its_saved_width() {
     assert_eq!(harness.mock_state.ax_frame(99).width(), saved_width);
 }
 
-/// A window that opens with no title in the startup grace period, while a
-/// saved window of its app has one, and that restore never matches, gets the
-/// new-window width when the grace period ends.
-#[test]
-fn an_untitled_window_restore_never_matches_gets_the_new_width_after_the_grace_period() {
+/// Opens window 99, 380 pt wide and with no title, half a second into the
+/// startup grace period, with `new_window_width = 0.5` and `rules`. The only
+/// saved window is window 50 of the same app, titled "Some other window", so
+/// restore never matches window 99 by its title.
+fn untitled_window_in_grace_period(rules: Vec<WindowParams>) -> TestHarness {
     let options = MainOptions {
         new_window_width: Some(0.5),
         ..MainOptions::default()
@@ -1016,7 +1016,7 @@ fn an_untitled_window_restore_never_matches_gets_the_new_width_after_the_grace_p
     let mut saved = saved_window(50);
     saved.title = "Some other window".to_string();
     let mut harness = TestHarness::new()
-        .with_config((options, vec![]).into())
+        .with_config((options, rules).into())
         .with_state(state_with_strips(vec![SavedStrip {
             view: None,
             virtual_index: 0,
@@ -1034,12 +1034,11 @@ fn an_untitled_window_restore_never_matches_gets_the_new_width_after_the_grace_p
     harness.mock_state.focus_window(99);
     harness.world().trigger(SpawnWindowTrigger(vec![window]));
     harness.advance(Duration::from_millis(500));
-    assert_eq!(
-        harness.mock_state.ax_frame(99).width(),
-        opened.width(),
-        "the window waits for a match while the grace period runs"
-    );
+    harness
+}
 
+/// Lets the startup grace period end, with time to spare for the layout.
+fn end_grace_period(harness: &mut TestHarness) {
     for _ in 0..100 {
         harness.advance(Duration::from_millis(20));
     }
@@ -1048,10 +1047,58 @@ fn an_untitled_window_restore_never_matches_gets_the_new_width_after_the_grace_p
             .world()
             .contains_resource::<crate::ecs::restore::SessionRestore>()
     );
+}
+
+/// A window that opens with no title in the startup grace period, while a
+/// saved window of its app has one, and that restore never matches, gets the
+/// new-window width when the grace period ends.
+#[test]
+fn an_untitled_window_restore_never_matches_gets_the_new_width_after_the_grace_period() {
+    let mut harness = untitled_window_in_grace_period(vec![]);
+    assert_eq!(
+        harness.mock_state.ax_frame(99).width(),
+        380,
+        "the window waits for a match while the grace period runs"
+    );
+
+    end_grace_period(&mut harness);
     assert_eq!(
         harness.mock_state.ax_frame(99).width(),
         TEST_DISPLAY_WIDTH / 2
     );
+}
+
+/// A width the user gives such a window while it waits stands when the grace
+/// period ends.
+#[test]
+fn a_width_the_user_sets_while_the_window_waits_for_a_title_match_stands() {
+    let mut harness = untitled_window_in_grace_period(vec![]);
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::SetWidth(0.75)),
+    }]);
+    harness.advance(Duration::from_millis(200));
+    let set = harness.mock_state.ax_frame(99).width();
+    assert_ne!(set, 380, "the command resizes the window");
+
+    end_grace_period(&mut harness);
+    assert_eq!(harness.mock_state.ax_frame(99).width(), set);
+}
+
+/// A window whose width rule sized it does not wait for a title match, so a
+/// title that arrives later and no longer matches the rule leaves its width.
+#[test]
+fn a_window_a_width_rule_sized_keeps_that_width_after_the_grace_period() {
+    let mut rule = WindowParams::new("^$", None);
+    rule.width = Some(crate::config::InitialWindowWidth::Ratio(0.25));
+    let mut harness = untitled_window_in_grace_period(vec![rule]);
+    let ruled = harness.mock_state.ax_frame(99).width();
+    assert_ne!(ruled, 380, "the rule sizes the window");
+
+    harness
+        .mock_state
+        .update_window(99, |window| window.title = "Unsaved".to_string());
+    end_grace_period(&mut harness);
+    assert_eq!(harness.mock_state.ax_frame(99).width(), ruled);
 }
 
 /// Opens window 99 half a second into the startup grace period, with
