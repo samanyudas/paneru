@@ -912,6 +912,7 @@ mod tests {
             animation_speed = 12.0
             mouse_resize_modifier = "alt"
             menubar_height = 24
+            new_window_width = 0.5
 
             [swipe.gesture]
             fingers_count = 3
@@ -943,6 +944,7 @@ mod tests {
         }
 
         assert_eq!(options_table.get::<i64>("stack_limit").unwrap(), 5);
+        assert_eq!(options_table.get::<f64>("new_window_width").unwrap(), 0.5);
 
         let padding_table: Table = root.get("padding").unwrap();
         for field in struct_field_names::<PaddingOptions>() {
