@@ -901,6 +901,15 @@ pub(super) fn window_managed_trigger(
     }
     let entity = trigger.event().entity;
 
+    // A despawn removes every component, `Unmanaged` included, and has no
+    // archetype after it. That is a hidden, minimized or floating window that
+    // closed or whose app quit, not one coming back. Putting it back into a
+    // strip would leave a dead column there, because `window_removal_trigger`
+    // has already run for it (miri#478).
+    if trigger.trigger().new_archetype.is_none() {
+        return;
+    }
+
     if ctx
         .windows
         .get(entity)
@@ -2057,6 +2066,47 @@ pub(super) fn window_removal_trigger(
             strip.id()
         );
         strip.remove(entity);
+        commands
+            .entity(strip_entity)
+            .try_insert(ExposeFocusedSurvivorAfterRemoval);
+    }
+}
+
+/// Takes out of every strip each entry whose window entity no longer exists.
+///
+/// `window_removal_trigger` takes a despawned window out of its strip, so this
+/// should find nothing. It is the safety net for a path that misses it: a dead
+/// entry swallows every focus move onto its column until the engine restarts
+/// (miri#478). The warning names the leak so it can be fixed at its source.
+pub(super) fn prune_dead_strip_entries(
+    mut workspaces: Query<(Entity, &mut LayoutStrip)>,
+    windows: Query<(), With<Window>>,
+    mut commands: Commands,
+) {
+    for (strip_entity, mut strip) in &mut workspaces {
+        let mut dead = strip
+            .all_windows()
+            .into_iter()
+            .filter(|entity| !windows.contains(*entity))
+            .collect::<Vec<_>>();
+        dead.sort_unstable();
+        dead.dedup();
+        if dead.is_empty() {
+            continue;
+        }
+        for entity in dead {
+            warn!(
+                "Pruning dead window entity {entity} from strip {}",
+                strip.id()
+            );
+            // `remove` takes out one entry, and a leak can leave several.
+            for _ in 0..=strip.len() {
+                if !strip.contains(entity) {
+                    break;
+                }
+                strip.remove(entity);
+            }
+        }
         commands
             .entity(strip_entity)
             .try_insert(ExposeFocusedSurvivorAfterRemoval);

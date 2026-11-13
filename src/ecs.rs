@@ -375,6 +375,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::invalidate_window_title,
             triggers::refresh_configuration_trigger,
             triggers::theme_change_trigger,
+            triggers::prune_dead_strip_entries,
         )
             .in_set(UpdateSet::Events),
     );
