@@ -10,13 +10,14 @@ use std::time::Duration;
 use bevy::app::{App, PostUpdate, Update};
 use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _};
 use bevy::ecs::entity::Entity;
+use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Has, Without};
+use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::common_conditions::{any_with_component, resource_changed};
 use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
 use bevy::ecs::system::{
-    Commands, In, IntoSystem as _, Local, NonSend, NonSendMut, Query, Res, ResMut,
+    Commands, In, IntoSystem as _, Local, NonSend, NonSendMut, Query, Res, ResMut, SystemParam,
 };
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
@@ -26,18 +27,19 @@ use objc2_core_graphics::CGImage;
 use tracing::{debug, warn};
 
 use crate::config::Config;
-use crate::ecs::layout::lies_mostly_elsewhere;
+use crate::ecs::layout::{LayoutStrip, lies_mostly_elsewhere};
 use crate::ecs::pacing::{self, SlideHolds};
 use crate::ecs::shared_edge::{
     EdgeSlice, Hold, PhotoWait, Slide, showing_edge_slices, showing_may_change,
 };
 use crate::ecs::systems::{self, AnimationStep, ease_out_factor, ease_step};
 use crate::ecs::{
-    Position, PostUpdateSet, PresentedOrigin, RepositionMarker, Scrolling, UpdateSet,
+    Position, PostUpdateSet, PresentedOrigin, RepositionMarker, Scrolling, SelectedVirtualMarker,
+    UpdateSet,
 };
 use crate::events::Event;
 use crate::manager::window_writer::LANDING_TIMEOUT;
-use crate::manager::{Display, Window};
+use crate::manager::{Display, Window, WindowManager};
 use crate::platform::WinID;
 use crate::types::commands::Side;
 
@@ -453,7 +455,7 @@ fn present_slices(
 fn refresh_slices(
     mut slices: ResMut<Slices>,
     in_view: InView,
-    displays: Query<(Entity, &Display)>,
+    next: NextToCross,
     access: Res<SliceAccess>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
@@ -461,7 +463,8 @@ fn refresh_slices(
         return;
     };
     if *access == SliceAccess::On {
-        renew_kept(screen.0.as_mut(), &mut slices, &in_view, &displays);
+        let next = next.find(&in_view);
+        renew_kept(screen.0.as_mut(), &mut slices, &in_view, &next);
     }
     let Slices {
         showing,
@@ -623,14 +626,14 @@ type InView<'w, 's> = Query<'w, 's, &'static Window, (Without<EdgeSlice>, Withou
 
 /// Asks for a new photo of each window in view with a kept photo, unless the
 /// window shows a slice. A new ask calls off one still on its way. A window
-/// in view with no kept photo yet, on a display that shares an edge with
-/// another, gets its first one, as after the engine starts with it tucked:
-/// a swipe could carry it past the edge, where it photographs blank.
+/// in `next`, which a swipe would carry past a shared edge first, gets its
+/// first photo if it has none, as after the engine starts with it tucked:
+/// past the edge it photographs blank.
 fn renew_kept(
     screen: &mut dyn SliceScreen,
     slices: &mut Slices,
     in_view: &InView,
-    displays: &Query<(Entity, &Display)>,
+    next: &[(WinID, EdgeSlice)],
 ) {
     let Slices {
         showing,
@@ -643,16 +646,15 @@ fn renew_kept(
         if showing.iter().any(|(showing, _, _)| *showing == id) {
             continue;
         }
-        let shown = window.shown_frame();
         // A window resized in view, as by maximizing, would otherwise keep
         // a photo whose size no later slice of it matches.
         let slice = match kept.get(&id) {
             Some((kept, _)) => EdgeSlice {
-                size: shown.size(),
+                size: window.shown_frame().size(),
                 ..*kept
             },
-            None => match first_slice(shown, displays) {
-                Some(slice) => slice,
+            None => match next.iter().find(|(next, _)| *next == id) {
+                Some((_, slice)) => *slice,
                 None => continue,
             },
         };
@@ -671,26 +673,76 @@ fn renew_kept(
     }
 }
 
-/// The slice that a first photo of a window showing `shown` is for, when the
-/// display it shows on shares an edge with another display. Only its size
-/// and display matter until the window crosses: a photo shows the whole
-/// window.
-fn first_slice(shown: IRect, displays: &Query<(Entity, &Display)>) -> Option<EdgeSlice> {
-    let (entity, own) = displays
-        .iter()
-        .map(|(entity, display)| (entity, display.bounds()))
-        .find(|(_, bounds)| bounds.contains(shown.center()))?;
-    let shares_edge = displays.iter().any(|(other, display)| {
-        let other_bounds = display.bounds();
-        other != entity
-            && (other_bounds.min.x == own.max.x || other_bounds.max.x == own.min.x)
-            && other_bounds.min.y < own.max.y
-            && other_bounds.max.y > own.min.y
-    });
-    if shares_edge {
-        EdgeSlice::new(shown, own, entity)
-    } else {
-        None
+/// Finds the windows in view that a swipe would carry past a shared edge
+/// first.
+#[derive(SystemParam)]
+struct NextToCross<'w, 's> {
+    strips: Query<'w, 's, (&'static LayoutStrip, &'static ChildOf), With<SelectedVirtualMarker>>,
+    displays: Query<'w, 's, (Entity, &'static Display)>,
+    window_manager: Res<'w, WindowManager>,
+}
+
+impl NextToCross<'_, '_> {
+    /// On the strip each display shows, the windows of the last column in
+    /// view when the display shares its east edge with another display, and
+    /// of the first one when it shares its west edge. Each comes with the
+    /// slice a first photo of it is for. Until the window crosses, only the
+    /// slice's size and display matter: a photo shows the whole window.
+    fn find(&self, in_view: &InView) -> Vec<(WinID, EdgeSlice)> {
+        let mut found = Vec::new();
+        for (strip, child_of) in &self.strips {
+            let Ok((display, own)) = self.displays.get(child_of.parent()) else {
+                continue;
+            };
+            if !self
+                .window_manager
+                .active_display_space(own.id())
+                .is_ok_and(|space| space == strip.id())
+            {
+                continue;
+            }
+            let bounds = own.bounds();
+            let shares = |touches: fn(IRect, IRect) -> bool| {
+                self.displays.iter().any(|(other, other_display)| {
+                    let other_bounds = other_display.bounds();
+                    other != display
+                        && touches(bounds, other_bounds)
+                        && other_bounds.min.y < bounds.max.y
+                        && other_bounds.max.y > bounds.min.y
+                })
+            };
+            let east = shares(|own, other| other.min.x == own.max.x);
+            let west = shares(|own, other| other.max.x == own.min.x);
+            if !east && !west {
+                continue;
+            }
+            let columns = strip
+                .columns()
+                .filter_map(|column| {
+                    let windows = column
+                        .window_iter()
+                        .map(|entity| in_view.get(entity).ok())
+                        .collect::<Option<Vec<_>>>()?;
+                    windows
+                        .iter()
+                        .any(|window| !window.shown_frame().intersect(bounds).is_empty())
+                        .then_some(windows)
+                })
+                .collect::<Vec<_>>();
+            let ends = [
+                west.then(|| columns.first()).flatten(),
+                east.then(|| columns.last()).flatten(),
+            ];
+            for window in ends.into_iter().flatten().flatten() {
+                if found.iter().any(|(id, _)| *id == window.id()) {
+                    continue;
+                }
+                if let Some(slice) = EdgeSlice::new(window.shown_frame(), bounds, display) {
+                    found.push((window.id(), slice));
+                }
+            }
+        }
+        found
     }
 }
 
@@ -701,7 +753,7 @@ fn renew_kept_on_swipe(
     mut was_swiping: Local<bool>,
     mut slices: ResMut<Slices>,
     in_view: InView,
-    displays: Query<(Entity, &Display)>,
+    next: NextToCross,
     access: Res<SliceAccess>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
@@ -711,7 +763,8 @@ fn renew_kept_on_swipe(
         && *access == SliceAccess::On
         && let Some(mut screen) = screen
     {
-        renew_kept(screen.0.as_mut(), &mut slices, &in_view, &displays);
+        let next = next.find(&in_view);
+        renew_kept(screen.0.as_mut(), &mut slices, &in_view, &next);
     }
     *was_swiping = swiping;
 }

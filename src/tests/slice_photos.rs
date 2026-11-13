@@ -1657,6 +1657,35 @@ fn a_window_in_view_with_no_photo_yet_is_photographed_every_refresh() {
 }
 
 #[test]
+fn only_the_column_beside_the_shared_edge_gets_a_first_photo() {
+    let (mut harness, log) = in_view_without_a_photo(animated_swipes());
+    let others = (0..3)
+        .filter(|id| in_view(harness.mock_state.ax_frame(*id)))
+        .collect::<Vec<_>>();
+    assert!(!others.is_empty(), "another window is in view");
+    let asks = |log: &ScreenLog| {
+        others
+            .iter()
+            .map(|id| asks_for(log, *id).len())
+            .collect::<Vec<_>>()
+    };
+    let before = asks(&log);
+
+    harness.advance(REFRESH);
+    swipe_back(&mut harness, 1);
+
+    assert_eq!(
+        asks(&log),
+        before,
+        "windows {others:?} away from the edge are not photographed"
+    );
+    assert!(
+        asks_for(&log, 3).len() >= 2,
+        "window 3 is photographed at the refresh and the swipe"
+    );
+}
+
+#[test]
 fn a_window_on_a_display_that_shares_no_edge_is_not_photographed_in_view() {
     let (mut harness, log) = laid_out(animated(), Screen::default(), &[], 4, Some(Direction::Last));
 
