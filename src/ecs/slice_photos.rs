@@ -27,10 +27,11 @@ use objc2_core_graphics::CGImage;
 use tracing::{debug, warn};
 
 use crate::config::Config;
+use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{LayoutStrip, lies_mostly_elsewhere};
 use crate::ecs::pacing::{self, SlideHolds};
 use crate::ecs::shared_edge::{
-    EdgeSlice, Hold, PhotoWait, Slide, showing_edge_slices, showing_may_change,
+    EdgeSlice, Hold, PhotoWait, Slide, showing_edge_slices, showing_may_change, shown_in,
 };
 use crate::ecs::systems::{self, AnimationStep, ease_out_factor, ease_step};
 use crate::ecs::{
@@ -680,12 +681,14 @@ struct NextToCross<'w, 's> {
     strips: Query<'w, 's, (&'static LayoutStrip, &'static ChildOf), With<SelectedVirtualMarker>>,
     displays: Query<'w, 's, (Entity, &'static Display)>,
     window_manager: Res<'w, WindowManager>,
+    history: Res<'w, FocusHistory>,
 }
 
 impl NextToCross<'_, '_> {
     /// On the strip each display shows, the windows of the last column in
     /// view when the display shares its east edge with another display, and
-    /// of the first one when it shares its west edge. Each comes with the
+    /// of the first one when it shares its west edge. A tabbed column counts
+    /// only its front tab, which hides the rest. Each comes with the
     /// slice a first photo of it is for. Until the window crosses, only the
     /// slice's size and display matter: a photo shows the whole window.
     fn find(&self, in_view: &InView) -> Vec<(WinID, EdgeSlice)> {
@@ -719,8 +722,8 @@ impl NextToCross<'_, '_> {
             let columns = strip
                 .columns()
                 .filter_map(|column| {
-                    let windows = column
-                        .window_iter()
+                    let windows = shown_in(strip, column, &self.history)
+                        .into_iter()
                         .map(|entity| in_view.get(entity).ok())
                         .collect::<Option<Vec<_>>>()?;
                     windows
