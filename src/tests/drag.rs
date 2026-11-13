@@ -1,6 +1,7 @@
 //! Dragging a tiled window by its title bar into a column or to a new column
 //! (samanyudas/miri#43).
 
+mod drop_width;
 mod part_c;
 
 use std::time::Duration;
