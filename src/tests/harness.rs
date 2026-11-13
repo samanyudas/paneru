@@ -230,6 +230,18 @@ impl TestHarness {
     }
 
     pub(crate) fn run(&mut self, commands: Vec<Event>) {
+        if let Some(step) = self
+            .verifiers
+            .keys()
+            .copied()
+            .filter(|step| *step >= commands.len())
+            .min()
+        {
+            panic!(
+                "verifier at iteration {step} never runs: there are only {} commands",
+                commands.len()
+            );
+        }
         for (iteration, command) in commands.into_iter().enumerate() {
             self.app.world_mut().write_message::<Event>(command);
 
@@ -242,7 +254,7 @@ impl TestHarness {
                 }
             }
 
-            if let Some(verifier) = self.verifiers.get_mut(&iteration) {
+            if let Some(mut verifier) = self.verifiers.remove(&iteration) {
                 verifier(self.app.world_mut(), self.mock_state.clone());
             }
         }
