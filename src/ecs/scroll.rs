@@ -22,7 +22,7 @@ use crate::ecs::layout::{Column, LayoutStrip, strip_content_range};
 use crate::ecs::params::Windows;
 use crate::ecs::systems::AnimationStep;
 use crate::ecs::{
-    ActiveWorkspaceMarker, DockPosition, ManualStripOffset, MissionControlActive,
+    ActiveWorkspaceMarker, DockPosition, FocusedMarker, ManualStripOffset, MissionControlActive,
     NativeFullscreenMarker, Position, PreUpdateSet, RepositionMarker, ScrollInput, Scrolling,
     SelectedVirtualMarker, SendMessageTrigger, SettleEase, UpdateSet,
 };
@@ -338,9 +338,11 @@ fn swipe_gesture(
     window_manager: Res<WindowManager>,
     time: Res<Time>,
     config: Res<Config>,
+    focused: Option<Single<Entity, With<FocusedMarker>>>,
     mut fingers_down: Local<bool>,
     mut commands: Commands,
 ) {
+    let focused = focused.map(|focused| *focused);
     let swipe_sensitivity = config.swipe_sensitivity();
     let mut total_delta = 0.0;
     let mut gesture_delta = 0.0;
@@ -451,6 +453,7 @@ fn swipe_gesture(
         scrolling.origin = scrolling.position;
         scrolling.detent = None;
         scrolling.start = scrolling.landing_focus.take();
+        scrolling.focus_at_start = focused;
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = true;
         scrolling.last_event = time.elapsed();
@@ -502,6 +505,7 @@ fn swipe_gesture(
                 detent: None,
                 origin: f64::from(position.0.x),
                 landing_focus: None,
+                focus_at_start: focused,
                 start: None,
                 fingers_down: *fingers_down,
             });
@@ -1035,7 +1039,7 @@ fn settle_strip(
                     // the end.
                     scroll.landing_focus = Some(window);
                 } else {
-                    focus(window, &windows, &mut commands);
+                    focus(window, strip, &scroll, &windows, &mut commands);
                 }
             }
             target
@@ -1046,7 +1050,7 @@ fn settle_strip(
         if config.options().animation_speed.is_none() {
             position.x = round_px(target);
             if let Some(window) = scroll.landing_focus.take() {
-                focus(window, &windows, &mut commands);
+                focus(window, strip, &scroll, &windows, &mut commands);
             }
             finish(&mut commands);
             continue;
@@ -1070,7 +1074,7 @@ fn settle_strip(
         if progress >= 1.0 {
             position.x = round_px(target);
             if let Some(window) = scroll.landing_focus.take() {
-                focus(window, &windows, &mut commands);
+                focus(window, strip, &scroll, &windows, &mut commands);
             }
             finish(&mut commands);
             continue;
@@ -1113,10 +1117,19 @@ pub(crate) fn settle_curve(progress: f64, slope: f64) -> f64 {
     slope * u * (1.0 - u).powi(2) + u * u * (3.0 - 2.0 * u)
 }
 
-/// Focuses `window`, the window a settle lands on, unless it has focus.
-fn focus(window: Entity, windows: &Windows, commands: &mut Commands) {
+/// Focuses `window`, the window a settle of `strip` lands on, unless it has
+/// focus, or focus has moved during the swipe to a window outside `strip`.
+fn focus(
+    window: Entity,
+    strip: &LayoutStrip,
+    scroll: &Scrolling,
+    windows: &Windows,
+    commands: &mut Commands,
+) {
     let focused = windows.focused().map(|(_, focused)| focused);
-    if focused != Some(window) {
+    let switched_away =
+        focused != scroll.focus_at_start && !focused.is_some_and(|focused| strip.contains(focused));
+    if focused != Some(window) && !switched_away {
         focus_with_verification(window, focused, None, FocusSource::Other, commands);
     }
 }
