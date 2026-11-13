@@ -89,7 +89,7 @@ type WindowDefaultsQueries<'w, 's> = ParamSet<
     's,
     (
         AddedWindowDefaults<'static, 'static>,
-        Query<'static, 'static, &'static WidthRatio, With<FocusedMarker>>,
+        Query<'static, 'static, &'static Bounds, With<FocusedMarker>>,
     ),
 >;
 
@@ -949,9 +949,7 @@ pub(super) fn window_managed_trigger(
         // Re-managing an existing window (e.g. after un-floating it) retains
         // its width under the dynamic rule. Fixed rules keep their old behavior.
         if let Some(width_ratio) = properties.fixed_width_ratio() {
-            let (_, pad_right, _, pad_left) = ctx.config.edge_padding();
-            let padded_width = display_bounds.width() - pad_left - pad_right;
-            let width = round_px(f64::from(padded_width) * width_ratio);
+            let width = round_px(f64::from(display_bounds.width()) * width_ratio);
             let height = display_bounds.height();
             ctx.commands.resize_entity(entity, Size::new(width, height));
         }
@@ -1484,7 +1482,12 @@ pub(super) fn apply_window_defaults(
     overrides: Res<TileOverrides>,
     mut commands: Commands,
 ) {
-    let focused_ratio = windows.p1().single().ok().map(|ratio| ratio.0);
+    let tiling_width = f64::from(active_display.actual_bounds(&config).width());
+    let focused_ratio = windows
+        .p1()
+        .single()
+        .ok()
+        .map(|bounds| f64::from(bounds.0.x) / tiling_width);
     for (entity, ref mut window, mut position, mut bounds, mut width_ratio, child) in windows.p0() {
         let Ok((_, app)) = apps.get(child.parent()) else {
             continue;
@@ -1521,11 +1524,13 @@ pub(super) fn apply_window_defaults(
         }
 
         // Apply configured width AFTER update_frame so it isn't overwritten.
-        // WidthRatio and commit_window_frame use the display's raw bounds.
+        // A rule's width is a share of the tiling area, as the preset widths
+        // are, while WidthRatio and commit_window_frame keep the display's raw
+        // bounds. (miri#464)
         // Safe during init: this only resizes, it doesn't reposition, so a
         // window on an inactive display stays put.
         if let Some(width) = properties.width_ratio(focused_ratio) {
-            let new_width = round_px(display_width * width);
+            let new_width = round_px(tiling_width * width);
             let height = window.frame().height();
             window.resize(Size::new(new_width, height));
             // Re-read the actual OS size: the app may enforce a minimum width

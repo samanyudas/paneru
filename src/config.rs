@@ -1705,7 +1705,7 @@ pub struct WindowParams {
     pub vertical_padding: Option<i32>,
     pub horizontal_padding: Option<i32>,
     pub dont_focus: Option<bool>,
-    /// A positive initial width ratio relative to the display width, or
+    /// A positive initial width ratio relative to the display's tiling area, or
     /// `"complement_focused"` to fill the width left by the focused window.
     /// Fixed ratios above 1.0 create an oversized, horizontally scrollable window.
     /// Overrides the default column width when the window is first managed.
