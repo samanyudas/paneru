@@ -10,13 +10,14 @@ use std::time::Duration;
 use bevy::app::{App, PostUpdate, Update};
 use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _};
 use bevy::ecs::entity::Entity;
+use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Has, Without};
+use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::common_conditions::{any_with_component, resource_changed};
 use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
 use bevy::ecs::system::{
-    Commands, In, IntoSystem as _, Local, NonSend, NonSendMut, Query, Res, ResMut,
+    Commands, In, IntoSystem as _, Local, NonSend, NonSendMut, Query, Res, ResMut, SystemParam,
 };
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
@@ -26,18 +27,20 @@ use objc2_core_graphics::CGImage;
 use tracing::{debug, warn};
 
 use crate::config::Config;
-use crate::ecs::layout::lies_mostly_elsewhere;
+use crate::ecs::focus::FocusHistory;
+use crate::ecs::layout::{LayoutStrip, lies_mostly_elsewhere};
 use crate::ecs::pacing::{self, SlideHolds};
 use crate::ecs::shared_edge::{
-    EdgeSlice, Hold, PhotoWait, Slide, showing_edge_slices, showing_may_change,
+    EdgeSlice, Hold, PhotoWait, Slide, showing_edge_slices, showing_may_change, shown_in,
 };
 use crate::ecs::systems::{self, AnimationStep, ease_out_factor, ease_step};
 use crate::ecs::{
-    Position, PostUpdateSet, PresentedOrigin, RepositionMarker, Scrolling, UpdateSet,
+    Position, PostUpdateSet, PresentedOrigin, RepositionMarker, Scrolling, SelectedVirtualMarker,
+    UpdateSet,
 };
 use crate::events::Event;
 use crate::manager::window_writer::LANDING_TIMEOUT;
-use crate::manager::{Display, Window};
+use crate::manager::{Display, Window, WindowManager};
 use crate::platform::WinID;
 use crate::types::commands::Side;
 
@@ -251,10 +254,10 @@ struct Slices {
     /// photo instead, because it may have changed while on screen, and macOS
     /// photographs a tucked window blank, so no later refresh could repair it.
     kept: BTreeMap<WinID, (EdgeSlice, Photo)>,
-    /// New photos on their way of windows in view with a kept photo. A swipe
-    /// tucks a window the moment it crosses the edge, with no time for a
-    /// photo, so its kept photo is renewed while it is in view: when a swipe
-    /// starts, and every [`REFRESH`].
+    /// New photos on their way of windows in view. A swipe tucks a window
+    /// the moment it crosses the edge, with no time for a photo, so its kept
+    /// photo is renewed, or its first one taken, while it is in view: when a
+    /// swipe starts, and every [`REFRESH`].
     renewing: BTreeMap<WinID, Renewal>,
     /// The generation of the latest photo asked for, so a photo of an
     /// earlier ask is told apart.
@@ -384,7 +387,12 @@ fn present_slices(
         kept.clear();
         Vec::new()
     };
-    renewing.retain(|id, _| kept.contains_key(id));
+    // A first photo is on its way for a window with none kept yet.
+    if *access == SliceAccess::On {
+        renewing.retain(|id, _| windows.iter().any(|(window, _)| window.id() == *id));
+    } else {
+        renewing.clear();
+    }
     let mut before = std::mem::take(shown)
         .into_iter()
         .map(|(id, slice, photo)| (id, (slice, photo)))
@@ -448,12 +456,17 @@ fn present_slices(
 fn refresh_slices(
     mut slices: ResMut<Slices>,
     in_view: InView,
+    next: NextToCross,
+    access: Res<SliceAccess>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
     let Some(mut screen) = screen else {
         return;
     };
-    renew_kept(screen.0.as_mut(), &mut slices, &in_view);
+    if *access == SliceAccess::On {
+        let next = next.find(&in_view);
+        renew_kept(screen.0.as_mut(), &mut slices, &in_view, &next);
+    }
     let Slices {
         showing,
         generation,
@@ -613,8 +626,16 @@ fn receive_photos(
 type InView<'w, 's> = Query<'w, 's, &'static Window, (Without<EdgeSlice>, Without<Slide>)>;
 
 /// Asks for a new photo of each window in view with a kept photo, unless the
-/// window shows a slice. A new ask calls off one still on its way.
-fn renew_kept(screen: &mut dyn SliceScreen, slices: &mut Slices, in_view: &InView) {
+/// window shows a slice. A new ask calls off one still on its way. A window
+/// in `next`, which a swipe would carry past a shared edge first, gets its
+/// first photo if it has none, as after the engine starts with it tucked:
+/// past the edge it photographs blank.
+fn renew_kept(
+    screen: &mut dyn SliceScreen,
+    slices: &mut Slices,
+    in_view: &InView,
+    next: &[(WinID, EdgeSlice)],
+) {
     let Slices {
         showing,
         kept,
@@ -623,17 +644,20 @@ fn renew_kept(screen: &mut dyn SliceScreen, slices: &mut Slices, in_view: &InVie
     } = slices;
     for window in in_view {
         let id = window.id();
-        let Some((kept, _)) = kept.get(&id) else {
-            continue;
-        };
         if showing.iter().any(|(showing, _, _)| *showing == id) {
             continue;
         }
         // A window resized in view, as by maximizing, would otherwise keep
         // a photo whose size no later slice of it matches.
-        let slice = EdgeSlice {
-            size: window.shown_frame().size(),
-            ..*kept
+        let slice = match kept.get(&id) {
+            Some((kept, _)) => EdgeSlice {
+                size: window.shown_frame().size(),
+                ..*kept
+            },
+            None => match next.iter().find(|(next, _)| *next == id) {
+                Some((_, slice)) => *slice,
+                None => continue,
+            },
         };
         *generation = generation.wrapping_add(1);
         let ticket = Ticket::default();
@@ -650,6 +674,81 @@ fn renew_kept(screen: &mut dyn SliceScreen, slices: &mut Slices, in_view: &InVie
     }
 }
 
+/// Finds the windows in view that a swipe would carry past a shared edge
+/// first.
+#[derive(SystemParam)]
+struct NextToCross<'w, 's> {
+    strips: Query<'w, 's, (&'static LayoutStrip, &'static ChildOf), With<SelectedVirtualMarker>>,
+    displays: Query<'w, 's, (Entity, &'static Display)>,
+    window_manager: Res<'w, WindowManager>,
+    history: Res<'w, FocusHistory>,
+}
+
+impl NextToCross<'_, '_> {
+    /// On the strip each display shows, the windows of the last column in
+    /// view when the display shares its east edge with another display, and
+    /// of the first one when it shares its west edge. A tabbed column counts
+    /// only its front tab, which hides the rest. Each comes with the
+    /// slice a first photo of it is for. Until the window crosses, only the
+    /// slice's size and display matter: a photo shows the whole window.
+    fn find(&self, in_view: &InView) -> Vec<(WinID, EdgeSlice)> {
+        let mut found = Vec::new();
+        for (strip, child_of) in &self.strips {
+            let Ok((display, own)) = self.displays.get(child_of.parent()) else {
+                continue;
+            };
+            if !self
+                .window_manager
+                .active_display_space(own.id())
+                .is_ok_and(|space| space == strip.id())
+            {
+                continue;
+            }
+            let bounds = own.bounds();
+            let shares = |touches: fn(IRect, IRect) -> bool| {
+                self.displays.iter().any(|(other, other_display)| {
+                    let other_bounds = other_display.bounds();
+                    other != display
+                        && touches(bounds, other_bounds)
+                        && other_bounds.min.y < bounds.max.y
+                        && other_bounds.max.y > bounds.min.y
+                })
+            };
+            let east = shares(|own, other| other.min.x == own.max.x);
+            let west = shares(|own, other| other.max.x == own.min.x);
+            if !east && !west {
+                continue;
+            }
+            let columns = strip
+                .columns()
+                .filter_map(|column| {
+                    let windows = shown_in(strip, column, &self.history)
+                        .into_iter()
+                        .map(|entity| in_view.get(entity).ok())
+                        .collect::<Option<Vec<_>>>()?;
+                    windows
+                        .iter()
+                        .any(|window| !window.shown_frame().intersect(bounds).is_empty())
+                        .then_some(windows)
+                })
+                .collect::<Vec<_>>();
+            let ends = [
+                west.then(|| columns.first()).flatten(),
+                east.then(|| columns.last()).flatten(),
+            ];
+            for window in ends.into_iter().flatten().flatten() {
+                if found.iter().any(|(id, _)| *id == window.id()) {
+                    continue;
+                }
+                if let Some(slice) = EdgeSlice::new(window.shown_frame(), bounds, display) {
+                    found.push((window.id(), slice));
+                }
+            }
+        }
+        found
+    }
+}
+
 /// Renews the kept photos of the windows in view as a swipe or scroll
 /// starts, before it carries any of them past the edge.
 fn renew_kept_on_swipe(
@@ -657,14 +756,18 @@ fn renew_kept_on_swipe(
     mut was_swiping: Local<bool>,
     mut slices: ResMut<Slices>,
     in_view: InView,
+    next: NextToCross,
+    access: Res<SliceAccess>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
     let swiping = scrolls.iter().any(|scrolling| scrolling.is_user_swiping);
     if swiping
         && !*was_swiping
+        && *access == SliceAccess::On
         && let Some(mut screen) = screen
     {
-        renew_kept(screen.0.as_mut(), &mut slices, &in_view);
+        let next = next.find(&in_view);
+        renew_kept(screen.0.as_mut(), &mut slices, &in_view, &next);
     }
     *was_swiping = swiping;
 }
@@ -691,22 +794,24 @@ fn receive_renewal(
     let Some(renewal) = slices.renewing.remove(&window) else {
         return true;
     };
-    let (Ok(taken), Some(kept)) = (result, slices.kept.get_mut(&window)) else {
+    let Ok(taken) = result else {
         debug!("edge slice kept photo not renewed: window {window}");
         return true;
     };
-    let old = kept.1.digest;
-    *kept = (renewal.slice, taken.clone());
+    let old = slices
+        .kept
+        .insert(window, (renewal.slice, taken.clone()))
+        .map(|(_, photo)| photo.digest);
     debug!("edge slice kept photo renewed: window {window}");
     // A slice still showing the old photo, or a swiped one still waiting for
     // its first, or closed because that photo came back blank, as a tucked
     // window's photo does. A window leaving the screen waits for its own
     // newer photo instead.
     let replaces = |photo: &SlicePhoto| match *photo {
-        SlicePhoto::Shown { digest } => digest == old && digest != taken.digest,
+        SlicePhoto::Shown { digest } => Some(digest) == old && digest != taken.digest,
         SlicePhoto::Asked {
             last: Some(last), ..
-        } => last == old && last != taken.digest,
+        } => Some(last) == old && last != taken.digest,
         SlicePhoto::Asked {
             last: None,
             kept_wait,

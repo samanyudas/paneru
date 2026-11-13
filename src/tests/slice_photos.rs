@@ -352,7 +352,11 @@ fn a_showing_slice_gets_a_panel_at_its_place_and_a_photo_of_its_window() {
     let (id, slice) = showing[0];
     assert_eq!(log.borrow().placed, showing, "one panel at the slice");
     assert_eq!(
-        log.borrow().asked.last().map(|(id, crop, _)| (*id, *crop)),
+        log.borrow()
+            .asked
+            .iter()
+            .rfind(|(asked, _, _)| *asked == id)
+            .map(|(id, crop, _)| (*id, *crop)),
         Some((id, slice.in_window)),
         "a photo of window 3 for its slice"
     );
@@ -1593,6 +1597,198 @@ fn a_window_in_view_with_a_kept_photo_is_photographed_every_refresh() {
         asks_for(&log, 3).len() > asks,
         "window 3 is photographed while in view"
     );
+}
+
+/// Window 3 rests in view beside the display to the right without ever
+/// having had a photo, as after the engine starts with it tucked and a
+/// swipe brings it in.
+fn in_view_without_a_photo(config: Config) -> (TestHarness, ScreenLog) {
+    let (harness, log) = laid_out(
+        config,
+        Screen::default(),
+        &[RIGHT],
+        4,
+        Some(Direction::Last),
+    );
+    let rest = harness.mock_state.ax_frame(3);
+    assert!(in_view(rest), "window 3 rests in view at {rest:?}");
+    assert!(log.borrow().painted.is_empty(), "no photo arrived");
+    (harness, log)
+}
+
+/// After a restart, Sam's Helium window had no kept photo, so swipes never
+/// renewed one and it crossed the edge as wallpaper (#451).
+#[test]
+fn a_window_in_view_with_no_photo_yet_swipes_past_the_edge_under_its_first_photo() {
+    let (mut harness, log) = in_view_without_a_photo(animated_swipes());
+    let asks = asks_for(&log, 3).len();
+
+    swipe_back(&mut harness, 1);
+    assert!(
+        asks_for(&log, 3).len() > asks,
+        "window 3 is photographed as the swipe starts"
+    );
+    arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(9)));
+
+    swipe_back(&mut harness, 30);
+    harness.advance(SETTLE);
+    assert!(
+        showing(harness.world()).iter().any(|(id, _)| *id == 3),
+        "window 3 shows a slice"
+    );
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(9))),
+        "its slice shows its first photo"
+    );
+}
+
+#[test]
+fn a_first_photo_that_arrives_after_the_window_crossed_reopens_its_slice() {
+    let (mut harness, log) = in_view_without_a_photo(animated_swipes());
+    swipe_back(&mut harness, 1);
+    let first = last_ask(&log, 3);
+
+    swipe_back(&mut harness, 30);
+    harness.advance(SETTLE);
+    let tucked = last_ask(&log, 3);
+    assert_ne!(tucked, first, "the slice of window 3 asks its own photo");
+    arrive(&mut harness, 3, tucked, Err(PhotoError::Blank));
+    assert!(
+        !placed_ids(&log).contains(&3),
+        "a blank photo closes the panel of window 3"
+    );
+
+    arrive(&mut harness, 3, first, Ok(photo(9)));
+    assert!(placed_ids(&log).contains(&3), "the first photo reopens it");
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(9))),
+        "its slice shows the first photo"
+    );
+}
+
+/// Windows 2 and 3 stacked in the last column, in view beside the display
+/// to the right, neither with a photo yet.
+fn stacked_in_view_without_a_photo(config: Config) -> (TestHarness, ScreenLog) {
+    let (mut harness, log) = in_view_without_a_photo(config);
+    harness.run(vec![command(Operation::Stack(Side::West))]);
+    harness.advance(SETTLE);
+    for id in [2, 3] {
+        let rest = harness.mock_state.ax_frame(id);
+        assert!(in_view(rest), "window {id} rests in view at {rest:?}");
+    }
+    (harness, log)
+}
+
+#[test]
+fn each_window_of_a_stack_beside_the_shared_edge_gets_a_first_photo() {
+    let (mut harness, log) = stacked_in_view_without_a_photo(animated());
+    let asks = [asks_for(&log, 2).len(), asks_for(&log, 3).len()];
+
+    harness.advance(REFRESH);
+
+    assert!(
+        asks_for(&log, 2).len() > asks[0],
+        "window 2 is photographed"
+    );
+    assert!(
+        asks_for(&log, 3).len() > asks[1],
+        "window 3 is photographed"
+    );
+}
+
+#[test]
+fn only_the_front_tab_beside_the_shared_edge_gets_a_first_photo() {
+    let (mut harness, log) = stacked_in_view_without_a_photo(animated());
+    harness.run(vec![command(Operation::ToggleTabbedDisplay)]);
+    harness.advance(SETTLE);
+    let asks = [asks_for(&log, 2).len(), asks_for(&log, 3).len()];
+
+    harness.advance(REFRESH);
+
+    assert_eq!(
+        asks_for(&log, 2).len(),
+        asks[0],
+        "window 2, a tab behind window 3, is not photographed"
+    );
+    assert!(
+        asks_for(&log, 3).len() > asks[1],
+        "window 3, the front tab, is photographed"
+    );
+}
+
+#[test]
+fn a_window_in_view_with_no_photo_yet_is_photographed_every_refresh() {
+    let (mut harness, log) = in_view_without_a_photo(animated());
+    let asks = asks_for(&log, 3).len();
+
+    harness.advance(REFRESH);
+
+    assert!(
+        asks_for(&log, 3).len() > asks,
+        "window 3 is photographed while in view"
+    );
+}
+
+#[test]
+fn the_first_column_in_view_beside_a_shared_west_edge_gets_a_first_photo() {
+    let (mut harness, log) = laid_out(
+        animated(),
+        Screen::default(),
+        &[LEFT],
+        4,
+        Some(Direction::First),
+    );
+    let rest = harness.mock_state.ax_frame(0);
+    assert!(in_view(rest), "window 0 rests in view at {rest:?}");
+    assert!(log.borrow().painted.is_empty(), "no photo arrived");
+    let asks = asks_for(&log, 0).len();
+
+    harness.advance(REFRESH);
+
+    assert!(
+        asks_for(&log, 0).len() > asks,
+        "window 0 is photographed while in view"
+    );
+}
+
+#[test]
+fn only_the_column_beside_the_shared_edge_gets_a_first_photo() {
+    let (mut harness, log) = in_view_without_a_photo(animated_swipes());
+    let others = (0..3)
+        .filter(|id| in_view(harness.mock_state.ax_frame(*id)))
+        .collect::<Vec<_>>();
+    assert!(!others.is_empty(), "another window is in view");
+    let asks = |log: &ScreenLog| {
+        others
+            .iter()
+            .map(|id| asks_for(log, *id).len())
+            .collect::<Vec<_>>()
+    };
+    let before = asks(&log);
+
+    harness.advance(REFRESH);
+    swipe_back(&mut harness, 1);
+
+    assert_eq!(
+        asks(&log),
+        before,
+        "windows {others:?} away from the edge are not photographed"
+    );
+    assert!(
+        asks_for(&log, 3).len() >= 2,
+        "window 3 is photographed at the refresh and the swipe"
+    );
+}
+
+#[test]
+fn a_window_on_a_display_that_shares_no_edge_is_not_photographed_in_view() {
+    let (mut harness, log) = laid_out(animated(), Screen::default(), &[], 4, Some(Direction::Last));
+
+    harness.advance(REFRESH * 2);
+
+    assert_eq!(log.borrow().asked, vec![], "no window is photographed");
 }
 
 #[test]

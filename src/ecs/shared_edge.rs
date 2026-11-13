@@ -297,6 +297,21 @@ fn back_to_front(strip: &LayoutStrip, column: &Column, history: &FocusHistory) -
     order
 }
 
+/// The windows of `column` that show on screen, back to front: each window
+/// of a stack, but only the front tab of a tabbed one, which hides the rest.
+pub(crate) fn shown_in(
+    strip: &LayoutStrip,
+    column: &Column,
+    history: &FocusHistory,
+) -> Vec<Entity> {
+    let order = back_to_front(strip, column, history);
+    if order.iter().any(|top| strip.is_tabbed_display(*top)) {
+        order.last().copied().into_iter().collect()
+    } else {
+        order
+    }
+}
+
 /// `back_to_front` with each slice cut where a window in front of it begins,
 /// and without the slices that leaves empty. A window in front covers its
 /// slice from its top down, as each one reaches the column bottom.
