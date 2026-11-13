@@ -1654,9 +1654,8 @@ fn a_first_photo_that_arrives_after_the_window_crossed_reopens_its_slice() {
     let tucked = last_ask(&log, 3);
     assert_ne!(tucked, first, "the slice of window 3 asks its own photo");
     arrive(&mut harness, 3, tucked, Err(PhotoError::Blank));
-    assert_eq!(
-        panel_photo(&log, 3),
-        None,
+    assert!(
+        !placed_ids(&log).contains(&3),
         "a blank photo closes the panel of window 3"
     );
 
