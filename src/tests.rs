@@ -1,3 +1,4 @@
+mod app_quit;
 mod column_moves;
 mod crossing_focus;
 mod display;
