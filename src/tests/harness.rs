@@ -230,6 +230,18 @@ impl TestHarness {
     }
 
     pub(crate) fn run(&mut self, commands: Vec<Event>) {
+        if let Some(step) = self
+            .verifiers
+            .keys()
+            .copied()
+            .filter(|step| *step >= commands.len())
+            .min()
+        {
+            panic!(
+                "verifier at iteration {step} never runs: there are only {} commands",
+                commands.len()
+            );
+        }
         for (iteration, command) in commands.into_iter().enumerate() {
             self.app.world_mut().write_message::<Event>(command);
 
