@@ -475,7 +475,33 @@ mod tests {
         CGImageAlphaInfo,
     };
 
-    use super::{blank, pixels};
+    use bevy::math::IVec2;
+    use objc2_screen_capture_kit::SCStreamConfiguration;
+
+    use super::{blank, configuration, pixels};
+
+    /// A source rectangle makes `ScreenCaptureKit` leave out the part of a
+    /// window off screen, so every photo of a tucked window, which shows 1
+    /// point, came back blank (#451).
+    #[test]
+    fn a_photo_asks_for_the_whole_window_with_no_source_rectangle() {
+        let asked = configuration(IVec2::new(2560, 1410), 2.0);
+        // SAFETY: plain property reads of configurations this test owns.
+        let (rect, default, width, height) = unsafe {
+            (
+                asked.sourceRect(),
+                SCStreamConfiguration::new().sourceRect(),
+                asked.width(),
+                asked.height(),
+            )
+        };
+        assert_eq!(rect, default, "the source rectangle is left at its default");
+        assert_eq!(
+            (width, height),
+            (5120, 2820),
+            "the whole window at 2 pixels per point"
+        );
+    }
 
     /// A clear 64 by 48 photo with `width` by `height` pixels drawn opaque
     /// from its corner.
