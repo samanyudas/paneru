@@ -352,7 +352,11 @@ fn a_showing_slice_gets_a_panel_at_its_place_and_a_photo_of_its_window() {
     let (id, slice) = showing[0];
     assert_eq!(log.borrow().placed, showing, "one panel at the slice");
     assert_eq!(
-        log.borrow().asked.last().map(|(id, crop, _)| (*id, *crop)),
+        log.borrow()
+            .asked
+            .iter()
+            .rfind(|(asked, _, _)| *asked == id)
+            .map(|(id, crop, _)| (*id, *crop)),
         Some((id, slice.in_window)),
         "a photo of window 3 for its slice"
     );
@@ -1593,6 +1597,72 @@ fn a_window_in_view_with_a_kept_photo_is_photographed_every_refresh() {
         asks_for(&log, 3).len() > asks,
         "window 3 is photographed while in view"
     );
+}
+
+/// Window 3 rests in view beside the display to the right without ever
+/// having had a photo, as after the engine starts with it tucked and a
+/// swipe brings it in.
+fn in_view_without_a_photo(config: Config) -> (TestHarness, ScreenLog) {
+    let (harness, log) = laid_out(
+        config,
+        Screen::default(),
+        &[RIGHT],
+        4,
+        Some(Direction::Last),
+    );
+    let rest = harness.mock_state.ax_frame(3);
+    assert!(in_view(rest), "window 3 rests in view at {rest:?}");
+    assert!(log.borrow().painted.is_empty(), "no photo arrived");
+    (harness, log)
+}
+
+/// After a restart, Sam's Helium window had no kept photo, so swipes never
+/// renewed one and it crossed the edge as wallpaper (#451).
+#[test]
+fn a_window_in_view_with_no_photo_yet_swipes_past_the_edge_under_its_first_photo() {
+    let (mut harness, log) = in_view_without_a_photo(animated_swipes());
+    let asks = asks_for(&log, 3).len();
+
+    swipe_back(&mut harness, 1);
+    assert!(
+        asks_for(&log, 3).len() > asks,
+        "window 3 is photographed as the swipe starts"
+    );
+    arrive(&mut harness, 3, last_ask(&log, 3), Ok(photo(9)));
+
+    swipe_back(&mut harness, 30);
+    harness.advance(SETTLE);
+    assert!(
+        showing(harness.world()).iter().any(|(id, _)| *id == 3),
+        "window 3 shows a slice"
+    );
+    assert_eq!(
+        log.borrow().painted.last(),
+        Some(&(3, Digest(9))),
+        "its slice shows its first photo"
+    );
+}
+
+#[test]
+fn a_window_in_view_with_no_photo_yet_is_photographed_every_refresh() {
+    let (mut harness, log) = in_view_without_a_photo(animated());
+    let asks = asks_for(&log, 3).len();
+
+    harness.advance(REFRESH);
+
+    assert!(
+        asks_for(&log, 3).len() > asks,
+        "window 3 is photographed while in view"
+    );
+}
+
+#[test]
+fn a_window_on_a_display_that_shares_no_edge_is_not_photographed_in_view() {
+    let (mut harness, log) = laid_out(animated(), Screen::default(), &[], 4, Some(Direction::Last));
+
+    harness.advance(REFRESH * 2);
+
+    assert_eq!(log.borrow().asked, vec![], "no window is photographed");
 }
 
 #[test]
