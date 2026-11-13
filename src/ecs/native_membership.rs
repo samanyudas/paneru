@@ -415,17 +415,13 @@ fn not_initializing(initializing: Option<Res<Initializing>>) -> bool {
     initializing.is_none()
 }
 
-fn held_window(drag: &DragState) -> Option<Entity> {
-    drag.holds_window().then(|| drag.window()).flatten()
-}
-
 fn membership_work(native: Res<NativeMembership>, drag: Res<DragState>, time: Res<Time>) -> bool {
     native.all_spaces
         || native
             .dirty
             .values()
             .any(|dirty| dirty.retry.due(time.elapsed()))
-        || native.held.as_ref().map(|held| held.window) != held_window(&drag)
+        || native.held.as_ref().map(|held| held.window) != drag.held_window()
 }
 
 fn capture_activations(
@@ -465,7 +461,7 @@ fn live_spaces(world: &mut World) -> Vec<(WorkspaceId, Entity)> {
 
 fn reconcile(world: &mut World) {
     world.resource_scope(|world, mut native: Mut<NativeMembership>| {
-        let held = held_window(world.resource::<DragState>());
+        let held = world.resource::<DragState>().held_window();
         if native.held.as_ref().map(|held| held.window) != held {
             if native.held.is_some() {
                 native.release();
