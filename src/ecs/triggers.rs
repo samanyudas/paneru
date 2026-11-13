@@ -31,7 +31,7 @@ use crate::ecs::maximize::FloatingMaximized;
 use crate::ecs::native_membership::{NativeMembership, NativeScope};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
-use crate::ecs::systems::launch_watch;
+use crate::ecs::systems::{app_listing_watch, launch_watch};
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
@@ -591,7 +591,7 @@ pub(super) fn application_event_trigger(
 pub(super) fn dispatch_application_messages(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    applications: Query<(&Application, &Children)>,
+    applications: Query<(Entity, &Application, Option<&Children>)>,
     unmanaged_query: Query<&Unmanaged>,
     floats_when_restored: Query<(), With<FloatsWhenRestored>>,
     config: Res<Config>,
@@ -629,12 +629,13 @@ pub(super) fn dispatch_application_messages(
             }
 
             Event::ApplicationHidden { pid } => {
-                let Some((_, children)) = applications.iter().find(|(app, _)| app.pid() == *pid)
+                let Some((_, _, children)) =
+                    applications.iter().find(|(_, app, _)| app.pid() == *pid)
                 else {
                     warn!("Unable to find with pid {pid}");
                     continue;
                 };
-                for entity in children {
+                for entity in children.into_iter().flatten() {
                     // Only hide windows that are currently managed (no Unmanaged component).
                     // Preserve existing Floating, Minimized, and Hidden states.
                     if unmanaged_query.get(*entity).is_err()
@@ -646,12 +647,16 @@ pub(super) fn dispatch_application_messages(
             }
 
             Event::ApplicationVisible { pid } => {
-                let Some((app, children)) = applications.iter().find(|(app, _)| app.pid() == *pid)
+                let Some((app_entity, app, children)) =
+                    applications.iter().find(|(_, app, _)| app.pid() == *pid)
                 else {
                     warn!("Unable to find application with pid {pid}");
                     continue;
                 };
-                for entity in children {
+                if let Ok(mut entity_commands) = commands.get_entity(app_entity) {
+                    entity_commands.try_insert(app_listing_watch());
+                }
+                for entity in children.into_iter().flatten() {
                     // Only restore windows that were hidden by the app hide/show cycle.
                     // Preserve Floating and Minimized states.
                     if !matches!(unmanaged_query.get(*entity), Ok(Unmanaged::Hidden)) {

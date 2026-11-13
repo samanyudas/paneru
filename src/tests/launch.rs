@@ -357,3 +357,81 @@ fn a_minimized_window_of_a_hidden_app_takes_no_column_when_shown() {
         "the app's other window joins the strip"
     );
 }
+
+const LAUNCHED_HIDDEN_APP: Pid = 12;
+const LAUNCHED_HIDDEN_WINDOW: WinID = 120;
+
+/// Launches an app hidden, as a login item set to hide does. While the app is
+/// hidden, Accessibility reports its window as `AXDialog`, so the engine does
+/// not track it.
+fn launch_hidden(harness: &mut TestHarness) {
+    let state = harness.mock_state.clone();
+    state.spawn_app(LAUNCHED_HIDDEN_APP, "com.example.login-item", "Login item");
+    state.update_app(LAUNCHED_HIDDEN_APP, |app| app.is_hidden = true);
+    state.spawn_window(
+        LAUNCHED_HIDDEN_APP,
+        TEST_WORKSPACE_ID,
+        LAUNCHED_HIDDEN_WINDOW,
+        IRect::new(200, 100, 900, 600),
+    );
+    state.update_window(LAUNCHED_HIDDEN_WINDOW, |window| {
+        window.listed_as_dialog = true;
+    });
+    let world = harness.world();
+    let mut commands = world.commands();
+    let watch = launch_watch("Login item", &mut commands);
+    commands.spawn((
+        watch,
+        BProcess(Box::new(state.create_process(LAUNCHED_HIDDEN_APP))),
+    ));
+    world.flush();
+}
+
+/// Shows the app, as a click on its Dock icon does. macOS sends the show
+/// before the window stops reading as `AXDialog`, so the engine's first look
+/// at the app can still miss the window.
+fn show_launched_hidden_app(harness: &mut TestHarness) {
+    let state = harness.mock_state.clone();
+    state.update_app(LAUNCHED_HIDDEN_APP, |app| app.is_hidden = false);
+    harness.world().write_message(Event::ApplicationVisible {
+        pid: LAUNCHED_HIDDEN_APP,
+    });
+    harness.advance(Duration::from_millis(100));
+    state.update_window(LAUNCHED_HIDDEN_WINDOW, |window| {
+        window.listed_as_dialog = false;
+    });
+}
+
+/// A window of an app that launched hidden joins the strip within 2 seconds
+/// of the show, however long the app stayed hidden. (#431)
+#[test]
+fn a_window_of_an_app_launched_hidden_tiles_when_shown() {
+    for hidden_for in [Duration::from_secs(20), Duration::from_secs(60)] {
+        let mut harness = TestHarness::new().with_windows(1);
+        launch_hidden(&mut harness);
+        harness.advance(hidden_for);
+        assert!(
+            !tiled(&mut harness, LAUNCHED_HIDDEN_WINDOW),
+            "a hidden app's window takes no column"
+        );
+
+        show_launched_hidden_app(&mut harness);
+        harness.advance(Duration::from_millis(1900));
+        assert!(
+            tiled(&mut harness, LAUNCHED_HIDDEN_WINDOW),
+            "after {hidden_for:?} hidden, the window joins the strip within 2 s of the show"
+        );
+    }
+}
+
+/// An app that launches hidden and is never shown takes no column. (#431)
+#[test]
+fn an_app_launched_hidden_and_never_shown_takes_no_column() {
+    let mut harness = TestHarness::new().with_windows(1);
+    launch_hidden(&mut harness);
+    harness.advance(Duration::from_secs(60));
+    assert!(
+        !tiled(&mut harness, LAUNCHED_HIDDEN_WINDOW),
+        "a hidden app's window takes no column"
+    );
+}
