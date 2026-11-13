@@ -400,6 +400,21 @@ pub(crate) fn launch_watch(name: &str, commands: &mut Commands) -> (FreshMarker,
     (FreshMarker, timeout)
 }
 
+/// How long `add_launched_application` lists an app's windows after the app
+/// becomes observable or shows.
+const APP_OBSERVABLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The components that make `add_launched_application` list an app's windows
+/// until it finds one the engine does not track. An app that shows gets them
+/// again: while it was hidden, its window read as `AXDialog`, and it sends no
+/// `AXCreated` when it becomes a standard window. (#431)
+pub(crate) fn app_listing_watch() -> (FreshMarker, Timeout) {
+    (
+        FreshMarker,
+        Timeout::for_component::<FreshMarker>(APP_OBSERVABLE_TIMEOUT),
+    )
+}
+
 type FreshProcess = (
     Entity,
     &'static mut BProcess,
@@ -424,7 +439,6 @@ pub(super) fn add_launched_process(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    const APP_OBSERVABLE_TIMEOUT: Duration = Duration::from_secs(10);
     let mut already_seen = HashSet::new();
 
     for (entity, mut process, children, awaiting) in fresh_processes {
@@ -464,8 +478,7 @@ pub(super) fn add_launched_process(
                 // An app too busy to list its windows in time stays managed, so a
                 // window of it that is created or focused later still enters the
                 // layout.
-                let timeout = Timeout::for_component::<FreshMarker>(APP_OBSERVABLE_TIMEOUT);
-                commands.spawn((app, FreshMarker, timeout, ChildOf(entity)));
+                commands.spawn((app, app_listing_watch(), ChildOf(entity)));
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_remove::<AwaitingAccessibility>();
                 }
