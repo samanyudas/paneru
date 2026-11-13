@@ -692,8 +692,8 @@ fn swipe_settles_when_the_active_display_changes_mid_swipe() {
             "the strip end is on the viewport edge"
         );
         assert_eq!(window_x(harness.world(), 100), TEST_DISPLAY_WIDTH);
-        // The settle focuses the window it lands on, as it always has.
-        assert_focused!(harness.world(), 4);
+        // The switch to the other display during the swipe stands.
+        assert_focused!(harness.world(), 100);
     }
 }
 
@@ -721,6 +721,38 @@ fn swipe_settles_when_the_active_display_changes_before_the_settle() {
             "the strip end is on the viewport edge"
         );
         assert_eq!(window_x(harness.world(), 100), TEST_DISPLAY_WIDTH);
+        assert_focused!(harness.world(), 100);
+    }
+}
+
+/// With window landing, the window a swipe lands on takes focus only once the
+/// strip has landed. A switch to the other display before then stands.
+#[test]
+fn window_landing_swipe_keeps_a_switch_to_the_other_display() {
+    for switch in [false, true] {
+        let config = Config::try_from(
+            "[options]\nanimation_speed = 14\n[swipe.gesture]\nfingers_count = 3\nwindow_landing = true\nhaptics = false\ntarget = \"pointer\"\n[bindings]\n",
+        )
+        .expect("config should parse");
+        let mut harness = two_displays(config, vec![EXT_WORKSPACE_ID]);
+        harness.mock_state.set_cursor_position(POINTER_ON_TEST);
+
+        send(&mut harness, Event::TouchpadDown);
+        move_fingers(&mut harness, 0.008, 40);
+        send(&mut harness, Event::TouchpadUp);
+        harness.advance(ONE_FRAME);
+        if switch {
+            harness.mock_state.focus_window(100);
+            harness.mock_state.os_activate_display(EXT_DISPLAY_ID);
+        }
+        harness.advance(SETTLE);
+
+        assert!(!is_scrolling(harness.world()), "the settle has finished");
+        if switch {
+            assert_focused!(harness.world(), 100);
+        } else {
+            assert_focused!(harness.world(), 1);
+        }
     }
 }
 
