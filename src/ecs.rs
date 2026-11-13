@@ -519,6 +519,10 @@ pub struct Scrolling {
     pub origin: f64,
     /// The window a window-landing settle focuses once it lands.
     pub landing_focus: Option<Entity>,
+    /// The focused window when the swipe began. If focus has since left it
+    /// for a window outside the swiped strip, the settle leaves focus there:
+    /// the user chose another window during the swipe.
+    pub focus_at_start: Option<Entity>,
     /// A window in the column a window-landing swipe began on: the focused
     /// one, or the one a caught settle was headed for.
     pub start: Option<Entity>,
@@ -1640,6 +1644,7 @@ mod tests {
                     detent: None,
                     origin: 0.0,
                     landing_focus: None,
+                    focus_at_start: None,
                     start: None,
                     fingers_down: false,
                 });

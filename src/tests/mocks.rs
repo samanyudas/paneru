@@ -123,6 +123,9 @@ pub(crate) struct MockWindowData {
     /// The app has not put the window's current AX element in its window
     /// list yet.
     pub(crate) ax_unlisted: bool,
+    /// The engine rejects the window as not real when it lists the app's
+    /// windows, as when a hidden app's window reads as `AXDialog`.
+    pub(crate) listed_as_dialog: bool,
     /// The app lists the window but does not answer reads of its details in
     /// time, like a window asked while its app's main thread is blocked.
     pub(crate) ax_unanswered: bool,
@@ -204,6 +207,7 @@ impl Default for MockWindowData {
             child_role: false,
             ax_generation: 0,
             ax_unlisted: false,
+            listed_as_dialog: false,
             ax_unanswered: false,
         }
     }
@@ -1984,7 +1988,14 @@ impl MockState {
                     .get(&id)
                     .is_some_and(|w| w.ax_unanswered)
             };
-            let ids = ids();
+            let rejected = |id| {
+                s.inner
+                    .force_read()
+                    .windows
+                    .get(&id)
+                    .is_some_and(|w| w.listed_as_dialog)
+            };
+            let ids: Vec<_> = ids().into_iter().filter(|&id| !rejected(id)).collect();
             WindowList {
                 complete: !ids.iter().any(|&id| unanswered(id)),
                 windows: ids

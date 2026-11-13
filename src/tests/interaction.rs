@@ -869,19 +869,10 @@ fn keyboard_focus_in_same_frame_does_not_stall_later_pages() {
     assert_focused!(h.world(), 3);
 }
 
+/// Fingers that touch the trackpad while the strip still moves stop it.
 #[test]
 #[allow(clippy::float_cmp)]
 fn test_scrolling_stop() {
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Swipe {
-            delta: 0.3,
-            fingers: 3,
-            distance_cm: 0.0,
-        },
-        Event::TouchpadDown,
-    ];
-
     let config: Config = (
         MainOptions {
             swipe_gesture_fingers: Some(3),
@@ -890,18 +881,27 @@ fn test_scrolling_stop() {
         vec![],
     )
         .into();
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
 
-    TestHarness::new()
-        .with_config(config)
-        .with_windows(3)
-        .on_iteration(3, |world, _state| {
-            use crate::ecs::Scrolling;
-            let mut query = world.query::<&Scrolling>();
-            let scroll = query.single(world).unwrap();
-            assert_eq!(scroll.velocity, 0.0);
-            assert!(scroll.is_user_swiping);
-        })
-        .run(commands);
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.3,
+        fingers: 3,
+        distance_cm: 0.0,
+    });
+    h.advance(Duration::from_millis(40));
+    let moving = {
+        let mut query = h.world().query::<&crate::ecs::Scrolling>();
+        query.single(h.world()).unwrap().velocity
+    };
+    assert_ne!(moving, 0.0, "the swipe moves the strip");
+
+    h.world().write_message::<Event>(Event::TouchpadDown);
+    h.advance(Duration::from_millis(20));
+    let mut query = h.world().query::<&crate::ecs::Scrolling>();
+    let scroll = query.single(h.world()).unwrap();
+    assert_eq!(scroll.velocity, 0.0);
+    assert!(scroll.is_user_swiping);
 }
 
 #[test]
@@ -1874,30 +1874,29 @@ fn focus_unmanaged_ignores_floats_from_other_workspaces() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
-            command: Command::Window(Operation::FocusUnmanaged),
-        },
-        Event::Command {
             command: Command::PrintState,
         },
         Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
+            command: Command::Window(Operation::FocusUnmanaged),
+        },
+        Event::Command {
+            command: Command::Window(Operation::FocusUnmanaged),
         },
     ];
 
     harness
-        .on_iteration(2, |world, _state| {
+        .on_iteration(1, |world, _state| {
             let off_workspace_float = find_window_entity(99, world);
             world
                 .entity_mut(off_workspace_float)
                 .insert(Unmanaged::Floating);
-            assert_focused!(world, 0);
         })
-        .on_iteration(3, |world, _state| {
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 0);
             let active_float = find_window_entity(0, world);
             world.entity_mut(active_float).insert(Unmanaged::Floating);
-            assert_focused!(world, 0);
         })
-        .on_iteration(4, |world, _state| {
+        .on_iteration(3, |world, _state| {
             assert_focused!(world, 0);
         })
         .run(commands);

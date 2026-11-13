@@ -896,8 +896,8 @@ impl Config {
             .unwrap_or(0.05)
     }
 
-    /// The share of the display width that a window opening while the engine
-    /// runs starts at, when the option holds a ratio above 0 and up to 1.
+    /// The share of the display's tiling area that a window opening while the
+    /// engine runs starts at, when the option holds a ratio above 0 and up to 1.
     /// Without it, such a window keeps the width it opened with.
     pub fn new_window_width(&self) -> Option<f64> {
         self.options()
@@ -1425,8 +1425,8 @@ pub struct MainOptions {
     /// resize commands add or remove. Default: 0.05.
     pub window_resize_step: Option<f64>,
 
-    /// The share of the display width (0.0-1.0) that a window opening while
-    /// the engine runs starts at. A `[windows]` rule's `width` wins. Windows
+    /// The share of the display's tiling area (0.0-1.0) that a window opening
+    /// while the engine runs starts at. A `[windows]` rule's `width` wins. Windows
     /// found when the engine starts keep their widths. Default: none, so a
     /// new window keeps the width it opened with.
     pub new_window_width: Option<f64>,
@@ -1705,7 +1705,7 @@ pub struct WindowParams {
     pub vertical_padding: Option<i32>,
     pub horizontal_padding: Option<i32>,
     pub dont_focus: Option<bool>,
-    /// A positive initial width ratio relative to the display width, or
+    /// A positive initial width ratio relative to the display's tiling area, or
     /// `"complement_focused"` to fill the width left by the focused window.
     /// Fixed ratios above 1.0 create an oversized, horizontally scrollable window.
     /// Overrides the default column width when the window is first managed.

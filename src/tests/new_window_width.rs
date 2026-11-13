@@ -125,6 +125,99 @@ fn the_new_window_width_stays_inside_the_tiling_area() {
     assert_eq!(width(&harness, 2), TEST_DISPLAY_WIDTH - 20);
 }
 
+/// A new column at `new_window_width = 0.5` is as wide as the 0.5 preset
+/// width makes a column, so two of them fit the tiling area side by side.
+/// (miri#460)
+#[test]
+fn a_new_column_at_half_is_as_wide_as_the_half_preset() {
+    let options = MainOptions {
+        new_window_width: Some(0.5),
+        padding_left: Some(4),
+        padding_right: Some(4),
+        ..MainOptions::default()
+    };
+    let mut harness = started((options, vec![]).into());
+    open_window(&mut harness, 2);
+    let new_column = width(&harness, 2);
+
+    harness.run(vec![crate::events::Event::Command {
+        command: crate::commands::Command::Window(crate::commands::Operation::SetWidth(0.5)),
+    }]);
+    harness.advance(Duration::from_secs(2));
+
+    assert_eq!(new_column, width(&harness, 2));
+    assert!(2 * new_column <= TEST_DISPLAY_WIDTH - 8);
+}
+
+fn padded(rules: Vec<WindowParams>) -> Config {
+    let options = MainOptions {
+        padding_left: Some(4),
+        padding_right: Some(4),
+        ..MainOptions::default()
+    };
+    (options, rules).into()
+}
+
+fn half_width_rule() -> WindowParams {
+    let mut rule = WindowParams::new("^Window 2$", None);
+    rule.width = Some(InitialWindowWidth::Ratio(0.5));
+    rule
+}
+
+fn run_window_command(harness: &mut TestHarness, operation: crate::commands::Operation) {
+    harness.run(vec![crate::events::Event::Command {
+        command: crate::commands::Command::Window(operation),
+    }]);
+    harness.advance(Duration::from_secs(2));
+}
+
+/// The width the 0.5 preset gives the focused column.
+fn half_preset_width(harness: &mut TestHarness, id: WinID) -> i32 {
+    run_window_command(harness, crate::commands::Operation::SetWidth(0.5));
+    width(harness, id)
+}
+
+/// A new column under a `width = 0.5` rule is as wide as the 0.5 preset
+/// makes a column, so two of them fit the tiling area side by side.
+/// (miri#464)
+#[test]
+fn a_half_width_rule_is_as_wide_as_the_half_preset() {
+    let mut harness = started(padded(vec![half_width_rule()]));
+    open_window(&mut harness, 2);
+    let ruled = width(&harness, 2);
+
+    assert_eq!(ruled, half_preset_width(&mut harness, 2));
+    assert!(2 * ruled <= TEST_DISPLAY_WIDTH - 8);
+}
+
+/// A window under a `width = 0.5` rule that the user floats and tiles again
+/// gets the same width as when it opened. (miri#464)
+#[test]
+fn a_half_width_rule_window_tiled_again_is_as_wide_as_the_half_preset() {
+    let mut harness = started(padded(vec![half_width_rule()]));
+    open_window(&mut harness, 2);
+    run_window_command(&mut harness, crate::commands::Operation::Manage);
+    run_window_command(&mut harness, crate::commands::Operation::Manage);
+    let tiled_again = width(&harness, 2);
+
+    assert_eq!(tiled_again, half_preset_width(&mut harness, 2));
+}
+
+/// A `complement_focused` window beside a column at the 0.5 preset fills the
+/// rest of the tiling area, so the two fit side by side. (miri#464)
+#[test]
+fn a_complement_rule_fills_the_tiling_area_beside_the_focused_column() {
+    let mut rule = WindowParams::new("^Window 2$", None);
+    rule.width = Some(InitialWindowWidth::Mode(
+        crate::config::InitialWindowWidthMode::ComplementFocused,
+    ));
+    let mut harness = started(padded(vec![rule]));
+    let focused = half_preset_width(&mut harness, 0);
+    open_window(&mut harness, 2);
+
+    assert_eq!(focused + width(&harness, 2), TEST_DISPLAY_WIDTH - 8);
+}
+
 #[test]
 fn without_the_option_a_new_window_keeps_its_width() {
     let mut harness = started(Config::default());

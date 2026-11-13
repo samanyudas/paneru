@@ -149,8 +149,10 @@ fn new_window_starts_full_width_after_full_width_focus() {
         ]);
 }
 
+/// A rule's width is a share of the tiling area inside the edge padding, as
+/// the preset widths are. (miri#464)
 #[test]
-fn configured_width_uses_raw_display_bounds_with_edge_padding() {
+fn configured_width_uses_the_tiling_area_inside_edge_padding() {
     let options = MainOptions {
         padding_left: Some(20),
         padding_right: Some(30),
@@ -169,14 +171,14 @@ fn configured_width_uses_raw_display_bounds_with_edge_padding() {
             world.trigger(SpawnWindowTrigger(vec![window]));
         })
         .on_iteration(1, |world, _state| {
-            assert_window_size!(world, 1, TEST_DISPLAY_WIDTH / 2, 748);
-            let mut query = world.query::<(&crate::manager::Window, &crate::ecs::WidthRatio)>();
-            let ratio = query
-                .iter(world)
-                .find_map(|(window, ratio)| (window.id() == 1).then_some(ratio.0));
-            assert_eq!(ratio, Some(0.5));
+            assert_window_size!(world, 1, (TEST_DISPLAY_WIDTH - 50) / 2, 748);
         })
-        .run(vec![Event::MenuOpened { window_id: 0 }]);
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
 }
 
 #[test]
@@ -1066,18 +1068,25 @@ fn test_window_can_resize_to_two_display_widths_and_scroll() {
 /// window just like the interactive `Operation::SetWidth` path, instead of only
 /// storing a `WidthRatio` that nothing consumes and the next bounds sync
 /// overwrites from the live frame.
+#[cfg(feature = "lua")]
 #[test]
 fn test_lua_set_width_layout_op_resizes_the_focused_window() {
     use crate::types::windowset::LayoutOp;
 
     const VIEWPORT_HEIGHT: i32 = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT;
 
-    let commands = vec![Event::Command {
-        command: Command::Layout(vec![LayoutOp::SetWidth {
-            window: 0,
-            ratio: 0.5,
-        }]),
-    }];
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Layout(vec![LayoutOp::SetWidth {
+                window: 0,
+                ratio: 0.5,
+            }]),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
 
     TestHarness::new()
         .with_windows(1)

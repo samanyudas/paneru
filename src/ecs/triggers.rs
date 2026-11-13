@@ -31,7 +31,7 @@ use crate::ecs::maximize::FloatingMaximized;
 use crate::ecs::native_membership::{NativeMembership, NativeScope};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
-use crate::ecs::systems::launch_watch;
+use crate::ecs::systems::{app_listing_watch, launch_watch};
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
@@ -89,7 +89,7 @@ type WindowDefaultsQueries<'w, 's> = ParamSet<
     's,
     (
         AddedWindowDefaults<'static, 'static>,
-        Query<'static, 'static, &'static WidthRatio, With<FocusedMarker>>,
+        Query<'static, 'static, &'static Bounds, With<FocusedMarker>>,
     ),
 >;
 
@@ -591,7 +591,7 @@ pub(super) fn application_event_trigger(
 pub(super) fn dispatch_application_messages(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    applications: Query<(&Application, &Children)>,
+    applications: Query<(Entity, &Application, Option<&Children>)>,
     unmanaged_query: Query<&Unmanaged>,
     floats_when_restored: Query<(), With<FloatsWhenRestored>>,
     config: Res<Config>,
@@ -629,12 +629,13 @@ pub(super) fn dispatch_application_messages(
             }
 
             Event::ApplicationHidden { pid } => {
-                let Some((_, children)) = applications.iter().find(|(app, _)| app.pid() == *pid)
+                let Some((_, _, children)) =
+                    applications.iter().find(|(_, app, _)| app.pid() == *pid)
                 else {
                     warn!("Unable to find with pid {pid}");
                     continue;
                 };
-                for entity in children {
+                for entity in children.into_iter().flatten() {
                     // Only hide windows that are currently managed (no Unmanaged component).
                     // Preserve existing Floating, Minimized, and Hidden states.
                     if unmanaged_query.get(*entity).is_err()
@@ -646,12 +647,16 @@ pub(super) fn dispatch_application_messages(
             }
 
             Event::ApplicationVisible { pid } => {
-                let Some((app, children)) = applications.iter().find(|(app, _)| app.pid() == *pid)
+                let Some((app_entity, app, children)) =
+                    applications.iter().find(|(_, app, _)| app.pid() == *pid)
                 else {
                     warn!("Unable to find application with pid {pid}");
                     continue;
                 };
-                for entity in children {
+                if let Ok(mut entity_commands) = commands.get_entity(app_entity) {
+                    entity_commands.try_insert(app_listing_watch());
+                }
+                for entity in children.into_iter().flatten() {
                     // Only restore windows that were hidden by the app hide/show cycle.
                     // Preserve Floating and Minimized states.
                     if !matches!(unmanaged_query.get(*entity), Ok(Unmanaged::Hidden)) {
@@ -944,9 +949,7 @@ pub(super) fn window_managed_trigger(
         // Re-managing an existing window (e.g. after un-floating it) retains
         // its width under the dynamic rule. Fixed rules keep their old behavior.
         if let Some(width_ratio) = properties.fixed_width_ratio() {
-            let (_, pad_right, _, pad_left) = ctx.config.edge_padding();
-            let padded_width = display_bounds.width() - pad_left - pad_right;
-            let width = round_px(f64::from(padded_width) * width_ratio);
+            let width = round_px(f64::from(display_bounds.width()) * width_ratio);
             let height = display_bounds.height();
             ctx.commands.resize_entity(entity, Size::new(width, height));
         }
@@ -1479,7 +1482,12 @@ pub(super) fn apply_window_defaults(
     overrides: Res<TileOverrides>,
     mut commands: Commands,
 ) {
-    let focused_ratio = windows.p1().single().ok().map(|ratio| ratio.0);
+    let tiling_width = f64::from(active_display.actual_bounds(&config).width());
+    let focused_ratio = windows
+        .p1()
+        .single()
+        .ok()
+        .map(|bounds| f64::from(bounds.0.x) / tiling_width);
     for (entity, ref mut window, mut position, mut bounds, mut width_ratio, child) in windows.p0() {
         let Ok((_, app)) = apps.get(child.parent()) else {
             continue;
@@ -1516,11 +1524,13 @@ pub(super) fn apply_window_defaults(
         }
 
         // Apply configured width AFTER update_frame so it isn't overwritten.
-        // WidthRatio and commit_window_frame use the display's raw bounds.
+        // A rule's width is a share of the tiling area, as the preset widths
+        // are, while WidthRatio and commit_window_frame keep the display's raw
+        // bounds. (miri#464)
         // Safe during init: this only resizes, it doesn't reposition, so a
         // window on an inactive display stays put.
         if let Some(width) = properties.width_ratio(focused_ratio) {
-            let new_width = round_px(display_width * width);
+            let new_width = round_px(tiling_width * width);
             let height = window.frame().height();
             window.resize(Size::new(new_width, height));
             // Re-read the actual OS size: the app may enforce a minimum width
@@ -1720,18 +1730,18 @@ type ActiveDisplays<'w, 's> =
 /// The width a new window that joins the active strip as a column starts
 /// at, or `None` to leave the width it has. A `[windows]` rule's width, which
 /// `apply_window_defaults` already gave it, wins over `new_window_width`, a
-/// share of `display_width`. Either way the column is no wider than the
-/// display's tiling area, as an app that remembers its size from a larger
-/// display would make it. (miri#410, miri#305)
+/// share of `tiling_width` as the preset widths are, so two half-width columns
+/// fit side by side. Either way the column is no wider than the display's
+/// tiling area, as an app that remembers its size from a larger display would
+/// make it. (miri#410, miri#305, miri#460)
 fn starting_width(
     width: i32,
-    display_width: i32,
     tiling_width: i32,
     new_window_width: Option<f64>,
     rule_sets_width: bool,
 ) -> Option<i32> {
     let wanted = match new_window_width {
-        Some(ratio) if !rule_sets_width => round_px(f64::from(display_width) * ratio),
+        Some(ratio) if !rule_sets_width => round_px(f64::from(tiling_width) * ratio),
         _ => width,
     };
     let starting = wanted.min(tiling_width);
@@ -1771,7 +1781,6 @@ fn size_new_column(
     }
     let width = starting_width(
         frame.width(),
-        display.bounds().width(),
         display.actual_display_bounds(dock, config).width(),
         new_window_width,
         rule_sets_width,
@@ -2566,37 +2575,25 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn a_new_column_starts_at_the_share_of_the_display_width() {
-        assert_eq!(
-            starting_width(380, 2560, 2544, Some(0.5), false),
-            Some(1280)
-        );
-        assert_eq!(
-            starting_width(1500, 2560, 2544, Some(0.5), false),
-            Some(1280)
-        );
-        assert_eq!(starting_width(1280, 2560, 2544, Some(0.5), false), None);
-        assert_eq!(starting_width(333, 1000, 990, Some(1.0 / 3.0), false), None);
+    fn a_new_column_starts_at_the_share_of_the_tiling_area() {
+        assert_eq!(starting_width(380, 2552, Some(0.5), false), Some(1276));
+        assert_eq!(starting_width(1500, 2552, Some(0.5), false), Some(1276));
+        assert_eq!(starting_width(1276, 2552, Some(0.5), false), None);
+        assert_eq!(starting_width(330, 990, Some(1.0 / 3.0), false), None);
     }
 
     #[test]
     fn a_new_column_is_never_wider_than_the_tiling_area() {
-        assert_eq!(
-            starting_width(380, 2560, 2544, Some(1.0), false),
-            Some(2544)
-        );
-        assert_eq!(starting_width(3000, 2560, 2544, None, false), Some(2544));
-        assert_eq!(
-            starting_width(3000, 2560, 2544, Some(0.5), true),
-            Some(2544)
-        );
+        assert_eq!(starting_width(380, 2544, Some(1.0), false), Some(2544));
+        assert_eq!(starting_width(3000, 2544, None, false), Some(2544));
+        assert_eq!(starting_width(3000, 2544, Some(0.5), true), Some(2544));
     }
 
     #[test]
     fn a_rule_width_or_no_option_keeps_the_width_the_window_has() {
-        assert_eq!(starting_width(640, 2560, 2544, Some(0.5), true), None);
-        assert_eq!(starting_width(380, 2560, 2544, None, false), None);
-        assert_eq!(starting_width(2544, 2560, 2544, None, false), None);
+        assert_eq!(starting_width(640, 2544, Some(0.5), true), None);
+        assert_eq!(starting_width(380, 2544, None, false), None);
+        assert_eq!(starting_width(2544, 2544, None, false), None);
     }
 
     #[test]
