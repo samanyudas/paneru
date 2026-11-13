@@ -254,7 +254,7 @@ impl TestHarness {
                 }
             }
 
-            if let Some(verifier) = self.verifiers.get_mut(&iteration) {
+            if let Some(mut verifier) = self.verifiers.remove(&iteration) {
                 verifier(self.app.world_mut(), self.mock_state.clone());
             }
         }
