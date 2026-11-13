@@ -1720,18 +1720,18 @@ type ActiveDisplays<'w, 's> =
 /// The width a new window that joins the active strip as a column starts
 /// at, or `None` to leave the width it has. A `[windows]` rule's width, which
 /// `apply_window_defaults` already gave it, wins over `new_window_width`, a
-/// share of `display_width`. Either way the column is no wider than the
-/// display's tiling area, as an app that remembers its size from a larger
-/// display would make it. (miri#410, miri#305)
+/// share of `tiling_width` as the preset widths are, so two half-width columns
+/// fit side by side. Either way the column is no wider than the display's
+/// tiling area, as an app that remembers its size from a larger display would
+/// make it. (miri#410, miri#305, miri#460)
 fn starting_width(
     width: i32,
-    display_width: i32,
     tiling_width: i32,
     new_window_width: Option<f64>,
     rule_sets_width: bool,
 ) -> Option<i32> {
     let wanted = match new_window_width {
-        Some(ratio) if !rule_sets_width => round_px(f64::from(display_width) * ratio),
+        Some(ratio) if !rule_sets_width => round_px(f64::from(tiling_width) * ratio),
         _ => width,
     };
     let starting = wanted.min(tiling_width);
@@ -1771,7 +1771,6 @@ fn size_new_column(
     }
     let width = starting_width(
         frame.width(),
-        display.bounds().width(),
         display.actual_display_bounds(dock, config).width(),
         new_window_width,
         rule_sets_width,
@@ -2566,37 +2565,25 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn a_new_column_starts_at_the_share_of_the_display_width() {
-        assert_eq!(
-            starting_width(380, 2560, 2544, Some(0.5), false),
-            Some(1280)
-        );
-        assert_eq!(
-            starting_width(1500, 2560, 2544, Some(0.5), false),
-            Some(1280)
-        );
-        assert_eq!(starting_width(1280, 2560, 2544, Some(0.5), false), None);
-        assert_eq!(starting_width(333, 1000, 990, Some(1.0 / 3.0), false), None);
+    fn a_new_column_starts_at_the_share_of_the_tiling_area() {
+        assert_eq!(starting_width(380, 2552, Some(0.5), false), Some(1276));
+        assert_eq!(starting_width(1500, 2552, Some(0.5), false), Some(1276));
+        assert_eq!(starting_width(1276, 2552, Some(0.5), false), None);
+        assert_eq!(starting_width(330, 990, Some(1.0 / 3.0), false), None);
     }
 
     #[test]
     fn a_new_column_is_never_wider_than_the_tiling_area() {
-        assert_eq!(
-            starting_width(380, 2560, 2544, Some(1.0), false),
-            Some(2544)
-        );
-        assert_eq!(starting_width(3000, 2560, 2544, None, false), Some(2544));
-        assert_eq!(
-            starting_width(3000, 2560, 2544, Some(0.5), true),
-            Some(2544)
-        );
+        assert_eq!(starting_width(380, 2544, Some(1.0), false), Some(2544));
+        assert_eq!(starting_width(3000, 2544, None, false), Some(2544));
+        assert_eq!(starting_width(3000, 2544, Some(0.5), true), Some(2544));
     }
 
     #[test]
     fn a_rule_width_or_no_option_keeps_the_width_the_window_has() {
-        assert_eq!(starting_width(640, 2560, 2544, Some(0.5), true), None);
-        assert_eq!(starting_width(380, 2560, 2544, None, false), None);
-        assert_eq!(starting_width(2544, 2560, 2544, None, false), None);
+        assert_eq!(starting_width(640, 2544, Some(0.5), true), None);
+        assert_eq!(starting_width(380, 2544, None, false), None);
+        assert_eq!(starting_width(2544, 2544, None, false), None);
     }
 
     #[test]
