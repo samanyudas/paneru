@@ -1657,6 +1657,28 @@ fn a_window_in_view_with_no_photo_yet_is_photographed_every_refresh() {
 }
 
 #[test]
+fn the_first_column_in_view_beside_a_shared_west_edge_gets_a_first_photo() {
+    let (mut harness, log) = laid_out(
+        animated(),
+        Screen::default(),
+        &[LEFT],
+        4,
+        Some(Direction::First),
+    );
+    let rest = harness.mock_state.ax_frame(0);
+    assert!(in_view(rest), "window 0 rests in view at {rest:?}");
+    assert!(log.borrow().painted.is_empty(), "no photo arrived");
+    let asks = asks_for(&log, 0).len();
+
+    harness.advance(REFRESH);
+
+    assert!(
+        asks_for(&log, 0).len() > asks,
+        "window 0 is photographed while in view"
+    );
+}
+
+#[test]
 fn only_the_column_beside_the_shared_edge_gets_a_first_photo() {
     let (mut harness, log) = in_view_without_a_photo(animated_swipes());
     let others = (0..3)
