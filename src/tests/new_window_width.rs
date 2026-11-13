@@ -125,6 +125,30 @@ fn the_new_window_width_stays_inside_the_tiling_area() {
     assert_eq!(width(&harness, 2), TEST_DISPLAY_WIDTH - 20);
 }
 
+/// A new column at `new_window_width = 0.5` is as wide as the 0.5 preset
+/// width makes a column, so two of them fit the tiling area side by side.
+/// (miri#460)
+#[test]
+fn a_new_column_at_half_is_as_wide_as_the_half_preset() {
+    let options = MainOptions {
+        new_window_width: Some(0.5),
+        padding_left: Some(4),
+        padding_right: Some(4),
+        ..MainOptions::default()
+    };
+    let mut harness = started((options, vec![]).into());
+    open_window(&mut harness, 2);
+    let new_column = width(&harness, 2);
+
+    harness.run(vec![crate::events::Event::Command {
+        command: crate::commands::Command::Window(crate::commands::Operation::SetWidth(0.5)),
+    }]);
+    harness.advance(Duration::from_secs(2));
+
+    assert_eq!(new_column, width(&harness, 2));
+    assert!(2 * new_column <= TEST_DISPLAY_WIDTH - 8);
+}
+
 #[test]
 fn without_the_option_a_new_window_keeps_its_width() {
     let mut harness = started(Config::default());
