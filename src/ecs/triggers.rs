@@ -2241,10 +2241,20 @@ pub(super) fn window_resize_verifier(
                 continue;
             }
         }
+        // A tile restore that got the slot's place and width back but kept
+        // the tile's taller height meets macOS's bottom-edge zone, not an
+        // app applying the size late, so the release starts at once.
+        let kept_tile_height = frame.as_ref().is_ok_and(|frame| {
+            verification
+                .native_resizes
+                .get(entity)
+                .is_ok_and(|start| start.restores_tile() && start.misses_only_height(*frame))
+        });
         // A window still taller than asked for, or of another width, may not
         // have applied the size yet, so it is read again before the size
         // counts as a limit.
         if request.mismatched_since.is_none()
+            && !kept_tile_height
             && frame.as_ref().is_ok_and(|frame| {
                 fuzzy_equal(frame.height(), bounds.0.y) == Ordering::Less
                     || fuzzy_equal(frame.width(), bounds.0.x) != Ordering::Equal
