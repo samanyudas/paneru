@@ -1144,7 +1144,7 @@ pub(super) fn recover_window_handles(
             }
         }
         if !handle_recovered {
-            debug!("Window {window_id} has no new AX element; closing it.");
+            info!("Window {window_id} has no new AX element after its wait; closing it.");
             commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
                 window_id,
                 source: DestroySource::Accessibility { element: None },
@@ -1231,6 +1231,14 @@ pub(super) fn window_destroyed_trigger(
             }
             _ => {}
         }
+        info!(
+            "Closing window {window_id}: {}.",
+            match source {
+                DestroySource::SpaceNotification => "a Space notification with a dead AX element",
+                DestroySource::Accessibility { element: Some(_) } => "its AX element was destroyed",
+                DestroySource::Accessibility { element: None } => "the engine found it gone",
+            }
+        );
 
         let Ok(mut app) = apps.get_mut(parent) else {
             error!("Window {} has no parent!", window.id());
@@ -2050,6 +2058,7 @@ pub(super) fn refresh_configuration_trigger(
 
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
+    windows: Query<&Window>,
     mut workspaces: Query<(Entity, &mut LayoutStrip)>,
     mut focus_history: ResMut<FocusHistory>,
     mut commands: Commands,
@@ -2061,8 +2070,11 @@ pub(super) fn window_removal_trigger(
         .iter_mut()
         .find(|(_, strip)| strip.contains(entity))
     {
-        debug!(
-            "Removing despawned entity {entity} from strip {}",
+        // Every path that stops managing a window ends here, so this line
+        // names each loss even when the path that caused it logs nothing.
+        info!(
+            "Stopped managing window {} (entity {entity}): removed from strip {}.",
+            windows.get(entity).map_or(0, |window| window.id()),
             strip.id()
         );
         strip.remove(entity);

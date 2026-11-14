@@ -14,7 +14,7 @@ use bevy::time::Time;
 use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
 use std::time::Duration;
-use tracing::{Level, debug, error, instrument, warn};
+use tracing::{Level, debug, error, info, instrument, warn};
 
 use super::ActiveDisplayMarker;
 use crate::commands::{Operation, filter_window_operations};
@@ -508,7 +508,7 @@ pub(crate) fn cleanup_unordered_windows(
     for window in windows {
         let window_id = window.id();
         if matches!(window_manager.window_ordered_in(window_id), Ok(false)) && !window.is_alive() {
-            debug!("Window {window_id} is unordered; removing it.");
+            info!("Window {window_id} is ordered out with a dead AX element; removing it.");
             commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
                 window_id,
                 source: DestroySource::Accessibility { element: None },
