@@ -1939,7 +1939,7 @@ fn to_next_display(
     } else {
         commands.reposition_entity(entity, origin);
     }
-    native.placed(arrival.members, arrival.maximized);
+    native.placed(arrival.members, arrival.maximized, false);
     if matches!(move_focus, MoveFocus::Follow) && config.mouse_follows_focus() {
         window_manager.warp_mouse(bounds.center());
     }
