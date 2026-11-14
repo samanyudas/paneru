@@ -495,6 +495,11 @@ pub(crate) fn cleanup_unordered_windows(
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
+    // While the screen is locked, every AX element looks dead, and a wake
+    // orders windows out for a moment as it moves them between displays.
+    if window_manager.screen_locked() {
+        return;
+    }
     let windows = workspaces
         .iter()
         .flat_map(|strip| {

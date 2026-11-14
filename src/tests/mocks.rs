@@ -254,6 +254,8 @@ struct MockStateInner {
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
     unordered_windows: HashSet<WinID>,
+    /// While locked, every AX read from another process fails as an invalid
+    /// element and every app's window list is empty, as on a real lock screen.
     screen_locked: bool,
     dock_frame: Option<crate::manager::DockFrame>,
     /// Windows the app keeps out of its accessibility window list while the
@@ -1671,6 +1673,11 @@ impl MockState {
                     "window {id} role"
                 )));
             }
+            if inner.screen_locked {
+                return Err(crate::errors::Error::Generic(format!(
+                    "window {id} role: invalid element while locked"
+                )));
+            }
             inner
                 .windows
                 .get(&id)
@@ -1953,6 +1960,9 @@ impl MockState {
         let s = self.clone();
         let window_ids = move || {
             let inner = s.inner.force_read();
+            if inner.screen_locked {
+                return Vec::new();
+            }
             inner
                 .windows
                 .values()
