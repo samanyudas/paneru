@@ -412,6 +412,7 @@ impl NativeResizeStart {
                 },
             },
             tile: if tile { Some(frame.size()) } else { self.tile },
+            beside: None,
             ..self
         })
     }
