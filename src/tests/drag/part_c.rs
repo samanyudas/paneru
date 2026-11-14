@@ -791,6 +791,42 @@ fn a_restored_window_an_app_puts_beside_its_slot_returns_before_the_hold_ends() 
     );
 }
 
+/// The app can report the frame beside the slot while the engine still
+/// checks the restored size. The wait for a still frame starts then, so
+/// the slot is written again once the check is done.
+#[test]
+fn a_window_beside_its_slot_while_the_restore_is_checked_returns_before_the_hold_ends() {
+    let mut harness = three_columns();
+    let id = 2;
+    let start = frame(harness.world(), id);
+    let point = Origin::new(grab(start).x, TEST_DISPLAY_HEIGHT - 1);
+    press_and_drag(&mut harness, id, point);
+    release(&mut harness, point);
+    macos_tile(&mut harness, id, IRect::new(683, 20, 1024, 768));
+    let slot = frame(harness.world(), id);
+    let above = IRect::from_corners(slot.min - IVec2::new(0, 8), slot.max - IVec2::new(0, 8));
+    harness
+        .mock_state
+        .update_window(id, |window| window.frame = above);
+    harness
+        .world()
+        .write_message(Event::WindowMoved { window_id: id });
+    let mut shown = above;
+    let mut elapsed = Duration::ZERO;
+    while (shown != slot || elapsed < ms(100)) && elapsed < ms(2000) {
+        harness.advance(FRAME);
+        elapsed += FRAME;
+        harness
+            .mock_state
+            .update_window(id, |window| shown = window.frame);
+    }
+    assert_eq!(shown, slot);
+    assert!(
+        elapsed <= ms(300),
+        "the slot came back {elapsed:?} after the window stopped above it"
+    );
+}
+
 /// A frame beside the slot that a tile then replaces does not keep the
 /// engine writing the slot again while an app holds the tile.
 #[test]
