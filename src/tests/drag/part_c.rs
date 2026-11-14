@@ -4783,3 +4783,27 @@ fn a_dropped_window_an_app_moves_while_it_settles_returns_to_its_column() {
     harness.advance(SETTLE);
     assert_eq!(harness.mock_state.ax_frame(id), slot);
 }
+
+/// #489: an app that moves its tiled window off its column again after each
+/// time the engine puts it back. The engine stops after a few answers and
+/// lets the app keep the place it chose, instead of fighting it without end.
+#[test]
+fn an_app_that_keeps_moving_its_window_off_its_column_gets_a_few_answers() {
+    let mut harness = three_columns();
+    let id = 1;
+    let slot = harness.mock_state.ax_frame(id);
+    let off = slot.min + IVec2::new(150, 0);
+    let mut answers = 0;
+    for _ in 0..10 {
+        harness.mock_state.os_move_window(id, off);
+        harness.advance(ms(60));
+        if harness.mock_state.ax_frame(id).min == slot.min {
+            answers += 1;
+        }
+    }
+    assert!(
+        (1..=3).contains(&answers),
+        "the engine put the window back {answers} times"
+    );
+    assert_eq!(harness.mock_state.ax_frame(id).min, off);
+}

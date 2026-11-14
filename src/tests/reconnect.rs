@@ -880,6 +880,54 @@ fn a_window_macos_carries_with_its_display_stays_where_macos_put_it() {
     assert_eq!(every_strip(harness.world()), before);
 }
 
+/// #489: a small sideways move of the built-in display. macOS carries its
+/// shown windows before the engine reads the new arrangement, and each
+/// carried window's center stays inside the display's old bounds, so the
+/// carry looks like an app's move on the same display. The engine leaves
+/// each window where macOS put it.
+#[test]
+fn a_window_macos_carries_within_its_displays_old_bounds_stays_where_macos_put_it() {
+    let shifted = IRect::from_corners(
+        builtin_bounds().min + IVec2::new(100, 0),
+        builtin_bounds().max + IVec2::new(100, 0),
+    );
+    let mut harness = two_displays_with_parked_columns();
+    let shown: Vec<WinID> = [10, 11, 12, 13, 14, 15]
+        .into_iter()
+        .filter(|&id| {
+            let center = harness.mock_state.ax_frame(id).center();
+            builtin_bounds().contains(center)
+                && builtin_bounds().contains(center + IVec2::new(100, 0))
+        })
+        .collect();
+    assert!(
+        !shown.is_empty(),
+        "a carried window stays inside the old bounds"
+    );
+    harness.world().write_message(Event::DisplayMoved {
+        display_id: BUILTIN,
+    });
+    harness.mock_state.set_display_bounds(BUILTIN, shifted);
+    carry(&harness, &shown, builtin_bounds(), shifted);
+    let carried: Vec<IRect> = shown
+        .iter()
+        .map(|&id| harness.mock_state.ax_frame(id))
+        .collect();
+    for &id in &shown {
+        harness
+            .world()
+            .write_message(Event::WindowMoved { window_id: id });
+    }
+    harness.advance(Duration::from_millis(100));
+    for (&id, &frame) in shown.iter().zip(&carried) {
+        assert_eq!(
+            harness.mock_state.ax_frame(id),
+            frame,
+            "window {id} stays where macOS carried it"
+        );
+    }
+}
+
 /// macOS moves `ids` into `space` and onto the display at `to`, and the
 /// engine sees each window's new frame.
 fn refile(harness: &mut TestHarness, ids: &[WinID], space: WorkspaceId, to: IRect) {
