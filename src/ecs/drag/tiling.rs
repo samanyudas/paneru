@@ -26,6 +26,11 @@ const TILE_TOLERANCE: i32 = 2;
 const RESIZE_RELEASE_GRACE: Duration = Duration::from_millis(600);
 const NATIVE_RESIZE_SETTLE: Duration = Duration::from_millis(200);
 const TILE_RESTORE_HOLD: Duration = Duration::from_secs(1);
+/// How long a frame off the slot holds still during a tile hold before the
+/// engine writes the slot again. An app can apply a size it was given at the
+/// tile's place after the engine's later writes, and macOS then keeps the
+/// window on the display beside its slot (miri#386).
+const HOLD_REWRITE_SETTLE: Duration = Duration::from_millis(100);
 /// How long a frame an app reports before it catches up with the engine's
 /// writes stays the engine's own. An app like T3 Code applies the writes of
 /// a move one by one, well after the engine sent them, and pauses longer
@@ -231,6 +236,9 @@ pub(crate) struct NativeResizeStart {
     caught: Option<IRect>,
     /// The frame the window showed when that wait last wrote the slot.
     written: Option<IRect>,
+    /// The frame off the slot, not a tile, that the window has shown while
+    /// the hold lasts, and since when.
+    beside: Option<(IRect, Duration)>,
     /// Whether the engine wrote its frame again after the app kept another
     /// one while the engine was done writing.
     reasserted: bool,
@@ -278,6 +286,7 @@ impl NativeResizeStart {
             catch_up: None,
             caught: None,
             written: None,
+            beside: None,
             reasserted: false,
         }
     }
@@ -309,8 +318,26 @@ impl NativeResizeStart {
         match self.phase {
             Phase::Settling { retry, .. } => now >= retry,
             Phase::Refused { .. } => true,
-            _ => self.settlement(now).is_some() || self.reasserts(now),
+            _ => self.settlement(now).is_some() || self.reasserts(now) || self.rewrites(now),
         }
+    }
+
+    /// This hold, noting that the window shows `frame`, which is not a tile.
+    fn shown(self, frame: IRect, now: Duration) -> Self {
+        let beside = (frame != self.slot()).then(|| match self.beside {
+            Some((seen, since)) if seen == frame => (seen, since),
+            _ => (frame, now),
+        });
+        Self { beside, ..self }
+    }
+
+    /// Whether, while the hold lasts, the window has kept a frame off the
+    /// slot for [`HOLD_REWRITE_SETTLE`] that no write of the slot has seen.
+    fn rewrites(&self, now: Duration) -> bool {
+        matches!(self.phase, Phase::Holding { until } if now < until)
+            && self.beside.is_some_and(|(frame, since)| {
+                now >= since + HOLD_REWRITE_SETTLE && self.written != Some(frame)
+            })
     }
 
     /// Whether the app has held a frame for [`NATIVE_RESIZE_SETTLE`] while
@@ -403,6 +430,7 @@ impl NativeResizeStart {
                 catch_up: None,
                 caught: None,
                 written: None,
+                beside: None,
                 ..self
             },
         )
@@ -695,6 +723,20 @@ impl TilingRestore<'_, '_> {
                 entity_commands.try_remove::<(ResizeMarker, RepositionMarker, VerifyWindowSize)>();
                 entity_commands.try_insert(start.with_phase(Phase::Refused { frame }));
                 return NativeFrame::Refused;
+            }
+            _ if !engine && !moving && matches!(start.phase, Phase::Holding { .. }) => {
+                let shown = start.shown(frame, now);
+                if shown.rewrites(now) {
+                    let written = NativeResizeStart {
+                        written: Some(frame),
+                        ..shown
+                    };
+                    return Self::restore(entity, written, commands);
+                }
+                if shown.beside != start.beside {
+                    entity_commands.try_insert(shown);
+                }
+                return NativeFrame::Deferred;
             }
             _ if engine || moving || matches!(start.phase, Phase::Holding { .. }) => {
                 // An observation the move began after is the app catching up
