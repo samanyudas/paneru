@@ -100,8 +100,9 @@ const REJOIN_FOR: Duration = Duration::from_secs(30);
 /// this, the app's frame is its own.
 const CARRIED_LIMIT: Duration = Duration::from_secs(5);
 /// How long the windows of a [`Carried`] placement stay at the origins the
-/// engine wrote before the placement is done. In recorded drops, T3 Code
-/// moved the window away again up to 0.23 s after it reached its place.
+/// engine wrote, with no move notified, before the placement is done. In
+/// recorded drops, T3 Code moved the window away again up to 0.23 s after it
+/// reached its place.
 const CARRIED_QUIET: Duration = Duration::from_millis(500);
 
 pub(crate) enum NativeScope {
@@ -193,7 +194,8 @@ struct Carried {
     reached: EntityHashSet,
     /// [`CARRIED_LIMIT`] after the first pass.
     until: Option<Duration>,
-    /// Since when every member that reached its place stayed there.
+    /// Since when every member that reached its place stayed there, and no
+    /// member's move was notified.
     quiet_since: Option<Duration>,
 }
 
@@ -320,6 +322,21 @@ impl NativeMembership {
             maximized,
             carried: carried.then(Carried::default),
         });
+    }
+
+    /// Restarts the quiet time of each carried placement of `member`, whose
+    /// move macOS notified. The engine can run no frame for a few hundred
+    /// milliseconds while an app is busy, and in that time the app can move
+    /// the window away and the engine's write can put it back, so no pass sees
+    /// it away. The notification still arrives.
+    pub(crate) fn moved(&mut self, member: Entity) {
+        for placing in &mut self.placing {
+            if placing.members.contains(&member)
+                && let Some(carried) = &mut placing.carried
+            {
+                carried.quiet_since = None;
+            }
+        }
     }
 
     /// Remembers the columns of `strip`, whose Space macOS destroyed, so its

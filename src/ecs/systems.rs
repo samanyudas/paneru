@@ -1034,6 +1034,11 @@ pub(crate) fn window_frame_update(
     } else {
         notified_windows(&mut messages, &windows)
     };
+    for (entity, moved, _) in &notified {
+        if *moved {
+            native.moved(*entity);
+        }
+    }
     for (entity, _, deferred) in &rechecks {
         let read = deferred.copied().unwrap_or_default();
         match notified
