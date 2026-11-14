@@ -791,6 +791,47 @@ fn a_restored_window_an_app_puts_beside_its_slot_returns_before_the_hold_ends() 
     );
 }
 
+/// A frame beside the slot that a tile then replaces does not keep the
+/// engine writing the slot again while an app holds the tile.
+#[test]
+fn a_tile_after_a_frame_beside_the_slot_is_restored_once_while_the_app_holds_it() {
+    let writes_while_held = |beside_first: bool| {
+        let mut harness = three_columns();
+        let id = 2;
+        let start = frame(harness.world(), id);
+        let point = Origin::new(grab(start).x, TEST_DISPLAY_HEIGHT - 1);
+        press_and_drag(&mut harness, id, point);
+        release(&mut harness, point);
+        let third = IRect::new(683, 20, 1024, 768);
+        macos_tile(&mut harness, id, third);
+        harness.advance(ms(100));
+        let slot = frame(harness.world(), id);
+        if beside_first {
+            let beside =
+                IRect::from_corners(slot.min - IVec2::new(60, 0), slot.max - IVec2::new(60, 0));
+            harness
+                .mock_state
+                .update_window(id, |window| window.frame = beside);
+            harness
+                .world()
+                .write_message(Event::WindowMoved { window_id: id });
+            harness.advance(FRAME);
+        }
+        harness.mock_state.update_window(id, |window| {
+            window.late_writes = Some(Vec::new());
+            window.position_writes = 0;
+        });
+        macos_tile(&mut harness, id, third);
+        harness.advance(ms(400));
+        let mut writes = 0;
+        harness
+            .mock_state
+            .update_window(id, |window| writes = window.position_writes);
+        writes
+    };
+    assert_eq!(writes_while_held(true), writes_while_held(false));
+}
+
 /// An app's own resize well after a drop is still the app's size.
 #[test]
 fn an_apps_resize_long_after_a_drop_keeps_its_width() {
