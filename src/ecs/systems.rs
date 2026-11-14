@@ -1110,6 +1110,7 @@ pub(crate) fn window_frame_update(
             continue;
         };
         let strip = workspaces.iter().find(|(strip, _)| strip.contains(entity));
+        let strip_space = strip.map(|(strip, _)| strip.id());
         let tiled = unmanaged.is_none() && strip.is_some_and(|(strip, _)| tiled_in(strip, entity));
         let (native_resize, deferred) = rechecks
             .get(entity)
@@ -1272,6 +1273,13 @@ pub(crate) fn window_frame_update(
                 known.sort_by_key(|(id, _)| *id);
                 present == known
             };
+            // Whether the window's strip is the Space its display shows. macOS
+            // files a window that the engine moves into the Space its display
+            // shows, so a window in a hidden Space gets no write.
+            let shown = |display| {
+                strip_space.is_some()
+                    && window_manager.active_display_space(display).ok() == strip_space
+            };
             // An app moved its tiled window on the same display without a
             // resize, as a window-snapping app's Move Left does. The window
             // keeps its place in the strip, so it goes back to its column. A
@@ -1282,7 +1290,8 @@ pub(crate) fn window_frame_update(
                 only_moved
                     && !drag.holds_window()
                     && !window_manager.left_button_down()
-                    && display_of(new_frame).is_some_and(|to| display_of(placed) == Some(to))
+                    && display_of(new_frame)
+                        .is_some_and(|to| display_of(placed) == Some(to) && shown(to))
                     && arrangement_read()
             };
             if tiled && *drag == DragState::Idle && stranding() {
