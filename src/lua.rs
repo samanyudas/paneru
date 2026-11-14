@@ -308,6 +308,63 @@ mod tests {
     use bevy::ecs::schedule::common_conditions::resource_changed;
     use std::cell::Cell;
 
+    /// A window that only a Space notification reports as gone runs a Lua
+    /// `window_destroyed` handler once (#210).
+    #[test]
+    fn space_notification_close_runs_the_lua_destroy_handler_once() {
+        use crate::tests::TestHarness;
+        use std::sync::atomic::AtomicU64;
+        use std::time::{Duration, Instant};
+
+        let worker = LuaWorker::spawn(
+            LuaSource::Inline(
+                r#"paneru.on("window_destroyed", function(e) paneru.flash("destroyed " .. e.window_id) end)"#
+                    .to_string(),
+            ),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.has_event_handlers() {
+            assert!(Instant::now() < deadline, "the Lua script loaded");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut harness = TestHarness::new().with_windows(2);
+        harness
+            .app
+            .insert_resource(worker)
+            .add_systems(
+                Update,
+                dispatch_lua_events.in_set(crate::ecs::UpdateSet::Housekeeping),
+            )
+            .add_systems(PostUpdate, (serve_lua_queries, serve_lua_store));
+        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.advance(Duration::from_millis(2000));
+
+        harness.mock_state.os_vanish_window(1);
+        harness.mock_state.os_repeat_space_destroy(1);
+        harness.advance(Duration::from_millis(500));
+        let still_managed = harness
+            .world()
+            .query::<&crate::manager::Window>()
+            .iter(harness.world())
+            .any(|window| window.id() == 1);
+        assert!(!still_managed, "window 1 closed");
+
+        let mut destroyed = 0;
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            harness.app.update();
+            for effect in harness.world().resource::<LuaWorker>().drain_outbox() {
+                if let FromLua::Flash { message, .. } = effect {
+                    assert_eq!(message, "destroyed 1");
+                    destroyed += 1;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(destroyed, 1, "the Lua handler ran once per closed window");
+    }
+
     #[test]
     fn reloading_menu_visibility_marks_config_changed() {
         use crate::tests::TestHarness;
