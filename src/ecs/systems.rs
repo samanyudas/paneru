@@ -1114,6 +1114,7 @@ pub(crate) fn window_frame_update(
             NativeFrame::Ordinary
         };
 
+        let only_moved = matches!(outcome, NativeFrame::Moved);
         let adopts_move = match outcome {
             NativeFrame::Deferred => false,
             NativeFrame::Restored(strip_x) => {
@@ -1192,6 +1193,24 @@ pub(crate) fn window_frame_update(
                     .collect();
                 stranded(new_frame, bounds.iter().copied()) && !stranded(placed, bounds)
             };
+            let display_of = |frame: IRect| {
+                displays
+                    .iter()
+                    .find(|display| display.bounds().contains(frame.center()))
+                    .map(Display::id)
+            };
+            // An app moved its tiled window on the same display without a
+            // resize, as a window-snapping app's Move Left does. The window
+            // keeps its place in the strip, so it goes back to its column. A
+            // window the left button holds, even from outside its title bar,
+            // goes where the pointer takes it, and a window that macOS carries
+            // to another display, or off every display, is handled below.
+            let displaced = || {
+                only_moved
+                    && !drag.holds_window()
+                    && !window_manager.left_button_down()
+                    && display_of(new_frame).is_some_and(|to| display_of(placed) == Some(to))
+            };
             if tiled && *drag == DragState::Idle && stranding() {
                 // An app moved its tiled window off every display, as System
                 // Settings does after you rearrange the displays in it. A
@@ -1199,18 +1218,18 @@ pub(crate) fn window_frame_update(
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_insert(VerifyWindowPosition::default());
                 }
+            } else if tiled && displaced() {
+                // A check already under way keeps its remaining writes
+                // instead of starting over.
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert_if_new(VerifyWindowPosition::default());
+                }
             } else {
                 // macOS reports a window's new Space before its new frame, as
                 // a Mission Control drop onto another display does. Native
                 // membership refused that report while the frame was still on
                 // the old display, and no second report comes, so the frame
                 // that arrives on the other display must reopen it.
-                let display_of = |frame: IRect| {
-                    displays
-                        .iter()
-                        .find(|display| display.bounds().contains(frame.center()))
-                        .map(Display::id)
-                };
                 if *drag == DragState::Idle
                     && display_of(new_frame).is_some_and(|to| display_of(placed) != Some(to))
                 {
