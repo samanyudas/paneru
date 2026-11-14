@@ -4725,3 +4725,61 @@ fn a_window_leaving_the_end_of_an_overflowing_strip_leaves_no_empty_space() {
         "the strip's last column reaches the display's right edge: {last:?}"
     );
 }
+
+/// #489: a window-snapping app moves an idle tiled window without resizing
+/// it, as Rectangle's Move Left and Move Right do. The window keeps its
+/// place in the strip, so the engine puts it back in its column.
+#[test]
+fn a_tiled_window_an_app_moves_without_a_resize_returns_to_its_column() {
+    for shift in [IVec2::new(-150, 0), IVec2::new(150, 0), IVec2::new(0, 40)] {
+        let mut harness = three_columns();
+        let id = 1;
+        let slot = harness.mock_state.ax_frame(id);
+        let before = layout(harness.world());
+        harness.mock_state.os_move_window(id, slot.min + shift);
+        harness.advance(SETTLE);
+        assert_eq!(
+            harness.mock_state.ax_frame(id),
+            slot,
+            "moved by {shift:?}, the window is back in its column"
+        );
+        assert_eq!(layout(harness.world()), before, "moved by {shift:?}");
+    }
+}
+
+/// A window that follows the pointer while the left button is held is the
+/// person's drag, even from outside its title bar, as with a drag from an
+/// app's own drag area. The engine leaves it where the pointer takes it.
+#[test]
+fn a_tiled_window_moved_while_the_button_is_held_is_left_where_it_goes() {
+    let mut harness = three_columns();
+    let id = 1;
+    let slot = harness.mock_state.ax_frame(id);
+    harness.mock_state.set_left_button_down(true);
+    let moved = slot.min + IVec2::new(150, 0);
+    harness.mock_state.os_move_window(id, moved);
+    harness.advance(SETTLE);
+    assert_eq!(harness.mock_state.ax_frame(id).min, moved);
+    harness.mock_state.set_left_button_down(false);
+}
+
+/// #489: right after a drop, while the dropped window settles home, a
+/// window-snapping app moves it without a resize. The engine still puts the
+/// window back in its column.
+#[test]
+fn a_dropped_window_an_app_moves_while_it_settles_returns_to_its_column() {
+    let mut harness = three_columns();
+    let id = 1;
+    let start = frame(harness.world(), id);
+    let point = Origin::new(grab(start).x, TEST_DISPLAY_HEIGHT - 100);
+    press_and_drag(&mut harness, id, point);
+    release(&mut harness, point);
+    harness.advance(ms(300));
+    let slot = harness.mock_state.ax_frame(id);
+    assert_eq!(slot, start, "the drop slid the window home");
+    harness
+        .mock_state
+        .os_move_window(id, slot.min + IVec2::new(150, 0));
+    harness.advance(SETTLE);
+    assert_eq!(harness.mock_state.ax_frame(id), slot);
+}
