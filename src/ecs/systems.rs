@@ -1013,6 +1013,57 @@ type FrameRechecks<'w, 's> = Query<
     Or<(With<NativeResizeStart>, With<DeferredFrameRead>)>,
 >;
 
+/// How many times the engine writes a tiled window's place back after its
+/// app moved it, before it lets the app keep the place it chose. An app that
+/// moves the window again after each write would otherwise fight the engine
+/// without end.
+const FOREIGN_MOVE_ANSWERS: u8 = 3;
+/// How long the answers to such moves count together. A person who runs a
+/// window-snapping app's Move Left again a few seconds later gets an answer
+/// each time.
+const FOREIGN_MOVE_FIGHT: Duration = Duration::from_secs(1);
+
+/// The engine's recent answers to an app moving a tiled window off `slot`.
+#[derive(Component)]
+pub(crate) struct ForeignMoveAnswers {
+    slot: Origin,
+    since: Duration,
+    count: u8,
+}
+
+/// Whether the engine writes `slot` back once more after an app moved the
+/// window off it at `now`, and records that answer.
+fn answer_foreign_move(
+    answers: &mut Query<&mut ForeignMoveAnswers>,
+    commands: &mut Commands,
+    entity: Entity,
+    slot: Origin,
+    now: Duration,
+) -> bool {
+    let fresh = ForeignMoveAnswers {
+        slot,
+        since: now,
+        count: 1,
+    };
+    match answers.get_mut(entity) {
+        Ok(mut answered)
+            if answered.slot == slot && now.saturating_sub(answered.since) < FOREIGN_MOVE_FIGHT =>
+        {
+            if answered.count >= FOREIGN_MOVE_ANSWERS {
+                return false;
+            }
+            answered.count += 1;
+        }
+        Ok(mut answered) => *answered = fresh,
+        Err(_) => {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_insert(fresh);
+            }
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn window_frame_update(
@@ -1026,6 +1077,8 @@ pub(crate) fn window_frame_update(
     drag: Res<DragState>,
     displays: Query<&Display>,
     mut native: ResMut<NativeMembership>,
+    mut answers: Query<&mut ForeignMoveAnswers>,
+    time: Res<Time>,
     mut commands: Commands,
 ) {
     let swiping = swipes.iter().any(|scrolling| scrolling.is_user_swiping);
@@ -1199,6 +1252,24 @@ pub(crate) fn window_frame_update(
                     .find(|display| display.bounds().contains(frame.center()))
                     .map(Display::id)
             };
+            // Whether the engine has read the arrangement macOS has now. While
+            // a display moves, macOS carries its windows before the engine
+            // reads the new bounds, and a carried window can stay inside the
+            // old bounds.
+            let arrangement_read = || {
+                let mut present: Vec<_> = window_manager
+                    .present_displays()
+                    .into_iter()
+                    .map(|(display, _)| (display.id(), display.bounds()))
+                    .collect();
+                let mut known: Vec<_> = displays
+                    .iter()
+                    .map(|display| (display.id(), display.bounds()))
+                    .collect();
+                present.sort_by_key(|(id, _)| *id);
+                known.sort_by_key(|(id, _)| *id);
+                present == known
+            };
             // An app moved its tiled window on the same display without a
             // resize, as a window-snapping app's Move Left does. The window
             // keeps its place in the strip, so it goes back to its column. A
@@ -1210,6 +1281,7 @@ pub(crate) fn window_frame_update(
                     && !drag.holds_window()
                     && !window_manager.left_button_down()
                     && display_of(new_frame).is_some_and(|to| display_of(placed) == Some(to))
+                    && arrangement_read()
             };
             if tiled && *drag == DragState::Idle && stranding() {
                 // An app moved its tiled window off every display, as System
@@ -1218,7 +1290,16 @@ pub(crate) fn window_frame_update(
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_insert(VerifyWindowPosition::default());
                 }
-            } else if tiled && displaced() {
+            } else if tiled
+                && displaced()
+                && answer_foreign_move(
+                    &mut answers,
+                    &mut commands,
+                    entity,
+                    position.0,
+                    time.elapsed(),
+                )
+            {
                 // A check already under way keeps its remaining writes
                 // instead of starting over.
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
