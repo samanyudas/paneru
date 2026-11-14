@@ -257,6 +257,9 @@ struct MockStateInner {
     /// While locked, every AX read from another process fails as an invalid
     /// element and every app's window list is empty, as on a real lock screen.
     screen_locked: bool,
+    /// How many more role reads of each window go unanswered, like an app
+    /// still waking up that answers the next read as an invalid element.
+    unanswered_role_reads: HashMap<WinID, u32>,
     dock_frame: Option<crate::manager::DockFrame>,
     /// Windows the app keeps out of its accessibility window list while the
     /// window server still reports them on screen: a background native tab.
@@ -558,6 +561,7 @@ impl MockState {
             stale_window_ids: HashMap::new(),
             unordered_windows: HashSet::new(),
             screen_locked: false,
+            unanswered_role_reads: HashMap::new(),
             dock_frame: None,
             background_tabs: HashSet::new(),
             raise_count: 0,
@@ -1185,6 +1189,14 @@ impl MockState {
         self.inner.force_write().dock_frame = frame;
     }
 
+    /// Leaves the next `reads` role reads of a window unanswered.
+    pub fn os_leave_role_reads_unanswered(&self, id: WinID, reads: u32) {
+        self.inner
+            .force_write()
+            .unanswered_role_reads
+            .insert(id, reads);
+    }
+
     pub fn os_lock_screen(&self, locked: bool) {
         self.inner.force_write().screen_locked = locked;
     }
@@ -1662,6 +1674,14 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_read_role().returning(move || {
+            if let Some(left) = s.inner.force_write().unanswered_role_reads.get_mut(&id)
+                && *left > 0
+            {
+                *left -= 1;
+                return Err(crate::errors::Error::CannotComplete(format!(
+                    "window {id} role"
+                )));
+            }
             let inner = s.inner.force_read();
             let busy = inner
                 .windows

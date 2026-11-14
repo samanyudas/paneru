@@ -367,7 +367,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::application_event_trigger,
             triggers::dispatch_application_messages,
             (
-                triggers::claim_replaced_window_handles.run_if(on_message::<Event>),
+                triggers::confirm_space_departures.run_if(on_message::<Event>),
                 triggers::recover_window_handles,
                 triggers::window_destroyed_trigger,
             )
@@ -787,6 +787,12 @@ pub struct VerifyFocus {
 /// Uses its own timer because the window's `Timeout` can verify focus.
 #[derive(Component)]
 pub struct AwaitingHandle(pub Timer);
+
+/// Marks a window that `confirm_space_departures` found gone after a Space
+/// notification, so `window_destroyed_trigger` closes it from that same
+/// notification without another AX read or a second destroy event.
+#[derive(Component)]
+pub struct DepartureConfirmed;
 
 /// Reads a new window's level again each frame until the timer ends.
 /// Chrome shows its Picture-in-Picture window at the normal level and raises
