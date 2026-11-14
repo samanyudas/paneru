@@ -1557,6 +1557,7 @@ fn test_regroup_stray_native_tabs_skips_os_queries_without_overlapping_columns()
     let mut wm = MockWindowManagerApi::new();
     wm.expect_windows_on_screen().never();
     wm.expect_window_ordered_in().returning(|_| Ok(true));
+    wm.expect_screen_locked().return_const(false);
     wm.expect_present_displays().returning(Vec::new);
     harness
         .app

@@ -1057,7 +1057,9 @@ pub(super) fn window_managed_trigger(
 
 const HANDLE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Defers ambiguous SLS destruction while the window remains ordered in.
+/// Defers ambiguous SLS destruction while the window remains ordered in, or
+/// while the screen is locked and no AX read can tell a closed window from a
+/// moved one.
 pub(super) fn claim_replaced_window_handles(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -1076,10 +1078,11 @@ pub(super) fn claim_replaced_window_handles(
             continue;
         };
         if !window.is_alive()
-            && matches!(window_manager.window_ordered_in(*window_id), Ok(true))
+            && (window_manager.screen_locked()
+                || matches!(window_manager.window_ordered_in(*window_id), Ok(true)))
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
-            debug!("Window {window_id} is still ordered in with a dead AX element.");
+            debug!("Window {window_id} has a dead AX element; waiting for its handle.");
             entity_commands.try_insert_if_new(AwaitingHandle(Timer::new(
                 HANDLE_RECOVERY_TIMEOUT,
                 TimerMode::Once,
@@ -2713,22 +2716,22 @@ mod tests {
         assert_eq!(harness.mock_state.create_window(0).frame().width(), 800);
     }
 
+    fn column_of(
+        world: &mut bevy::ecs::world::World,
+        window_id: WinID,
+    ) -> Option<(Entity, crate::platform::WorkspaceId, usize)> {
+        let entity = world
+            .query::<(&Window, Entity)>()
+            .iter(world)
+            .find_map(|(window, entity)| (window.id() == window_id).then_some(entity))?;
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .find_map(|strip| Some((entity, strip.id(), strip.index_of(entity).ok()?)))
+    }
+
     #[test]
     fn test_locked_screen_keeps_a_window_whose_handle_died() {
-        use crate::platform::WorkspaceId;
-        use bevy::ecs::world::World;
-
-        fn column_of(world: &mut World, window_id: WinID) -> Option<(Entity, WorkspaceId, usize)> {
-            let entity = world
-                .query::<(&Window, Entity)>()
-                .iter(world)
-                .find_map(|(window, entity)| (window.id() == window_id).then_some(entity))?;
-            world
-                .query::<&LayoutStrip>()
-                .iter(world)
-                .find_map(|strip| Some((entity, strip.id(), strip.index_of(entity).ok()?)))
-        }
-
         let mut harness = TestHarness::new().with_windows(2);
         harness.run(vec![Event::MenuOpened { window_id: 1 }]);
         harness.advance(Duration::from_millis(2000));
@@ -2756,6 +2759,79 @@ mod tests {
         );
         let (entity, _, _) = before.unwrap();
         assert!(harness.world().get::<AwaitingHandle>(entity).is_none());
+    }
+
+    /// A wake moves windows between displays while the lock screen is still
+    /// up, and a moved window can be ordered out for a moment.
+    #[test]
+    fn test_locked_screen_keeps_a_window_ordered_out_for_a_moment() {
+        let mut harness = TestHarness::new().with_windows(2);
+        harness.run(vec![Event::MenuOpened { window_id: 1 }]);
+        harness.advance(Duration::from_millis(2000));
+        let before = column_of(harness.world(), 1);
+        assert!(before.is_some(), "window 1 starts in a strip");
+
+        harness.mock_state.os_lock_screen(true);
+        harness.mock_state.set_window_unordered(1, true);
+        harness.advance(Duration::from_millis(3000));
+        assert_eq!(
+            column_of(harness.world(), 1),
+            before,
+            "a locked screen must not close an ordered-out window whose AX element looks dead"
+        );
+
+        harness.mock_state.set_window_unordered(1, false);
+        harness.mock_state.os_lock_screen(false);
+        harness.advance(Duration::from_millis(2000));
+        assert_eq!(column_of(harness.world(), 1), before);
+    }
+
+    #[test]
+    fn test_locked_screen_keeps_a_window_that_left_a_space_while_ordered_out() {
+        let mut harness = TestHarness::new().with_windows(2);
+        harness.run(vec![Event::MenuOpened { window_id: 1 }]);
+        harness.advance(Duration::from_millis(2000));
+        let before = column_of(harness.world(), 1);
+        assert!(before.is_some(), "window 1 starts in a strip");
+
+        harness.mock_state.os_lock_screen(true);
+        harness.mock_state.set_window_unordered(1, true);
+        harness.mock_state.os_repeat_space_destroy(1);
+        harness.advance(Duration::from_millis(100));
+        harness.mock_state.set_window_unordered(1, false);
+        harness.advance(Duration::from_millis(3000));
+        assert_eq!(
+            column_of(harness.world(), 1),
+            before,
+            "a space notification during a lock must not close a window whose AX element looks dead"
+        );
+
+        harness.mock_state.os_lock_screen(false);
+        harness.advance(Duration::from_millis(2000));
+        assert_eq!(column_of(harness.world(), 1), before);
+        let (entity, _, _) = before.unwrap();
+        assert!(harness.world().get::<AwaitingHandle>(entity).is_none());
+    }
+
+    #[test]
+    fn test_window_that_vanished_during_a_lock_is_forgotten_after_the_unlock() {
+        let mut harness = TestHarness::new().with_windows(2);
+        harness.run(vec![Event::MenuOpened { window_id: 1 }]);
+        harness.advance(Duration::from_millis(2000));
+
+        harness.mock_state.os_lock_screen(true);
+        harness.mock_state.os_vanish_window(1);
+        harness.mock_state.os_repeat_space_destroy(1);
+        harness.advance(Duration::from_millis(3000));
+
+        harness.mock_state.os_lock_screen(false);
+        harness.advance(Duration::from_millis(3000));
+        assert_eq!(
+            column_of(harness.world(), 1),
+            None,
+            "a window that really closed during the lock is dropped after the unlock"
+        );
+        assert!(column_of(harness.world(), 0).is_some());
     }
     #[test]
     fn test_size_verification_retries_a_transient_read_failure() {
