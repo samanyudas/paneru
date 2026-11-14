@@ -4807,3 +4807,49 @@ fn an_app_that_keeps_moving_its_window_off_its_column_gets_a_few_answers() {
     );
     assert_eq!(harness.mock_state.ax_frame(id).min, off);
 }
+
+/// #489: an app that moves its window off its column every 400 ms for
+/// several seconds still gets only a few answers, because its moves never
+/// leave a quiet second between them.
+#[test]
+fn an_app_that_moves_its_window_off_its_column_every_400_ms_gets_a_few_answers() {
+    let mut harness = three_columns();
+    let id = 1;
+    let slot = harness.mock_state.ax_frame(id);
+    let off = slot.min + IVec2::new(150, 0);
+    let mut answers = 0;
+    for _ in 0..12 {
+        harness.mock_state.os_move_window(id, off);
+        harness.advance(ms(400));
+        if harness.mock_state.ax_frame(id).min == slot.min {
+            answers += 1;
+        }
+    }
+    assert!(
+        (1..=3).contains(&answers),
+        "the engine put the window back {answers} times"
+    );
+    assert_eq!(harness.mock_state.ax_frame(id).min, off);
+}
+
+/// #489: with the menu bar height set in the configuration, the engine's
+/// displays differ from freshly read ones only by that setting. The engine
+/// still puts a tiled window an app moved back in its column.
+#[test]
+fn a_tiled_window_an_app_moves_returns_with_a_menu_bar_height_setting() {
+    let mut harness = three_columns();
+    let world = harness.world();
+    for mut display in world
+        .query::<&mut crate::manager::Display>()
+        .iter_mut(world)
+    {
+        display.set_menubar_height_override(Some(0));
+    }
+    let id = 1;
+    let slot = harness.mock_state.ax_frame(id);
+    harness
+        .mock_state
+        .os_move_window(id, slot.min + IVec2::new(150, 0));
+    harness.advance(SETTLE);
+    assert_eq!(harness.mock_state.ax_frame(id), slot);
+}
