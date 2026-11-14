@@ -1057,12 +1057,23 @@ pub(super) fn window_managed_trigger(
 
 const HANDLE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Defers ambiguous SLS destruction while the window remains ordered in, or
-/// while the screen is locked and no AX read can tell a closed window from a
-/// moved one.
-pub(super) fn claim_replaced_window_handles(
+/// Decides what an SLS "window left a Space" notification means, from one AX
+/// read of the window. The notification also fires when a window only moves
+/// to another Space, so a window whose AX element answers stays.
+///
+/// A window whose element is dead waits for the app to give it a new one
+/// while the window stays ordered in, or while the screen is locked and no AX
+/// read can tell a closed window from a moved one. Any other window is closed.
+///
+/// This runs before [`recover_window_handles`], so a moved window adopts its
+/// new element before the teardown of the old one is handled. It is the only
+/// reader of the notification: a wake can leave an app unable to answer one
+/// read and answering "invalid element" to the next, so two reads of the same
+/// window can disagree.
+pub(super) fn confirm_space_departures(
     mut messages: MessageReader<Event>,
     windows: Windows,
+    awaiting: Query<(), With<AwaitingHandle>>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
@@ -1075,19 +1086,33 @@ pub(super) fn claim_replaced_window_handles(
             continue;
         };
         let Some((window, entity)) = windows.find(*window_id) else {
+            debug!("Duplicate event: window {window_id} already destroyed.");
             continue;
         };
-        if !window.is_alive()
-            && (window_manager.screen_locked()
-                || matches!(window_manager.window_ordered_in(*window_id), Ok(true)))
-            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        if awaiting.contains(entity) {
+            continue;
+        }
+        if window.is_alive() {
+            debug!("Window {window_id} still present, this was SLS workspace change.");
+            continue;
+        }
+        if window_manager.screen_locked()
+            || matches!(window_manager.window_ordered_in(*window_id), Ok(true))
         {
             debug!("Window {window_id} has a dead AX element; waiting for its handle.");
-            entity_commands.try_insert_if_new(AwaitingHandle(Timer::new(
-                HANDLE_RECOVERY_TIMEOUT,
-                TimerMode::Once,
-            )));
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_insert_if_new(AwaitingHandle(Timer::new(
+                    HANDLE_RECOVERY_TIMEOUT,
+                    TimerMode::Once,
+                )));
+            }
+            continue;
         }
+        info!("Window {window_id} left a Space with a dead AX element; closing it.");
+        commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
+            window_id: *window_id,
+            source: DestroySource::Accessibility { element: None },
+        }));
     }
 }
 
@@ -1185,7 +1210,6 @@ fn adopt_fresh_handle(window: &mut Window, app: &mut Application, config: &Confi
 /// * `apps` - A query for all applications.
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `windows` - A query for all windows with their parent.
-/// * `awaiting` - Windows waiting for the app to replace their AX element.
 /// * `commands` - Bevy commands to despawn entities and trigger events.
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -1195,7 +1219,6 @@ pub(super) fn window_destroyed_trigger(
     mut apps: Query<&mut Application>,
     mut global_state: GlobalState,
     windows: Windows,
-    awaiting: Query<(), With<AwaitingHandle>>,
     focus_history: Res<FocusHistory>,
     mut overrides: ResMut<TileOverrides>,
     mut commands: Commands,
@@ -1210,38 +1233,27 @@ pub(super) fn window_destroyed_trigger(
             continue;
         };
 
-        // Only the SLS notification is ambiguous — it also fires when a window merely leaves a
-        // space, so it needs confirming. A `kAXUIElementDestroyedNotification` means the AX element
-        // itself has been torn down and is taken at face value: confirming it against the app is
-        // not just unnecessary but actively wrong, because both signals below lag the teardown.
-        // `is_alive()` keeps succeeding on the dead element for apps that outlive their windows, and
-        // the app's AX window list is still warm for a moment after the close. Re-checking them
-        // raced the window back to life, leaving the entity in the strip and a permanent gap where
-        // the window had been.
-        match source {
-            DestroySource::SpaceNotification if awaiting.contains(entity) || window.is_alive() => {
-                debug!(
-                    "Window {} still present, this was SLS workspace change.",
-                    window.id()
-                );
-                continue;
-            }
+        // Only the SLS notification is ambiguous: it also fires when a window merely leaves a
+        // space. `confirm_space_departures` confirms it and sends a close of its own for a window
+        // that is gone, so it is skipped here. A `kAXUIElementDestroyedNotification` means the AX
+        // element itself has been torn down and is taken at face value: confirming it against the
+        // app is not just unnecessary but actively wrong, because both signals below lag the
+        // teardown. `is_alive()` keeps succeeding on the dead element for apps that outlive their
+        // windows, and the app's AX window list is still warm for a moment after the close.
+        // Re-checking them raced the window back to life, leaving the entity in the strip and a
+        // permanent gap where the window had been.
+        let reason = match source {
+            DestroySource::SpaceNotification => continue,
             DestroySource::Accessibility {
                 element: Some(element),
             } if !window.is_current_element(element) => {
                 debug!("Window {window_id} lost a replaced AX element.");
                 continue;
             }
-            _ => {}
-        }
-        info!(
-            "Closing window {window_id}: {}.",
-            match source {
-                DestroySource::SpaceNotification => "a Space notification with a dead AX element",
-                DestroySource::Accessibility { element: Some(_) } => "its AX element was destroyed",
-                DestroySource::Accessibility { element: None } => "the engine found it gone",
-            }
-        );
+            DestroySource::Accessibility { element: Some(_) } => "its AX element was destroyed",
+            DestroySource::Accessibility { element: None } => "the engine found it gone",
+        };
+        info!("Closing window {window_id}: {reason}.");
 
         let Ok(mut app) = apps.get_mut(parent) else {
             error!("Window {} has no parent!", window.id());
@@ -2823,6 +2835,32 @@ mod tests {
         assert_eq!(column_of(harness.world(), 1), before);
         let (entity, _, _) = before.unwrap();
         assert!(harness.world().get::<AwaitingHandle>(entity).is_none());
+    }
+
+    /// On a wake, an app can leave one AX read unanswered and answer the next
+    /// as an invalid element. The engine closed Notes this way in a live run
+    /// (#210): one read let it skip the wait, and the next one closed it.
+    #[test]
+    fn test_locked_screen_keeps_a_window_whose_app_answers_late() {
+        let mut harness = TestHarness::new().with_windows(2);
+        harness.run(vec![Event::MenuOpened { window_id: 1 }]);
+        harness.advance(Duration::from_millis(2000));
+        let before = column_of(harness.world(), 1);
+        assert!(before.is_some(), "window 1 starts in a strip");
+
+        harness.mock_state.os_lock_screen(true);
+        harness.mock_state.os_leave_role_reads_unanswered(1, 1);
+        harness.mock_state.os_repeat_space_destroy(1);
+        harness.advance(Duration::from_millis(3000));
+        assert_eq!(
+            column_of(harness.world(), 1),
+            before,
+            "a late AX answer during a lock must not close a window that is still there"
+        );
+
+        harness.mock_state.os_lock_screen(false);
+        harness.advance(Duration::from_millis(2000));
+        assert_eq!(column_of(harness.world(), 1), before);
     }
 
     #[test]

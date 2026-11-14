@@ -367,7 +367,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::application_event_trigger,
             triggers::dispatch_application_messages,
             (
-                triggers::claim_replaced_window_handles.run_if(on_message::<Event>),
+                triggers::confirm_space_departures.run_if(on_message::<Event>),
                 triggers::recover_window_handles,
                 triggers::window_destroyed_trigger,
             )
