@@ -56,7 +56,9 @@
 //! The engine's own placements win while they are in progress: a held drag
 //! group, and an explicit placement until the engine has finished moving its
 //! windows. A space whose report names such a window waits and is read again
-//! once the hold ends.
+//! once the hold ends. A drop of a window that macOS had carried off the
+//! drop's display also sends the window back when its app moves it away
+//! again, and ends only once the window has stayed in place for a moment.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -92,6 +94,15 @@ const IGNORE_FOR: Duration = Duration::from_secs(30);
 /// lists them. After that, a window that lands beside the others was moved
 /// on its own.
 const REJOIN_FOR: Duration = Duration::from_secs(30);
+/// How long a [`Carried`] placement sends back a window that its app moves
+/// away again. T3 Code put such a window back on the display macOS had
+/// carried it to after each of the engine's writes, for over a second. Past
+/// this, the app's frame is its own.
+const CARRIED_LIMIT: Duration = Duration::from_secs(5);
+/// How long the windows of a [`Carried`] placement stay at the origins the
+/// engine wrote before the placement is done. In recorded drops, T3 Code
+/// moved the window away again up to 0.23 s after it reached its place.
+const CARRIED_QUIET: Duration = Duration::from_millis(500);
 
 pub(crate) enum NativeScope {
     ActivatedSpace(WorkspaceId),
@@ -167,6 +178,61 @@ struct Placing {
     /// windows stop moving and these stay the same for a pass.
     targets: Vec<(Entity, IRect)>,
     maximized: Option<Before>,
+    carried: Option<Carried>,
+}
+
+/// A drop of a window that macOS had moved off the drop's display, as it
+/// does during a drag with "Displays have separate Spaces" on. Its app can
+/// keep putting the window back there after each of the engine's writes, and
+/// macOS lists it in that display's Space meanwhile.
+#[derive(Default)]
+struct Carried {
+    /// The members that were at the origin the engine wrote on some pass. One
+    /// that its app then moves away goes back. A member that never got there,
+    /// because its app ignores the engine's writes, holds nothing.
+    reached: EntityHashSet,
+    /// [`CARRIED_LIMIT`] after the first pass.
+    until: Option<Duration>,
+    /// Since when every member that reached its place stayed there.
+    quiet_since: Option<Duration>,
+}
+
+impl Carried {
+    /// Whether the placement still holds `members`: one is still moving, one
+    /// that reached its place is away from it, which sends it back, or they
+    /// have been still at their places for less than [`CARRIED_QUIET`].
+    fn holds(
+        &mut self,
+        world: &mut World,
+        members: &[Entity],
+        moving: &mut QueryState<(), Moving>,
+        now: Duration,
+    ) -> bool {
+        if now >= *self.until.get_or_insert(now + CARRIED_LIMIT) {
+            return false;
+        }
+        let mut unsettled = false;
+        for &member in members {
+            let Some(frame) = world.get::<Window>(member).map(|window| window.frame()) else {
+                continue;
+            };
+            let still = moving.get(world, member).is_err();
+            if at_written_origin(world, member, frame) {
+                self.reached.insert(member);
+            } else if self.reached.contains(&member) {
+                unsettled = true;
+                if still {
+                    return_to_strip(world, member);
+                }
+            }
+            unsettled |= !still;
+        }
+        if unsettled {
+            self.quiet_since = None;
+            return true;
+        }
+        now < *self.quiet_since.get_or_insert(now) + CARRIED_QUIET
+    }
 }
 
 /// A group a placement left in no strip, because the destination display
@@ -233,8 +299,14 @@ impl NativeMembership {
     /// Holds `members`, which the engine just placed explicitly, against
     /// native reports until the engine has moved them into place.
     /// `maximized` is what they return to when they are a maximized window
-    /// that joined no strip yet.
-    pub(crate) fn placed(&mut self, members: Vec<Entity>, maximized: Option<Before>) {
+    /// that joined no strip yet. `carried` says that macOS had moved them off
+    /// the display the engine places them on.
+    pub(crate) fn placed(
+        &mut self,
+        members: Vec<Entity>,
+        maximized: Option<Before>,
+        carried: bool,
+    ) {
         debug!(?members, "Explicit placement holds native membership");
         self.placing.retain(|placing| {
             !placing
@@ -246,6 +318,7 @@ impl NativeMembership {
             members,
             targets: Vec::new(),
             maximized,
+            carried: carried.then(Carried::default),
         });
     }
 
@@ -690,23 +763,7 @@ fn window_display(world: &mut World, member: Entity) -> Option<Shown> {
             window.update_frame().ok()?
         }
     };
-    let near = |a: IVec2, b: IVec2| (a - b).abs().max_element() <= FRAME_TOLERANCE;
-    // `PresentedOrigin` is where the engine is taking the window. While a
-    // `RepositionMarker` animates it, `Position` is the last frame the engine
-    // wrote. Otherwise `Position` can hold a native move the engine adopted.
-    // Only the origin counts: an app that refuses to make a window shorter
-    // than its minimum allows keeps the origin the engine wrote.
-    let animated = world.get::<RepositionMarker>(member).is_some();
-    let written = [
-        world.get::<PresentedOrigin>(member).map(|origin| origin.0),
-        world
-            .get::<Position>(member)
-            .filter(|_| animated)
-            .map(|position| position.0),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|origin| near(frame.min, origin));
+    let written = at_written_origin(world, member, frame);
     let strip = world
         .query::<(&LayoutStrip, &ChildOf, Has<PreviousStripPosition>)>()
         .iter(world)
@@ -733,6 +790,27 @@ fn window_display(world: &mut World, member: Entity) -> Option<Shown> {
         Some((home, false)) if world.get::<Display>(home).is_some() => Some(Shown::Stranded(home)),
         _ => None,
     }
+}
+
+/// Whether `frame` is at an origin the engine wrote for `member`.
+/// `PresentedOrigin` is where the engine is taking the window. While a
+/// `RepositionMarker` animates it, `Position` is the last frame the engine
+/// wrote. Otherwise `Position` can hold a native move the engine adopted.
+/// Only the origin counts: an app that refuses to make a window shorter than
+/// its minimum allows keeps the origin the engine wrote.
+fn at_written_origin(world: &World, member: Entity, frame: IRect) -> bool {
+    let near = |a: IVec2, b: IVec2| (a - b).abs().max_element() <= FRAME_TOLERANCE;
+    let animated = world.get::<RepositionMarker>(member).is_some();
+    [
+        world.get::<PresentedOrigin>(member).map(|origin| origin.0),
+        world
+            .get::<Position>(member)
+            .filter(|_| animated)
+            .map(|position| position.0),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|origin| near(frame.min, origin))
 }
 
 /// Whether `frame` is stranded off every display, by rule 4 in the module
@@ -972,6 +1050,7 @@ fn append_native_group(world: &mut World, space: WorkspaceId, members: &[Entity]
 fn observe_placements(world: &mut World) {
     world.resource_scope(|world, mut native: Mut<NativeMembership>| {
         let mut moving = world.query_filtered::<(), Moving>();
+        let now = world.resource::<Time>().elapsed();
         let mut ended = false;
         for mut placing in std::mem::take(&mut native.placing) {
             placing.members.retain(|member| {
@@ -979,7 +1058,20 @@ fn observe_placements(world: &mut World) {
             });
             let gone = placing.members.is_empty();
             let targets = layout_frames(world, &placing.members);
+            // A person who takes a member again moves it themselves.
+            if world
+                .resource::<DragState>()
+                .held_window()
+                .is_some_and(|held| placing.members.contains(&held))
+            {
+                placing.carried = None;
+            }
+            let held = placing
+                .carried
+                .as_mut()
+                .is_some_and(|carried| carried.holds(world, &placing.members, &mut moving, now));
             let settled = targets == placing.targets
+                && !held
                 && !placing
                     .members
                     .iter()

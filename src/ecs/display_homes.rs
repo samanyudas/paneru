@@ -539,7 +539,7 @@ fn apply(world: &mut World, arrivals: Vec<Arrival>) -> HashSet<WorkspaceId> {
             // which still lists them in the Space they are leaving.
             world
                 .resource_mut::<NativeMembership>()
-                .placed(members, None);
+                .placed(members, None, false);
         }
     }
     emptied

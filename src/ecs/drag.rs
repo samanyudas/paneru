@@ -1311,10 +1311,12 @@ pub(super) fn drag_events(
             if let Ok((_, bounds)) = placements.get(window) {
                 dropped.dropped(window, bounds.0, now + TILED_DROP_WINDOW);
             }
+            let carried = carried_off(window, target, &windows, &moves);
             apply_drop(
                 window,
                 target,
                 focused,
+                carried,
                 &mut moves,
                 &mut placements,
                 &mut commands,
@@ -1543,10 +1545,12 @@ pub(super) fn drag_watchdog(
         if let Ok((_, bounds)) = placements.get(window) {
             dropped.dropped(window, bounds.0, time.elapsed() + TILED_DROP_WINDOW);
         }
+        let carried = carried_off(window, target, &windows, &moves);
         apply_drop(
             window,
             target,
             focused,
+            carried,
             &mut moves,
             &mut placements,
             &mut commands,
@@ -1891,12 +1895,47 @@ pub(super) fn undo_tiled_drop(
     commands.focus_entity(window, false);
 }
 
+/// Whether `window` is on a display other than the one that a drop at
+/// `target` puts it on. With "Displays have separate Spaces" on, macOS moves
+/// a window onto the display that holds most of it during a drag, whatever
+/// the pointer does.
+fn carried_off(
+    window: Entity,
+    target: DropTarget,
+    windows: &WindowInfo,
+    moves: &DisplayMoves,
+) -> bool {
+    let Ok((_, shown, _, _)) = windows.get(window) else {
+        return false;
+    };
+    let destination = match target {
+        DropTarget::IntoColumn { display, .. } | DropTarget::NewColumn { display, .. } => {
+            Some(display)
+        }
+        DropTarget::Home | DropTarget::Refused { .. } => moves
+            .strips
+            .iter()
+            .find(|(_, strip, _, _, _)| strip.contains(window))
+            .and_then(|(_, _, _, child, _)| moves.displays.get(child.parent()).ok())
+            .map(|(_, display, _, _)| display.id()),
+    };
+    let center = shown.frame().center();
+    moves
+        .displays
+        .iter()
+        .find(|(_, display, _, _)| display.bounds().contains(center))
+        .is_some_and(|(_, display, _, _)| Some(display.id()) != destination)
+}
+
 /// Moves `window` to `target` in its strip, then sends it to its slot, which
-/// is its old one for [`DropTarget::Home`] and a refusal.
+/// is its old one for [`DropTarget::Home`] and a refusal. `carried` says that
+/// macOS had moved the window off the display the drop puts it on.
+#[allow(clippy::too_many_arguments)]
 fn apply_drop(
     window: Entity,
     target: DropTarget,
     focused: bool,
+    carried: bool,
     moves: &mut DisplayMoves,
     placements: &mut Placements,
     commands: &mut Commands,
@@ -1944,7 +1983,7 @@ fn apply_drop(
         if let Some(transfer) = transfer {
             tiling::supersede_native_resize(&transfer.members, commands);
             restore_drop_members(&transfer.members, placements);
-            native.placed(transfer.members, transfer.maximized);
+            native.placed(transfer.members, transfer.maximized, carried);
         } else if let Some((_, strip, _, _, _)) = moves
             .strips
             .iter()
@@ -1952,7 +1991,7 @@ fn apply_drop(
         {
             let members = strip.tab_group(window).unwrap_or_else(|| vec![window]);
             restore_drop_members(&members, placements);
-            native.placed(members, None);
+            native.placed(members, None, carried);
         }
         commands.ensure_visible(window);
         commands.focus_entity(window, false);
@@ -2000,7 +2039,7 @@ fn apply_drop(
     // The user's drag left the window where it was released. Marking its
     // slot changed sends it there, even when the slot did not move.
     restore_drop_members(&members, placements);
-    native.placed(members, None);
+    native.placed(members, None, carried);
     commands.ensure_visible(window);
     if !focused {
         commands.focus_entity(window, false);

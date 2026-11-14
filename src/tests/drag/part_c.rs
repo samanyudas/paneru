@@ -385,6 +385,144 @@ fn a_snapping_apps_third_after_a_drop_on_another_display_returns_to_the_drops_pl
     assert!(failures.is_empty(), "{failures:?}");
 }
 
+/// macOS can move a window into another display's Space while it is dragged,
+/// and its app can keep putting it back on that display after each of the
+/// engine's writes for over a second, as T3 Code did in miri#390, with or
+/// without a snapping app's quarter right after the release. A drop in its
+/// own column still keeps the window in the strip of the display the pointer
+/// was released on, at its place there.
+#[test]
+fn a_window_macos_keeps_moving_to_another_display_after_a_drop_home_stays_in_its_strip() {
+    let quarter = IRect::new(TEST_DISPLAY_WIDTH / 2, 394, TEST_DISPLAY_WIDTH, 768);
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    for snap in [false, true] {
+        let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+        harness.mock_state.set_spaces_follow_frames(true);
+        let home = middle_of(harness.world(), 2, 600);
+        press_and_drag(&mut harness, 2, home);
+        macos_moves_to_ext(&mut harness, 2);
+        harness.advance(FRAME);
+        release(&mut harness, home);
+        if snap {
+            macos_tile(&mut harness, 2, quarter);
+        }
+
+        let mut bounces = 0;
+        for _ in 0..65 {
+            let now = harness.mock_state.create_window(2).frame();
+            if !ext.contains(now.center()) {
+                harness
+                    .mock_state
+                    .update_window(2, |window| window.workspace_id = EXT_WORKSPACE_ID);
+                harness
+                    .mock_state
+                    .os_move_window(2, Origin::new(ext.min.x + 100, now.min.y));
+                bounces += 1;
+            }
+            harness.advance(FRAME);
+        }
+        harness.advance(SETTLE);
+
+        assert_eq!(
+            layout_on(harness.world(), TEST_WORKSPACE_ID),
+            vec![vec![0], vec![1], vec![2]],
+            "snap={snap}"
+        );
+        assert_eq!(
+            layout_on(harness.world(), EXT_WORKSPACE_ID),
+            vec![vec![100]],
+            "snap={snap}"
+        );
+        let entity = find_window_entity(2, harness.world());
+        let placed = harness
+            .world()
+            .get::<crate::ecs::PresentedOrigin>(entity)
+            .expect("a placed window")
+            .0;
+        let now = harness.mock_state.create_window(2).frame();
+        assert_eq!(now.min, placed, "snap={snap}");
+        assert!(now.center().x < TEST_DISPLAY_WIDTH, "snap={snap} {now:?}");
+        assert!(
+            bounces > 10,
+            "snap={snap}: the app moved the window back {bounces} times"
+        );
+    }
+}
+
+/// macOS moves window `id` back onto the external display and into its
+/// Space, as T3 Code did after the engine's writes in miri#390.
+fn app_moves_back_to_ext(harness: &mut TestHarness, id: WinID) {
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    let now = harness.mock_state.create_window(id).frame();
+    harness
+        .mock_state
+        .update_window(id, |window| window.workspace_id = EXT_WORKSPACE_ID);
+    harness
+        .mock_state
+        .os_move_window(id, Origin::new(ext.min.x + 100, now.min.y));
+}
+
+/// A drop in its own column of a window macOS carried to another display,
+/// with a slow slide back. The app moves the window back once, a moment
+/// after the slide lands, and the window still goes home.
+#[test]
+fn a_carried_window_moved_back_after_a_slow_slide_home_stays_in_its_strip() {
+    let mut harness = two_displays("[options]\nanimation_speed = 8\n", EXT_DISPLAY_HEIGHT);
+    harness.mock_state.set_spaces_follow_frames(true);
+    let home = middle_of(harness.world(), 2, 600);
+    press_and_drag(&mut harness, 2, home);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.advance(FRAME);
+    release(&mut harness, home);
+    let entity = find_window_entity(2, harness.world());
+    let mut slid = Duration::ZERO;
+    while harness
+        .world()
+        .get::<crate::ecs::RepositionMarker>(entity)
+        .is_some()
+        && slid < Duration::from_secs(5)
+    {
+        harness.advance(FRAME);
+        slid += FRAME;
+    }
+    assert!(slid > ms(500), "the slide took {slid:?}");
+    harness.advance(ms(240));
+    app_moves_back_to_ext(&mut harness, 2);
+    harness.advance(SETTLE);
+
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+}
+
+/// A person who grabs a carried window again while its drop still holds it
+/// drags it where the pointer goes.
+#[test]
+fn a_carried_window_grabbed_again_follows_the_new_drag() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    harness.mock_state.set_spaces_follow_frames(true);
+    let home = middle_of(harness.world(), 2, 600);
+    press_and_drag(&mut harness, 2, home);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.advance(FRAME);
+    release(&mut harness, home);
+    harness.advance(ms(100));
+
+    let start = harness.mock_state.create_window(2).frame();
+    let to = grab(start) + IVec2::new(-200, 300);
+    press_and_drag(&mut harness, 2, to);
+    harness.advance(ms(200));
+
+    let held = harness.mock_state.create_window(2).frame();
+    assert_eq!(held.min, start.min + IVec2::new(-200, 300), "{held:?}");
+    release(&mut harness, to);
+}
+
 #[test]
 fn a_window_dropped_above_a_column_on_another_display_becomes_its_top_window() {
     let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
