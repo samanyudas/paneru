@@ -725,9 +725,12 @@ impl TilingRestore<'_, '_> {
                 entity_commands.try_insert(start.with_phase(Phase::Refused { frame }));
                 return NativeFrame::Refused;
             }
-            _ if !engine && !moving && matches!(start.phase, Phase::Holding { .. }) => {
+            // A size check of the restore can still be pending when the app
+            // shows a frame beside the slot, so the wait starts then and
+            // the write waits for the check.
+            _ if resize.is_none() && !moving && matches!(start.phase, Phase::Holding { .. }) => {
                 let shown = start.shown(frame, now);
-                if shown.rewrites(now) {
+                if !verifying && shown.rewrites(now) {
                     let written = NativeResizeStart {
                         written: Some(frame),
                         ..shown
