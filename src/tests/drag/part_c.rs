@@ -385,6 +385,70 @@ fn a_snapping_apps_third_after_a_drop_on_another_display_returns_to_the_drops_pl
     assert!(failures.is_empty(), "{failures:?}");
 }
 
+/// macOS can move a window into another display's Space while it is dragged,
+/// and its app can keep putting it back on that display after each of the
+/// engine's writes for over a second, as T3 Code did in miri#390, with or
+/// without a snapping app's quarter right after the release. A drop in its
+/// own column still keeps the window in the strip of the display the pointer
+/// was released on, at its place there.
+#[test]
+fn a_window_macos_keeps_moving_to_another_display_after_a_drop_home_stays_in_its_strip() {
+    let quarter = IRect::new(TEST_DISPLAY_WIDTH / 2, 394, TEST_DISPLAY_WIDTH, 768);
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    for snap in [false, true] {
+        let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+        harness.mock_state.set_spaces_follow_frames(true);
+        let home = middle_of(harness.world(), 2, 600);
+        press_and_drag(&mut harness, 2, home);
+        macos_moves_to_ext(&mut harness, 2);
+        harness.advance(FRAME);
+        release(&mut harness, home);
+        if snap {
+            macos_tile(&mut harness, 2, quarter);
+        }
+
+        let mut bounces = 0;
+        for _ in 0..65 {
+            let now = harness.mock_state.create_window(2).frame();
+            if !ext.contains(now.center()) {
+                harness
+                    .mock_state
+                    .update_window(2, |window| window.workspace_id = EXT_WORKSPACE_ID);
+                harness
+                    .mock_state
+                    .os_move_window(2, Origin::new(ext.min.x + 100, now.min.y));
+                bounces += 1;
+            }
+            harness.advance(FRAME);
+        }
+        harness.advance(SETTLE);
+
+        assert_eq!(
+            layout_on(harness.world(), TEST_WORKSPACE_ID),
+            vec![vec![0], vec![1], vec![2]],
+            "snap={snap}"
+        );
+        assert_eq!(
+            layout_on(harness.world(), EXT_WORKSPACE_ID),
+            vec![vec![100]],
+            "snap={snap}"
+        );
+        let entity = find_window_entity(2, harness.world());
+        let placed = harness
+            .world()
+            .get::<crate::ecs::PresentedOrigin>(entity)
+            .expect("a placed window")
+            .0;
+        let now = harness.mock_state.create_window(2).frame();
+        assert_eq!(now.min, placed, "snap={snap}");
+        assert!(now.center().x < TEST_DISPLAY_WIDTH, "snap={snap} {now:?}");
+        assert!(
+            bounces > 10,
+            "snap={snap}: the app moved the window back {bounces} times"
+        );
+    }
+}
+
 #[test]
 fn a_window_dropped_above_a_column_on_another_display_becomes_its_top_window() {
     let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
