@@ -3283,10 +3283,7 @@ fn position_layout_windows(
         );
     }
 
-    let held = drag
-        .as_ref()
-        .filter(|drag| drag.holds_window())
-        .and_then(|drag| drag.window());
+    let held = drag.as_ref().and_then(|drag| drag.held_window());
     let held_group = held
         .map(|held| {
             workspaces

@@ -324,6 +324,13 @@ fn pend_move(harness: &mut TestHarness, id: WinID, dx: i32) -> IRect {
         .expect("a tiled window has a position")
         .0
         .x += dx;
+    // The layout moves a window's slot with it.
+    harness
+        .world()
+        .get_mut::<crate::ecs::PresentedOrigin>(entity)
+        .expect("a tiled window has a slot")
+        .0
+        .x += dx;
     harness.advance(FRAME);
     let asked = engine_frame(harness.world(), id);
     assert_ne!(

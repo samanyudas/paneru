@@ -510,6 +510,11 @@ impl DragState {
         )
     }
 
+    /// The window a press or drag holds.
+    pub(crate) fn held_window(&self) -> Option<Entity> {
+        self.holds_window().then(|| self.window()).flatten()
+    }
+
     /// The window a press, drag, or settling drop is about.
     pub(crate) fn window(&self) -> Option<Entity> {
         match self {

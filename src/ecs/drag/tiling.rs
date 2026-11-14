@@ -12,7 +12,7 @@ use bevy::ecs::world::World;
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 
-use super::DragState;
+use super::{DragState, kept_an_edge};
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::{
     Bounds, DockPosition, PresentedOrigin, RepositionMarker, ResizeMarker, SpawnCommandsExt,
@@ -541,14 +541,12 @@ impl TilingRestore<'_, '_> {
         self.gesture.resizes(entity, self.time.elapsed())
     }
 
-    /// Whether a title-bar drag holds `entity` while it follows the
-    /// pointer, itself or as a native tab of the window it drags. `strip`
-    /// is the strip that holds `entity`.
+    /// Whether a title-bar press or drag holds `entity`, itself or as a
+    /// native tab of the window it holds. `strip` is the strip that holds
+    /// `entity`.
     fn drags(&self, entity: Entity, strip: Option<&LayoutStrip>) -> bool {
-        let dragged = match &*self.drag {
-            DragState::Dragging(drag) => drag.window,
-            DragState::Unconfirmed(press) => press.window,
-            _ => return false,
+        let Some(dragged) = self.drag.held_window() else {
+            return false;
         };
         dragged == entity
             || strip
@@ -733,6 +731,16 @@ impl TilingRestore<'_, '_> {
                 return NativeFrame::Deferred;
             }
             Some(Settlement::Adopt(seen)) if seen == frame => {
+                // A size that came with a move off every edge of the slot is
+                // an app's size while the user drags the window, not a
+                // resize. `managed` follows the app's own moves, so only the
+                // slot still shows the move.
+                if !kept_an_edge(start.slot(), frame) {
+                    let hold = start.with_phase(Phase::Holding {
+                        until: now + TILE_RESTORE_HOLD,
+                    });
+                    return Self::restore(entity, hold, commands);
+                }
                 entity_commands.try_remove::<NativeResizeStart>();
                 return NativeFrame::Settled;
             }
