@@ -19,8 +19,9 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     AboveOrdinaryCheck, ActiveDisplayMarker, AwaitingHandle, AwaitsTitleMatch, BProcess,
-    FloatsWhenRestored, FocusedMarker, MissionControlActive, OpenedHidden, PreviousManagedStrip,
-    Rejoin, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    DepartureConfirmed, FloatsWhenRestored, FocusedMarker, MissionControlActive, OpenedHidden,
+    PreviousManagedStrip, Rejoin, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent,
+    SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::display::size_for_arrival;
@@ -1063,7 +1064,8 @@ const HANDLE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 ///
 /// A window whose element is dead waits for the app to give it a new one
 /// while the window stays ordered in, or while the screen is locked and no AX
-/// read can tell a closed window from a moved one. Any other window is closed.
+/// read can tell a closed window from a moved one. Any other window gets
+/// [`DepartureConfirmed`], and `window_destroyed_trigger` closes it.
 ///
 /// This runs before [`recover_window_handles`], so a moved window adopts its
 /// new element before the teardown of the old one is handled. It is the only
@@ -1092,27 +1094,25 @@ pub(super) fn confirm_space_departures(
         if awaiting.contains(entity) {
             continue;
         }
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            continue;
+        };
         if window.is_alive() {
             debug!("Window {window_id} still present, this was SLS workspace change.");
-            continue;
-        }
-        if window_manager.screen_locked()
+            entity_commands.try_remove::<DepartureConfirmed>();
+        } else if window_manager.screen_locked()
             || matches!(window_manager.window_ordered_in(*window_id), Ok(true))
         {
             debug!("Window {window_id} has a dead AX element; waiting for its handle.");
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_insert_if_new(AwaitingHandle(Timer::new(
+            entity_commands
+                .try_remove::<DepartureConfirmed>()
+                .try_insert_if_new(AwaitingHandle(Timer::new(
                     HANDLE_RECOVERY_TIMEOUT,
                     TimerMode::Once,
                 )));
-            }
-            continue;
+        } else {
+            entity_commands.try_insert(DepartureConfirmed);
         }
-        info!("Window {window_id} left a Space with a dead AX element; closing it.");
-        commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
-            window_id: *window_id,
-            source: DestroySource::Accessibility { element: None },
-        }));
     }
 }
 
@@ -1210,6 +1210,7 @@ fn adopt_fresh_handle(window: &mut Window, app: &mut Application, config: &Confi
 /// * `apps` - A query for all applications.
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `windows` - A query for all windows with their parent.
+/// * `confirmed` - Windows that `confirm_space_departures` found gone.
 /// * `commands` - Bevy commands to despawn entities and trigger events.
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -1219,6 +1220,7 @@ pub(super) fn window_destroyed_trigger(
     mut apps: Query<&mut Application>,
     mut global_state: GlobalState,
     windows: Windows,
+    confirmed: Query<(), With<DepartureConfirmed>>,
     focus_history: Res<FocusHistory>,
     mut overrides: ResMut<TileOverrides>,
     mut commands: Commands,
@@ -1234,8 +1236,8 @@ pub(super) fn window_destroyed_trigger(
         };
 
         // Only the SLS notification is ambiguous: it also fires when a window merely leaves a
-        // space. `confirm_space_departures` confirms it and sends a close of its own for a window
-        // that is gone, so it is skipped here. A `kAXUIElementDestroyedNotification` means the AX
+        // space. `confirm_space_departures` confirms it from one AX read and marks a window that
+        // is gone with `DepartureConfirmed`, so only a marked window closes here. A `kAXUIElementDestroyedNotification` means the AX
         // element itself has been torn down and is taken at face value: confirming it against the
         // app is not just unnecessary but actively wrong, because both signals below lag the
         // teardown. `is_alive()` keeps succeeding on the dead element for apps that outlive their
@@ -1243,7 +1245,8 @@ pub(super) fn window_destroyed_trigger(
         // Re-checking them raced the window back to life, leaving the entity in the strip and a
         // permanent gap where the window had been.
         let reason = match source {
-            DestroySource::SpaceNotification => continue,
+            DestroySource::SpaceNotification if !confirmed.contains(entity) => continue,
+            DestroySource::SpaceNotification => "a Space notification with a dead AX element",
             DestroySource::Accessibility {
                 element: Some(element),
             } if !window.is_current_element(element) => {

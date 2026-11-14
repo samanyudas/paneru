@@ -788,6 +788,12 @@ pub struct VerifyFocus {
 #[derive(Component)]
 pub struct AwaitingHandle(pub Timer);
 
+/// Marks a window that `confirm_space_departures` found gone after a Space
+/// notification, so `window_destroyed_trigger` closes it from that same
+/// notification without another AX read or a second destroy event.
+#[derive(Component)]
+pub struct DepartureConfirmed;
+
 /// Reads a new window's level again each frame until the timer ends.
 /// Chrome shows its Picture-in-Picture window at the normal level and raises
 /// it a few tens of milliseconds later.
