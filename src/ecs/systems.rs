@@ -1018,16 +1018,17 @@ type FrameRechecks<'w, 's> = Query<
 /// moves the window again after each write would otherwise fight the engine
 /// without end.
 const FOREIGN_MOVE_ANSWERS: u8 = 3;
-/// How long the answers to such moves count together. A person who runs a
-/// window-snapping app's Move Left again a few seconds later gets an answer
-/// each time.
+/// How long after the last such move the answers start again. A person who
+/// runs a window-snapping app's Move Left again a few seconds later gets an
+/// answer each time.
 const FOREIGN_MOVE_FIGHT: Duration = Duration::from_secs(1);
 
-/// The engine's recent answers to an app moving a tiled window off `slot`.
+/// The engine's recent answers to an app moving a tiled window off `slot`,
+/// and when the app last did.
 #[derive(Component)]
 pub(crate) struct ForeignMoveAnswers {
     slot: Origin,
-    since: Duration,
+    last: Duration,
     count: u8,
 }
 
@@ -1042,13 +1043,14 @@ fn answer_foreign_move(
 ) -> bool {
     let fresh = ForeignMoveAnswers {
         slot,
-        since: now,
+        last: now,
         count: 1,
     };
     match answers.get_mut(entity) {
         Ok(mut answered)
-            if answered.slot == slot && now.saturating_sub(answered.since) < FOREIGN_MOVE_FIGHT =>
+            if answered.slot == slot && now.saturating_sub(answered.last) < FOREIGN_MOVE_FIGHT =>
         {
+            answered.last = now;
             if answered.count >= FOREIGN_MOVE_ANSWERS {
                 return false;
             }
@@ -1260,11 +1262,11 @@ pub(crate) fn window_frame_update(
                 let mut present: Vec<_> = window_manager
                     .present_displays()
                     .into_iter()
-                    .map(|(display, _)| (display.id(), display.bounds()))
+                    .map(|(display, _)| (display.id(), display.physical_bounds()))
                     .collect();
                 let mut known: Vec<_> = displays
                     .iter()
-                    .map(|display| (display.id(), display.bounds()))
+                    .map(|display| (display.id(), display.physical_bounds()))
                     .collect();
                 present.sort_by_key(|(id, _)| *id);
                 known.sort_by_key(|(id, _)| *id);
