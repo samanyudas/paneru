@@ -198,9 +198,9 @@ struct Carried {
 }
 
 impl Carried {
-    /// Whether the placement still holds `members`: one that reached its
-    /// place is away from it, which sends it back, or they have been there
-    /// for less than [`CARRIED_QUIET`].
+    /// Whether the placement still holds `members`: one is still moving, one
+    /// that reached its place is away from it, which sends it back, or they
+    /// have been still at their places for less than [`CARRIED_QUIET`].
     fn holds(
         &mut self,
         world: &mut World,
@@ -211,21 +211,23 @@ impl Carried {
         if now >= *self.until.get_or_insert(now + CARRIED_LIMIT) {
             return false;
         }
-        let mut away = false;
+        let mut unsettled = false;
         for &member in members {
             let Some(frame) = world.get::<Window>(member).map(|window| window.frame()) else {
                 continue;
             };
+            let still = moving.get(world, member).is_err();
             if at_written_origin(world, member, frame) {
                 self.reached.insert(member);
             } else if self.reached.contains(&member) {
-                away = true;
-                if moving.get(world, member).is_err() {
+                unsettled = true;
+                if still {
                     return_to_strip(world, member);
                 }
             }
+            unsettled |= !still;
         }
-        if away {
+        if unsettled {
             self.quiet_since = None;
             return true;
         }
@@ -1056,6 +1058,14 @@ fn observe_placements(world: &mut World) {
             });
             let gone = placing.members.is_empty();
             let targets = layout_frames(world, &placing.members);
+            // A person who takes a member again moves it themselves.
+            if world
+                .resource::<DragState>()
+                .held_window()
+                .is_some_and(|held| placing.members.contains(&held))
+            {
+                placing.carried = None;
+            }
             let held = placing
                 .carried
                 .as_mut()
