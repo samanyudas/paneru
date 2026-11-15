@@ -347,6 +347,7 @@ fn swipe_gesture(
     let mut total_delta = 0.0;
     let mut gesture_delta = 0.0;
     let mut touchpad_down = false;
+    let mut lifted = false;
     let mut has_scroll_event = false;
     let mut has_gesture_event = false;
 
@@ -366,7 +367,10 @@ fn swipe_gesture(
                 *fingers_down = true;
                 total_delta = 0.0;
             }
-            Event::TouchpadUp => *fingers_down = false,
+            Event::TouchpadUp => {
+                *fingers_down = false;
+                lifted = true;
+            }
             Event::Scroll { delta } => {
                 total_delta += *delta * scroll_scale;
                 has_scroll_event = true;
@@ -386,6 +390,18 @@ fn swipe_gesture(
         }
     }
 
+    if lifted {
+        // Every lift counts, even one whose fingers came back in the same
+        // frame, so a touch-down soon after the latest one continues the
+        // swipe.
+        for (.., scrolling) in &mut strips {
+            if let Some(mut scrolling) =
+                scrolling.filter(|scrolling| scrolling.fingers_down || scrolling.is_user_swiping)
+            {
+                scrolling.lifted_at = Some(time.elapsed());
+            }
+        }
+    }
     if !*fingers_down {
         for (.., scrolling) in &mut strips {
             let Some(mut scrolling) = scrolling.filter(|scrolling| scrolling.fingers_down) else {
@@ -444,7 +460,15 @@ fn swipe_gesture(
         entity_commands.try_remove::<ManualStripOffset>();
     }
 
-    if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
+    if touchpad_down
+        && let Some(scrolling) = scrolling.as_mut()
+        && continues_swipe(scrolling, time.elapsed())
+    {
+        // The trackpad lost a finger for a moment, so this is the same
+        // swipe: it keeps where it began, its column and its speed.
+        scrolling.is_user_swiping = true;
+        scrolling.last_event = time.elapsed();
+    } else if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
         // Fingers that catch a settle start a new swipe from where the strip
         // was headed, so a second quick swipe steps on from there.
         if let Some(target) = scrolling.settle {
@@ -459,6 +483,7 @@ fn swipe_gesture(
         scrolling.last_event = time.elapsed();
         scrolling.settle = None;
         scrolling.ease = None;
+        scrolling.lifted_at = None;
     }
 
     if has_scroll_event {
@@ -508,9 +533,26 @@ fn swipe_gesture(
                 focus_at_start: focused,
                 start: None,
                 fingers_down: *fingers_down,
+                lifted_at: None,
             });
         }
     }
+}
+
+/// How soon after a lift a touch-down still continues the same swipe. Near
+/// its edge, the trackpad can report a finger lifted and touching down again
+/// 1 to 14 ms apart while the fingers keep moving (miri#494). A new swipe
+/// needs the fingers back on the trackpad, which takes far longer.
+const RETOUCH_WINDOW: Duration = Duration::from_millis(40);
+
+/// Whether a touch-down at `now` continues `scrolling`'s swipe instead of
+/// starting a new one: the latest lift was no more than [`RETOUCH_WINDOW`]
+/// ago, and the strip has not started to settle.
+fn continues_swipe(scrolling: &Scrolling, now: Duration) -> bool {
+    scrolling.settle.is_none()
+        && scrolling
+            .lifted_at
+            .is_some_and(|lifted| now.saturating_sub(lifted) <= RETOUCH_WINDOW)
 }
 
 /// The strip this frame's swipe input drives. The strip under the fingers
