@@ -42,7 +42,9 @@ use tracing::{debug, warn};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::shared_edge::Slide;
-use crate::ecs::systems::{AnimationStep, ease_out_factor, ease_step};
+use crate::ecs::systems::{
+    AnimationStep, LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, ease_out_factor, ease_step,
+};
 use crate::ecs::{
     Bounds, FocusedMarker, Position, PresentedOrigin, RepositionMarker, ResizeMarker,
 };
@@ -291,12 +293,15 @@ pub(super) struct Tracked {
     /// Where the window shows away from where the engine asked for it, and
     /// since when it has shown no progress.
     late: Option<(Edges, Duration)>,
+    /// Where the engine first asked for the window this motion.
+    start: Option<Edges>,
 }
 
 impl Tracked {
     /// Takes in that the engine asked for the window at `asked` last frame
     /// and the window server shows it at `shown`, if it lists it.
     fn see(&mut self, asked: Edges, shown: Option<Edges>, now: Duration) -> Pacer {
+        self.start.get_or_insert(asked);
         let before = self.asked.replace(asked);
         match shown {
             Some(edges) if edges != asked => {
@@ -337,6 +342,13 @@ impl Tracked {
         self.on_time = false;
         self.late_this_motion = false;
         self.late = None;
+        self.start = None;
+    }
+
+    /// Where the window started this motion, while the window server still
+    /// shows it there.
+    fn unmoved(&self, shown: Option<Edges>) -> Option<Edges> {
+        self.start.filter(|&start| shown == Some(start))
     }
 }
 
@@ -514,13 +526,19 @@ pub(super) fn pace_rows(
 
     let now = time.elapsed();
     let t = ease_out_factor(config.animation_speed(), step.secs());
+    let first_t = ease_out_factor(
+        config.animation_speed(),
+        f64::from(LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS) / 1000.0,
+    );
     for row in rows {
         let mut row = row
             .into_iter()
             .map(|column| {
                 column
                     .into_iter()
-                    .filter_map(|entity| member(entity, &windows, &shown, &mut tracked, t, now))
+                    .filter_map(|entity| {
+                        member(entity, &windows, &shown, &mut tracked, (t, first_t), now)
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -557,13 +575,14 @@ pub(super) fn pace_rows(
 }
 
 /// The row window `entity` as pacing sees it this frame, with `t` the
-/// row's ease this frame and `tracked` what the engine has seen of each app.
+/// row's ease this frame, `first_t` the ease of a slide's first step, and
+/// `tracked` what the engine has seen of each app.
 fn member(
     entity: Entity,
     windows: &RowWindows,
     shown: &Shown,
     tracked: &mut EntityHashMap<Tracked>,
-    t: f32,
+    (t, first_t): (f32, f32),
     now: Duration,
 ) -> Option<Member> {
     let (window, position, bounds, to, resize, slide) = windows.get(entity).ok()?;
@@ -605,10 +624,9 @@ fn member(
             slides: true,
         });
     }
-    let pacer = tracked
-        .entry(entity)
-        .or_default()
-        .see(asked, shown_edges, now);
+    let record = tracked.entry(entity).or_default();
+    let pacer = record.see(asked, shown_edges, now);
+    let unmoved = record.unmoved(shown_edges);
     // A window landing under its photo shows where its photo rests, however
     // far its app has yet to take it, and has no move of its own yet but
     // still heads where layout puts it.
@@ -617,11 +635,28 @@ fn member(
         None => (to.map_or(position.0.x, |to| to.0.x), pacer),
     };
     let target_width = resize.map_or(width, |resize| resize.0.x);
+    let in_motion = to.is_some() && slide.is_none();
+    // A window whose app has yet to show any move this motion gets only the
+    // first step of its slide until it does. Asked on, it would show its
+    // first move however far the ease had got by then, which right after a
+    // focus change is half the way, over the window beside it (miri#500).
+    // The windows ahead wait for where it shows, so the row starts together.
+    let x = match (pacer, unmoved) {
+        (Pacer::Shown(_), Some(start)) if in_motion && resize.is_none() => {
+            let (step, _) = ease_step(IVec2::X * start.left, IVec2::X * target, first_t);
+            if (position.0.x - step.x) * (step.x - start.left) > 0 {
+                step.x
+            } else {
+                position.0.x
+            }
+        }
+        _ => position.0.x,
+    };
     Some(Member {
         entity,
         id,
         eased: position.0.x,
-        x: position.0.x,
+        x,
         width,
         // With animation off the resize lands in one step, so pacing holds no
         // width.
@@ -632,7 +667,7 @@ fn member(
         asked: asked.left,
         asked_edges: asked,
         pacer,
-        paced: to.is_some() && slide.is_none(),
+        paced: in_motion,
         slides: false,
     })
 }

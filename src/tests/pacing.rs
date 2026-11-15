@@ -233,6 +233,49 @@ fn the_window_ahead_waits_for_a_slow_window_behind_it_scrolling_right() {
     );
 }
 
+/// Focus moves to the slow window 1, and the row scrolls it into view. Its
+/// app shows nothing for three frames, as an app that gains focus does. Once
+/// it answers, window 1 shows its first step and slides on from there,
+/// rather than showing far along at once while it covers window 0 (miri#500).
+#[test]
+fn a_slow_window_coming_into_view_starts_its_slide_where_its_app_first_shows_it() {
+    let mut harness = harness();
+    let start = harness.mock_state.ax_frame(1).min.x;
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::East));
+    for _ in 0..3 {
+        harness.advance(FRAME);
+    }
+    let mut shown = vec![start];
+    land_slow_writes(&mut harness);
+    shown.push(harness.mock_state.ax_frame(1).min.x);
+    for _ in 0..200 {
+        harness.mock_state.hold_writes(SLOW_APP);
+        harness.advance(FRAME);
+        land_slow_writes(&mut harness);
+        shown.push(harness.mock_state.ax_frame(1).min.x);
+        if !moving(harness.world()) {
+            break;
+        }
+    }
+    settle(&mut harness);
+    assert_landed(&mut harness);
+
+    let end = harness.mock_state.ax_frame(1).min.x;
+    assert!(
+        end < start,
+        "window 1 scrolled into view from {start} to {end}"
+    );
+    let largest_step = (start - end) / 3;
+    assert!(
+        shown
+            .windows(2)
+            .all(|pair| (0..=largest_step).contains(&(pair[0] - pair[1]))),
+        "window 1 slides from {start} to {end} in steps of at most {largest_step}: {shown:?}"
+    );
+}
+
 /// The slow window 1 widens between windows 0 and 2. Its right edge moves
 /// right as its left edge moves left, so window 2 ahead on the right waits
 /// for its right edge, as window 0 on the left waits for its left edge.

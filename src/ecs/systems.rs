@@ -102,7 +102,7 @@ type ChangedWindowFrames<'w, 's> = Populated<
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
-const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
+pub(super) const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
 // Real events (input, IPC, workspace changes, ...) wake the pump immediately
 // via `EventLoopWaker`, so this only bounds how late the free-running 1s
