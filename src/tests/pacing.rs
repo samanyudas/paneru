@@ -22,8 +22,10 @@ const FAST_APP: Pid = 2;
 
 /// Three of them fill more than the display.
 const WINDOW_WIDTH: i32 = 600;
-/// How long each of the slow app's writes takes, so that it shows each move
-/// a frame or more late.
+/// How long each of the slow app's writes takes once its writes are let
+/// through. The tests hold its writes while frames run and land them between
+/// frames, so this sets no lateness on the engine's clock. It only makes
+/// each landing take real time, as a slow app's does.
 const SLOW_WRITE: Duration = Duration::from_millis(40);
 const FRAME: Duration = Duration::from_millis(20);
 const FLUSH: Duration = Duration::from_secs(5);
@@ -119,20 +121,38 @@ fn gap(harness: &TestHarness, left: WinID, right: WinID) -> i32 {
     harness.mock_state.ax_frame(right).min.x - harness.mock_state.ax_frame(left).max.x
 }
 
-/// Runs frames at the speed the slow app takes its moves until the row
-/// settles, asserting after each that no more desktop than `rest` shows
-/// between windows `left` and `right`.
+/// Lets the slow app take every move it has been asked for, and waits until
+/// it has.
+fn land_slow_writes(harness: &mut TestHarness) {
+    harness.mock_state.release_writes(SLOW_APP);
+    assert!(
+        harness.mock_state.flush_writes(FLUSH),
+        "the slow app takes its moves"
+    );
+}
+
+/// Runs frames until the row settles, with the slow app showing each move
+/// one frame late, and asserts after each frame that no more desktop than
+/// `rest` shows between windows `left` and `right`.
+///
+/// The slow app's writes land between frames, never during one. Pacing
+/// stops waiting for a window shown late for `LANDING_TIMEOUT` of engine
+/// time, and a real write delay let a loaded machine run the frames past it
+/// before the app answered (miri#496).
 fn settle_beside(harness: &mut TestHarness, left: WinID, right: WinID, rest: i32) {
+    // The app answers the writes it held as it is released.
+    land_slow_writes(harness);
     for frame in 0..200 {
+        harness.mock_state.hold_writes(SLOW_APP);
         harness.advance(FRAME);
-        std::thread::sleep(FRAME);
         assert!(
             gap(harness, left, right) <= rest,
             "desktop shows between windows {left} and {right} {frame} frames after the release: {:?} {:?}",
             harness.mock_state.ax_frame(left),
             harness.mock_state.ax_frame(right)
         );
-        if !moving(harness.world()) && harness.mock_state.flush_writes(Duration::ZERO) {
+        land_slow_writes(harness);
+        if !moving(harness.world()) {
             return;
         }
     }

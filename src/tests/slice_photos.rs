@@ -2677,18 +2677,24 @@ fn a_window_leaving_past_the_edge_waits_for_a_slow_window_behind_it() {
         "window 0 rests in view"
     );
 
-    // Pacing stops waiting for a window shown late for `LANDING_TIMEOUT`, and
-    // the slow app takes its raise before its first move. Hold its writes
-    // for little enough of that time that the raise and move still fit.
+    // Pacing stops waiting for a window shown late for `LANDING_TIMEOUT` of
+    // engine time, and the slow app takes its raise before its first move.
+    // Hold its writes for little enough of that time that the raise and move
+    // still fit.
     harness.mock_state.hold_writes(TEST_PROCESS_ID);
     let mut seen = watch(&mut harness, &log, &ids, &[(0, Direction::East)], 5);
-    harness.mock_state.release_writes(TEST_PROCESS_ID);
-    // At the speed the slow app takes its moves, through its last one.
+    // Then the slow app shows each move one frame late, through its last
+    // one: its writes land between frames, never during one. A real write
+    // delay let a loaded machine run the frames past `LANDING_TIMEOUT`
+    // before the app answered (miri#496).
     for _ in 0..40 {
+        harness.mock_state.release_writes(TEST_PROCESS_ID);
+        assert!(harness.mock_state.flush_writes(Duration::from_secs(5)));
+        harness.mock_state.hold_writes(TEST_PROCESS_ID);
         harness.advance(Duration::from_millis(20));
-        std::thread::sleep(Duration::from_millis(20));
         seen.push(scanline(&harness, &log, &ids));
     }
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
     assert!(harness.mock_state.flush_writes(Duration::from_secs(5)));
 
     for (frame, runs) in seen.iter().enumerate() {
