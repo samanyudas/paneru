@@ -531,6 +531,10 @@ pub struct Scrolling {
     /// lifted. Fingers held still send no swipe events, so this, not a pause,
     /// ends a window-landing swipe.
     pub fingers_down: bool,
+    /// When the trackpad last reported the fingers lifted. A touch-down soon
+    /// after it, before the settle starts, continues this swipe; see
+    /// `scroll::continues_swipe`.
+    pub lifted_at: Option<Duration>,
 }
 
 /// The progress of a settle along its ease. See `scroll::settle_strip`.
@@ -1654,6 +1658,7 @@ mod tests {
                     focus_at_start: None,
                     start: None,
                     fingers_down: false,
+                    lifted_at: None,
                 });
             }),
             "overlay must rerun to hide when Scrolling starts"
