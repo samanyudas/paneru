@@ -42,9 +42,7 @@ use tracing::{debug, warn};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::shared_edge::Slide;
-use crate::ecs::systems::{
-    AnimationStep, LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, ease_out_factor, ease_step,
-};
+use crate::ecs::systems::{AnimationStep, ease_out_factor, ease_step};
 use crate::ecs::{
     Bounds, FocusedMarker, Position, PresentedOrigin, RepositionMarker, ResizeMarker,
 };
@@ -526,10 +524,7 @@ pub(super) fn pace_rows(
 
     let now = time.elapsed();
     let t = ease_out_factor(config.animation_speed(), step.secs());
-    let first_t = ease_out_factor(
-        config.animation_speed(),
-        f64::from(LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS) / 1000.0,
-    );
+    let first_t = ease_out_factor(config.animation_speed(), AnimationStep::first_step_secs());
     for row in rows {
         let mut row = row
             .into_iter()

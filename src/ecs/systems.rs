@@ -102,7 +102,7 @@ type ChangedWindowFrames<'w, 's> = Populated<
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
-pub(super) const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
+const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
 // Real events (input, IPC, workspace changes, ...) wake the pump immediately
 // via `EventLoopWaker`, so this only bounds how late the free-running 1s
@@ -707,13 +707,57 @@ const MAX_ANIMATION_STEP_SECS: f64 = 1.0 / 30.0;
 #[derive(Clone, Copy, Debug, Default, Resource)]
 pub(crate) struct AnimationStep {
     secs: f64,
+    /// [`AnimationStep::secs`] before the gentle start slows it.
+    raw_secs: f64,
+    /// How long the motion has run since the row was last at rest.
+    since_rest: f64,
     /// How long the last pump slept with nothing in motion.
     idle_sleep: f64,
 }
 
 impl AnimationStep {
+    /// The time each window and photo ease steps by this pass, slowed near
+    /// the start of a motion by [`gentle_start`].
     pub(crate) fn secs(self) -> f64 {
         self.secs
+    }
+
+    /// The pass's time as the clock measured it, for eases that set their own
+    /// curve, such as a swipe settling.
+    pub(crate) fn raw_secs(self) -> f64 {
+        self.raw_secs
+    }
+
+    /// The time a slide's first frame steps by from rest.
+    pub(crate) fn first_step_secs() -> f64 {
+        let frame = f64::from(LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS) / 1000.0;
+        frame * start_pace(frame / 2.0)
+    }
+}
+
+/// Prototype for miri#500: how long a slide from rest takes to reach full
+/// pace, in seconds, from `PANERU_GENTLE_START_MS`. Zero, the default, keeps
+/// the plain ease-out. While the pace builds, the windows of a row move less
+/// per frame, so a window whose app shows a move a frame late falls less far
+/// behind the window beside it.
+fn gentle_start() -> f64 {
+    static GENTLE_START: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *GENTLE_START.get_or_init(|| {
+        std::env::var("PANERU_GENTLE_START_MS")
+            .ok()
+            .and_then(|ms| ms.parse::<f64>().ok())
+            .map_or(0.0, |ms| ms.max(0.0) / 1000.0)
+    })
+}
+
+/// The share of full pace a slide moves at `at` seconds after it left rest:
+/// rising evenly from none to all over [`gentle_start`].
+fn start_pace(at: f64) -> f64 {
+    let ramp = gentle_start();
+    if ramp > 0.0 {
+        (at / ramp).clamp(0.0, 1.0)
+    } else {
+        1.0
     }
 }
 
@@ -737,7 +781,14 @@ pub(crate) fn step_animation_clock(
     time: Res<Time>,
     mut step: ResMut<AnimationStep>,
 ) {
-    step.secs = animation_step(time.delta_secs_f64(), step.idle_sleep, activity.mid_frame());
+    let moving = activity.mid_frame();
+    let raw = animation_step(time.delta_secs_f64(), step.idle_sleep, moving);
+    if !moving {
+        step.since_rest = 0.0;
+    }
+    step.raw_secs = raw;
+    step.secs = raw * start_pace(step.since_rest + raw / 2.0);
+    step.since_rest += raw;
 }
 
 /// Fraction of the remaining distance an exponential ease-out consumes in a

@@ -1106,7 +1106,7 @@ fn settle_strip(
             elapsed: 0.0,
             slope,
         });
-        ease.elapsed += step.secs();
+        ease.elapsed += step.raw_secs();
         let ease = *ease;
         // The ease carries the strip's speed from here.
         scroll.velocity = 0.0;
