@@ -375,6 +375,8 @@ struct Member {
     /// The window's photo slides it at a shared edge: pacing holds the
     /// photo, not the window.
     slides: bool,
+    /// The window has slid as a photo or landed under one this motion.
+    photo: bool,
 }
 
 impl Member {
@@ -437,6 +439,29 @@ impl Member {
             self.x = self.x.min(bound).max(self.asked);
         }
     }
+
+    /// Brings a window that moves left at least as far left as `bound`, but
+    /// not past its target. A window held for a slow window behind it would
+    /// otherwise ease on from where it waited once that window catches up in
+    /// one jump, and the window behind would slide over it (miri#500).
+    fn catch_up_left_to(&mut self, bound: i32) {
+        if self.paced && self.eased < self.asked {
+            self.x = self.x.min(bound.max(self.target));
+        }
+    }
+
+    /// Brings a window that moves right at least as far right as `bound`,
+    /// but not past its target, as [`Member::catch_up_left_to`] does.
+    fn catch_up_right_to(&mut self, bound: i32) {
+        if self.paced && self.eased > self.asked {
+            self.x = self.x.max(bound.min(self.target));
+        }
+    }
+
+    /// Whether pacing put the window further along than the animation did.
+    fn caught_up(&self) -> bool {
+        (self.target - self.x).abs() < (self.target - self.eased).abs()
+    }
 }
 
 type RowWindows<'w, 's> = Query<
@@ -472,6 +497,7 @@ pub(super) fn pace_rows(
     config: Res<Config>,
     mut slide_holds: ResMut<SlideHolds>,
     mut tracked: Local<EntityHashMap<Tracked>>,
+    mut photos: Local<EntityHashSet>,
     mut watching: Local<bool>,
 ) {
     *slide_holds = SlideHolds::default();
@@ -494,6 +520,7 @@ pub(super) fn pace_rows(
                 window.rest();
                 windows.contains(entity)
             });
+            photos.clear();
             *watching = false;
         }
         return;
@@ -520,7 +547,9 @@ pub(super) fn pace_rows(
             .map(|column| {
                 column
                     .into_iter()
-                    .filter_map(|entity| member(entity, &windows, &shown, &mut tracked, t, now))
+                    .filter_map(|entity| {
+                        member(entity, &windows, &shown, &mut tracked, &mut photos, t, now)
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -536,16 +565,23 @@ pub(super) fn pace_rows(
                 );
                 slide_holds.bounds.insert(member.entity, member.x);
             } else if let Ok((_, mut position, mut bounds, ..)) = windows.get_mut(member.entity) {
-                debug!(
-                    "pacing holds window {} at x {} right {} short of {} right {} on its way to {} right {}",
-                    member.id,
-                    member.x,
-                    member.right(),
-                    member.eased,
-                    member.eased + member.width,
-                    member.target,
-                    member.target_right
-                );
+                if member.caught_up() {
+                    debug!(
+                        "pacing brings window {} up to x {} from {} on its way to {}",
+                        member.id, member.x, member.eased, member.target
+                    );
+                } else {
+                    debug!(
+                        "pacing holds window {} at x {} right {} short of {} right {} on its way to {} right {}",
+                        member.id,
+                        member.x,
+                        member.right(),
+                        member.eased,
+                        member.eased + member.width,
+                        member.target,
+                        member.target_right
+                    );
+                }
                 position.0.x = member.x;
                 let width = member.right() - member.x;
                 if bounds.0.x != width {
@@ -557,12 +593,15 @@ pub(super) fn pace_rows(
 }
 
 /// The row window `entity` as pacing sees it this frame, with `t` the
-/// row's ease this frame and `tracked` what the engine has seen of each app.
+/// row's ease this frame, `tracked` what the engine has seen of each app, and
+/// `photos` the windows that have slid as a photo or landed under one this
+/// motion.
 fn member(
     entity: Entity,
     windows: &RowWindows,
     shown: &Shown,
     tracked: &mut EntityHashMap<Tracked>,
+    photos: &mut EntityHashSet,
     t: f32,
     now: Duration,
 ) -> Option<Member> {
@@ -577,6 +616,7 @@ fn member(
     if let Some((at, heading_to)) = slide.and_then(|(slide, presented)| heading(slide, presented.0))
     {
         let (step, _) = ease_step(at, heading_to, t);
+        photos.insert(entity);
         // A photo shows at once where it steps to this frame. A window
         // leaving for its tuck moves itself, as late as its app takes the
         // move.
@@ -603,12 +643,16 @@ fn member(
             pacer,
             paced: true,
             slides: true,
+            photo: true,
         });
     }
     let pacer = tracked
         .entry(entity)
         .or_default()
         .see(asked, shown_edges, now);
+    if slide.is_some() {
+        photos.insert(entity);
+    }
     // A window landing under its photo shows where its photo rests, however
     // far its app has yet to take it, and has no move of its own yet but
     // still heads where layout puts it.
@@ -634,6 +678,7 @@ fn member(
         pacer,
         paced: to.is_some() && slide.is_none(),
         slides: false,
+        photo: photos.contains(&entity),
     })
 }
 
@@ -766,10 +811,14 @@ fn moving_rows(strips: &Query<&LayoutStrip>, windows: &RowWindows) -> Vec<Vec<Ve
         .collect()
 }
 
-/// Holds the columns of `row`, left to right, from behind each one in the
+/// Paces the columns of `row`, left to right, from behind each one in the
 /// direction of motion to the front, so each column follows where the edge
-/// of the column behind it that faces it is this frame.
+/// of the column behind it that faces it is this frame: no closer to its
+/// target than that column is to its own. In a row with no photo this
+/// motion, also no further from it. Photos hand over to their windows by
+/// rules of their own, which keep a revealed window from jumping.
 fn pace_row(row: &mut [Vec<Member>]) {
+    let catch_up = row.iter().flatten().all(|member| !member.photo);
     // A column whose left edge is right of its target has yet to move left,
     // so the column left of it, ahead, may get no closer to its own.
     for index in (0..row.len().saturating_sub(1)).rev() {
@@ -777,6 +826,9 @@ fn pace_row(row: &mut [Vec<Member>]) {
         if let Some(lag) = lag.filter(|&lag| lag > 0) {
             for member in &mut row[index] {
                 member.hold_right_of(member.target + lag);
+                if catch_up {
+                    member.catch_up_left_to(member.target + lag);
+                }
                 member.hold_right_edge_right_of(member.target_right + lag);
             }
         }
@@ -786,6 +838,9 @@ fn pace_row(row: &mut [Vec<Member>]) {
         if let Some(lag) = lag.filter(|&lag| lag < 0) {
             for member in &mut row[index] {
                 member.hold_left_of(member.target + lag);
+                if catch_up {
+                    member.catch_up_right_to(member.target + lag);
+                }
             }
         }
     }

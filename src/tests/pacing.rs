@@ -233,6 +233,79 @@ fn the_window_ahead_waits_for_a_slow_window_behind_it_scrolling_right() {
     );
 }
 
+/// Runs frames until the row settles, as [`settle_beside`] does, and
+/// returns how much desktop showed between windows `left` and `right` after
+/// each frame, negative where one covered the other.
+fn settle_gaps(harness: &mut TestHarness, left: WinID, right: WinID) -> Vec<i32> {
+    land_slow_writes(harness);
+    let mut gaps = Vec::new();
+    for _ in 0..200 {
+        harness.mock_state.hold_writes(SLOW_APP);
+        harness.advance(FRAME);
+        gaps.push(gap(harness, left, right));
+        land_slow_writes(harness);
+        if !moving(harness.world()) {
+            return gaps;
+        }
+    }
+    panic!("the row did not settle");
+}
+
+/// Asserts that windows `left` and `right` met after each frame of `gaps`
+/// as they do at rest before the motion, `before`, or after it: no more
+/// desktop showed between them, and neither covered more of the other.
+fn assert_touching(harness: &TestHarness, gaps: &[i32], before: i32, left: WinID, right: WinID) {
+    let after = gap(harness, left, right);
+    let (least, most) = (before.min(after), before.max(after));
+    for (frame, &gap) in gaps.iter().enumerate() {
+        assert!(
+            (least..=most).contains(&gap),
+            "windows {left} and {right} met with a gap of {gap} {frame} frames after the release, \
+             outside {least}..={most}: {gaps:?}"
+        );
+    }
+}
+
+/// Once the slow window 1 behind takes its late moves in one jump, window 0
+/// ahead, which waited for it, moves as far at once, rather than easing on
+/// from where it waited while window 1 slides over it (miri#500).
+#[test]
+fn the_window_ahead_keeps_up_once_a_slow_window_behind_it_jumps() {
+    let mut harness = harness();
+    let before = gap(&harness, 0, 1);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::East));
+    for _ in 0..3 {
+        harness.advance(FRAME);
+    }
+    let gaps = settle_gaps(&mut harness, 0, 1);
+    settle(&mut harness);
+    assert_landed(&mut harness);
+    assert_touching(&harness, &gaps, before, 0, 1);
+}
+
+/// The same as the row scrolls right: window 2 ahead keeps up with the slow
+/// window 1 behind it. Window 2 ends tucked at the display's right edge,
+/// partly over window 1.
+#[test]
+fn the_window_ahead_keeps_up_once_a_slow_window_behind_it_jumps_scrolling_right() {
+    let mut harness = harness();
+    harness.world().write_message(focus(Direction::Last));
+    settle(&mut harness);
+    let before = gap(&harness, 1, 2);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::First));
+    for _ in 0..3 {
+        harness.advance(FRAME);
+    }
+    let gaps = settle_gaps(&mut harness, 1, 2);
+    settle(&mut harness);
+    assert_landed(&mut harness);
+    assert_touching(&harness, &gaps, before, 1, 2);
+}
+
 /// The slow window 1 widens between windows 0 and 2. Its right edge moves
 /// right as its left edge moves left, so window 2 ahead on the right waits
 /// for its right edge, as window 0 on the left waits for its left edge.
