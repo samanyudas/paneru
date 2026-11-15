@@ -736,14 +736,15 @@ impl AnimationStep {
 }
 
 /// Prototype for miri#500: how long a slide from rest takes to reach full
-/// pace, in seconds, from `PANERU_GENTLE_START_MS`. Zero, the default, keeps
+/// pace, in seconds, from `MIRI_PROTO_GENTLE_START_MS` (Miri drops `PANERU_`
+/// variables before it starts the engine). Zero, the default, keeps
 /// the plain ease-out. While the pace builds, the windows of a row move less
 /// per frame, so a window whose app shows a move a frame late falls less far
 /// behind the window beside it.
 fn gentle_start() -> f64 {
     static GENTLE_START: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *GENTLE_START.get_or_init(|| {
-        std::env::var("PANERU_GENTLE_START_MS")
+        std::env::var("MIRI_PROTO_GENTLE_START_MS")
             .ok()
             .and_then(|ms| ms.parse::<f64>().ok())
             .map_or(0.0, |ms| ms.max(0.0) / 1000.0)
