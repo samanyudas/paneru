@@ -1144,6 +1144,33 @@ fn window_landing_keeps_a_swipe_through_a_lost_finger() {
     }
 }
 
+/// The trackpad can lose and find a finger twice in a row, with the first
+/// touch-down and the next lift in the same frame, as in Sam's capture:
+/// lifted, back 1 ms later, lifted 4 ms later, back 12 ms later, then the
+/// real lift. The swipe still lands on the next column.
+#[test]
+fn window_landing_keeps_a_swipe_through_a_finger_lost_twice() {
+    let mut harness = window_landing_harness_with_widths(&[640, 1024, 512, 700], false);
+    harness.run(vec![focus(Direction::Nth(1))]);
+    harness.advance(SETTLE);
+
+    send(&mut harness, Event::TouchpadDown);
+    move_fingers(&mut harness, 0.03, 8);
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(Duration::from_millis(1));
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(Duration::from_millis(12));
+    send(&mut harness, Event::TouchpadDown);
+    harness.advance(Duration::from_millis(7));
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(SETTLE);
+
+    assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_focused!(harness.world(), 2);
+    assert_eq!(window_x(harness.world(), 2), TEST_DISPLAY_WIDTH - 512);
+}
+
 /// The strip follows the fingers one to one, and a long drag stretches with
 /// resistance once the next column shows in full, so the landing never jumps
 /// back across columns the fingers pulled past. On lift it eases back from

@@ -347,6 +347,7 @@ fn swipe_gesture(
     let mut total_delta = 0.0;
     let mut gesture_delta = 0.0;
     let mut touchpad_down = false;
+    let mut lifted = false;
     let mut has_scroll_event = false;
     let mut has_gesture_event = false;
 
@@ -366,7 +367,10 @@ fn swipe_gesture(
                 *fingers_down = true;
                 total_delta = 0.0;
             }
-            Event::TouchpadUp => *fingers_down = false,
+            Event::TouchpadUp => {
+                *fingers_down = false;
+                lifted = true;
+            }
             Event::Scroll { delta } => {
                 total_delta += *delta * scroll_scale;
                 has_scroll_event = true;
@@ -386,13 +390,24 @@ fn swipe_gesture(
         }
     }
 
+    if lifted {
+        // Every lift counts, even one whose fingers came back in the same
+        // frame, so a touch-down soon after the latest one continues the
+        // swipe.
+        for (.., scrolling) in &mut strips {
+            if let Some(mut scrolling) =
+                scrolling.filter(|scrolling| scrolling.fingers_down || scrolling.is_user_swiping)
+            {
+                scrolling.lifted_at = Some(time.elapsed());
+            }
+        }
+    }
     if !*fingers_down {
         for (.., scrolling) in &mut strips {
             let Some(mut scrolling) = scrolling.filter(|scrolling| scrolling.fingers_down) else {
                 continue;
             };
             scrolling.fingers_down = false;
-            scrolling.lifted_at = Some(time.elapsed());
             // Fingers that held still before they lifted made no flick,
             // whatever speed they moved at before the hold.
             if lands_on_window(&config, scrolling.input)
@@ -453,7 +468,6 @@ fn swipe_gesture(
         // swipe: it keeps where it began, its column and its speed.
         scrolling.is_user_swiping = true;
         scrolling.last_event = time.elapsed();
-        scrolling.lifted_at = None;
     } else if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
         // Fingers that catch a settle start a new swipe from where the strip
         // was headed, so a second quick swipe steps on from there.
@@ -532,7 +546,7 @@ fn swipe_gesture(
 const RETOUCH_WINDOW: Duration = Duration::from_millis(40);
 
 /// Whether a touch-down at `now` continues `scrolling`'s swipe instead of
-/// starting a new one: the fingers lifted no more than [`RETOUCH_WINDOW`]
+/// starting a new one: the latest lift was no more than [`RETOUCH_WINDOW`]
 /// ago, and the strip has not started to settle.
 fn continues_swipe(scrolling: &Scrolling, now: Duration) -> bool {
     scrolling.settle.is_none()

@@ -531,9 +531,9 @@ pub struct Scrolling {
     /// lifted. Fingers held still send no swipe events, so this, not a pause,
     /// ends a window-landing swipe.
     pub fingers_down: bool,
-    /// When the trackpad last reported the fingers lifted. A touch-down soon
-    /// after it, before the settle starts, continues this swipe; see
-    /// `scroll::continues_swipe`.
+    /// When the trackpad last reported the fingers lifted during this swipe.
+    /// A touch-down soon after it, before the settle starts, continues this
+    /// swipe; see `scroll::continues_swipe`.
     pub lifted_at: Option<Duration>,
 }
 
