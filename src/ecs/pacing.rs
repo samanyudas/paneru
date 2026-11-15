@@ -295,6 +295,18 @@ pub(super) struct Tracked {
     late: Option<(Edges, Duration)>,
     /// Where the engine first asked for the window this motion.
     start: Option<Edges>,
+    /// Where pacing held the window last frame, short of its slide.
+    held: Option<Held>,
+}
+
+/// A window that pacing held back for a frame.
+#[derive(Clone, Copy)]
+struct Held {
+    /// Where the window's slide would have put it.
+    free: i32,
+    /// Where pacing put it instead.
+    at: i32,
+    target: i32,
 }
 
 impl Tracked {
@@ -343,6 +355,29 @@ impl Tracked {
         self.late_this_motion = false;
         self.late = None;
         self.start = None;
+        self.held = None;
+    }
+
+    /// Where the window's slide puts it this frame had pacing not held it
+    /// last frame: one step on from where it would have been then. `at`,
+    /// where the animation stepped it to from where pacing held it, if
+    /// pacing did not hold it or something else has moved it since. Pacing
+    /// writes where it holds a window back into its slide, so a window held
+    /// for a slow window behind it would otherwise ease on from where it
+    /// waited, and trail that window for the rest of the motion (miri#500).
+    fn free(&mut self, at: i32, target: i32, t: f32) -> i32 {
+        let step = |from: i32| ease_step(IVec2::X * from, IVec2::X * target, t).0.x;
+        match self.held.take() {
+            Some(held) if held.target == target && step(held.at) == at => {
+                let free = step(held.free);
+                if (target - free).abs() <= (target - at).abs() {
+                    free
+                } else {
+                    at
+                }
+            }
+            _ => at,
+        }
     }
 
     /// Where the window started this motion, while the window server still
@@ -369,6 +404,9 @@ struct Member {
     id: WinID,
     /// Where the animation puts the window this frame.
     eased: i32,
+    /// Where the window's slide puts it this frame had pacing never held
+    /// it, or the first step a window gets until its app shows a move.
+    free: i32,
     /// Where pacing lets the window go this frame.
     x: i32,
     /// How wide the animation makes the window this frame.
@@ -437,7 +475,7 @@ impl Member {
     /// Keeps a window that moves left at `bound` or right of it, but never
     /// further right than where the engine last asked for it.
     fn hold_right_of(&mut self, bound: i32) {
-        if self.paced && self.eased < self.asked {
+        if self.paced && self.x < self.asked {
             self.x = self.x.max(bound).min(self.asked);
         }
     }
@@ -445,7 +483,7 @@ impl Member {
     /// Keeps a window that moves right at `bound` or left of it, but never
     /// further left than where the engine last asked for it.
     fn hold_left_of(&mut self, bound: i32) {
-        if self.paced && self.eased > self.asked {
+        if self.paced && self.x > self.asked {
             self.x = self.x.min(bound).max(self.asked);
         }
     }
@@ -543,6 +581,15 @@ pub(super) fn pace_rows(
             })
             .collect::<Vec<_>>();
         pace_row(&mut row);
+        for member in row.iter().flatten().filter(|member| !member.slides) {
+            if let Some(record) = tracked.get_mut(&member.entity) {
+                record.held = (member.paced && member.x != member.free).then_some(Held {
+                    free: member.free,
+                    at: member.x,
+                    target: member.target,
+                });
+            }
+        }
 
         for member in row.iter().flatten().filter(|member| {
             member.x != member.eased || member.right() != member.eased + member.width
@@ -555,7 +602,7 @@ pub(super) fn pace_rows(
                 slide_holds.bounds.insert(member.entity, member.x);
             } else if let Ok((_, mut position, mut bounds, ..)) = windows.get_mut(member.entity) {
                 debug!(
-                    "pacing holds window {} at x {} right {} short of {} right {} on its way to {} right {}",
+                    "pacing puts window {} at x {} right {}, not at {} right {}, on its way to {} right {}",
                     member.id,
                     member.x,
                     member.right(),
@@ -612,6 +659,7 @@ fn member(
             entity,
             id,
             eased: step.x,
+            free: step.x,
             x: step.x,
             width,
             held_right: None,
@@ -636,27 +684,42 @@ fn member(
     };
     let target_width = resize.map_or(width, |resize| resize.0.x);
     let in_motion = to.is_some() && slide.is_none();
-    // A window whose app has yet to show any move this motion gets only the
-    // first step of its slide until it does. Asked on, it would show its
-    // first move however far the ease had got by then, which right after a
-    // focus change is half the way, over the window beside it (miri#500).
-    // The windows ahead wait for where it shows, so the row starts together.
-    let x = match (pacer, unmoved) {
-        (Pacer::Shown(_), Some(start)) if in_motion && resize.is_none() => {
-            let (step, _) = ease_step(IVec2::X * start.left, IVec2::X * target, first_t);
-            if (position.0.x - step.x) * (step.x - start.left) > 0 {
-                step.x
-            } else {
-                position.0.x
+    let free = if in_motion && resize.is_none() {
+        let led = record.held.is_none();
+        let free = record.free(position.0.x, target, t);
+        match (pacer, unmoved) {
+            // A window whose app has yet to show any move this motion gets
+            // only the first step of its slide until it does. Asked on, it
+            // would show its first move however far the ease had got by
+            // then, which right after a focus change is half the way, over
+            // the window beside it (miri#500). The windows ahead wait for
+            // where it shows, so the row starts together. A window that
+            // pacing held last frame waits for the window behind it instead.
+            (Pacer::Shown(_), Some(start)) if led => {
+                let (step, _) = ease_step(IVec2::X * start.left, IVec2::X * target, first_t);
+                let along = |x: i32| (x - start.left) * (target - start.left).signum();
+                let first = if along(asked.left) > along(step.x) {
+                    asked.left
+                } else {
+                    step.x
+                };
+                if along(free) > along(first) {
+                    first
+                } else {
+                    free
+                }
             }
+            _ => free,
         }
-        _ => position.0.x,
+    } else {
+        position.0.x
     };
     Some(Member {
         entity,
         id,
         eased: position.0.x,
-        x,
+        free,
+        x: free,
         width,
         // With animation off the resize lands in one step, so pacing holds no
         // width.

@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use bevy::prelude::*;
+use bevy::time::TimeUpdateStrategy;
 
 use crate::commands::{Command, Direction, Operation, ResizeDirection};
 use crate::config::{Config, MainOptions};
@@ -28,6 +29,8 @@ const WINDOW_WIDTH: i32 = 600;
 /// each landing take real time, as a slow app's does.
 const SLOW_WRITE: Duration = Duration::from_millis(40);
 const FRAME: Duration = Duration::from_millis(20);
+/// How soon after a pass an event can wake the engine for the next one.
+const SHORT_PASS: Duration = Duration::from_millis(2);
 const FLUSH: Duration = Duration::from_secs(5);
 
 /// Windows 0, 1 and 2 in a row, at rest with window 0 at the display's left
@@ -503,6 +506,37 @@ fn the_window_ahead_does_not_snap_past_a_slow_window_on_a_short_move() {
     );
 }
 
+/// A pass too short to move window 0 a whole point, near the end of a short
+/// move: window 0 ahead still waits for the slow window 1 behind it, rather
+/// than taking the rest of its slide at once while window 1 has yet to move.
+#[test]
+fn the_window_ahead_does_not_pass_a_slow_window_on_a_pass_too_short_to_move_it() {
+    let mut harness = harness_with_widths([600, TEST_DISPLAY_WIDTH - 600 + 12, 400]);
+    let rest = gap(&harness, 0, 1);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::East));
+    for _ in 0..5 {
+        harness.advance(FRAME);
+    }
+    harness
+        .world()
+        .insert_resource(TimeUpdateStrategy::ManualDuration(SHORT_PASS));
+    harness.advance(SHORT_PASS);
+    harness
+        .world()
+        .insert_resource(TimeUpdateStrategy::ManualDuration(FRAME));
+    assert!(
+        gap(&harness, 0, 1) <= rest,
+        "desktop shows between windows 0 and 1 after a short pass: {:?} {:?}",
+        harness.mock_state.ax_frame(0),
+        harness.mock_state.ax_frame(1)
+    );
+    harness.mock_state.release_writes(SLOW_APP);
+    settle(&mut harness);
+    assert_landed(&mut harness);
+}
+
 /// Owns no window the engine tracks, like Finder showing only the desktop.
 const DESKTOP_APP: Pid = 3;
 
@@ -580,4 +614,42 @@ fn the_window_ahead_waits_for_a_prompt_window_whose_app_comes_back_to_the_front(
     settle(&mut harness);
 
     assert_window_0_waits(&mut harness, Operation::Maximize);
+}
+
+/// Events wake the engine for passes a few milliseconds apart, each a small
+/// share of a slide. Window 0 waits for the slow window 1 behind it, then in
+/// one such pass moves as far as window 1 shows, rather than easing on from
+/// where it waited while window 1 covers it (miri#500).
+#[test]
+fn a_window_held_for_a_slow_window_keeps_up_once_that_window_shows() {
+    let mut harness = harness();
+    let before = gap(&harness, 0, 1);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::East));
+    for _ in 0..3 {
+        harness.advance(FRAME);
+    }
+    land_slow_writes(&mut harness);
+    harness.mock_state.hold_writes(SLOW_APP);
+    harness
+        .world()
+        .insert_resource(TimeUpdateStrategy::ManualDuration(SHORT_PASS));
+    harness.advance(SHORT_PASS);
+    harness
+        .world()
+        .insert_resource(TimeUpdateStrategy::ManualDuration(FRAME));
+    let met = gap(&harness, 0, 1);
+    let frames = (
+        harness.mock_state.ax_frame(0),
+        harness.mock_state.ax_frame(1),
+    );
+    harness.mock_state.release_writes(SLOW_APP);
+    settle(&mut harness);
+    assert_landed(&mut harness);
+
+    assert_eq!(
+        met, before,
+        "windows 0 and 1 meet as at rest one pass after window 1 shows its first step: {frames:?}"
+    );
 }
