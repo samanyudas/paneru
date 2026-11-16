@@ -896,3 +896,36 @@ fn a_slow_window_whose_first_step_rounds_to_no_move_still_scrolls_in() {
     assert_eq!(engine_frame(harness.world(), 1).min.x, start - 6);
     assert_landed(&mut harness);
 }
+
+/// Focus moves from window 0 to window 2, whose app takes each move at once,
+/// and the row scrolls left with the slow window 1 ahead of window 2. Window
+/// 1 shows nothing for four frames. It keeps its slide beside window 2 all
+/// the same, rather than only its first step: window 2 does not wait for
+/// it, so it would stay under window 2 for the rest of the slide (miri#500).
+#[test]
+fn a_slow_window_keeps_its_slide_ahead_of_a_window_that_moves_on() {
+    let mut harness = harness();
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::Last));
+    let mut covers = Vec::new();
+    let mut places = Vec::new();
+    for _ in 0..4 {
+        harness.advance(FRAME);
+        let behind = engine_frame(harness.world(), 2).min.x;
+        covers.push(engine_frame(harness.world(), 1).max.x - behind);
+        places.push(behind);
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle(&mut harness);
+    assert_landed(&mut harness);
+
+    assert!(
+        places.windows(2).all(|pair| pair[1] < pair[0]),
+        "window 2 moves on each frame: {places:?}"
+    );
+    assert!(
+        covers.windows(2).all(|pair| pair[1] <= pair[0]),
+        "window 2 is asked no further over window 1 from frame to frame: {covers:?}"
+    );
+}
