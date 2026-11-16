@@ -405,11 +405,12 @@ struct Member {
     /// Where the animation puts the window this frame.
     eased: i32,
     /// Where the window's slide puts it this frame had pacing never held
-    /// it, or the first step a window gets until its app shows a move.
+    /// it, or the first step a window that leads the row in gets until its
+    /// app shows a move.
     free: i32,
     /// The first step of the window's slide, the most it gets while a window
-    /// of its column has yet to show a move. `None` for a window that
-    /// changes width, is on its way nowhere, or slides as a photo.
+    /// of its column has yet to show a move and its column leads the row in. `None` for a window that changes width, is on its way
+    /// nowhere, or slides as a photo.
     first: Option<FirstStep>,
     /// Where pacing lets the window go this frame.
     x: i32,
@@ -429,6 +430,8 @@ struct Member {
     /// The window's photo slides it at a shared edge: pacing holds the
     /// photo, not the window.
     slides: bool,
+    /// The engine has moved the window or its photo this motion.
+    moved: bool,
 }
 
 /// Where the first step of a window's slide puts it.
@@ -437,6 +440,9 @@ struct FirstStep {
     /// Where it puts the window, counted from where the window started this
     /// motion.
     at: i32,
+    /// Which way the window heads from where it started this motion: -1
+    /// left, 1 right.
+    heading: i32,
     /// The window's app has yet to show a move sideways this motion, so the
     /// window gets only its first step.
     unshown: bool,
@@ -614,9 +620,7 @@ pub(super) fn pace_rows(
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        for column in &mut row {
-            start_together(column);
-        }
+        start_on_first_steps(&mut row);
         pace_row(&mut row);
         for member in row.iter().flatten().filter(|member| !member.slides) {
             if let Some(record) = tracked.get_mut(&member.entity) {
@@ -708,6 +712,7 @@ fn member(
             pacer,
             paced: true,
             slides: true,
+            moved: true,
         });
     }
     let record = tracked.entry(entity).or_default();
@@ -722,6 +727,9 @@ fn member(
     };
     let target_width = resize.map_or(width, |resize| resize.0.x);
     let in_motion = to.is_some() && slide.is_none();
+    let moved = slide.is_some()
+        || position.0.x != asked.left
+        || record.start.is_some_and(|start| start != asked);
     let (free, first) = if in_motion && resize.is_none() {
         let led = record.held.is_none();
         let free = record.free(position.0.x, target, t);
@@ -729,6 +737,7 @@ fn member(
         let at = first_step(start, asked.left, free, target, first_t);
         let first = FirstStep {
             at,
+            heading: (target - start).signum(),
             // A window that pacing held last frame waits for the window
             // behind it instead. One that only moves up or down has no move
             // sideways to show, and neither has one whose first step rounds
@@ -739,13 +748,6 @@ fn member(
                 && matches!(pacer, Pacer::Shown(_))
                 && unmoved.is_some(),
         };
-        // A window whose app has yet to show any move this motion gets only
-        // the first step of its slide until it does. Asked on, it would show
-        // its first move however far the ease had got by then, which right
-        // after a focus change is half the way, over the window beside it
-        // (miri#500). The windows ahead wait for where it shows, so the row
-        // starts together.
-        let free = if first.unshown { first.at } else { free };
         (free, Some(first))
     } else {
         (position.0.x, None)
@@ -769,11 +771,53 @@ fn member(
         pacer,
         paced: in_motion,
         slides: false,
+        moved,
     })
 }
 
-/// Gives every window of a stack only the first step of its slide while one
-/// of them has yet to show a move, so the stack starts as one. On its own
+/// Gives each column that leads the row in only the first step of its
+/// slide while one of its windows has yet to show a move.
+///
+/// Asked on, such a window would show its first move however far the ease
+/// had got by then, which right after a focus change is half the way, over
+/// the window beside it (miri#500). The windows ahead wait for where it
+/// shows, so the row starts together.
+///
+/// A column that follows one the engine has moved keeps its slide, and
+/// [`pace_row`] holds it to where that column is. A photo shows each step at
+/// once, and so does a window whose app pacing trusts, so neither waits for
+/// the column ahead of it: held to its first step, that column would fall
+/// behind and stay covered for the rest of the slide.
+fn start_on_first_steps(row: &mut [Vec<Member>]) {
+    let follows = (0..row.len())
+        .map(|index| follows(row, index))
+        .collect::<Vec<_>>();
+    for (column, follows) in row.iter_mut().zip(follows) {
+        if !follows {
+            start_together(column);
+        }
+    }
+}
+
+/// Whether column `index` of `row` has a window yet to show a move, behind
+/// which, in the direction of motion, the engine has moved a column this
+/// motion.
+fn follows(row: &[Vec<Member>], index: usize) -> bool {
+    row[index]
+        .iter()
+        .filter_map(|member| member.first.filter(|first| first.unshown))
+        .any(|first| {
+            let behind = if first.heading < 0 {
+                row.get(index + 1)
+            } else {
+                index.checked_sub(1).and_then(|behind| row.get(behind))
+            };
+            behind.is_some_and(|column| column.iter().any(|member| member.moved))
+        })
+}
+
+/// Gives every window of a column only the first step of its slide while
+/// one of them has yet to show a move, so a stack starts as one. On its own
 /// slide, a window stacked with a late one would go on ahead, and the late
 /// one would trail it until the slide ended (miri#500). Each window takes
 /// its own first step, from where it started this motion towards where it
