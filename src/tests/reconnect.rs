@@ -880,6 +880,89 @@ fn a_window_macos_carries_with_its_display_stays_where_macos_put_it() {
     assert_eq!(every_strip(harness.world()), before);
 }
 
+/// #489: a small sideways move of the built-in display. macOS carries its
+/// shown windows before the engine reads the new arrangement, and each
+/// carried window's center stays inside the display's old bounds, so the
+/// carry looks like an app's move on the same display. The engine leaves
+/// each window where macOS put it.
+#[test]
+fn a_window_macos_carries_within_its_displays_old_bounds_stays_where_macos_put_it() {
+    let shifted = IRect::from_corners(
+        builtin_bounds().min + IVec2::new(100, 0),
+        builtin_bounds().max + IVec2::new(100, 0),
+    );
+    let mut harness = two_displays_with_parked_columns();
+    let shown: Vec<WinID> = [10, 11, 12, 13, 14, 15]
+        .into_iter()
+        .filter(|&id| {
+            let center = harness.mock_state.ax_frame(id).center();
+            builtin_bounds().contains(center)
+                && builtin_bounds().contains(center + IVec2::new(100, 0))
+        })
+        .collect();
+    assert!(
+        !shown.is_empty(),
+        "a carried window stays inside the old bounds"
+    );
+    harness.world().write_message(Event::DisplayMoved {
+        display_id: BUILTIN,
+    });
+    harness.mock_state.set_display_bounds(BUILTIN, shifted);
+    carry(&harness, &shown, builtin_bounds(), shifted);
+    let carried: Vec<IRect> = shown
+        .iter()
+        .map(|&id| harness.mock_state.ax_frame(id))
+        .collect();
+    for &id in &shown {
+        harness
+            .world()
+            .write_message(Event::WindowMoved { window_id: id });
+    }
+    harness.advance(Duration::from_millis(100));
+    for (&id, &frame) in shown.iter().zip(&carried) {
+        assert_eq!(
+            harness.mock_state.ax_frame(id),
+            frame,
+            "window {id} stays where macOS carried it"
+        );
+    }
+}
+
+/// #489: an app moves a tiled window in a Space its display does not show.
+/// macOS files a window that the engine moves into the Space its display
+/// shows, so the engine does not write the window's place back.
+#[test]
+fn a_window_its_app_moves_in_a_hidden_space_is_not_put_back() {
+    let mut harness = TestHarness::new();
+    harness.mock_state.add_display(
+        BUILTIN,
+        builtin_bounds(),
+        vec![BUILTIN_SPACE, BUILTIN_EMPTY_SPACE],
+    );
+    harness
+        .mock_state
+        .add_display(EXT, ext_bounds(), vec![EXT_SPACE]);
+    harness.mock_state.activate_display(EXT);
+    spawn_row(&harness, BUILTIN_SPACE, &[10, 11], builtin_bounds());
+    spawn_row(&harness, BUILTIN_EMPTY_SPACE, &[70, 71], builtin_bounds());
+    spawn_row(&harness, EXT_SPACE, &[50, 51], ext_bounds());
+    harness.advance(Duration::from_secs(2));
+    let entity = find_window_entity(70, harness.world());
+    let world = harness.world();
+    assert!(
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .any(|strip| strip.id() == BUILTIN_EMPTY_SPACE && strip.contains(entity)),
+        "the hidden Space's strip holds the window"
+    );
+    assert_eq!(harness.mock_state.shown_space(BUILTIN), BUILTIN_SPACE);
+    let moved = harness.mock_state.ax_frame(70).min + IVec2::new(150, 0);
+    harness.mock_state.os_move_window(70, moved);
+    harness.advance(Duration::from_millis(500));
+    assert_eq!(harness.mock_state.ax_frame(70).min, moved);
+}
+
 /// macOS moves `ids` into `space` and onto the display at `to`, and the
 /// engine sees each window's new frame.
 fn refile(harness: &mut TestHarness, ids: &[WinID], space: WorkspaceId, to: IRect) {
