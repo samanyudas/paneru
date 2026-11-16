@@ -954,10 +954,17 @@ fn assert_slides_out(laid_out: (TestHarness, ScreenLog), id: WinID, focus: (Dire
         "window {id} moves with the row before its photo arrives: {:?} from {start:?}",
         seen[0].window
     );
-    assert_eq!(
-        seen[waiting].photo,
-        Some(seen[waiting - 1].window.intersect(DISPLAY)),
-        "the photo first shows where window {id} was"
+    // The window still moves when its photo arrives, so the photo first
+    // shows where it was or one step of its slide on, where the engine
+    // last asked for it.
+    let was = seen[waiting - 1].window.intersect(DISPLAY);
+    let step = seen[waiting - 2].window.intersect(DISPLAY).width() - was.width();
+    let first = seen[waiting].photo.expect("the photo shows");
+    assert!(
+        (first.min.x == was.min.x || first.max.x == was.max.x)
+            && (first.min.y, first.max.y) == (was.min.y, was.max.y)
+            && (0..=2 * step + 1).contains(&(was.width() - first.width())),
+        "the photo first shows where window {id} was, {was:?}, or a step of {step} on: {first:?}"
     );
     let mut places = seen[waiting..]
         .iter()
@@ -1351,7 +1358,8 @@ fn focus_away_during_a_slide_in_slides_the_photo_back_out() {
     harness
         .world()
         .write_message(command(Operation::Focus(Direction::Last)));
-    harness.advance(Duration::from_millis(60));
+    // Halfway along the curve, which starts gently, the photo is well in.
+    harness.advance(Duration::from_millis(160));
     let turned_at = panel().expect("the photo slides in");
 
     harness
@@ -3105,7 +3113,8 @@ fn the_column_ahead_waits_for_a_slow_window_landing_under_its_photo() {
             let photo = scanline(&harness, &log, &ids)
                 .into_iter()
                 .find(|run| run.window == SLOW && run.photo);
-            let near_rest = photo.is_some_and(|photo| photo.shown.min.x > -60);
+            // The curve lands the last stretch in a few frames.
+            let near_rest = photo.is_some_and(|photo| photo.shown.min.x > -120);
             if near_rest {
                 harness.mock_state.hold_writes(TEST_PROCESS_ID);
             }
@@ -3159,7 +3168,7 @@ fn the_column_ahead_waits_for_a_slow_window_landing_under_its_photo() {
 }
 
 /// The photo of window 3 slides in at the shared edge and pushes window 2,
-/// whose app shows nothing for four frames. Window 2 keeps its slide beside
+/// whose app shows nothing for nine frames. Window 2 keeps its slide beside
 /// the photo all the same, rather than only its first step: a photo shows
 /// each step at once and does not wait for the window ahead of it, so it
 /// would cover window 2 for the rest of the slide (miri#500).
@@ -3205,7 +3214,9 @@ fn a_window_pushed_by_a_photo_sliding_in_keeps_its_slide_while_its_app_shows_not
     // server.
     harness.advance(Duration::from_millis(20));
     let mut places = Vec::new();
-    for _ in 0..3 {
+    // The curve starts gently, so the photo leaves the edge after a few
+    // frames.
+    for _ in 0..8 {
         harness.advance(Duration::from_millis(20));
         let photo = log
             .borrow()
@@ -3230,9 +3241,26 @@ fn a_window_pushed_by_a_photo_sliding_in_keeps_its_slide_while_its_app_shows_not
         "window 2 moves on from {start}: {places:?}"
     );
     assert!(
-        places
-            .iter()
-            .all(|&(photo, asked)| photo.is_some_and(|photo| photo >= asked)),
+        places.iter().all(|&(photo, _)| photo.is_some()),
+        "the photo of window 3 shows: {places:?}"
+    );
+    // At the edge, the photo shows the sliver it rests as, over window 2 as
+    // at rest. Once it leaves the edge, it shows beside window 2.
+    let edge = TEST_DISPLAY_WIDTH - 5;
+    let off_edge = places
+        .iter()
+        .filter_map(|&(photo, asked)| {
+            photo
+                .filter(|&photo| photo < edge)
+                .map(|photo| (photo, asked))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        off_edge.len() >= 3,
+        "the photo of window 3 slides in while window 2's app shows nothing: {places:?}"
+    );
+    assert!(
+        off_edge.iter().all(|&(photo, asked)| photo >= asked),
         "the photo of window 3 never passes where window 2 is asked for: {places:?}"
     );
 }

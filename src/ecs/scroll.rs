@@ -17,6 +17,7 @@ use crate::commands::{Direction, FocusSource, focus_with_verification};
 use crate::config::Config;
 use crate::config::swipe::{SwipeGestureDirection, SwipeTarget, focus_direction};
 use crate::ecs::display::shown_strip;
+use crate::ecs::ease;
 use crate::ecs::focus::{FocusHistory, PageHapticRequest};
 use crate::ecs::layout::{Column, LayoutStrip, strip_content_range};
 use crate::ecs::params::Windows;
@@ -984,9 +985,9 @@ pub(super) fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
 /// picks the column [`landing`] gives for that offset, and focuses the window
 /// in it that had focus last. A strip that fits the viewport springs back to
 /// where the swipe began instead, and focus stays. The strip then slides
-/// there over [`settle_duration`] on [`settle_curve`]: it carries on at the
-/// speed it had when the fingers lifted, or gathers speed from rest, then
-/// slows into the column.
+/// there along the curve in [`ease`] that every window motion follows: it
+/// enters the curve where the curve's speed matches the speed it had when
+/// the fingers lifted, or starts from rest, then slows into the column.
 ///
 /// A window-landing swipe ignores the momentum: it lands one column on from
 /// where it began, or back there, as [`Step`] decides, and pulses if that is
@@ -1098,19 +1099,20 @@ fn settle_strip(
             continue;
         }
 
-        let duration = settle_duration(&config);
+        let duration = ease::duration(&config);
         let from = scroll.position;
-        let slope = handoff_slope(scroll.velocity * px_per_velocity, target - from, duration);
+        let start =
+            ease::entry_for_speed(scroll.velocity * px_per_velocity, target - from, duration);
         let ease = scroll.ease.get_or_insert(SettleEase {
             from,
+            start,
             elapsed: 0.0,
-            slope,
         });
         ease.elapsed += step.secs();
         let ease = *ease;
         // The ease carries the strip's speed from here.
         scroll.velocity = 0.0;
-        let progress = settle_curve(ease.elapsed / duration, ease.slope);
+        let progress = ease::share(ease.start, ease.start + ease.elapsed / duration);
         let from = ease.from;
 
         if progress >= 1.0 {
@@ -1123,40 +1125,6 @@ fn settle_strip(
         }
         scroll.position = from + (target - from) * progress;
     }
-}
-
-/// How long a settle lasts, in keyboard ease time constants
-/// (`1 / animation_speed`).
-const SETTLE_TIME_CONSTANTS: f64 = 7.0;
-
-/// How long a settle lasts: 0.5 s at Miri's `animation_speed` of 14. A faster
-/// `animation_speed` settles sooner, as it slides sooner.
-fn settle_duration(config: &Config) -> f64 {
-    SETTLE_TIME_CONSTANTS / config.animation_speed()
-}
-
-/// The steepest start [`settle_curve`] takes without overshooting.
-const MAX_HANDOFF_SLOPE: f64 = 3.0;
-
-/// The starting slope of [`settle_curve`] that carries on `velocity`, in
-/// points per second, for a settle that moves `distance` points over
-/// `duration` seconds. A strip moving away from its target, or still, starts
-/// from rest. A slope of 1 starts at the settle's average speed, and the slope
-/// is capped where the curve would overshoot.
-pub(crate) fn handoff_slope(velocity: f64, distance: f64, duration: f64) -> f64 {
-    if distance.abs() < f64::EPSILON {
-        return 0.0;
-    }
-    (velocity * duration / distance).clamp(0.0, MAX_HANDOFF_SLOPE)
-}
-
-/// The share of a settle covered at `progress` through its time, from 0 to 1:
-/// a cubic that starts at `slope` times the average speed and ends at rest.
-/// From rest it is smoothstep, whose fastest moment, halfway, is 1.5 times the
-/// average speed. At [`MAX_HANDOFF_SLOPE`] it is the cubic ease-out.
-pub(crate) fn settle_curve(progress: f64, slope: f64) -> f64 {
-    let u = progress.clamp(0.0, 1.0);
-    slope * u * (1.0 - u).powi(2) + u * u * (3.0 - 2.0 * u)
 }
 
 /// Focuses `window`, the window a settle of `strip` lands on, unless it has

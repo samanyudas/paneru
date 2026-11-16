@@ -31,6 +31,7 @@ use crate::ecs::display::FloatingLayer;
 use crate::ecs::drag::{
     DragOverlayHandle, DragState, NativeFrame, NativeResizeStart, TilingRestore, tiled_in,
 };
+use crate::ecs::ease::{self, PositionEase, SizeEase};
 use crate::ecs::layout::{Column, LayoutStrip, RestoreTo};
 use crate::ecs::maximize::{FloatingMaximized, FrameHold};
 use crate::ecs::native_membership::{NativeMembership, NativeScope, stranded};
@@ -741,21 +742,9 @@ pub(crate) fn step_animation_clock(
     step.secs = animation_step(time.delta_secs_f64(), step.idle_sleep, activity.mid_frame());
 }
 
-/// Fraction of the remaining distance an exponential ease-out consumes in a
-/// frame, given a decay `rate` (per second) and the pass's [`AnimationStep`]
-/// `delta` in seconds. Shared by every animator so they never drift out of step.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "clamped to [0, 1], well within f32's range; only sub-pixel precision is lost"
-)]
-pub(crate) fn ease_out_factor(rate: f64, delta: f64) -> f32 {
-    (1.0 - (-rate * delta).exp()).clamp(0.0, 1.0) as f32
-}
-
-/// One step of the reposition ease from `current` toward `target` by the
-/// fraction `t`: where it lands, and whether that is `target`. Snaps once
-/// within a pixel of the target (or after one effectively-complete tick), so
-/// the move ends promptly.
+/// One step of an ease from `current` toward `target` by the fraction `t`
+/// of what is left: where it lands, and whether that is `target`. Snaps
+/// once within a few points of the target, so the move ends promptly.
 pub(crate) fn ease_step(current: Origin, target: Origin, t: f32) -> (Origin, bool) {
     let lerped = current.as_vec2().lerp(target.as_vec2(), t);
     if (target.as_vec2() - lerped).length() <= ANIAMTE_SNAP_THRESHOLD {
@@ -765,40 +754,46 @@ pub(crate) fn ease_step(current: Origin, target: Origin, t: f32) -> (Origin, boo
     }
 }
 
-/// This is a Bevy system that runs on `Update`. It smoothly moves windows to their target
-/// positions, as indicated by the `RepositionMarker` component.
-/// Animation speed is controlled by the `animation_speed` in the `Config`.
-/// When a window reaches its target position, the `RepositionMarker` is removed.
-///
-/// # Arguments
-///
-/// * `windows` - A `Populated` query for `(&mut Window, Entity, &RepositionMarker)` components.
-/// * `displays` - A query for all `Display` entities, used to get display bounds and menubar height.
-/// * `step` - The pass's [`AnimationStep`], the time each ease steps by.
-/// * `config` - The `Config` resource, used for animation speed.
+/// This is a Bevy system that runs on `Update`. It moves windows to their
+/// target positions, as indicated by the `RepositionMarker` component, along
+/// the curve in [`ease`](crate::ecs::ease), which `animation_speed` in the
+/// `Config` makes shorter or longer. Each new target, or a marker set afresh,
+/// starts a motion that carries on the speed the window had, so a window that
+/// chases a target that moves keeps up with it. The window's
+/// [`PositionEase`] stays once the move ends, so a move that follows at once
+/// carries its speed on.
 ///
 /// [`finish_repositions`] ends the move once the window is at its target.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
+    animate: Populated<(
+        &mut Position,
+        Entity,
+        Ref<RepositionMarker>,
+        &mut PositionEase,
+    )>,
     step: Res<AnimationStep>,
+    time: Res<Time>,
     config: Res<Config>,
 ) {
-    // Frame-rate-independent exponential smoothing (ease-out).
-    // `animation_speed` is the decay rate (per second); higher = snappier.
-    let t = ease_out_factor(config.animation_speed(), step.secs());
-
-    animate
-        .into_iter()
-        .for_each(|(mut position, entity, RepositionMarker(origin))| {
-            let (new_pos, _) = ease_step(position.0, *origin, t);
-
-            trace!(
-                "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
-                position.0,
-            );
-            position.0 = new_pos;
-        });
+    let duration = ease::duration(&config);
+    let now = time.elapsed_secs_f64();
+    for (mut position, entity, marker, mut ease) in animate {
+        let RepositionMarker(origin) = *marker;
+        let t = ease.0.step(
+            position.0,
+            origin,
+            marker.is_added(),
+            (now, step.secs()),
+            duration,
+        );
+        let (new_pos, _) = ease_step(position.0, origin, t);
+        trace!(
+            "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
+            position.0,
+        );
+        position.0 = new_pos;
+    }
 }
 
 /// Removes the `RepositionMarker` of each entity at its target. Runs after
@@ -817,43 +812,36 @@ pub(super) fn finish_repositions(
 }
 
 /// Animates window resizing.
-/// This is a Bevy system that runs on `Update`. It resizes windows to their target
-/// dimensions, as indicated by the `ResizeMarker` component.
+/// This is a Bevy system that runs on `Update`. It resizes windows to their
+/// target dimensions, as indicated by the `ResizeMarker` component, along the
+/// same curve and at the same pace as [`animate_entities`], so a window that
+/// moves and resizes at once keeps both in step.
 /// [`finish_resizes`] ends the resize once the window has its target size.
-///
-/// # Arguments
-///
-/// * `windows` - A `Populated` query for `(&mut Window, Entity, &ResizeMarker)` components.
-/// * `active_display` - An `ActiveDisplay` system parameter providing immutable access to the active display.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
-    animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
+    animate: Populated<(&mut Bounds, Entity, Ref<ResizeMarker>, &mut SizeEase)>,
     step: Res<AnimationStep>,
+    time: Res<Time>,
     config: Res<Config>,
 ) {
-    // Matches animate_entities: exponential ease-out, frame-rate independent.
-    let t = ease_out_factor(config.animation_speed(), step.secs());
-
-    animate
-        .into_iter()
-        .for_each(|(mut bounds, entity, ResizeMarker(size))| {
-            let target = size.as_vec2();
-            let current = bounds.0.as_vec2();
-            let lerped = current.lerp(target, t);
-
-            let finished = (target - lerped).length() <= ANIAMTE_SNAP_THRESHOLD;
-            let new_size = if finished {
-                *size
-            } else {
-                lerped.round().as_ivec2()
-            };
-
-            trace!(
-                "entity {entity} source {} dest {size} t {t:.3} resizing to {new_size}",
-                bounds.0,
-            );
-            bounds.0 = new_size;
-        });
+    let duration = ease::duration(&config);
+    let now = time.elapsed_secs_f64();
+    for (mut bounds, entity, marker, mut ease) in animate {
+        let ResizeMarker(size) = *marker;
+        let t = ease.0.step(
+            bounds.0,
+            size,
+            marker.is_added(),
+            (now, step.secs()),
+            duration,
+        );
+        let (new_size, _) = ease_step(bounds.0, size, t);
+        trace!(
+            "entity {entity} source {} dest {size} t {t:.3} resizing to {new_size}",
+            bounds.0,
+        );
+        bounds.0 = new_size;
+    }
 }
 
 /// Removes the `ResizeMarker` of each entity at its target size. Runs after

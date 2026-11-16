@@ -45,6 +45,7 @@ use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 pub mod display;
 mod display_homes;
 pub mod drag;
+pub(crate) mod ease;
 pub mod focus;
 pub mod layout;
 #[cfg(feature = "lua")]
@@ -323,6 +324,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
         ((
             systems::animate_entities,
             systems::animate_resize_entities,
+            ease::step_slides,
             pacing::pace_rows.run_if(not(resource_exists::<Initializing>)),
             systems::finish_repositions,
             systems::finish_resizes,
@@ -431,12 +433,16 @@ pub struct FreshMarker;
 #[derive(Component)]
 pub struct ExistingMarker;
 
-/// Component representing a request to reposition a window.
+/// Component representing a request to reposition a window. The move follows
+/// the curve in [`ease`], whose progress [`ease::PositionEase`] keeps.
 #[derive(Component, Debug, Deref, DerefMut)]
+#[require(ease::PositionEase)]
 pub struct RepositionMarker(pub Origin);
 
-/// Component representing a request to resize a window.
+/// Component representing a request to resize a window. The resize follows
+/// the curve in [`ease`], whose progress [`ease::SizeEase`] keeps.
 #[derive(Component, Debug, Deref, DerefMut)]
+#[require(ease::SizeEase)]
 pub struct ResizeMarker(pub Size);
 
 /// Marker component indicating that windows around the marked entity need to be reshuffled.
@@ -541,10 +547,11 @@ pub struct Scrolling {
 #[derive(Clone, Copy, Debug)]
 pub struct SettleEase {
     pub from: f64,
+    /// Where the settle entered the curve, as a share of the curve's time,
+    /// which carries on the strip's speed at the lift. See
+    /// `ease::entry_for_speed`.
+    pub start: f64,
     pub elapsed: f64,
-    /// The ease's starting slope, which carries on the strip's speed at the
-    /// lift. See `scroll::handoff_slope`.
-    pub slope: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

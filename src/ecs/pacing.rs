@@ -40,11 +40,10 @@ use bevy::time::Time;
 use tracing::{debug, warn};
 
 use crate::config::Config;
+use crate::ecs::ease::{self, PositionEase, SlideEase};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::shared_edge::Slide;
-use crate::ecs::systems::{
-    AnimationStep, LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, ease_out_factor, ease_step,
-};
+use crate::ecs::systems::ease_step;
 use crate::ecs::{
     Bounds, FocusedMarker, Position, PresentedOrigin, RepositionMarker, ResizeMarker,
 };
@@ -252,16 +251,6 @@ impl SlideHolds {
     /// engine put it.
     pub(crate) fn landed(&self, entity: Entity) -> bool {
         self.landed.contains(&entity)
-    }
-}
-
-/// Where a sliding window or its photo shows now, and where it heads.
-/// `None` while it lands, at rest under its photo.
-fn heading(slide: &Slide, presented: IVec2) -> Option<(IVec2, IVec2)> {
-    match *slide {
-        Slide::Moving { at, .. } => Some((at, presented)),
-        Slide::Leaving { at, to, .. } | Slide::Tucking { at, to, .. } => Some((at, to)),
-        Slide::Landing { .. } => None,
     }
 }
 
@@ -554,6 +543,8 @@ type RowWindows<'w, 's> = Query<
         &'static mut Bounds,
         Option<&'static RepositionMarker>,
         Option<&'static ResizeMarker>,
+        Option<&'static PositionEase>,
+        Option<&'static SlideEase>,
         Option<(&'static Slide, &'static PresentedOrigin)>,
     ),
 >;
@@ -574,7 +565,6 @@ pub(super) fn pace_rows(
     strips: Query<&LayoutStrip>,
     mut windows: RowWindows,
     time: Res<Time>,
-    step: Res<AnimationStep>,
     config: Res<Config>,
     mut slide_holds: ResMut<SlideHolds>,
     mut tracked: Local<EntityHashMap<Tracked>>,
@@ -619,11 +609,9 @@ pub(super) fn pace_rows(
     slide_holds.landed = landed(&rows, &windows, &shown);
 
     let now = time.elapsed();
-    let t = ease_out_factor(config.animation_speed(), step.secs());
-    let first_t = ease_out_factor(
-        config.animation_speed(),
-        f64::from(LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS) / 1000.0,
-    );
+    let duration = ease::duration(&config);
+    let first_t = ease::first_share(duration);
+    let animates = ease::animates(duration);
     for row in rows {
         let mut row = row
             .into_iter()
@@ -631,7 +619,14 @@ pub(super) fn pace_rows(
                 column
                     .into_iter()
                     .filter_map(|entity| {
-                        member(entity, &windows, &shown, &mut tracked, (t, first_t), now)
+                        member(
+                            entity,
+                            &windows,
+                            &shown,
+                            &mut tracked,
+                            (first_t, animates),
+                            now,
+                        )
                     })
                     .collect::<Vec<_>>()
             })
@@ -678,18 +673,21 @@ pub(super) fn pace_rows(
     }
 }
 
-/// The row window `entity` as pacing sees it this frame, with `t` the
-/// row's ease this frame, `first_t` the ease of a slide's first step, and
-/// `tracked` what the engine has seen of each app.
+/// The row window `entity` as pacing sees it this frame, with `first_t` the
+/// share of a slide's first step, `animates` whether a motion takes more
+/// than one step, and `tracked` what the engine has seen of each app. Each
+/// window's own ease gives the share of what is left that it steps by this
+/// frame: its move's, or its photo's while it slides.
 fn member(
     entity: Entity,
     windows: &RowWindows,
     shown: &Shown,
     tracked: &mut EntityHashMap<Tracked>,
-    (t, first_t): (f32, f32),
+    (first_t, animates): (f32, bool),
     now: Duration,
 ) -> Option<Member> {
-    let (window, position, bounds, to, resize, slide) = windows.get(entity).ok()?;
+    let (window, position, bounds, to, resize, position_ease, slide_ease, slide) =
+        windows.get(entity).ok()?;
     let id = window.id();
     let asked = Edges::from(window.frame());
     let shown_edges = shown
@@ -697,8 +695,11 @@ fn member(
         .get(&id)
         .map(|&frame| Edges::from(window.margins().tracked(frame)));
     let width = bounds.0.x;
-    if let Some((at, heading_to)) = slide.and_then(|(slide, presented)| heading(slide, presented.0))
+    if let Some((at, heading_to)) =
+        slide.and_then(|(slide, presented)| ease::slide_heading(slide, presented.0))
     {
+        // The photo steps by its slide's ease, which has stepped this frame.
+        let t = slide_ease.map_or(1.0, |ease| ease.0.t());
         let (step, _) = ease_step(at, heading_to, t);
         let record = tracked.entry(entity).or_default();
         let from = *record.slid_from.get_or_insert(at.x);
@@ -741,6 +742,8 @@ fn member(
     let target_width = resize.map_or(width, |resize| resize.0.x);
     let in_motion = to.is_some() && slide.is_none();
     let (free, first) = if in_motion && resize.is_none() {
+        // The move's ease has stepped this frame, before pacing.
+        let t = position_ease.map_or(1.0, |ease| ease.0.t());
         let led = record.held.is_none();
         let free = record.free(position.0.x, target, t);
         let start = record.start.map_or(asked.left, |start| start.left);
@@ -781,7 +784,7 @@ fn member(
         width,
         // With animation off the resize lands in one step, so pacing holds no
         // width.
-        held_right: (resize.is_some() && slide.is_none() && t < 1.0)
+        held_right: (resize.is_some() && slide.is_none() && animates)
             .then_some(position.0.x + width),
         target,
         target_right: target + target_width,
@@ -976,7 +979,7 @@ fn moving_rows(strips: &Query<&LayoutStrip>, windows: &RowWindows) -> Vec<Vec<Ve
             row.iter().flatten().any(|&entity| {
                 windows
                     .get(entity)
-                    .is_ok_and(|(_, _, _, to, resize, slide)| {
+                    .is_ok_and(|(_, _, _, to, resize, _, _, slide)| {
                         to.is_some()
                             || resize.is_some()
                             || slide

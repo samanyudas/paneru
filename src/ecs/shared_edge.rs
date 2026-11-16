@@ -141,6 +141,7 @@ impl Hold {
 /// a [`Hold`] where the row takes it further past the edge, so a hidden
 /// column keeps its sliver until the row brings it out.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+#[require(crate::ecs::ease::SlideEase)]
 pub(crate) enum Slide {
     /// The window leaves its tuck, where it showed `from`.
     Moving { at: IVec2, from: Hold },

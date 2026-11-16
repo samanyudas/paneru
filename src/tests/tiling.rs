@@ -896,27 +896,47 @@ fn test_native_height_growth_handles_both_animation_completion_orders() {
             .write_message(step(Operation::ResizeVerticalStep, ResizeDirection::Grow));
         harness.advance(Duration::from_millis(40));
         assert!(harness.world().get::<ResizeMarker>(entity).is_some());
-        assert!(harness.world().get::<RepositionMarker>(entity).is_some());
         let moving_frame = harness.mock_state.create_window(window_id).frame();
         assert!(moving_frame.height() > 374 && moving_frame.height() < 449);
         assert_ne!(moving_frame.min, start.min);
 
-        let mut observed_completion = false;
-        for _ in 0..25 {
+        // The lower window's move follows the upper window's height a frame
+        // behind, landing on each step's target within the frame, so its
+        // marker does not show between frames. What counts is the tick each
+        // motion last moved the window.
+        let (mut last_resize, mut last_move) = (0, 0);
+        let mut previous = moving_frame;
+        for tick in 1..=25 {
             harness.advance(Duration::from_millis(20));
-            let resizing = harness.world().get::<ResizeMarker>(entity).is_some();
-            let moving = harness.world().get::<RepositionMarker>(entity).is_some();
-            if resizing != moving {
-                assert_eq!(resizing, position_finishes_first);
+            let frame = harness.mock_state.create_window(window_id).frame();
+            let resized = frame.height() != previous.height();
+            let moved = frame.min != previous.min;
+            previous = frame;
+            if resized {
+                last_resize = tick;
+            }
+            if moved {
+                last_move = tick;
+            }
+            if resized || moved {
                 assert!(harness.world().get::<VerifyWindowSize>(entity).is_some());
-                observed_completion = true;
-                break;
             }
         }
-        assert!(
-            observed_completion,
-            "animations must finish on different ticks"
-        );
+        // Every motion along the curve lasts the same time, so the lower
+        // window's move, which follows the upper window's height, ends with
+        // the resize or after it. The short move of the upper window ends
+        // first.
+        if position_finishes_first {
+            assert!(
+                last_resize > last_move,
+                "window {window_id}: the resize last moved on tick {last_resize}, the move on {last_move}"
+            );
+        } else {
+            assert!(
+                last_move >= last_resize && last_resize > 0,
+                "window {window_id}: the resize last moved on tick {last_resize}, the move on {last_move}"
+            );
+        }
         harness.advance(Duration::from_secs(3));
         let frame = harness.mock_state.create_window(window_id).frame();
         assert_eq!(frame.height(), 449);
@@ -938,7 +958,6 @@ fn test_interrupted_native_height_resize_uses_the_latest_target() {
         .write_message(step(Operation::ResizeVerticalStep, ResizeDirection::Grow));
     harness.advance(Duration::from_millis(40));
     assert!(harness.world().get::<ResizeMarker>(entity).is_some());
-    assert!(harness.world().get::<RepositionMarker>(entity).is_some());
     let moving_frame = harness.mock_state.create_window(1).frame();
     assert!(moving_frame.height() > 374 && moving_frame.height() < 449);
     assert!(moving_frame.min.y < 394 && moving_frame.min.y > 319);

@@ -410,10 +410,10 @@ impl Config {
         self.inner().options.clone()
     }
 
-    // Exponential ease-out decay rate (per second) consumed by the animation
-    // systems as `t = 1 - e^(-rate*dt)`. Higher values feel snappier; very large
-    // values collapse to an instant snap.
-    // Suggested range: 8..20 for a fluid feel. Unset = instant (no animation),
+    // How fast window motions run. Every motion follows the curve in
+    // `ecs::ease` and lasts 325 ms * 14 / speed, so 14 is macOS's own window
+    // zoom, higher is shorter, and a value that makes a motion shorter than a
+    // frame lands it in one step. Unset = instant (no animation).
     pub fn animation_speed(&self) -> f64 {
         self.options()
             .animation_speed

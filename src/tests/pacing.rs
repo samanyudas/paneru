@@ -880,7 +880,8 @@ fn a_slow_window_whose_first_step_rounds_to_no_move_still_scrolls_in() {
 
     harness.world().write_message(focus(Direction::East));
     let mut places = Vec::new();
-    for _ in 0..30 {
+    // A motion at speed 5 lasts 0.91 s, 46 frames.
+    for _ in 0..60 {
         harness.advance(FRAME);
         land_slow_writes(&mut harness);
         places.push(engine_frame(harness.world(), 1).min.x);
