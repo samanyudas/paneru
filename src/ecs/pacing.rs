@@ -407,6 +407,10 @@ struct Member {
     /// Where the window's slide puts it this frame had pacing never held
     /// it, or the first step a window gets until its app shows a move.
     free: i32,
+    /// The first step of the window's slide, the most it gets while a window
+    /// of its column has yet to show a move. `None` for a window that
+    /// changes width, is on its way nowhere, or slides as a photo.
+    first: Option<FirstStep>,
     /// Where pacing lets the window go this frame.
     x: i32,
     /// How wide the animation makes the window this frame.
@@ -425,6 +429,36 @@ struct Member {
     /// The window's photo slides it at a shared edge: pacing holds the
     /// photo, not the window.
     slides: bool,
+}
+
+/// Where the first step of a window's slide puts it.
+#[derive(Clone, Copy)]
+struct FirstStep {
+    /// Where it puts the window, counted from where the window started this
+    /// motion.
+    at: i32,
+    /// The window's app has yet to show a move sideways this motion, so the
+    /// window gets only its first step.
+    unshown: bool,
+}
+
+/// Where the first step of a slide from `start` to `target` puts a window:
+/// at `asked`, where the engine has it, if that is further along, and no
+/// further than `free`, where its slide has it this frame. `first_t` is the
+/// ease of a first step.
+fn first_step(start: i32, asked: i32, free: i32, target: i32, first_t: f32) -> i32 {
+    let (step, _) = ease_step(IVec2::X * start, IVec2::X * target, first_t);
+    let along = |x: i32| (x - start) * (target - start).signum();
+    let first = if along(asked) > along(step.x) {
+        asked
+    } else {
+        step.x
+    };
+    if along(free) > along(first) {
+        first
+    } else {
+        free
+    }
 }
 
 impl Member {
@@ -580,6 +614,9 @@ pub(super) fn pace_rows(
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        for column in &mut row {
+            start_together(column);
+        }
         pace_row(&mut row);
         for member in row.iter().flatten().filter(|member| !member.slides) {
             if let Some(record) = tracked.get_mut(&member.entity) {
@@ -660,6 +697,7 @@ fn member(
             id,
             eased: step.x,
             free: step.x,
+            first: None,
             x: step.x,
             width,
             held_right: None,
@@ -684,41 +722,40 @@ fn member(
     };
     let target_width = resize.map_or(width, |resize| resize.0.x);
     let in_motion = to.is_some() && slide.is_none();
-    let free = if in_motion && resize.is_none() {
+    let (free, first) = if in_motion && resize.is_none() {
         let led = record.held.is_none();
         let free = record.free(position.0.x, target, t);
-        match (pacer, unmoved) {
-            // A window whose app has yet to show any move this motion gets
-            // only the first step of its slide until it does. Asked on, it
-            // would show its first move however far the ease had got by
-            // then, which right after a focus change is half the way, over
-            // the window beside it (miri#500). The windows ahead wait for
-            // where it shows, so the row starts together. A window that
-            // pacing held last frame waits for the window behind it instead.
-            (Pacer::Shown(_), Some(start)) if led => {
-                let (step, _) = ease_step(IVec2::X * start.left, IVec2::X * target, first_t);
-                let along = |x: i32| (x - start.left) * (target - start.left).signum();
-                let first = if along(asked.left) > along(step.x) {
-                    asked.left
-                } else {
-                    step.x
-                };
-                if along(free) > along(first) {
-                    first
-                } else {
-                    free
-                }
-            }
-            _ => free,
-        }
+        let start = record.start.map_or(asked.left, |start| start.left);
+        let at = first_step(start, asked.left, free, target, first_t);
+        let first = FirstStep {
+            at,
+            // A window that pacing held last frame waits for the window
+            // behind it instead. One that only moves up or down has no move
+            // sideways to show, and neither has one whose first step rounds
+            // to no move at all.
+            unshown: led
+                && start != target
+                && at != start
+                && matches!(pacer, Pacer::Shown(_))
+                && unmoved.is_some(),
+        };
+        // A window whose app has yet to show any move this motion gets only
+        // the first step of its slide until it does. Asked on, it would show
+        // its first move however far the ease had got by then, which right
+        // after a focus change is half the way, over the window beside it
+        // (miri#500). The windows ahead wait for where it shows, so the row
+        // starts together.
+        let free = if first.unshown { first.at } else { free };
+        (free, Some(first))
     } else {
-        position.0.x
+        (position.0.x, None)
     };
     Some(Member {
         entity,
         id,
         eased: position.0.x,
         free,
+        first,
         x: free,
         width,
         // With animation off the resize lands in one step, so pacing holds no
@@ -733,6 +770,27 @@ fn member(
         paced: in_motion,
         slides: false,
     })
+}
+
+/// Gives every window of a stack only the first step of its slide while one
+/// of them has yet to show a move, so the stack starts as one. On its own
+/// slide, a window stacked with a late one would go on ahead, and the late
+/// one would trail it until the slide ended (miri#500). Each window takes
+/// its own first step, from where it started this motion towards where it
+/// heads.
+fn start_together(column: &mut [Member]) {
+    if !column
+        .iter()
+        .any(|member| member.first.is_some_and(|first| first.unshown))
+    {
+        return;
+    }
+    for member in column {
+        if let Some(first) = member.first {
+            member.free = first.at;
+            member.x = first.at;
+        }
+    }
 }
 
 /// Forgets what the engine has seen of the apps that gained focus from
