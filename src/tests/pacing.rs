@@ -929,3 +929,44 @@ fn a_slow_window_keeps_its_slide_ahead_of_a_window_that_moves_on() {
         "window 2 is asked no further over window 1 from frame to frame: {covers:?}"
     );
 }
+
+/// Window 0 is tucked behind the slow window 1, and its app reports it 3
+/// points from where the engine asked, as apps do. Focus moves to window 1,
+/// which leads the row in, and the engine puts window 0 back as the row
+/// moves. That shift is no slide for window 1 to follow: while its app
+/// shows nothing, window 1 gets only its first step (miri#500).
+#[test]
+fn a_window_that_leads_the_row_in_keeps_its_first_step_while_one_behind_it_only_shifts() {
+    let mut harness = harness_with_widths([1016, 508, 1016]);
+    harness.world().write_message(focus(Direction::Last));
+    settle_beside(&mut harness, 1, 2, i32::MAX);
+    settle(&mut harness);
+    let tucked = harness.mock_state.ax_frame(0).min;
+    harness
+        .mock_state
+        .os_move_window(0, tucked + IVec2::new(3, 0));
+    for _ in 0..5 {
+        harness.advance(FRAME);
+    }
+    let start = engine_frame(harness.world(), 1).min.x;
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::West));
+    let mut places = Vec::new();
+    for _ in 0..4 {
+        harness.advance(FRAME);
+        places.push(engine_frame(harness.world(), 1).min.x);
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle(&mut harness);
+    assert_landed(&mut harness);
+
+    assert!(
+        places[0] > start,
+        "window 1 takes a first step from {start}: {places:?}"
+    );
+    assert!(
+        places.iter().all(|&place| place == places[0]),
+        "window 1 waits at its first step while its app shows nothing: {places:?}"
+    );
+}

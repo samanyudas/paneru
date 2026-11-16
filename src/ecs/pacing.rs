@@ -297,6 +297,8 @@ pub(super) struct Tracked {
     start: Option<Edges>,
     /// Where pacing held the window last frame, short of its slide.
     held: Option<Held>,
+    /// Where the window's photo was when it began to slide this motion.
+    slid_from: Option<i32>,
 }
 
 /// A window that pacing held back for a frame.
@@ -356,6 +358,7 @@ impl Tracked {
         self.late = None;
         self.start = None;
         self.held = None;
+        self.slid_from = None;
     }
 
     /// Where the window's slide puts it this frame had pacing not held it
@@ -409,7 +412,8 @@ struct Member {
     /// app shows a move.
     free: i32,
     /// The first step of the window's slide, the most it gets while a window
-    /// of its column has yet to show a move and its column leads the row in. `None` for a window that changes width, is on its way
+    /// of its column has yet to show a move and no column behind it has gone
+    /// further. `None` for a window that changes width, is on its way
     /// nowhere, or slides as a photo.
     first: Option<FirstStep>,
     /// Where pacing lets the window go this frame.
@@ -430,8 +434,10 @@ struct Member {
     /// The window's photo slides it at a shared edge: pacing holds the
     /// photo, not the window.
     slides: bool,
-    /// The engine has moved the window or its photo this motion.
-    moved: bool,
+    /// How far the window or its photo is from where it was when this
+    /// motion began: where its app shows it, or where the engine puts it
+    /// this frame if that shows at once.
+    travelled: i32,
 }
 
 /// Where the first step of a window's slide puts it.
@@ -443,6 +449,8 @@ struct FirstStep {
     /// Which way the window heads from where it started this motion: -1
     /// left, 1 right.
     heading: i32,
+    /// How far one step takes the window from where it started this motion.
+    reach: i32,
     /// The window's app has yet to show a move sideways this motion, so the
     /// window gets only its first step.
     unshown: bool,
@@ -451,8 +459,8 @@ struct FirstStep {
 /// Where the first step of a slide from `start` to `target` puts a window:
 /// at `asked`, where the engine has it, if that is further along, and no
 /// further than `free`, where its slide has it this frame. `first_t` is the
-/// ease of a first step.
-fn first_step(start: i32, asked: i32, free: i32, target: i32, first_t: f32) -> i32 {
+/// ease of a first step. Comes with how far one step takes it from `start`.
+fn first_step(start: i32, asked: i32, free: i32, target: i32, first_t: f32) -> (i32, i32) {
     let (step, _) = ease_step(IVec2::X * start, IVec2::X * target, first_t);
     let along = |x: i32| (x - start) * (target - start).signum();
     let first = if along(asked) > along(step.x) {
@@ -460,11 +468,12 @@ fn first_step(start: i32, asked: i32, free: i32, target: i32, first_t: f32) -> i
     } else {
         step.x
     };
-    if along(free) > along(first) {
+    let at = if along(free) > along(first) {
         first
     } else {
         free
-    }
+    };
+    (at, along(step.x))
 }
 
 impl Member {
@@ -684,16 +693,13 @@ fn member(
     if let Some((at, heading_to)) = slide.and_then(|(slide, presented)| heading(slide, presented.0))
     {
         let (step, _) = ease_step(at, heading_to, t);
+        let record = tracked.entry(entity).or_default();
+        let from = *record.slid_from.get_or_insert(at.x);
         // A photo shows at once where it steps to this frame. A window
         // leaving for its tuck moves itself, as late as its app takes the
         // move.
         let pacer = match slide {
-            Some((Slide::Leaving { .. }, _)) => {
-                tracked
-                    .entry(entity)
-                    .or_default()
-                    .see(asked, shown_edges, now)
-            }
+            Some((Slide::Leaving { .. }, _)) => record.see(asked, shown_edges, now),
             _ => Pacer::Asked,
         };
         return Some(Member {
@@ -712,7 +718,7 @@ fn member(
             pacer,
             paced: true,
             slides: true,
-            moved: true,
+            travelled: (step.x - from).abs(),
         });
     }
     let record = tracked.entry(entity).or_default();
@@ -727,17 +733,15 @@ fn member(
     };
     let target_width = resize.map_or(width, |resize| resize.0.x);
     let in_motion = to.is_some() && slide.is_none();
-    let moved = slide.is_some()
-        || position.0.x != asked.left
-        || record.start.is_some_and(|start| start != asked);
     let (free, first) = if in_motion && resize.is_none() {
         let led = record.held.is_none();
         let free = record.free(position.0.x, target, t);
         let start = record.start.map_or(asked.left, |start| start.left);
-        let at = first_step(start, asked.left, free, target, first_t);
+        let (at, reach) = first_step(start, asked.left, free, target, first_t);
         let first = FirstStep {
             at,
             heading: (target - start).signum(),
+            reach,
             // A window that pacing held last frame waits for the window
             // behind it instead. One that only moves up or down has no move
             // sideways to show, and neither has one whose first step rounds
@@ -752,6 +756,14 @@ fn member(
     } else {
         (position.0.x, None)
     };
+    // A window at rest counts from the frame the engine asked for: its
+    // position can stand a few points off that frame while it is tucked.
+    let place = match pacer {
+        Pacer::Asked if in_motion => free,
+        Pacer::Asked => asked.left,
+        Pacer::Shown(edges) => edges.left,
+    };
+    let travelled = record.start.map_or(0, |start| (place - start.left).abs());
     Some(Member {
         entity,
         id,
@@ -771,7 +783,7 @@ fn member(
         pacer,
         paced: in_motion,
         slides: false,
-        moved,
+        travelled,
     })
 }
 
@@ -783,11 +795,12 @@ fn member(
 /// the window beside it (miri#500). The windows ahead wait for where it
 /// shows, so the row starts together.
 ///
-/// A column that follows one the engine has moved keeps its slide, and
-/// [`pace_row`] holds it to where that column is. A photo shows each step at
-/// once, and so does a window whose app pacing trusts, so neither waits for
-/// the column ahead of it: held to its first step, that column would fall
-/// behind and stay covered for the rest of the slide.
+/// A column that follows one already further along than its own first step
+/// keeps its slide, and [`pace_row`] holds it to where that column is. A
+/// photo shows each step at once, and so does a window whose app pacing
+/// trusts, so neither waits for the column ahead of it: held to its first
+/// step, that column would fall behind and stay covered for the rest of the
+/// slide.
 fn start_on_first_steps(row: &mut [Vec<Member>]) {
     let follows = (0..row.len())
         .map(|index| follows(row, index))
@@ -799,9 +812,10 @@ fn start_on_first_steps(row: &mut [Vec<Member>]) {
     }
 }
 
-/// Whether column `index` of `row` has a window yet to show a move, behind
-/// which, in the direction of motion, the engine has moved a column this
-/// motion.
+/// Whether column `index` of `row` has a window yet to show a move, and a
+/// window of the column behind it, in the direction of motion, has gone
+/// further this motion than that window's first step would take it. A
+/// tucked column behind that only shifts a few points does not count.
 fn follows(row: &[Vec<Member>], index: usize) -> bool {
     row[index]
         .iter()
@@ -812,7 +826,7 @@ fn follows(row: &[Vec<Member>], index: usize) -> bool {
             } else {
                 index.checked_sub(1).and_then(|behind| row.get(behind))
             };
-            behind.is_some_and(|column| column.iter().any(|member| member.moved))
+            behind.is_some_and(|column| column.iter().any(|member| member.travelled > first.reach))
         })
 }
 
