@@ -977,7 +977,9 @@ fn assert_slides_out(laid_out: (TestHarness, ScreenLog), id: WinID, focus: (Dire
         );
     }
     places.dedup();
-    assert!(places.len() >= 5, "the photo slides through {places:?}");
+    // The window covers most of its way in the 5 frames before its photo
+    // arrives, so the photo slides the rest in a few steps.
+    assert!(places.len() >= 3, "the photo slides through {places:?}");
 }
 
 #[test]

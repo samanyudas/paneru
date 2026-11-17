@@ -874,7 +874,8 @@ fn test_animated_native_height_growth_settles_for_both_stack_members() {
 fn test_native_height_growth_handles_both_animation_completion_orders() {
     use crate::ecs::{Position, RepositionMarker, ResizeMarker, VerifyWindowSize};
     for (window_id, position_finishes_first) in [(1, false), (0, true)] {
-        let mut harness = native_height_harness(30.0);
+        // Slow enough that both motions are still on their way after 40 ms.
+        let mut harness = native_height_harness(20.0);
         harness.run(vec![Event::Command {
             command: Command::Window(Operation::Focus(if window_id == 0 {
                 Direction::North

@@ -132,7 +132,7 @@ fn swap_steps(idle: Duration, frame: Duration, frames: usize) -> Vec<f64> {
 /// How far the passes of a slide go, as shares of the whole move, when
 /// they follow each other by `deltas`.
 fn ease_shares(deltas: &[Duration]) -> Vec<f64> {
-    let duration = 0.325 * 14.0 / SPEED;
+    let duration = ease::duration_at(SPEED);
     let mut elapsed = 0.0;
     let mut previous = 0.0;
     deltas
@@ -186,7 +186,7 @@ fn swiping(world: &mut World) -> Option<bool> {
 }
 
 /// Once the fingers lift, a strip that fits the display slides back along
-/// the curve every window motion follows, over 325 ms at Miri's speed. It
+/// the curve every window motion follows, over about 237 ms at Miri's speed. It
 /// resisted the fingers, so it starts from rest, with no jump at the lift,
 /// and slows into where it was.
 #[test]
@@ -212,10 +212,10 @@ fn a_spring_back_eases_in_and_out() {
     assert_eq!(x(&harness), rest, "the strip springs back to where it was");
     assert!(left[0].abs() > 10.0, "the swipe moved the strip: {left:?}");
 
-    let duration = 0.325 * 14.0 / SPEED;
+    let duration = ease::duration_at(SPEED);
     let frame = ACTIVE_FRAME.as_secs_f64();
-    // 325 ms of 16 ms passes.
-    assert_eq!(left.len(), 21, "the settle lasts {duration} s: {left:?}");
+    // 237 ms of 16 ms passes, after the pass the fingers lifted on.
+    assert_eq!(left.len(), 15, "the settle lasts {duration} s: {left:?}");
     for (pass, at) in left.iter().enumerate().skip(1) {
         #[allow(clippy::cast_precision_loss, reason = "a few dozen passes")]
         let progress = ease::curve(pass as f64 * frame / duration);
@@ -253,6 +253,8 @@ fn a_settle_carries_on_the_speed_toward_its_landing() {
     assert!(ease::entry_for_speed(-800.0, 400.0, 0.5).abs() < 1e-12);
     assert!(ease::entry_for_speed(0.0, 400.0, 0.5).abs() < 1e-12);
     assert!(ease::entry_for_speed(800.0, 0.0, 0.5).abs() < 1e-12);
-    // Slower than the curve's own start, a quarter of the average speed.
-    assert!(ease::entry_for_speed(100.0, 400.0, 0.5).abs() < 1e-12);
+    // The curve starts from rest, so even a slow strip enters a little way
+    // in.
+    let slow = ease::entry_for_speed(100.0, 400.0, 0.5);
+    assert!(slow > 0.0 && slow < 0.05, "100 enters at {slow}");
 }

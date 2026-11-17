@@ -1,10 +1,13 @@
 //! The curve that every window motion the engine animates follows.
 //!
-//! macOS zooms a window along `cubic-bezier(0.4, 0.1, 0.7, 1)` over about
-//! 325 ms. Measured on macOS 27.0.1 from 60 fps recordings of a title-bar
-//! Fill and its restore, that fit is within 0.4 percent RMS of every frame,
-//! for a window that grows and one that shrinks. The motion starts gently,
-//! moves at a steady pace through the middle, and lands softly.
+//! It is a critically damped spring, the bounce-free spring that Apple's
+//! fluid interfaces use for motion that follows a gesture. With a
+//! [`RESPONSE`] of 0.2 s, a motion from rest covers half its distance in
+//! about 54 ms and lands in about 237 ms. It moves from the first frame,
+//! slows into its target, and never overshoots.
+//!
+//! A spring never quite stops, so a motion lands once less than
+//! [`LEFT_AT_LANDING`] of its distance is left, which sets its duration.
 //!
 //! A motion keeps its place along the curve, from 0 at its start to 1 at its
 //! end. Each pass steps a value by the share of what is left that the curve
@@ -12,6 +15,8 @@
 //! such as pacing, still lands when the curve ends. A motion whose target
 //! changes enters the curve again where the curve's speed toward the new
 //! target matches the speed the value had, so it neither jumps nor stalls.
+//! For a spring that is exact: the curve from rest, entered later, is the
+//! same spring started with that speed.
 
 use bevy::ecs::change_detection::{DetectChanges as _, Ref};
 use bevy::ecs::component::Component;
@@ -25,15 +30,19 @@ use crate::ecs::shared_edge::Slide;
 use crate::ecs::systems::{AnimationStep, LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS};
 use crate::manager::Window;
 
-/// The control points of the curve, in the CSS order x1, y1, x2, y2.
-const X1: f64 = 0.4;
-const Y1: f64 = 0.1;
-const X2: f64 = 0.7;
-const Y2: f64 = 1.0;
-
-/// How long a motion lasts at Miri's `animation_speed` of 14, in seconds.
-const MIRI_DURATION: f64 = 0.325;
+/// The spring's response at Miri's `animation_speed` of 14, in seconds: the
+/// period it would swing at without damping. A shorter response is a stiffer,
+/// faster spring.
+const RESPONSE: f64 = 0.2;
 const MIRI_SPEED: f64 = 14.0;
+
+/// The share of a motion's distance left when it lands.
+const LEFT_AT_LANDING: f64 = 0.005;
+
+/// The spring's angular frequency times the motion's duration: where
+/// `(1 + x) e^-x`, the share of the distance a spring from rest has left
+/// after `x / ω` seconds, reaches [`LEFT_AT_LANDING`].
+const SPAN: f64 = 7.430_129_500_280_122;
 
 /// One active frame, in seconds. A motion shorter than this lands in one
 /// step.
@@ -41,11 +50,17 @@ fn frame_secs() -> f64 {
     f64::from(LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS) / 1000.0
 }
 
-/// How long a motion lasts, in seconds: 325 ms at Miri's `animation_speed`
-/// of 14, and shorter at a faster speed. The unset default speed makes it
-/// far shorter than a frame, so each motion lands in one step.
+/// How long a motion lasts, in seconds: about 237 ms at Miri's
+/// `animation_speed` of 14, and shorter at a faster speed. The unset default
+/// speed makes it far shorter than a frame, so each motion lands in one step.
 pub(crate) fn duration(config: &Config) -> f64 {
-    MIRI_DURATION * MIRI_SPEED / config.animation_speed()
+    duration_at(config.animation_speed())
+}
+
+/// How long a motion lasts at an `animation_speed` of `speed`, in seconds.
+pub(crate) fn duration_at(speed: f64) -> f64 {
+    let omega = std::f64::consts::TAU / RESPONSE;
+    SPAN / omega * MIRI_SPEED / speed
 }
 
 /// Whether a motion of `duration` seconds takes more than one step.
@@ -53,62 +68,31 @@ pub(crate) fn animates(duration: f64) -> bool {
     duration >= frame_secs()
 }
 
-fn bezier(p1: f64, p2: f64, u: f64) -> f64 {
-    let v = 1.0 - u;
-    3.0 * v * v * u * p1 + 3.0 * v * u * u * p2 + u * u * u
-}
-
-fn bezier_slope(p1: f64, p2: f64, u: f64) -> f64 {
-    let v = 1.0 - u;
-    3.0 * v * v * p1 + 6.0 * v * u * (p2 - p1) + 3.0 * u * u * (1.0 - p2)
-}
-
-/// The Bezier parameter whose time is `s`. The time rises with the
-/// parameter, so bisection always finds it, and Newton steps finish it.
-fn parameter(s: f64) -> f64 {
-    let (mut low, mut high) = (0.0, 1.0);
-    let mut u = s;
-    for _ in 0..32 {
-        let error = bezier(X1, X2, u) - s;
-        if error.abs() < 1e-12 {
-            return u;
-        }
-        if error > 0.0 {
-            high = u;
-        } else {
-            low = u;
-        }
-        let slope = bezier_slope(X1, X2, u);
-        let next = u - error / slope;
-        u = if slope > 1e-9 && next > low && next < high {
-            next
-        } else {
-            f64::midpoint(low, high)
-        };
-    }
-    u
+/// The share of its distance a spring from rest has left at `s` of the
+/// motion's time.
+fn spring_left(s: f64) -> f64 {
+    let x = SPAN * s;
+    (1.0 + x) * (-x).exp()
 }
 
 /// How far along its distance a motion is at `s` of its time, from 0 to 1.
+/// The spring is scaled so it lands exactly at 1.
 pub(crate) fn curve(s: f64) -> f64 {
     let s = s.clamp(0.0, 1.0);
-    bezier(Y1, Y2, parameter(s))
+    (1.0 - spring_left(s)) / (1.0 - LEFT_AT_LANDING)
 }
 
 /// The curve's slope at `s`: its speed as a multiple of the motion's average
 /// speed.
 fn curve_slope(s: f64) -> f64 {
-    let u = parameter(s.clamp(0.0, 1.0));
-    let dx = bezier_slope(X1, X2, u);
-    if dx <= 1e-12 {
-        return 0.0;
-    }
-    bezier_slope(Y1, Y2, u) / dx
+    let s = s.clamp(0.0, 1.0);
+    let x = SPAN * s;
+    SPAN * x * (-x).exp() / (1.0 - LEFT_AT_LANDING)
 }
 
 /// The curve's speed at `s` toward its end, as a multiple of the average
 /// speed that would cover what is left of the distance in the whole time.
-/// It rises from 0.25 at the start toward infinity at the end.
+/// It rises from 0 at the start toward infinity at the end.
 fn speed_for_what_is_left(s: f64) -> f64 {
     let left = 1.0 - curve(s);
     if left <= 1e-12 {
@@ -315,34 +299,15 @@ pub(crate) fn step_slides(
 mod tests {
     use super::*;
 
-    /// The point of the Bezier at parameter `u`, as (time, progress).
-    fn point(u: f64) -> (f64, f64) {
-        (bezier(X1, X2, u), bezier(Y1, Y2, u))
-    }
-
-    /// The curve's progress at `s`, found by bisecting the Bezier's
-    /// parameter on its own, apart from the solver under test.
-    fn reference(s: f64) -> f64 {
-        let (mut low, mut high) = (0.0, 1.0);
-        for _ in 0..200 {
-            let mid = f64::midpoint(low, high);
-            if point(mid).0 < s {
-                low = mid;
-            } else {
-                high = mid;
-            }
-        }
-        point(f64::midpoint(low, high)).1
-    }
-
     #[test]
-    fn the_curve_follows_the_measured_bezier() {
-        // Computed with an independent bisection in Python of
-        // cubic-bezier(0.4, 0.1, 0.7, 1).
+    fn the_curve_follows_a_critically_damped_spring() {
+        // Computed in Python from 1 - (1 + x) e^-x at x = 7.4301295 s,
+        // divided by 0.995.
         for (s, want) in [
-            (0.25, 0.163_500_577_448_484_8),
-            (0.5, 0.482_896_656_134_697_9),
-            (0.75, 0.830_666_168_233_599_6),
+            (0.1, 0.171_744_836_577_587_35),
+            (0.25, 0.556_845_594_073_891_4),
+            (0.5, 0.889_618_043_845_977_9),
+            (0.75, 0.979_919_806_262_001_8),
         ] {
             assert!(
                 (curve(s) - want).abs() < 1e-9,
@@ -350,19 +315,16 @@ mod tests {
                 curve(s)
             );
         }
-        for step in 0..=100 {
-            let s = f64::from(step) / 100.0;
-            assert!((curve(s) - reference(s)).abs() < 1e-9, "at {s}");
-        }
         assert!(curve(0.0).abs() < 1e-12);
         assert!((curve(1.0) - 1.0).abs() < 1e-12);
+        assert!((spring_left(1.0) - LEFT_AT_LANDING).abs() < 1e-12);
     }
 
     #[test]
-    fn the_curve_starts_at_a_quarter_of_its_average_speed_and_lands_at_rest() {
-        assert!((curve_slope(0.0) - Y1 / X1).abs() < 1e-9);
-        assert!(curve_slope(1.0).abs() < 1e-9);
-        assert!((speed_for_what_is_left(0.0) - 0.25).abs() < 1e-9);
+    fn the_curve_starts_from_rest_and_covers_half_its_distance_in_a_quarter_of_its_time() {
+        assert!(curve_slope(0.0).abs() < 1e-12);
+        assert!(speed_for_what_is_left(0.0).abs() < 1e-12);
+        assert!(curve(0.22) < 0.5 && curve(0.24) > 0.5);
     }
 
     #[test]
@@ -379,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn a_motion_lasts_325_ms_at_miri_speed_and_scales_with_speed() {
+    fn a_motion_lasts_237_ms_at_miri_speed_and_scales_with_speed() {
         let at = |speed: f64| {
             let config: Config = (
                 crate::config::MainOptions {
@@ -391,9 +353,10 @@ mod tests {
                 .into();
             duration(&config)
         };
-        assert!((at(14.0) - 0.325).abs() < 1e-12);
-        assert!((at(28.0) - 0.1625).abs() < 1e-12);
-        assert!((at(7.0) - 0.65).abs() < 1e-12);
+        let miri = 0.236_508_367_556_499_12;
+        assert!((at(14.0) - miri).abs() < 1e-12, "{}", at(14.0));
+        assert!((at(28.0) - miri / 2.0).abs() < 1e-12);
+        assert!((at(7.0) - miri * 2.0).abs() < 1e-12);
         assert!(animates(at(14.0)));
         assert!(!animates(at(10_000.0)));
     }
@@ -415,7 +378,7 @@ mod tests {
         }
     }
 
-    const DURATION: f64 = 0.325;
+    const DURATION: f64 = 0.236_508_367_556_499_12;
     const DT: f64 = 1.0 / 60.0;
 
     /// A window that an ease steps at 60 fps, as each pass moves one.
@@ -464,7 +427,7 @@ mod tests {
     fn steps_follow_the_curve_and_land_on_time() {
         let mut window = Moving::new(IVec2::ZERO);
         let path = window.run(IVec2::new(1000, 0));
-        assert_eq!(path.len(), 20, "{path:?}");
+        assert_eq!(path.len(), 15, "{path:?}");
         for (index, at) in path.iter().enumerate() {
             #[allow(clippy::cast_precision_loss, reason = "a few dozen passes")]
             let want = 1000.0 * curve((index + 1) as f64 * DT / DURATION);
@@ -477,7 +440,8 @@ mod tests {
     }
 
     /// A target that changes mid-motion carries the window's speed on: the
-    /// next step moves about as far as the last, with no jump and no stall.
+    /// next step moves at least as far as the last, with no stall, and the
+    /// spring then pulls the window on toward the new target.
     #[test]
     fn a_new_target_mid_motion_carries_the_speed_on() {
         let mut window = Moving::new(IVec2::ZERO);
@@ -488,9 +452,10 @@ mod tests {
         assert!(speed > 20, "moving at {speed} a pass");
         let to = IVec2::new(1200, 0);
         let step = window.step(to, false);
-        // The curve still gathers speed, so the step can be a little longer.
+        // The spring pulls harder toward a target that moved further away,
+        // so the step can be longer, but never shorter.
         assert!(
-            step >= speed && step - speed <= speed / 8 + 1,
+            step >= speed && step <= speed * 4,
             "the step after the new target moved {step}, the one before {speed}"
         );
         let from = window.at.x;
@@ -502,7 +467,7 @@ mod tests {
             previous = x;
         }
         assert!(
-            rest.len() < 20,
+            rest.len() < 15,
             "lands sooner than a whole motion: {rest:?}"
         );
     }
@@ -515,7 +480,8 @@ mod tests {
             window.step(IVec2::new(600, 0), false);
         }
         let path = window.run(IVec2::new(-400, 0));
-        assert_eq!(path.len(), 20, "a whole motion: {path:?}");
+        // A whole motion, less the last few points that snap.
+        assert!((14..=15).contains(&path.len()), "a whole motion: {path:?}");
     }
 
     /// A motion that ends and has a new target set at once carries its speed
