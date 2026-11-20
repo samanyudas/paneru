@@ -14,6 +14,12 @@
 //!
 //! A maximized floating window fills the usable area of its display over the
 //! layout, and returns to its frame on restore.
+//!
+//! A double-click on a floating window's title bar stays with macOS, which
+//! zooms the window with its own animation. The engine's write and hold would
+//! cut that animation short, and the window would jump. The maximize command
+//! still toggles a floating window, and a double-click restores a floating
+//! window that the command maximized.
 
 use std::time::Duration;
 
@@ -130,17 +136,26 @@ pub(crate) fn command_toggle(
     }
 }
 
+/// The windows a title bar double-click can toggle.
+type Clicked<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut Window,
+        Option<&'static TopBarHeight>,
+        Option<&'static Unmanaged>,
+        Has<FloatingMaximized>,
+    ),
+>;
+
 /// Toggles a window when its title bar is double-clicked. A double-click on
 /// a control in the title bar, such as a button or tab, is the control's
-/// own.
+/// own, and one on a floating window that the command did not maximize is
+/// macOS's.
 fn double_click_toggle(
     mut messages: MessageReader<InputEvent>,
-    mut windows: Query<(
-        Entity,
-        &mut Window,
-        Option<&TopBarHeight>,
-        Has<FloatingMaximized>,
-    )>,
+    mut windows: Clicked,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
@@ -160,12 +175,15 @@ fn double_click_toggle(
             continue;
         };
         let point = origin_from(*point);
-        let Some((entity, mut window, top_bar, maximized)) = windows
+        let Some((entity, mut window, top_bar, unmanaged, maximized)) = windows
             .iter_mut()
             .find(|(_, window, ..)| window.id() == window_id)
         else {
             continue;
         };
+        if matches!(unmanaged, Some(Unmanaged::Floating)) && !maximized {
+            continue;
+        }
         // The engine stops reading a maximized floating window's moves, so a
         // window the user dragged is read here to find its top bar.
         if maximized && !window.write_pending() {
