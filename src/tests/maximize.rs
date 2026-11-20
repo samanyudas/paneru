@@ -139,7 +139,7 @@ fn the_command_and_a_double_click_toggle_one_state() {
 }
 
 /// On a floating window the command fills the usable area over the layout,
-/// as a double-click does, and the next toggle of either kind restores it.
+/// and the next command or a title bar double-click restores it.
 #[test]
 fn the_command_fills_a_floating_window_and_restores_it() {
     let mut harness = three_windows();
@@ -164,7 +164,7 @@ fn the_command_fills_a_floating_window_and_restores_it() {
 
 /// An app can move a maximized floating window to another display, and the
 /// engine stops reading its frame while it is maximized. The command still
-/// restores it on the display it is on now, as a double-click does.
+/// restores it on the display it is on now.
 #[test]
 fn the_command_restores_a_floating_window_on_the_display_it_was_moved_to() {
     let mut harness = TestHarness::new().with_windows(3).with_display(
@@ -315,8 +315,11 @@ fn restoring_after_the_stack_changed_uses_the_stack_as_it_is() {
     assert_eq!(restored.height(), usable_area(&mut harness).height());
 }
 
+/// A double-click on a floating window's title bar stays with macOS, which
+/// animates its own zoom. The engine writes no frame, keeps the frames macOS
+/// gives the window, and the maximize command still toggles it.
 #[test]
-fn a_floating_window_returns_to_its_frame() {
+fn a_double_click_on_a_floating_window_stays_with_macos() {
     let mut harness = three_windows();
     harness.mock_state.focus_window(1);
     harness.advance(SETTLE);
@@ -331,11 +334,37 @@ fn a_floating_window_returns_to_its_frame() {
         "window 1 floats"
     );
     let before = os_frame(&harness, 1);
+    let tiled = frames(&harness, &[0, 2]);
 
     double_click_title_bar(&mut harness, 1);
+    assert_eq!(
+        os_frame(&harness, 1),
+        before,
+        "the engine leaves it to macOS"
+    );
+
+    // macOS zooms the window, and back on the next double-click.
+    let zoomed = usable_area(&mut harness);
+    harness.mock_state.os_resize_window(1, zoomed.size());
+    harness.mock_state.os_move_window(1, zoomed.min);
+    harness.advance(SETTLE);
+    assert_eq!(os_frame(&harness, 1), zoomed, "the engine keeps the zoom");
+    assert_eq!(frames(&harness, &[0, 2]), tiled, "the layout stays");
+
+    double_click_title_bar(&mut harness, 1);
+    assert_eq!(
+        os_frame(&harness, 1),
+        zoomed,
+        "the engine leaves it to macOS"
+    );
+    harness.mock_state.os_resize_window(1, before.size());
+    harness.mock_state.os_move_window(1, before.min);
+    harness.advance(SETTLE);
+    assert_eq!(os_frame(&harness, 1), before);
+
+    run_window_verb(&mut harness, "maximize");
     assert_eq!(os_frame(&harness, 1), usable_area(&mut harness));
-
-    double_click_title_bar(&mut harness, 1);
+    run_window_verb(&mut harness, "maximize");
     assert_eq!(os_frame(&harness, 1), before);
 }
 
