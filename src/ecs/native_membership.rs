@@ -71,6 +71,7 @@ use tracing::{debug, warn};
 use super::display::migrate_windows_to_space;
 use super::drag::DragState;
 use super::layout::{Before, DetachedColumn, LayoutStrip};
+use super::pacing::ShownFrames;
 use super::workspace::PreviousStripPosition;
 use super::{
     ActiveWorkspaceMarker, AwaitingHandle, Bounds, Initializing, NativeFullscreenMarker, Position,
@@ -233,7 +234,59 @@ impl Carried {
             self.quiet_since = None;
             return true;
         }
-        now < *self.quiet_since.get_or_insert(now) + CARRIED_QUIET
+        if now < *self.quiet_since.get_or_insert(now) + CARRIED_QUIET {
+            return true;
+        }
+        // The frames above are what the app reported. A busy app reports a
+        // move late, so the window server, which shows the window without
+        // waiting on the app, has the last word before the hold ends.
+        if self.shown_away(world, members, moving) {
+            self.quiet_since = None;
+            return true;
+        }
+        false
+    }
+
+    /// Whether the window server shows a member that reached its place away
+    /// from it. Sends each such member back.
+    fn shown_away(
+        &self,
+        world: &mut World,
+        members: &[Entity],
+        moving: &mut QueryState<(), Moving>,
+    ) -> bool {
+        let reached: Vec<_> = members
+            .iter()
+            .filter(|member| self.reached.contains(*member))
+            .filter_map(|&member| Some((world.get::<Window>(member)?.id(), member)))
+            .collect();
+        if reached.is_empty() {
+            return false;
+        }
+        let ids: Vec<_> = reached.iter().map(|&(id, _)| id).collect();
+        let Some(shown) = world
+            .get_resource::<ShownFrames>()
+            .map(|frames| frames.now(&ids))
+        else {
+            return false;
+        };
+        let mut away = false;
+        for (id, frame) in shown {
+            let Some(&(_, member)) = reached.iter().find(|&&(reached, _)| reached == id) else {
+                continue;
+            };
+            let Some(margins) = world.get::<Window>(member).map(|window| window.margins()) else {
+                continue;
+            };
+            if at_written_origin(world, member, margins.tracked(frame)) {
+                continue;
+            }
+            away = true;
+            if moving.get(world, member).is_err() {
+                return_to_strip(world, member);
+            }
+        }
+        away
     }
 }
 

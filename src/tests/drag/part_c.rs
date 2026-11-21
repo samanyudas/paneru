@@ -551,6 +551,70 @@ fn a_carried_window_moved_away_and_back_between_frames_stays_in_its_strip() {
     assert_eq!(now.min, placed, "{now:?}");
 }
 
+/// A drop in its own column of a window macOS carried to another display.
+/// A busy app moves the window back to that display and tells the engine
+/// only after the drop's quiet time ran out, so neither a pass nor a move
+/// notification sees it away before then. The window still goes home, as T3
+/// Code needed in miri#390 at a load average of 12.
+#[test]
+fn a_carried_window_moved_away_without_a_notification_stays_in_its_strip() {
+    // Queued writes keep the frame the engine last wrote or read, as the real
+    // window does, so a move nobody reports stays unseen.
+    let config = crate::config::Config::try_from("").expect("config parses");
+    let ext = ext_bounds(EXT_DISPLAY_HEIGHT);
+    let harness = TestHarness::new();
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    let mut harness = harness
+        .with_config(config)
+        .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
+        .with_windows(3)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+            window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
+        });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let settle = |harness: &mut TestHarness, duration: Duration| {
+        let mut left = duration;
+        while left > Duration::ZERO {
+            harness.advance(FRAME);
+            harness.mock_state.flush_writes(Duration::from_millis(100));
+            left = left.saturating_sub(FRAME);
+        }
+    };
+    settle(&mut harness, SETTLE);
+    harness.mock_state.set_spaces_follow_frames(true);
+    let home = middle_of(harness.world(), 2, 600);
+    press_and_drag(&mut harness, 2, home);
+    macos_moves_to_ext(&mut harness, 2);
+    settle(&mut harness, FRAME);
+    release(&mut harness, home);
+    settle(&mut harness, ms(300));
+
+    let placed = harness.mock_state.create_window(2).frame().min;
+    harness.mock_state.update_window(2, |window| {
+        let size = window.frame.size();
+        window.frame.min = Origin::new(ext.min.x + 100, window.frame.min.y);
+        window.frame.max = window.frame.min + size;
+        window.workspace_id = EXT_WORKSPACE_ID;
+    });
+    settle(&mut harness, ms(1500));
+    harness
+        .app
+        .world_mut()
+        .write_message(Event::WindowMoved { window_id: 2 });
+    settle(&mut harness, SETTLE);
+
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+    let now = harness.mock_state.create_window(2).frame();
+    assert_eq!(now.min, placed, "{now:?}");
+}
+
 /// A person who grabs a carried window again while its drop still holds it
 /// drags it where the pointer goes.
 #[test]
