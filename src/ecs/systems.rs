@@ -1073,6 +1073,7 @@ pub(crate) fn window_frame_update(
             entity_commands.try_remove::<NativeResizeStart>();
         }
         let hidden = matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
+        let floating = matches!(unmanaged, Some(Unmanaged::Floating));
         if hidden
             && deferred
             && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -1150,7 +1151,10 @@ pub(crate) fn window_frame_update(
                 !repositioning
             }
             NativeFrame::Ordinary => {
-                if resized && !engine {
+                // macOS can report a floating window's zoom as a move an
+                // update before the resize. The new `Position` with the old
+                // `Bounds` would write the old size back.
+                if (resized || floating) && !engine {
                     // The user's edge resize of a maximized window ends
                     // maximize, and the window keeps the width it was given.
                     if tiling.user_resizes(entity)
