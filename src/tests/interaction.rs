@@ -2367,13 +2367,16 @@ fn test_stack_unstack_brings_focused_window_into_view() {
         .run(commands);
 }
 
-/// A `WindowMoved` notification for a window paneru is not currently moving is
-/// the app (or the user) moving it, and the layout must take that new origin on
-/// board.
+/// A `WindowMoved` notification for a tiled window paneru is not currently
+/// moving is an app moving it, and paneru must not ignore it. The window
+/// keeps its place in the layout, so paneru writes that place back (#489).
 #[test]
-fn test_foreign_window_move_is_adopted() {
+fn test_foreign_window_move_is_written_back() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
         Event::Command {
             command: Command::PrintState,
         },
@@ -2393,19 +2396,26 @@ fn test_foreign_window_move_is_adopted() {
     )
         .into();
 
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let recorded = slot.clone();
     TestHarness::new()
         .with_config(config)
         .with_windows(2)
-        .on_iteration(0, |_world, state| {
-            state.os_move_window(0, Origin::new(77, 88));
-        })
-        .on_iteration(2, |world, _state| {
+        .on_iteration(0, move |world, state| {
             let entity = find_window_entity(0, world);
             let position = world.get::<Position>(entity).expect("window position");
+            *recorded.lock().unwrap() = Some(position.0);
+            state.os_move_window(0, Origin::new(77, 88));
+        })
+        .on_iteration(3, move |world, state| {
+            let slot = slot.lock().unwrap().expect("slot recorded");
+            let entity = find_window_entity(0, world);
+            let position = world.get::<Position>(entity).expect("window position");
+            assert_eq!(position.0, slot, "the window keeps its place in the layout");
             assert_eq!(
-                position.0,
-                Origin::new(77, 88),
-                "a move paneru did not make must be read back into the layout"
+                state.ax_frame(0).min,
+                slot,
+                "paneru wrote the window's place back"
             );
         })
         .run(commands);
