@@ -103,8 +103,9 @@ const CARRIED_LIMIT: Duration = Duration::from_secs(5);
 /// How long the windows of a [`Carried`] placement stay at the origins the
 /// engine wrote, with no move notified, before the placement is done. In
 /// recorded drops, T3 Code moved the window away again up to 0.23 s after it
-/// reached its place.
-const CARRIED_QUIET: Duration = Duration::from_millis(500);
+/// reached its place on an idle Mac, and first did so 0.68 s after it at a
+/// load average of 6 to 8. About 1.5 s leaves room for a busier app.
+const CARRIED_QUIET: Duration = Duration::from_millis(1500);
 
 pub(crate) enum NativeScope {
     ActivatedSpace(WorkspaceId),

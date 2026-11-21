@@ -615,6 +615,47 @@ fn a_carried_window_moved_away_without_a_notification_stays_in_its_strip() {
     assert_eq!(now.min, placed, "{now:?}");
 }
 
+/// A drop in its own column of a window macOS carried to another display. A
+/// busy app first moves the window back to that display 0.8 s after it
+/// reached its place, as T3 Code did at a load average of 6 to 8 in miri#390.
+/// The window still goes home.
+#[test]
+fn a_carried_window_its_app_moves_back_late_stays_in_its_strip() {
+    let mut harness = two_displays("", EXT_DISPLAY_HEIGHT);
+    harness.mock_state.set_spaces_follow_frames(true);
+    let home = middle_of(harness.world(), 2, 600);
+    press_and_drag(&mut harness, 2, home);
+    macos_moves_to_ext(&mut harness, 2);
+    harness.advance(FRAME);
+    release(&mut harness, home);
+    let entity = find_window_entity(2, harness.world());
+    let mut slid = Duration::ZERO;
+    while harness
+        .world()
+        .get::<crate::ecs::RepositionMarker>(entity)
+        .is_some()
+        && slid < Duration::from_secs(5)
+    {
+        harness.advance(FRAME);
+        slid += FRAME;
+    }
+    let placed = harness.mock_state.create_window(2).frame().min;
+    harness.advance(ms(800));
+    app_moves_back_to_ext(&mut harness, 2);
+    harness.advance(SETTLE);
+
+    assert_eq!(
+        layout_on(harness.world(), TEST_WORKSPACE_ID),
+        vec![vec![0], vec![1], vec![2]]
+    );
+    assert_eq!(
+        layout_on(harness.world(), EXT_WORKSPACE_ID),
+        vec![vec![100]]
+    );
+    let now = harness.mock_state.create_window(2).frame();
+    assert_eq!(now.min, placed, "{now:?}");
+}
+
 /// A person who grabs a carried window again while its drop still holds it
 /// drags it where the pointer goes.
 #[test]
