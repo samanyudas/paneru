@@ -1297,15 +1297,23 @@ pub(crate) fn window_frame_update(
             // window the left button holds, even from outside its title bar,
             // goes where the pointer takes it, and a window that macOS carries
             // to another display, or off every display, is handled below.
+            let slot = presented.get(entity).ok();
+            // Where an answer writes the window: its slot, unless a slide
+            // across a shared edge owns `Position`.
+            let target = match slot {
+                Some((origin, false)) => origin.0,
+                _ => position.0,
+            };
+            let home = IRect::from_corners(target, target + new_frame.size());
             let displaced = || {
                 only_moved
                     && !drag.holds_window()
                     && !window_manager.left_button_down()
-                    && display_of(new_frame)
-                        .is_some_and(|to| display_of(placed) == Some(to) && shown(to))
+                    && display_of(new_frame).is_some_and(|to| {
+                        display_of(placed) == Some(to) && display_of(home) == Some(to) && shown(to)
+                    })
                     && arrangement_read()
             };
-            let slot = presented.get(entity).ok();
             if tiled && *drag == DragState::Idle && stranding() {
                 // An app moved its tiled window off every display, as System
                 // Settings does after you rearrange the displays in it. A
@@ -1327,11 +1335,8 @@ pub(crate) fn window_frame_update(
                 )
             {
                 // Back to the slot, even after the engine let an app keep
-                // another place. A slide across a shared edge leaves
-                // `Position` to the slide.
-                if let Some((origin, false)) = slot {
-                    position.0 = origin.0;
-                }
+                // another place.
+                position.0 = target;
                 // A check already under way keeps its remaining writes
                 // instead of starting over.
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {

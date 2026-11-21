@@ -5090,3 +5090,21 @@ fn a_tiled_window_an_app_moves_returns_with_a_menu_bar_height_setting() {
     harness.advance(SETTLE);
     assert_eq!(harness.mock_state.ax_frame(id), slot);
 }
+
+/// #489: an app moves a tiled window that the strip parks as an edge sliver
+/// onto the display, and then moves it again there. The engine does not send
+/// the window back offscreen to its sliver, and leaves it where the app put
+/// it, as it did before the first move.
+#[test]
+fn a_parked_window_an_app_moves_onto_the_display_stays_there() {
+    let mut harness = harness_with("", TEST_DISPLAY_HEIGHT, 5);
+    let id = 3;
+    let parked = harness.mock_state.ax_frame(id);
+    assert!(parked.center().x > TEST_DISPLAY_WIDTH, "parked: {parked:?}");
+    for x in [300, 350] {
+        let place = Origin::new(x, parked.min.y);
+        harness.mock_state.os_move_window(id, place);
+        harness.advance(SETTLE);
+        assert_eq!(harness.mock_state.ax_frame(id).min, place, "moved to x={x}");
+    }
+}
