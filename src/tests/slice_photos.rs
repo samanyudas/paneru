@@ -2677,18 +2677,24 @@ fn a_window_leaving_past_the_edge_waits_for_a_slow_window_behind_it() {
         "window 0 rests in view"
     );
 
-    // Pacing stops waiting for a window shown late for `LANDING_TIMEOUT`, and
-    // the slow app takes its raise before its first move. Hold its writes
-    // for little enough of that time that the raise and move still fit.
+    // Pacing stops waiting for a window shown late for `LANDING_TIMEOUT` of
+    // engine time, and the slow app takes its raise before its first move.
+    // Hold its writes for little enough of that time that the raise and move
+    // still fit.
     harness.mock_state.hold_writes(TEST_PROCESS_ID);
     let mut seen = watch(&mut harness, &log, &ids, &[(0, Direction::East)], 5);
-    harness.mock_state.release_writes(TEST_PROCESS_ID);
-    // At the speed the slow app takes its moves, through its last one.
+    // Then the slow app shows each move one frame late, through its last
+    // one: its writes land between frames, never during one. A real write
+    // delay let a loaded machine run the frames past `LANDING_TIMEOUT`
+    // before the app answered (miri#496).
     for _ in 0..40 {
+        harness.mock_state.release_writes(TEST_PROCESS_ID);
+        assert!(harness.mock_state.flush_writes(Duration::from_secs(5)));
+        harness.mock_state.hold_writes(TEST_PROCESS_ID);
         harness.advance(Duration::from_millis(20));
-        std::thread::sleep(Duration::from_millis(20));
         seen.push(scanline(&harness, &log, &ids));
     }
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
     assert!(harness.mock_state.flush_writes(Duration::from_secs(5)));
 
     for (frame, runs) in seen.iter().enumerate() {
@@ -2892,5 +2898,84 @@ fn the_column_ahead_waits_for_a_slow_window_landing_under_its_photo() {
         harness.mock_state.ax_frame(SLOW).min.x > rest.shown.min.x,
         "window 2 moved on from where its photo rested, to {:?}",
         harness.mock_state.ax_frame(SLOW)
+    );
+}
+
+/// The photo of window 3 slides in at the shared edge and pushes window 2,
+/// whose app shows nothing for four frames. Window 2 keeps its slide beside
+/// the photo all the same, rather than only its first step: a photo shows
+/// each step at once and does not wait for the window ahead of it, so it
+/// would cover window 2 for the rest of the slide (miri#500).
+#[test]
+fn a_window_pushed_by_a_photo_sliding_in_keeps_its_slide_while_its_app_shows_nothing() {
+    let log: ScreenLog = Rc::new(RefCell::new(Screen::default()));
+    let harness = TestHarness::new().with_config(animated()).with_display(
+        EXT_DISPLAY_ID,
+        RIGHT,
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    let mut harness = harness.with_windows(4);
+    harness
+        .world()
+        .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+        harness.mock_state.flush_writes(Duration::from_secs(1));
+    }
+    let (mut harness, log) = painted((harness, log), 3);
+    let asked_right = |world: &mut World| {
+        world
+            .query::<&Window>()
+            .iter(world)
+            .find(|window| window.id() == 2)
+            .expect("window 2 not found")
+            .frame()
+            .max
+            .x
+    };
+    let start = asked_right(harness.world());
+    harness.mock_state.hold_writes(TEST_PROCESS_ID);
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Last)));
+    // Pacing starts with the second frame, once it has a read of the window
+    // server.
+    harness.advance(Duration::from_millis(20));
+    let mut places = Vec::new();
+    for _ in 0..3 {
+        harness.advance(Duration::from_millis(20));
+        let photo = log
+            .borrow()
+            .placed
+            .iter()
+            .find(|(id, _)| *id == 3)
+            .map(|(_, slice)| slice.on_screen.min.x);
+        places.push((photo, asked_right(harness.world())));
+    }
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+        harness.mock_state.flush_writes(Duration::from_secs(1));
+    }
+
+    assert!(
+        in_view(harness.mock_state.ax_frame(3)),
+        "window 3 rests in view"
+    );
+    assert!(
+        places.iter().all(|&(_, asked)| asked < start),
+        "window 2 moves on from {start}: {places:?}"
+    );
+    assert!(
+        places
+            .iter()
+            .all(|&(photo, asked)| photo.is_some_and(|photo| photo >= asked)),
+        "the photo of window 3 never passes where window 2 is asked for: {places:?}"
     );
 }

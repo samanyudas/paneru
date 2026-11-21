@@ -5,10 +5,11 @@
 use std::time::Duration;
 
 use bevy::prelude::*;
+use bevy::time::TimeUpdateStrategy;
 
-use crate::commands::{Command, Direction, Operation, ResizeDirection};
+use crate::commands::{Command, Direction, Operation, ResizeDirection, Side};
 use crate::config::{Config, MainOptions};
-use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
+use crate::ecs::{RepositionMarker, SpawnWindowTrigger, WidthLimits};
 use crate::events::Event;
 use crate::manager::Window;
 use crate::platform::{Pid, WinID};
@@ -22,10 +23,14 @@ const FAST_APP: Pid = 2;
 
 /// Three of them fill more than the display.
 const WINDOW_WIDTH: i32 = 600;
-/// How long each of the slow app's writes takes, so that it shows each move
-/// a frame or more late.
+/// How long each of the slow app's writes takes once its writes are let
+/// through. The tests hold its writes while frames run and land them between
+/// frames, so this sets no lateness on the engine's clock. It only makes
+/// each landing take real time, as a slow app's does.
 const SLOW_WRITE: Duration = Duration::from_millis(40);
 const FRAME: Duration = Duration::from_millis(20);
+/// How soon after a pass an event can wake the engine for the next one.
+const SHORT_PASS: Duration = Duration::from_millis(2);
 const FLUSH: Duration = Duration::from_secs(5);
 
 /// Windows 0, 1 and 2 in a row, at rest with window 0 at the display's left
@@ -119,20 +124,38 @@ fn gap(harness: &TestHarness, left: WinID, right: WinID) -> i32 {
     harness.mock_state.ax_frame(right).min.x - harness.mock_state.ax_frame(left).max.x
 }
 
-/// Runs frames at the speed the slow app takes its moves until the row
-/// settles, asserting after each that no more desktop than `rest` shows
-/// between windows `left` and `right`.
+/// Lets the slow app take every move it has been asked for, and waits until
+/// it has.
+fn land_slow_writes(harness: &mut TestHarness) {
+    harness.mock_state.release_writes(SLOW_APP);
+    assert!(
+        harness.mock_state.flush_writes(FLUSH),
+        "the slow app takes its moves"
+    );
+}
+
+/// Runs frames until the row settles, with the slow app showing each move
+/// one frame late, and asserts after each frame that no more desktop than
+/// `rest` shows between windows `left` and `right`.
+///
+/// The slow app's writes land between frames, never during one. Pacing
+/// stops waiting for a window shown late for `LANDING_TIMEOUT` of engine
+/// time, and a real write delay let a loaded machine run the frames past it
+/// before the app answered (miri#496).
 fn settle_beside(harness: &mut TestHarness, left: WinID, right: WinID, rest: i32) {
+    // The app answers the writes it held as it is released.
+    land_slow_writes(harness);
     for frame in 0..200 {
+        harness.mock_state.hold_writes(SLOW_APP);
         harness.advance(FRAME);
-        std::thread::sleep(FRAME);
         assert!(
             gap(harness, left, right) <= rest,
             "desktop shows between windows {left} and {right} {frame} frames after the release: {:?} {:?}",
             harness.mock_state.ax_frame(left),
             harness.mock_state.ax_frame(right)
         );
-        if !moving(harness.world()) && harness.mock_state.flush_writes(Duration::ZERO) {
+        land_slow_writes(harness);
+        if !moving(harness.world()) {
             return;
         }
     }
@@ -210,6 +233,49 @@ fn the_window_ahead_waits_for_a_slow_window_behind_it_scrolling_right() {
     assert!(
         harness.mock_state.ax_frame(2).min.x > start.min.x,
         "window 2 scrolled right from {start:?}"
+    );
+}
+
+/// Focus moves to the slow window 1, and the row scrolls it into view. Its
+/// app shows nothing for three frames, as an app that gains focus does. Once
+/// it answers, window 1 shows its first step and slides on from there,
+/// rather than showing far along at once while it covers window 0 (miri#500).
+#[test]
+fn a_slow_window_coming_into_view_starts_its_slide_where_its_app_first_shows_it() {
+    let mut harness = harness();
+    let start = harness.mock_state.ax_frame(1).min.x;
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::East));
+    for _ in 0..3 {
+        harness.advance(FRAME);
+    }
+    let mut shown = vec![start];
+    land_slow_writes(&mut harness);
+    shown.push(harness.mock_state.ax_frame(1).min.x);
+    for _ in 0..200 {
+        harness.mock_state.hold_writes(SLOW_APP);
+        harness.advance(FRAME);
+        land_slow_writes(&mut harness);
+        shown.push(harness.mock_state.ax_frame(1).min.x);
+        if !moving(harness.world()) {
+            break;
+        }
+    }
+    settle(&mut harness);
+    assert_landed(&mut harness);
+
+    let end = harness.mock_state.ax_frame(1).min.x;
+    assert!(
+        end < start,
+        "window 1 scrolled into view from {start} to {end}"
+    );
+    let largest_step = (start - end) / 3;
+    assert!(
+        shown
+            .windows(2)
+            .all(|pair| (0..=largest_step).contains(&(pair[0] - pair[1]))),
+        "window 1 slides from {start} to {end} in steps of at most {largest_step}: {shown:?}"
     );
 }
 
@@ -440,6 +506,37 @@ fn the_window_ahead_does_not_snap_past_a_slow_window_on_a_short_move() {
     );
 }
 
+/// A pass too short to move window 0 a whole point, near the end of a short
+/// move: window 0 ahead still waits for the slow window 1 behind it, rather
+/// than taking the rest of its slide at once while window 1 has yet to move.
+#[test]
+fn the_window_ahead_does_not_pass_a_slow_window_on_a_pass_too_short_to_move_it() {
+    let mut harness = harness_with_widths([600, TEST_DISPLAY_WIDTH - 600 + 12, 400]);
+    let rest = gap(&harness, 0, 1);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::East));
+    for _ in 0..5 {
+        harness.advance(FRAME);
+    }
+    harness
+        .world()
+        .insert_resource(TimeUpdateStrategy::ManualDuration(SHORT_PASS));
+    harness.advance(SHORT_PASS);
+    harness
+        .world()
+        .insert_resource(TimeUpdateStrategy::ManualDuration(FRAME));
+    assert!(
+        gap(&harness, 0, 1) <= rest,
+        "desktop shows between windows 0 and 1 after a short pass: {:?} {:?}",
+        harness.mock_state.ax_frame(0),
+        harness.mock_state.ax_frame(1)
+    );
+    harness.mock_state.release_writes(SLOW_APP);
+    settle(&mut harness);
+    assert_landed(&mut harness);
+}
+
 /// Owns no window the engine tracks, like Finder showing only the desktop.
 const DESKTOP_APP: Pid = 3;
 
@@ -517,4 +614,359 @@ fn the_window_ahead_waits_for_a_prompt_window_whose_app_comes_back_to_the_front(
     settle(&mut harness);
 
     assert_window_0_waits(&mut harness, Operation::Maximize);
+}
+
+/// Events wake the engine for passes a few milliseconds apart, each a small
+/// share of a slide. Window 0 waits for the slow window 1 behind it, then in
+/// one such pass moves as far as window 1 shows, rather than easing on from
+/// where it waited while window 1 covers it (miri#500).
+#[test]
+fn a_window_held_for_a_slow_window_keeps_up_once_that_window_shows() {
+    let mut harness = harness();
+    let before = gap(&harness, 0, 1);
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::East));
+    for _ in 0..3 {
+        harness.advance(FRAME);
+    }
+    land_slow_writes(&mut harness);
+    harness.mock_state.hold_writes(SLOW_APP);
+    harness
+        .world()
+        .insert_resource(TimeUpdateStrategy::ManualDuration(SHORT_PASS));
+    harness.advance(SHORT_PASS);
+    harness
+        .world()
+        .insert_resource(TimeUpdateStrategy::ManualDuration(FRAME));
+    let met = gap(&harness, 0, 1);
+    let frames = (
+        harness.mock_state.ax_frame(0),
+        harness.mock_state.ax_frame(1),
+    );
+    harness.mock_state.release_writes(SLOW_APP);
+    settle(&mut harness);
+    assert_landed(&mut harness);
+
+    assert_eq!(
+        met, before,
+        "windows 0 and 1 meet as at rest one pass after window 1 shows its first step: {frames:?}"
+    );
+}
+
+/// Windows 1 and 2, of `widths`, share a stack right of window 0, and focus
+/// moves to the slow window 1. Its app shows nothing for three frames, so
+/// it gets only the first step of its slide. Asserts that window 2, which
+/// takes each move at once, is asked for the same place as window 1 each
+/// frame.
+fn assert_a_stack_slides_together(widths: [i32; 3]) {
+    let mut harness = harness_with_widths(widths);
+    harness.run(vec![
+        focus(Direction::Last),
+        window(Operation::Stack(Side::West)),
+        focus(Direction::North),
+        focus(Direction::First),
+    ]);
+    settle(&mut harness);
+    let asked = |harness: &mut TestHarness| {
+        (
+            engine_frame(harness.world(), 1).min.x,
+            engine_frame(harness.world(), 2).min.x,
+        )
+    };
+    let start = asked(&mut harness);
+    assert_eq!(start.0, start.1, "windows 1 and 2 share a column");
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::East));
+    let mut places = Vec::new();
+    for _ in 0..3 {
+        harness.advance(FRAME);
+        places.push(asked(&mut harness));
+    }
+    land_slow_writes(&mut harness);
+    for _ in 0..200 {
+        harness.mock_state.hold_writes(SLOW_APP);
+        harness.advance(FRAME);
+        places.push(asked(&mut harness));
+        land_slow_writes(&mut harness);
+        if !moving(harness.world()) {
+            break;
+        }
+    }
+    settle(&mut harness);
+    assert_landed(&mut harness);
+
+    let end = asked(&mut harness);
+    assert!(
+        end.0 < start.0,
+        "the stack scrolled into view from {start:?} to {end:?}"
+    );
+    assert!(
+        places.iter().all(|(top, bottom)| top == bottom),
+        "windows 1 and 2 are asked for the same place each frame: {places:?}"
+    );
+}
+
+/// A window stacked with one whose app shows late slides with it, rather
+/// than on ahead of it (miri#500).
+#[test]
+fn stacked_windows_slide_together_while_one_of_them_shows_late() {
+    assert_a_stack_slides_together([TEST_DISPLAY_WIDTH - 100, WINDOW_WIDTH, WINDOW_WIDTH]);
+}
+
+/// The same on a scroll of a few points, which the window that takes its
+/// moves at once would finish before the late one shows its first step.
+#[test]
+fn stacked_windows_stay_together_on_a_short_scroll_while_one_shows_late() {
+    assert_a_stack_slides_together([WINDOW_WIDTH, 431, 431]);
+}
+
+/// The slow window 1 cannot grow past its width, so stacked with the wider
+/// window 0 it parks a few points from it past the left edge. Focus comes
+/// back to the stack while window 1's app shows nothing for three frames:
+/// the two slide back in no further apart than they parked.
+#[test]
+fn stacked_windows_of_two_widths_slide_together_while_one_shows_late() {
+    let narrow = WINDOW_WIDTH - 2;
+    let mut harness = harness_with_widths([WINDOW_WIDTH, narrow, 2 * WINDOW_WIDTH]);
+    let world = harness.world();
+    let entity = world
+        .query::<(Entity, &Window)>()
+        .iter(world)
+        .find(|(_, window)| window.id() == 1)
+        .expect("window 1")
+        .0;
+    world.entity_mut(entity).insert(WidthLimits {
+        min: None,
+        max: Some(narrow),
+    });
+    harness.run(vec![
+        focus(Direction::East),
+        window(Operation::Stack(Side::West)),
+        focus(Direction::Last),
+    ]);
+    settle(&mut harness);
+    let asked =
+        |harness: &mut TestHarness| [0, 1].map(|id| engine_frame(harness.world(), id).min.x);
+    let start = asked(&mut harness);
+    let parked_apart = (start[0] - start[1]).abs();
+    assert!(
+        parked_apart > 0,
+        "windows 0 and 1 park at different places: {start:?}"
+    );
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::First));
+    let mut places = Vec::new();
+    for _ in 0..3 {
+        harness.advance(FRAME);
+        places.push(asked(&mut harness));
+    }
+    land_slow_writes(&mut harness);
+    for _ in 0..200 {
+        harness.mock_state.hold_writes(SLOW_APP);
+        harness.advance(FRAME);
+        places.push(asked(&mut harness));
+        land_slow_writes(&mut harness);
+        if !moving(harness.world()) {
+            break;
+        }
+    }
+    settle(&mut harness);
+    assert_landed(&mut harness);
+
+    let end = asked(&mut harness);
+    assert!(
+        start[1] < end[1],
+        "the stack scrolled into view from {start:?} to {end:?}"
+    );
+    assert!(
+        places
+            .iter()
+            .all(|[wide, narrow]| (wide - narrow).abs() <= parked_apart),
+        "windows 0 and 1 stay within {parked_apart} points of each other: {places:?}"
+    );
+}
+
+/// Window 2 joins window 1's column while the row scrolls, so the two head
+/// for the same place from opposite sides. Each slides straight there, and
+/// neither is put where the other is.
+#[test]
+fn windows_that_meet_in_a_stack_from_both_sides_each_slide_straight_there() {
+    let mut harness = harness();
+    harness.run(vec![focus(Direction::Last)]);
+    settle(&mut harness);
+    let asked =
+        |harness: &mut TestHarness| [1, 2].map(|id| engine_frame(harness.world(), id).min.x);
+    let start = asked(&mut harness);
+
+    harness
+        .world()
+        .write_message(window(Operation::Stack(Side::West)));
+    let mut places = vec![start];
+    for _ in 0..200 {
+        harness.advance(FRAME);
+        places.push(asked(&mut harness));
+        if !moving(harness.world()) {
+            break;
+        }
+    }
+    settle(&mut harness);
+    assert_landed(&mut harness);
+
+    let end = asked(&mut harness);
+    assert_eq!(end[0], end[1], "windows 1 and 2 share a column");
+    assert!(
+        start[0] < end[0] && end[1] < start[1],
+        "windows 1 and 2 meet from opposite sides: {start:?} to {end:?}"
+    );
+    assert!(
+        places
+            .windows(2)
+            .all(|pair| pair[0][0] <= pair[1][0] && pair[1][1] <= pair[0][1]),
+        "window 1 only moves right and window 2 only moves left: {places:?}"
+    );
+}
+
+/// Windows 0 and 1 share a stack, and window 2 joins it from the right.
+/// Window 1 only moves up to make room, so its app shows no move sideways.
+/// Window 2 does not wait for one: it slides in from its first frame.
+#[test]
+fn a_window_joining_a_stack_does_not_wait_for_one_that_only_moves_up() {
+    let mut harness = harness_with_widths([300; 3]);
+    harness.run(vec![
+        focus(Direction::East),
+        window(Operation::Stack(Side::West)),
+        focus(Direction::Last),
+    ]);
+    settle(&mut harness);
+    let mut places = vec![engine_frame(harness.world(), 2).min.x];
+
+    harness
+        .world()
+        .write_message(window(Operation::Stack(Side::West)));
+    for _ in 0..4 {
+        harness.advance(FRAME);
+        places.push(engine_frame(harness.world(), 2).min.x);
+    }
+
+    assert!(
+        places.windows(2).all(|pair| pair[1] < pair[0]),
+        "window 2 moves left each frame: {places:?}"
+    );
+    settle(&mut harness);
+    assert_landed(&mut harness);
+}
+
+/// At a slow animation speed, the first step of a six-point scroll rounds
+/// to no move at all. The slow window 1 could never show such a step, so it
+/// takes its slide instead and still scrolls in.
+#[test]
+fn a_slow_window_whose_first_step_rounds_to_no_move_still_scrolls_in() {
+    let mut harness =
+        harness_with_widths([WINDOW_WIDTH, TEST_DISPLAY_WIDTH - WINDOW_WIDTH + 6, 400]);
+    let start = engine_frame(harness.world(), 1).min.x;
+    // The row settles at the usual speed, then scrolls at a slow one.
+    let slow: Config = (
+        MainOptions {
+            animation_speed: Some(5.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    harness.world().insert_resource(slow);
+
+    harness.world().write_message(focus(Direction::East));
+    let mut places = Vec::new();
+    for _ in 0..30 {
+        harness.advance(FRAME);
+        land_slow_writes(&mut harness);
+        places.push(engine_frame(harness.world(), 1).min.x);
+        if !moving(harness.world()) {
+            break;
+        }
+    }
+
+    assert!(
+        !moving(harness.world()),
+        "window 1 finishes its scroll from {start}: {places:?}"
+    );
+    assert_eq!(engine_frame(harness.world(), 1).min.x, start - 6);
+    assert_landed(&mut harness);
+}
+
+/// Focus moves from window 0 to window 2, whose app takes each move at once,
+/// and the row scrolls left with the slow window 1 ahead of window 2. Window
+/// 1 shows nothing for four frames. It keeps its slide beside window 2 all
+/// the same, rather than only its first step: window 2 does not wait for
+/// it, so it would stay under window 2 for the rest of the slide (miri#500).
+#[test]
+fn a_slow_window_keeps_its_slide_ahead_of_a_window_that_moves_on() {
+    let mut harness = harness();
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::Last));
+    let mut covers = Vec::new();
+    let mut places = Vec::new();
+    for _ in 0..4 {
+        harness.advance(FRAME);
+        let behind = engine_frame(harness.world(), 2).min.x;
+        covers.push(engine_frame(harness.world(), 1).max.x - behind);
+        places.push(behind);
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle(&mut harness);
+    assert_landed(&mut harness);
+
+    assert!(
+        places.windows(2).all(|pair| pair[1] < pair[0]),
+        "window 2 moves on each frame: {places:?}"
+    );
+    assert!(
+        covers.windows(2).all(|pair| pair[1] <= pair[0]),
+        "window 2 is asked no further over window 1 from frame to frame: {covers:?}"
+    );
+}
+
+/// Window 0 is tucked behind the slow window 1, and its app reports it 3
+/// points from where the engine asked, as apps do. Focus moves to window 1,
+/// which leads the row in, and the engine puts window 0 back as the row
+/// moves. That shift is no slide for window 1 to follow: while its app
+/// shows nothing, window 1 gets only its first step (miri#500).
+#[test]
+fn a_window_that_leads_the_row_in_keeps_its_first_step_while_one_behind_it_only_shifts() {
+    let mut harness = harness_with_widths([1016, 508, 1016]);
+    harness.world().write_message(focus(Direction::Last));
+    settle_beside(&mut harness, 1, 2, i32::MAX);
+    settle(&mut harness);
+    let tucked = harness.mock_state.ax_frame(0).min;
+    harness
+        .mock_state
+        .os_move_window(0, tucked + IVec2::new(3, 0));
+    for _ in 0..5 {
+        harness.advance(FRAME);
+    }
+    let start = engine_frame(harness.world(), 1).min.x;
+    harness.mock_state.hold_writes(SLOW_APP);
+
+    harness.world().write_message(focus(Direction::West));
+    let mut places = Vec::new();
+    for _ in 0..4 {
+        harness.advance(FRAME);
+        places.push(engine_frame(harness.world(), 1).min.x);
+    }
+    harness.mock_state.release_writes(SLOW_APP);
+    settle(&mut harness);
+    assert_landed(&mut harness);
+
+    assert!(
+        places[0] > start,
+        "window 1 takes a first step from {start}: {places:?}"
+    );
+    assert!(
+        places.iter().all(|&place| place == places[0]),
+        "window 1 waits at its first step while its app shows nothing: {places:?}"
+    );
 }

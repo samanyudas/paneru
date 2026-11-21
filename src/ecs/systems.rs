@@ -102,7 +102,7 @@ type ChangedWindowFrames<'w, 's> = Populated<
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
-const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
+pub(super) const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
 // Real events (input, IPC, workspace changes, ...) wake the pump immediately
 // via `EventLoopWaker`, so this only bounds how late the free-running 1s
@@ -1089,6 +1089,11 @@ pub(crate) fn window_frame_update(
     } else {
         notified_windows(&mut messages, &windows)
     };
+    for (entity, moved, _) in &notified {
+        if *moved {
+            native.moved(*entity);
+        }
+    }
     for (entity, _, deferred) in &rechecks {
         let read = deferred.copied().unwrap_or_default();
         match notified
@@ -1124,6 +1129,7 @@ pub(crate) fn window_frame_update(
             entity_commands.try_remove::<NativeResizeStart>();
         }
         let hidden = matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
+        let floating = matches!(unmanaged, Some(Unmanaged::Floating));
         if hidden
             && deferred
             && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -1202,7 +1208,10 @@ pub(crate) fn window_frame_update(
                 !repositioning
             }
             NativeFrame::Ordinary => {
-                if resized && !engine {
+                // macOS can report a floating window's zoom as a move an
+                // update before the resize. The new `Position` with the old
+                // `Bounds` would write the old size back.
+                if (resized || floating) && !engine {
                     // The user's edge resize of a maximized window ends
                     // maximize, and the window keeps the width it was given.
                     if tiling.user_resizes(entity)
