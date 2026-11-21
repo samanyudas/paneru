@@ -35,6 +35,7 @@ use crate::ecs::layout::{Column, LayoutStrip, RestoreTo};
 use crate::ecs::maximize::{FloatingMaximized, FrameHold};
 use crate::ecs::native_membership::{NativeMembership, NativeScope, stranded};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, WindowCtx, Windows};
+use crate::ecs::shared_edge::Slide;
 use crate::ecs::state::{PaneruState, SaveSession, StateFile};
 use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
 use crate::ecs::{
@@ -1080,7 +1081,7 @@ pub(crate) fn window_frame_update(
     displays: Query<&Display>,
     mut native: ResMut<NativeMembership>,
     mut answers: Query<&mut ForeignMoveAnswers>,
-    presented: Query<&PresentedOrigin>,
+    presented: Query<(&PresentedOrigin, Has<Slide>)>,
     time: Res<Time>,
     mut commands: Commands,
 ) {
@@ -1304,6 +1305,7 @@ pub(crate) fn window_frame_update(
                         .is_some_and(|to| display_of(placed) == Some(to) && shown(to))
                     && arrangement_read()
             };
+            let slot = presented.get(entity).ok();
             if tiled && *drag == DragState::Idle && stranding() {
                 // An app moved its tiled window off every display, as System
                 // Settings does after you rearrange the displays in it. A
@@ -1320,10 +1322,16 @@ pub(crate) fn window_frame_update(
                     // The slot the layout placed the window in. `Position`
                     // holds the app's origin once the engine stops answering,
                     // and must not start the count again.
-                    presented.get(entity).map_or(position.0, |origin| origin.0),
+                    slot.map_or(position.0, |(origin, _)| origin.0),
                     time.elapsed(),
                 )
             {
+                // Back to the slot, even after the engine let an app keep
+                // another place. A slide across a shared edge leaves
+                // `Position` to the slide.
+                if let Some((origin, false)) = slot {
+                    position.0 = origin.0;
+                }
                 // A check already under way keeps its remaining writes
                 // instead of starting over.
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
