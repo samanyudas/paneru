@@ -122,6 +122,13 @@ impl ShownFrames {
         }
     }
 
+    /// Where the window server shows the windows of `ids` right now. A
+    /// window it does not list is left out. The read does not wait on any
+    /// app.
+    pub(crate) fn now(&self, ids: &[WinID]) -> Vec<(WinID, IRect)> {
+        (self.shared.read)(ids)
+    }
+
     /// Watches the windows of `asked`, each with the frame the engine last
     /// asked for, and returns where each is shown as of the newest read.
     /// `None` when no sampler can run.
