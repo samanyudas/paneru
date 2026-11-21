@@ -181,9 +181,6 @@ fn double_click_toggle(
         else {
             continue;
         };
-        if matches!(unmanaged, Some(Unmanaged::Floating)) && !maximized {
-            continue;
-        }
         // The engine stops reading a maximized floating window's moves, so a
         // window the user dragged is read here to find its top bar.
         if maximized && !window.write_pending() {
@@ -199,6 +196,13 @@ fn double_click_toggle(
                 debug!("no maximize: element under {point} unreadable: {err}");
                 continue;
             }
+        }
+        if matches!(unmanaged, Some(Unmanaged::Floating)) && !maximized {
+            // A hold left by the command's restore would undo macOS's zoom.
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<FrameHold>();
+            }
+            continue;
         }
         commands.trigger(ToggleMaximize {
             entity,
