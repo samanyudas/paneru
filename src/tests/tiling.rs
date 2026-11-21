@@ -1550,6 +1550,74 @@ fn a_window_raised_just_after_it_opens_floats_and_takes_focus() {
     assert_eq!(window_x(world, 2), TEST_WINDOW_WIDTH * 2);
 }
 
+/// The app behind the window that a background app opens above ordinary
+/// windows.
+const BACKGROUND_PID: i32 = TEST_PROCESS_ID + 1;
+
+/// Tiled windows 0 to 2 of the frontmost app with 0 focused, and an app in
+/// the background that has not opened a window yet.
+fn harness_with_background_app() -> TestHarness {
+    let mut harness = TestHarness::new()
+        .with_windows(3)
+        .with_focused_window(0)
+        .with_app(BACKGROUND_PID, "background.app", "BackgroundApp", |app| {
+            app.is_frontmost = false;
+        });
+    harness.advance(Duration::from_millis(500));
+    harness
+}
+
+/// Asserts that window 3 floats and that window 0 keeps the focus.
+fn assert_floats_and_focus_stays_on_0(harness: &mut TestHarness) {
+    let world = harness.world();
+    let entity = find_window_entity(3, world);
+    assert!(matches!(
+        world.entity(entity).get::<crate::ecs::Unmanaged>(),
+        Some(crate::ecs::Unmanaged::Floating)
+    ));
+    crate::assert_focused!(world, 0);
+}
+
+/// A window that a background app opens above ordinary windows, such as a
+/// floating panel, floats but leaves the focus with the app in front.
+#[test]
+fn a_background_app_window_above_ordinary_windows_does_not_take_focus() {
+    let mut harness = harness_with_background_app();
+    let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let window = harness
+        .mock_state
+        .spawn_window(BACKGROUND_PID, TEST_WORKSPACE_ID, 3, frame);
+    harness
+        .mock_state
+        .update_window(3, |window| window.above_ordinary = true);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_millis(500));
+
+    assert_floats_and_focus_stays_on_0(&mut harness);
+}
+
+/// A background app that raises its window just after it opens, as Chrome
+/// does with Picture-in-Picture started while another app is in front, gets
+/// the window floated but leaves the focus with the app in front.
+#[test]
+fn a_background_app_window_raised_after_it_opens_does_not_take_focus() {
+    let mut harness = harness_with_background_app();
+    let window = harness.mock_state.spawn_window(
+        BACKGROUND_PID,
+        TEST_WORKSPACE_ID,
+        3,
+        IRect::new(1000, 500, 400, 225),
+    );
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_millis(40));
+    harness
+        .mock_state
+        .update_window(3, |window| window.above_ordinary = true);
+    harness.advance(Duration::from_millis(500));
+
+    assert_floats_and_focus_stays_on_0(&mut harness);
+}
+
 /// A window that stays at the ordinary level stays tiled, and the engine
 /// stops reading its level once the check ends.
 #[test]
