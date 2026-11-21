@@ -5011,6 +5011,33 @@ fn an_app_that_keeps_moving_its_window_off_its_column_gets_a_few_answers() {
     assert_eq!(harness.mock_state.ax_frame(id).min, off);
 }
 
+/// #489: an app that keeps moving its tiled window to a new place each time.
+/// Once the engine stops answering, the place the app chose last does not
+/// start the answers again, so the engine never writes back a place the app
+/// chose.
+#[test]
+fn an_app_that_keeps_moving_its_window_to_new_places_gets_a_few_answers() {
+    let mut harness = three_columns();
+    let id = 1;
+    let slot = harness.mock_state.ax_frame(id);
+    let places = [slot.min + IVec2::new(150, 0), slot.min + IVec2::new(250, 0)];
+    let mut answers = 0;
+    for step in 0..10 {
+        let place = places[step % 2];
+        harness.mock_state.os_move_window(id, place);
+        harness.advance(ms(60));
+        let now = harness.mock_state.ax_frame(id).min;
+        if now != place {
+            answers += 1;
+        }
+    }
+    assert!(
+        (1..=3).contains(&answers),
+        "the engine undid the app's move {answers} times"
+    );
+    assert_eq!(harness.mock_state.ax_frame(id).min, places[1]);
+}
+
 /// #489: an app that moves its window off its column every 400 ms for
 /// several seconds still gets only a few answers, because its moves never
 /// leave a quiet second between them.

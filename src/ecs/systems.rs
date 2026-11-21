@@ -40,8 +40,8 @@ use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
     LowPowerMode, MaximumHeight, MinimumHeight, MissionControlActive, Position, PreLaunchFrame,
-    ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    SystemTheme, Unmanaged, WidthLimits, WidthRatio, WindowProperties,
+    PresentedOrigin, ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger,
+    SpawnCommandsExt, SystemTheme, Unmanaged, WidthLimits, WidthRatio, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -1080,6 +1080,7 @@ pub(crate) fn window_frame_update(
     displays: Query<&Display>,
     mut native: ResMut<NativeMembership>,
     mut answers: Query<&mut ForeignMoveAnswers>,
+    presented: Query<&PresentedOrigin>,
     time: Res<Time>,
     mut commands: Commands,
 ) {
@@ -1316,7 +1317,10 @@ pub(crate) fn window_frame_update(
                     &mut answers,
                     &mut commands,
                     entity,
-                    position.0,
+                    // The slot the layout placed the window in. `Position`
+                    // holds the app's origin once the engine stops answering,
+                    // and must not start the count again.
+                    presented.get(entity).map_or(position.0, |origin| origin.0),
                     time.elapsed(),
                 )
             {
