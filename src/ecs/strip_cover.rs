@@ -48,7 +48,7 @@ use crate::ecs::workspace::spawn_snap_strip_guard;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker, LayoutPosition,
     NativeFullscreenMarker, Position, PostUpdateSet, RepositionMarker, ResizeMarker, ScrollInput,
-    Scrolling, SelectedVirtualMarker, Unmanaged, UpdateSet, ease, systems,
+    Scrolling, SelectedVirtualMarker, SpawnCommandsExt as _, Unmanaged, UpdateSet, ease, systems,
 };
 use crate::events::Event;
 use crate::manager::{Display, Window, WindowManager};
@@ -79,6 +79,10 @@ const BLANK_RETRY: Duration = Duration::from_secs(6);
 
 /// How often the engine looks for a picture to refresh.
 const REFRESH_TICK: Duration = Duration::from_millis(100);
+
+/// How long past its length a slide waits for Core Animation to show it
+/// landed before the windows land anyway.
+const SHOWN_GRACE: f64 = 0.5;
 
 /// The longest slide the cover plays. A slower `animation_speed` moves the
 /// real windows as before.
@@ -255,9 +259,14 @@ pub(crate) struct CoverSlide {
     landing: Option<(Duration, u8)>,
     /// The snap guard the landing spawned, which ends when the cover lifts.
     guard: Option<Entity>,
-    /// The display's bounds when the slide began. A display that moved
-    /// since has placed the strip anew.
+    /// The display's bounds and the strip's viewport when the slide began.
+    /// A display or a Dock that changed since has placed the strip anew.
     bounds: IRect,
+    viewport: IRect,
+    /// How long the slide has run by the engine's count, for when Core
+    /// Animation cannot tell where it shows: the landing waits at most
+    /// [`SHOWN_GRACE`] past the slide's length for the screen.
+    counted: f64,
 }
 
 impl CoverSlide {
@@ -626,16 +635,20 @@ fn cover_strip_moves(
             // Where the pictures show, as Core Animation draws them, which
             // runs on while the engine stalls.
             let showing = if slide.landing.is_none() {
-                slide.elapsed += step.secs();
+                slide.counted += step.secs();
                 let showing = match screen.0.showing(slide.display) {
-                    // Core Animation runs on while the engine stalls, so the
-                    // slide's clock catches up with what it shows, and a
-                    // turn and the landing follow the screen.
-                    Some(showing) => {
-                        slide.elapsed = slide.elapsed.max(slide.phase_of(showing));
+                    // Core Animation runs on while the engine stalls, and the
+                    // engine's count can run ahead of it, so the slide's clock
+                    // is where the screen shows it: a turn and the landing
+                    // follow the screen.
+                    Some(showing) if slide.counted < slide.length() + SHOWN_GRACE => {
+                        slide.elapsed = slide.phase_of(showing);
                         showing
                     }
-                    None => slide.x_at(slide.elapsed),
+                    _ => {
+                        slide.elapsed = slide.counted;
+                        slide.x_at(slide.elapsed)
+                    }
                 };
                 screen.0.track(slide.display, showing);
                 showing
@@ -654,13 +667,22 @@ fn cover_strip_moves(
                 debug!("cover over strip {entity} ended early");
                 // A strip moved to another display keeps where that display
                 // put it.
-                if slide.landing.is_none()
-                    && shown_here
-                    && display.id() == slide.display
+                let same_place = display.id() == slide.display
                     && display.bounds() == slide.bounds
-                {
-                    position.0 = slide.target;
-                    spawn_snap_strip_guard(entity, &mut commands);
+                    && viewport == slide.viewport;
+                if slide.landing.is_none() && shown_here {
+                    if same_place {
+                        position.0 = slide.target;
+                        spawn_snap_strip_guard(entity, &mut commands);
+                    } else if let Some(focused) = strip_windows(&strip, &windows)
+                        .iter()
+                        .find(|window| window.focused)
+                    {
+                        // The display or the Dock changed under the slide:
+                        // its target is stale, so the layout shows the
+                        // focused window again where it now fits.
+                        commands.ensure_visible(focused.entity);
+                    }
                 }
                 end_guard(slide.guard.take(), &mut commands);
                 screen.0.hide(slide.display);
@@ -676,14 +698,22 @@ fn cover_strip_moves(
                 // A new target while the pictures slide: the slide turns
                 // there from where it shows, at the speed it has. After
                 // they land, the strip already rests at the old target.
-                let speed = if slide.landing.is_none() {
+                // A slide shown landed has no speed left to carry on.
+                let speed = if slide.landing.is_none() && slide.elapsed < slide.length() {
                     slide.speed_at(slide.elapsed)
                 } else {
                     0.0
                 };
                 position.0.y = target.y;
                 let guard = slide.guard;
-                *slide = start_slide(slide.display, slide.bounds, showing, speed, target, &config);
+                *slide = start_slide(
+                    slide.display,
+                    (slide.bounds, slide.viewport),
+                    showing,
+                    speed,
+                    target,
+                    &config,
+                );
                 slide.guard = guard;
                 screen.0.slide(slide.display, &slide.path(), PATH_STEP);
                 debug!("cover over strip {entity} turned to {}", target.x);
@@ -745,7 +775,7 @@ fn cover_strip_moves(
         screen.0.show(&scene);
         let slide = start_slide(
             display.id(),
-            display.bounds(),
+            (display.bounds(), viewport),
             f64::from(from),
             0.0,
             target,
@@ -768,7 +798,7 @@ fn cover_strip_moves(
 /// `target`.
 fn start_slide(
     display: CGDirectDisplayID,
-    bounds: IRect,
+    (bounds, viewport): (IRect, IRect),
     from: f64,
     speed: f64,
     target: IVec2,
@@ -786,6 +816,8 @@ fn start_slide(
         landing: None,
         guard: None,
         bounds,
+        viewport,
+        counted: 0.0,
     }
 }
 
@@ -948,6 +980,8 @@ fn cover_swipes(
                         landing: Some((time.elapsed() + LANDING_TIMEOUT, 0)),
                         guard: Some(guard),
                         bounds: display.bounds(),
+                        viewport: display.actual_display_bounds(dock, &config),
+                        counted: 0.0,
                     });
                     let x = position.0.x;
                     debug!("cover over swiped strip {entity} landed at {x}");

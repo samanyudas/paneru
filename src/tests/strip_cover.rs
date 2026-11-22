@@ -542,3 +542,20 @@ fn the_landing_follows_the_pictures_on_screen() {
         "the windows land once the pictures show landed"
     );
 }
+
+/// While Core Animation still shows the pictures short of their target,
+/// the real windows wait, however far the engine has counted.
+#[test]
+fn the_windows_wait_while_the_pictures_still_move() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    log.borrow_mut().showing = Some(f64::from(-STEP) / 2.0);
+    harness.advance(ONE_FRAME * 15);
+    assert!(covered(harness.world()), "still sliding on screen");
+    assert_eq!(window_x(harness.world(), 1), 700, "the window waits");
+    log.borrow_mut().showing = Some(f64::from(-STEP));
+    harness.advance(ONE_FRAME * 3);
+    assert_eq!(window_x(harness.world(), 1), 700 - STEP, "then lands");
+}
