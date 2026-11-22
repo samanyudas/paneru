@@ -87,6 +87,23 @@ pub struct CoverScreenOS {
     filters: HashMap<WinID, Arc<OnceLock<Filter>>>,
 }
 
+/// One animated number of a morph: the picture layer, which of its numbers
+/// moves (an index into [`MORPH_TRACKS`]), and from where to where.
+struct Lead {
+    layer: Retained<CALayer>,
+    track: usize,
+    from: f64,
+    to: f64,
+}
+
+/// The numbers of a picture layer a morph animates.
+const MORPH_TRACKS: [&str; 4] = [
+    "position.x",
+    "position.y",
+    "bounds.size.width",
+    "bounds.size.height",
+];
+
 /// One display's cover: a panel over its viewport, the layer that holds the
 /// strip's pictures, and the viewport it covers.
 struct Cover {
@@ -99,6 +116,8 @@ struct Cover {
     layers: Vec<(WinID, Retained<CALayer>)>,
     /// The strip origin the cover was laid out at, which a resize keeps.
     laid: IVec2,
+    /// The track of a morph that moves furthest, to tell how far it shows.
+    lead: Option<Lead>,
     /// Where the strip origin shows now, as far as the engine has told.
     at: IVec2,
     /// Whether the cover is up.
@@ -396,6 +415,7 @@ impl CoverScreen for CoverScreenOS {
                     pictures: Vec::new(),
                     layers: Vec::new(),
                     laid: scene.strip,
+                    lead: None,
                     at: scene.strip,
                     shown: false,
                 },
@@ -449,6 +469,7 @@ impl CoverScreen for CoverScreenOS {
         cover.strip = strip;
         cover.layers = layers;
         cover.laid = scene.strip;
+        cover.lead = None;
         cover.pictures = scene
             .pictures
             .iter()
@@ -517,6 +538,7 @@ impl CoverScreen for CoverScreenOS {
                 viewport,
             )
         };
+        let mut lead = None;
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         if let Some(root) = cover.window.contentView().and_then(|view| view.layer()) {
@@ -530,15 +552,26 @@ impl CoverScreen for CoverScreenOS {
             let (from, to) = (local(*from), local(*to));
             layer.removeAllAnimations();
             layer.setFrame(to);
-            let tracks: [(&str, f64, f64); 4] = [
-                ("position.x", from.origin.x, to.origin.x),
-                ("position.y", from.origin.y, to.origin.y),
-                ("bounds.size.width", from.size.width, to.size.width),
-                ("bounds.size.height", from.size.height, to.size.height),
+            let tracks = [
+                (from.origin.x, to.origin.x),
+                (from.origin.y, to.origin.y),
+                (from.size.width, to.size.width),
+                (from.size.height, to.size.height),
             ];
-            for (path, start, end) in tracks {
+            for (track, (path, (start, end))) in MORPH_TRACKS.into_iter().zip(tracks).enumerate() {
                 if (end - start).abs() < f64::EPSILON {
                     continue;
+                }
+                if lead
+                    .as_ref()
+                    .is_none_or(|lead: &Lead| (end - start).abs() > (lead.to - lead.from).abs())
+                {
+                    lead = Some(Lead {
+                        layer: layer.clone(),
+                        track,
+                        from: start,
+                        to: end,
+                    });
                 }
                 let values = shares
                     .iter()
@@ -552,6 +585,7 @@ impl CoverScreen for CoverScreenOS {
         }
         CATransaction::commit();
         CATransaction::flush();
+        cover.lead = lead;
         // A press goes to the window where its picture rests.
         cover.pictures = frames
             .iter()
@@ -580,6 +614,21 @@ impl CoverScreen for CoverScreenOS {
         );
         CATransaction::commit();
         CATransaction::flush();
+    }
+
+    fn morph_share(&self, display: CGDirectDisplayID) -> Option<f64> {
+        let cover = self.covers.get(&display).filter(|cover| cover.shown)?;
+        let lead = cover.lead.as_ref()?;
+        // SAFETY: a plain read of the layer Core Animation shows now.
+        let shown = unsafe { lead.layer.presentationLayer() }?;
+        let (position, size) = (shown.position(), shown.bounds().size);
+        let now = [position.x, position.y, size.width, size.height][lead.track];
+        // Within half a point of the end, the morph shows landed.
+        Some(if (now - lead.to).abs() < 0.5 {
+            1.0
+        } else {
+            ((now - lead.from) / (lead.to - lead.from)).clamp(0.0, 1.0)
+        })
     }
 
     fn track(&mut self, display: CGDirectDisplayID, x: f64) {
@@ -642,6 +691,7 @@ impl CoverScreen for CoverScreenOS {
         cover.shown = false;
         cover.pictures.clear();
         cover.layers.clear();
+        cover.lead = None;
         // The pictures go with the layer that held them.
         cover.strip = CALayer::new();
         cover.window.orderOut(None::<&AnyObject>);

@@ -44,6 +44,8 @@ struct Screen {
     /// Each window's frame where its picture starts and where it heads, for
     /// each morph.
     morphs: Vec<Vec<(WinID, IRect, IRect)>>,
+    /// How far along Core Animation shows the morph, if the test says.
+    morph_share: Option<f64>,
     fades: usize,
     hidden: usize,
 }
@@ -107,6 +109,10 @@ impl CoverScreen for RecordingScreen {
 
     fn fade(&mut self, _display: CGDirectDisplayID, _seconds: f64) {
         self.0.borrow_mut().fades += 1;
+    }
+
+    fn morph_share(&self, _display: CGDirectDisplayID) -> Option<f64> {
+        self.0.borrow().morph_share
     }
 
     fn track(&mut self, _display: CGDirectDisplayID, x: f64) {
@@ -881,7 +887,10 @@ fn a_focus_key_mid_resize_turns_the_morph() {
     send(&mut harness, focus(Direction::East));
     harness.advance(ONE_FRAME);
     assert_eq!(log.borrow().shown.len(), 1, "the same cover stays up");
-    assert!(log.borrow().slides.is_empty(), "no strip slide starts over it");
+    assert!(
+        log.borrow().slides.is_empty(),
+        "no strip slide starts over it"
+    );
     assert_eq!(log.borrow().morphs.len(), 2, "the morph turns");
     let (_, to) = morph_of(&log, 1, 1);
     assert!(to.min.x < first_to.min.x, "the strip heads east: {to:?}");
@@ -915,4 +924,50 @@ fn a_stacked_column_resize_morphs_every_window_of_it() {
     let paths = frames_of(&mut harness, &[0, 1]);
     assert_eq!(paths[0], vec![to0], "each window changes once");
     assert_eq!(paths[1], vec![to1]);
+}
+
+/// A turn starts where Core Animation shows the pictures, even when the
+/// engine's own count lags it after a stalled frame.
+#[test]
+fn a_turn_starts_where_the_screen_shows_the_morph() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    take_pictures(&mut harness, &log);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    let (from, to) = morph_of(&log, 0, 0);
+    log.borrow_mut().morph_share = Some(0.9);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().morphs.len(), 2, "the morph turns");
+    let (turned_from, _) = morph_of(&log, 1, 0);
+    #[allow(clippy::cast_possible_truncation)]
+    let shown = from.max.x + (f64::from(to.max.x - from.max.x) * 0.9).round() as i32;
+    assert_eq!(
+        turned_from.max.x, shown,
+        "the turn starts where the screen shows"
+    );
+}
+
+/// The cover stays up after the pictures land while the window server
+/// still shows a window at its old frame, as an app that takes its new
+/// size after the write returned does, and fades once it shows the new one.
+#[test]
+fn the_cover_waits_for_the_window_server_to_show_the_new_frames() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    take_pictures(&mut harness, &log);
+    harness.mock_state.show_late(0);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    // Past the landing, within its time limit.
+    harness.advance(ONE_FRAME * 16);
+    assert!(morphed(harness.world()), "the cover is still up");
+    assert_eq!(log.borrow().fades, 0, "no fade while the old frame shows");
+    harness.mock_state.show_now(0);
+    harness.advance(ONE_FRAME * 3);
+    assert_eq!(
+        log.borrow().fades,
+        1,
+        "the cover fades once the new frame shows"
+    );
 }

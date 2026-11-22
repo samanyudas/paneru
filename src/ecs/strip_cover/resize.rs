@@ -28,12 +28,13 @@ use tracing::debug;
 
 use super::{
     CoverPhotos, CoverScreenHandle, CoverSlide, CoverSwipe, CoverWindows, LANDED_FRAMES,
-    LANDING_TIMEOUT, PATH_STEP, ShownStrips, StripWindow, cover_enabled, end_guard, scene_of,
-    shows, strip_windows,
+    LANDING_TIMEOUT, PATH_STEP, SHOWN_GRACE, ShownStrips, StripWindow, close, cover_enabled,
+    end_guard, scene_of, shows, strip_windows,
 };
 use crate::config::Config;
 use crate::ecs::drag::DragState;
 use crate::ecs::layout::LayoutStrip;
+use crate::ecs::pacing::ShownFrames;
 use crate::ecs::systems::AnimationStep;
 use crate::ecs::workspace::spawn_snap_strip_guard;
 use crate::ecs::{
@@ -102,6 +103,9 @@ pub(crate) struct CoverMorph {
     entry: f64,
     elapsed: f64,
     duration: f64,
+    /// How long the morph has run by the engine's count, for when Core
+    /// Animation cannot tell how far it shows.
+    counted: f64,
     stage: Stage,
     /// The snap guard that holds the real windows to their places.
     guard: Option<Entity>,
@@ -127,6 +131,21 @@ impl CoverMorph {
             return 1.0;
         }
         ease::share(self.entry, self.entry + (at / self.duration).max(0.0))
+    }
+
+    /// How far into the morph the pictures show `share` of the way along,
+    /// in seconds: the share only grows, so each has one time.
+    fn phase_of(&self, share: f64) -> f64 {
+        let (mut low, mut high) = (0.0, self.length());
+        for _ in 0..40 {
+            let mid = f64::midpoint(low, high);
+            if self.share_at(mid) < share {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        high
     }
 
     /// The share at each [`PATH_STEP`] of the morph, ending on 1.
@@ -195,8 +214,13 @@ type RestStrips<'w, 's> = Query<
 pub(super) fn remember_resting(
     strips: RestStrips,
     windows: CoverWindows,
+    config: Res<Config>,
     mut resting: ResMut<RestingStrips>,
 ) {
+    if !cover_enabled(&config) {
+        resting.0.clear();
+        return;
+    }
     resting.0 = strips
         .iter()
         .filter_map(|(entity, strip, position)| {
@@ -250,7 +274,8 @@ fn headings(row: &[StripWindow], origin: IVec2) -> Vec<(Entity, WinID, IRect)> {
 
 /// Gives the real windows of a resized strip their new frames at once,
 /// under the cover: the strip takes its target, each resizing window its
-/// new size, and a snap guard keeps the layout from easing them there.
+/// new size, and a fresh snap guard keeps the layout from easing them
+/// there: the one before may have timed out.
 fn snap(
     strip: Entity,
     position: &mut Mut<Position>,
@@ -259,6 +284,7 @@ fn snap(
     guard: Option<Entity>,
     commands: &mut Commands,
 ) -> Entity {
+    end_guard(guard, commands);
     position.0 = target;
     // Every window of the strip takes its place again, from the new origin.
     position.set_changed();
@@ -272,7 +298,7 @@ fn snap(
                 .try_remove::<ResizeMarker>();
         }
     }
-    guard.unwrap_or_else(|| spawn_snap_strip_guard(strip, commands))
+    spawn_snap_strip_guard(strip, commands)
 }
 
 /// Starts a cover for each eligible resize, turns a covered resize that
@@ -315,17 +341,32 @@ pub(super) fn cover_resizes(
         swiping,
     ) in &mut strips
     {
+        let row = strip_windows(strip, &windows);
+        if morph.is_none() && row.iter().all(|window| window.resize.is_none()) {
+            continue;
+        }
         let Ok((display, dock)) = displays.get(child.parent()) else {
             continue;
         };
-        let row = strip_windows(strip, &windows);
         let target = marker.as_ref().map_or(position.0, |marker| marker.0);
         let viewport = display.actual_display_bounds(dock, &config);
         let shown_here = active || shows(&window_manager, display.id(), &shown_strips, entity);
 
         if let Some(mut morph) = morph {
             if morph.stage == Stage::Moving {
-                morph.elapsed += step.secs();
+                morph.counted += step.secs();
+                // Core Animation runs on while the engine stalls, so the
+                // morph's clock is where the screen shows it.
+                morph.elapsed = match screen.0.morph_share(morph.display) {
+                    Some(share) if morph.counted < morph.length() + SHOWN_GRACE => {
+                        if share >= 1.0 {
+                            morph.length()
+                        } else {
+                            morph.phase_of(share)
+                        }
+                    }
+                    _ => morph.counted,
+                };
             }
             let same_windows = row.len() == morph.frames.len()
                 && row
@@ -382,6 +423,7 @@ pub(super) fn cover_resizes(
                     .collect();
                 morph.entry = entry;
                 morph.elapsed = 0.0;
+                morph.counted = 0.0;
                 morph.duration = duration;
                 morph.stage = Stage::Moving;
                 let guard = morph.guard.take();
@@ -409,9 +451,6 @@ pub(super) fn cover_resizes(
             continue;
         }
 
-        if row.iter().all(|window| window.resize_to().is_none()) {
-            continue;
-        }
         let refused = if !cover_enabled(&config) {
             Some("switched off")
         } else if !shown_here {
@@ -502,6 +541,7 @@ pub(super) fn cover_resizes(
             entry: 0.0,
             elapsed: 0.0,
             duration,
+            counted: 0.0,
             stage: Stage::Moving,
             guard: None,
         };
@@ -547,12 +587,31 @@ fn turn_entry(
     ease::entry_for_speed(speed, f64::from(to - now), duration)
 }
 
+/// Whether the window server shows each window of `row` where the engine
+/// last asked: a write call can return before its app shows the new frame,
+/// and the fade must not show a window still at its old width.
+fn shows_asked(row: &[StripWindow], windows: &CoverWindows, shown: &ShownFrames) -> bool {
+    let asked = row
+        .iter()
+        .filter_map(|window| windows.get(window.entity).ok())
+        .map(|(window, ..)| (window.id(), window.margins().shown(window.frame())))
+        .collect::<Vec<_>>();
+    let ids = asked.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    shown.now(&ids).into_iter().all(|(id, frame)| {
+        asked
+            .iter()
+            .find(|(asked, _)| *asked == id)
+            .is_none_or(|(_, want)| close(frame.min, want.min) && close(frame.max, want.max))
+    })
+}
+
 /// Fades each resize's cover out once its pictures land and its windows
 /// rest, or once it has waited [`LANDING_TIMEOUT`], and takes it down after
 /// the fade.
 pub(super) fn lift_morphs(
     mut strips: Query<(Entity, &LayoutStrip, &mut CoverMorph)>,
     windows: CoverWindows,
+    shown_frames: Option<Res<ShownFrames>>,
     time: Res<Time>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
     mut commands: Commands,
@@ -565,9 +624,11 @@ pub(super) fn lift_morphs(
         match morph.stage {
             Stage::Moving => {}
             Stage::Landing { deadline, settled } => {
-                let in_place = strip_windows(strip, &windows)
-                    .iter()
-                    .all(|window| window.at_rest);
+                let row = strip_windows(strip, &windows);
+                let in_place = row.iter().all(|window| window.at_rest)
+                    && shown_frames
+                        .as_ref()
+                        .is_none_or(|shown| shows_asked(&row, &windows, shown));
                 let settled = if in_place { settled + 1 } else { 0 };
                 if settled >= LANDED_FRAMES || now >= deadline {
                     let late = if settled >= LANDED_FRAMES {

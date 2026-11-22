@@ -175,6 +175,10 @@ pub(crate) trait CoverScreen {
     /// windows under it. A [`CoverScreen::morph`] or [`CoverScreen::show`]
     /// makes it opaque again, and [`CoverScreen::hide`] takes it down.
     fn fade(&mut self, display: CGDirectDisplayID, seconds: f64);
+    /// How far along its morph the cover of `display` shows its pictures
+    /// now, as Core Animation draws them, from 0 to 1. `None` when it
+    /// cannot tell.
+    fn morph_share(&self, display: CGDirectDisplayID) -> Option<f64>;
     /// Where the strip on the cover of `display` shows now, as Core
     /// Animation draws it. `None` when it cannot tell.
     fn showing(&self, display: CGDirectDisplayID) -> Option<f64>;
