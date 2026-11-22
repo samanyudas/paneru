@@ -971,3 +971,34 @@ fn the_cover_waits_for_the_window_server_to_show_the_new_frames() {
         "the cover fades once the new frame shows"
     );
 }
+
+/// A neighbor that a resize pushes off the cover's area is still checked
+/// before the fade: the window server may still show it at its old frame,
+/// under the cover.
+#[test]
+fn the_cover_waits_for_a_neighbor_pushed_off_it() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    take_pictures(&mut harness, &log);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(SETTLE);
+    take_pictures(&mut harness, &log);
+    harness.mock_state.show_late(1);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().morphs.len(), 2, "the second resize is covered");
+    let (from, to) = morph_of(&log, 1, 1);
+    assert!(
+        from.min.x < TEST_DISPLAY_WIDTH && to.min.x >= TEST_DISPLAY_WIDTH,
+        "the neighbor leaves the display: {from:?} to {to:?}"
+    );
+    harness.advance(ONE_FRAME * 16);
+    assert_eq!(log.borrow().fades, 1, "only the first resize's cover faded");
+    harness.mock_state.show_now(1);
+    harness.advance(ONE_FRAME * 3);
+    assert_eq!(
+        log.borrow().fades,
+        2,
+        "the cover fades once the neighbor shows"
+    );
+}

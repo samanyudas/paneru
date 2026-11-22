@@ -566,6 +566,7 @@ pub(super) fn cover_resizes(
             stage: Stage::Moving,
             guard: None,
         };
+        morph.note_hidden();
         morph.guard = Some(snap(
             entity,
             &mut position,
