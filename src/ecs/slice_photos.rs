@@ -1116,6 +1116,15 @@ fn slide_photos_out(
                         next.x, next.y
                     );
                 } else {
+                    // The photo rests as the slice, so a window held beside it
+                    // goes on from there.
+                    *slide = Slide::Tucking {
+                        at: to,
+                        to,
+                        hold,
+                        slice,
+                        until,
+                    };
                     entity_commands.try_insert(slice).try_remove::<Slide>();
                     debug!("edge slice photo tucked: window {id}");
                 }
