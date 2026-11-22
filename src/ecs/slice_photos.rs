@@ -246,8 +246,9 @@ impl SlicePhoto {
 struct Renewal {
     generation: u32,
     slice: EdgeSlice,
-    /// The engine time a swipe asked for it, if a swipe did.
-    swiped_at: Option<Duration>,
+    /// A swipe asked for it, at once. Such a photo always answers, which
+    /// ends the renewal.
+    swiped: bool,
     _wanted: Wanted,
 }
 
@@ -559,7 +560,6 @@ fn refresh_slices(
     in_view: InView,
     next: NextToCross,
     access: Res<SliceAccess>,
-    time: Res<Time>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
     let Some(screen) = screen else {
@@ -584,7 +584,7 @@ fn refresh_slices(
     // The panels someone sees go before the kept photos of windows in view.
     if *access == SliceAccess::On {
         let next = next.find(&in_view);
-        renew_kept(None, &mut slices, &in_view, &next, time.elapsed());
+        renew_kept(None, &mut slices, &in_view, &next);
     }
 }
 
@@ -741,7 +741,6 @@ fn renew_kept(
     slices: &mut Slices,
     in_view: &InView,
     next: &[(WinID, EdgeSlice)],
-    now: Duration,
 ) {
     let Slices {
         showing,
@@ -756,14 +755,9 @@ fn renew_kept(
         if showing.iter().any(|(showing, _, _)| *showing == id) {
             continue;
         }
-        // A photo a swipe asked for in this refresh period is on its way, and
-        // a queued one would replace it with one that starts later.
-        if screen.is_none()
-            && renewing
-                .get(&id)
-                .and_then(|renewal| renewal.swiped_at)
-                .is_some_and(|at| now < at + REFRESH)
-        {
+        // A photo a swipe asked for is on its way, and a queued one would
+        // replace it with one that starts later.
+        if screen.is_none() && renewing.get(&id).is_some_and(|renewal| renewal.swiped) {
             continue;
         }
         // A window resized in view, as by maximizing, would otherwise keep
@@ -797,7 +791,7 @@ fn renew_kept(
             Renewal {
                 generation: *generation,
                 slice,
-                swiped_at: screen.is_some().then_some(now),
+                swiped: screen.is_some(),
                 _wanted: Wanted(ticket),
             },
         );
@@ -881,7 +875,6 @@ impl NextToCross<'_, '_> {
 
 /// Renews the kept photos of the windows in view as a swipe or scroll
 /// starts, before it carries any of them past the edge.
-#[allow(clippy::too_many_arguments)]
 fn renew_kept_on_swipe(
     scrolls: Query<&Scrolling>,
     mut was_swiping: Local<bool>,
@@ -889,7 +882,6 @@ fn renew_kept_on_swipe(
     in_view: InView,
     next: NextToCross,
     access: Res<SliceAccess>,
-    time: Res<Time>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
     let swiping = scrolls.iter().any(|scrolling| scrolling.is_user_swiping);
@@ -899,13 +891,7 @@ fn renew_kept_on_swipe(
         && let Some(mut screen) = screen
     {
         let next = next.find(&in_view);
-        renew_kept(
-            Some(screen.0.as_mut()),
-            &mut slices,
-            &in_view,
-            &next,
-            time.elapsed(),
-        );
+        renew_kept(Some(screen.0.as_mut()), &mut slices, &in_view, &next);
     }
     *was_swiping = swiping;
 }
