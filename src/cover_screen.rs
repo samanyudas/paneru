@@ -178,7 +178,9 @@ impl CoverScreenOS {
                         &cover.pictures,
                     ))
                 })
-                .flatten()
+                // Pictures paint back to front, and the front one takes a
+                // press where pictures overlap.
+                .flat_map(|panels| panels.into_iter().rev())
                 .collect(),
         );
     }
@@ -445,12 +447,29 @@ impl CoverScreen for CoverScreenOS {
         self.track(display, x);
     }
 
+    fn showing(&self, display: CGDirectDisplayID) -> Option<f64> {
+        let cover = self.covers.get(&display).filter(|cover| cover.shown)?;
+        // SAFETY: a plain read of the layer Core Animation shows now.
+        let shown = unsafe { cover.strip.presentationLayer() }?;
+        Some(shown.position().x + f64::from(cover.viewport.min.x))
+    }
+
+    fn shown(&self) -> Vec<CGDirectDisplayID> {
+        self.covers
+            .iter()
+            .filter(|(_, cover)| cover.shown)
+            .map(|(display, _)| *display)
+            .collect()
+    }
+
     fn hide(&mut self, display: CGDirectDisplayID) {
         let Some(cover) = self.covers.get_mut(&display) else {
             return;
         };
         cover.shown = false;
         cover.pictures.clear();
+        // The pictures go with the layer that held them.
+        cover.strip = CALayer::new();
         cover.window.orderOut(None::<&AnyObject>);
         if let Some(root) = cover.window.contentView().and_then(|view| view.layer()) {
             CATransaction::begin();

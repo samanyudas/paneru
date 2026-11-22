@@ -87,23 +87,22 @@ pub(crate) fn is_slice_panel(window: WinID) -> bool {
 /// decides it.
 fn panel_at(point: CGPoint) -> Option<SlicePanel> {
     let (slices, covers) = (SLICE_PANELS.load(), COVER_PANELS.load());
-    let panel = slices
+    let mut panels = slices
         .iter()
         .chain(covers.iter())
-        .find(|panel| panel.contains(point))?;
+        .filter(|panel| panel.contains(point))
+        .peekable();
+    panels.peek()?;
     let mtm = MainThreadMarker::new()?;
     let hit = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(
         NSPoint::new(point.x, primary_screen_height(mtm) - point.y),
         0,
         mtm,
     );
-    if WinID::try_from(hit).ok() != Some(panel.panel) {
-        debug!(
-            "press at ({:.0}, {:.0}) over panel {} of window {} reached window {hit}",
-            point.x, point.y, panel.panel, panel.window
-        );
-    }
-    (WinID::try_from(hit).ok() == Some(panel.panel)).then_some(*panel)
+    // An edge slice and a cover picture can both hold the point: the one
+    // the window server shows on top takes the press.
+    let hit = WinID::try_from(hit).ok();
+    panels.find(|panel| Some(panel.panel) == hit).copied()
 }
 
 /// A press the tap held back on a panel, for the engine to post again once

@@ -96,6 +96,19 @@ impl CoverScreen for RecordingScreen {
         self.0.borrow_mut().placed.push(x);
     }
 
+    fn showing(&self, _display: CGDirectDisplayID) -> Option<f64> {
+        None
+    }
+
+    fn shown(&self) -> Vec<CGDirectDisplayID> {
+        let screen = self.0.borrow();
+        if screen.shown.len() > screen.hidden {
+            vec![TEST_DISPLAY_ID]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn hide(&mut self, _display: CGDirectDisplayID) {
         self.0.borrow_mut().hidden += 1;
     }
@@ -239,6 +252,11 @@ fn a_keyboard_move_slides_pictures_and_moves_each_window_once() {
     assert!(covered(harness.world()), "the move is under a cover");
     assert_eq!(log.borrow().shown.len(), 1, "one cover goes up");
     assert_eq!(
+        log.borrow().shown[0].1,
+        4,
+        "a picture of every window, so a turned slide shows each window"
+    );
+    assert_eq!(
         log.borrow().slides.first().copied(),
         Some((0.0, f64::from(-STEP))),
         "the pictures slide the strip from where it was to where it heads"
@@ -252,6 +270,7 @@ fn a_keyboard_move_slides_pictures_and_moves_each_window_once() {
     let path = path_of(&mut harness, 1);
     assert_eq!(path, vec![700, 700 - STEP], "the window moves once");
     assert_eq!(log.borrow().hidden, 1, "the cover comes down");
+
     // The tap learns where the pictures are as they slide, so a press on
     // one reaches its window.
     let tracked = log.borrow().tracked.clone();
@@ -397,4 +416,77 @@ fn a_swipe_moves_the_pictures_and_lands_each_window_once() {
         Some(f64::from(landing - 700)),
         "the pictures land where the windows do"
     );
+}
+
+/// A cover whose move went away, as when its strip or display did, comes
+/// down on its own.
+#[test]
+fn a_cover_without_its_move_comes_down() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    assert!(covered(harness.world()));
+    let strips = harness
+        .world()
+        .query_filtered::<Entity, With<CoverSlide>>()
+        .iter(harness.world())
+        .collect::<Vec<_>>();
+    // The strip rests where the slide headed, so no new move starts.
+    for strip in strips {
+        let mut strip = harness.world().entity_mut(strip);
+        strip.remove::<CoverSlide>();
+        strip.get_mut::<crate::ecs::Position>().unwrap().0.x = -STEP;
+    }
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().hidden, 1, "the orphaned cover comes down");
+}
+
+/// Modifier-scroll stays uncovered: its ticks over the cover would not
+/// reach the engine.
+#[test]
+fn a_wheel_scroll_gets_no_cover() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, Event::Scroll { delta: 30.0 });
+    harness.advance(ONE_FRAME);
+    send(&mut harness, Event::Scroll { delta: 30.0 });
+    harness.advance(SETTLE);
+    assert!(log.borrow().shown.is_empty(), "no cover");
+}
+
+/// An `animation_speed` of 0 would make an endless slide: the strip moves
+/// as before, and the engine takes no pictures.
+#[test]
+fn a_zero_animation_speed_gets_no_cover() {
+    let (mut harness, log) = harness(config(true, Some(0.0)));
+    harness.advance(SETTLE);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME * 3);
+    assert!(log.borrow().asked.is_empty(), "no pictures");
+    assert!(log.borrow().shown.is_empty(), "no cover");
+}
+
+/// The landing's snap guard ends as the cover lifts, so a layout change
+/// right after animates again.
+#[test]
+fn the_landing_snap_guard_ends_with_the_cover() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    for _ in 0..60 {
+        if !covered(harness.world()) {
+            break;
+        }
+        harness.advance(ONE_FRAME);
+    }
+    assert!(!covered(harness.world()), "the cover lifted");
+    harness.advance(ONE_FRAME);
+    let guards = harness
+        .world()
+        .query::<&crate::ecs::workspace::SnapStripMarker>()
+        .iter(harness.world())
+        .count();
+    assert_eq!(guards, 0, "no snap guard outlives the cover");
 }
