@@ -376,6 +376,97 @@ fn a_shown_slice_is_photographed_again_after_the_refresh_period() {
     assert_eq!(asks_for(&log, 3).len(), asks + 1);
 }
 
+/// `ScreenCaptureKit` answers one capture at a time. When the refresh asked
+/// for every slice's photo at once, a window leaving across the edge a
+/// moment later waited behind all of them, up to 640 ms on Sam's Mac with
+/// 13 refresh photos (miri#502). The refresh now photographs one window at a
+/// time, so a photo the engine waits for queues behind at most one.
+#[test]
+fn the_refresh_photographs_one_window_at_a_time() {
+    let (mut harness, log) = stacked_beside();
+    for id in [3, 4] {
+        arrive(&mut harness, id, last_ask(&log, id), Ok(photo(7)));
+    }
+    let before = log.borrow().asked.len();
+
+    harness.advance(REFRESH);
+    let asked: Vec<_> = log.borrow().asked[before..]
+        .iter()
+        .map(|(id, _, generation)| (*id, *generation))
+        .collect();
+    assert_eq!(asked.len(), 1, "one photo on its way at a time: {asked:?}");
+
+    let (id, generation) = asked[0];
+    arrive(&mut harness, id, generation, Ok(photo(7)));
+    harness.advance(Duration::from_millis(20));
+    let next: Vec<_> = log.borrow().asked[before + 1..]
+        .iter()
+        .map(|(id, _, _)| *id)
+        .collect();
+    assert_eq!(
+        next.len(),
+        1,
+        "the next photo once the first answers: {next:?}"
+    );
+    assert_ne!(next[0], id, "of the other window");
+}
+
+/// A capture that has to look its window up gives no answer once it is
+/// called off, so a refresh photo that never answers holds the next one
+/// back for a second at most.
+#[test]
+fn a_refresh_photo_that_never_answers_lets_the_next_one_start_after_a_second() {
+    let (mut harness, log) = stacked_beside();
+    for id in [3, 4] {
+        arrive(&mut harness, id, last_ask(&log, id), Ok(photo(7)));
+    }
+    let before = log.borrow().asked.len();
+
+    let step = Duration::from_millis(20);
+    let mut waited = Duration::ZERO;
+    while log.borrow().asked.len() == before && waited < REFRESH * 2 {
+        harness.advance(step);
+        waited += step;
+    }
+    assert_eq!(log.borrow().asked.len(), before + 1, "one on its way");
+    harness.advance(Duration::from_millis(900));
+    assert_eq!(log.borrow().asked.len(), before + 1, "still waiting for it");
+    harness.advance(Duration::from_millis(200));
+    assert_eq!(
+        log.borrow().asked.len(),
+        before + 2,
+        "the next one starts after a second"
+    );
+}
+
+/// Turning slices off in the frame a refresh photo answers starts no queued
+/// one.
+#[test]
+fn turning_the_switch_off_starts_no_queued_refresh_photo() {
+    let (mut harness, log) = stacked_beside();
+    for id in [3, 4] {
+        arrive(&mut harness, id, last_ask(&log, id), Ok(photo(7)));
+    }
+    let before = log.borrow().asked.len();
+    let step = Duration::from_millis(20);
+    let mut waited = Duration::ZERO;
+    while log.borrow().asked.len() == before && waited < REFRESH * 2 {
+        harness.advance(step);
+        waited += step;
+    }
+    let (id, _, generation) = *log.borrow().asked.last().expect("a refresh photo");
+
+    harness.world().insert_resource(switch(false));
+    arrive(&mut harness, id, generation, Ok(photo(7)));
+    harness.advance(step);
+
+    assert_eq!(
+        log.borrow().asked.len(),
+        before + 1,
+        "no queued photo starts once slices are off"
+    );
+}
+
 #[test]
 fn an_unchanged_photo_does_not_repaint_and_a_changed_one_does() {
     let (mut harness, log) = painted_beside();
@@ -1432,6 +1523,35 @@ fn a_swipe_renews_the_kept_photo_of_a_window_in_view_before_it_crosses() {
         log.borrow().painted.last(),
         Some(&(3, Digest(9))),
         "its slice shows the renewed photo"
+    );
+}
+
+/// A refresh in the middle of a swipe leaves the photo the swipe asked for
+/// on its way, rather than replacing it with one that starts later, after
+/// the window may have crossed the edge.
+#[test]
+fn a_refresh_keeps_the_photo_a_swipe_asked_for() {
+    let (mut harness, log) = revealed(painted_beside_with(animated_swipes()), 3, Direction::Last);
+    let asks = asks_for(&log, 3).len();
+    // A swipe away from the edge, so window 3 stays in view.
+    harness.world().write_message(Event::Swipe {
+        delta: 0.05,
+        fingers: 3,
+        distance_cm: 0.0,
+    });
+    harness.advance(Duration::from_millis(20));
+    assert_eq!(asks_for(&log, 3).len(), asks + 1, "the swipe asks for one");
+    let swiped = last_ask(&log, 3);
+
+    harness.advance(REFRESH);
+    assert!(
+        in_view(harness.mock_state.ax_frame(3)),
+        "window 3 stays in view"
+    );
+
+    assert!(
+        !called_off(&log, swiped),
+        "the swipe's photo is still wanted"
     );
 }
 
