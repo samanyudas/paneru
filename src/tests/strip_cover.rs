@@ -35,6 +35,10 @@ struct Screen {
     shown: Vec<(IVec2, usize)>,
     /// The first and last strip x of each slide.
     slides: Vec<(f64, f64)>,
+    /// Each strip x the engine told the tap about.
+    tracked: Vec<f64>,
+    /// Each strip x a swipe put the cover's strip at.
+    placed: Vec<f64>,
     hidden: usize,
 }
 
@@ -84,6 +88,14 @@ impl CoverScreen for RecordingScreen {
         self.0.borrow_mut().slides.push((first, last));
     }
 
+    fn track(&mut self, _display: CGDirectDisplayID, x: f64) {
+        self.0.borrow_mut().tracked.push(x);
+    }
+
+    fn place(&mut self, _display: CGDirectDisplayID, x: f64) {
+        self.0.borrow_mut().placed.push(x);
+    }
+
     fn hide(&mut self, _display: CGDirectDisplayID) {
         self.0.borrow_mut().hidden += 1;
     }
@@ -112,6 +124,7 @@ fn config(on: bool, animation_speed: Option<f64>) -> Config {
         MainOptions {
             slide_window_pictures: Some(on),
             animation_speed,
+            swipe_gesture_fingers: Some(3),
             ..MainOptions::default()
         },
         vec![],
@@ -239,6 +252,15 @@ fn a_keyboard_move_slides_pictures_and_moves_each_window_once() {
     let path = path_of(&mut harness, 1);
     assert_eq!(path, vec![700, 700 - STEP], "the window moves once");
     assert_eq!(log.borrow().hidden, 1, "the cover comes down");
+    // The tap learns where the pictures are as they slide, so a press on
+    // one reaches its window.
+    let tracked = log.borrow().tracked.clone();
+    assert_eq!(tracked.first(), Some(&0.0), "from where the strip was");
+    assert_eq!(tracked.last(), Some(&f64::from(-STEP)), "to where it lands");
+    assert!(
+        tracked.windows(2).all(|pair| pair[1] <= pair[0]) && tracked.len() > 3,
+        "along the slide, got {tracked:?}"
+    );
     assert_eq!(log.borrow().shown.len(), 1);
 }
 
@@ -321,4 +343,58 @@ fn a_second_move_turns_the_slide() {
     let path = path_of(&mut harness, 2);
     assert_eq!(path.len(), 2, "the window moves once, got {path:?}");
     assert_eq!(log.borrow().shown.len(), 1, "one cover throughout");
+}
+
+fn swipe(delta: f64) -> Event {
+    Event::Swipe {
+        delta,
+        fingers: 3,
+        distance_cm: 0.0,
+    }
+}
+
+/// With pictures ready, a swipe moves the pictures with the fingers while
+/// the real windows stay put, then lands them in one step when it settles.
+#[test]
+fn a_swipe_moves_the_pictures_and_lands_each_window_once() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    assert_eq!(window_x(harness.world(), 1), 700);
+
+    send(&mut harness, Event::TouchpadDown);
+    let mut path = vec![window_x(harness.world(), 1)];
+    for _ in 0..6 {
+        send(&mut harness, swipe(0.05));
+        harness.advance(ONE_FRAME);
+        path.push(window_x(harness.world(), 1));
+    }
+    send(&mut harness, Event::TouchpadUp);
+    assert_eq!(log.borrow().shown.len(), 1, "the swipe is under a cover");
+    assert!(
+        path.iter().all(|x| *x == 700),
+        "the real window waits while the fingers move, got {path:?}"
+    );
+    let placed = log.borrow().placed.clone();
+    assert!(
+        placed.len() >= 3 && placed.windows(2).all(|pair| pair[1] <= pair[0]),
+        "the pictures follow the fingers, got {placed:?}"
+    );
+
+    for _ in 0..100 {
+        harness.advance(ONE_FRAME);
+        let x = window_x(harness.world(), 1);
+        if path.last() != Some(&x) {
+            path.push(x);
+        }
+    }
+    path.dedup();
+    let landing = *path.last().unwrap();
+    assert_eq!(path.len(), 2, "the window moves once, got {path:?}");
+    assert!(landing < 700, "the flick moved the strip, got {landing}");
+    assert_eq!(log.borrow().hidden, 1, "the cover comes down");
+    assert_eq!(
+        log.borrow().placed.last().copied(),
+        Some(f64::from(landing - 700)),
+        "the pictures land where the windows do"
+    );
 }

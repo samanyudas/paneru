@@ -1473,10 +1473,10 @@ pub struct MainOptions {
     /// the engine never asks for. Default: false.
     pub shared_edge_slices: Option<bool>,
 
-    /// During a keyboard strip move, slide pictures of the strip's windows
-    /// on a cover over the display, then move the real windows once in one
-    /// step. Needs the Screen Recording permission, which the engine never
-    /// asks for. Default: false.
+    /// During a keyboard strip move or a strip swipe, slide pictures of the
+    /// strip's windows on a cover over the display, then move the real
+    /// windows once in one step. Needs the Screen Recording permission,
+    /// which the engine never asks for. Default: false.
     pub slide_window_pictures: Option<bool>,
 }
 

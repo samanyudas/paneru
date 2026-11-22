@@ -140,7 +140,12 @@ type StripsForWindowPositioning<'w, 's> = Query<
         Has<Scrolling>,
         &'static ChildOf,
     ),
-    With<LayoutStrip>,
+    // A strip swiped under the picture cover keeps its windows where they
+    // are until the swipe lands.
+    (
+        With<LayoutStrip>,
+        Without<crate::ecs::strip_cover::CoverSwipe>,
+    ),
 >;
 
 /// Windows whose size or target size changed this tick — the strip holding them

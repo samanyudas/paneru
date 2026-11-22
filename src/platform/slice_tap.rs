@@ -65,24 +65,44 @@ pub(crate) fn set_slice_panels(panels: Vec<SlicePanel>) {
     SLICE_PANELS.store(Arc::new(panels));
 }
 
+/// The pictures on the strip covers, each as a panel of the window it shows,
+/// so a press on a picture reaches its window once the window is in place.
+static COVER_PANELS: LazyLock<ArcSwap<Vec<SlicePanel>>> =
+    LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
+
+/// Replaces the cover pictures the tap and the window lookups know of.
+pub(crate) fn set_cover_panels(panels: Vec<SlicePanel>) {
+    COVER_PANELS.store(Arc::new(panels));
+}
+
 pub(crate) fn is_slice_panel(window: WinID) -> bool {
     SLICE_PANELS
         .load()
         .iter()
+        .chain(COVER_PANELS.load().iter())
         .any(|panel| panel.panel == window)
 }
 
 /// The panel that a press at `point` would reach, as the window server
 /// decides it.
 fn panel_at(point: CGPoint) -> Option<SlicePanel> {
-    let panels = SLICE_PANELS.load();
-    let panel = panels.iter().find(|panel| panel.contains(point))?;
+    let (slices, covers) = (SLICE_PANELS.load(), COVER_PANELS.load());
+    let panel = slices
+        .iter()
+        .chain(covers.iter())
+        .find(|panel| panel.contains(point))?;
     let mtm = MainThreadMarker::new()?;
     let hit = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(
         NSPoint::new(point.x, primary_screen_height(mtm) - point.y),
         0,
         mtm,
     );
+    if WinID::try_from(hit).ok() != Some(panel.panel) {
+        debug!(
+            "press at ({:.0}, {:.0}) over panel {} of window {} reached window {hit}",
+            point.x, point.y, panel.panel, panel.window
+        );
+    }
     (WinID::try_from(hit).ok() == Some(panel.panel)).then_some(*panel)
 }
 

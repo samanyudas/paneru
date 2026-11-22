@@ -26,7 +26,9 @@ use crate::ecs::strip_cover::{CoverScene, CoverScreen, CoverSubject};
 use crate::events::{Event, EventSender};
 use crate::overlay::{cg_abs_to_cocoa, primary_screen_height};
 use crate::platform::WinID;
+use crate::platform::slice_tap::{SlicePanel, set_cover_panels};
 use crate::slice_screen::{Filter, capture};
+use crate::types::commands::Side;
 
 /// The key of the slide animation on a cover's strip layer. A new slide
 /// replaces the one before it.
@@ -46,6 +48,12 @@ struct Cover {
     window: Retained<NSPanel>,
     strip: Retained<CALayer>,
     viewport: IRect,
+    /// Each window's picture and the frame it shows from the strip origin.
+    pictures: Vec<(WinID, IRect)>,
+    /// Where the strip origin shows now, as far as the engine has told.
+    at: IVec2,
+    /// Whether the cover is up.
+    shown: bool,
 }
 
 impl CoverScreenOS {
@@ -100,7 +108,7 @@ impl CoverScreenOS {
 
     /// An opaque borderless panel at the level of the edge slice panels,
     /// below floating windows and the menu bar. It never animates its own
-    /// appearance, and lets clicks through to the windows under it.
+    /// appearance, and takes clicks without activating the engine.
     fn make_panel(&self, frame: NSRect) -> Retained<NSPanel> {
         let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
             NSPanel::alloc(self.mtm),
@@ -113,7 +121,9 @@ impl CoverScreenOS {
         panel.setBackgroundColor(Some(&NSColor::blackColor()));
         panel.setHasShadow(false);
         panel.setHidesOnDeactivate(false);
-        panel.setIgnoresMouseEvents(true);
+        // A press on a picture never reaches the panel: the event tap holds
+        // it for the window. One between pictures stops here.
+        panel.setIgnoresMouseEvents(false);
         panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
         panel.setLevel(NSFloatingWindowLevel - 1);
         panel.setCollectionBehavior(
@@ -151,6 +161,26 @@ impl CoverScreenOS {
         unsafe { layer.setContents(Some(image.as_ref())) };
         layer.setContentsScale(scale);
         layer
+    }
+
+    /// Tells the event tap where every shown cover's pictures are.
+    fn publish_panels(&self) {
+        set_cover_panels(
+            self.covers
+                .values()
+                .filter(|cover| cover.shown)
+                .filter_map(|cover| {
+                    let panel = WinID::try_from(cover.window.windowNumber()).ok()?;
+                    Some(cover_panels(
+                        panel,
+                        cover.viewport,
+                        cover.at,
+                        &cover.pictures,
+                    ))
+                })
+                .flatten()
+                .collect(),
+        );
     }
 
     fn reply(&self, subject: CoverSubject, generation: u32) -> Reply {
@@ -285,6 +315,9 @@ impl CoverScreen for CoverScreenOS {
                     window,
                     strip,
                     viewport,
+                    pictures: Vec::new(),
+                    at: scene.strip,
+                    shown: false,
                 },
             );
         }
@@ -333,8 +366,16 @@ impl CoverScreen for CoverScreenOS {
         root.addSublayer(&strip);
         CATransaction::commit();
         cover.strip = strip;
+        cover.pictures = scene
+            .pictures
+            .iter()
+            .map(|(id, rel, _)| (*id, *rel))
+            .collect();
+        cover.at = scene.strip;
+        cover.shown = true;
         cover.window.orderFrontRegardless();
         CATransaction::flush();
+        self.publish_panels();
         debug!(
             "cover shown on display {}: {} pictures",
             scene.display,
@@ -375,10 +416,41 @@ impl CoverScreen for CoverScreenOS {
         CATransaction::flush();
     }
 
-    fn hide(&mut self, display: CGDirectDisplayID) {
+    fn track(&mut self, display: CGDirectDisplayID, x: f64) {
+        let Some(cover) = self.covers.get_mut(&display) else {
+            return;
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let x = x.round() as i32;
+        if cover.at.x != x {
+            cover.at.x = x;
+            self.publish_panels();
+        }
+    }
+
+    fn place(&mut self, display: CGDirectDisplayID, x: f64) {
         let Some(cover) = self.covers.get(&display) else {
             return;
         };
+        let origin = f64::from(cover.viewport.min.x);
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        cover.strip.removeAllAnimations();
+        let position = cover.strip.position();
+        cover
+            .strip
+            .setPosition(CGPoint::new(x - origin, position.y));
+        CATransaction::commit();
+        CATransaction::flush();
+        self.track(display, x);
+    }
+
+    fn hide(&mut self, display: CGDirectDisplayID) {
+        let Some(cover) = self.covers.get_mut(&display) else {
+            return;
+        };
+        cover.shown = false;
+        cover.pictures.clear();
         cover.window.orderOut(None::<&AnyObject>);
         if let Some(root) = cover.window.contentView().and_then(|view| view.layer()) {
             CATransaction::begin();
@@ -388,6 +460,7 @@ impl CoverScreen for CoverScreenOS {
             CATransaction::commit();
         }
         CATransaction::flush();
+        self.publish_panels();
         let id = display;
         debug!("cover hidden on display {id}");
     }
@@ -409,5 +482,71 @@ impl Reply {
             generation: self.generation,
             result,
         });
+    }
+}
+
+/// The pictures of a cover over `viewport`, with the strip origin at
+/// `strip`, as panels of the cover window `panel`: each picture's part in
+/// the viewport, and the part of its window that shows there, from the top
+/// left of the window's shown frame.
+pub(crate) fn cover_panels(
+    panel: WinID,
+    viewport: IRect,
+    strip: IVec2,
+    pictures: &[(WinID, IRect)],
+) -> Vec<SlicePanel> {
+    pictures
+        .iter()
+        .filter_map(|(window, rel)| {
+            let frame = IRect::from_corners(rel.min + strip, rel.max + strip);
+            let on_screen = frame.intersect(viewport);
+            (!on_screen.is_empty()).then(|| SlicePanel {
+                panel,
+                window: *window,
+                on_screen,
+                in_window: IRect::from_corners(
+                    on_screen.min - frame.min,
+                    on_screen.max - frame.min,
+                ),
+                side: Side::West,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::math::{IRect, IVec2};
+
+    use super::cover_panels;
+
+    /// A press on a picture lands on its window at the same point in the
+    /// window, wherever the strip shows, and a picture cut by the
+    /// viewport's edge maps only its shown part.
+    #[test]
+    fn each_picture_maps_its_shown_part_to_its_window() {
+        let viewport = IRect::new(0, 25, 1000, 800);
+        let pictures = [
+            (7, IRect::new(0, 0, 600, 700)),
+            (8, IRect::new(600, 0, 1200, 700)),
+        ];
+        let panels = cover_panels(99, viewport, IVec2::new(-300, 30), &pictures);
+        assert_eq!(panels.len(), 2);
+        assert_eq!(panels[0].window, 7);
+        assert_eq!(panels[0].on_screen, IRect::new(0, 30, 300, 730));
+        assert_eq!(panels[0].in_window, IRect::new(300, 0, 600, 700));
+        assert_eq!(panels[1].on_screen, IRect::new(300, 30, 900, 730));
+        assert_eq!(panels[1].in_window, IRect::new(0, 0, 600, 700));
+        assert!(panels.iter().all(|panel| panel.panel == 99));
+    }
+
+    #[test]
+    fn a_picture_out_of_the_viewport_gets_no_panel() {
+        let viewport = IRect::new(0, 0, 1000, 800);
+        let pictures = [(7, IRect::new(0, 0, 600, 700))];
+        assert_eq!(
+            cover_panels(99, viewport, IVec2::new(-700, 0), &pictures),
+            []
+        );
     }
 }

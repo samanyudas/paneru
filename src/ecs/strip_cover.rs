@@ -7,7 +7,10 @@
 //! the windows would follow, while the real windows stay put. Once the
 //! pictures land, the real windows move to their places in one step under
 //! the cover, and the cover comes off when they are there, or after
-//! [`LANDING_TIMEOUT`].
+//! [`LANDING_TIMEOUT`]. A swipe that starts with every picture of its strip
+//! ready goes under the cover too: the pictures follow the fingers and the
+//! settle, and the real windows land once it settles. A press on a picture
+//! is held and reaches its window once the window is in place.
 //!
 //! The engine keeps a picture of every window of each display's active strip
 //! and one of each display's desktop without those windows, refreshed one at
@@ -19,7 +22,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy::app::{App, PostUpdate, Update};
-use bevy::ecs::change_detection::DetectChanges;
+use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut as _};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
@@ -134,6 +137,12 @@ pub(crate) trait CoverScreen {
     /// Moves the strip on the cover of `display` along `path`, one strip x
     /// in global points every `step` seconds from now. It rests at the last.
     fn slide(&mut self, display: CGDirectDisplayID, path: &[f64], step: f64);
+    /// Tells the event tap that the strip on the cover of `display` shows
+    /// at strip x `x`, so a press on a picture reaches its window.
+    fn track(&mut self, display: CGDirectDisplayID, x: f64);
+    /// Shows the strip on the cover of `display` at strip x `x` at once, as
+    /// a swipe moves it, and tells the event tap.
+    fn place(&mut self, display: CGDirectDisplayID, x: f64);
     /// Takes the cover of `display` down.
     fn hide(&mut self, display: CGDirectDisplayID);
 }
@@ -275,6 +284,16 @@ impl CoverSlide {
     }
 }
 
+/// A swipe under the cover: the pictures follow the strip, and its real
+/// windows wait where they are until the swipe lands. The landing is a
+/// [`CoverSlide`] that has landed.
+#[derive(bevy::ecs::component::Component, Clone, Copy, Debug)]
+pub(crate) struct CoverSwipe {
+    display: CGDirectDisplayID,
+    /// The strip x the cover shows.
+    shown: i32,
+}
+
 pub(crate) fn register(app: &mut App) {
     app.init_resource::<CoverPhotos>()
         .add_systems(
@@ -285,7 +304,8 @@ pub(crate) fn register(app: &mut App) {
         )
         .add_systems(
             Update,
-            cover_strip_moves
+            (cover_strip_moves, cover_swipes, mark_moved)
+                .chain()
                 .in_set(UpdateSet::Layout)
                 .after(ensure_visible_in_strip)
                 .before(position_layout_strips),
@@ -480,6 +500,7 @@ fn cover_strip_moves(
         if let Some(mut slide) = slide {
             if slide.landing.is_none() {
                 slide.elapsed += step.secs();
+                screen.0.track(slide.display, slide.x_at(slide.elapsed));
             }
             // Anything but a new target for the strip ends the cover: the
             // windows go where the slide headed, at once.
@@ -524,6 +545,7 @@ fn cover_strip_moves(
                 // step under the cover.
                 position.0 = slide.target;
                 spawn_snap_strip_guard(entity, &mut commands);
+                screen.0.track(slide.display, f64::from(slide.target.x));
                 slide.landing = Some((time.elapsed() + LANDING_TIMEOUT, 0));
                 debug!("cover over strip {entity} landed at {}", slide.target.x);
             }
@@ -555,6 +577,10 @@ fn cover_strip_moves(
             continue;
         }
         let from = position.0.x;
+        if target.x == from {
+            // A target where the strip rests moves nothing to cover.
+            continue;
+        }
         let swing = viewport.width() / SWING_MARGIN;
         let (lo, hi) = (from.min(target.x) - swing, from.max(target.x) + swing);
         let row = strip_windows(&strip, &windows);
@@ -608,6 +634,7 @@ fn cover_strip_moves(
         });
         let slide = start_slide(display.id(), f64::from(from), 0.0, target, &config);
         screen.0.slide(display.id(), &slide.path(), PATH_STEP);
+        screen.0.track(display.id(), f64::from(from));
         debug!(
             "cover over strip {entity}: {} pictures, {} to {}",
             shown.len(),
@@ -664,19 +691,169 @@ fn lift_covers(
             .all(|window| window.at_rest);
         let settled = if in_place { settled + 1 } else { 0 };
         if settled >= LANDED_FRAMES || time.elapsed() >= deadline {
-            debug!(
-                "cover over strip {entity} lifted{}",
-                if settled >= LANDED_FRAMES {
-                    ""
-                } else {
-                    " at its time limit"
-                }
-            );
+            let late = if settled >= LANDED_FRAMES {
+                ""
+            } else {
+                " at its time limit"
+            };
+            debug!("cover over strip {entity} lifted{late}");
             screen.0.hide(slide.display);
             commands.entity(entity).remove::<CoverSlide>();
         } else {
             slide.landing = Some((deadline, settled));
         }
+    }
+}
+
+type SwipedStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        Ref<'static, LayoutStrip>,
+        Ref<'static, Position>,
+        Option<Ref<'static, Scrolling>>,
+        Option<&'static mut CoverSwipe>,
+        Has<CoverSlide>,
+        &'static ChildOf,
+        Has<ActiveWorkspaceMarker>,
+        Has<NativeFullscreenMarker>,
+    ),
+    (With<LayoutStrip>, Without<Window>),
+>;
+
+/// Puts a swipe under the cover when it starts with every picture of its
+/// strip ready, moves the pictures with the strip, and lands the real
+/// windows in one step once the swipe settles.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn cover_swipes(
+    mut strips: SwipedStrips,
+    windows: CoverWindows,
+    floating: Query<(&Window, &Unmanaged)>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
+    photos: Res<CoverPhotos>,
+    drag: Option<Res<DragState>>,
+    config: Res<Config>,
+    time: Res<Time>,
+    screen: Option<NonSendMut<CoverScreenHandle>>,
+    mut commands: Commands,
+) {
+    let Some(mut screen) = screen else {
+        return;
+    };
+    let dragging = drag
+        .as_ref()
+        .is_some_and(|drag| drag.held_window().is_some());
+    for (entity, strip, position, scrolling, swipe, sliding, child, active, fullscreen) in
+        &mut strips
+    {
+        if let Some(mut swipe) = swipe {
+            let aborted = !cover_enabled(&config)
+                || !active
+                || dragging
+                || (strip.is_changed() && !strip.is_added());
+            if aborted || scrolling.is_none() {
+                // The swipe has landed, or the cover cannot stay: the real
+                // windows take their places in one step.
+                spawn_snap_strip_guard(entity, &mut commands);
+                let mut entity_commands = commands.entity(entity);
+                entity_commands.remove::<CoverSwipe>().insert(Moved);
+                if aborted {
+                    debug!("cover over swiped strip {entity} ended early");
+                    screen.0.hide(swipe.display);
+                } else {
+                    screen.0.place(swipe.display, f64::from(position.0.x));
+                    entity_commands.insert(CoverSlide {
+                        display: swipe.display,
+                        from: f64::from(position.0.x),
+                        target: position.0,
+                        entry: 0.0,
+                        elapsed: 0.0,
+                        duration: 0.0,
+                        landing: Some((time.elapsed() + LANDING_TIMEOUT, 0)),
+                    });
+                    let x = position.0.x;
+                    debug!("cover over swiped strip {entity} landed at {x}");
+                }
+                continue;
+            }
+            if swipe.shown != position.0.x {
+                swipe.shown = position.0.x;
+                screen.0.place(swipe.display, f64::from(position.0.x));
+            }
+            continue;
+        }
+
+        if !scrolling.as_ref().is_some_and(DetectChanges::is_added)
+            || sliding
+            || !cover_enabled(&config)
+            || !active
+            || fullscreen
+            || dragging
+        {
+            continue;
+        }
+        let Ok((display, dock)) = displays.get(child.parent()) else {
+            continue;
+        };
+        let viewport = display.actual_display_bounds(dock, &config);
+        let row = strip_windows(&strip, &windows);
+        if row.is_empty() || row.iter().any(|window| !window.at_rest || window.tabbed) {
+            debug!("cover skipped over swiped strip {entity}: a window moves or is tabbed");
+            continue;
+        }
+        let floats_over = floating.iter().any(|(window, unmanaged)| {
+            matches!(unmanaged, Unmanaged::Floating)
+                && !window.shown_frame().intersect(viewport).is_empty()
+        });
+        if floats_over {
+            debug!("cover skipped over swiped strip {entity}: floating window");
+            continue;
+        }
+        let excluding = row.iter().map(|window| window.id).collect::<Vec<_>>();
+        let Some(desktop) = photos.desktop(display.id(), &excluding) else {
+            continue;
+        };
+        let Some(pictures) = row
+            .iter()
+            .map(|window| {
+                photos
+                    .window(window.id, window.frame.size())
+                    .map(|photo| (window.id, window.frame, photo))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            debug!("cover skipped over swiped strip {entity}: a window has no picture");
+            continue;
+        };
+        screen.0.show(&CoverScene {
+            display: display.id(),
+            display_bounds: display.bounds(),
+            viewport,
+            desktop,
+            strip: position.0,
+            pictures,
+        });
+        screen.0.track(display.id(), f64::from(position.0.x));
+        debug!("cover over swiped strip {entity}: {} pictures", row.len());
+        commands.entity(entity).insert(CoverSwipe {
+            display: display.id(),
+            shown: position.0.x,
+        });
+    }
+}
+
+/// Marks a strip whose windows must take their places again, once a swipe
+/// under the cover lands. [`mark_moved`] turns it into a change of the
+/// strip's position, which repositions its windows.
+#[derive(bevy::ecs::component::Component)]
+struct Moved;
+
+/// Repositions the windows of each strip marked [`Moved`].
+fn mark_moved(mut strips: Query<(Entity, &mut Position), With<Moved>>, mut commands: Commands) {
+    for (entity, mut position) in &mut strips {
+        position.set_changed();
+        commands.entity(entity).remove::<Moved>();
     }
 }
 

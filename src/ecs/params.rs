@@ -207,6 +207,7 @@ pub struct FrameActivity<'w, 's> {
     slice_press: Option<Res<'w, crate::ecs::slice_input::PendingPress>>,
     slides: Query<'w, 's, (), With<crate::ecs::shared_edge::Slide>>,
     covers: Query<'w, 's, (), With<crate::ecs::strip_cover::CoverSlide>>,
+    swipe_covers: Query<'w, 's, (), With<crate::ecs::strip_cover::CoverSwipe>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -224,6 +225,7 @@ impl FrameActivity<'_, '_> {
             || self.slice_press.is_some()
             || !self.slides.is_empty()
             || !self.covers.is_empty()
+            || !self.swipe_covers.is_empty()
             || self
                 .native_resizes
                 .iter()
