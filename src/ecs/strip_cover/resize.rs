@@ -587,21 +587,34 @@ fn turn_entry(
     ease::entry_for_speed(speed, f64::from(to - now), duration)
 }
 
-/// Whether the window server shows each window of `row` where the engine
-/// last asked: a write call can return before its app shows the new frame,
-/// and the fade must not show a window still at its old width.
-fn shows_asked(row: &[StripWindow], windows: &CoverWindows, shown: &ShownFrames) -> bool {
-    let asked = row
+/// Whether the window server shows each window of `row` that the cover
+/// over `viewport` hides at the frame the layout committed it to. A write
+/// call can return before its app shows the new frame, and an app that is
+/// late can have its old frame read back as the window's own, so the check
+/// goes by the layout's frame, and a window the window server does not list
+/// is not there yet. Windows outside the cover cannot show an overlap under
+/// it, and are left out to keep the read short.
+fn shows_committed(
+    row: &[StripWindow],
+    frames: &Query<(&Window, &Position, &Bounds)>,
+    viewport: IRect,
+    shown: &ShownFrames,
+) -> bool {
+    let committed = row
         .iter()
-        .filter_map(|window| windows.get(window.entity).ok())
-        .map(|(window, ..)| (window.id(), window.margins().shown(window.frame())))
+        .filter_map(|window| frames.get(window.entity).ok())
+        .map(|(window, position, bounds)| {
+            let cell = IRect::from_corners(position.0, position.0 + bounds.0);
+            (window.id(), window.margins().shown(cell))
+        })
+        .filter(|(_, frame)| !frame.intersect(viewport).is_empty())
         .collect::<Vec<_>>();
-    let ids = asked.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-    shown.now(&ids).into_iter().all(|(id, frame)| {
-        asked
-            .iter()
-            .find(|(asked, _)| *asked == id)
-            .is_none_or(|(_, want)| close(frame.min, want.min) && close(frame.max, want.max))
+    let ids = committed.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let read = shown.now(&ids);
+    committed.iter().all(|(id, want)| {
+        read.iter()
+            .find(|(shown, _)| shown == id)
+            .is_some_and(|(_, frame)| close(frame.min, want.min) && close(frame.max, want.max))
     })
 }
 
@@ -611,6 +624,7 @@ fn shows_asked(row: &[StripWindow], windows: &CoverWindows, shown: &ShownFrames)
 pub(super) fn lift_morphs(
     mut strips: Query<(Entity, &LayoutStrip, &mut CoverMorph)>,
     windows: CoverWindows,
+    frames: Query<(&Window, &Position, &Bounds)>,
     shown_frames: Option<Res<ShownFrames>>,
     time: Res<Time>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
@@ -628,7 +642,7 @@ pub(super) fn lift_morphs(
                 let in_place = row.iter().all(|window| window.at_rest)
                     && shown_frames
                         .as_ref()
-                        .is_none_or(|shown| shows_asked(&row, &windows, shown));
+                        .is_none_or(|shown| shows_committed(&row, &frames, morph.viewport, shown));
                 let settled = if in_place { settled + 1 } else { 0 };
                 if settled >= LANDED_FRAMES || now >= deadline {
                     let late = if settled >= LANDED_FRAMES {
