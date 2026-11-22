@@ -272,6 +272,17 @@ pub enum Event {
         >,
     },
 
+    /// A picture for the strip cover arrived, or failed. `generation` names
+    /// the ask it answers.
+    CoverPhoto {
+        subject: crate::ecs::strip_cover::CoverSubject,
+        generation: u32,
+        result: std::result::Result<
+            crate::ecs::slice_photos::Photo,
+            crate::ecs::slice_photos::PhotoError,
+        >,
+    },
+
     /// A client has read or written the script state store. Answered
     /// from the same store the embedded Lua runtime uses, so the two see each
     /// other's writes.

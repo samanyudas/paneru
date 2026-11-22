@@ -951,6 +951,10 @@ impl Config {
         self.options().shared_edge_slices.unwrap_or(false)
     }
 
+    pub fn slide_window_pictures(&self) -> bool {
+        self.options().slide_window_pictures.unwrap_or(false)
+    }
+
     pub fn native_tabs_enabled(&self) -> bool {
         // Default is enabled.
         !self
@@ -1468,6 +1472,12 @@ pub struct MainOptions {
     /// with another display. Needs the Screen Recording permission, which
     /// the engine never asks for. Default: false.
     pub shared_edge_slices: Option<bool>,
+
+    /// During a keyboard strip move, slide pictures of the strip's windows
+    /// on a cover over the display, then move the real windows once in one
+    /// step. Needs the Screen Recording permission, which the engine never
+    /// asks for. Default: false.
+    pub slide_window_pictures: Option<bool>,
 }
 
 /// Returns a default set of column widths.

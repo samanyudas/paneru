@@ -3013,7 +3013,7 @@ pub(super) fn reshuffle_layout_strip(
 /// shortfall — never to anchor the entity to a particular position.
 #[allow(clippy::type_complexity)]
 #[instrument(level = Level::DEBUG, skip_all)]
-fn ensure_visible_in_strip(
+pub(crate) fn ensure_visible_in_strip(
     markers: Query<(Entity, &LayoutPosition, &EnsureVisibleMarker)>,
     mut strip_params: ParamSet<(
         StripPlacements,
@@ -3098,7 +3098,7 @@ fn ensure_visible_in_strip(
 /// Reacts to changes in the position or target offset of the `LayoutStrip`, and
 /// marks all the windows in the strip as requiring re-positioning.
 #[instrument(level = Level::DEBUG, skip_all)]
-pub(super) fn position_layout_strips(
+pub(crate) fn position_layout_strips(
     moved_strips: MovedStrips,
     mut windows: Query<&mut LayoutPosition, (With<Window>, Without<LayoutStrip>)>,
 ) {

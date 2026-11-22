@@ -206,6 +206,7 @@ pub struct FrameActivity<'w, 's> {
     native_resizes: Query<'w, 's, &'static crate::ecs::drag::NativeResizeStart>,
     slice_press: Option<Res<'w, crate::ecs::slice_input::PendingPress>>,
     slides: Query<'w, 's, (), With<crate::ecs::shared_edge::Slide>>,
+    covers: Query<'w, 's, (), With<crate::ecs::strip_cover::CoverSlide>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -222,6 +223,7 @@ impl FrameActivity<'_, '_> {
             || !self.drag_edges.is_empty()
             || self.slice_press.is_some()
             || !self.slides.is_empty()
+            || !self.covers.is_empty()
             || self
                 .native_resizes
                 .iter()

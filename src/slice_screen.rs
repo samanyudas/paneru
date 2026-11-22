@@ -49,7 +49,7 @@ pub struct SliceScreenOS {
 }
 
 /// A filter that `ScreenCaptureKit`'s queue makes and the main thread reuses.
-struct Filter(Retained<SCContentFilter>);
+pub(crate) struct Filter(pub(crate) Retained<SCContentFilter>);
 
 // SAFETY: no one changes a filter after making it, and Apple's own samples
 // share one filter across queues.
@@ -272,7 +272,7 @@ impl SliceScreen for SliceScreenOS {
         if lookup == Lookup::Reuse
             && let Some(filter) = self.filters.get(&window).and_then(|found| found.get())
         {
-            capture(&filter.0, size, scale, reply);
+            capture(&filter.0, size, scale, move |result| reply.send(result));
             return;
         }
         debug!("edge slice window looked up: window {window} generation {generation}");
@@ -304,7 +304,8 @@ impl SliceScreen for SliceScreenOS {
                         )
                     })
                 });
-                capture(&filter.0, size, scale, reply.clone());
+                let reply = reply.clone();
+                capture(&filter.0, size, scale, move |result| reply.send(result));
             },
         );
         unsafe {
@@ -361,38 +362,45 @@ impl Reply {
     }
 
     fn fail(&self, error: *mut NSError) {
-        // SAFETY: ScreenCaptureKit passes a valid error or null.
-        let error = unsafe { error.as_ref() };
-        debug!(
-            "edge slice photo of window {} failed: {error:?}",
-            self.window
-        );
-        let refused = error.is_some_and(|error| error.code() == SCStreamErrorCode::UserDeclined.0);
-        self.send(Err(if refused {
-            PhotoError::Refused
-        } else {
-            PhotoError::Failed
-        }));
+        self.send(Err(photo_error(error)));
     }
 }
 
-/// Photographs the window of `filter`, sending the photo to `reply`.
-fn capture(filter: &SCContentFilter, size: IVec2, scale: f64, reply: Reply) {
+/// Why `ScreenCaptureKit` gave no photo, from the error it passed.
+pub(crate) fn photo_error(error: *mut NSError) -> PhotoError {
+    // SAFETY: ScreenCaptureKit passes a valid error or null.
+    let error = unsafe { error.as_ref() };
+    debug!("photo failed: {error:?}");
+    if error.is_some_and(|error| error.code() == SCStreamErrorCode::UserDeclined.0) {
+        PhotoError::Refused
+    } else {
+        PhotoError::Failed
+    }
+}
+
+/// Photographs what `filter` shows, at `size` points and `scale` pixels per
+/// point, and hands the photo, or why there is none, to `done`.
+pub(crate) fn capture(
+    filter: &SCContentFilter,
+    size: IVec2,
+    scale: f64,
+    done: impl Fn(Result<Photo, PhotoError>) + 'static,
+) {
     let configuration = configuration(size, scale);
     let taken = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
         let Some(image) = NonNull::new(image) else {
-            reply.fail(error);
+            done(Err(photo_error(error)));
             return;
         };
         // SAFETY: a non-null image that ScreenCaptureKit lends to this call.
         let image = unsafe { CFRetained::retain(image) };
         let pixels = pixels(&image);
         if blank(&image, &pixels) {
-            debug!("edge slice photo of window {} is blank", reply.window);
-            reply.send(Err(PhotoError::Blank));
+            debug!("photo is blank");
+            done(Err(PhotoError::Blank));
             return;
         }
-        reply.send(Ok(Photo {
+        done(Ok(Photo {
             digest: digest(&image, &pixels),
             image,
         }));
