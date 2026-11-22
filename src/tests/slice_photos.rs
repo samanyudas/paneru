@@ -1001,6 +1001,143 @@ fn focus_back_during_a_slide_out_slides_the_photo_back_in() {
     assert!(turned, "the photo turns back");
 }
 
+/// Sam's run (#503): the two windows of a stack leave across the shared edge,
+/// and the photo of one arrives a few frames before the other's. The stack
+/// leaves as one column, so what shows of each window starts at the same x.
+#[test]
+fn a_stack_leaving_across_the_shared_edge_slides_out_as_one_column() {
+    assert_stack_leaves_together(5, 12, None);
+    assert_stack_leaves_together(12, 5, None);
+    // A photo that arrives while the column still slides toward the edge.
+    for first in 1..4 {
+        assert_stack_leaves_together(first, 12, None);
+        assert_stack_leaves_together(12, first, None);
+    }
+}
+
+/// The window whose photo arrives last belongs to an app that takes its tuck
+/// a few frames late, so it still waits once both photos have arrived.
+#[test]
+fn a_stack_leaving_across_the_shared_edge_waits_for_a_slow_tuck() {
+    assert_stack_leaves_together(5, 12, Some(4));
+    assert_stack_leaves_together(12, 5, Some(3));
+    // The later photo arrives after the other columns have settled, so no
+    // moving neighbour holds the photo that slides.
+    assert_stack_leaves_together(5, 40, Some(4));
+    assert_stack_leaves_together(40, 5, Some(3));
+}
+
+/// As above, but with both windows of the stack in apps of their own, so the
+/// window that is ready steps before the one whose app is slow.
+#[test]
+fn a_stack_leaving_across_the_shared_edge_waits_for_a_slow_tuck_stepped_last() {
+    assert_stack_leaves_together_in(5, 40, Some(4), true);
+    assert_stack_leaves_together_in(40, 5, Some(3), true);
+}
+
+/// Windows 3 and 4, stacked at the shared edge, leave it with their photos
+/// arriving after `three` and `four` frames. Window `slow`, if any, belongs
+/// to another app, which takes its tuck 4 frames late.
+fn assert_stack_leaves_together(three: usize, four: usize, slow: Option<WinID>) {
+    assert_stack_leaves_together_in(three, four, slow, false);
+}
+
+/// `assert_stack_leaves_together`, with windows 3 and 4 each in an app of its
+/// own if `own_apps`.
+fn assert_stack_leaves_together_in(three: usize, four: usize, slow: Option<WinID>, own_apps: bool) {
+    const SLOW_APP: crate::platform::Pid = 2;
+    const OTHER_APP: crate::platform::Pid = 3;
+    let log = Rc::new(RefCell::new(Screen::default()));
+    let mut harness = TestHarness::new()
+        .with_config(animated())
+        .with_display(EXT_DISPLAY_ID, RIGHT, vec![EXT_WORKSPACE_ID])
+        .with_app(SLOW_APP, "slow", "SlowApp", |_| {})
+        .with_app(OTHER_APP, "other", "OtherApp", |_| {});
+    harness.mock_state.queue_writes(SLOW_APP);
+    harness.mock_state.queue_writes(OTHER_APP);
+    for id in 0..5 {
+        let pid = if slow == Some(id) {
+            SLOW_APP
+        } else if own_apps && (id == 3 || id == 4) {
+            OTHER_APP
+        } else {
+            TEST_PROCESS_ID
+        };
+        let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness
+        .world()
+        .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::Last)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+        harness.mock_state.flush_writes(Duration::from_secs(1));
+    }
+    for id in [3, 4] {
+        let rest = harness.mock_state.ax_frame(id);
+        assert!(in_view(rest), "window {id} rests in view at {rest:?}");
+    }
+    let asks = (asks_for(&log, 3).len(), asks_for(&log, 4).len());
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::First)));
+    let left = |harness: &TestHarness, id: WinID| {
+        panel_photo(&log, id).map_or(harness.mock_state.ax_frame(id).min.x, |photo| photo.min.x)
+    };
+    let mut apart = Vec::new();
+    for frame in 0..100 {
+        for (id, after, asked) in [(3, three, asks.0), (4, four, asks.1)] {
+            if frame == after {
+                assert_eq!(asks_for(&log, id).len(), asked + 1, "one photo of {id}");
+                let generation = last_ask(&log, id);
+                arrive(&mut harness, id, generation, Ok(photo(8)));
+            }
+        }
+        let held = slow.map(|slow| if slow == 3 { three } else { four });
+        if held == Some(frame) {
+            harness.mock_state.hold_writes(SLOW_APP);
+        }
+        if held.map(|held| held + 4) == Some(frame) {
+            harness.mock_state.release_writes(SLOW_APP);
+        }
+        harness.advance(Duration::from_millis(20));
+        if held.is_none_or(|held| !(held..held + 4).contains(&frame)) {
+            assert!(harness.mock_state.flush_writes(Duration::from_secs(5)));
+        }
+        apart.push((left(&harness, 3) - left(&harness, 4)).abs());
+    }
+
+    assert!(
+        apart.iter().all(|apart| *apart <= 20),
+        "the two windows of the stack show at most 20 pt apart sideways, photos after {three} and {four} frames, slow tuck {slow:?}: {apart:?}"
+    );
+    let rest = showing(harness.world());
+    assert_eq!(
+        rest.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![3, 4],
+        "the stack rests as two slices"
+    );
+    for (id, slice) in rest {
+        assert!(
+            !in_view(harness.mock_state.ax_frame(id)),
+            "window {id} tucks"
+        );
+        assert_eq!(panel_photo(&log, id), Some(slice.on_screen), "window {id}");
+    }
+}
+
 /// The first photo after the engine starts took a second on Sam's Mac, so a
 /// window waits that long for its photo before it tucks without one.
 #[test]

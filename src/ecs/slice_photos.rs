@@ -1100,7 +1100,9 @@ fn slide_photos(
 /// the frame after it was asked for tucks at once. With the switch off, the
 /// window tucks once its next step would put most of it on another display.
 /// A photo never slides further past the edge than its place in the row
-/// beside a nearer window that waits, so no wallpaper shows between them.
+/// beside a nearer window that waits, so no wallpaper shows between them, or
+/// further than a window of its own column that waits, so a stack leaves as
+/// one column (#503).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn slide_photos_out(
     mut sliding: Sliding,
@@ -1115,7 +1117,7 @@ fn slide_photos_out(
 ) {
     let t = ease_out_factor(config.animation_speed(), step.secs());
     let mut moved_out = Vec::<Out>::new();
-    for entity in Out::nearest_first(&sliding) {
+    for (entity, waits) in Out::nearest_first(&sliding, &slices, time.elapsed()) {
         let Ok((entity, window, mut slide, mut position, presented, _)) = sliding.get_mut(entity)
         else {
             continue;
@@ -1174,7 +1176,9 @@ fn slide_photos_out(
                     continue;
                 };
                 let all = displays.iter().map(Display::bounds).collect::<Vec<_>>();
+                let out = Out::of(&slide);
                 let (at, moved, stopped) = step_in_view(&slice, at, to, t, own, &all, |next| {
+                    let next = out.map_or(next, |out| out.beside(&moved_out, next, true));
                     holds.limit(entity, at, next)
                 });
                 if no_photos && stopped {
@@ -1204,7 +1208,7 @@ fn slide_photos_out(
                     at.x, at.y
                 );
             }
-            Slide::Tucking { until, .. } if window.write_pending() && time.elapsed() < until => {}
+            Slide::Tucking { .. } if waits => {}
             Slide::Tucking {
                 at,
                 to,
@@ -1216,7 +1220,7 @@ fn slide_photos_out(
                     position.0 = presented.0;
                 }
                 let (next, arrived) = ease_step(at, to, t);
-                let next = Out::of(&slide).map_or(next, |out| out.beside(&moved_out, next));
+                let next = Out::of(&slide).map_or(next, |out| out.beside(&moved_out, next, false));
                 let next = holds.limit(entity, at, next);
                 let arrived = arrived && next == to;
                 let moved = displays
@@ -1238,6 +1242,15 @@ fn slide_photos_out(
                         next.x, next.y
                     );
                 } else {
+                    // The photo rests as the slice, so a window held beside it
+                    // goes on from there.
+                    *slide = Slide::Tucking {
+                        at: to,
+                        to,
+                        hold,
+                        slice,
+                        until,
+                    };
                     entity_commands.try_insert(slice).try_remove::<Slide>();
                     debug!("edge slice photo tucked: window {id}");
                 }
@@ -1275,13 +1288,37 @@ impl Out {
 
     /// The windows of `sliding` heading for a tuck, each display's nearest
     /// its edge first, so each one steps after the windows nearer the edge.
-    fn nearest_first(sliding: &Sliding) -> Vec<Entity> {
+    /// In one column, the windows that hold still this frame come first, then
+    /// the windows that wait for their photos, then the photos that slide, so
+    /// that each steps no further than the ones before it (#503). A window
+    /// holds still as its photo, in `slices`, takes over from it, or, as of
+    /// `now`, while macOS has yet to take its tuck under the photo, until the
+    /// engine time `until` of its `Slide::Tucking`. Each comes with whether
+    /// it holds still.
+    fn nearest_first(sliding: &Sliding, slices: &Slices, now: Duration) -> Vec<(Entity, bool)> {
         let mut order = sliding
             .iter()
-            .filter_map(|(entity, _, slide, ..)| Some((Self::of(slide)?.outwards(), entity)))
+            .filter_map(|(entity, window, slide, ..)| {
+                let rank = match *slide {
+                    Slide::Leaving { .. }
+                        if slices
+                            .photo(window.id())
+                            .is_some_and(|photo| photo.shown().is_some()) =>
+                    {
+                        0
+                    }
+                    Slide::Tucking { until, .. } if window.write_pending() && now < until => 0,
+                    Slide::Leaving { .. } => 1,
+                    Slide::Tucking { .. } | Slide::Moving { .. } | Slide::Landing { .. } => 2,
+                };
+                Some((Self::of(slide)?.outwards(), rank, entity))
+            })
             .collect::<Vec<_>>();
         order.sort_unstable();
-        order.into_iter().map(|(_, entity)| entity).collect()
+        order
+            .into_iter()
+            .map(|(_, rank, entity)| (entity, rank == 0))
+            .collect()
     }
 
     /// How far past its edge the row places it, so that windows nearer the
@@ -1295,13 +1332,18 @@ impl Out {
     }
 
     /// `next`, held where it would go further past the edge than its place
-    /// beside any of `nearer` that the row puts between it and the display.
-    /// Never moves it back toward the display from where it shows now.
-    fn beside(&self, nearer: &[Out], next: IVec2) -> IVec2 {
+    /// in its column, or, unless `column_only`, beside any of `nearer` that
+    /// the row puts between it and the display. Never moves it back toward
+    /// the display from where it shows now.
+    fn beside(&self, nearer: &[Out], next: IVec2, column_only: bool) -> IVec2 {
         let places = nearer
             .iter()
             .filter(|other| other.display == self.display && other.side == self.side)
-            .filter(|other| other.outwards().1 < self.outwards().1)
+            .filter(|other| match other.outwards().1.cmp(&self.outwards().1) {
+                std::cmp::Ordering::Equal => true,
+                std::cmp::Ordering::Less => !column_only,
+                std::cmp::Ordering::Greater => false,
+            })
             .map(|other| other.at.x + self.to.x - other.to.x);
         let x = match self.side {
             Side::West => places
