@@ -910,6 +910,68 @@ fn focus_back_during_a_slide_out_slides_the_photo_back_in() {
     assert!(turned, "the photo turns back");
 }
 
+/// Sam's run (#503): the two windows of a stack leave across the shared edge,
+/// and the photo of one arrives a few frames before the other's. The stack
+/// leaves as one column, so what shows of each window starts at the same x.
+#[test]
+fn a_stack_leaving_across_the_shared_edge_slides_out_as_one_column() {
+    assert_stack_leaves_together(5, 12);
+    assert_stack_leaves_together(12, 5);
+}
+
+/// Windows 3 and 4, stacked at the shared edge, leave it with their photos
+/// arriving after `three` and `four` frames.
+fn assert_stack_leaves_together(three: usize, four: usize) {
+    let (mut harness, log) = laid_out(animated(), Screen::default(), &[RIGHT], 5, None);
+    harness.run(vec![
+        command(Operation::Focus(Direction::Last)),
+        command(Operation::Stack(Side::West)),
+    ]);
+    harness.advance(SETTLE);
+    for id in [3, 4] {
+        let rest = harness.mock_state.ax_frame(id);
+        assert!(in_view(rest), "window {id} rests in view at {rest:?}");
+    }
+    let asks = (asks_for(&log, 3).len(), asks_for(&log, 4).len());
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::First)));
+    let left = |harness: &TestHarness, id: WinID| {
+        panel_photo(&log, id).map_or(harness.mock_state.ax_frame(id).min.x, |photo| photo.min.x)
+    };
+    let mut apart = Vec::new();
+    for frame in 0..100 {
+        for (id, after, asked) in [(3, three, asks.0), (4, four, asks.1)] {
+            if frame == after {
+                assert_eq!(asks_for(&log, id).len(), asked + 1, "one photo of {id}");
+                let generation = last_ask(&log, id);
+                arrive(&mut harness, id, generation, Ok(photo(8)));
+            }
+        }
+        harness.advance(Duration::from_millis(20));
+        apart.push((left(&harness, 3) - left(&harness, 4)).abs());
+    }
+
+    assert!(
+        apart.iter().all(|apart| *apart <= 20),
+        "the two windows of the stack show at most 20 pt apart sideways, photos after {three} and {four} frames: {apart:?}"
+    );
+    let rest = showing(harness.world());
+    assert_eq!(
+        rest.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![3, 4],
+        "the stack rests as two slices"
+    );
+    for (id, slice) in rest {
+        assert!(
+            !in_view(harness.mock_state.ax_frame(id)),
+            "window {id} tucks"
+        );
+        assert_eq!(panel_photo(&log, id), Some(slice.on_screen), "window {id}");
+    }
+}
+
 /// The first photo after the engine starts took a second on Sam's Mac, so a
 /// window waits that long for its photo before it tucks without one.
 #[test]

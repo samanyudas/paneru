@@ -976,7 +976,9 @@ fn slide_photos(
 /// the frame after it was asked for tucks at once. With the switch off, the
 /// window tucks once its next step would put most of it on another display.
 /// A photo never slides further past the edge than its place in the row
-/// beside a nearer window that waits, so no wallpaper shows between them.
+/// beside a nearer window that waits, so no wallpaper shows between them, or
+/// further than a window of its own column that waits, so a stack leaves as
+/// one column (#503).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn slide_photos_out(
     mut sliding: Sliding,
@@ -1151,13 +1153,18 @@ impl Out {
 
     /// The windows of `sliding` heading for a tuck, each display's nearest
     /// its edge first, so each one steps after the windows nearer the edge.
+    /// In one column, the windows that still wait for a photo come first, so
+    /// a photo that slides steps after them.
     fn nearest_first(sliding: &Sliding) -> Vec<Entity> {
         let mut order = sliding
             .iter()
-            .filter_map(|(entity, _, slide, ..)| Some((Self::of(slide)?.outwards(), entity)))
+            .filter_map(|(entity, _, slide, ..)| {
+                let waits = matches!(slide, Slide::Leaving { .. });
+                Some((Self::of(slide)?.outwards(), !waits, entity))
+            })
             .collect::<Vec<_>>();
         order.sort_unstable();
-        order.into_iter().map(|(_, entity)| entity).collect()
+        order.into_iter().map(|(.., entity)| entity).collect()
     }
 
     /// How far past its edge the row places it, so that windows nearer the
@@ -1171,13 +1178,14 @@ impl Out {
     }
 
     /// `next`, held where it would go further past the edge than its place
-    /// beside any of `nearer` that the row puts between it and the display.
-    /// Never moves it back toward the display from where it shows now.
+    /// beside any of `nearer` that the row puts between it and the display,
+    /// or in its column. Never moves it back toward the display from where it
+    /// shows now.
     fn beside(&self, nearer: &[Out], next: IVec2) -> IVec2 {
         let places = nearer
             .iter()
             .filter(|other| other.display == self.display && other.side == self.side)
-            .filter(|other| other.outwards().1 < self.outwards().1)
+            .filter(|other| other.outwards().1 <= self.outwards().1)
             .map(|other| other.at.x + self.to.x - other.to.x);
         let x = match self.side {
             Side::West => places
