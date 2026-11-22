@@ -1589,16 +1589,21 @@ pub(super) fn apply_window_defaults(
 
 /// Gives a window that just opened focus. A window kept above ordinary
 /// windows, such as Picture-in-Picture, often opens without focus, so the
-/// engine focuses it once, unless it opened minimized. For any other
+/// engine focuses it once, unless it opened minimized or its app is in the
+/// background. A background app's window must not take focus, the rule the
+/// `WindowFocused` handler applies to every other window. For any other
 /// window, macOS already focused it, and the engine only records that.
 fn focus_opened_window(
     entity: Entity,
     window: &Window,
+    app: &Application,
     properties: &WindowProperties,
     commands: &mut Commands,
 ) {
     if properties.above_ordinary() && !window.is_minimized() {
-        commands.focus_entity(entity, true);
+        if app.is_frontmost() {
+            commands.focus_entity(entity, true);
+        }
     } else {
         commands.trigger(SendMessageTrigger(Event::WindowFocused {
             window_id: window.id(),
@@ -1691,7 +1696,9 @@ pub(super) fn recheck_window_level(
             commands.reposition_entity(entity, opened.min);
             commands.resize_entity(entity, opened.size());
         }
-        if !properties.dont_focus() {
+        // As in `focus_opened_window`, a background app's window does not
+        // take focus.
+        if !properties.dont_focus() && app.is_some_and(|app| app.is_frontmost()) {
             commands.focus_entity(entity, true);
         }
     }
@@ -1911,7 +1918,7 @@ pub(super) fn apply_window_positions(
             // macOS reported the new window's focus before it was tracked, so
             // it takes focus here, as a tiled window does below.
             if initializing.is_none() && !minimized && !properties.dont_focus() {
-                focus_opened_window(entity, window, &properties, &mut ctx.commands);
+                focus_opened_window(entity, window, app, &properties, &mut ctx.commands);
             }
             continue;
         }
@@ -1995,7 +2002,7 @@ pub(super) fn apply_window_positions(
                 }
             } else {
                 debug!("Focusing newly spawned window {entity}");
-                focus_opened_window(entity, window, &properties, &mut ctx.commands);
+                focus_opened_window(entity, window, app, &properties, &mut ctx.commands);
             }
         }
     }
