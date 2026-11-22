@@ -98,6 +98,7 @@ pub(crate) fn register(app: &mut App) {
                     .pipe(present_slices)
                     .run_if(showing_may_change.or_eager(resource_changed::<SliceAccess>)),
                 refresh_slices.run_if(on_timer(REFRESH)),
+                start_queued_photos,
             )
                 .chain()
                 .in_set(PostUpdateSet::Animate)
@@ -245,6 +246,8 @@ impl SlicePhoto {
 struct Renewal {
     generation: u32,
     slice: EdgeSlice,
+    /// The engine time a swipe asked for it, if a swipe did.
+    swiped_at: Option<Duration>,
     _wanted: Wanted,
 }
 
@@ -281,8 +284,9 @@ struct Slices {
     /// as a window's leaving the screen, would otherwise queue behind every
     /// refresh photo (miri#502).
     queued: VecDeque<Queued>,
-    /// The generation of the refresh photo on its way, and when it started.
-    in_flight: Option<(u32, Duration)>,
+    /// The generation of the refresh photo on its way, and the engine time
+    /// of the frame after it started, as [`PhotoWait`] explains.
+    in_flight: Option<(u32, Option<Duration>)>,
 }
 
 impl Slices {
@@ -377,21 +381,39 @@ fn ask_queued(
     }
 }
 
-/// Starts the next refresh photo unless one is on its way. A queued photo
-/// that the engine no longer wants is dropped.
-fn start_queued(screen: &mut dyn SliceScreen, slices: &mut Slices, now: Duration) {
-    if slices
-        .in_flight
-        .is_some_and(|(_, since)| now < since + QUEUED_TIMEOUT)
-    {
+/// Starts the next refresh photo unless one is on its way, once the panels
+/// have their places for the frame. A queued photo that the engine no longer
+/// wants is dropped, and with slices off the queue empties.
+fn start_queued_photos(
+    mut slices: ResMut<Slices>,
+    access: Res<SliceAccess>,
+    time: Res<Time>,
+    screen: Option<NonSendMut<SliceScreenHandle>>,
+) {
+    let Some(mut screen) = screen else {
+        return;
+    };
+    if *access != SliceAccess::On {
+        slices.queued.clear();
+        slices.in_flight = None;
         return;
     }
-    slices.in_flight = None;
+    let now = time.elapsed();
+    match &mut slices.in_flight {
+        // The frame that started it can end with a long wait for events,
+        // so the timeout counts from the frame after.
+        Some((_, since @ None)) => {
+            *since = Some(now);
+            return;
+        }
+        Some((_, Some(since))) if now < *since + QUEUED_TIMEOUT => return,
+        _ => slices.in_flight = None,
+    }
     while let Some(next) = slices.queued.pop_front() {
         if next.ticket.called_off() {
             continue;
         }
-        screen.photograph(
+        screen.0.photograph(
             next.window,
             &next.slice,
             next.generation,
@@ -402,7 +424,7 @@ fn start_queued(screen: &mut dyn SliceScreen, slices: &mut Slices, now: Duration
             "edge slice queued photo started: window {} generation {}",
             next.window, next.generation
         );
-        slices.in_flight = Some((next.generation, now));
+        slices.in_flight = Some((next.generation, None));
         return;
     }
 }
@@ -540,7 +562,7 @@ fn refresh_slices(
     time: Res<Time>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
-    let Some(mut screen) = screen else {
+    let Some(screen) = screen else {
         return;
     };
     let Slices {
@@ -562,9 +584,8 @@ fn refresh_slices(
     // The panels someone sees go before the kept photos of windows in view.
     if *access == SliceAccess::On {
         let next = next.find(&in_view);
-        renew_kept(None, &mut slices, &in_view, &next);
+        renew_kept(None, &mut slices, &in_view, &next, time.elapsed());
     }
-    start_queued(screen.0.as_mut(), &mut slices, time.elapsed());
 }
 
 /// Paints each photo that differs from the one its panel shows, and keeps it.
@@ -580,7 +601,6 @@ fn receive_photos(
     mut slices: ResMut<Slices>,
     mut access: ResMut<SliceAccess>,
     sliding: Query<(&Window, &Slide)>,
-    time: Res<Time>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
     let Some(mut screen) = screen else {
@@ -703,7 +723,6 @@ fn receive_photos(
     if ended {
         screen.0.place(&slices.placed(), &slices.remembered());
     }
-    start_queued(screen.0.as_mut(), &mut slices, time.elapsed());
 }
 
 /// The windows that show themselves rather than a slice, and are not on
@@ -722,6 +741,7 @@ fn renew_kept(
     slices: &mut Slices,
     in_view: &InView,
     next: &[(WinID, EdgeSlice)],
+    now: Duration,
 ) {
     let Slices {
         showing,
@@ -734,6 +754,16 @@ fn renew_kept(
     for window in in_view {
         let id = window.id();
         if showing.iter().any(|(showing, _, _)| *showing == id) {
+            continue;
+        }
+        // A photo a swipe asked for in this refresh period is on its way, and
+        // a queued one would replace it with one that starts later.
+        if screen.is_none()
+            && renewing
+                .get(&id)
+                .and_then(|renewal| renewal.swiped_at)
+                .is_some_and(|at| now < at + REFRESH)
+        {
             continue;
         }
         // A window resized in view, as by maximizing, would otherwise keep
@@ -767,6 +797,7 @@ fn renew_kept(
             Renewal {
                 generation: *generation,
                 slice,
+                swiped_at: screen.is_some().then_some(now),
                 _wanted: Wanted(ticket),
             },
         );
@@ -850,6 +881,7 @@ impl NextToCross<'_, '_> {
 
 /// Renews the kept photos of the windows in view as a swipe or scroll
 /// starts, before it carries any of them past the edge.
+#[allow(clippy::too_many_arguments)]
 fn renew_kept_on_swipe(
     scrolls: Query<&Scrolling>,
     mut was_swiping: Local<bool>,
@@ -857,6 +889,7 @@ fn renew_kept_on_swipe(
     in_view: InView,
     next: NextToCross,
     access: Res<SliceAccess>,
+    time: Res<Time>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
     let swiping = scrolls.iter().any(|scrolling| scrolling.is_user_swiping);
@@ -866,7 +899,13 @@ fn renew_kept_on_swipe(
         && let Some(mut screen) = screen
     {
         let next = next.find(&in_view);
-        renew_kept(Some(screen.0.as_mut()), &mut slices, &in_view, &next);
+        renew_kept(
+            Some(screen.0.as_mut()),
+            &mut slices,
+            &in_view,
+            &next,
+            time.elapsed(),
+        );
     }
     *was_swiping = swiping;
 }

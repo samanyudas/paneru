@@ -439,6 +439,34 @@ fn a_refresh_photo_that_never_answers_lets_the_next_one_start_after_a_second() {
     );
 }
 
+/// Turning slices off in the frame a refresh photo answers starts no queued
+/// one.
+#[test]
+fn turning_the_switch_off_starts_no_queued_refresh_photo() {
+    let (mut harness, log) = stacked_beside();
+    for id in [3, 4] {
+        arrive(&mut harness, id, last_ask(&log, id), Ok(photo(7)));
+    }
+    let before = log.borrow().asked.len();
+    let step = Duration::from_millis(20);
+    let mut waited = Duration::ZERO;
+    while log.borrow().asked.len() == before && waited < REFRESH * 2 {
+        harness.advance(step);
+        waited += step;
+    }
+    let (id, _, generation) = *log.borrow().asked.last().expect("a refresh photo");
+
+    harness.world().insert_resource(switch(false));
+    arrive(&mut harness, id, generation, Ok(photo(7)));
+    harness.advance(step);
+
+    assert_eq!(
+        log.borrow().asked.len(),
+        before + 1,
+        "no queued photo starts once slices are off"
+    );
+}
+
 #[test]
 fn an_unchanged_photo_does_not_repaint_and_a_changed_one_does() {
     let (mut harness, log) = painted_beside();
@@ -1495,6 +1523,35 @@ fn a_swipe_renews_the_kept_photo_of_a_window_in_view_before_it_crosses() {
         log.borrow().painted.last(),
         Some(&(3, Digest(9))),
         "its slice shows the renewed photo"
+    );
+}
+
+/// A refresh in the middle of a swipe leaves the photo the swipe asked for
+/// on its way, rather than replacing it with one that starts later, after
+/// the window may have crossed the edge.
+#[test]
+fn a_refresh_keeps_the_photo_a_swipe_asked_for() {
+    let (mut harness, log) = revealed(painted_beside_with(animated_swipes()), 3, Direction::Last);
+    let asks = asks_for(&log, 3).len();
+    // A swipe away from the edge, so window 3 stays in view.
+    harness.world().write_message(Event::Swipe {
+        delta: 0.05,
+        fingers: 3,
+        distance_cm: 0.0,
+    });
+    harness.advance(Duration::from_millis(20));
+    assert_eq!(asks_for(&log, 3).len(), asks + 1, "the swipe asks for one");
+    let swiped = last_ask(&log, 3);
+
+    harness.advance(REFRESH);
+    assert!(
+        in_view(harness.mock_state.ax_frame(3)),
+        "window 3 stays in view"
+    );
+
+    assert!(
+        !called_off(&log, swiped),
+        "the swipe's photo is still wanted"
     );
 }
 
