@@ -182,7 +182,9 @@ impl SliceScreenOS {
         panel.setHasShadow(false);
         panel.setHidesOnDeactivate(false);
         panel.setIgnoresMouseEvents(false);
-        panel.setLevel(NSFloatingWindowLevel - 1);
+        // Above tiled windows, and one below the picture cover, which a
+        // resize puts up while its windows cross the edge underneath.
+        panel.setLevel(NSFloatingWindowLevel - 2);
         panel.setCollectionBehavior(
             NSWindowCollectionBehavior::Transient
                 | NSWindowCollectionBehavior::IgnoresCycle

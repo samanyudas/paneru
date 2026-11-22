@@ -587,9 +587,14 @@ impl CoverScreen for CoverScreenOS {
         CATransaction::flush();
         cover.lead = lead;
         // A press goes to the window where its picture rests.
-        cover.pictures = frames
+        // In paint order, so a press where pictures overlap goes to the front.
+        cover.pictures = cover
+            .layers
             .iter()
-            .map(|(id, _, to)| (*id, IRect::from_corners(to.min - laid, to.max - laid)))
+            .filter_map(|(id, _)| {
+                let (_, _, to) = frames.iter().find(|(frame, ..)| frame == id)?;
+                Some((*id, IRect::from_corners(to.min - laid, to.max - laid)))
+            })
             .collect();
         cover.at = laid;
         self.publish_panels();

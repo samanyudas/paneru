@@ -307,9 +307,13 @@ fn snap(
     position.set_changed();
     commands.entity(strip).remove::<RepositionMarker>();
     for window in row {
-        if let Some(size) = window.resize_to()
-            && let Ok(mut entity_commands) = commands.get_entity(window.entity)
-        {
+        let Ok(mut entity_commands) = commands.get_entity(window.entity) else {
+            continue;
+        };
+        // The layout places every window again from the new origin, so a
+        // move asked for before, such as the resize's own, is spent.
+        entity_commands.try_remove::<RepositionMarker>();
+        if let Some(size) = window.resize_to() {
             entity_commands
                 .try_insert(Bounds(size))
                 .try_remove::<ResizeMarker>();
@@ -399,9 +403,17 @@ pub(super) fn cover_resizes(
                 || dragging
                 || mission_control.0
                 || !same_windows
-                || row
+                || row.iter().any(|window| {
+                    window.tabbed || window.turns_height() || window.asks_refused_width()
+                });
+            // A change that moves a window up or down, such as a stack or a
+            // vertical strip move, is no resize: the real windows take it.
+            let heading = headings(&row, target);
+            let aborted = aborted
+                || heading
                     .iter()
-                    .any(|window| window.tabbed || window.turns_height());
+                    .zip(&morph.frames)
+                    .any(|((.., to), frame)| !same_rows(*to, frame.to));
             if aborted {
                 // The real windows are where the layout put them already, or
                 // ease on from there.
@@ -411,7 +423,6 @@ pub(super) fn cover_resizes(
                 commands.entity(entity).remove::<CoverMorph>();
                 continue;
             }
-            let heading = headings(&row, target);
             let turned = heading
                 .iter()
                 .zip(&morph.frames)
@@ -483,6 +494,8 @@ pub(super) fn cover_resizes(
             Some("Mission Control")
         } else if row.iter().any(StripWindow::turns_height) {
             Some("height changes")
+        } else if row.iter().any(StripWindow::asks_refused_width) {
+            Some("a width the window refused before")
         } else {
             None
         };
@@ -518,6 +531,10 @@ pub(super) fn cover_resizes(
         if frames.iter().all(|frame| frame.from == frame.to) {
             continue;
         }
+        if frames.iter().any(|frame| !same_rows(frame.from, frame.to)) {
+            debug!("cover skipped over resized strip {entity}: a window moves up or down");
+            continue;
+        }
         // The pictures show where the windows rested.
         let before = row
             .iter()
@@ -529,6 +546,7 @@ pub(super) fn cover_resizes(
                 heading: window.heading,
                 size: window.size,
                 resize: window.resize,
+                limits: window.limits,
                 at_rest: true,
                 tabbed: window.tabbed,
                 focused: window.focused,
@@ -581,6 +599,12 @@ pub(super) fn cover_resizes(
         debug!("cover over resized strip {entity}: {pictures} pictures");
         commands.entity(entity).insert(morph);
     }
+}
+
+/// Whether two frames of a window span the same rows: a resize under the
+/// cover moves windows only sideways.
+fn same_rows(a: IRect, b: IRect) -> bool {
+    a.min.y == b.min.y && a.max.y == b.max.y
 }
 
 /// Where a turn enters the curve: the edge that has furthest to go keeps

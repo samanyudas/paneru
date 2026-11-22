@@ -50,7 +50,7 @@ use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker, LayoutPosition,
     MissionControlActive, NativeFullscreenMarker, Position, PostUpdateSet, RepositionMarker,
     ResizeMarker, ScrollInput, Scrolling, SelectedVirtualMarker, SpawnCommandsExt as _, Unmanaged,
-    UpdateSet, ease, systems,
+    UpdateSet, WidthLimits, ease, systems,
 };
 use crate::events::Event;
 use crate::manager::{Display, Window, WindowManager};
@@ -532,6 +532,8 @@ struct StripWindow {
     /// Its cell's size, and the size a resize on its way asks for.
     size: IVec2,
     resize: Option<IVec2>,
+    /// The widths the window was found to accept, if it refused one.
+    limits: Option<WidthLimits>,
     at_rest: bool,
     tabbed: bool,
     focused: bool,
@@ -548,6 +550,7 @@ type CoverWindows<'w, 's> = Query<
         Has<RepositionMarker>,
         Option<&'static ResizeMarker>,
         Has<FocusedMarker>,
+        Option<&'static WidthLimits>,
     ),
 >;
 
@@ -562,7 +565,7 @@ fn strip_windows(strip: &LayoutStrip, windows: &CoverWindows) -> Vec<StripWindow
         .all_windows()
         .into_iter()
         .filter_map(|entity| {
-            let (window, layout, bounds, unmanaged, moving, resize, focused) =
+            let (window, layout, bounds, unmanaged, moving, resize, focused, limits) =
                 windows.get(entity).ok()?;
             if unmanaged.is_some() {
                 return None;
@@ -579,6 +582,7 @@ fn strip_windows(strip: &LayoutStrip, windows: &CoverWindows) -> Vec<StripWindow
                 heading: window.margins().shown(heading),
                 size: bounds.0,
                 resize: resize.map(|resize| resize.0),
+                limits: limits.copied(),
                 at_rest: !moving && resize.is_none() && !window.write_pending(),
                 tabbed: tabbed.contains(&entity),
                 focused,
@@ -597,6 +601,15 @@ impl StripWindow {
     /// Whether a resize on its way changes the window's height.
     fn turns_height(&self) -> bool {
         self.resize.is_some_and(|resize| resize.y != self.size.y)
+    }
+
+    /// Whether a resize on its way asks for a width the window already
+    /// refused: the layout clamps it a pass later and moves the strip again.
+    fn asks_refused_width(&self) -> bool {
+        let (Some(resize), Some(limits)) = (self.resize, self.limits) else {
+            return false;
+        };
+        limits.min.is_some_and(|min| resize.x < min) || limits.max.is_some_and(|max| resize.x > max)
     }
 }
 
@@ -691,7 +704,10 @@ fn layout_print(strip: &LayoutStrip, windows: &CoverWindows) -> u64 {
     let mut hasher = DefaultHasher::new();
     for window in strip_windows(strip, windows) {
         window.entity.to_bits().hash(&mut hasher);
+        // Where it heads too: a resize on its way changes the layout before
+        // the window's own size does.
         (window.frame.min, window.frame.max).hash(&mut hasher);
+        (window.heading.min, window.heading.max).hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -1441,7 +1457,7 @@ fn next_picture(
             }
             let focused = windows
                 .get(window.entity)
-                .is_ok_and(|(.., focused)| focused);
+                .is_ok_and(|(.., focused, _)| focused);
             let size = window.frame.size();
             let kept = photos.windows.get(&window.id);
             let age = kept.map_or(Duration::MAX, |kept| now.saturating_sub(kept.taken));

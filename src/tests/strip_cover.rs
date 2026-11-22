@@ -1002,3 +1002,73 @@ fn the_cover_waits_for_a_neighbor_pushed_off_it() {
         "the cover fades once the neighbor shows"
     );
 }
+
+fn entity_of(world: &mut World, id: WinID) -> Entity {
+    let mut query = world.query::<(Entity, &Window)>();
+    query
+        .iter(world)
+        .find(|(_, window)| window.id() == id)
+        .map(|(entity, _)| entity)
+        .expect("window not found")
+}
+
+/// A resize to a width the window refused before moves the real windows as
+/// before: the layout clamps the width a pass later, which would turn the
+/// pictures twice.
+#[test]
+fn a_resize_past_a_refused_width_is_not_covered() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    take_pictures(&mut harness, &log);
+    let entity = entity_of(harness.world(), 0);
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(crate::ecs::WidthLimits {
+            min: None,
+            max: Some(720),
+        });
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    assert!(log.borrow().morphs.is_empty(), "no cover");
+}
+
+/// A stack while a resize's pictures move ends the cover: windows that move
+/// up or down are no resize.
+#[test]
+fn a_stack_mid_resize_ends_the_cover() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    take_pictures(&mut harness, &log);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME * 2);
+    assert!(morphed(harness.world()));
+    send(
+        &mut harness,
+        Event::Command {
+            command: Command::Window(Operation::Stack(crate::commands::Side::East)),
+        },
+    );
+    harness.advance(ONE_FRAME * 2);
+    assert!(!morphed(harness.world()), "the cover ends");
+    assert_eq!(log.borrow().morphs.len(), 1, "no turn into the stack");
+}
+
+/// A resize during a covered strip slide ends the slide at once, so the
+/// resized window never changes width under a slide's pictures, even the
+/// last column's, whose resize moves no other window.
+#[test]
+fn a_resize_mid_slide_ends_the_slide() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::Last));
+    harness.advance(ONE_FRAME);
+    assert!(covered(harness.world()), "the move is under a cover");
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    assert!(
+        !covered(harness.world()),
+        "the slide ends in the resize's pass"
+    );
+}
