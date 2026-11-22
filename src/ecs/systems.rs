@@ -1607,9 +1607,21 @@ pub(super) struct OverlayWindowConfigCache {
     detected_border_radius: Option<f64>,
 }
 
+/// The active strip, and whether a swipe or a picture cover moves it.
+type ActiveStripMotion<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Has<Scrolling>,
+        Has<crate::ecs::strip_cover::CoverSlide>,
+        &'static LayoutStrip,
+    ),
+    With<ActiveWorkspaceMarker>,
+>;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_overlays(
-    active_workspace: Populated<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
+    active_workspace: ActiveStripMotion,
     windows: Windows,
     applications: Query<&Application>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
@@ -1631,11 +1643,12 @@ pub(super) fn update_overlays(
 
     // Hide overlays during swipe, mission control, native fullscreen spaces,
     // or briefly after a space change (macOS space-switch animation).
-    let Some((swiping, active_strip)) = active_workspace.iter().next() else {
+    let Some((swiping, covered, active_strip)) = active_workspace.iter().next() else {
         return;
     };
 
-    if swiping || mission_control_active.0 || active_strip.is_fullscreen() {
+    // A picture cover moves pictures, not the windows the overlays follow.
+    if swiping || covered || mission_control_active.0 || active_strip.is_fullscreen() {
         overlay_mgr.hide_all();
         return;
     }
@@ -1783,6 +1796,7 @@ pub(super) fn verify_window_position(
 /// and puts every tiled window where [`exit_frame`] says, so none is left
 /// parked off-screen. A window in a strip stays on that strip's display.
 /// Floating, minimized, and hidden windows stay where they are.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
     mut all_windows: Query<ExitWindow>,
@@ -1791,8 +1805,14 @@ pub(crate) fn cleanup_on_exit(
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mut drag_overlay: Option<NonSendMut<DragOverlayHandle>>,
+    mut covers: Option<NonSendMut<crate::ecs::strip_cover::CoverScreenHandle>>,
 ) {
     for _ in exit_events.read() {
+        if let Some(ref mut covers) = covers {
+            for display in covers.0.shown() {
+                covers.0.hide(display);
+            }
+        }
         // First, because restoring windows below goes through slow
         // accessibility calls, and a drag line or symbol must not stay on
         // screen meanwhile.

@@ -47,8 +47,9 @@ use crate::ecs::systems::AnimationStep;
 use crate::ecs::workspace::spawn_snap_strip_guard;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker, LayoutPosition,
-    NativeFullscreenMarker, Position, PostUpdateSet, RepositionMarker, ResizeMarker, ScrollInput,
-    Scrolling, SelectedVirtualMarker, SpawnCommandsExt as _, Unmanaged, UpdateSet, ease, systems,
+    MissionControlActive, NativeFullscreenMarker, Position, PostUpdateSet, RepositionMarker,
+    ResizeMarker, ScrollInput, Scrolling, SelectedVirtualMarker, SpawnCommandsExt as _, Unmanaged,
+    UpdateSet, ease, systems,
 };
 use crate::events::Event;
 use crate::manager::{Display, Window, WindowManager};
@@ -108,7 +109,8 @@ pub(crate) struct CoverScene<'a> {
     pub display: CGDirectDisplayID,
     /// The whole display, in global points, where the desktop picture goes.
     pub display_bounds: IRect,
-    /// The part of the display the cover covers: where the strip shows.
+    /// The part of the display the cover covers: its visible area, where
+    /// the strip and its edge padding show.
     pub viewport: IRect,
     pub desktop: &'a Photo,
     /// Where the strip's origin is, in global points.
@@ -159,6 +161,9 @@ pub(crate) trait CoverScreen {
     fn shown(&self) -> Vec<CGDirectDisplayID>;
     /// Takes the cover of `display` down.
     fn hide(&mut self, display: CGDirectDisplayID);
+    /// Lets go of what the screen keeps to find `window`, or every window,
+    /// so a stale lookup never sticks.
+    fn forget(&mut self, window: Option<WinID>);
 }
 
 /// The cover screen the engine draws with, as a non-send resource.
@@ -233,6 +238,13 @@ impl CoverPhotos {
         self.blank_until.clear();
         self.asked = None;
     }
+
+    fn is_clear(&self) -> bool {
+        self.windows.is_empty()
+            && self.desktops.is_empty()
+            && self.blank_until.is_empty()
+            && self.asked.is_none()
+    }
 }
 
 /// Whether two sizes match to within the rounding of a capture.
@@ -270,6 +282,12 @@ pub(crate) struct CoverSlide {
 }
 
 impl CoverSlide {
+    /// Where the strip heads while its pictures slide. Once they land, the
+    /// strip is there already.
+    pub(crate) fn heading(&self) -> Option<IVec2> {
+        self.landing.is_none().then_some(self.target)
+    }
+
     /// Where the strip shows `at` seconds into the slide.
     fn x_at(&self, at: f64) -> f64 {
         let to = f64::from(self.target.x);
@@ -336,6 +354,9 @@ pub(crate) struct CoverSwipe {
     display: CGDirectDisplayID,
     /// The strip x the cover shows.
     shown: i32,
+    /// The display's bounds and the strip's viewport when the swipe began.
+    bounds: IRect,
+    viewport: IRect,
 }
 
 pub(crate) fn register(app: &mut App) {
@@ -382,9 +403,16 @@ fn cover_enabled(config: &Config) -> bool {
 fn keep_cover_photos(
     mut messages: MessageReader<Event>,
     mut photos: ResMut<CoverPhotos>,
-    screen: Option<NonSendMut<CoverScreenHandle>>,
+    mut screen: Option<NonSendMut<CoverScreenHandle>>,
+    config: Res<Config>,
     time: Res<Time>,
 ) {
+    if !cover_enabled(&config) || photos.access != Access::Allowed {
+        // A picture that arrives after the switch or the permission went
+        // is dropped, never kept.
+        messages.clear();
+        return;
+    }
     for event in messages.read() {
         let Event::CoverPhoto {
             subject,
@@ -424,22 +452,32 @@ fn keep_cover_photos(
                     photos.blank_until.insert(id, time.elapsed() + BLANK_RETRY);
                 }
             }
-            Err(PhotoError::WindowGone) => {
+            Err(error @ (PhotoError::WindowGone | PhotoError::Failed)) => {
+                // A failed lookup is looked up afresh next time.
                 if let CoverSubject::Window(id) = *subject {
-                    photos.windows.remove(&id);
+                    if *error == PhotoError::WindowGone {
+                        photos.windows.remove(&id);
+                    }
+                    if let Some(screen) = screen.as_mut() {
+                        screen.0.forget(Some(id));
+                    }
                 }
             }
             Err(PhotoError::Refused) => {
                 debug!("cover pictures refused by macOS");
-                if screen
+                photos.access = if screen
                     .as_ref()
                     .is_some_and(|screen| screen.0.may_photograph())
                 {
-                    photos.access = Access::Refused;
-                }
+                    Access::Refused
+                } else {
+                    Access::Off
+                };
                 photos.clear();
+                if let Some(screen) = screen.as_mut() {
+                    screen.0.forget(None);
+                }
             }
-            Err(PhotoError::Failed) => {}
         }
     }
 }
@@ -514,14 +552,15 @@ fn shows(
     shown_strip(window_manager, display, strips.iter()) == Some(entity)
 }
 
-/// What a cover over `strip`, at strip origin `at`, would show, or why it
+/// What a cover over `area` of `strip`'s display, the display's visible
+/// area with its edge padding, at strip origin `at`, would show, or why it
 /// cannot: it needs a picture of every window of the strip, so a move that
 /// turns, or a swipe, shows each window wherever it goes. The focused window
 /// comes last, over any window it overlaps.
 fn cover_scene<'a>(
     strip: &LayoutStrip,
     display: &Display,
-    viewport: IRect,
+    area: IRect,
     at: IVec2,
     windows: &CoverWindows,
     floating: &Query<(&Window, &Unmanaged)>,
@@ -538,8 +577,7 @@ fn cover_scene<'a>(
         return Err("tabbed windows");
     }
     let floats_over = floating.iter().any(|(window, unmanaged)| {
-        matches!(unmanaged, Unmanaged::Floating)
-            && !window.shown_frame().intersect(viewport).is_empty()
+        matches!(unmanaged, Unmanaged::Floating) && !window.shown_frame().intersect(area).is_empty()
     });
     if floats_over {
         return Err("a floating window over the strip");
@@ -560,8 +598,8 @@ fn cover_scene<'a>(
         .ok_or("a window has no picture")?;
     Ok(CoverScene {
         display: display.id(),
-        display_bounds: display.bounds(),
-        viewport,
+        display_bounds: display.physical_bounds(),
+        viewport: area,
         desktop,
         strip: at,
         pictures,
@@ -608,12 +646,16 @@ fn cover_strip_moves(
     config: Res<Config>,
     time: Res<Time>,
     step: Res<AnimationStep>,
+    mission_control: Res<MissionControlActive>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
     mut commands: Commands,
 ) {
     let Some(mut screen) = screen else {
         return;
     };
+    // The displays a cover went up on in this pass, which another strip's
+    // early end there must not take down.
+    let mut started = Vec::new();
     let dragging = drag
         .as_ref()
         .is_some_and(|drag| drag.held_window().is_some());
@@ -669,11 +711,14 @@ fn cover_strip_moves(
             let same_place = display.id() == slide.display
                 && display.bounds() == slide.bounds
                 && viewport == slide.viewport;
+            let turns_height = target.is_some_and(|target| fresh && target.y != position.0.y);
             let aborted = !cover_enabled(&config)
                 || !shown_here
                 || !same_place
                 || scrolling
                 || dragging
+                || mission_control.0
+                || turns_height
                 || (strip.is_changed() && !strip.is_added());
             if aborted {
                 debug!("cover over strip {entity} ended early");
@@ -694,7 +739,9 @@ fn cover_strip_moves(
                     }
                 }
                 end_guard(slide.guard.take(), &mut commands);
-                screen.0.hide(slide.display);
+                if !started.contains(&slide.display) {
+                    screen.0.hide(slide.display);
+                }
                 commands.entity(entity).remove::<CoverSlide>();
                 continue;
             }
@@ -713,7 +760,6 @@ fn cover_strip_moves(
                 } else {
                     0.0
                 };
-                position.0.y = target.y;
                 let guard = slide.guard;
                 *slide = start_slide(
                     slide.display,
@@ -772,7 +818,13 @@ fn cover_strip_moves(
             continue;
         }
         let scene = match cover_scene(
-            &strip, display, viewport, position.0, &windows, &floating, &photos,
+            &strip,
+            display,
+            display.visible_bounds(dock),
+            position.0,
+            &windows,
+            &floating,
+            &photos,
         ) {
             Ok(scene) => scene,
             Err(reason) => {
@@ -782,6 +834,7 @@ fn cover_strip_moves(
         };
         let pictures = scene.pictures.len();
         screen.0.show(&scene);
+        started.push(display.id());
         let slide = start_slide(
             display.id(),
             (display.bounds(), viewport),
@@ -917,6 +970,7 @@ type SwipedStrips<'w, 's> = Query<
         Ref<'static, Position>,
         Option<Ref<'static, Scrolling>>,
         Option<&'static mut CoverSwipe>,
+        Option<Ref<'static, RepositionMarker>>,
         Has<CoverSlide>,
         &'static ChildOf,
         Has<ActiveWorkspaceMarker>,
@@ -928,7 +982,7 @@ type SwipedStrips<'w, 's> = Query<
 /// Puts a trackpad swipe under the cover when it starts with every picture
 /// of its strip ready, moves the pictures with the strip, and lands the
 /// real windows in one step once the swipe settles. Modifier-scroll stays
-/// uncovered: its ticks over the cover would not reach the engine.
+/// uncovered: the wheel scrolls in steps that real windows follow well.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn cover_swipes(
     mut strips: SwipedStrips,
@@ -941,6 +995,7 @@ fn cover_swipes(
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     time: Res<Time>,
+    mission_control: Res<MissionControlActive>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
     mut commands: Commands,
 ) {
@@ -950,7 +1005,8 @@ fn cover_swipes(
     let dragging = drag
         .as_ref()
         .is_some_and(|drag| drag.held_window().is_some());
-    for (entity, strip, position, scrolling, swipe, sliding, child, active, fullscreen) in
+    let mut started = Vec::new();
+    for (entity, strip, position, scrolling, swipe, marker, sliding, child, active, fullscreen) in
         &mut strips
     {
         let starts = scrolling.as_ref().is_some_and(|scrolling| {
@@ -964,9 +1020,18 @@ fn cover_swipes(
         };
         let shown_here = active || shows(&window_manager, display.id(), &shown_strips, entity);
         if let Some(mut swipe) = swipe {
+            // A strip move that arrives during the swipe, such as a key or a
+            // press on a picture, ends the cover, as does a display or Dock
+            // that changes under it, or Mission Control.
+            let moved = marker.as_ref().is_some_and(DetectChanges::is_changed);
+            let same_place = display.bounds() == swipe.bounds
+                && display.actual_display_bounds(dock, &config) == swipe.viewport;
             let aborted = !cover_enabled(&config)
                 || !shown_here
+                || !same_place
+                || moved
                 || dragging
+                || mission_control.0
                 || (strip.is_changed() && !strip.is_added());
             if aborted || scrolling.is_none() {
                 // The swipe has landed, or the cover cannot stay: the real
@@ -976,7 +1041,9 @@ fn cover_swipes(
                 entity_commands.remove::<CoverSwipe>().insert(Moved);
                 if aborted {
                     debug!("cover over swiped strip {entity} ended early");
-                    screen.0.hide(swipe.display);
+                    if !started.contains(&swipe.display) {
+                        screen.0.hide(swipe.display);
+                    }
                 } else {
                     screen.0.place(swipe.display, f64::from(position.0.x));
                     entity_commands.insert(CoverSlide {
@@ -1004,12 +1071,23 @@ fn cover_swipes(
             continue;
         }
 
-        if sliding || !cover_enabled(&config) || !shown_here || fullscreen || dragging {
+        if sliding
+            || !cover_enabled(&config)
+            || !shown_here
+            || fullscreen
+            || dragging
+            || mission_control.0
+        {
             continue;
         }
-        let viewport = display.actual_display_bounds(dock, &config);
         let scene = match cover_scene(
-            &strip, display, viewport, position.0, &windows, &floating, &photos,
+            &strip,
+            display,
+            display.visible_bounds(dock),
+            position.0,
+            &windows,
+            &floating,
+            &photos,
         ) {
             Ok(scene) => scene,
             Err(reason) => {
@@ -1019,11 +1097,14 @@ fn cover_swipes(
         };
         let pictures = scene.pictures.len();
         screen.0.show(&scene);
+        started.push(display.id());
         screen.0.track(display.id(), f64::from(position.0.x));
         debug!("cover over swiped strip {entity}: {pictures} pictures");
         commands.entity(entity).insert(CoverSwipe {
             display: display.id(),
             shown: position.0.x,
+            bounds: display.bounds(),
+            viewport: display.actual_display_bounds(dock, &config),
         });
     }
 }
@@ -1042,8 +1123,11 @@ fn mark_moved(mut strips: Query<(Entity, &mut Position), With<Moved>>, mut comma
     }
 }
 
-/// Every strip under a cover, by a move or a swipe.
-type AnyCover<'w, 's> = Query<'w, 's, (), Or<(With<CoverSlide>, With<CoverSwipe>)>>;
+/// A strip under a cover, by a move or a swipe.
+pub(crate) type UnderCover = Or<(With<CoverSlide>, With<CoverSwipe>)>;
+
+/// Every strip under a cover.
+type AnyCover<'w, 's> = Query<'w, 's, (), UnderCover>;
 
 /// Asks for the next picture the cover needs, one at a time: a missing or
 /// outgrown one first, then the desktop, then the focused window, then the
@@ -1065,10 +1149,14 @@ fn refresh_cover_photos(
         return;
     };
     let now = time.elapsed();
+    if config.is_changed() {
+        photos.checked_at = None;
+    }
     check_access(&mut photos, &config, screen.0.as_ref(), now);
     if photos.access != Access::Allowed || !cover_enabled(&config) {
-        if !photos.windows.is_empty() || !photos.desktops.is_empty() {
+        if !photos.is_clear() {
             photos.clear();
+            screen.0.forget(None);
         }
         return;
     }
@@ -1088,7 +1176,16 @@ fn refresh_cover_photos(
         .iter()
         .map(|window| window.id())
         .collect::<Vec<_>>();
-    photos.windows.retain(|id, _| alive.contains(id));
+    let gone = photos
+        .windows
+        .keys()
+        .filter(|id| !alive.contains(id))
+        .copied()
+        .collect::<Vec<_>>();
+    for id in gone {
+        photos.windows.remove(&id);
+        screen.0.forget(Some(id));
+    }
 
     // The strip each display shows, so every display's next move is ready.
     let rows = displays
@@ -1178,7 +1275,7 @@ fn next_picture(
                 priority: if kept.is_none() { 1 } else { 3 },
                 taken: kept.map_or(Duration::ZERO, |kept| kept.taken),
                 subject: CoverSubject::Desktop(display.id()),
-                size: display.bounds().size(),
+                size: display.physical_bounds().size(),
                 display: display.id(),
                 excluding: excluding.clone(),
             }),

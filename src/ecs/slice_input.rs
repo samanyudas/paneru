@@ -8,7 +8,7 @@ use bevy::app::{App, PostUpdate, Update};
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_exists};
-use bevy::prelude::{Commands, Entity, Has, Query, Res, Resource, Time, With};
+use bevy::prelude::{ChildOf, Commands, Entity, Has, Query, Res, Resource, Time, With};
 use tracing::debug;
 
 use crate::commands::{FocusSource, focus_with_verification};
@@ -83,9 +83,12 @@ fn reveal_pressed(
 
 /// Posts the press once its window rests on a display where the window
 /// server sends the press to it, with no photo of it sliding or over it.
+#[allow(clippy::too_many_arguments)]
 fn deliver_press(
     pending: Res<PendingPress>,
     windows: Query<(&Window, Has<RepositionMarker>, Has<ResizeMarker>)>,
+    parents: Query<&ChildOf>,
+    covered: Query<(), crate::ecs::strip_cover::UnderCover>,
     sliding: Query<(), With<Slide>>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
@@ -109,7 +112,17 @@ fn deliver_press(
         commands.remove_resource::<PendingPress>();
         return;
     };
-    if moving || resizing || sliding.contains(pending.window) || window.write_pending() {
+    // A window under a picture cover sits where the move began until the
+    // cover lifts, so its press waits for that.
+    let under_cover = parents
+        .get(pending.window)
+        .is_ok_and(|parent| covered.contains(parent.parent()));
+    if moving
+        || resizing
+        || under_cover
+        || sliding.contains(pending.window)
+        || window.write_pending()
+    {
         return;
     }
     let point = press.point_in(window.shown_frame());

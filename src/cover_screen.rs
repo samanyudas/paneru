@@ -269,7 +269,9 @@ impl CoverScreen for CoverScreenOS {
         let reply = self.reply(CoverSubject::Window(window), generation);
         let scale = self.scale_at(Self::display_bounds(display));
         if let Some(filter) = self.filters.get(&window).and_then(|found| found.get()) {
-            capture(&filter.0, size, scale, move |result| reply.send(result));
+            capture(&filter.0, size, scale, false, move |result| {
+                reply.send(result);
+            });
             return;
         }
         let filter = Arc::new(OnceLock::new());
@@ -297,7 +299,9 @@ impl CoverScreen for CoverScreenOS {
                     })
                 });
                 let reply = reply.clone();
-                capture(&filter.0, size, scale, move |result| reply.send(result));
+                capture(&filter.0, size, scale, false, move |result| {
+                    reply.send(result);
+                });
             },
         );
         unsafe {
@@ -352,7 +356,7 @@ impl CoverScreen for CoverScreenOS {
                     )
                 };
                 let reply = reply.clone();
-                capture(&filter, bounds.size(), scale, move |result| {
+                capture(&filter, bounds.size(), scale, false, move |result| {
                     reply.send(result);
                 });
             },
@@ -505,6 +509,15 @@ impl CoverScreen for CoverScreenOS {
         CATransaction::commit();
         CATransaction::flush();
         self.track(display, x);
+    }
+
+    fn forget(&mut self, window: Option<WinID>) {
+        match window {
+            Some(window) => {
+                self.filters.remove(&window);
+            }
+            None => self.filters.clear(),
+        }
     }
 
     fn showing(&self, display: CGDirectDisplayID) -> Option<f64> {

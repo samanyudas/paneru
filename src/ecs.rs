@@ -176,10 +176,14 @@ pub fn register_systems(app: &mut bevy::app::App) {
                           mission_control: Option<Res<MissionControlActive>>,
                           strip_changed: OverlayStripChanged,
                           mut scrolling_removed: RemovedComponents<Scrolling>,
+                          mut covers_removed: RemovedComponents<strip_cover::CoverSlide>,
+                          covers_added: Query<(), Added<strip_cover::CoverSlide>>,
                           focus_gained: Query<(), Added<FocusedMarker>>,
                           workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
                           focused_moved: OverlayFocusedMoved| {
-        let scrolling_ended = scrolling_removed.read().count() > 0;
+        let scrolling_ended = scrolling_removed.read().count() > 0
+            || covers_removed.read().count() > 0
+            || !covers_added.is_empty();
         let Some(config) = config else {
             return false;
         };

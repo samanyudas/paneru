@@ -89,16 +89,22 @@ type StripPlacements<'w, 's> = Query<
         Option<&'static RepositionMarker>,
         Option<&'static Scrolling>,
         Has<PreviousStripPosition>,
+        Option<&'static crate::ecs::strip_cover::CoverSlide>,
     ),
 >;
 
-/// Where a strip is headed: the target of an animation in flight, else the
-/// offset a swipe is settling on, else where it is now.
+/// Where a strip is headed: the target of an animation in flight or of a
+/// slide under the picture cover, else the offset a swipe is settling on,
+/// else where it is now.
 fn strip_destination(
     position: &Position,
     reposition: Option<&RepositionMarker>,
     scrolling: Option<&Scrolling>,
+    cover: Option<&crate::ecs::strip_cover::CoverSlide>,
 ) -> Origin {
+    if let Some(heading) = cover.and_then(crate::ecs::strip_cover::CoverSlide::heading) {
+        return heading;
+    }
     reposition.map_or_else(
         || {
             scrolling
@@ -2682,7 +2688,7 @@ fn follow_viewport(
         if !selected || parked {
             continue;
         }
-        let destination = strip_destination(position, reposition, scrolling);
+        let destination = strip_destination(position, reposition, scrolling, None);
         let target = displays
             .get(child.parent())
             .ok()
@@ -2817,9 +2823,15 @@ fn resolve_strip_scroll_context<'a>(
         strip_reposition,
         strip_scrolling,
         has_previous_position,
+        strip_cover,
     ) = strips.into_iter().find(|strip| strip.0.contains(entity))?;
     let (display, dock) = displays.get(child.parent()).ok()?;
-    let strip_target = strip_destination(strip_position, strip_reposition, strip_scrolling);
+    let strip_target = strip_destination(
+        strip_position,
+        strip_reposition,
+        strip_scrolling,
+        strip_cover,
+    );
     Some(StripScrollContext {
         strip,
         strip_entity,

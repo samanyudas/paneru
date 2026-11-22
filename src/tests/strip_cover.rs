@@ -114,6 +114,8 @@ impl CoverScreen for RecordingScreen {
     fn hide(&mut self, _display: CGDirectDisplayID) {
         self.0.borrow_mut().hidden += 1;
     }
+
+    fn forget(&mut self, _window: Option<WinID>) {}
 }
 
 fn pixel() -> CFRetained<CGImage> {
@@ -444,8 +446,8 @@ fn a_cover_without_its_move_comes_down() {
     assert_eq!(log.borrow().hidden, 1, "the orphaned cover comes down");
 }
 
-/// Modifier-scroll stays uncovered: its ticks over the cover would not
-/// reach the engine.
+/// Modifier-scroll stays uncovered: the wheel scrolls in steps that real
+/// windows follow well.
 #[test]
 fn a_wheel_scroll_gets_no_cover() {
     let (mut harness, log) = harness(config(true, Some(14.0)));
@@ -559,4 +561,42 @@ fn the_windows_wait_while_the_pictures_still_move() {
     log.borrow_mut().showing = Some(f64::from(-STEP) + 1e-6);
     harness.advance(ONE_FRAME * 3);
     assert_eq!(window_x(harness.world(), 1), 700 - STEP, "then lands");
+}
+
+/// A key back toward where the slide began turns it there, and the focused
+/// column ends up shown.
+#[test]
+fn a_key_back_mid_slide_turns_the_slide_home() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME * 2);
+    send(&mut harness, focus(Direction::West));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().slides.len(), 2, "the slide turns back");
+    harness.advance(SETTLE);
+    assert_eq!(window_x(harness.world(), 0), 0, "the focused column shows");
+}
+
+/// A key during a covered swipe ends the cover, and the strip goes where
+/// the key sends it.
+#[test]
+fn a_key_during_a_covered_swipe_ends_the_cover() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.01));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().shown.len(), 1, "the swipe is under a cover");
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME * 3);
+    let swiping = harness
+        .world()
+        .query::<&crate::ecs::strip_cover::CoverSwipe>()
+        .iter(harness.world())
+        .count();
+    assert_eq!(swiping, 0, "the swipe's cover ends");
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(SETTLE);
+    assert!(!covered(harness.world()));
 }

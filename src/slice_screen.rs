@@ -16,7 +16,7 @@ use objc2_app_kit::{
     NSViewLayerContentsRedrawPolicy, NSWindowCollectionBehavior, NSWindowOcclusionState,
     NSWindowStyleMask,
 };
-use objc2_core_foundation::{CFRetained, CFType, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFData, CFRetained, CFType, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGDataProvider, CGImage, CGImageAlphaInfo, CGPreflightScreenCaptureAccess,
 };
@@ -273,7 +273,9 @@ impl SliceScreen for SliceScreenOS {
         if lookup == Lookup::Reuse
             && let Some(filter) = self.filters.get(&window).and_then(|found| found.get())
         {
-            capture(&filter.0, size, scale, move |result| reply.send(result));
+            capture(&filter.0, size, scale, true, move |result| {
+                reply.send(result);
+            });
             return;
         }
         debug!("edge slice window looked up: window {window} generation {generation}");
@@ -306,7 +308,9 @@ impl SliceScreen for SliceScreenOS {
                     })
                 });
                 let reply = reply.clone();
-                capture(&filter.0, size, scale, move |result| reply.send(result));
+                capture(&filter.0, size, scale, true, move |result| {
+                    reply.send(result);
+                });
             },
         );
         unsafe {
@@ -385,6 +389,7 @@ pub(crate) fn capture(
     filter: &SCContentFilter,
     size: IVec2,
     scale: f64,
+    digested: bool,
     done: impl Fn(Result<Photo, PhotoError>) + 'static,
 ) {
     let configuration = configuration(size, scale);
@@ -395,16 +400,24 @@ pub(crate) fn capture(
         };
         // SAFETY: a non-null image that ScreenCaptureKit lends to this call.
         let image = unsafe { CFRetained::retain(image) };
-        let pixels = pixels(&image);
-        if blank(&image, &pixels) {
+        let data = pixels(&image);
+        // SAFETY: the bytes stay put while `data` lives, and nothing writes
+        // to an image ScreenCaptureKit handed over.
+        let pixels = data
+            .as_deref()
+            .map_or(&[][..], |data| unsafe { data.as_bytes_unchecked() });
+        if blank(&image, pixels) {
             debug!("photo is blank");
             done(Err(PhotoError::Blank));
             return;
         }
-        done(Ok(Photo {
-            digest: digest(&image, &pixels),
-            image,
-        }));
+        // Only an edge slice compares photos by digest.
+        let digest = if digested {
+            digest(&image, pixels)
+        } else {
+            Digest(0)
+        };
+        done(Ok(Photo { digest, image }));
     });
     unsafe {
         SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
@@ -432,12 +445,9 @@ fn configuration(size: IVec2, scale: f64) -> Retained<SCStreamConfiguration> {
     configuration
 }
 
-/// The bytes of `image`, empty when Core Graphics cannot give them.
-fn pixels(image: &CGImage) -> Vec<u8> {
-    CGImage::data_provider(Some(image))
-        .and_then(|provider| CGDataProvider::data(Some(&provider)))
-        .map(|data| data.to_vec())
-        .unwrap_or_default()
+/// The bytes of `image`, when Core Graphics can give them.
+fn pixels(image: &CGImage) -> Option<CFRetained<CFData>> {
+    CGImage::data_provider(Some(image)).and_then(|provider| CGDataProvider::data(Some(&provider)))
 }
 
 /// Whether nearly all of `image` is clear. Some apps, such as Notion, stop
@@ -538,7 +548,13 @@ mod tests {
     }
 
     fn is_blank(image: &CGImage) -> bool {
-        blank(image, &pixels(image))
+        let data = pixels(image);
+        // SAFETY: a test image nothing writes to.
+        blank(
+            image,
+            data.as_deref()
+                .map_or(&[][..], |data| unsafe { data.as_bytes_unchecked() }),
+        )
     }
 
     #[test]
