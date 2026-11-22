@@ -97,6 +97,9 @@ pub(crate) struct CoverMorph {
     /// The display's bounds and the strip's viewport when the resize began.
     bounds: IRect,
     viewport: IRect,
+    /// The part of the display the cover hides: the visible area, with its
+    /// edge padding.
+    area: IRect,
     frames: Vec<Reframe>,
     /// Where the morph entered the curve, as a share of its time, how long it
     /// has run in animation time, and how long the whole curve lasts.
@@ -531,12 +534,14 @@ pub(super) fn cover_resizes(
             }
         };
         let pictures = scene.pictures.len();
+        let area = scene.viewport;
         screen.0.show(&scene);
         let duration = ease::duration(&config);
         let mut morph = CoverMorph {
             display: display.id(),
             bounds: display.bounds(),
             viewport,
+            area,
             frames,
             entry: 0.0,
             elapsed: 0.0,
@@ -587,27 +592,34 @@ fn turn_entry(
     ease::entry_for_speed(speed, f64::from(to - now), duration)
 }
 
-/// Whether the window server shows each window of `row` that the cover
-/// over `viewport` hides at the frame the layout committed it to. A write
-/// call can return before its app shows the new frame, and an app that is
-/// late can have its old frame read back as the window's own, so the check
-/// goes by the layout's frame, and a window the window server does not list
-/// is not there yet. Windows outside the cover cannot show an overlap under
-/// it, and are left out to keep the read short.
+/// Whether the window server shows each window of `row` that the cover of
+/// `morph` hides, before or after the resize, at the frame the layout
+/// committed it to. A write call can return before its app shows the new
+/// frame, and an app that is late can have its old frame read back as the
+/// window's own, so the check goes by the layout's frame, and a window the
+/// window server does not list is not there yet. Windows the cover never
+/// hides cannot show an overlap as it fades, and are left out to keep the
+/// read short.
 fn shows_committed(
     row: &[StripWindow],
     frames: &Query<(&Window, &Position, &Bounds)>,
-    viewport: IRect,
+    morph: &CoverMorph,
     shown: &ShownFrames,
 ) -> bool {
+    let hidden = |rect: IRect| !rect.intersect(morph.area).is_empty();
     let committed = row
         .iter()
-        .filter_map(|window| frames.get(window.entity).ok())
-        .map(|(window, position, bounds)| {
+        .filter_map(|window| {
+            let (found, position, bounds) = frames.get(window.entity).ok()?;
             let cell = IRect::from_corners(position.0, position.0 + bounds.0);
-            (window.id(), window.margins().shown(cell))
+            let frame = found.margins().shown(cell);
+            let was = morph
+                .frames
+                .iter()
+                .find(|reframe| reframe.entity == window.entity)
+                .map(|reframe| reframe.from);
+            (hidden(frame) || was.is_some_and(hidden)).then_some((found.id(), frame))
         })
-        .filter(|(_, frame)| !frame.intersect(viewport).is_empty())
         .collect::<Vec<_>>();
     let ids = committed.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     let read = shown.now(&ids);
@@ -642,7 +654,7 @@ pub(super) fn lift_morphs(
                 let in_place = row.iter().all(|window| window.at_rest)
                     && shown_frames
                         .as_ref()
-                        .is_none_or(|shown| shows_committed(&row, &frames, morph.viewport, shown));
+                        .is_none_or(|shown| shows_committed(&row, &frames, &morph, shown));
                 let settled = if in_place { settled + 1 } else { 0 };
                 if settled >= LANDED_FRAMES || now >= deadline {
                     let late = if settled >= LANDED_FRAMES {
