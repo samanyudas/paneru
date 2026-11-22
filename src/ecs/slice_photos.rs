@@ -993,7 +993,7 @@ fn slide_photos_out(
 ) {
     let t = ease_out_factor(config.animation_speed(), step.secs());
     let mut moved_out = Vec::<Out>::new();
-    for entity in Out::nearest_first(&sliding) {
+    for (entity, waits) in Out::nearest_first(&sliding, time.elapsed()) {
         let Ok((entity, window, mut slide, mut position, presented, _)) = sliding.get_mut(entity)
         else {
             continue;
@@ -1082,7 +1082,7 @@ fn slide_photos_out(
                     at.x, at.y
                 );
             }
-            Slide::Tucking { until, .. } if window.write_pending() && time.elapsed() < until => {}
+            Slide::Tucking { .. } if waits => {}
             Slide::Tucking {
                 at,
                 to,
@@ -1162,18 +1162,28 @@ impl Out {
 
     /// The windows of `sliding` heading for a tuck, each display's nearest
     /// its edge first, so each one steps after the windows nearer the edge.
-    /// In one column, the windows that still wait for a photo come first, so
-    /// a photo that slides steps after them.
-    fn nearest_first(sliding: &Sliding) -> Vec<Entity> {
+    /// In one column, the windows that wait where they show come first, so a
+    /// photo that slides steps after them. A window waits for its photo, or,
+    /// as of `now`, for macOS to take its tuck under the photo until the
+    /// engine time `until` of its `Slide::Tucking`. Each comes with whether
+    /// it waits.
+    fn nearest_first(sliding: &Sliding, now: Duration) -> Vec<(Entity, bool)> {
         let mut order = sliding
             .iter()
-            .filter_map(|(entity, _, slide, ..)| {
-                let waits = matches!(slide, Slide::Leaving { .. });
+            .filter_map(|(entity, window, slide, ..)| {
+                let waits = match *slide {
+                    Slide::Leaving { .. } => true,
+                    Slide::Tucking { until, .. } => window.write_pending() && now < until,
+                    Slide::Moving { .. } | Slide::Landing { .. } => false,
+                };
                 Some((Self::of(slide)?.outwards(), !waits, entity))
             })
             .collect::<Vec<_>>();
         order.sort_unstable();
-        order.into_iter().map(|(.., entity)| entity).collect()
+        order
+            .into_iter()
+            .map(|(_, steps, entity)| (entity, !steps))
+            .collect()
     }
 
     /// How far past its edge the row places it, so that windows nearer the

@@ -931,20 +931,39 @@ fn a_stack_leaving_across_the_shared_edge_waits_for_a_slow_tuck() {
     assert_stack_leaves_together(40, 5, Some(3));
 }
 
+/// As above, but with both windows of the stack in apps of their own, so the
+/// window that is ready steps before the one whose app is slow.
+#[test]
+fn a_stack_leaving_across_the_shared_edge_waits_for_a_slow_tuck_stepped_last() {
+    assert_stack_leaves_together_in(5, 40, Some(4), true);
+    assert_stack_leaves_together_in(40, 5, Some(3), true);
+}
+
 /// Windows 3 and 4, stacked at the shared edge, leave it with their photos
 /// arriving after `three` and `four` frames. Window `slow`, if any, belongs
 /// to another app, which takes its tuck 4 frames late.
 fn assert_stack_leaves_together(three: usize, four: usize, slow: Option<WinID>) {
+    assert_stack_leaves_together_in(three, four, slow, false);
+}
+
+/// `assert_stack_leaves_together`, with windows 3 and 4 each in an app of its
+/// own if `own_apps`.
+fn assert_stack_leaves_together_in(three: usize, four: usize, slow: Option<WinID>, own_apps: bool) {
     const SLOW_APP: crate::platform::Pid = 2;
+    const OTHER_APP: crate::platform::Pid = 3;
     let log = Rc::new(RefCell::new(Screen::default()));
     let mut harness = TestHarness::new()
         .with_config(animated())
         .with_display(EXT_DISPLAY_ID, RIGHT, vec![EXT_WORKSPACE_ID])
-        .with_app(SLOW_APP, "slow", "SlowApp", |_| {});
+        .with_app(SLOW_APP, "slow", "SlowApp", |_| {})
+        .with_app(OTHER_APP, "other", "OtherApp", |_| {});
     harness.mock_state.queue_writes(SLOW_APP);
+    harness.mock_state.queue_writes(OTHER_APP);
     for id in 0..5 {
         let pid = if slow == Some(id) {
             SLOW_APP
+        } else if own_apps && (id == 3 || id == 4) {
+            OTHER_APP
         } else {
             TEST_PROCESS_ID
         };
