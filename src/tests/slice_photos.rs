@@ -925,6 +925,10 @@ fn a_stack_leaving_across_the_shared_edge_slides_out_as_one_column() {
 fn a_stack_leaving_across_the_shared_edge_waits_for_a_slow_tuck() {
     assert_stack_leaves_together(5, 12, Some(4));
     assert_stack_leaves_together(12, 5, Some(3));
+    // The later photo arrives after the other columns have settled, so no
+    // moving neighbour holds the photo that slides.
+    assert_stack_leaves_together(5, 40, Some(4));
+    assert_stack_leaves_together(40, 5, Some(3));
 }
 
 /// Windows 3 and 4, stacked at the shared edge, leave it with their photos
