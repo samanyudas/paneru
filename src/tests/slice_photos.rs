@@ -1008,6 +1008,11 @@ fn focus_back_during_a_slide_out_slides_the_photo_back_in() {
 fn a_stack_leaving_across_the_shared_edge_slides_out_as_one_column() {
     assert_stack_leaves_together(5, 12, None);
     assert_stack_leaves_together(12, 5, None);
+    // A photo that arrives while the column still slides toward the edge.
+    for first in 1..4 {
+        assert_stack_leaves_together(first, 12, None);
+        assert_stack_leaves_together(12, first, None);
+    }
 }
 
 /// The window whose photo arrives last belongs to an app that takes its tuck
