@@ -44,6 +44,50 @@ const LEFT_AT_LANDING: f64 = 0.005;
 /// after `x / ω` seconds, reaches [`LEFT_AT_LANDING`].
 const SPAN: f64 = 7.430_129_500_280_122;
 
+/// The damping ratio of the settle after a trackpad flick. Below 1, the
+/// spring swings a little past its target and back, which Apple's fluid
+/// interfaces keep for motion a gesture threw.
+const FLICK_DAMPING: f64 = 0.8;
+
+/// A flick's settle lands once its swing stays within this many points.
+const FLICK_LANDS_WITHIN: f64 = 0.5;
+
+/// The fastest a flick's settle starts toward its target, as a multiple of
+/// the spring's angular frequency times the distance. A flick that lands
+/// close, such as at a strip end, would otherwise swing far past it; at this
+/// limit the swing stays under about 2% of the distance.
+const FLICK_ENTRY_LIMIT: f64 = 0.5;
+
+/// Where a flick's settle is `elapsed` seconds after it began, at an
+/// `animation_speed` of `speed`, as points from its target: it began `from`
+/// points from the target, moving at `velocity` points per second. `None`
+/// once its swing stays within [`FLICK_LANDS_WITHIN`], where it lands.
+///
+/// The spring has the curve's [`RESPONSE`] and [`FLICK_DAMPING`], so it
+/// swings past the target by about 2% of its distance and comes back. A
+/// start faster than [`FLICK_ENTRY_LIMIT`] allows starts at that limit.
+pub(crate) fn flick_offset(from: f64, velocity: f64, elapsed: f64, speed: f64) -> Option<f64> {
+    if speed.is_nan() || speed <= 0.0 || !animates(duration_at(speed)) {
+        return None;
+    }
+    let omega = std::f64::consts::TAU / RESPONSE * speed / MIRI_SPEED;
+    let fastest = FLICK_ENTRY_LIMIT * omega * from.abs();
+    let velocity = if -velocity * from.signum() > fastest {
+        -fastest * from.signum()
+    } else {
+        velocity
+    };
+    let decay = FLICK_DAMPING * omega;
+    let swing = omega * (1.0 - FLICK_DAMPING * FLICK_DAMPING).sqrt();
+    let sine = (velocity + decay * from) / swing;
+    let envelope = (-decay * elapsed).exp();
+    if from.hypot(sine) * envelope < FLICK_LANDS_WITHIN {
+        return None;
+    }
+    let (sin, cos) = (swing * elapsed).sin_cos();
+    Some(envelope * (from * cos + sine * sin))
+}
+
 /// One active frame, in seconds. A motion shorter than this lands in one
 /// step.
 fn frame_secs() -> f64 {
@@ -298,6 +342,49 @@ pub(crate) fn step_slides(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Samples a flick's settle every millisecond until it lands: the
+    /// furthest it swings past its target, and when it lands, in seconds.
+    fn flick_path(from: f64, velocity: f64) -> (f64, f64) {
+        let mut past = 0.0_f64;
+        for ms in 0..2000 {
+            let elapsed = f64::from(ms) / 1000.0;
+            let Some(offset) = flick_offset(from, velocity, elapsed, MIRI_SPEED) else {
+                return (past, elapsed);
+            };
+            // `from` is on one side of the target, so past it has the other sign.
+            past = past.max(-offset * from.signum());
+        }
+        panic!("a flick's settle lands");
+    }
+
+    #[test]
+    fn a_flick_settle_starts_where_and_how_fast_the_strip_moves() {
+        let (from, velocity) = (-500.0, 3000.0);
+        let start = flick_offset(from, velocity, 0.0, MIRI_SPEED).unwrap();
+        assert!((start - from).abs() < 1e-9, "starts at {start}");
+        let dt = 1e-6;
+        let next = flick_offset(from, velocity, dt, MIRI_SPEED).unwrap();
+        let speed = (next - start) / dt;
+        assert!((speed - velocity).abs() < 1.0, "starts at {speed} pt/s");
+    }
+
+    #[test]
+    fn a_flick_settle_swings_a_little_past_and_lands() {
+        for velocity in [600.0, 3000.0, 8000.0] {
+            let (past, lands) = flick_path(-1000.0, velocity);
+            assert!(past > 5.0, "swings past at {velocity} pt/s, by {past}");
+            assert!(past < 20.0, "by under 2% at {velocity} pt/s, by {past}");
+            assert!(lands < 0.35, "lands at {velocity} pt/s after {lands} s");
+        }
+    }
+
+    #[test]
+    fn a_hard_flick_that_lands_close_swings_no_further() {
+        let (past, lands) = flick_path(-100.0, 20_000.0);
+        assert!(past < 2.0, "swings past by {past}");
+        assert!(lands < 0.35, "lands after {lands} s");
+    }
 
     #[test]
     fn the_curve_follows_a_critically_damped_spring() {

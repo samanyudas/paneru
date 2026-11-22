@@ -506,6 +506,9 @@ pub struct Scrolling {
     pub is_user_swiping: bool,
     /// Last time a physical swipe event was received.
     pub last_event: Duration,
+    /// When the fingers or the wheel last moved the strip. Unlike
+    /// `last_event`, a touch-down that continues the swipe leaves it.
+    pub moved_at: Duration,
     /// The kind of input driving the strip, which decides how long a pause
     /// in it counts as the fingers lifting.
     pub input: ScrollInput,
@@ -541,6 +544,11 @@ pub struct Scrolling {
     /// A touch-down soon after it, before the settle starts, continues this
     /// swipe; see `scroll::continues_swipe`.
     pub lifted_at: Option<Duration>,
+    /// Where the strip showed when fingers touched down on its settle, in
+    /// this frame. A settle's `position` is where the strip shows, so
+    /// `scroll::constrain` turns it into the finger travel that shows the
+    /// strip there, before the fingers' first movement.
+    pub caught: Option<f64>,
 }
 
 /// The progress of a settle along its ease. See `scroll::settle_strip`.
@@ -552,6 +560,10 @@ pub struct SettleEase {
     /// `ease::entry_for_speed`.
     pub start: f64,
     pub elapsed: f64,
+    /// The strip's speed at the lift, in points per second, when the
+    /// fingers flicked it toward its landing. The settle then follows
+    /// `ease::flick_offset`, which swings a little past the landing.
+    pub flick: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1655,6 +1667,7 @@ mod tests {
                     position: 0.0,
                     is_user_swiping: true,
                     last_event,
+                    moved_at: last_event,
                     input: super::ScrollInput::Gesture,
                     anchor: 0.0,
                     settle: None,
@@ -1666,6 +1679,7 @@ mod tests {
                     start: None,
                     fingers_down: false,
                     lifted_at: None,
+                    caught: None,
                 });
             }),
             "overlay must rerun to hide when Scrolling starts"
