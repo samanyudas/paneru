@@ -2,7 +2,7 @@
 //! photos themselves: one panel per showing slice, a photo when it first
 //! shows, and one every [`REFRESH`] while someone can see it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -61,6 +61,11 @@ const PHOTO_WAIT: Duration = Duration::from_millis(1500);
 /// Mac a new photo of a test window took 120 ms, and one of a Helium window
 /// that needed a lookup took 256 to 276 ms.
 const KEPT_WAIT: Duration = Duration::from_millis(750);
+
+/// How long a refresh photo may stay on its way before the next one starts
+/// anyway. A capture that has to look its window up first gives no answer
+/// when it is called off, and the queue must not wait for it forever.
+const QUEUED_TIMEOUT: Duration = Duration::from_millis(1000);
 
 pub(crate) fn register(app: &mut App) {
     app.init_resource::<SliceAccess>()
@@ -243,6 +248,15 @@ struct Renewal {
     _wanted: Wanted,
 }
 
+/// A refresh photo waiting for the one before it.
+#[derive(Debug)]
+struct Queued {
+    window: WinID,
+    slice: EdgeSlice,
+    generation: u32,
+    ticket: Ticket,
+}
+
 /// The showing slices, back to front, each with the slice its photo is of.
 #[derive(Resource, Default)]
 struct Slices {
@@ -262,6 +276,13 @@ struct Slices {
     /// The generation of the latest photo asked for, so a photo of an
     /// earlier ask is told apart.
     generation: u32,
+    /// The refresh's photos, started one at a time. `ScreenCaptureKit`
+    /// answers one capture at a time, so a photo the engine waits for, such
+    /// as a window's leaving the screen, would otherwise queue behind every
+    /// refresh photo (miri#502).
+    queued: VecDeque<Queued>,
+    /// The generation of the refresh photo on its way, and when it started.
+    in_flight: Option<(u32, Duration)>,
 }
 
 impl Slices {
@@ -330,6 +351,62 @@ fn ask(
     }
 }
 
+/// `ask`, for the refresh: the photo starts once the refresh photos before
+/// it have answered.
+fn ask_queued(
+    queued: &mut VecDeque<Queued>,
+    generation: &mut u32,
+    window: WinID,
+    slice: &EdgeSlice,
+    last: Option<Digest>,
+) -> SlicePhoto {
+    *generation = generation.wrapping_add(1);
+    let ticket = Ticket::default();
+    queued.push_back(Queued {
+        window,
+        slice: *slice,
+        generation: *generation,
+        ticket: ticket.clone(),
+    });
+    debug!("edge slice photo queued: window {window} generation {generation}");
+    SlicePhoto::Asked {
+        generation: *generation,
+        last,
+        kept_wait: None,
+        _wanted: Wanted(ticket),
+    }
+}
+
+/// Starts the next refresh photo unless one is on its way. A queued photo
+/// that the engine no longer wants is dropped.
+fn start_queued(screen: &mut dyn SliceScreen, slices: &mut Slices, now: Duration) {
+    if slices
+        .in_flight
+        .is_some_and(|(_, since)| now < since + QUEUED_TIMEOUT)
+    {
+        return;
+    }
+    slices.in_flight = None;
+    while let Some(next) = slices.queued.pop_front() {
+        if next.ticket.called_off() {
+            continue;
+        }
+        screen.photograph(
+            next.window,
+            &next.slice,
+            next.generation,
+            next.ticket,
+            Lookup::Reuse,
+        );
+        debug!(
+            "edge slice queued photo started: window {} generation {}",
+            next.window, next.generation
+        );
+        slices.in_flight = Some((next.generation, now));
+        return;
+    }
+}
+
 fn update_access(
     config: Res<Config>,
     mut access: ResMut<SliceAccess>,
@@ -379,6 +456,7 @@ fn present_slices(
         kept,
         renewing,
         generation,
+        ..
     } = &mut *slices;
     let showing = if *access == SliceAccess::On {
         kept.retain(|id, _| windows.iter().any(|(window, _)| window.id() == *id));
@@ -452,24 +530,23 @@ fn present_slices(
 }
 
 /// Photographs each shown slice again with its last lookup, unless no one
-/// can see its panel, and renews the kept photos of the windows in view.
+/// can see its panel, and renews the kept photos of the windows in view,
+/// one photo at a time.
 fn refresh_slices(
     mut slices: ResMut<Slices>,
     in_view: InView,
     next: NextToCross,
     access: Res<SliceAccess>,
+    time: Res<Time>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
     let Some(mut screen) = screen else {
         return;
     };
-    if *access == SliceAccess::On {
-        let next = next.find(&in_view);
-        renew_kept(screen.0.as_mut(), &mut slices, &in_view, &next);
-    }
     let Slices {
         showing,
         generation,
+        queued,
         ..
     } = &mut *slices;
     for (id, slice, photo) in showing.iter_mut() {
@@ -480,15 +557,14 @@ fn refresh_slices(
             debug!("edge slice photo skipped, panel unseen: window {id}");
             continue;
         }
-        *photo = ask(
-            screen.0.as_mut(),
-            generation,
-            *id,
-            slice,
-            Some(digest),
-            Lookup::Reuse,
-        );
+        *photo = ask_queued(queued, generation, *id, slice, Some(digest));
     }
+    // The panels someone sees go before the kept photos of windows in view.
+    if *access == SliceAccess::On {
+        let next = next.find(&in_view);
+        renew_kept(None, &mut slices, &in_view, &next);
+    }
+    start_queued(screen.0.as_mut(), &mut slices, time.elapsed());
 }
 
 /// Paints each photo that differs from the one its panel shows, and keeps it.
@@ -504,6 +580,7 @@ fn receive_photos(
     mut slices: ResMut<Slices>,
     mut access: ResMut<SliceAccess>,
     sliding: Query<(&Window, &Slide)>,
+    time: Res<Time>,
     screen: Option<NonSendMut<SliceScreenHandle>>,
 ) {
     let Some(mut screen) = screen else {
@@ -519,6 +596,12 @@ fn receive_photos(
         else {
             continue;
         };
+        if slices
+            .in_flight
+            .is_some_and(|(in_flight, _)| in_flight == *generation)
+        {
+            slices.in_flight = None;
+        }
         if receive_renewal(
             *window_id,
             *generation,
@@ -533,6 +616,7 @@ fn receive_photos(
             kept,
             renewing,
             generation: latest,
+            ..
         } = &mut *slices;
         let asked = showing
             .iter_mut()
@@ -619,6 +703,7 @@ fn receive_photos(
     if ended {
         screen.0.place(&slices.placed(), &slices.remembered());
     }
+    start_queued(screen.0.as_mut(), &mut slices, time.elapsed());
 }
 
 /// The windows that show themselves rather than a slice, and are not on
@@ -630,8 +715,10 @@ type InView<'w, 's> = Query<'w, 's, &'static Window, (Without<EdgeSlice>, Withou
 /// in `next`, which a swipe would carry past a shared edge first, gets its
 /// first photo if it has none, as after the engine starts with it tucked:
 /// past the edge it photographs blank.
+/// Asks for each photo at once on `screen`, or queues it behind the other
+/// refresh photos when `screen` is `None`.
 fn renew_kept(
-    screen: &mut dyn SliceScreen,
+    mut screen: Option<&mut dyn SliceScreen>,
     slices: &mut Slices,
     in_view: &InView,
     next: &[(WinID, EdgeSlice)],
@@ -641,6 +728,8 @@ fn renew_kept(
         kept,
         renewing,
         generation,
+        queued,
+        ..
     } = slices;
     for window in in_view {
         let id = window.id();
@@ -661,7 +750,17 @@ fn renew_kept(
         };
         *generation = generation.wrapping_add(1);
         let ticket = Ticket::default();
-        screen.photograph(id, &slice, *generation, ticket.clone(), Lookup::Reuse);
+        match screen.as_deref_mut() {
+            Some(screen) => {
+                screen.photograph(id, &slice, *generation, ticket.clone(), Lookup::Reuse);
+            }
+            None => queued.push_back(Queued {
+                window: id,
+                slice,
+                generation: *generation,
+                ticket: ticket.clone(),
+            }),
+        }
         debug!("edge slice kept photo renewing: window {id} generation {generation}");
         renewing.insert(
             id,
@@ -767,7 +866,7 @@ fn renew_kept_on_swipe(
         && let Some(mut screen) = screen
     {
         let next = next.find(&in_view);
-        renew_kept(screen.0.as_mut(), &mut slices, &in_view, &next);
+        renew_kept(Some(screen.0.as_mut()), &mut slices, &in_view, &next);
     }
     *was_swiping = swiping;
 }
