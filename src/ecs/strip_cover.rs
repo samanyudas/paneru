@@ -343,6 +343,7 @@ fn cover_enabled(config: &Config) -> bool {
         && config.options().animation_speed.is_some()
         && duration.is_finite()
         && duration <= LONGEST_SLIDE
+        && ease::animates(duration)
 }
 
 /// Keeps each picture that arrives for the ask it answers.
@@ -622,10 +623,13 @@ fn cover_strip_moves(
                 || (strip.is_changed() && !strip.is_added());
             if aborted {
                 debug!("cover over strip {entity} ended early");
-                if slide.landing.is_none() && shown_here {
+                // A strip moved to another display keeps where that display
+                // put it.
+                if slide.landing.is_none() && shown_here && display.id() == slide.display {
                     position.0 = slide.target;
                     spawn_snap_strip_guard(entity, &mut commands);
                 }
+                end_guard(slide.guard.take(), &mut commands);
                 screen.0.hide(slide.display);
                 commands.entity(entity).remove::<CoverSlide>();
                 continue;
@@ -657,6 +661,7 @@ fn cover_strip_moves(
                 // The pictures have landed: the real windows follow in one
                 // step under the cover.
                 position.0 = slide.target;
+                end_guard(slide.guard.take(), &mut commands);
                 slide.guard = Some(spawn_snap_strip_guard(entity, &mut commands));
                 screen.0.track(slide.display, f64::from(slide.target.x));
                 slide.landing = Some((time.elapsed() + LANDING_TIMEOUT, 0));
@@ -779,20 +784,39 @@ fn lift_covers(
 }
 
 /// Takes down any cover that no strip move or swipe holds up any more, as
-/// when its strip or display went away mid-move.
+/// when its strip or display went away mid-move. A move whose strip left
+/// the cover's display ends there too.
 fn drop_orphan_covers(
-    slides: Query<&CoverSlide>,
-    swipes: Query<&CoverSwipe>,
+    slides: Query<(Entity, &CoverSlide, Option<&ChildOf>)>,
+    swipes: Query<(Entity, &CoverSwipe, Option<&ChildOf>)>,
+    displays: Query<&Display>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
+    mut commands: Commands,
 ) {
     let Some(mut screen) = screen else {
         return;
     };
-    let held = slides
-        .iter()
-        .map(|slide| slide.display)
-        .chain(swipes.iter().map(|swipe| swipe.display))
-        .collect::<Vec<_>>();
+    let on = |child: Option<&ChildOf>, display: CGDirectDisplayID| {
+        child
+            .and_then(|child| displays.get(child.parent()).ok())
+            .is_some_and(|parent| parent.id() == display)
+    };
+    let mut held = Vec::new();
+    for (entity, slide, child) in &slides {
+        if on(child, slide.display) {
+            held.push(slide.display);
+        } else {
+            end_guard(slide.guard, &mut commands);
+            commands.entity(entity).remove::<CoverSlide>();
+        }
+    }
+    for (entity, swipe, child) in &swipes {
+        if on(child, swipe.display) {
+            held.push(swipe.display);
+        } else {
+            commands.entity(entity).remove::<CoverSwipe>().insert(Moved);
+        }
+    }
     for id in screen.0.shown() {
         if !held.contains(&id) {
             debug!("cover on display {id} had no move, taken down");

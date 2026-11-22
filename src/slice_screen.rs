@@ -143,6 +143,7 @@ impl SliceScreenOS {
                         on_screen: panel.slice.on_screen,
                         in_window: panel.slice.in_window,
                         side: panel.slice.side,
+                        cover: false,
                     })
                 })
                 .collect(),

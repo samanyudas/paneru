@@ -490,3 +490,34 @@ fn the_landing_snap_guard_ends_with_the_cover() {
         .count();
     assert_eq!(guards, 0, "no snap guard outlives the cover");
 }
+
+/// A strip that loses its display mid-slide lets its cover go.
+#[test]
+fn a_strip_that_loses_its_display_lets_its_cover_go() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    assert!(covered(harness.world()));
+    let strips = harness
+        .world()
+        .query_filtered::<Entity, With<CoverSlide>>()
+        .iter(harness.world())
+        .collect::<Vec<_>>();
+    for strip in strips {
+        harness.world().entity_mut(strip).remove::<ChildOf>();
+    }
+    harness.advance(ONE_FRAME);
+    assert!(!covered(harness.world()), "the move ends");
+    assert_eq!(log.borrow().hidden, 1, "the cover comes down");
+}
+
+/// A speed so fast that windows move in one step plays no cover.
+#[test]
+fn an_instant_animation_speed_gets_no_cover() {
+    let (mut harness, log) = harness(config(true, Some(1000.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME * 3);
+    assert!(log.borrow().shown.is_empty(), "no cover");
+}

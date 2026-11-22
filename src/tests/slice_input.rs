@@ -70,6 +70,7 @@ impl Desk {
                 on_screen: slice.on_screen,
                 in_window: slice.in_window,
                 side: slice.side,
+                cover: false,
             },
             tap: SliceTap::default(),
             reached: Vec::new(),
@@ -754,6 +755,7 @@ fn the_tap_lets_through_only_the_posted_press_it_waits_for() {
         on_screen: IRect::new(1019, 20, 1024, 200),
         in_window: IRect::new(395, 0, 400, 180),
         side: Side::West,
+        cover: false,
     };
     let user = |mouse, x, y, panel| Pointer {
         mouse,
@@ -809,6 +811,7 @@ fn west_panel() -> SlicePanel {
         on_screen: IRect::new(1019, 20, 1024, 200),
         in_window: IRect::new(395, 0, 400, 180),
         side: Side::West,
+        cover: false,
     }
 }
 
@@ -991,4 +994,46 @@ fn a_click_released_after_its_press_was_posted_reaches_the_app_where_the_press_d
             released_at.y
         );
     }
+}
+
+/// A press on a cover picture lands at its exact point in the window, even
+/// at the window's edge, and a scroll over a cover picture reaches the
+/// engine, which may be scrolling the strip under it.
+#[test]
+fn a_cover_picture_keeps_the_exact_point_and_lets_scrolls_through() {
+    let press = SlicePress {
+        id: 1,
+        window_id: 42,
+        at: CGPoint::new(395.0, 10.0),
+        side: Side::West,
+        exact: true,
+        button: MouseButton::Left,
+        flags: objc2_core_graphics::CGEventFlags::empty(),
+    };
+    let shown = IRect::new(100, 20, 500, 200);
+    assert_eq!(press.point_in(shown), CGPoint::new(495.0, 30.0));
+    let inset = SlicePress {
+        exact: false,
+        ..press
+    };
+    assert!(
+        inset.point_in(shown).x < 495.0,
+        "an edge slice keeps its inset"
+    );
+
+    let mut tap = SliceTap::default();
+    let cover = SlicePanel {
+        cover: true,
+        ..west_panel()
+    };
+    let scroll = |panel| Pointer {
+        mouse: Mouse::Scrolled,
+        point: CGPoint::new(1020.0, 50.0),
+        flags: objc2_core_graphics::CGEventFlags::empty(),
+        time: Duration::ZERO,
+        tag: None,
+        panel: Some(panel),
+    };
+    assert_eq!(tap.handle(&scroll(cover)), Verdict::Pass);
+    assert_eq!(tap.handle(&scroll(west_panel())), Verdict::Swallow);
 }

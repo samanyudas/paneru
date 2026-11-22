@@ -48,6 +48,9 @@ pub(crate) struct SlicePanel {
     /// shown frame.
     pub in_window: IRect,
     pub side: Side,
+    /// A picture on a strip cover: a scroll over it reaches the engine, and
+    /// a press on it lands at its exact point in the window.
+    pub cover: bool,
 }
 
 impl SlicePanel {
@@ -86,14 +89,17 @@ pub(crate) fn is_slice_panel(window: WinID) -> bool {
 /// The panel that a press at `point` would reach, as the window server
 /// decides it.
 fn panel_at(point: CGPoint) -> Option<SlicePanel> {
-    let (slices, covers) = (SLICE_PANELS.load(), COVER_PANELS.load());
+    let mtm = MainThreadMarker::new()?;
+    // The cover pictures where Core Animation shows them now, which can be
+    // ahead of what the engine last published.
+    let covers = crate::cover_screen::live_cover_panels(mtm);
+    let slices = SLICE_PANELS.load();
     let mut panels = slices
         .iter()
         .chain(covers.iter())
         .filter(|panel| panel.contains(point))
         .peekable();
     panels.peek()?;
-    let mtm = MainThreadMarker::new()?;
     let hit = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(
         NSPoint::new(point.x, primary_screen_height(mtm) - point.y),
         0,
@@ -116,6 +122,9 @@ pub(crate) struct SlicePress {
     /// shown frame.
     pub at: CGPoint,
     pub side: Side,
+    /// Lands at `at` exactly, with no inset from an edge, as a press on a
+    /// cover picture does.
+    pub exact: bool,
     pub button: MouseButton,
     pub flags: CGEventFlags,
 }
@@ -129,6 +138,7 @@ impl SlicePress {
         let inset = EDGE_INSET.min((max - min) / 2.0);
         let x = min + self.at.x;
         let x = match self.side {
+            _ if self.exact => x,
             Side::West => x.min(max - inset),
             Side::East => x.max(min + inset),
         };
@@ -371,7 +381,9 @@ impl SliceTap {
                 self.passing(pointer, passed)
             }
             (Mouse::Moved, _) if pointer.panel.is_some() => Verdict::Quiet,
-            (Mouse::Scrolled, _) if pointer.panel.is_some() => Verdict::Swallow,
+            (Mouse::Scrolled, _) if pointer.panel.is_some_and(|panel| !panel.cover) => {
+                Verdict::Swallow
+            }
             _ => Verdict::Pass,
         }
     }
@@ -424,6 +436,7 @@ impl SliceTap {
                 y - f64::from(panel.on_screen.min.y) + f64::from(panel.in_window.min.y),
             ),
             side: panel.side,
+            exact: panel.cover,
             button,
             flags: pointer.flags,
         })

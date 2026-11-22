@@ -34,6 +34,48 @@ use crate::types::commands::Side;
 /// replaces the one before it.
 const SLIDE_KEY: &str = "slide";
 
+/// A shown cover, as the event tap needs it on the main thread: its window,
+/// its viewport, its strip layer, and each picture's frame from the strip
+/// origin, back to front.
+struct LiveCover {
+    panel: WinID,
+    viewport: IRect,
+    strip_y: i32,
+    strip: Retained<CALayer>,
+    pictures: Vec<(WinID, IRect)>,
+}
+
+thread_local! {
+    static LIVE_COVERS: std::cell::RefCell<Vec<LiveCover>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The pictures of every shown cover, as panels of their windows, where
+/// Core Animation shows them now, the front one first. The event tap asks on
+/// the main thread when a press or a scroll arrives.
+pub(crate) fn live_cover_panels(_mtm: MainThreadMarker) -> Vec<SlicePanel> {
+    LIVE_COVERS.with(|live| {
+        live.borrow()
+            .iter()
+            .flat_map(|cover| {
+                // SAFETY: a plain read of the layer Core Animation shows now.
+                let shown = unsafe { cover.strip.presentationLayer() }
+                    .unwrap_or_else(|| cover.strip.clone());
+                #[allow(clippy::cast_possible_truncation)]
+                let x = (shown.position().x + f64::from(cover.viewport.min.x)).round() as i32;
+                cover_panels(
+                    cover.panel,
+                    cover.viewport,
+                    IVec2::new(x, cover.strip_y),
+                    &cover.pictures,
+                )
+                .into_iter()
+                .rev()
+            })
+            .collect()
+    })
+}
+
 pub struct CoverScreenOS {
     mtm: MainThreadMarker,
     events: EventSender,
@@ -163,8 +205,26 @@ impl CoverScreenOS {
         layer
     }
 
-    /// Tells the event tap where every shown cover's pictures are.
+    /// Tells the event tap where every shown cover's pictures are: the
+    /// live layers for presses and scrolls, and the last known places for
+    /// the window lookups off the main thread.
     fn publish_panels(&self) {
+        LIVE_COVERS.with(|live| {
+            *live.borrow_mut() = self
+                .covers
+                .values()
+                .filter(|cover| cover.shown)
+                .filter_map(|cover| {
+                    Some(LiveCover {
+                        panel: WinID::try_from(cover.window.windowNumber()).ok()?,
+                        viewport: cover.viewport,
+                        strip_y: cover.at.y,
+                        strip: cover.strip.clone(),
+                        pictures: cover.pictures.clone(),
+                    })
+                })
+                .collect();
+        });
         set_cover_panels(
             self.covers
                 .values()
@@ -528,6 +588,7 @@ pub(crate) fn cover_panels(
                     on_screen.max - frame.min,
                 ),
                 side: Side::West,
+                cover: true,
             })
         })
         .collect()
