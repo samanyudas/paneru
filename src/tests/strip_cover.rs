@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use bevy::math::IVec2;
+use bevy::math::{IRect, IVec2};
 use bevy::prelude::*;
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{
@@ -41,6 +41,10 @@ struct Screen {
     placed: Vec<f64>,
     /// Where Core Animation shows the cover's strip, if the test says.
     showing: Option<f64>,
+    /// Each window's frame where its picture starts and where it heads, for
+    /// each morph.
+    morphs: Vec<Vec<(WinID, IRect, IRect)>>,
+    fades: usize,
     hidden: usize,
 }
 
@@ -88,6 +92,21 @@ impl CoverScreen for RecordingScreen {
     fn slide(&mut self, _display: CGDirectDisplayID, path: &[f64], _step: f64) {
         let (first, last) = (path[0], *path.last().unwrap());
         self.0.borrow_mut().slides.push((first, last));
+    }
+
+    fn morph(
+        &mut self,
+        _display: CGDirectDisplayID,
+        frames: &[(WinID, IRect, IRect)],
+        shares: &[f64],
+        _step: f64,
+    ) {
+        assert_eq!(shares.last(), Some(&1.0), "a morph ends where it heads");
+        self.0.borrow_mut().morphs.push(frames.to_vec());
+    }
+
+    fn fade(&mut self, _display: CGDirectDisplayID, _seconds: f64) {
+        self.0.borrow_mut().fades += 1;
     }
 
     fn track(&mut self, _display: CGDirectDisplayID, x: f64) {
@@ -678,4 +697,222 @@ fn a_swap_is_not_covered() {
     );
     harness.advance(ONE_FRAME);
     assert!(log.borrow().shown.is_empty(), "no cover for a swap");
+}
+
+/// The cover's config with three column widths to cycle through: half,
+/// three quarters, and the whole display.
+fn resize_config() -> Config {
+    (
+        MainOptions {
+            slide_window_pictures: Some(true),
+            animation_speed: Some(14.0),
+            preset_column_widths: vec![0.5, 0.75, 1.0],
+            ..MainOptions::default()
+        },
+        vec![],
+    )
+        .into()
+}
+
+fn resize(direction: crate::types::commands::ResizeDirection) -> Event {
+    Event::Command {
+        command: Command::Window(Operation::Resize(direction)),
+    }
+}
+
+fn window_frame(world: &mut World, id: WinID) -> IRect {
+    let mut query = world.query::<&Window>();
+    query
+        .iter(world)
+        .find(|window| window.id() == id)
+        .expect("window not found")
+        .frame()
+}
+
+fn morphed(world: &mut World) -> bool {
+    world
+        .query::<&crate::ecs::strip_cover::CoverMorph>()
+        .iter(world)
+        .next()
+        .is_some()
+}
+
+/// Steps one frame at a time until the resize's cover is gone, and returns
+/// every frame windows `ids` showed on the way, each window's apart.
+fn frames_of(harness: &mut TestHarness, ids: &[WinID]) -> Vec<Vec<IRect>> {
+    let mut paths = ids
+        .iter()
+        .map(|id| vec![window_frame(harness.world(), *id)])
+        .collect::<Vec<_>>();
+    for _ in 0..100 {
+        harness.advance(ONE_FRAME);
+        for (path, id) in paths.iter_mut().zip(ids) {
+            let frame = window_frame(harness.world(), *id);
+            if path.last() != Some(&frame) {
+                path.push(frame);
+            }
+        }
+        if !morphed(harness.world()) {
+            harness.advance(SETTLE);
+            return paths;
+        }
+    }
+    panic!("the resize ends");
+}
+
+/// The frame a morph moves window `id`'s picture from and to.
+fn morph_of(log: &ScreenLog, morph: usize, id: WinID) -> (IRect, IRect) {
+    let screen = log.borrow();
+    let (_, from, to) = screen.morphs[morph]
+        .iter()
+        .find(|(window, ..)| *window == id)
+        .copied()
+        .expect("the window's picture is in the morph");
+    (from, to)
+}
+
+/// With pictures ready, a resize moves each picture from its window's old
+/// frame to its new one, gaps kept, while each real window takes its new
+/// frame once, under the cover. The cover then fades out and comes down.
+#[test]
+fn a_resize_morphs_the_pictures_and_moves_each_window_once() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    take_pictures(&mut harness, &log);
+    let before = [0, 1].map(|id| window_frame(harness.world(), id));
+
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "the resize is under a cover");
+    assert_eq!(log.borrow().shown.len(), 1, "one cover goes up");
+    assert_eq!(log.borrow().morphs.len(), 1, "one morph");
+    assert_eq!(log.borrow().morphs[0].len(), 4, "a picture of each window");
+    let (from0, to0) = morph_of(&log, 0, 0);
+    let (from1, to1) = morph_of(&log, 0, 1);
+    assert_eq!(
+        [from0, from1],
+        before,
+        "the pictures start where the windows rest"
+    );
+    assert_ne!(
+        to0.width(),
+        from0.width(),
+        "the focused window changes width"
+    );
+    assert_eq!(to1.width(), from1.width(), "its neighbor keeps its width");
+    assert_eq!(
+        to1.min.x - to0.max.x,
+        from1.min.x - from0.max.x,
+        "the gap between them holds"
+    );
+
+    assert_eq!(
+        [0, 1].map(|id| window_frame(harness.world(), id)),
+        [to0, to1],
+        "the real windows take their new frames at once, under the cover"
+    );
+    let paths = frames_of(&mut harness, &[0, 1]);
+    assert_eq!(paths[0], vec![to0], "the resized window changes once");
+    assert_eq!(paths[1], vec![to1], "its neighbor moves once");
+    assert_eq!(log.borrow().fades, 1, "the cover fades out");
+    assert_eq!(log.borrow().hidden, 1, "and comes down");
+}
+
+/// Without pictures, a resize moves the real windows as before, through the
+/// frames between.
+#[test]
+fn without_pictures_a_resize_moves_the_windows_as_before() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    send(&mut harness, resize(ResizeDirection::Grow));
+    let mut widths = vec![window_frame(harness.world(), 0).width()];
+    for _ in 0..30 {
+        harness.advance(ONE_FRAME);
+        let width = window_frame(harness.world(), 0).width();
+        if widths.last() != Some(&width) {
+            widths.push(width);
+        }
+    }
+    assert!(log.borrow().morphs.is_empty(), "no cover");
+    assert!(widths.len() > 2, "the window eases through {widths:?}");
+}
+
+/// A second resize while the first one's pictures move turns them from
+/// where they show to the new frames, on the same cover, and the real
+/// windows go to the new frames at once.
+#[test]
+fn a_second_resize_turns_the_morph() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    take_pictures(&mut harness, &log);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME * 3);
+    assert!(morphed(harness.world()));
+    let (first_from, first_to) = morph_of(&log, 0, 0);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().shown.len(), 1, "the same cover stays up");
+    assert_eq!(log.borrow().morphs.len(), 2, "the morph turns");
+    let (from, to) = morph_of(&log, 1, 0);
+    assert!(
+        from.width() > first_from.width() && from.width() < first_to.width(),
+        "the turn starts where the picture shows: {from:?}"
+    );
+    assert_ne!(to, first_to, "and heads to the new frame");
+    let paths = frames_of(&mut harness, &[0]);
+    assert_eq!(
+        *paths[0].last().unwrap(),
+        to,
+        "the window ends where its picture does"
+    );
+    assert_eq!(log.borrow().fades, 1);
+}
+
+/// A focus key while a resize's pictures move turns them on the same cover
+/// to where the strip now heads, and the real windows go there at once.
+#[test]
+fn a_focus_key_mid_resize_turns_the_morph() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    take_pictures(&mut harness, &log);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME * 3);
+    let (_, first_to) = morph_of(&log, 0, 1);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().shown.len(), 1, "the same cover stays up");
+    assert!(log.borrow().slides.is_empty(), "no strip slide starts over it");
+    assert_eq!(log.borrow().morphs.len(), 2, "the morph turns");
+    let (_, to) = morph_of(&log, 1, 1);
+    assert!(to.min.x < first_to.min.x, "the strip heads east: {to:?}");
+    let paths = frames_of(&mut harness, &[1]);
+    assert_eq!(*paths[0].last().unwrap(), to);
+}
+
+/// A resize of a column of stacked windows resizes every window of the
+/// column, so each one's picture stretches together.
+#[test]
+fn a_stacked_column_resize_morphs_every_window_of_it() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    harness.run(vec![
+        focus(Direction::East),
+        Event::Command {
+            command: Command::Window(Operation::Stack(crate::commands::Side::West)),
+        },
+        focus(Direction::First),
+    ]);
+    harness.advance(SETTLE);
+    take_pictures(&mut harness, &log);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().morphs.len(), 1, "the resize is under a cover");
+    let (from0, to0) = morph_of(&log, 0, 0);
+    let (from1, to1) = morph_of(&log, 0, 1);
+    assert_eq!(from0.min.x, from1.min.x, "the two share a column");
+    assert_eq!(to0.width(), to1.width(), "and both take the new width");
+    assert_ne!(to0.width(), from0.width());
+    let paths = frames_of(&mut harness, &[0, 1]);
+    assert_eq!(paths[0], vec![to0], "each window changes once");
+    assert_eq!(paths[1], vec![to1]);
 }
