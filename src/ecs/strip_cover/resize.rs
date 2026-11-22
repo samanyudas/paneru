@@ -101,6 +101,9 @@ pub(crate) struct CoverMorph {
     /// edge padding.
     area: IRect,
     frames: Vec<Reframe>,
+    /// Every window whose frame met `area` at any start or turn of the
+    /// morph: the window server may still show it there.
+    hid: Vec<Entity>,
     /// Where the morph entered the curve, as a share of its time, how long it
     /// has run in animation time, and how long the whole curve lasts.
     entry: f64,
@@ -115,6 +118,17 @@ pub(crate) struct CoverMorph {
 }
 
 impl CoverMorph {
+    /// Adds each window whose frame, before or after, meets the cover's
+    /// area to the ones it hid.
+    fn note_hidden(&mut self) {
+        for frame in &self.frames {
+            let meets = |rect: IRect| !rect.intersect(self.area).is_empty();
+            if (meets(frame.from) || meets(frame.to)) && !self.hid.contains(&frame.entity) {
+                self.hid.push(frame.entity);
+            }
+        }
+    }
+
     pub(super) fn display(&self) -> CGDirectDisplayID {
         self.display
     }
@@ -424,6 +438,7 @@ pub(super) fn cover_resizes(
                         to,
                     })
                     .collect();
+                morph.note_hidden();
                 morph.entry = entry;
                 morph.elapsed = 0.0;
                 morph.counted = 0.0;
@@ -543,6 +558,7 @@ pub(super) fn cover_resizes(
             viewport,
             area,
             frames,
+            hid: Vec::new(),
             entry: 0.0,
             elapsed: 0.0,
             duration,
@@ -613,12 +629,7 @@ fn shows_committed(
             let (found, position, bounds) = frames.get(window.entity).ok()?;
             let cell = IRect::from_corners(position.0, position.0 + bounds.0);
             let frame = found.margins().shown(cell);
-            let was = morph
-                .frames
-                .iter()
-                .find(|reframe| reframe.entity == window.entity)
-                .map(|reframe| reframe.from);
-            (hidden(frame) || was.is_some_and(hidden)).then_some((found.id(), frame))
+            (hidden(frame) || morph.hid.contains(&window.entity)).then_some((found.id(), frame))
         })
         .collect::<Vec<_>>();
     let ids = committed.iter().map(|(id, _)| *id).collect::<Vec<_>>();
