@@ -39,6 +39,8 @@ struct Screen {
     tracked: Vec<f64>,
     /// Each strip x a swipe put the cover's strip at.
     placed: Vec<f64>,
+    /// Where Core Animation shows the cover's strip, if the test says.
+    showing: Option<f64>,
     hidden: usize,
 }
 
@@ -97,7 +99,7 @@ impl CoverScreen for RecordingScreen {
     }
 
     fn showing(&self, _display: CGDirectDisplayID) -> Option<f64> {
-        None
+        self.0.borrow().showing
     }
 
     fn shown(&self) -> Vec<CGDirectDisplayID> {
@@ -520,4 +522,23 @@ fn an_instant_animation_speed_gets_no_cover() {
     send(&mut harness, focus(Direction::East));
     harness.advance(ONE_FRAME * 3);
     assert!(log.borrow().shown.is_empty(), "no cover");
+}
+
+/// The slide follows what Core Animation shows: when the pictures have
+/// already landed there, as after the engine stalled, the real windows land
+/// without waiting out the engine's own count of the slide.
+#[test]
+fn the_landing_follows_the_pictures_on_screen() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    assert!(covered(harness.world()));
+    log.borrow_mut().showing = Some(f64::from(-STEP));
+    harness.advance(ONE_FRAME * 3);
+    assert_eq!(
+        window_x(harness.world(), 1),
+        700 - STEP,
+        "the windows land once the pictures show landed"
+    );
 }
