@@ -642,7 +642,13 @@ fn cover_strip_moves(
                     // is where the screen shows it: a turn and the landing
                     // follow the screen.
                     Some(showing) if slide.counted < slide.length() + SHOWN_GRACE => {
-                        slide.elapsed = slide.phase_of(showing);
+                        // Within half a point of the target, the slide shows
+                        // landed, whatever rounding is left in the sample.
+                        slide.elapsed = if (showing - f64::from(slide.target.x)).abs() < 0.5 {
+                            slide.length()
+                        } else {
+                            slide.phase_of(showing)
+                        };
                         showing
                     }
                     _ => {
@@ -658,8 +664,14 @@ fn cover_strip_moves(
             // Anything but a new target for the strip ends the cover: the
             // windows go where the slide headed, at once. A strip no longer
             // shown keeps where the workspace switch put it.
+            // A display or a Dock that changes under the slide ends it too,
+            // even when the strip's layout stays the same.
+            let same_place = display.id() == slide.display
+                && display.bounds() == slide.bounds
+                && viewport == slide.viewport;
             let aborted = !cover_enabled(&config)
                 || !shown_here
+                || !same_place
                 || scrolling
                 || dragging
                 || (strip.is_changed() && !strip.is_added());
@@ -667,9 +679,6 @@ fn cover_strip_moves(
                 debug!("cover over strip {entity} ended early");
                 // A strip moved to another display keeps where that display
                 // put it.
-                let same_place = display.id() == slide.display
-                    && display.bounds() == slide.bounds
-                    && viewport == slide.viewport;
                 if slide.landing.is_none() && shown_here {
                     if same_place {
                         position.0 = slide.target;

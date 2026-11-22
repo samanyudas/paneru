@@ -555,7 +555,8 @@ fn the_windows_wait_while_the_pictures_still_move() {
     harness.advance(ONE_FRAME * 15);
     assert!(covered(harness.world()), "still sliding on screen");
     assert_eq!(window_x(harness.world(), 1), 700, "the window waits");
-    log.borrow_mut().showing = Some(f64::from(-STEP));
+    // A sample a hair off the target, as Core Animation can report.
+    log.borrow_mut().showing = Some(f64::from(-STEP) + 1e-6);
     harness.advance(ONE_FRAME * 3);
     assert_eq!(window_x(harness.world(), 1), 700 - STEP, "then lands");
 }
