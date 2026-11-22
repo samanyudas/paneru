@@ -600,3 +600,82 @@ fn a_key_during_a_covered_swipe_ends_the_cover() {
     harness.advance(SETTLE);
     assert!(!covered(harness.world()));
 }
+
+/// A focus move into a column of stacked windows goes under the cover too.
+#[test]
+fn a_move_into_a_stack_is_covered() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    harness.run(vec![
+        focus(Direction::Last),
+        Event::Command {
+            command: Command::Window(Operation::Stack(crate::commands::Side::West)),
+        },
+        focus(Direction::First),
+    ]);
+    harness.advance(SETTLE);
+    take_pictures(&mut harness, &log);
+    let before = log.borrow().shown.len();
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    harness.advance(SETTLE);
+    send(&mut harness, focus(Direction::West));
+    harness.advance(ONE_FRAME);
+    assert!(
+        log.borrow().shown.len() > before,
+        "moves around a stack go under the cover"
+    );
+}
+
+/// Marks the strip changed without changing its layout, as some systems do
+/// when they take it mutably.
+fn touch_strip(harness: &mut TestHarness) {
+    let strips = harness
+        .world()
+        .query_filtered::<Entity, With<crate::ecs::layout::LayoutStrip>>()
+        .iter(harness.world())
+        .collect::<Vec<_>>();
+    for strip in strips {
+        harness
+            .world()
+            .get_mut::<crate::ecs::layout::LayoutStrip>(strip)
+            .unwrap()
+            .set_changed();
+    }
+}
+
+/// A system that only touches the strip, as on Sam's Mac with every focus
+/// key, neither keeps a move from its cover nor ends a slide early: only a
+/// change to the layout does.
+#[test]
+fn touching_the_strip_without_changing_its_layout_keeps_the_cover() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    touch_strip(&mut harness);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().shown.len(), 1, "the move is under the cover");
+    touch_strip(&mut harness);
+    harness.advance(ONE_FRAME);
+    assert!(covered(harness.world()), "the slide goes on");
+    let path = path_of(&mut harness, 1);
+    assert_eq!(path, vec![700, 700 - STEP], "the window moves once");
+}
+
+/// A move whose layout changes in the same pass, as a swap does, moves the
+/// real windows as before: the pictures would show the windows where the
+/// layout now puts them, not where they are.
+#[test]
+fn a_swap_is_not_covered() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(
+        &mut harness,
+        Event::Command {
+            command: Command::Window(Operation::Swap(Direction::East)),
+        },
+    );
+    harness.advance(ONE_FRAME);
+    assert!(log.borrow().shown.is_empty(), "no cover for a swap");
+}

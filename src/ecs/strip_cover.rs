@@ -19,6 +19,7 @@
 //! moves the real windows as before.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::time::Duration;
 
 use bevy::app::{App, PostUpdate, Update};
@@ -279,6 +280,8 @@ pub(crate) struct CoverSlide {
     /// Animation cannot tell where it shows: the landing waits at most
     /// [`SHOWN_GRACE`] past the slide's length for the screen.
     counted: f64,
+    /// The strip's layout when the slide began, as [`layout_print`] gives it.
+    layout: u64,
 }
 
 impl CoverSlide {
@@ -357,10 +360,13 @@ pub(crate) struct CoverSwipe {
     /// The display's bounds and the strip's viewport when the swipe began.
     bounds: IRect,
     viewport: IRect,
+    /// The strip's layout when the swipe began, as [`layout_print`] gives it.
+    layout: u64,
 }
 
 pub(crate) fn register(app: &mut App) {
     app.init_resource::<CoverPhotos>()
+        .init_resource::<StripLayouts>()
         .add_systems(
             Update,
             keep_cover_photos
@@ -369,7 +375,12 @@ pub(crate) fn register(app: &mut App) {
         )
         .add_systems(
             Update,
-            (cover_strip_moves, cover_swipes, mark_moved)
+            (
+                cover_strip_moves,
+                cover_swipes,
+                mark_moved,
+                remember_layouts,
+            )
                 .chain()
                 .in_set(UpdateSet::Layout)
                 .after(ensure_visible_in_strip)
@@ -606,6 +617,36 @@ fn cover_scene<'a>(
     })
 }
 
+/// A digest of `strip`'s layout: its tiled windows and the frames they show
+/// from the strip's origin. Two prints differ when a window joins, leaves,
+/// moves, or resizes in the layout, not when a system only touches the
+/// strip.
+fn layout_print(strip: &LayoutStrip, windows: &CoverWindows) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for window in strip_windows(strip, windows) {
+        window.entity.to_bits().hash(&mut hasher);
+        (window.frame.min, window.frame.max).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Each strip's [`layout_print`] at the end of the last pass, so a move can
+/// tell whether its strip's layout changed in this pass.
+#[derive(Resource, Debug, Default)]
+pub(crate) struct StripLayouts(HashMap<Entity, u64>);
+
+/// Remembers each strip's layout for the next pass.
+fn remember_layouts(
+    strips: Query<(Entity, &LayoutStrip)>,
+    windows: CoverWindows,
+    mut layouts: ResMut<StripLayouts>,
+) {
+    layouts.0 = strips
+        .iter()
+        .map(|(entity, strip)| (entity, layout_print(strip, &windows)))
+        .collect();
+}
+
 /// Ends a snap guard that a landing spawned, once the cover lifts, so a
 /// later layout change animates again.
 fn end_guard(guard: Option<Entity>, commands: &mut Commands) {
@@ -647,6 +688,7 @@ fn cover_strip_moves(
     time: Res<Time>,
     step: Res<AnimationStep>,
     mission_control: Res<MissionControlActive>,
+    layouts: Res<StripLayouts>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
     mut commands: Commands,
 ) {
@@ -719,7 +761,7 @@ fn cover_strip_moves(
                 || dragging
                 || mission_control.0
                 || turns_height
-                || (strip.is_changed() && !strip.is_added());
+                || layout_print(&strip, &windows) != slide.layout;
             if aborted {
                 debug!("cover over strip {entity} ended early");
                 // A strip moved to another display keeps where that display
@@ -760,7 +802,7 @@ fn cover_strip_moves(
                 } else {
                     0.0
                 };
-                let guard = slide.guard;
+                let (guard, layout) = (slide.guard, slide.layout);
                 *slide = start_slide(
                     slide.display,
                     (slide.bounds, slide.viewport),
@@ -770,6 +812,7 @@ fn cover_strip_moves(
                     &config,
                 );
                 slide.guard = guard;
+                slide.layout = layout;
                 screen.0.slide(slide.display, &slide.path(), PATH_STEP);
                 debug!("cover over strip {entity} turned to {}", target.x);
                 commands.entity(entity).remove::<RepositionMarker>();
@@ -808,7 +851,9 @@ fn cover_strip_moves(
             Some("drag")
         } else if target.y != position.0.y {
             Some("vertical move")
-        } else if strip.is_changed() && !strip.is_added() {
+        } else if layouts.0.get(&entity) != Some(&layout_print(&strip, &windows)) {
+            // A layout that changed in this pass shows its windows where
+            // they were, not where the pictures would put them.
             Some("layout changed")
         } else {
             None
@@ -835,7 +880,7 @@ fn cover_strip_moves(
         let pictures = scene.pictures.len();
         screen.0.show(&scene);
         started.push(display.id());
-        let slide = start_slide(
+        let mut slide = start_slide(
             display.id(),
             (display.bounds(), viewport),
             f64::from(from),
@@ -843,6 +888,7 @@ fn cover_strip_moves(
             target,
             &config,
         );
+        slide.layout = layout_print(&strip, &windows);
         screen.0.slide(display.id(), &slide.path(), PATH_STEP);
         screen.0.track(display.id(), f64::from(from));
         debug!(
@@ -880,6 +926,7 @@ fn start_slide(
         bounds,
         viewport,
         counted: 0.0,
+        layout: 0,
     }
 }
 
@@ -996,6 +1043,7 @@ fn cover_swipes(
     config: Res<Config>,
     time: Res<Time>,
     mission_control: Res<MissionControlActive>,
+    layouts: Res<StripLayouts>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
     mut commands: Commands,
 ) {
@@ -1032,7 +1080,7 @@ fn cover_swipes(
                 || moved
                 || dragging
                 || mission_control.0
-                || (strip.is_changed() && !strip.is_added());
+                || layout_print(&strip, &windows) != swipe.layout;
             if aborted || scrolling.is_none() {
                 // The swipe has landed, or the cover cannot stay: the real
                 // windows take their places in one step.
@@ -1058,6 +1106,7 @@ fn cover_swipes(
                         bounds: display.bounds(),
                         viewport: display.actual_display_bounds(dock, &config),
                         counted: 0.0,
+                        layout: swipe.layout,
                     });
                     let x = position.0.x;
                     debug!("cover over swiped strip {entity} landed at {x}");
@@ -1077,6 +1126,7 @@ fn cover_swipes(
             || fullscreen
             || dragging
             || mission_control.0
+            || layouts.0.get(&entity) != Some(&layout_print(&strip, &windows))
         {
             continue;
         }
@@ -1105,6 +1155,7 @@ fn cover_swipes(
             shown: position.0.x,
             bounds: display.bounds(),
             viewport: display.actual_display_bounds(dock, &config),
+            layout: layout_print(&strip, &windows),
         });
     }
 }
