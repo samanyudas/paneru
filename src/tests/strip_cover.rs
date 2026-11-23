@@ -1061,6 +1061,180 @@ fn a_new_target_as_a_swipe_starts_turns_the_slide_on_its_cover() {
     );
 }
 
+/// A new target in the frame a swipe catches a slide mid-way turns the
+/// slide, and the real windows stay where they wait until it lands. The
+/// swipe's first frame had moved the strip, and the windows took that place,
+/// which the pictures never showed.
+#[test]
+fn a_turn_over_a_swipe_keeps_the_real_windows_until_it_lands() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    let (strip, slide) = sliding_strip(harness.world());
+    let target = slide.heading().expect("the pictures slide");
+    log.borrow_mut().showing = Some(-100.0);
+    harness.advance(ONE_FRAME);
+
+    let next = target.with_x(target.x - 300);
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(next));
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.05));
+    harness.advance(ONE_FRAME);
+    log.borrow_mut().showing = None;
+    let (_, turned) = sliding_strip(harness.world());
+    assert_eq!(turned.heading(), Some(next), "the slide turns");
+    assert_eq!(
+        strip_x(harness.world(), strip),
+        0,
+        "the strip stays laid out"
+    );
+    let path = path_of(&mut harness, 1);
+    assert_eq!(
+        path,
+        vec![700, 700 + next.x],
+        "window 1 waits, then moves once, to where it lands"
+    );
+}
+
+/// A move up or down in the frame a swipe starts over a slide ends the
+/// cover, as any vertical move does, rather than hand the pictures to the
+/// swipe and drop the move.
+#[test]
+fn a_vertical_move_as_a_swipe_starts_ends_the_slide() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    let (strip, slide) = sliding_strip(harness.world());
+    let target = slide.heading().expect("the pictures slide");
+
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(target.with_y(target.y + 50)));
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.01));
+    harness.advance(ONE_FRAME);
+    let world = harness.world();
+    assert!(
+        world
+            .get::<crate::ecs::strip_cover::CoverSwipe>(strip)
+            .is_none(),
+        "the swipe does not take the pictures over"
+    );
+    assert!(world.get::<CoverSlide>(strip).is_none(), "the slide ended");
+    assert!(
+        world.get::<crate::ecs::RepositionMarker>(strip).is_some(),
+        "the move goes on"
+    );
+    assert_eq!(log.borrow().hidden, 1, "the cover came down");
+    assert_eq!(log.borrow().shown.len(), 1, "and no swipe put one up");
+}
+
+/// A swipe that catches a slide's pictures stretched past the strip's
+/// start shows the strip where they were, not stretched a second time.
+#[test]
+fn a_swipe_that_catches_a_stretched_slide_shows_it_where_it_was() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    let strip = harness
+        .world()
+        .query_filtered::<Entity, With<crate::ecs::layout::LayoutStrip>>()
+        .iter(harness.world())
+        .next()
+        .expect("a strip");
+    let position = harness
+        .world()
+        .get::<crate::ecs::Position>(strip)
+        .expect("a strip position")
+        .0;
+    // A move past the strip's start, as Center gives a first column that
+    // is narrower than the display.
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(position.with_x(120)));
+    harness.advance(ONE_FRAME);
+    assert!(covered(harness.world()), "the move is under a cover");
+    log.borrow_mut().showing = Some(100.0);
+
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.0001));
+    harness.advance(ONE_FRAME);
+    log.borrow_mut().showing = None;
+    let x = strip_x(harness.world(), strip);
+    assert!(
+        (x - 100).abs() <= 1,
+        "the strip shows where the pictures were, got {x}"
+    );
+}
+
+/// A swipe that catches a slide while Core Animation cannot tell where it
+/// shows moves on from the place this frame's slide reaches, as the cover
+/// shows it, not from a frame before.
+#[test]
+fn a_swipe_that_catches_a_slide_starts_from_this_frames_place() {
+    let start = |swiped: bool| {
+        let (mut harness, log) = harness(config(true, Some(14.0)));
+        take_pictures(&mut harness, &log);
+        send(&mut harness, focus(Direction::East));
+        harness.advance(ONE_FRAME * 3);
+        if swiped {
+            send(&mut harness, Event::TouchpadDown);
+            send(&mut harness, swipe(0.000_01));
+        }
+        harness.advance(ONE_FRAME);
+        let screen = log.borrow();
+        if swiped {
+            screen.placed.last().copied().expect("the swipe places it")
+        } else {
+            screen.tracked.last().copied().expect("the slide shows")
+        }
+    };
+    let (slid, caught) = (start(false), start(true));
+    assert!(
+        (slid - caught).abs() <= 1.0,
+        "the swipe starts where this frame's slide shows: {caught} vs {slid}"
+    );
+}
+
+/// A move during a covered swipe held at the most it may stretch past the
+/// strip's start starts from rest: fingers that push on there move nothing.
+#[test]
+fn a_move_during_a_held_stretch_starts_from_rest() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, Event::TouchpadDown);
+    for _ in 0..10 {
+        send(&mut harness, swipe(-0.5));
+        harness.advance(ONE_FRAME);
+    }
+    let strip = swiped_strip(harness.world());
+    let scroll = scrolling_of(harness.world(), strip);
+    assert!(scroll.velocity < 0.0, "the fingers push on past the start");
+    assert_eq!(scroll.slope, 0.0, "the strip no longer moves with them");
+    let position = harness
+        .world()
+        .get::<crate::ecs::Position>(strip)
+        .expect("a strip position")
+        .0;
+
+    let away = position.with_x(position.x + 40);
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(away));
+    harness.advance(ONE_FRAME);
+    let path = log.borrow().paths.last().cloned().expect("a slide");
+    let carried = starting_speed(&path);
+    // A slide from rest over 40 points starts at about 150 points a second.
+    assert!(carried < 250.0, "the slide starts from rest, got {carried}");
+}
+
 /// The cover's config with window-landing swipes, which step one column.
 fn landing_config() -> Config {
     Config::try_from(

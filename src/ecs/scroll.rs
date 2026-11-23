@@ -885,6 +885,39 @@ fn unresist(shown: f64, viewport_width: f64) -> f64 {
     shown * limit / (RUBBER_BAND * (limit - shown.abs()))
 }
 
+/// How far a strip stretched past `edge`, an end of the offsets `range`
+/// it settles in, moves for each point of finger travel. At the hold, a
+/// viewport `width` past either end, fingers that push on outward move
+/// nothing.
+fn stretch_slope(
+    scroll: &Scrolling,
+    edge: f64,
+    (start, end): (f64, f64),
+    width: f64,
+    config: &Config,
+) -> f64 {
+    let outward = scroll.velocity * direction_modifier(config);
+    let held = (scroll.position <= start - width + 1e-6 && outward <= 0.0)
+        || (scroll.position >= end + width - 1e-6 && outward >= 0.0);
+    if held {
+        0.0
+    } else {
+        resist_slope(scroll.position - edge, width)
+    }
+}
+
+/// Turns `scroll.position`, which holds where the strip shows, `caught`,
+/// plus the fingers' travel since, into the finger travel that shows the
+/// strip there when it resists past either edge of `edges`, so the
+/// resistance is not laid on twice. Does nothing without `caught`.
+fn catch_at(scroll: &mut Scrolling, caught: Option<f64>, edges: (f64, f64), width: f64) {
+    let Some(shown) = caught else {
+        return;
+    };
+    let edge = shown.clamp(edges.0.min(edges.1), edges.0.max(edges.1));
+    scroll.position += edge + unresist(shown - edge, width) - shown;
+}
+
 /// How fast a resisting strip moves for each point the fingers move, at
 /// `stretch`: the slope of [`resist`].
 fn resist_slope(stretch: f64, viewport_width: f64) -> f64 {
@@ -1376,6 +1409,7 @@ fn constrain(
     config: &Config,
 ) {
     let caught = std::mem::take(&mut scroll.caught);
+    let width = f64::from(viewport.width());
     if scroll.is_user_swiping
         && settling
         && let Some(fitted) = fitted_offsets(strip, windows, viewport)
@@ -1383,9 +1417,10 @@ fn constrain(
         // Keep the raw finger position in `scroll.position`, so the stretch
         // eases off along the same curve when the fingers turn back.
         let anchor = scroll.anchor.clamp(fitted.0, fitted.1);
+        catch_at(scroll, caught, (anchor, anchor), width);
         let stretch = scroll.position - anchor;
-        position.x = round_px(anchor + resist(stretch, f64::from(viewport.width())));
-        scroll.slope = resist_slope(stretch, f64::from(viewport.width()));
+        position.x = round_px(anchor + resist(stretch, width));
+        scroll.slope = resist_slope(stretch, width);
         return;
     }
 
@@ -1410,7 +1445,7 @@ fn constrain(
             landing(from, Some(step), strip, windows, viewport).map(|(_, offset)| f64::from(offset))
         };
         if let (Some(next), Some(previous)) = (reach(true), reach(false)) {
-            let width = f64::from(viewport.width());
+            catch_at(scroll, caught, (next, previous), width);
             let (shown, slope) = if scroll.position < next {
                 let stretch = scroll.position - next;
                 (next + resist(stretch, width), resist_slope(stretch, width))
@@ -1436,12 +1471,10 @@ fn constrain(
         && fitted_offsets(strip, windows, viewport).is_none()
         && let Some(range) = settle_range(strip, windows, viewport)
     {
-        let width = f64::from(viewport.width());
         let (start, end) = (f64::from(*range.start()), f64::from(*range.end()));
         let swiping = scroll.is_user_swiping && !lands_on_window(config, scroll.input);
-        if swiping && let Some(shown) = caught {
-            let edge = shown.clamp(start, end);
-            scroll.position += edge + unresist(shown - edge, width) - shown;
+        if swiping {
+            catch_at(scroll, caught, (start, end), width);
         }
         let edge = scroll.position.clamp(start, end);
         let past_an_end = !(start..=end).contains(&scroll.position);
@@ -1450,7 +1483,7 @@ fn constrain(
             // back soon move the strip again.
             scroll.position = scroll.position.clamp(start - width, end + width);
             position.x = round_px(edge + resist(scroll.position - edge, width));
-            scroll.slope = resist_slope(scroll.position - edge, width);
+            scroll.slope = stretch_slope(scroll, edge, (start, end), width, config);
             return;
         }
         if !scroll.is_user_swiping && scroll.settle.is_some() && past_an_end {

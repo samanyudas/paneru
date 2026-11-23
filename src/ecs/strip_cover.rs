@@ -463,6 +463,14 @@ pub(crate) struct CoverSlide {
     /// it to the strip's ends and columns, so the cover hands over to it
     /// as it is.
     caught: Option<f64>,
+    /// The strip x the real windows are laid out at: where the slide began,
+    /// until they land at its target. A swipe or a move that the cover
+    /// gives way to puts the strip back here, so no window takes a place
+    /// the pictures never showed.
+    rest: i32,
+    /// Where the pictures show in this frame, as of when: a frame samples
+    /// them once, however many systems look.
+    sampled: Option<(Duration, f64)>,
     /// How long the slide has run by the engine's count, for when Core
     /// Animation cannot tell where it shows: the landing waits at most
     /// [`SHOWN_GRACE`] past the slide's length for the screen.
@@ -564,6 +572,9 @@ pub(crate) struct CoverSwipe {
     /// as [`CoverSlide::hid`]: the window server may still show one where
     /// the engine no longer has it, as a window tucked at an edge.
     hid: Vec<Entity>,
+    /// The strip x the real windows wait at until the swipe lands, as
+    /// [`CoverSlide::rest`].
+    rest: i32,
     /// The strip's layout when the swipe began, as [`layout_print`] gives it.
     layout: u64,
 }
@@ -1093,31 +1104,13 @@ fn cover_strip_moves(
             // Where the pictures show, as Core Animation draws them, which
             // runs on while the engine stalls.
             let showing = if slide.landing.is_none() {
-                slide.counted += step.secs();
-                let showing = match screen.0.showing(slide.display) {
-                    // Core Animation runs on while the engine stalls, and the
-                    // engine's count can run ahead of it, so the slide's clock
-                    // is where the screen shows it: a turn and the landing
-                    // follow the screen.
-                    Some(showing) if slide.counted < slide.length() + SHOWN_GRACE => {
-                        // Within half a point of the target, the slide shows
-                        // landed, whatever rounding is left in the sample.
-                        slide.elapsed = if (showing - f64::from(slide.target.x)).abs() < 0.5 {
-                            slide.length()
-                        } else {
-                            slide.phase_of(showing)
-                        };
-                        showing
-                    }
-                    _ => {
-                        slide.elapsed = slide.counted;
-                        slide.x_at(slide.elapsed)
-                    }
-                };
+                let showing = sample(&mut slide, screen.0.as_ref(), step.secs(), time.elapsed());
                 screen.0.track(slide.display, showing);
                 showing
             } else {
-                f64::from(position.0.x)
+                // Landed, the pictures rest at the slide's target, where a
+                // swipe that starts with this frame may have moved `Position`.
+                f64::from(slide.target.x)
             };
             // Anything but a new target for the strip ends the cover: the
             // windows go where the slide headed, at once. A strip no longer
@@ -1143,8 +1136,10 @@ fn cover_strip_moves(
                 && !dragging
                 && !mission_control.0
                 && layout_print(&strip, &windows) == slide.layout;
+            // Only a swipe with no strip move of its own this frame takes the
+            // pictures over: a move goes to its turn or ends the cover.
             if keeps
-                && turn.is_none()
+                && !fresh
                 && let Some(scroll) = scrolling
                     .as_mut()
                     .filter(|scroll| scroll.input == ScrollInput::Gesture)
@@ -1179,6 +1174,7 @@ fn cover_strip_moves(
                         viewport: slide.viewport,
                         area: slide.area,
                         hid: std::mem::take(&mut slide.hid),
+                        rest: slide.rest,
                         layout: slide.layout,
                     });
                 continue;
@@ -1189,7 +1185,7 @@ fn cover_strip_moves(
                 Some("strip not shown")
             } else if !same_place {
                 Some("display or viewport changed")
-            } else if scrolling.is_some() && turn.is_none() {
+            } else if scrolling.is_some() && turn.is_none() && !turns_height {
                 Some("scroll")
             } else if dragging {
                 Some("drag")
@@ -1242,6 +1238,7 @@ fn cover_strip_moves(
                 let (guard, layout) = (slide.guard, slide.layout);
                 let mut hid = std::mem::take(&mut slide.hid);
                 note_hidden(&mut hid, &strip, &windows, slide.area, target);
+                let rest = slide.rest;
                 *slide = start_slide(
                     slide.display,
                     (slide.bounds, slide.viewport, slide.area),
@@ -1253,12 +1250,17 @@ fn cover_strip_moves(
                 slide.guard = guard;
                 slide.layout = layout;
                 slide.hid = hid;
+                slide.rest = rest;
                 screen.0.slide(slide.display, &slide.path(), PATH_STEP);
                 debug!("cover over strip {entity} turned to {}", target.x);
                 let mut entity_commands = commands.entity(entity);
                 entity_commands.remove::<RepositionMarker>();
                 if scrolling.is_some() {
+                    // The swipe that started with the move gives way, and
+                    // the real windows stay where they are laid out, not
+                    // where its first frame moved the strip.
                     entity_commands.remove::<Scrolling>();
+                    position.0.x = rest;
                 }
                 continue;
             }
@@ -1268,6 +1270,7 @@ fn cover_strip_moves(
                 let (area, target) = (slide.area, slide.target);
                 note_hidden(&mut slide.hid, &strip, &windows, area, target);
                 position.0 = slide.target;
+                slide.rest = slide.target.x;
                 end_guard(slide.guard.take(), &mut commands);
                 slide.guard = Some(spawn_snap_strip_guard(entity, &mut commands));
                 screen.0.track(slide.display, f64::from(slide.target.x));
@@ -1349,6 +1352,40 @@ fn cover_strip_moves(
     }
 }
 
+/// Where the pictures of `slide` show now, as Core Animation draws them,
+/// which runs on while the engine stalls, advancing the slide's clock by
+/// this frame's animation `step` at `now`. The first look in a frame
+/// samples them, and later looks in the same frame get the same answer.
+fn sample(slide: &mut CoverSlide, screen: &dyn CoverScreen, step: f64, now: Duration) -> f64 {
+    if let Some((at, showing)) = slide.sampled
+        && at == now
+    {
+        return showing;
+    }
+    slide.counted += step;
+    let showing = match screen.showing(slide.display) {
+        // Core Animation runs on while the engine stalls, and the engine's
+        // count can run ahead of it, so the slide's clock is where the
+        // screen shows it: a turn and the landing follow the screen.
+        Some(showing) if slide.counted < slide.length() + SHOWN_GRACE => {
+            // Within half a point of the target, the slide shows landed,
+            // whatever rounding is left in the sample.
+            slide.elapsed = if (showing - f64::from(slide.target.x)).abs() < 0.5 {
+                slide.length()
+            } else {
+                slide.phase_of(showing)
+            };
+            showing
+        }
+        _ => {
+            slide.elapsed = slide.counted;
+            slide.x_at(slide.elapsed)
+        }
+    };
+    slide.sampled = Some((now, showing));
+    showing
+}
+
 /// Moves the scroll state of a swipe that catches a slide's pictures
 /// mid-way to where they show: the swipe began from the real windows'
 /// place, but the fingers move the strip on from `showing`, and it rests at
@@ -1358,6 +1395,10 @@ fn rebase(scroll: &mut Scrolling, showing: f64, target: i32) {
     scroll.origin = showing;
     scroll.position = showing + travel;
     scroll.anchor = f64::from(target);
+    // The pictures may show the strip stretched past an end or a column:
+    // the scroll systems turn `showing` into the finger travel that shows
+    // it there, rather than stretch it again.
+    scroll.caught = Some(showing);
 }
 
 /// Moves each trackpad swipe that starts while a slide's pictures move to
@@ -1366,6 +1407,8 @@ fn rebase(scroll: &mut Scrolling, showing: f64, target: i32) {
 /// [`cover_strip_moves`] then hands the cover over to the swipe as it is.
 fn catch_slides(
     mut strips: Query<(&mut CoverSlide, &mut Scrolling), Added<Scrolling>>,
+    time: Res<Time>,
+    step: Res<AnimationStep>,
     screen: Option<NonSend<CoverScreenHandle>>,
 ) {
     let Some(screen) = screen else {
@@ -1375,13 +1418,7 @@ fn catch_slides(
         if scroll.input != ScrollInput::Gesture || slide.landing.is_some() {
             continue;
         }
-        // Where the pictures show, as in `cover_strip_moves`, which counts
-        // this frame's step later.
-        let showing = screen
-            .0
-            .showing(slide.display)
-            .filter(|_| slide.counted < slide.length() + SHOWN_GRACE)
-            .unwrap_or_else(|| slide.x_at(slide.counted));
+        let showing = sample(&mut slide, screen.0.as_ref(), step.secs(), time.elapsed());
         rebase(&mut scroll, showing, slide.target.x);
         slide.caught = Some(showing);
     }
@@ -1413,6 +1450,8 @@ fn start_slide(
         area,
         hid: Vec::new(),
         caught: None,
+        rest: round_px(from),
+        sampled: None,
         counted: 0.0,
         layout: 0,
     }
@@ -1518,7 +1557,7 @@ type SwipedStrips<'w, 's> = Query<
     (
         Entity,
         Ref<'static, LayoutStrip>,
-        Ref<'static, Position>,
+        &'static mut Position,
         Option<Ref<'static, Scrolling>>,
         Option<&'static mut CoverSwipe>,
         Option<Ref<'static, RepositionMarker>>,
@@ -1562,7 +1601,7 @@ fn cover_swipes(
     for (
         entity,
         strip,
-        position,
+        mut position,
         scrolling,
         swipe,
         marker,
@@ -1640,11 +1679,15 @@ fn cover_swipes(
                 slide.layout = swipe.layout;
                 slide.hid = std::mem::take(&mut swipe.hid);
                 note_hidden(&mut slide.hid, &strip, &windows, swipe.area, marker.0);
+                // The real windows wait where the swipe found them until the
+                // slide lands, not where the fingers last took the strip.
+                slide.rest = swipe.rest;
+                position.0.x = swipe.rest;
                 screen.0.slide(swipe.display, &slide.path(), PATH_STEP);
                 screen.0.track(swipe.display, from);
                 debug!(
-                    "cover over swiped strip {entity} slides on from {} to {}",
-                    position.0.x, marker.0.x
+                    "cover over swiped strip {entity} slides on from {from} to {}",
+                    marker.0.x
                 );
                 commands
                     .entity(entity)
@@ -1682,6 +1725,8 @@ fn cover_swipes(
                         area: swipe.area,
                         hid,
                         caught: None,
+                        rest: position.0.x,
+                        sampled: None,
                         counted: 0.0,
                         layout: swipe.layout,
                     });
@@ -1697,8 +1742,12 @@ fn cover_swipes(
             continue;
         }
 
+        // A strip move on its way takes the strip: a swipe that starts with
+        // it gets no cover, which would hold the move back until it lands.
+        let moving = marker.as_ref().is_some_and(|marker| marker.0 != position.0);
         if sliding
             || morphing
+            || moving
             || !cover_enabled(&config)
             || !shown_here
             || fullscreen
@@ -1737,6 +1786,10 @@ fn cover_swipes(
             viewport: display.actual_display_bounds(dock, &config),
             area,
             hid,
+            // Where the strip was when the fingers moved it first.
+            rest: scrolling
+                .as_ref()
+                .map_or(position.0.x, |scrolling| round_px(scrolling.origin)),
             layout: layout_print(&strip, &windows),
         });
     }
