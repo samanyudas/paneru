@@ -33,10 +33,10 @@ use objc2_core_graphics::CGDirectDisplayID;
 use tracing::debug;
 
 use super::{
-    ASK_TIMEOUT, Access, Asked, CoverPhotos, CoverScreenHandle, CoverSlide, CoverSubject,
-    CoverSwipe, CoverWindows, LANDED_FRAMES, LANDING_TIMEOUT, PATH_STEP, SHOWN_GRACE, ShownStrips,
-    StartedCovers, StripWindow, apply_cover_reply, close, cover_enabled, end_guard, scene_of,
-    shows, strip_windows,
+    ASK_TIMEOUT, Access, Asked, CoverPhotos, CoverScreen, CoverScreenHandle, CoverSlide,
+    CoverSubject, CoverSwipe, CoverWindows, LANDED_FRAMES, LANDING_TIMEOUT, PATH_STEP, SHOWN_GRACE,
+    ShownStrips, StartedCovers, StripWindow, apply_cover_reply, close, cover_enabled, end_guard,
+    scene_of, shows, strip_windows,
 };
 use crate::config::Config;
 use crate::ecs::drag::DragState;
@@ -65,6 +65,12 @@ struct Reframe {
 
 impl Reframe {
     /// The frame the picture shows `share` of the way along.
+    /// Whether the frame gets larger, and no smaller either way.
+    fn grows(&self) -> bool {
+        let (from, to) = (self.from.size(), self.to.size());
+        to != from && to.x >= from.x && to.y >= from.y
+    }
+
     fn at(&self, share: f64) -> IRect {
         #[allow(clippy::cast_possible_truncation)]
         let mix = |from: i32, to: i32| {
@@ -83,9 +89,20 @@ impl Reframe {
     }
 }
 
+/// How long a maximize's cover waits at most for the window to take its new
+/// frame before its pictures move, in seconds of animation steps. A browser
+/// takes 50 to 140 ms to lay out and draw a window several times wider, and
+/// the window server shows it a frame or two later.
+const OPEN_WAIT: f64 = 0.25;
+
 /// Where a resize's cover is.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Stage {
+    /// The pictures rest while a window that a maximize grows takes its new
+    /// frame, for [`OPEN_WAIT`] at the longest: `waited` counts the seconds
+    /// so far. The cover then opens onto the window itself, so its frame
+    /// never opens onto a fill.
+    Waiting { waited: f64 },
     /// The pictures move.
     Moving,
     /// The pictures have landed: when the cover comes down at the latest,
@@ -128,6 +145,9 @@ pub(crate) struct CoverMorph {
     /// Animation cannot tell how far it shows.
     counted: f64,
     stage: Stage,
+    /// The windows whose frames open onto the windows themselves, not onto
+    /// pictures: while [`Stage::Waiting`], the ones waited for.
+    open: Vec<WinID>,
     /// The snap guard that holds the real windows to their places.
     guard: Option<Entity>,
 }
@@ -568,6 +588,8 @@ pub(super) fn cover_resizes(
                     })
                     .collect();
                 morph.note_hidden();
+                // The frames head elsewhere, onto pictures.
+                morph.open.clear();
                 morph.entry = entry;
                 morph.elapsed = 0.0;
                 morph.counted = 0.0;
@@ -742,6 +764,7 @@ pub(super) fn cover_resizes(
             duration,
             counted: 0.0,
             stage: Stage::Moving,
+            open: Vec::new(),
             guard: None,
         };
         morph.note_hidden();
@@ -753,29 +776,128 @@ pub(super) fn cover_resizes(
             None,
             &mut commands,
         ));
-        screen
-            .0
-            .morph(display.id(), &morph.sent(), &morph.shares(), PATH_STEP);
-        // A window that returns to a size it had before, as a maximized
-        // window that is restored does, shows its picture at that size from
-        // the start. A window that grows still gets a fresh picture once it
-        // shows its new frame, which then takes this one's place unseen.
-        for frame in &morph.frames {
-            if frame.to.size() != frame.from.size()
-                && let Some(photo) = photos.heading(frame.id, frame.to.size(), time.elapsed())
-                && screen
-                    .0
-                    .head_picture(display.id(), frame.id, frame.to.size(), photo)
-            {
-                debug!(
-                    "cover over resized strip {entity} shows window {} as it was at {}",
-                    frame.id,
-                    frame.to.size()
-                );
-            }
+        // A window that a maximize grows has no picture of its new layout
+        // unless it was this size before. Its old picture would open onto a
+        // fill, so the pictures rest until the window has its new frame,
+        // and the frame then opens onto the window itself.
+        let now = time.elapsed();
+        morph.open = if maximize_morph {
+            morph
+                .frames
+                .iter()
+                .filter(|frame| frame.grows())
+                .filter(|frame| photos.heading(frame.id, frame.to.size(), now).is_none())
+                .map(|frame| frame.id)
+                .take(1)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if morph.open.is_empty() {
+            launch(&morph, &mut *screen.0, &photos, now, &[]);
+        } else {
+            morph.stage = Stage::Waiting { waited: 0.0 };
         }
         debug!("cover over resized strip {entity}: {shown} pictures");
         commands.entity(entity).insert(morph);
+    }
+}
+
+/// Starts the pictures of `morph` moving. The frame of each window of `open`
+/// opens onto the window itself. A window that returns to a size it had
+/// before, as a maximized window that is restored does, shows its picture
+/// at that size from the start. A window that grows still gets a fresh
+/// picture once it shows its new frame, which takes that one's place unseen.
+fn launch(
+    morph: &CoverMorph,
+    screen: &mut dyn CoverScreen,
+    photos: &CoverPhotos,
+    now: Duration,
+    open: &[WinID],
+) {
+    for id in open {
+        screen.open(morph.display, *id);
+    }
+    screen.morph(morph.display, &morph.sent(), &morph.shares(), PATH_STEP);
+    for frame in &morph.frames {
+        if frame.to.size() != frame.from.size()
+            && !open.contains(&frame.id)
+            && let Some(photo) = photos.heading(frame.id, frame.to.size(), now)
+            && screen.head_picture(morph.display, frame.id, frame.to.size(), photo)
+        {
+            debug!(
+                "cover over a resize shows window {} as it was at {}",
+                frame.id,
+                frame.to.size()
+            );
+        }
+    }
+}
+
+/// Whether the window server shows the window of `frame` at the frame the
+/// layout committed for it, of the size the morph heads to, with no write
+/// to it on its way.
+fn shows_new_frame(
+    frame: &Reframe,
+    frames: &Query<(&Window, &Position, &Bounds)>,
+    shown_frames: Option<&ShownFrames>,
+) -> bool {
+    let Ok((window, position, bounds)) = frames.get(frame.entity) else {
+        return false;
+    };
+    let cell = IRect::from_corners(position.0, position.0 + bounds.0);
+    let committed = window.margins().shown(cell);
+    if window.write_pending() || !close(committed.size(), frame.to.size()) {
+        return false;
+    }
+    shown_frames.is_none_or(|shown| {
+        shown.watch_morph(&[frame.id]).iter().any(|(id, shown)| {
+            *id == frame.id && close(shown.min, committed.min) && close(shown.max, committed.max)
+        })
+    })
+}
+
+/// Starts each waiting morph once the windows it waits for show their new
+/// frames, with their frames open onto them. One that has waited
+/// [`OPEN_WAIT`] starts as any other resize does, onto pictures and a fill.
+pub(super) fn start_waiting_morphs(
+    mut morphs: Query<&mut CoverMorph>,
+    frames: Query<(&Window, &Position, &Bounds)>,
+    shown_frames: Option<Res<ShownFrames>>,
+    photos: Res<CoverPhotos>,
+    time: Res<Time>,
+    step: Res<AnimationStep>,
+    screen: Option<NonSendMut<CoverScreenHandle>>,
+) {
+    let Some(mut screen) = screen else {
+        return;
+    };
+    let now = time.elapsed();
+    for mut morph in &mut morphs {
+        let Stage::Waiting { waited } = morph.stage else {
+            continue;
+        };
+        // Counted in animation steps, as the morph's own clock is: the
+        // engine's time can leap after a pause.
+        let waited = waited + step.secs();
+        let ready = morph
+            .frames
+            .iter()
+            .filter(|frame| morph.open.contains(&frame.id))
+            .all(|frame| shows_new_frame(frame, &frames, shown_frames.as_deref()));
+        if !ready && waited < OPEN_WAIT {
+            morph.stage = Stage::Waiting { waited };
+            continue;
+        }
+        if !ready {
+            debug!("cover over a maximize waited its limit for the window");
+            morph.open.clear();
+        }
+        let open = morph.open.clone();
+        launch(&morph, &mut *screen.0, &photos, now, &open);
+        morph.counted = 0.0;
+        morph.elapsed = 0.0;
+        morph.stage = Stage::Moving;
     }
 }
 

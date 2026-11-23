@@ -192,6 +192,11 @@ pub(crate) trait CoverScreen {
         size: IVec2,
         photo: &Photo,
     ) -> bool;
+    /// Makes the frame of `window` on the cover of `display` open onto the
+    /// window itself in the next [`CoverScreen::morph`]: the cover shows
+    /// nothing inside that frame, so the window below it shows through as
+    /// the frame grows. For a window that already has its final frame.
+    fn open(&mut self, display: CGDirectDisplayID, window: WinID);
     /// Shows `photo`, a picture of `window` at the `size` its frame on the
     /// cover of `display` heads to, at once: in place of the picture there
     /// when the frame grows to that size, and over that picture's top left
@@ -537,6 +542,7 @@ pub(crate) fn register(app: &mut App) {
             Update,
             (
                 resize::cover_resizes,
+                resize::start_waiting_morphs,
                 resize::apply_morph_replies,
                 cover_strip_moves,
                 cover_swipes,

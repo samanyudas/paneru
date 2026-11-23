@@ -354,6 +354,9 @@ struct Cover {
     at: IVec2,
     /// Whether the cover is up.
     shown: bool,
+    /// The windows whose frames the next morph opens onto the windows
+    /// themselves.
+    open: Vec<WinID>,
 }
 
 impl CoverScreenOS {
@@ -462,6 +465,91 @@ impl CoverScreenOS {
         unsafe { layer.setContents(Some(image.as_ref())) };
         layer.setContentsScale(scale);
         layer
+    }
+
+    /// Makes a hole in the cover that moves from `from` to `to`, in the
+    /// root layer's space, along `shares` over `duration` seconds, so the
+    /// windows below the cover show through it. The root layer's mask is
+    /// four bands around the hole, each of which moves and sizes with it.
+    /// The panel stops being opaque while it has a hole.
+    fn open_over(
+        panel: &NSPanel,
+        root: &CALayer,
+        from: CGRect,
+        to: CGRect,
+        shares: &[f64],
+        duration: f64,
+    ) {
+        let whole = root.bounds().size;
+        // The bands left of, right of, below and above a hole.
+        let bands = |hole: CGRect| {
+            let (x, y) = (hole.origin.x, hole.origin.y);
+            let (right, top) = (x + hole.size.width, y + hole.size.height);
+            [
+                CGRect::new(
+                    CGPoint::new(0.0, 0.0),
+                    CGSize::new(x.max(0.0), whole.height),
+                ),
+                CGRect::new(
+                    CGPoint::new(right, 0.0),
+                    CGSize::new((whole.width - right).max(0.0), whole.height),
+                ),
+                CGRect::new(
+                    CGPoint::new(x, 0.0),
+                    CGSize::new(hole.size.width, y.max(0.0)),
+                ),
+                CGRect::new(
+                    CGPoint::new(x, top),
+                    CGSize::new(hole.size.width, (whole.height - top).max(0.0)),
+                ),
+            ]
+        };
+        let mask = CALayer::new();
+        mask.setAnchorPoint(CGPoint::new(0.0, 0.0));
+        mask.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), whole));
+        let solid = CGColor::new_srgb(0.0, 0.0, 0.0, 1.0);
+        for (from, to) in bands(from).into_iter().zip(bands(to)) {
+            let band = CALayer::new();
+            band.setAnchorPoint(CGPoint::new(0.0, 0.0));
+            band.setBackgroundColor(Some(&solid));
+            band.setFrame(to);
+            let tracks = [
+                (from.origin.x, to.origin.x),
+                (from.origin.y, to.origin.y),
+                (from.size.width, to.size.width),
+                (from.size.height, to.size.height),
+            ];
+            for (path, (start, end)) in MORPH_TRACKS.into_iter().zip(tracks) {
+                if duration <= 0.0 || (end - start).abs() < f64::EPSILON {
+                    continue;
+                }
+                let values = shares
+                    .iter()
+                    .map(|share| start + (end - start) * share)
+                    .collect::<Vec<_>>();
+                band.addAnimation_forKey(
+                    &keyframes(path, &values, duration),
+                    Some(&NSString::from_str(path)),
+                );
+            }
+            mask.addSublayer(&band);
+        }
+        // SAFETY: the mask is a new layer that no other layer holds.
+        unsafe { root.setMask(Some(&mask)) };
+        panel.setOpaque(false);
+        panel.setBackgroundColor(Some(&NSColor::clearColor()));
+    }
+
+    /// Closes any hole [`Self::open_over`] made in the cover.
+    fn close_over(panel: &NSPanel, root: &CALayer) {
+        if root.mask().is_some() {
+            // SAFETY: taking a mask away holds no layer.
+            unsafe { root.setMask(None) };
+        }
+        if !panel.isOpaque() {
+            panel.setOpaque(true);
+            panel.setBackgroundColor(Some(&NSColor::blackColor()));
+        }
     }
 
     /// Window `id`'s frame at `frame` in the strip layer's space, holding
@@ -683,6 +771,7 @@ impl CoverScreen for CoverScreenOS {
                     lead: None,
                     at: scene.strip,
                     shown: false,
+                    open: Vec::new(),
                 },
             );
         }
@@ -701,6 +790,8 @@ impl CoverScreen for CoverScreenOS {
         root.setMasksToBounds(true);
         // SAFETY: no layer of the cover is in use elsewhere.
         unsafe { root.setSublayers(None) };
+        Self::close_over(&cover.window, &root);
+        cover.open.clear();
         let desktop: &CFType = &scene.desktop.image;
         root.addSublayer(&Self::picture(
             desktop,
@@ -801,8 +892,28 @@ impl CoverScreen for CoverScreenOS {
             )
         };
         let mut lead = None;
+        let open = std::mem::take(&mut cover.open);
+        let root = cover.window.contentView().and_then(|view| view.layer());
         CATransaction::begin();
         CATransaction::setDisableActions(true);
+        // The frame of the first open window is a hole in the cover that
+        // moves as the frame does. Any hole of a morph before goes.
+        let hole = frames
+            .iter()
+            .find(|(id, ..)| open.contains(id))
+            .map(|(_, from, to)| (local(*from), local(*to)));
+        if let Some(root) = &root {
+            match hole {
+                Some((from, to)) => {
+                    let (from, to) = (
+                        root.convertRect_fromLayer(from, Some(&cover.strip)),
+                        root.convertRect_fromLayer(to, Some(&cover.strip)),
+                    );
+                    Self::open_over(&cover.window, root, from, to, shares, duration);
+                }
+                None => Self::close_over(&cover.window, root),
+            }
+        }
         for (id, from, to) in frames {
             let Some(window) = cover.layers.iter().find(|window| window.id == *id) else {
                 continue;
@@ -923,6 +1034,12 @@ impl CoverScreen for CoverScreenOS {
             size.x, size.y
         );
         true
+    }
+
+    fn open(&mut self, display: CGDirectDisplayID, window: WinID) {
+        if let Some(cover) = self.covers.get_mut(&display).filter(|cover| cover.shown) {
+            cover.open.push(window);
+        }
     }
 
     fn head_picture(
@@ -1061,11 +1178,13 @@ impl CoverScreen for CoverScreenOS {
         // The pictures go with the layer that held them.
         cover.strip = CALayer::new();
         cover.window.orderOut(None::<&AnyObject>);
+        cover.open.clear();
         if let Some(root) = cover.window.contentView().and_then(|view| view.layer()) {
             CATransaction::begin();
             CATransaction::setDisableActions(true);
             // SAFETY: no layer of the cover is in use elsewhere.
             unsafe { root.setSublayers(None) };
+            Self::close_over(&cover.window, &root);
             CATransaction::commit();
         }
         CATransaction::flush();

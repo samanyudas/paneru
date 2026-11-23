@@ -52,6 +52,8 @@ struct Screen {
     /// Each picture a resize's cover put in place of an older one, and the
     /// size it shows.
     replaced: Vec<(WinID, IVec2)>,
+    /// Each window whose frame was opened onto the window itself.
+    opened: Vec<WinID>,
     /// Each picture shown at the size its window heads to.
     headed: Vec<(WinID, IVec2)>,
     hidden: usize,
@@ -124,6 +126,10 @@ impl CoverScreen for RecordingScreen {
     ) -> bool {
         self.0.borrow_mut().replaced.push((window, size));
         true
+    }
+
+    fn open(&mut self, _display: CGDirectDisplayID, window: WinID) {
+        self.0.borrow_mut().opened.push(window);
     }
 
     fn head_picture(
@@ -791,6 +797,18 @@ fn frames_of(harness: &mut TestHarness, ids: &[WinID]) -> Vec<Vec<IRect>> {
         }
     }
     panic!("the resize ends");
+}
+
+/// Runs frames until the cover has moved its pictures `count` times. A
+/// maximize's pictures rest first, until the window shows its new frame.
+fn until_morphs(harness: &mut TestHarness, log: &ScreenLog, count: usize) {
+    for _ in 0..30 {
+        if log.borrow().morphs.len() >= count {
+            return;
+        }
+        harness.advance(ONE_FRAME);
+    }
+    panic!("the cover moves its pictures {count} times");
 }
 
 /// The frame a morph moves window `id`'s picture from and to.
@@ -1629,6 +1647,12 @@ fn a_maximize_and_restore_morph_under_the_cover() {
     send(&mut harness, maximize_cmd());
     harness.advance(ONE_FRAME);
     assert!(morphed(harness.world()), "maximize runs under a cover");
+    until_morphs(&mut harness, &log, 1);
+    assert_eq!(
+        log.borrow().opened,
+        vec![1],
+        "the frame opens onto the maximized window itself"
+    );
     let (from_1, to_1) = morph_of(&log, 0, 1);
     assert_eq!(from_1, rest_1);
     assert!(to_1.width() > from_1.width(), "window 1 widens");
@@ -1700,6 +1724,40 @@ fn maximized_with_its_picture(harness: &mut TestHarness, log: &ScreenLog) -> IRe
     rest
 }
 
+/// A window whose app has not taken its maximized frame when the cover has
+/// waited its limit still maximizes: its pictures move as any resize's do,
+/// onto its old picture and a fill, rather than waiting on the app.
+#[test]
+fn a_maximize_of_a_slow_window_starts_at_the_wait_limit() {
+    let (mut harness, log) = harness(padded_resize_config());
+    send(
+        &mut harness,
+        resize(crate::types::commands::ResizeDirection::Shrink),
+    );
+    frames_of(&mut harness, &[0, 1]);
+    send(&mut harness, focus(Direction::East));
+    for _ in 0..40 {
+        harness.advance(ONE_FRAME);
+    }
+    take_pictures(&mut harness, &log);
+    // The window server shows window 1's new frame late, as a slow app's.
+    harness.mock_state.show_late(1);
+
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "maximize runs under a cover");
+    assert!(
+        log.borrow().morphs.is_empty(),
+        "the pictures rest while the window has yet to take its frame"
+    );
+    until_morphs(&mut harness, &log, 1);
+    assert!(
+        log.borrow().opened.is_empty(),
+        "a frame never opens onto a window that is not there yet"
+    );
+    harness.mock_state.show_now(1);
+}
+
 /// A restore shows the window as it was before the maximize from its first
 /// frame, from the picture kept of that size, so its frame closes onto the
 /// layout it will have rather than onto the maximized layout's corner.
@@ -1763,6 +1821,7 @@ fn a_stacked_window_maximize_and_restore_morph_under_the_cover() {
     send(&mut harness, maximize_cmd());
     harness.advance(ONE_FRAME);
     assert!(morphed(harness.world()), "stacked maximize is covered");
+    until_morphs(&mut harness, &log, 1);
     let (from_0, to_0) = morph_of(&log, 0, 0);
     let (from_1, to_1) = morph_of(&log, 0, 1);
     assert_eq!(from_0, before_0);
@@ -1919,6 +1978,7 @@ fn a_title_bar_double_click_morphs_under_the_cover() {
         morphed(harness.world()),
         "title-bar double-click maximize runs under the cover on MouseDown"
     );
+    until_morphs(&mut harness, &log, 1);
     let (from_1, to_1) = morph_of(&log, 0, 1);
     assert_eq!(from_1, rest_1);
     assert!(to_1.width() > from_1.width());
