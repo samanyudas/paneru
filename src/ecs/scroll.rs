@@ -1198,20 +1198,14 @@ fn settle_strip(
             };
             let target = f64::from(target);
             scroll.settle = Some(target);
-            if !window_landing {
-                // A strip stretched past an end, or caught further out than
-                // a stretch shows, starts its ease where it shows, at the
-                // speed it moves there.
-                scroll.position = f64::from(position.x);
-                scroll.velocity *= scroll.slope;
-            }
-            if window_landing {
-                // The fingers chose the step. The ease starts from where the
-                // resisting strip shows.
-                scroll.position = f64::from(position.x);
-                if config.swipe_gesture_haptics() && column.top() != scroll.detent {
-                    haptics.write(PageHapticRequest);
-                }
+            // The fingers' own speed chose the landing. A strip stretched
+            // past an end or a column, or caught further out than a stretch
+            // shows, starts its ease where it shows, at the speed it moves
+            // there, so a resisting release flicks only as fast as it shows.
+            scroll.position = f64::from(position.x);
+            scroll.velocity *= scroll.slope;
+            if window_landing && config.swipe_gesture_haptics() && column.top() != scroll.detent {
+                haptics.write(PageHapticRequest);
             }
             if let Some(window) = focus_history.last_focused_in(&column) {
                 if window_landing {

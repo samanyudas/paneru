@@ -1412,6 +1412,63 @@ fn a_caught_strip_settles_from_where_it_shows() {
     assert_eq!(path.last().copied(), Some(0), "to the strip's start");
 }
 
+/// A window-landing swipe released while it resists past a column settles
+/// at the speed the strip shows, not the fingers' raw speed: fingers that
+/// move back quickly while the strip barely follows make no flick, and the
+/// strip lands without swinging past its column.
+#[test]
+fn a_resisting_release_settles_at_the_speed_it_shows() {
+    let (mut harness, _log) = harness(landing_config());
+    let strip = the_strip(harness.world());
+    send(&mut harness, Event::TouchpadDown);
+    for _ in 0..10 {
+        send(&mut harness, swipe(0.15));
+        harness.advance(ONE_FRAME);
+    }
+    let scroll = scrolling_of(harness.world(), strip);
+    assert!(scroll.slope < 0.35, "the strip resists: {}", scroll.slope);
+    let shown = strip_x(harness.world(), strip);
+    // The fingers turn back at 800 points a second, which the strip shows
+    // at under the 256 a second a flick takes.
+    let velocity = -800.0 / f64::from(TEST_DISPLAY_WIDTH);
+    assert!(-velocity * f64::from(TEST_DISPLAY_WIDTH) * scroll.slope < 256.0);
+    harness
+        .world()
+        .get_mut::<crate::ecs::Scrolling>(strip)
+        .expect("the strip scrolls")
+        .velocity = velocity;
+    send(&mut harness, Event::TouchpadUp);
+
+    let mut ease = None;
+    for _ in 0..10 {
+        harness.advance(ONE_FRAME);
+        ease = harness
+            .world()
+            .get::<crate::ecs::Scrolling>(strip)
+            .and_then(|scroll| scroll.ease);
+        if ease.is_some() {
+            break;
+        }
+    }
+    let ease = ease.expect("the swipe settles");
+    assert!(
+        (ease.from - f64::from(shown)).abs() <= 1.0,
+        "the settle starts where the strip shows: {} vs {shown}",
+        ease.from
+    );
+    assert!(ease.flick.is_none(), "no flick");
+    let mut path = vec![strip_x(harness.world(), strip)];
+    for _ in 0..60 {
+        harness.advance(ONE_FRAME);
+        path.push(strip_x(harness.world(), strip));
+    }
+    let landed = *path.last().expect("a place");
+    assert!(
+        path.windows(2).all(|pair| pair[1] >= pair[0]) && path.iter().all(|x| *x <= landed),
+        "it lands without swinging past: {path:?}"
+    );
+}
+
 /// With `auto_center`, a strip held at its start shows no speed for fingers
 /// that push on past it, even in a frame whose push rounds to nothing: a
 /// move then starts from rest.
