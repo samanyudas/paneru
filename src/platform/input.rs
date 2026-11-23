@@ -489,6 +489,7 @@ impl InputHandler {
         };
 
         if let Some(mouse) = Mouse::of(event_type) {
+            slice_tap::apply_cancellations(&mut self.slice_tap);
             let pointer = Pointer::read(mouse, event);
             match self.slice_tap.handle(&pointer) {
                 Verdict::Pass => {}

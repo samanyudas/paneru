@@ -245,6 +245,7 @@ struct MockStateInner {
     left_button_down: bool,
     /// The presses the engine posted, oldest first, each where it posted it.
     posted_presses: Vec<(SlicePress, CGPoint)>,
+    cancelled_presses: Vec<u32>,
     /// Windows raised above the rest, bottom to top. Windows not in it sit
     /// below, the lowest ID on top, so overlapping windows resolve the same
     /// way on every run.
@@ -556,6 +557,7 @@ impl MockState {
             ignores_desktop_focus: false,
             left_button_down: false,
             posted_presses: Vec::new(),
+            cancelled_presses: Vec::new(),
             raised: Vec::new(),
             event_queue: VecDeque::new(),
             stale_window_ids: HashMap::new(),
@@ -1352,6 +1354,10 @@ impl MockState {
     /// Takes the presses the engine posted since the last call.
     pub fn take_posted_presses(&self) -> Vec<(SlicePress, CGPoint)> {
         std::mem::take(&mut self.inner.force_write().posted_presses)
+    }
+
+    pub fn take_cancelled_presses(&self) -> Vec<u32> {
+        std::mem::take(&mut self.inner.force_write().cancelled_presses)
     }
 
     pub fn focused_desktop(&self) -> Option<IRect> {
@@ -2235,6 +2241,11 @@ impl MockState {
         let s = self.clone();
         wm.expect_post_press().returning(move |press, point| {
             s.inner.force_write().posted_presses.push((*press, point));
+        });
+
+        let s = self.clone();
+        wm.expect_cancel_press().returning(move |press_id| {
+            s.inner.force_write().cancelled_presses.push(press_id);
         });
 
         let s = self.clone();

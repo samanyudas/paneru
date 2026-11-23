@@ -4,7 +4,7 @@
 //! window is in view, and the tap then lets that press and the rest of the
 //! gesture through.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -72,6 +72,34 @@ pub(crate) fn set_slice_panels(panels: Vec<SlicePanel>) {
 /// so a press on a picture reaches its window once the window is in place.
 static COVER_PANELS: LazyLock<ArcSwap<Vec<SlicePanel>>> =
     LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
+
+/// Held press ids that the engine cancelled because they can no longer be
+/// replayed (for example, a window shrank past the pressed point). Drained by
+/// the OS event tap on the main thread before handling the next pointer event.
+static CANCELLED_PRESSES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Queues cancellation of held press `press_id` for the live event tap.
+pub(crate) fn cancel_live_press(press_id: u32) {
+    CANCELLED_PRESSES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(press_id);
+}
+
+/// Applies press cancellations queued by the engine to `tap`.
+pub(crate) fn apply_cancellations(tap: &mut SliceTap) {
+    let mut cancelled = CANCELLED_PRESSES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if cancelled.is_empty() {
+        return;
+    }
+    let ids = std::mem::take(&mut *cancelled);
+    drop(cancelled);
+    for id in ids {
+        tap.cancel(id);
+    }
+}
 
 /// Replaces the cover pictures the tap and the window lookups know of.
 pub(crate) fn set_cover_panels(panels: Vec<SlicePanel>) {
@@ -528,6 +556,24 @@ impl SliceTap {
                 debug!("edge slice press dropped: press {tag} is no longer held");
                 Verdict::Swallow
             }
+        }
+    }
+
+    /// Cancels held press `press_id` when the engine can no longer replay it.
+    /// If the user still holds its button, its remaining drags and release
+    /// stay swallowed while subsequent presses pass through immediately.
+    pub fn cancel(&mut self, press_id: u32) {
+        match self.gesture {
+            Gesture::Holding { id, button, .. } if id == press_id => {
+                debug!("edge slice press cancelled: press {id}, button still held");
+                self.dropped.push(button);
+                self.gesture = Gesture::Idle;
+            }
+            Gesture::Released { id, .. } if id == press_id => {
+                debug!("edge slice press cancelled: press {id}, already released");
+                self.gesture = Gesture::Idle;
+            }
+            _ => {}
         }
     }
 

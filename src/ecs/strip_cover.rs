@@ -238,14 +238,15 @@ enum Access {
     Refused,
 }
 
-/// A freshly arrived window picture waiting for the frame's resize layout
-/// to resolve before unveiling on a morph cover.
+/// A morph capture reply waiting for the frame's resize layout to resolve
+/// before touching the cache or unveiling on a morph cover.
 #[derive(Debug)]
-struct ArrivedWindowPhoto {
+struct MorphReply {
     id: WinID,
     size: IVec2,
     generation: u32,
-    photo: Photo,
+    result: Result<Photo, PhotoError>,
+    taken: Duration,
 }
 
 /// The pictures the engine keeps for the cover.
@@ -260,12 +261,9 @@ pub(crate) struct CoverPhotos {
     /// The fresh pictures a resize's cover asked for, apart from the
     /// background refresh so neither drops the other's answer.
     morph_asked: Vec<Asked>,
-    /// The newest ask generation issued for each subject, so an older
-    /// superseded reply arriving out of order never overwrites newer state.
-    latest_ask: HashMap<CoverSubject, u32>,
-    /// Accepted window pictures from this frame's `Events` pass, applied to
-    /// any live morph after `cover_resizes` resolves the frame's layout.
-    arrived: Vec<ArrivedWindowPhoto>,
+    /// Morph replies received in this frame's `Events` pass, validated and
+    /// applied once `cover_resizes` resolves the frame's turns and aborts.
+    morph_replies: Vec<MorphReply>,
     generation: u32,
     access: Access,
     checked_at: Option<Duration>,
@@ -286,14 +284,30 @@ impl CoverPhotos {
             .map(|kept| &kept.photo)
     }
 
+    /// Invalidates any pending background or morph ask (and queued morph
+    /// reply) for `subject` before issuing a replacement, so an obsolete
+    /// request neither blocks the background queue nor lands out of order.
+    fn supersede(&mut self, subject: CoverSubject) {
+        if self
+            .asked
+            .as_ref()
+            .is_some_and(|asked| asked.subject == subject)
+        {
+            self.asked = None;
+        }
+        self.morph_asked.retain(|asked| asked.subject != subject);
+        if let CoverSubject::Window(id) = subject {
+            self.morph_replies.retain(|reply| reply.id != id);
+        }
+    }
+
     fn clear(&mut self) {
         self.windows.clear();
         self.desktops.clear();
         self.blank_until.clear();
         self.asked = None;
         self.morph_asked.clear();
-        self.latest_ask.clear();
-        self.arrived.clear();
+        self.morph_replies.clear();
     }
 
     fn is_clear(&self) -> bool {
@@ -302,8 +316,7 @@ impl CoverPhotos {
             && self.blank_until.is_empty()
             && self.asked.is_none()
             && self.morph_asked.is_empty()
-            && self.latest_ask.is_empty()
-            && self.arrived.is_empty()
+            && self.morph_replies.is_empty()
     }
 }
 
@@ -437,7 +450,7 @@ pub(crate) fn register(app: &mut App) {
             Update,
             (
                 resize::cover_resizes,
-                resize::unveil_morph_pictures,
+                resize::apply_morph_replies,
                 cover_strip_moves,
                 cover_swipes,
                 mark_moved,
@@ -475,10 +488,10 @@ fn cover_enabled(config: &Config) -> bool {
         && ease::animates(duration)
 }
 
-/// Keeps each picture that arrives for the ask it answers, rejecting any
-/// superseded reply so an older capture never overwrites newer state.
-/// Accepted window pictures are handed to [`resize::unveil_morph_pictures`]
-/// once the frame's layout resolves.
+/// Keeps each background picture that arrives for the ask it answers, and
+/// stages morph replies for [`resize::apply_morph_replies`] so they are
+/// validated against the frame's resolved turns and aborts before touching
+/// the cache.
 fn keep_cover_photos(
     mut messages: MessageReader<Event>,
     mut photos: ResMut<CoverPhotos>,
@@ -502,73 +515,104 @@ fn keep_cover_photos(
             continue;
         };
         let answers = |asked: &Asked| asked.generation == *generation && asked.subject == *subject;
-        let asked = photos.asked.take_if(|asked| answers(asked)).or_else(|| {
-            let index = photos.morph_asked.iter().position(answers)?;
-            Some(photos.morph_asked.swap_remove(index))
-        });
-        let Some(asked) = asked else {
-            continue;
-        };
-        // A newer ask for this subject supersedes any older reply: drop it
-        // before it can touch the cache, blank backoff, or capture filter.
-        if photos.latest_ask.get(subject) != Some(generation) {
+        if let Some(asked) = photos.asked.take_if(|asked| answers(asked)) {
+            apply_cover_reply(
+                &mut photos,
+                screen.as_deref_mut(),
+                *subject,
+                asked.size,
+                asked.excluding,
+                result,
+                time.elapsed(),
+            );
             continue;
         }
-        match result {
-            Ok(photo) => {
-                let kept = Kept {
-                    photo: photo.clone(),
-                    size: asked.size,
-                    taken: time.elapsed(),
-                    excluding: asked.excluding,
-                };
-                match *subject {
-                    CoverSubject::Window(id) => {
-                        photos.blank_until.remove(&id);
-                        photos.windows.insert(id, kept);
-                        photos.arrived.push(ArrivedWindowPhoto {
-                            id,
-                            size: asked.size,
-                            generation: *generation,
-                            photo: photo.clone(),
-                        });
-                    }
-                    CoverSubject::Desktop(display) => {
-                        photos.desktops.insert(display, kept);
-                    }
+        let Some(index) = photos.morph_asked.iter().position(answers) else {
+            continue;
+        };
+        let asked = photos.morph_asked.swap_remove(index);
+        if matches!(result, Err(PhotoError::Refused)) {
+            apply_cover_reply(
+                &mut photos,
+                screen.as_deref_mut(),
+                *subject,
+                asked.size,
+                asked.excluding,
+                result,
+                time.elapsed(),
+            );
+            continue;
+        }
+        if let CoverSubject::Window(id) = *subject {
+            photos.morph_replies.push(MorphReply {
+                id,
+                size: asked.size,
+                generation: *generation,
+                result: result.clone(),
+                taken: time.elapsed(),
+            });
+        }
+    }
+}
+
+/// Applies one accepted capture reply to `photos` and `screen`.
+fn apply_cover_reply(
+    photos: &mut CoverPhotos,
+    screen: Option<&mut CoverScreenHandle>,
+    subject: CoverSubject,
+    size: IVec2,
+    excluding: Vec<WinID>,
+    result: &Result<Photo, PhotoError>,
+    now: Duration,
+) {
+    match result {
+        Ok(photo) => {
+            let kept = Kept {
+                photo: photo.clone(),
+                size,
+                taken: now,
+                excluding,
+            };
+            match subject {
+                CoverSubject::Window(id) => {
+                    photos.blank_until.remove(&id);
+                    photos.windows.insert(id, kept);
+                }
+                CoverSubject::Desktop(display) => {
+                    photos.desktops.insert(display, kept);
                 }
             }
-            Err(PhotoError::Blank) => {
-                if let CoverSubject::Window(id) = *subject {
-                    debug!("cover picture of window {id} is blank");
-                    photos.blank_until.insert(id, time.elapsed() + BLANK_RETRY);
+        }
+        Err(PhotoError::Blank) => {
+            if let CoverSubject::Window(id) = subject {
+                debug!("cover picture of window {id} is blank");
+                photos.blank_until.insert(id, now + BLANK_RETRY);
+            }
+        }
+        Err(error @ (PhotoError::WindowGone | PhotoError::Failed)) => {
+            // A failed lookup is looked up afresh next time.
+            if let CoverSubject::Window(id) = subject {
+                if *error == PhotoError::WindowGone {
+                    photos.windows.remove(&id);
+                }
+                if let Some(screen) = screen {
+                    screen.0.forget(Some(id));
                 }
             }
-            Err(error @ (PhotoError::WindowGone | PhotoError::Failed)) => {
-                // A failed lookup is looked up afresh next time.
-                if let CoverSubject::Window(id) = *subject {
-                    if *error == PhotoError::WindowGone {
-                        photos.windows.remove(&id);
-                    }
-                    if let Some(screen) = screen.as_mut() {
-                        screen.0.forget(Some(id));
-                    }
-                }
-            }
-            Err(PhotoError::Refused) => {
-                debug!("cover pictures refused by macOS");
-                photos.access = if screen
-                    .as_ref()
-                    .is_some_and(|screen| screen.0.may_photograph())
-                {
-                    Access::Refused
-                } else {
-                    Access::Off
-                };
-                photos.clear();
-                if let Some(screen) = screen.as_mut() {
-                    screen.0.forget(None);
-                }
+        }
+        Err(PhotoError::Refused) => {
+            debug!("cover pictures refused by macOS");
+            photos.access = if screen
+                .as_ref()
+                .is_some_and(|screen| screen.0.may_photograph())
+            {
+                Access::Refused
+            } else {
+                Access::Off
+            };
+            photos.clear();
+            if let Some(screen) = screen {
+                screen.0.forget(None);
             }
         }
     }
@@ -1421,10 +1465,7 @@ fn refresh_cover_photos(
     };
     photos.generation = photos.generation.wrapping_add(1);
     let generation = photos.generation;
-    photos.latest_ask.insert(want.subject, generation);
-    photos
-        .morph_asked
-        .retain(|asked| asked.subject != want.subject);
+    photos.supersede(want.subject);
     match want.subject {
         CoverSubject::Window(id) => {
             screen

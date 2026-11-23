@@ -46,6 +46,7 @@ pub(crate) fn register(app: &mut App) {
 fn reveal_pressed(
     mut messages: MessageReader<Event>,
     windows: Windows,
+    window_manager: Res<WindowManager>,
     time: Res<Time>,
     mut commands: Commands,
 ) {
@@ -59,6 +60,7 @@ fn reveal_pressed(
                 "edge slice press dropped: window {} is gone",
                 press.window_id
             );
+            window_manager.cancel_press(press.id);
             continue;
         };
         focus_with_verification(
@@ -109,6 +111,7 @@ fn deliver_press(
             "edge slice press dropped: window {} is gone",
             press.window_id
         );
+        window_manager.cancel_press(press.id);
         commands.remove_resource::<PendingPress>();
         return;
     };
@@ -136,6 +139,7 @@ fn deliver_press(
             "edge slice press dropped: press {} window {} shrank past ({:.0}, {:.0})",
             press.id, press.window_id, press.at.x, press.at.y
         );
+        window_manager.cancel_press(press.id);
         commands.remove_resource::<PendingPress>();
         return;
     }

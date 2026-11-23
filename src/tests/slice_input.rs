@@ -131,6 +131,9 @@ impl Desk {
         for _ in 0..duration.as_millis().div_ceil(20) {
             self.harness.advance(Duration::from_millis(20));
             self.clock += Duration::from_millis(20);
+            for press_id in self.harness.mock_state.take_cancelled_presses() {
+                self.tap.cancel(press_id);
+            }
             for (press, point) in self.harness.mock_state.take_posted_presses() {
                 self.posted.push((press, point));
                 let pointer = Pointer {
@@ -1036,4 +1039,94 @@ fn a_cover_picture_keeps_the_exact_point_and_lets_scrolls_through() {
     };
     assert_eq!(tap.handle(&scroll(cover)), Verdict::Pass);
     assert_eq!(tap.handle(&scroll(west_panel())), Verdict::Swallow);
+}
+
+/// Cancelling a held press whose replay became impossible releases the tap
+/// immediately so subsequent clicks pass through, while still swallowing any
+/// remaining drag or release of the cancelled button.
+#[test]
+fn cancelling_a_held_press_frees_subsequent_clicks() {
+    let mut tap = SliceTap::default();
+    let cover = SlicePanel {
+        cover: true,
+        ..west_panel()
+    };
+    let at_panel = CGPoint::new(1020.0, 50.0);
+    let elsewhere = CGPoint::new(200.0, 200.0);
+    let make = |mouse, point, time, panel| Pointer {
+        mouse,
+        point,
+        flags: objc2_core_graphics::CGEventFlags::empty(),
+        time,
+        tag: None,
+        panel,
+    };
+
+    // Case 1: cancelled while still held. Drag and release stay swallowed,
+    // then the next click passes immediately (not waiting 1.5 s).
+    let Verdict::Hold(held) = tap.handle(&make(
+        Mouse::Down(MouseButton::Left),
+        at_panel,
+        Duration::from_millis(10),
+        Some(cover),
+    )) else {
+        panic!("press on cover must be held");
+    };
+    tap.cancel(held.id);
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Dragged(MouseButton::Left),
+            at_panel,
+            Duration::from_millis(20),
+            None,
+        )),
+        Verdict::Swallow
+    );
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Up(MouseButton::Left),
+            at_panel,
+            Duration::from_millis(30),
+            None,
+        )),
+        Verdict::Swallow
+    );
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Down(MouseButton::Left),
+            elsewhere,
+            Duration::from_millis(40),
+            None,
+        )),
+        Verdict::Pass
+    );
+
+    // Case 2: cancelled after release. Next click passes immediately.
+    let Verdict::Hold(released) = tap.handle(&make(
+        Mouse::Down(MouseButton::Left),
+        at_panel,
+        Duration::from_millis(100),
+        Some(cover),
+    )) else {
+        panic!("press on cover must be held");
+    };
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Up(MouseButton::Left),
+            at_panel,
+            Duration::from_millis(110),
+            None,
+        )),
+        Verdict::Swallow
+    );
+    tap.cancel(released.id);
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Down(MouseButton::Left),
+            elsewhere,
+            Duration::from_millis(120),
+            None,
+        )),
+        Verdict::Pass
+    );
 }

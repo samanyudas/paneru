@@ -1299,6 +1299,52 @@ fn a_returning_turn_asks_anew_and_rejects_an_earlier_reply() {
     assert_eq!(log.borrow().replaced, vec![(0, size_75)]);
 }
 
+/// A 75% morph reply arriving in the same update as a shrink turn back to
+/// 50% neither unveils nor overwrites the cached 50% picture, so the next
+/// resize still goes under the cover.
+#[test]
+fn a_same_frame_turn_back_keeps_the_cached_picture() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    // Put window 0 at the 50% preset first, then take fresh cached pictures.
+    send(&mut harness, resize(ResizeDirection::Shrink));
+    frames_of(&mut harness, &[0]);
+    take_pictures(&mut harness, &log);
+    let since = log.borrow().window_asks.len();
+    // 50% -> 75%
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    let asks = window_asks_since(&log, since);
+    assert_eq!(asks.len(), 1);
+    let (_, _, gen_75) = asks[0];
+    // Deliver the 75% reply and shrink back to 50% in the very same frame.
+    answer(&mut harness, 0, gen_75);
+    send(&mut harness, resize(ResizeDirection::Shrink));
+    harness.advance(ONE_FRAME);
+    assert!(
+        log.borrow().replaced.is_empty(),
+        "the 75% reply must not unveil after turning back to 50%"
+    );
+    // Let the morph finish and rest at 50%; the next resize must still be
+    // covered (meaning the 50% cached photo was not overwritten by 75%).
+    for _ in 0..40 {
+        if !morphed(harness.world()) {
+            break;
+        }
+        harness.advance(ONE_FRAME);
+    }
+    assert!(!morphed(harness.world()));
+    harness.advance(ONE_FRAME);
+    let morphs_before = log.borrow().morphs.len();
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    assert_eq!(
+        log.borrow().morphs.len(),
+        morphs_before + 1,
+        "cached 50% picture survived the same-frame turn back"
+    );
+}
+
 /// A fresh picture that arrives after the resize turned to another width
 /// shows nowhere: it shows the window at a size its frame no longer heads
 /// to. The turn asks for one at the new width.

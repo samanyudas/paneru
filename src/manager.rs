@@ -200,6 +200,9 @@ pub trait WindowManagerApi: Send + Sync {
     /// Posts `press` again at `point`, where a real mouse's presses enter,
     /// which moves the pointer there.
     fn post_press(&self, press: &SlicePress, point: CGPoint);
+    /// Cancels held press `press_id` in the event tap when replay becomes
+    /// impossible, so later clicks are not swallowed until `GIVE_UP`.
+    fn cancel_press(&self, press_id: u32);
     /// Returns a list of `WinID`s for all windows in a given workspace (space).
     ///
     /// # Arguments
@@ -596,6 +599,10 @@ impl WindowManagerApi for WindowManagerOS {
 
     fn post_press(&self, press: &SlicePress, point: CGPoint) {
         slice_tap::post(press.id, press.button, true, point, press.flags);
+    }
+
+    fn cancel_press(&self, press_id: u32) {
+        slice_tap::cancel_live_press(press_id);
     }
 
     /// Returns a list of `WinID`s for all windows in a given workspace (space).

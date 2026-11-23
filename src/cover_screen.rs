@@ -20,7 +20,9 @@ use objc2_core_graphics::{
     CGPreflightScreenCaptureAccess,
 };
 use objc2_foundation::{NSArray, NSError, NSNumber, NSPoint, NSRect, NSSize, NSString};
-use objc2_quartz_core::{CAKeyframeAnimation, CALayer, CAMediaTiming as _, CATransaction};
+use objc2_quartz_core::{
+    CAKeyframeAnimation, CALayer, CAMediaTiming as _, CATransaction, kCAAnimationDiscrete,
+};
 use objc2_screen_capture_kit::{SCContentFilter, SCShareableContent, SCWindow};
 use tracing::debug;
 
@@ -139,21 +141,40 @@ fn fill_start(picture_width: f64) -> f64 {
     (picture_width - overlap).max(0.0)
 }
 
-/// Per-share opacity for the fill sublayer: opaque only on samples where the
-/// presented width opens past `picture_width`, so translucent pixels inside
-/// the old picture are never altered before widening begins.
-fn fill_opacities(from_width: f64, to_width: f64, picture_width: f64, shares: &[f64]) -> Vec<f64> {
-    shares
-        .iter()
-        .map(|share| {
-            let width = from_width + (to_width - from_width) * share;
-            if width > picture_width + 0.5 {
-                1.0
-            } else {
+/// The normalized time in `(0.0, 1.0]` when the linearly interpolated width
+/// across `shares` crosses `picture_width + 0.5`, paired with whether the
+/// frame is open (`true`) or closed (`false`) after the crossing. `None` when
+/// the width stays on one side of the threshold throughout.
+fn fill_crossing_time(
+    from_width: f64,
+    to_width: f64,
+    picture_width: f64,
+    shares: &[f64],
+) -> Option<(f64, bool)> {
+    let threshold = picture_width + 0.5;
+    let width_at = |share: f64| from_width + (to_width - from_width) * share;
+    let segments = shares.len().checked_sub(1)?;
+    if segments == 0 {
+        return None;
+    }
+    let start_open = width_at(shares[0]) > threshold;
+    for (idx, pair) in shares.windows(2).enumerate() {
+        let w0 = width_at(pair[0]);
+        let w1 = width_at(pair[1]);
+        let open1 = w1 > threshold;
+        if open1 != start_open {
+            let delta = w1 - w0;
+            let frac = if delta.abs() < f64::EPSILON {
                 0.0
-            }
-        })
-        .collect()
+            } else {
+                ((threshold - w0) / delta).clamp(0.0, 1.0)
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let cross = ((idx as f64 + frac) / segments as f64).clamp(0.0, 1.0);
+            return Some((cross, open1));
+        }
+    }
+    None
 }
 
 impl Framed {
@@ -169,8 +190,9 @@ impl Framed {
     /// Sets the frame up to move from `from` to `to` along `shares` over
     /// `duration` seconds, in the strip layer's space: a frame wider than the
     /// picture shows the fill only while its presented width exceeds the
-    /// picture, and one that crops or opens rounds its corners as a window's
-    /// are. A frame of the picture's own size keeps the picture as it is.
+    /// picture, switching discretely at the exact interpolated crossing time,
+    /// and one that crops or opens rounds its corners as a window's are. A
+    /// frame of the picture's own size keeps the picture as it is.
     fn dress(&self, from: CGRect, to: CGRect, shares: &[f64], duration: f64) {
         let widest = from.size.width.max(to.size.width);
         let narrowest = from.size.width.min(to.size.width);
@@ -192,22 +214,19 @@ impl Framed {
                 CGSize::new((widest - start).max(0.0), to.size.height),
             ));
             fill.setHidden(false);
-            let opacities = fill_opacities(
-                from.size.width,
-                to.size.width,
-                self.picture_size.width,
-                shares,
-            );
-            #[allow(clippy::cast_possible_truncation)]
-            let end_opacity = opacities.last().copied().unwrap_or(0.0) as f32;
-            fill.setOpacity(end_opacity);
+            let end_open = to.size.width > self.picture_size.width + 0.5;
+            fill.setOpacity(if end_open { 1.0 } else { 0.0 });
             if duration > 0.0
-                && opacities
-                    .first()
-                    .is_some_and(|first| opacities.iter().any(|v| (v - first).abs() > f64::EPSILON))
+                && let Some((cross_t, open_after)) = fill_crossing_time(
+                    from.size.width,
+                    to.size.width,
+                    self.picture_size.width,
+                    shares,
+                )
             {
+                let (before, after) = if open_after { (0.0, 1.0) } else { (1.0, 0.0) };
                 fill.addAnimation_forKey(
-                    &keyframes("opacity", &opacities, duration),
+                    &discrete_step("opacity", before, after, cross_t, duration),
                     Some(&NSString::from_str(FILL_OPACITY_KEY)),
                 );
             }
@@ -922,6 +941,36 @@ impl CoverScreen for CoverScreenOS {
     }
 }
 
+/// A discrete step animation on `path`: holds `before` for `[0, cross_t)`
+/// and jumps to `after` for `[cross_t, 1]` over `seconds`, with zero linear
+/// interpolation before the crossing instant.
+fn discrete_step(
+    path: &str,
+    before: f64,
+    after: f64,
+    cross_t: f64,
+    seconds: f64,
+) -> Retained<CAKeyframeAnimation> {
+    let values = [NSNumber::new_f64(before), NSNumber::new_f64(after)];
+    let times = [
+        NSNumber::new_f64(0.0),
+        NSNumber::new_f64(cross_t.clamp(0.0, 1.0)),
+        NSNumber::new_f64(1.0),
+    ];
+    let animation = CAKeyframeAnimation::animationWithKeyPath(Some(&NSString::from_str(path)));
+    // SAFETY: an array of numbers is an array of objects.
+    let values: Retained<NSArray> =
+        unsafe { Retained::cast_unchecked(NSArray::from_retained_slice(&values)) };
+    let times = NSArray::from_retained_slice(&times);
+    unsafe {
+        animation.setValues(Some(&values));
+        animation.setKeyTimes(Some(&times));
+        animation.setCalculationMode(kCAAnimationDiscrete);
+    }
+    animation.setDuration(seconds);
+    animation
+}
+
 /// An animation of the number at `path` through `values`, evenly over
 /// `seconds`. It holds nothing at its end: the layer's own value takes over.
 fn keyframes(path: &str, values: &[f64], seconds: f64) -> Retained<CAKeyframeAnimation> {
@@ -1011,7 +1060,7 @@ mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
     use super::{
-        CoverScreenOS, cover_panels, fill_opacities, fill_start, global_rect, live_panels,
+        CoverScreenOS, cover_panels, fill_crossing_time, fill_start, global_rect, live_panels,
     };
 
     /// A press on a picture lands on its window at the same point in the
@@ -1085,10 +1134,12 @@ mod tests {
         assert_eq!(fill_start(16.0), 8.0);
         assert_eq!(fill_start(400.0), 390.0);
 
-        // Turning from narrower than picture to wider keeps fill transparent
-        // until the presented width actually exceeds the picture width.
-        let ops = fill_opacities(180.0, 220.0, 200.0, &[0.0, 0.25, 0.5, 0.75, 1.0]);
-        assert_eq!(ops, vec![0.0, 0.0, 0.0, 1.0, 1.0]);
+        // Segment [198, 206] for a 200-pt picture (threshold 200.5) crosses
+        // at 2.5/8 = 0.3125 of segment 1 of 3 -> (1 + 0.3125)/3 = 0.4375.
+        let cross = fill_crossing_time(180.0, 220.0, 200.0, &[0.0, 0.45, 0.65, 1.0]);
+        let (t, open_after) = cross.expect("crosses threshold");
+        assert!(open_after);
+        assert!((t - (1.0 + 2.5 / 8.0) / 3.0).abs() < 1e-9, "got {t}");
         let _ = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1.0, 1.0));
     }
 }
