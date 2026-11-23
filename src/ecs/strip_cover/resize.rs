@@ -41,7 +41,7 @@ use super::{
 use crate::config::Config;
 use crate::ecs::drag::DragState;
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::maximize::MaximizeMorph;
+use crate::ecs::maximize::{MaximizeMorph, RefusingWidth};
 use crate::ecs::pacing::ShownFrames;
 use crate::ecs::slice_photos::Photo;
 use crate::ecs::systems::AnimationStep;
@@ -95,6 +95,13 @@ impl Reframe {
 /// takes 50 to 140 ms to lay out and draw a window several times wider, and
 /// the window server shows it a frame or two later.
 const OPEN_WAIT: f64 = 0.25;
+
+/// How long a maximize's cover waits at most once the window's app has
+/// answered with a narrower frame than asked, in seconds of animation steps.
+/// Such an app refuses the width, and the engine undoes the maximize within
+/// a few frames, so the pictures never move toward a frame the window will
+/// not take.
+const REFUSED_WAIT: f64 = 0.8;
 
 /// Where a resize's cover is.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -863,9 +870,11 @@ fn shows_new_frame(
 /// Starts each waiting morph once the windows it waits for show their new
 /// frames, with their frames open onto them. One that has waited
 /// [`OPEN_WAIT`] starts as any other resize does, onto pictures and a fill.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn start_waiting_morphs(
     mut morphs: Query<&mut CoverMorph>,
     frames: Query<(&Window, &Position, &Bounds)>,
+    refusing: Query<(), With<RefusingWidth>>,
     shown_frames: Option<Res<ShownFrames>>,
     photos: Res<CoverPhotos>,
     time: Res<Time>,
@@ -888,7 +897,16 @@ pub(super) fn start_waiting_morphs(
             .iter()
             .filter(|frame| morph.open.contains(&frame.id))
             .all(|frame| shows_new_frame(frame, &frames, shown_frames.as_deref()));
-        if !ready && waited < OPEN_WAIT {
+        // An app that answered with a narrower frame refuses the width: the
+        // pictures rest on while the engine undoes the maximize.
+        let refused = !ready
+            && morph
+                .frames
+                .iter()
+                .filter(|frame| morph.open.contains(&frame.id))
+                .any(|frame| refusing.contains(frame.entity));
+        let limit = if refused { REFUSED_WAIT } else { OPEN_WAIT };
+        if !ready && waited < limit {
             morph.stage = Stage::Waiting { waited };
             continue;
         }

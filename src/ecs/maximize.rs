@@ -26,7 +26,7 @@ use std::time::Duration;
 use bevy::app::{App, Plugin, PostUpdate, PreUpdate, Update};
 use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _};
 use bevy::ecs::component::Component;
-use bevy::ecs::entity::Entity;
+use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
@@ -98,6 +98,29 @@ pub(crate) struct FloatingMaximized {
 pub(crate) struct FrameHold {
     until: Duration,
 }
+
+/// A tiled window whose app refused the width of a maximized column on a
+/// display whose usable area was `viewport` points. It would sit at the
+/// column's left edge with the desktop showing beside it, so its maximize
+/// was undone, and it is not maximized again while the area is that size.
+#[derive(Component, Clone, Copy, Debug)]
+pub(crate) struct MaximizeRefused {
+    viewport: IVec2,
+}
+
+/// A tiled window whose app last answered a finished write of its maximized
+/// frame with a narrower one. A picture cover that waits for the window to
+/// show that frame rests on instead of moving toward it.
+#[derive(Component, Clone, Copy, Debug)]
+pub(crate) struct RefusingWidth;
+
+/// How many times in a row a maximized tiled window answers a finished
+/// write with a narrower frame before its app counts as refusing the width.
+const REFUSALS: u8 = 2;
+
+/// How much narrower than asked a frame is before it counts as a refusal,
+/// in points.
+const REFUSED_SLACK: i32 = 2;
 
 /// One-frame marker on a [`LayoutStrip`] whose layout just changed due to a
 /// tiled maximize or restore toggle. Consumed by `strip_cover::resize` so the
@@ -285,6 +308,7 @@ type Toggles<'w, 's> = Query<
         &'static mut Bounds,
         Option<&'static Unmanaged>,
         Option<&'static FloatingMaximized>,
+        Option<&'static MaximizeRefused>,
     ),
 >;
 
@@ -301,7 +325,8 @@ fn toggle_maximize(
     mut commands: Commands,
 ) {
     let ToggleMaximize { entity, at } = *toggle;
-    let Ok((mut window, mut position, mut bounds, unmanaged, maximized)) = windows.get_mut(entity)
+    let Ok((mut window, mut position, mut bounds, unmanaged, maximized, refused)) =
+        windows.get_mut(entity)
     else {
         return;
     };
@@ -328,6 +353,15 @@ fn toggle_maximize(
             return;
         };
         let viewport = display.actual_display_bounds(dock, &config);
+        if strip.maximized(entity).is_none()
+            && refused.is_some_and(|refused| refused.viewport == viewport.size())
+        {
+            debug!("no maximize: the window's app refused this width before");
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<FrameHold>();
+            }
+            return;
+        }
         let frame = IRect::from_corners(position.0, position.0 + bounds.0);
         toggle_tiled(
             entity,
@@ -606,13 +640,24 @@ type Held<'w, 's> = Query<
 /// Puts a window back at the frame its last toggle gave it whenever the
 /// window shows another frame until the hold ends, such as after the app's
 /// own zoom.
+///
+/// A tiled window that keeps answering its maximized frame with a narrower
+/// one has an app that refuses the width, as System Settings does. Its
+/// maximize is undone, so it goes back to its column instead of standing at
+/// the left of an empty one, and [`MaximizeRefused`] keeps it there.
+#[allow(clippy::too_many_arguments)]
 fn hold_frames(
     mut windows: Held,
+    mut strips: Query<(Entity, &mut LayoutStrip, &ChildOf)>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
     gesture: Res<PointerResize>,
+    config: Res<Config>,
     time: Res<Time>,
+    mut refusals: Local<EntityHashMap<u8>>,
     mut commands: Commands,
 ) {
     let now = time.elapsed();
+    refusals.retain(|entity, _| windows.contains(*entity));
     for (entity, mut window, position, bounds, maximized, hold) in &mut windows {
         // Wait until the toggle frame's layout and animate passes have committed
         // the new target frame; otherwise `UpdateSet::Events` sees the old
@@ -633,8 +678,17 @@ fn hold_frames(
             || IRect::from_corners(position.0, position.0 + bounds.0),
             |maximized| maximized.frame,
         );
-        if let Ok(frame) = window.update_frame()
-            && frame != target
+        let Ok(frame) = window.update_frame() else {
+            continue;
+        };
+        if frame == target {
+            if refusals.remove(&entity).is_some()
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_remove::<RefusingWidth>();
+            }
+            continue;
+        }
         {
             // The user's edge resize is no zoom to undo. The hold ends here,
             // before the frame update, which takes the new size.
@@ -644,6 +698,31 @@ fn hold_frames(
                 }
                 continue;
             }
+            if maximized.is_none() && frame.width() + REFUSED_SLACK < target.width() {
+                let refused = refusals.entry(entity).or_default();
+                *refused += 1;
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(RefusingWidth);
+                }
+                if *refused >= REFUSALS
+                    && undo_refused_maximize(
+                        entity,
+                        (frame.width(), target.width()),
+                        now,
+                        &mut strips,
+                        &displays,
+                        &config,
+                        &mut commands,
+                    )
+                {
+                    refusals.remove(&entity);
+                    continue;
+                }
+            } else if refusals.remove(&entity).is_some()
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_remove::<RefusingWidth>();
+            }
             debug!(
                 "holding window {} at {target:?}, from {frame:?}",
                 window.id()
@@ -651,6 +730,67 @@ fn hold_frames(
             approach(&mut window, frame, target);
         }
     }
+}
+
+/// Undoes the maximize of tiled window `entity`, whose app took `widths.0`
+/// points of the `widths.1` its maximized column asked for. Returns `false`
+/// when the window is not maximized in a strip.
+fn undo_refused_maximize(
+    entity: Entity,
+    widths: (i32, i32),
+    now: Duration,
+    strips: &mut Query<(Entity, &mut LayoutStrip, &ChildOf)>,
+    displays: &Query<(&Display, Option<&DockPosition>)>,
+    config: &Config,
+    commands: &mut Commands,
+) -> bool {
+    let Some((strip_entity, mut strip, child_of)) = strips
+        .iter_mut()
+        .find(|(_, strip, _)| strip.maximized(entity).is_some())
+    else {
+        return false;
+    };
+    let Ok((display, dock)) = displays.get(child_of.parent()) else {
+        return false;
+    };
+    let viewport = display.actual_display_bounds(dock, config);
+    let limit = effective_stack_limit(config, viewport.height());
+    let Some(restored) = restore_tiled(
+        entity,
+        &mut strip,
+        RestoreTo::Home { limit },
+        viewport,
+        commands,
+    ) else {
+        return false;
+    };
+    debug!(
+        "window {entity} takes {} of the {} points of its maximized column: maximize undone",
+        widths.0, widths.1
+    );
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands
+            .try_insert((
+                WidthRun {
+                    anchor: restored.anchor,
+                },
+                MaximizeRefused {
+                    viewport: viewport.size(),
+                },
+                // The frame it returns to is held as a restore's is: macOS
+                // can ignore the small shrink back from the maximized height,
+                // which the layout would otherwise take for a resize by hand.
+                FrameHold {
+                    until: now + FRAME_HOLD,
+                },
+            ))
+            .try_remove::<RefusingWidth>();
+    }
+    if let Ok(mut strip_commands) = commands.get_entity(strip_entity) {
+        strip_commands.try_insert(MaximizeMorph);
+    }
+    commands.reshuffle_around(entity);
+    true
 }
 
 /// Writes `target` to a window that shows `from`. A window that must get

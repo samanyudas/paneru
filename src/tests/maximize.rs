@@ -104,6 +104,55 @@ fn a_title_bar_double_click_maximizes_and_the_next_restores() {
     assert_eq!(frames(&harness, &[0, 1, 2]), before);
 }
 
+/// Whether window `id` is maximized in its strip.
+fn is_maximized(harness: &mut TestHarness, id: WinID) -> bool {
+    let world = harness.world();
+    let entity = world
+        .query::<(Entity, &Window)>()
+        .iter(world)
+        .find(|(_, window)| window.id() == id)
+        .map(|(entity, _)| entity)
+        .expect("window not found");
+    world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .any(|strip| strip.maximized(entity).is_some())
+}
+
+/// An app that refuses the width of a maximized column, as System Settings
+/// does, would stand at the column's left edge with the desktop beside it.
+/// Its maximize is undone: it goes back to its column, and the next toggle
+/// leaves it there.
+#[test]
+fn a_window_that_refuses_the_maximized_width_goes_back_to_its_column() {
+    let mut harness = three_windows();
+    let before = frames(&harness, &[0, 1, 2]);
+    let limit = Size::new(before[0].width() + 40, 4000);
+    harness
+        .mock_state
+        .update_window(0, |window| window.maximum_size = Some(limit));
+
+    harness.run(vec![command(Operation::Maximize)]);
+    harness.advance(SETTLE);
+    assert!(
+        !is_maximized(&mut harness, 0),
+        "the maximize the app refused is undone"
+    );
+    assert_eq!(
+        frames(&harness, &[0, 1, 2]),
+        before,
+        "every window is back where it was"
+    );
+
+    harness.run(vec![command(Operation::Maximize)]);
+    harness.advance(SETTLE);
+    assert!(
+        !is_maximized(&mut harness, 0),
+        "the window is not maximized again"
+    );
+    assert_eq!(frames(&harness, &[0, 1, 2]), before);
+}
+
 /// Sends `window <verb>` as a key binding or the command line does, and
 /// lets it settle.
 fn run_window_verb(harness: &mut TestHarness, verb: &str) {
