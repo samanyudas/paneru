@@ -45,7 +45,7 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::shared_edge::Slide;
 use crate::ecs::systems::ease_step;
 use crate::ecs::{
-    Bounds, FocusedMarker, InstantMotion, Position, PresentedOrigin, RepositionMarker, ResizeMarker,
+    Bounds, FocusedMarker, Position, PresentedOrigin, RepositionMarker, ResizeMarker, ResizeMotion,
 };
 use crate::events::Event;
 use crate::manager::window_writer::LANDING_TIMEOUT;
@@ -546,7 +546,7 @@ type RowWindows<'w, 's> = Query<
         Option<&'static PositionEase>,
         Option<&'static SlideEase>,
         Option<(&'static Slide, &'static PresentedOrigin)>,
-        Has<InstantMotion>,
+        Has<ResizeMotion>,
     ),
 >;
 
@@ -611,24 +611,20 @@ pub(super) fn pace_rows(
 
     let now = time.elapsed();
     let duration = ease::duration(&config);
-    let first_t = ease::first_share(duration);
-    let animates = ease::animates(duration);
+    let resize_duration = ease::resize_duration(&config);
+    let steps = Steps {
+        first_t: ease::first_share(duration),
+        animates: ease::animates(duration),
+        resize_first_t: ease::Curve::EaseOut.first_share(resize_duration),
+        resize_animates: ease::animates(resize_duration),
+    };
     for row in rows {
         let mut row = row
             .into_iter()
             .map(|column| {
                 column
                     .into_iter()
-                    .filter_map(|entity| {
-                        member(
-                            entity,
-                            &windows,
-                            &shown,
-                            &mut tracked,
-                            (first_t, animates),
-                            now,
-                        )
-                    })
+                    .filter_map(|entity| member(entity, &windows, &shown, &mut tracked, steps, now))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -674,9 +670,20 @@ pub(super) fn pace_rows(
     }
 }
 
-/// The row window `entity` as pacing sees it this frame, with `first_t` the
-/// share of a slide's first step, `animates` whether a motion takes more
-/// than one step, and `tracked` what the engine has seen of each app. Each
+/// How a motion's first frame steps: the share of its distance it covers,
+/// and whether it takes more than one step, for the spring and for a
+/// resize's ease-out.
+#[derive(Clone, Copy)]
+struct Steps {
+    first_t: f32,
+    animates: bool,
+    resize_first_t: f32,
+    resize_animates: bool,
+}
+
+/// The row window `entity` as pacing sees it this frame, with `steps` how
+/// the first frame of its motion steps, and `tracked` what the engine has
+/// seen of each app. Each
 /// window's own ease gives the share of what is left that it steps by this
 /// frame: its move's, or its photo's while it slides.
 fn member(
@@ -684,14 +691,17 @@ fn member(
     windows: &RowWindows,
     shown: &Shown,
     tracked: &mut EntityHashMap<Tracked>,
-    (first_t, animates): (f32, bool),
+    steps: Steps,
     now: Duration,
 ) -> Option<Member> {
-    let (window, position, bounds, to, resize, position_ease, slide_ease, slide, instant) =
+    let (window, position, bounds, to, resize, position_ease, slide_ease, slide, resizing) =
         windows.get(entity).ok()?;
-    // A window that a resize moves at once takes its whole move as its first
-    // step, as with animation off.
-    let first_t = if instant { 1.0 } else { first_t };
+    // A window that a resize moves steps on the resize's own curve.
+    let (first_t, animates) = if resizing {
+        (steps.resize_first_t, steps.resize_animates)
+    } else {
+        (steps.first_t, steps.animates)
+    };
     let id = window.id();
     let asked = Edges::from(window.frame());
     let shown_edges = shown

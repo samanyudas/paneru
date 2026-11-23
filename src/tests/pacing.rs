@@ -977,27 +977,88 @@ fn engine_frames(world: &mut World) -> Vec<IRect> {
     (0..3).map(|id| engine_frame(world, id)).collect()
 }
 
-/// A width command moves the row to its new layout without easing there:
-/// once each app has shown the first frame, every window has its final
-/// frame. The slow window 1 still sets when its neighbours may follow.
+/// Where windows 0, 1 and 2 land after a width command, from [`harness`].
+fn resized_row() -> Vec<IRect> {
+    let mut harness = harness();
+    harness
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    settle(&mut harness);
+    engine_frames(harness.world())
+}
+
+/// A width command eases the row to its new layout on a short ease-out: its
+/// first frame covers a large share of the way, so it answers the key at
+/// once, and the row lands within a few frames, sooner than a spring motion.
 #[test]
-fn a_resize_takes_its_new_layout_at_once() {
+fn a_resize_eases_out_quickly() {
+    let end = resized_row();
     let mut harness = harness();
     let start = engine_frames(harness.world());
+    assert_ne!(start, end, "the resize changes the row");
 
     harness
         .world()
         .write_message(window(Operation::Resize(ResizeDirection::Grow)));
-    harness.advance(FRAME);
-    land_slow_writes(&mut harness);
-    harness.advance(FRAME);
-    let early = engine_frames(harness.world());
+    let mut rows = Vec::new();
+    for _ in 0..8 {
+        harness.advance(FRAME);
+        land_slow_writes(&mut harness);
+        rows.push(engine_frames(harness.world()));
+    }
+
+    // Window 1 slides left by the width window 0 gives up.
+    let distance = f64::from(start[1].min.x - end[1].min.x);
+    let first = f64::from(start[1].min.x - rows[0][1].min.x) / distance;
+    assert!(
+        (0.3..0.95).contains(&first),
+        "window 1 covered {first:.2} of its way in the first frame: {rows:?}"
+    );
+    assert!(
+        rows.windows(2)
+            .all(|pair| pair[1][1].min.x <= pair[0][1].min.x),
+        "window 1 never moves back: {rows:?}"
+    );
+    assert!(
+        rows.contains(&end),
+        "the row landed within 8 frames: {rows:?}"
+    );
+}
+
+/// A second width command mid-resize heads on to the next width from where
+/// the row is, with no desktop between the windows on any frame.
+#[test]
+fn a_second_resize_mid_motion_heads_on_without_gaps() {
+    let mut harness = harness();
+    let rest = gap(&harness, 0, 1);
+    let start = harness.mock_state.ax_frame(0);
+    harness
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    for _ in 0..2 {
+        harness.advance(FRAME);
+        land_slow_writes(&mut harness);
+    }
+    harness
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    for frame in 0..10 {
+        harness.advance(FRAME);
+        land_slow_writes(&mut harness);
+        assert!(
+            gap(&harness, 0, 1) <= rest,
+            "desktop shows between windows 0 and 1 after frame {frame}: {:?} {:?}",
+            harness.mock_state.ax_frame(0),
+            harness.mock_state.ax_frame(1)
+        );
+    }
     settle(&mut harness);
     assert_landed(&mut harness);
-
-    let end = engine_frames(harness.world());
-    assert_ne!(start, end, "the resize changed the row");
-    assert_eq!(early, end, "the row had its new layout after two frames");
+    assert_ne!(
+        harness.mock_state.ax_frame(0).width(),
+        start.width(),
+        "window 0 has a new width"
+    );
 }
 
 /// A motion after a resize, such as a focus move, still eases.

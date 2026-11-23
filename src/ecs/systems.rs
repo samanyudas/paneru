@@ -22,7 +22,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     AccessibilityProbe, ActiveDisplayMarker, AwaitingAccessibility, BProcess, ExistingMarker,
-    FreshMarker, InstantMotion, RepositionMarker, ResizeMarker, RetryFrontSwitch,
+    FreshMarker, RepositionMarker, ResizeMarker, ResizeMotion, RetryFrontSwitch,
     SpawnWindowTrigger, Timeout, VerifyWindowPosition, VerifyWindowSize,
 };
 
@@ -754,27 +754,37 @@ pub(crate) fn ease_step(current: Origin, target: Origin, t: f32) -> (Origin, boo
     }
 }
 
-/// Each moving entity, its ease, and whether it moves at once.
+/// The curve and duration of a motion: a resize's short ease-out, or the
+/// spring.
+fn motion_curve(resizing: bool, config: &Config) -> (ease::Curve, f64) {
+    if resizing {
+        (ease::Curve::EaseOut, ease::resize_duration(config))
+    } else {
+        (ease::Curve::Spring, ease::duration(config))
+    }
+}
+
+/// Each moving entity, its ease, and whether a resize moves it.
 type Moves = (
     &'static mut Position,
     Entity,
     Ref<'static, RepositionMarker>,
     &'static mut PositionEase,
-    Has<InstantMotion>,
+    Has<ResizeMotion>,
 );
 
-/// Each resizing entity, its ease, and whether it resizes at once.
+/// Each resizing entity, its ease, and whether a resize moves it.
 type Resizes = (
     &'static mut Bounds,
     Entity,
     Ref<'static, ResizeMarker>,
     &'static mut SizeEase,
-    Has<InstantMotion>,
+    Has<ResizeMotion>,
 );
 
-/// An entity whose instant motion has no move or resize left.
-type InstantMotionsDone = (
-    With<InstantMotion>,
+/// An entity whose resize motion has no move or resize left.
+type ResizeMotionsDone = (
+    With<ResizeMotion>,
     Without<RepositionMarker>,
     Without<ResizeMarker>,
 );
@@ -796,12 +806,12 @@ pub(super) fn animate_entities(
     time: Res<Time>,
     config: Res<Config>,
 ) {
-    let eased = ease::duration(&config);
     let now = time.elapsed_secs_f64();
-    for (mut position, entity, marker, mut ease, instant) in animate {
-        let duration = if instant { 0.0 } else { eased };
+    for (mut position, entity, marker, mut ease, resizing) in animate {
+        let (curve, duration) = motion_curve(resizing, &config);
         let RepositionMarker(origin) = *marker;
-        let t = ease.0.step(
+        let t = ease.0.step_on(
+            curve,
             position.0,
             origin,
             marker.is_added(),
@@ -845,12 +855,12 @@ pub(super) fn animate_resize_entities(
     time: Res<Time>,
     config: Res<Config>,
 ) {
-    let eased = ease::duration(&config);
     let now = time.elapsed_secs_f64();
-    for (mut bounds, entity, marker, mut ease, instant) in animate {
-        let duration = if instant { 0.0 } else { eased };
+    for (mut bounds, entity, marker, mut ease, resizing) in animate {
+        let (curve, duration) = motion_curve(resizing, &config);
         let ResizeMarker(size) = *marker;
-        let t = ease.0.step(
+        let t = ease.0.step_on(
+            curve,
             bounds.0,
             size,
             marker.is_added(),
@@ -881,14 +891,14 @@ pub(super) fn finish_resizes(
     }
 }
 
-/// Ends the [`InstantMotion`] of each entity with no move or resize left.
-pub(super) fn finish_instant_motions(
-    done: Populated<Entity, InstantMotionsDone>,
+/// Ends the [`ResizeMotion`] of each entity with no move or resize left.
+pub(super) fn finish_resize_motions(
+    done: Populated<Entity, ResizeMotionsDone>,
     mut commands: Commands,
 ) {
     for entity in &done {
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_remove::<InstantMotion>();
+            entity_commands.try_remove::<ResizeMotion>();
         }
     }
 }

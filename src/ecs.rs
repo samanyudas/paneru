@@ -334,7 +334,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             pacing::pace_rows.run_if(not(resource_exists::<Initializing>)),
             systems::finish_repositions,
             systems::finish_resizes,
-            systems::finish_instant_motions,
+            systems::finish_resize_motions,
             systems::commit_window_frame.run_if(not(resource_exists::<Initializing>)),
             systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
             triggers::window_resize_verifier,
@@ -931,13 +931,14 @@ pub(crate) struct WidthRun {
     pub(crate) anchor: WidthAnchor,
 }
 
-/// A window, or a strip, that a width command just moved. It takes the new
-/// layout in one step instead of easing there, so a resize shows each app at
-/// its new size at once rather than as a slow ease of late frames. Pacing still
-/// holds a window beside a slower one until that one shows its move. Removed
-/// once the entity has neither a move nor a resize left.
+/// A window, or a strip, that a width command just moved. It eases to the
+/// new layout on the short [`ease::Curve::EaseOut`] instead of the spring, so
+/// a resize answers the key at once and lands in about 100 ms: a slower
+/// resize gives each app's late frames time to overlap their neighbours.
+/// Pacing still holds a window beside a slower one until that one shows its
+/// move. Removed once the entity has neither a move nor a resize left.
 #[derive(Component)]
-pub(crate) struct InstantMotion;
+pub(crate) struct ResizeMotion;
 
 /// A width command's finite request for native readback and anchored placement.
 #[derive(Component)]
