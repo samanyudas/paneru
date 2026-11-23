@@ -3329,6 +3329,74 @@ fn a_background_picture_in_the_frame_of_a_title_change_never_starts_a_cover() {
     );
 }
 
+/// Runs frames, answering every picture of a window the background refresh
+/// asks for, until it asks for a picture of a desktop, which it returns
+/// unanswered.
+fn a_background_desktop_ask(harness: &mut TestHarness, log: &ScreenLog) -> (CoverSubject, u32) {
+    let mut answered = log.borrow().asked.len();
+    for _ in 0..2000 {
+        harness.advance(ONE_FRAME);
+        let asked = log.borrow().asked.clone();
+        for &(subject, generation) in &asked[answered..] {
+            match subject {
+                CoverSubject::Desktop(_) => return (subject, generation),
+                CoverSubject::Window(id) => answer(harness, id, generation),
+            }
+        }
+        answered = asked.len();
+    }
+    panic!("the background refresh asks for the desktop");
+}
+
+/// A refusal of pictures in a frame keeps nothing that frame, even a
+/// background picture that arrives after it. The refusal cleared the
+/// pictures, and the background picture came in after it while the engine
+/// had no leave to take any.
+#[test]
+fn a_refusal_keeps_no_picture_that_arrives_after_it() {
+    let (mut harness, log) = harness(padded_resize_config());
+    let rest = window_1_at_rest_with_pictures(&mut harness, &log);
+    let (desktop, background) = a_background_desktop_ask(&mut harness, &log);
+
+    let since = log.borrow().window_asks.len();
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "the maximize runs under a cover");
+    let (_, _, fresh) = window_asks_since(&log, since)
+        .into_iter()
+        .find(|&(id, size, _)| id == 1 && size.x > rest.width())
+        .expect("a fresh picture of window 1 maximized");
+
+    send(
+        &mut harness,
+        Event::CoverPhoto {
+            subject: CoverSubject::Window(1),
+            generation: fresh,
+            result: Err(crate::ecs::slice_photos::PhotoError::Refused),
+        },
+    );
+    send(
+        &mut harness,
+        Event::CoverPhoto {
+            subject: desktop,
+            generation: background,
+            result: Ok(Photo {
+                digest: Digest(u64::from(background)),
+                image: pixel(),
+                edge_color: None,
+            }),
+        },
+    );
+    harness.app.update();
+    assert!(
+        harness
+            .world()
+            .resource::<crate::ecs::strip_cover::CoverPhotos>()
+            .kept_nothing(),
+        "no picture is kept after the refusal"
+    );
+}
+
 /// A resize's fresh picture that arrives in the frame the window's title
 /// changes shows the old title: the cover drops it, shows nothing of it,
 /// and asks for a picture of the new title.
