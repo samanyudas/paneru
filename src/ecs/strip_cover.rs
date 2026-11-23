@@ -323,21 +323,32 @@ impl CoverPhotos {
             .map(|kept| &kept.photo)
     }
 
-    /// The picture of window `id` at `size`, a size it had before its
-    /// current one and now heads back to, if it is recent enough: younger
-    /// than [`PREVIOUS_KEEP`] when it `replaces` the window's picture on
-    /// the cover, being no smaller, and than [`PREVIOUS_SHRINK_KEEP`] when
-    /// it lies over that larger picture.
+    /// A kept picture of window `id` at `size`, the size it heads to, if it
+    /// is recent enough: younger than [`PREVIOUS_KEEP`] when it `replaces`
+    /// the window's picture on the cover, being no smaller, and than
+    /// [`PREVIOUS_SHRINK_KEEP`] when it lies over that larger picture. The
+    /// picture of the size it had before its current one comes first, then
+    /// its current one, which a turn back to where a resize began finds
+    /// before a fresh picture of the new size replaces it, unless the
+    /// window's title changed since.
     fn heading(&self, id: WinID, size: IVec2, replaces: bool, now: Duration) -> Option<&Photo> {
         let keep = if replaces {
             PREVIOUS_KEEP
         } else {
             PREVIOUS_SHRINK_KEEP
         };
+        let usable = |kept: &&Kept| close(kept.size, size) && now.saturating_sub(kept.taken) < keep;
+        let current = || {
+            self.windows.get(&id).filter(usable).filter(|kept| {
+                self.retitled
+                    .get(&id)
+                    .is_none_or(|retitled| kept.taken >= *retitled)
+            })
+        };
         self.previous
             .get(&id)
-            .filter(|kept| close(kept.size, size))
-            .filter(|kept| now.saturating_sub(kept.taken) < keep)
+            .filter(usable)
+            .or_else(current)
             .map(|kept| &kept.photo)
     }
 

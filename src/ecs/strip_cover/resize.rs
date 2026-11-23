@@ -135,6 +135,11 @@ pub(crate) struct CoverMorph {
     /// The size each window's picture on the cover shows it at: where it
     /// rested, until a fresh picture replaces it.
     pictured: Vec<(Entity, IVec2)>,
+    /// The size of the picture each window's frame on the cover holds:
+    /// `pictured`, or that of a kept picture of the size the frame heads
+    /// to that took its place. Only a fresh picture counts in `pictured`,
+    /// so the cover still asks for one, while a turn goes by this.
+    backed: Vec<(Entity, IVec2)>,
     /// Each window's active fresh-picture ask for its current target size,
     /// paired with that ask's generation. Cleared for a window whenever a
     /// turn changes its target size.
@@ -200,6 +205,22 @@ impl CoverMorph {
             .iter()
             .find(|(pictured, _)| *pictured == entity)
             .map(|(_, size)| *size)
+    }
+
+    /// The size of the picture window `entity`'s frame on the cover holds.
+    fn backed(&self, entity: Entity) -> Option<IVec2> {
+        self.backed
+            .iter()
+            .find(|(backed, _)| *backed == entity)
+            .map(|(_, size)| *size)
+    }
+
+    /// Notes that window `entity`'s frame on the cover holds a picture of
+    /// `size` now.
+    fn back(&mut self, entity: Entity, size: IVec2) {
+        if let Some((_, backed)) = self.backed.iter_mut().find(|(backed, _)| *backed == entity) {
+            *backed = size;
+        }
     }
 
     /// How long the morph lasts.
@@ -644,7 +665,7 @@ pub(super) fn cover_resizes(
                     guard,
                     &mut commands,
                 ));
-                head_pictures(&morph, &mut *screen.0, &photos, time.elapsed(), &[]);
+                head_pictures(&mut morph, &mut *screen.0, &photos, time.elapsed(), &[]);
                 screen
                     .0
                     .morph(morph.display, &morph.sent(), &morph.shares(), PATH_STEP);
@@ -782,7 +803,7 @@ pub(super) fn cover_resizes(
         let pictured = frames
             .iter()
             .map(|frame| (frame.entity, frame.from.size()))
-            .collect();
+            .collect::<Vec<_>>();
         let mut morph = CoverMorph {
             display: display.id(),
             bounds: display.bounds(),
@@ -790,6 +811,7 @@ pub(super) fn cover_resizes(
             area,
             frames,
             hid: Vec::new(),
+            backed: pictured.clone(),
             pictured,
             refresh_ask: Vec::new(),
             pending_unveil: Vec::new(),
@@ -832,7 +854,7 @@ pub(super) fn cover_resizes(
             Vec::new()
         };
         if morph.open.is_empty() {
-            launch(&morph, &mut *screen.0, &photos, now, &[]);
+            launch(&mut morph, &mut *screen.0, &photos, now, &[]);
         } else {
             morph.stage = Stage::Waiting { waited: 0.0 };
         }
@@ -848,7 +870,7 @@ pub(super) fn cover_resizes(
 /// that grows still gets a fresh picture once it shows its new frame, which
 /// takes that one's place unseen.
 fn launch(
-    morph: &CoverMorph,
+    morph: &mut CoverMorph,
     screen: &mut dyn CoverScreen,
     photos: &CoverPhotos,
     now: Duration,
@@ -866,29 +888,32 @@ fn launch(
 /// of `open`. A turn sends a morph of its own, which shows only the
 /// pictures given for it, so it gives them again.
 fn head_pictures(
-    morph: &CoverMorph,
+    morph: &mut CoverMorph,
     screen: &mut dyn CoverScreen,
     photos: &CoverPhotos,
     now: Duration,
     open: &[WinID],
 ) {
-    for frame in &morph.frames {
-        // The picture on the cover shows the window at `pictured`, whatever
-        // the frame does on the way: a frame that heads to another size
-        // shows the window as it was at that size, even when a turn only
-        // moves it, as a focus key does once a restore has its size.
-        let Some(pictured) = morph.pictured(frame.entity) else {
+    for frame in morph.frames.clone() {
+        // The frame holds a picture of the window at `backed`, whatever the
+        // frame does on the way: a frame that heads to another size shows
+        // the window as it was at that size, even when a turn only moves
+        // it, as a focus key does once a restore has its size.
+        let Some(backed) = morph.backed(frame.entity) else {
             continue;
         };
         let to = frame.to.size();
         // Laid over a larger picture, rather than in its place, it is kept
         // for less time: see `CoverPhotos::heading`.
-        let replaces = to.x >= pictured.x && to.y >= pictured.y;
-        if !close(to, pictured)
+        let replaces = to.x >= backed.x && to.y >= backed.y;
+        if !close(to, backed)
             && !open.contains(&frame.id)
             && let Some(photo) = photos.heading(frame.id, to, replaces, now)
             && screen.head_picture(morph.display, frame.id, to, photo)
         {
+            if replaces {
+                morph.back(frame.entity, to);
+            }
             debug!(
                 "cover over a resize shows window {} as it was at {}",
                 frame.id,
@@ -974,7 +999,7 @@ pub(super) fn start_waiting_morphs(
             morph.open.clear();
         }
         let open = morph.open.clone();
-        launch(&morph, &mut *screen.0, &photos, now, &open);
+        launch(&mut morph, &mut *screen.0, &photos, now, &open);
         morph.counted = 0.0;
         morph.elapsed = 0.0;
         morph.stage = Stage::Moving;
@@ -1314,6 +1339,7 @@ fn unveil_ready_pictures(morphs: &mut Query<&mut CoverMorph>, screen: &mut dyn s
                 .is_some_and(|pictured| fits.x > pictured.x || fits.y > pictured.y)
             {
                 if screen.replace_picture(morph.display, id, fits, &photo) {
+                    morph.back(entity, fits);
                     if let Some((_, pictured)) = morph
                         .pictured
                         .iter_mut()

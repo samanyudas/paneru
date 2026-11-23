@@ -2977,6 +2977,55 @@ fn a_moved_restore_at_its_size_still_shows_the_window_as_it_was() {
     assert_eq!(log.borrow().headed_before.last().copied(), Some(morphs));
 }
 
+/// A restore right after a maximize that showed the window's kept
+/// maximized picture, before a fresh one arrives, shows the window as it
+/// was before the maximize. The cover took the frame to hold its picture
+/// from before the maximize still, and showed the maximized one cropped.
+#[test]
+fn a_restore_right_after_a_headed_maximize_shows_the_window_as_it_was() {
+    let (mut harness, log) = harness(padded_resize_config());
+    let rest = maximized_with_its_picture(&mut harness, &log);
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    shown_frames_of(&mut harness, &[1]);
+    // Pictures of window 1 at rest, so the maximized one is kept as the
+    // size it had before.
+    take_pictures(&mut harness, &log);
+    let maximized = {
+        let screen = log.borrow();
+        screen
+            .window_asks
+            .iter()
+            .map(|(_, size, _)| *size)
+            .find(|size| size.x > rest.width())
+            .expect("a picture of window 1 maximized")
+    };
+
+    let since = log.borrow().window_asks.len();
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert_eq!(
+        log.borrow().headed.last().copied(),
+        Some((1, maximized)),
+        "the maximize shows window 1's kept maximized picture"
+    );
+    harness.advance(ONE_FRAME);
+    assert!(
+        window_asks_since(&log, since)
+            .iter()
+            .any(|&(id, size, _)| id == 1 && size == maximized),
+        "and still asks for a fresh one"
+    );
+
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert_eq!(
+        log.borrow().headed.last().copied(),
+        Some((1, rest.size())),
+        "the restore shows window 1 as it was"
+    );
+}
+
 /// A restore a minute or more after its window's picture from before the
 /// maximize was taken does not show it: laid over the maximized window's
 /// picture, it shows content that may have changed since, as a page that
