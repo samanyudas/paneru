@@ -204,7 +204,120 @@ fn fill_crossing_time(
     None
 }
 
+/// How a picture of the size a frame heads to goes with the picture in the
+/// frame, of size `shown`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Heading {
+    /// No smaller either way: it takes the frame's picture's place.
+    Replaces,
+    /// No larger either way: it lies over the frame's picture's top left
+    /// corner.
+    Overlays,
+}
+
+impl Heading {
+    /// How a picture of `heading` points goes with one of `shown` points,
+    /// or `None` when it is wider and shorter, or taller and narrower, so
+    /// neither covers the other.
+    fn of(heading: CGSize, shown: CGSize) -> Option<Self> {
+        if heading.width >= shown.width - 0.5 && heading.height >= shown.height - 0.5 {
+            Some(Self::Replaces)
+        } else if heading.width <= shown.width + 0.5 && heading.height <= shown.height + 0.5 {
+            Some(Self::Overlays)
+        } else {
+            None
+        }
+    }
+}
+
 impl Framed {
+    /// Shows `photo`, a picture of the window at `size` points, in place of
+    /// the frame's picture, at its own size, with the photo's edge colour
+    /// behind it for a frame that opens past it.
+    fn swap_picture(&mut self, photo: &Photo, size: CGSize) {
+        let image: &CFType = &photo.image;
+        self.drop_heading();
+        unsafe { self.picture.setContents(Some(image.as_ref())) };
+        self.picture_size = size;
+        // Because `picture` is anchored at its top-left `(0, 1)` and its
+        // `position.y` tracks `container`'s height animation, updating
+        // `bounds` alone keeps the new picture pinned to the container's
+        // top-left corner while the frame still moves.
+        self.picture
+            .setBounds(CGRect::new(CGPoint::new(0.0, 0.0), size));
+        if let Some(fill) = self.fill.take() {
+            fill.removeFromSuperlayer();
+        }
+        if let Some(color) = edge_fill(photo) {
+            let fill = fill_layer(&color);
+            self.container
+                .insertSublayer_below(&fill, Some(&self.picture));
+            self.fill = Some(fill);
+        }
+    }
+
+    /// Lays `photo`, a picture of the window at `size` points, no larger
+    /// than the frame's picture, over that picture's top left corner, which
+    /// shows on around it until the frame has closed over it.
+    fn lay_heading(&self, photo: &Photo, size: CGSize, scale: f64) {
+        self.drop_heading();
+        let image: &CFType = &photo.image;
+        let over = CoverScreenOS::picture(
+            image,
+            CGRect::new(
+                CGPoint::new(0.0, self.picture_size.height - size.height),
+                size,
+            ),
+            scale,
+        );
+        self.picture.addSublayer(&over);
+    }
+
+    /// Dresses the frame as [`Self::dress`] does, and shows the picture of
+    /// `headings` for its window at the size the frame heads to, if any,
+    /// from the morph's start, in the same transaction, so the old picture
+    /// and its fill never show on their own first.
+    fn dress_heading(
+        &mut self,
+        from: CGRect,
+        to: CGRect,
+        shares: &[f64],
+        duration: f64,
+        headings: &[(WinID, IVec2, Photo)],
+        scale: f64,
+    ) {
+        let heading = headings
+            .iter()
+            .filter(|(heading, ..)| *heading == self.id)
+            .map(|(_, size, photo)| (CGSize::new(f64::from(size.x), f64::from(size.y)), photo))
+            .find(|(size, _)| {
+                (to.size.width - size.width).abs() <= 0.5
+                    && (to.size.height - size.height).abs() <= 0.5
+            })
+            .and_then(|(size, photo)| {
+                Heading::of(size, self.picture_size).map(|kind| (kind, size, photo))
+            });
+        let id = self.id;
+        if let Some((Heading::Replaces, size, photo)) = heading {
+            // Before the frame is dressed, which goes by the picture's size.
+            self.swap_picture(photo, size);
+            debug!(
+                "cover picture of window {id} replaced at {}x{}",
+                size.width, size.height
+            );
+        }
+        self.dress(from, to, shares, duration);
+        if let Some((Heading::Overlays, size, photo)) = heading {
+            // After the frame is dressed, which drops any picture laid over
+            // its own.
+            self.lay_heading(photo, size, scale);
+            debug!(
+                "cover picture of window {id} headed to {}x{}",
+                size.width, size.height
+            );
+        }
+    }
+
     /// Puts the picture at the top left corner of a frame `height` points
     /// high. The picture's anchor is `(0, 1)` (its top left corner), so its
     /// position is `(0, height)` regardless of its own height.
@@ -357,6 +470,9 @@ struct Cover {
     /// The windows whose frames the next morph opens onto the windows
     /// themselves.
     open: Vec<WinID>,
+    /// Pictures of windows at the size their frames head to, which the next
+    /// morph shows from its start: each window, its size, and its picture.
+    headings: Vec<(WinID, IVec2, Photo)>,
 }
 
 impl CoverScreenOS {
@@ -772,6 +888,7 @@ impl CoverScreen for CoverScreenOS {
                     at: scene.strip,
                     shown: false,
                     open: Vec::new(),
+                    headings: Vec::new(),
                 },
             );
         }
@@ -792,6 +909,7 @@ impl CoverScreen for CoverScreenOS {
         unsafe { root.setSublayers(None) };
         Self::close_over(&cover.window, &root);
         cover.open.clear();
+        cover.headings.clear();
         let desktop: &CFType = &scene.desktop.image;
         root.addSublayer(&Self::picture(
             desktop,
@@ -875,6 +993,15 @@ impl CoverScreen for CoverScreenOS {
         shares: &[f64],
         step: f64,
     ) {
+        let scale = if self
+            .covers
+            .get(&display)
+            .is_some_and(|cover| !cover.headings.is_empty())
+        {
+            self.scale_at(Self::display_bounds(display))
+        } else {
+            1.0
+        };
         let Some(cover) = self.covers.get_mut(&display) else {
             return;
         };
@@ -893,6 +1020,7 @@ impl CoverScreen for CoverScreenOS {
         };
         let mut lead = None;
         let open = std::mem::take(&mut cover.open);
+        let headings = std::mem::take(&mut cover.headings);
         let root = cover.window.contentView().and_then(|view| view.layer());
         CATransaction::begin();
         CATransaction::setDisableActions(true);
@@ -915,14 +1043,14 @@ impl CoverScreen for CoverScreenOS {
             }
         }
         for (id, from, to) in frames {
-            let Some(window) = cover.layers.iter().find(|window| window.id == *id) else {
+            let Some(window) = cover.layers.iter_mut().find(|window| window.id == *id) else {
                 continue;
             };
             let (from, to) = (local(*from), local(*to));
             // The frame moves and sizes, and the picture in it stays put at
             // its own size: it crops, or opens onto the fill, never stretches.
+            window.dress_heading(from, to, shares, duration, &headings, scale);
             let layer = &window.container;
-            window.dress(from, to, shares, duration);
             layer.removeAllAnimations();
             layer.setFrame(to);
             let tracks = [
@@ -1001,30 +1129,10 @@ impl CoverScreen for CoverScreenOS {
         }
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        let image: &CFType = &photo.image;
-        framed.drop_heading();
-        unsafe { framed.picture.setContents(Some(image.as_ref())) };
-        framed.picture_size = picture_size;
-        // Because `picture` is anchored at its top-left `(0, 1)` and its
-        // `position.y` tracks `container`'s height animation, updating `bounds`
-        // alone keeps the fresh picture pinned to the container's top-left
-        // corner while the frame still moves.
-        framed
-            .picture
-            .setBounds(CGRect::new(CGPoint::new(0.0, 0.0), picture_size));
         // The new picture fits the live presented frame, so no fill is
         // needed now. A later morph that widens past it uses this photo's
         // edge colour.
-        if let Some(fill) = framed.fill.take() {
-            fill.removeFromSuperlayer();
-        }
-        if let Some(color) = edge_fill(photo) {
-            let fill = fill_layer(&color);
-            framed
-                .container
-                .insertSublayer_below(&fill, Some(&framed.picture));
-            framed.fill = Some(fill);
-        }
+        framed.swap_picture(photo, picture_size);
         // The frame keeps its rounded corners: while it still grows, it
         // crops the new picture's right edge.
         CATransaction::commit();
@@ -1049,53 +1157,15 @@ impl CoverScreen for CoverScreenOS {
         size: IVec2,
         photo: &Photo,
     ) -> bool {
-        let scale = self.scale_at(Self::display_bounds(display));
-        let Some(framed) = self
+        let Some(cover) = self
             .covers
-            .get(&display)
-            .filter(|cover| cover.shown)
-            .and_then(|cover| cover.layers.iter().find(|framed| framed.id == window))
+            .get_mut(&display)
+            .filter(|cover| cover.shown && cover.layers.iter().any(|framed| framed.id == window))
         else {
             return false;
         };
-        let heading = CGSize::new(f64::from(size.x), f64::from(size.y));
-        // The frame's own size is the one its morph ends at.
-        let target = framed.container.bounds().size;
-        if (target.width - heading.width).abs() > 0.5
-            || (target.height - heading.height).abs() > 0.5
-        {
-            return false;
-        }
-        let shown = framed.picture_size;
-        if heading.width >= shown.width - 0.5 && heading.height >= shown.height - 0.5 {
-            // The frame grows to `size`: it opens onto this picture, which
-            // shows the window as wide as it will be, in place of the fill.
-            return self.replace_picture(display, window, size, photo);
-        }
-        if heading.width > shown.width + 0.5 || heading.height > shown.height + 0.5 {
-            // Wider and shorter, or taller and narrower: neither picture
-            // covers the other.
-            return false;
-        }
-        // The frame shrinks to `size`: this picture lies over the top left
-        // corner of the larger one, which shows on around it until the
-        // frame has closed over it.
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        framed.drop_heading();
-        let image: &CFType = &photo.image;
-        let over = Self::picture(
-            image,
-            CGRect::new(CGPoint::new(0.0, shown.height - heading.height), heading),
-            scale,
-        );
-        framed.picture.addSublayer(&over);
-        CATransaction::commit();
-        CATransaction::flush();
-        debug!(
-            "cover picture of window {window} headed to {}x{}",
-            size.x, size.y
-        );
+        cover.headings.retain(|(id, ..)| *id != window);
+        cover.headings.push((window, size, photo.clone()));
         true
     }
 
@@ -1179,6 +1249,7 @@ impl CoverScreen for CoverScreenOS {
         cover.strip = CALayer::new();
         cover.window.orderOut(None::<&AnyObject>);
         cover.open.clear();
+        cover.headings.clear();
         if let Some(root) = cover.window.contentView().and_then(|view| view.layer()) {
             CATransaction::begin();
             CATransaction::setDisableActions(true);
@@ -1313,7 +1384,8 @@ mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
     use super::{
-        CoverScreenOS, cover_panels, fill_crossing_time, fill_start, global_rect, live_panels,
+        CoverScreenOS, Heading, cover_panels, fill_crossing_time, fill_start, global_rect,
+        live_panels,
     };
 
     /// A press on a picture lands on its window at the same point in the
@@ -1379,6 +1451,30 @@ mod tests {
         let click_on_b = CGPoint::new(500.0, 200.0);
         let hit = panels.iter().rev().find(|p| p.contains(click_on_b));
         assert_eq!(hit.map(|p| p.window), Some(2));
+    }
+
+    /// A picture of the size a frame heads to takes the frame's picture's
+    /// place when no smaller, lies over its corner when no larger, and goes
+    /// nowhere when neither covers the other.
+    #[test]
+    fn a_heading_replaces_or_overlays_by_its_size() {
+        let size = |w, h| CGSize::new(w, h);
+        let shown = size(700.0, 600.0);
+        assert_eq!(
+            Heading::of(size(1000.0, 700.0), shown),
+            Some(Heading::Replaces)
+        );
+        assert_eq!(
+            Heading::of(size(700.2, 599.8), shown),
+            Some(Heading::Replaces),
+            "the same size, to within rounding"
+        );
+        assert_eq!(
+            Heading::of(size(500.0, 600.0), shown),
+            Some(Heading::Overlays)
+        );
+        assert_eq!(Heading::of(size(1000.0, 500.0), shown), None);
+        assert_eq!(Heading::of(size(500.0, 700.0), shown), None);
     }
 
     #[test]

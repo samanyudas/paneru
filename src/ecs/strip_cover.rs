@@ -80,6 +80,12 @@ const FOCUSED_REFRESH: Duration = Duration::from_secs(1);
 /// window holds now.
 const PREVIOUS_KEEP: Duration = Duration::from_mins(10);
 
+/// How long that picture is kept for a window that shrinks back to its size,
+/// as a restored window does. It lies over the window's larger picture, so
+/// content that changed since without a new title, as a page that scrolled,
+/// shows a seam between the two.
+const PREVIOUS_SHRINK_KEEP: Duration = Duration::from_mins(1);
+
 /// How often every other window's picture is refreshed.
 const WINDOW_REFRESH: Duration = Duration::from_secs(6);
 
@@ -200,12 +206,15 @@ pub(crate) trait CoverScreen {
     /// nothing inside that frame, so the window below it shows through as
     /// the frame grows. For a window that already has its final frame.
     fn open(&mut self, display: CGDirectDisplayID, window: WinID);
-    /// Shows `photo`, a picture of `window` at the `size` its frame on the
-    /// cover of `display` heads to, at once: in place of the picture there
-    /// when the frame grows to that size, and over that picture's top left
-    /// corner when the frame shrinks to it. The window then shows as it
-    /// will be laid out while its frame gets there. Returns `false`, and
-    /// changes nothing, when the frame does not head to `size`.
+    /// Makes the next [`CoverScreen::morph`] of the cover of `display` show
+    /// `photo`, a picture of `window` at the `size` its frame heads to, from
+    /// the morph's start and in the same transaction: in place of the
+    /// picture there when the frame grows to that size, and over that
+    /// picture's top left corner when the frame shrinks to it. The window
+    /// then shows as it will be laid out while its frame gets there. The
+    /// morph leaves the picture out when the frame heads to another size.
+    /// Returns `false`, and keeps nothing, when the cover has no frame of
+    /// `window`.
     fn head_picture(
         &mut self,
         display: CGDirectDisplayID,
@@ -315,12 +324,19 @@ impl CoverPhotos {
     }
 
     /// The picture of window `id` at `size`, a size it had before its
-    /// current one and now heads back to, if it is recent enough.
-    fn heading(&self, id: WinID, size: IVec2, now: Duration) -> Option<&Photo> {
+    /// current one and now heads back to, if it is recent enough: younger
+    /// than [`PREVIOUS_KEEP`] for a window that `grows` back to it, and
+    /// than [`PREVIOUS_SHRINK_KEEP`] for one that shrinks.
+    fn heading(&self, id: WinID, size: IVec2, grows: bool, now: Duration) -> Option<&Photo> {
+        let keep = if grows {
+            PREVIOUS_KEEP
+        } else {
+            PREVIOUS_SHRINK_KEEP
+        };
         self.previous
             .get(&id)
             .filter(|kept| close(kept.size, size))
-            .filter(|kept| now.saturating_sub(kept.taken) < PREVIOUS_KEEP)
+            .filter(|kept| now.saturating_sub(kept.taken) < keep)
             .map(|kept| &kept.photo)
     }
 

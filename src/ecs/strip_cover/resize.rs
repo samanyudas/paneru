@@ -800,7 +800,11 @@ pub(super) fn cover_resizes(
                 .frames
                 .iter()
                 .filter(|frame| frame.grows())
-                .filter(|frame| photos.heading(frame.id, frame.to.size(), now).is_none())
+                .filter(|frame| {
+                    photos
+                        .heading(frame.id, frame.to.size(), true, now)
+                        .is_none()
+                })
                 .map(|frame| frame.id)
                 .take(1)
                 .collect()
@@ -820,8 +824,9 @@ pub(super) fn cover_resizes(
 /// Starts the pictures of `morph` moving. The frame of each window of `open`
 /// opens onto the window itself. A window that returns to a size it had
 /// before, as a maximized window that is restored does, shows its picture
-/// at that size from the start. A window that grows still gets a fresh
-/// picture once it shows its new frame, which takes that one's place unseen.
+/// at that size from the start, in the morph's own transaction. A window
+/// that grows still gets a fresh picture once it shows its new frame, which
+/// takes that one's place unseen.
 fn launch(
     morph: &CoverMorph,
     screen: &mut dyn CoverScreen,
@@ -832,11 +837,10 @@ fn launch(
     for id in open {
         screen.open(morph.display, *id);
     }
-    screen.morph(morph.display, &morph.sent(), &morph.shares(), PATH_STEP);
     for frame in &morph.frames {
         if frame.to.size() != frame.from.size()
             && !open.contains(&frame.id)
-            && let Some(photo) = photos.heading(frame.id, frame.to.size(), now)
+            && let Some(photo) = photos.heading(frame.id, frame.to.size(), frame.grows(), now)
             && screen.head_picture(morph.display, frame.id, frame.to.size(), photo)
         {
             debug!(
@@ -846,6 +850,7 @@ fn launch(
             );
         }
     }
+    screen.morph(morph.display, &morph.sent(), &morph.shares(), PATH_STEP);
 }
 
 /// Whether the window server shows the window of `frame` at the frame the

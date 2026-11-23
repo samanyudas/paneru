@@ -56,6 +56,9 @@ struct Screen {
     opened: Vec<WinID>,
     /// Each picture shown at the size its window heads to.
     headed: Vec<(WinID, IVec2)>,
+    /// How many morphs had started when each of `headed` was given: the
+    /// picture shows from the start of the next one.
+    headed_before: Vec<usize>,
     hidden: usize,
 }
 
@@ -139,7 +142,10 @@ impl CoverScreen for RecordingScreen {
         size: IVec2,
         _photo: &Photo,
     ) -> bool {
-        self.0.borrow_mut().headed.push((window, size));
+        let mut screen = self.0.borrow_mut();
+        screen.headed.push((window, size));
+        let morphs = screen.morphs.len();
+        screen.headed_before.push(morphs);
         true
     }
 
@@ -2164,6 +2170,7 @@ fn a_restore_shows_the_window_as_it_was_before_the_maximize() {
         "the first maximize has no picture of the maximized window"
     );
 
+    let morphs = log.borrow().morphs.len();
     send(&mut harness, maximize_cmd());
     harness.advance(ONE_FRAME);
     assert!(morphed(harness.world()), "restore runs under a cover");
@@ -2171,6 +2178,32 @@ fn a_restore_shows_the_window_as_it_was_before_the_maximize() {
         log.borrow().headed,
         vec![(1, rest.size())],
         "the restore shows window 1's picture from before the maximize"
+    );
+    assert_eq!(
+        log.borrow().headed_before,
+        vec![morphs],
+        "from the start of the restore's morph, in its own transaction"
+    );
+}
+
+/// A restore a minute or more after its window's picture from before the
+/// maximize was taken does not show it: laid over the maximized window's
+/// picture, it shows content that may have changed since, as a page that
+/// scrolled, beside the newer picture.
+#[test]
+fn a_late_restore_does_not_show_the_window_as_it_was() {
+    let (mut harness, log) = harness(padded_resize_config());
+    maximized_with_its_picture(&mut harness, &log);
+    for _ in 0..61 {
+        harness.advance(Duration::from_secs(1));
+    }
+
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "restore runs under a cover");
+    assert!(
+        log.borrow().headed.is_empty(),
+        "the picture from a minute before is not shown"
     );
 }
 
