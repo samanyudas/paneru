@@ -99,6 +99,14 @@ pub(crate) struct FrameHold {
     until: Duration,
 }
 
+impl FrameHold {
+    /// A hold that ends at `until`, as a test sets one up.
+    #[cfg(test)]
+    pub(crate) fn until(until: Duration) -> Self {
+        Self { until }
+    }
+}
+
 /// A tiled window whose app refused the width of a maximized column on a
 /// display whose usable area was `viewport` points. It would sit at the
 /// column's left edge with the desktop showing beside it, so its maximize
@@ -292,7 +300,7 @@ fn double_click_toggle(
         if matches!(unmanaged, Some(Unmanaged::Floating)) && !maximized {
             // A hold left by the command's restore would undo macOS's zoom.
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<FrameHold>();
+                entity_commands.try_remove::<(FrameHold, RefusingWidth)>();
             }
             double_click_tap::replay();
             continue;
@@ -358,9 +366,13 @@ fn toggle_maximize(
     let Ok(mut entity_commands) = commands.get_entity(entity) else {
         return;
     };
-    entity_commands.try_insert(FrameHold {
-        until: time.elapsed() + FRAME_HOLD,
-    });
+    // A new toggle starts a new hold: a width refused before answered the
+    // last one.
+    entity_commands
+        .try_insert(FrameHold {
+            until: time.elapsed() + FRAME_HOLD,
+        })
+        .try_remove::<RefusingWidth>();
 
     let tiled = unmanaged
         .is_none()
@@ -380,7 +392,7 @@ fn toggle_maximize(
         {
             debug!("no maximize: the window's app refused this width before");
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<FrameHold>();
+                entity_commands.try_remove::<(FrameHold, RefusingWidth)>();
             }
             return;
         }
@@ -688,10 +700,10 @@ fn hold_frames(
         if hold.is_changed() {
             continue;
         }
-        if now >= hold.until
-            && let Ok(mut entity_commands) = commands.get_entity(entity)
-        {
-            entity_commands.try_remove::<FrameHold>();
+        // The hold ends, and with it any count of the width refused.
+        let ends = now >= hold.until;
+        if ends {
+            end_hold(entity, &mut refusals, &mut commands);
         }
         if window.write_pending() {
             continue;
@@ -715,12 +727,16 @@ fn hold_frames(
             // The user's edge resize is no zoom to undo. The hold ends here,
             // before the frame update, which takes the new size.
             if gesture.resizes(entity, now) {
-                if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_remove::<FrameHold>();
-                }
+                end_hold(entity, &mut refusals, &mut commands);
                 continue;
             }
-            if maximized.is_none() && frame.width() + REFUSED_SLACK < target.width() {
+            // Only a window maximized in its strip can refuse the
+            // maximized width: a restored one heads back to its column.
+            let tiled_maximized = maximized.is_none()
+                && strips
+                    .iter()
+                    .any(|(_, strip, _)| strip.maximized(entity).is_some());
+            if !ends && tiled_maximized && frame.width() + REFUSED_SLACK < target.width() {
                 let refused = refusals.entry(entity).or_default();
                 *refused += 1;
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -751,6 +767,15 @@ fn hold_frames(
             );
             approach(&mut window, frame, target);
         }
+    }
+}
+
+/// Ends the frame hold of `entity`, and any count of the width its app
+/// refused: a later write is no answer to the maximize.
+fn end_hold(entity: Entity, refusals: &mut EntityHashMap<u8>, commands: &mut Commands) {
+    refusals.remove(&entity);
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<(FrameHold, RefusingWidth)>();
     }
 }
 

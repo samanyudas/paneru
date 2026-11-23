@@ -153,6 +153,65 @@ fn a_window_that_refuses_the_maximized_width_goes_back_to_its_column() {
     assert_eq!(frames(&harness, &[0, 1, 2]), before);
 }
 
+fn entity_of(harness: &mut TestHarness, id: WinID) -> Entity {
+    let world = harness.world();
+    world
+        .query::<(Entity, &Window)>()
+        .iter(world)
+        .find(|(_, window)| window.id() == id)
+        .map(|(entity, _)| entity)
+        .expect("window not found")
+}
+
+/// A window's mark as refusing the maximized width ends with the frame hold
+/// it answered. Left behind, it kept a later maximize's cover resting on
+/// for its longer wait.
+#[test]
+fn a_refused_width_ends_with_its_frame_hold() {
+    use crate::ecs::maximize::{FrameHold, RefusingWidth};
+    let mut harness = three_windows();
+    let entity = entity_of(&mut harness, 0);
+    let now = harness.world().resource::<bevy::time::Time>().elapsed();
+    harness.world().entity_mut(entity).insert((
+        FrameHold::until(now + Duration::from_millis(100)),
+        RefusingWidth,
+    ));
+    harness.advance(SETTLE);
+    let world = harness.world();
+    assert!(world.get::<FrameHold>(entity).is_none(), "the hold ended");
+    assert!(
+        world.get::<RefusingWidth>(entity).is_none(),
+        "and the window no longer counts as refusing the width"
+    );
+}
+
+/// A restored window whose app answers its column's width with a narrower
+/// frame refuses no maximized width: it is not maximized.
+#[test]
+fn a_restore_never_counts_as_refusing_the_maximized_width() {
+    use crate::ecs::maximize::RefusingWidth;
+    let mut harness = three_windows();
+    let before = frames(&harness, &[0, 1, 2]);
+    harness.run(vec![command(Operation::Maximize)]);
+    harness.advance(SETTLE);
+    assert!(is_maximized(&mut harness, 0), "window 0 maximizes");
+    let entity = entity_of(&mut harness, 0);
+    let limit = Size::new(before[0].width() - 40, 4000);
+    harness
+        .mock_state
+        .update_window(0, |window| window.maximum_size = Some(limit));
+
+    harness.run(vec![command(Operation::Maximize)]);
+    for frame in 0..60 {
+        harness.advance(Duration::from_millis(20));
+        assert!(
+            harness.world().get::<RefusingWidth>(entity).is_none(),
+            "the restore is no refusal, frame {frame}"
+        );
+    }
+    assert!(!is_maximized(&mut harness, 0), "window 0 is restored");
+}
+
 /// Sends `window <verb>` as a key binding or the command line does, and
 /// lets it settle.
 fn run_window_verb(harness: &mut TestHarness, verb: &str) {
