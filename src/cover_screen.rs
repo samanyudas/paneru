@@ -143,33 +143,58 @@ fn fill_start(picture_width: f64) -> f64 {
     (picture_width - overlap).max(0.0)
 }
 
-/// The normalized time in `(0.0, 1.0]` when the linearly interpolated width
-/// across `shares` crosses `picture_width + 0.5`, paired with whether the
-/// frame is open (`true`) or closed (`false`) after the crossing. `None` when
-/// the width stays on one side of the threshold throughout.
+/// The normalized time in `(0.0, 1.0]` when the linearly interpolated size
+/// across `shares` crosses `picture_size + 0.5` on either axis, paired with
+/// whether the frame is open (`true`) or closed (`false`) after the crossing.
+/// `None` when the size stays on one side of the threshold throughout.
 fn fill_crossing_time(
-    from_width: f64,
-    to_width: f64,
-    picture_width: f64,
+    from_size: CGSize,
+    to_size: CGSize,
+    picture_size: CGSize,
     shares: &[f64],
 ) -> Option<(f64, bool)> {
-    let threshold = picture_width + 0.5;
-    let width_at = |share: f64| from_width + (to_width - from_width) * share;
+    let w_thresh = picture_size.width + 0.5;
+    let h_thresh = picture_size.height + 0.5;
+    let size_at = |share: f64| {
+        (
+            from_size.width + (to_size.width - from_size.width) * share,
+            from_size.height + (to_size.height - from_size.height) * share,
+        )
+    };
+    let axis_cross = |a0: f64, a1: f64, thresh: f64| -> Option<f64> {
+        if (a0 > thresh) == (a1 > thresh) {
+            return None;
+        }
+        let delta = a1 - a0;
+        if delta.abs() < f64::EPSILON {
+            Some(0.0)
+        } else {
+            Some(((thresh - a0) / delta).clamp(0.0, 1.0))
+        }
+    };
     let segments = shares.len().checked_sub(1)?;
     if segments == 0 {
         return None;
     }
-    let start_open = width_at(shares[0]) > threshold;
+    let (w_start, h_start) = size_at(shares[0]);
+    let start_open = w_start > w_thresh || h_start > h_thresh;
     for (idx, pair) in shares.windows(2).enumerate() {
-        let w0 = width_at(pair[0]);
-        let w1 = width_at(pair[1]);
-        let open1 = w1 > threshold;
+        let (w0, h0) = size_at(pair[0]);
+        let (w1, h1) = size_at(pair[1]);
+        let open1 = w1 > w_thresh || h1 > h_thresh;
         if open1 != start_open {
-            let delta = w1 - w0;
-            let frac = if delta.abs() < f64::EPSILON {
-                0.0
-            } else {
-                ((threshold - w0) / delta).clamp(0.0, 1.0)
+            let fw = axis_cross(w0, w1, w_thresh);
+            let fh = axis_cross(h0, h1, h_thresh);
+            let frac = match (fw, fh) {
+                (Some(a), Some(b)) => {
+                    if open1 {
+                        a.min(b)
+                    } else {
+                        a.max(b)
+                    }
+                }
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => 0.0,
             };
             #[allow(clippy::cast_precision_loss)]
             let cross = ((idx as f64 + frac) / segments as f64).clamp(0.0, 1.0);
@@ -181,28 +206,44 @@ fn fill_crossing_time(
 
 impl Framed {
     /// Puts the picture at the top left corner of a frame `height` points
-    /// high. A layer's space runs up from its bottom left corner.
+    /// high. The picture's anchor is `(0, 1)` (its top left corner), so its
+    /// position is `(0, height)` regardless of its own height.
     fn place_picture(&self, height: f64) {
-        self.picture.setFrame(CGRect::new(
-            CGPoint::new(0.0, height - self.picture_size.height),
-            self.picture_size,
-        ));
+        self.picture
+            .setBounds(CGRect::new(CGPoint::new(0.0, 0.0), self.picture_size));
+        self.picture.setPosition(CGPoint::new(0.0, height));
     }
 
     /// Sets the frame up to move from `from` to `to` along `shares` over
-    /// `duration` seconds, in the strip layer's space: a frame wider than the
-    /// picture shows the fill only while its presented width exceeds the
-    /// picture, switching discretely at the exact interpolated crossing time,
-    /// and one that crops or opens rounds its corners as a window's are. A
-    /// frame of the picture's own size keeps the picture as it is.
+    /// `duration` seconds, in the strip layer's space: a frame wider or taller
+    /// than the picture shows the fill only while its presented size exceeds
+    /// the picture, switching discretely at the exact interpolated crossing
+    /// time, and one that crops or opens rounds its corners as a window's are.
+    /// A frame of the picture's own size keeps the picture as it is.
     fn dress(&self, from: CGRect, to: CGRect, shares: &[f64], duration: f64) {
         let widest = from.size.width.max(to.size.width);
         let narrowest = from.size.width.min(to.size.width);
-        let opens = widest > self.picture_size.width + 0.5;
-        let crops = narrowest < self.picture_size.width - 0.5;
+        let tallest = from.size.height.max(to.size.height);
+        let shortest = from.size.height.min(to.size.height);
+        let opens_w = widest > self.picture_size.width + 0.5;
+        let opens_h = tallest > self.picture_size.height + 0.5;
+        let opens = opens_w || opens_h;
+        let crops =
+            narrowest < self.picture_size.width - 0.5 || shortest < self.picture_size.height - 0.5;
         self.container
             .setCornerRadius(if opens || crops { FRAME_RADIUS } else { 0.0 });
+        self.picture.removeAllAnimations();
         self.place_picture(to.size.height);
+        if duration > 0.0 && (to.size.height - from.size.height).abs() >= f64::EPSILON {
+            let values = shares
+                .iter()
+                .map(|share| from.size.height + (to.size.height - from.size.height) * share)
+                .collect::<Vec<_>>();
+            self.picture.addAnimation_forKey(
+                &keyframes("position.y", &values, duration),
+                Some(&NSString::from_str("position.y")),
+            );
+        }
         if let Some(fill) = &self.fill {
             fill.removeAnimationForKey(&NSString::from_str(FILL_OPACITY_KEY));
             if !opens {
@@ -210,21 +251,22 @@ impl Framed {
                 fill.setOpacity(0.0);
                 return;
             }
-            let start = fill_start(self.picture_size.width);
+            let start = if opens_h {
+                0.0
+            } else {
+                fill_start(self.picture_size.width)
+            };
             fill.setFrame(CGRect::new(
                 CGPoint::new(start, 0.0),
-                CGSize::new((widest - start).max(0.0), to.size.height),
+                CGSize::new((widest - start).max(0.0), tallest),
             ));
             fill.setHidden(false);
-            let end_open = to.size.width > self.picture_size.width + 0.5;
+            let end_open = to.size.width > self.picture_size.width + 0.5
+                || to.size.height > self.picture_size.height + 0.5;
             fill.setOpacity(if end_open { 1.0 } else { 0.0 });
             if duration > 0.0
-                && let Some((cross_t, open_after)) = fill_crossing_time(
-                    from.size.width,
-                    to.size.width,
-                    self.picture_size.width,
-                    shares,
-                )
+                && let Some((cross_t, open_after)) =
+                    fill_crossing_time(from.size, to.size, self.picture_size, shares)
             {
                 let (before, after) = if open_after { (0.0, 1.0) } else { (1.0, 0.0) };
                 fill.addAnimation_forKey(
@@ -430,6 +472,11 @@ impl CoverScreenOS {
             CGRect::new(CGPoint::new(0.0, 0.0), frame.size),
             scale,
         );
+        // Top-left anchor `(0, 1)` pins the picture to `container`'s top edge
+        // during height morphs and mid-flight picture swaps alike.
+        picture.setAnchorPoint(CGPoint::new(0.0, 1.0));
+        picture.setBounds(CGRect::new(CGPoint::new(0.0, 0.0), frame.size));
+        picture.setPosition(CGPoint::new(0.0, frame.size.height));
         container.addSublayer(&picture);
         Framed {
             id,
@@ -819,13 +866,15 @@ impl CoverScreen for CoverScreenOS {
         };
         let picture_size = CGSize::new(f64::from(size.x), f64::from(size.y));
         let target = framed.container.bounds().size;
-        // If Core Animation's live presented width is still wider than the
+        // If Core Animation's live presented size is still larger than the
         // fresh picture (e.g. a centered turn back with fractional rounding),
         // leave the old picture and fill untouched so desktop never shows in
         // the overhang; the caller retries next frame once the layer fits.
-        let presented_width = unsafe { framed.container.presentationLayer() }
-            .map_or(target.width, |shown| shown.bounds().size.width);
-        if presented_width.max(target.width) > picture_size.width + 0.5 {
+        let presented = unsafe { framed.container.presentationLayer() }
+            .map_or(target, |shown| shown.bounds().size);
+        if presented.width.max(target.width) > picture_size.width + 0.5
+            || presented.height.max(target.height) > picture_size.height + 0.5
+        {
             return false;
         }
         CATransaction::begin();
@@ -833,9 +882,13 @@ impl CoverScreen for CoverScreenOS {
         let image: &CFType = &photo.image;
         unsafe { framed.picture.setContents(Some(image.as_ref())) };
         framed.picture_size = picture_size;
-        // The frame's own bounds are where the morph heads: the picture
-        // goes at their top left corner, while the frame still moves.
-        framed.place_picture(target.height);
+        // Because `picture` is anchored at its top-left `(0, 1)` and its
+        // `position.y` tracks `container`'s height animation, updating `bounds`
+        // alone keeps the fresh picture pinned to the container's top-left
+        // corner while the frame still moves.
+        framed
+            .picture
+            .setBounds(CGRect::new(CGPoint::new(0.0, 0.0), picture_size));
         // The new picture fits the live presented frame, so no fill is
         // needed now. A later morph that widens past it uses this photo's
         // edge colour.
@@ -1148,10 +1201,26 @@ mod tests {
 
         // Segment [198, 206] for a 200-pt picture (threshold 200.5) crosses
         // at 2.5/8 = 0.3125 of segment 1 of 3 -> (1 + 0.3125)/3 = 0.4375.
-        let cross = fill_crossing_time(180.0, 220.0, 200.0, &[0.0, 0.45, 0.65, 1.0]);
+        let cross = fill_crossing_time(
+            CGSize::new(180.0, 500.0),
+            CGSize::new(220.0, 500.0),
+            CGSize::new(200.0, 500.0),
+            &[0.0, 0.45, 0.65, 1.0],
+        );
         let (t, open_after) = cross.expect("crosses threshold");
         assert!(open_after);
         assert!((t - (1.0 + 2.5 / 8.0) / 3.0).abs() < 1e-9, "got {t}");
+
+        // Height-only growth crosses on the vertical threshold too.
+        let cross_h = fill_crossing_time(
+            CGSize::new(200.0, 480.0),
+            CGSize::new(200.0, 520.0),
+            CGSize::new(200.0, 500.0),
+            &[0.0, 0.45, 0.65, 1.0],
+        );
+        let (th, open_after_h) = cross_h.expect("crosses vertical threshold");
+        assert!(open_after_h);
+        assert!((th - (1.0 + 2.5 / 8.0) / 3.0).abs() < 1e-9, "got {th}");
         let _ = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1.0, 1.0));
     }
 }

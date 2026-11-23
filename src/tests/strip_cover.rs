@@ -1536,3 +1536,236 @@ fn an_uncovered_resize_eases_out() {
     assert!(log.borrow().morphs.is_empty(), "no cover");
     assert!(eases_a_resize(harness.world()), "the resize eases out");
 }
+
+fn maximize_cmd() -> Event {
+    Event::Command {
+        command: Command::Window(Operation::Maximize),
+    }
+}
+
+fn padded_resize_config() -> Config {
+    (
+        MainOptions {
+            slide_window_pictures: Some(true),
+            animation_speed: Some(14.0),
+            preset_column_widths: vec![0.5, 0.75, 1.0],
+            padding_top: Some(8),
+            padding_bottom: Some(8),
+            padding_left: Some(8),
+            padding_right: Some(8),
+            ..MainOptions::default()
+        },
+        vec![],
+    )
+        .into()
+}
+
+fn shown_window_frame(world: &mut World, id: WinID) -> IRect {
+    let mut query = world.query::<&Window>();
+    query
+        .iter(world)
+        .find(|window| window.id() == id)
+        .expect("window not found")
+        .shown_frame()
+}
+
+/// Steps one frame at a time until the morph cover is gone, recording each
+/// window's shown (OS) frame on every frame.
+fn shown_frames_of(harness: &mut TestHarness, ids: &[WinID]) -> Vec<Vec<IRect>> {
+    let mut paths = ids
+        .iter()
+        .map(|id| vec![shown_window_frame(harness.world(), *id)])
+        .collect::<Vec<_>>();
+    for _ in 0..100 {
+        if !morphed(harness.world()) {
+            return paths;
+        }
+        harness.advance(ONE_FRAME);
+        for (path, id) in paths.iter_mut().zip(ids) {
+            let frame = shown_window_frame(harness.world(), *id);
+            if path.last() != Some(&frame) {
+                path.push(frame);
+            }
+        }
+    }
+    panic!("the morph ends");
+}
+
+/// Maximizing and restoring a tiled window both morph under the cover, even
+/// when edge padding changes the window's top and bottom edges, and the real
+/// windows move in one step without `FrameHold` writing an intermediate frame.
+#[test]
+fn a_maximize_and_restore_morph_under_the_cover() {
+    let (mut harness, log) = harness(padded_resize_config());
+    // Put window 0 at 50% so window 1 sits beside it, then focus window 1.
+    send(
+        &mut harness,
+        resize(crate::types::commands::ResizeDirection::Shrink),
+    );
+    frames_of(&mut harness, &[0, 1]);
+    send(&mut harness, focus(Direction::East));
+    for _ in 0..40 {
+        harness.advance(ONE_FRAME);
+    }
+    take_pictures(&mut harness, &log);
+    let rest_0 = shown_window_frame(harness.world(), 0);
+    let rest_1 = shown_window_frame(harness.world(), 1);
+
+    // Maximize window 1.
+    let since = log.borrow().window_asks.len();
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "maximize runs under a cover");
+    let (from_1, to_1) = morph_of(&log, 0, 1);
+    assert_eq!(from_1, rest_1);
+    assert!(to_1.width() > from_1.width(), "window 1 widens");
+    assert!(
+        to_1.height() > from_1.height(),
+        "window 1 fills edge padding"
+    );
+    let asks = window_asks_since(&log, since);
+    assert_eq!(asks.len(), 1, "fresh picture asked for maximized window");
+    assert_eq!(asks[0].0, 1);
+    assert_eq!(asks[0].1, to_1.size());
+    answer(&mut harness, 1, asks[0].2);
+    harness.advance(ONE_FRAME);
+    assert_eq!(
+        log.borrow().replaced,
+        vec![(1, to_1.size())],
+        "fresh maximized picture unveils mid-morph"
+    );
+    let max_paths = shown_frames_of(&mut harness, &[1]);
+    assert_eq!(
+        max_paths[0],
+        vec![to_1],
+        "real window snaps once on maximize"
+    );
+
+    // Restore window 1 immediately after landing (cached maximized photo is ready).
+    harness.advance(ONE_FRAME);
+    let morphs_before = log.borrow().morphs.len();
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "restore runs under a cover");
+    assert_eq!(log.borrow().morphs.len(), morphs_before + 1);
+    let (r_from, r_to) = morph_of(&log, morphs_before, 1);
+    assert_eq!(r_from, to_1);
+    assert_eq!(r_to, rest_1);
+    let restore_paths = shown_frames_of(&mut harness, &[0, 1]);
+    assert_eq!(
+        restore_paths[1],
+        vec![rest_1],
+        "real window snaps directly to restored frame with no premature hold write"
+    );
+    assert_eq!(restore_paths[0].last().copied(), Some(rest_0));
+}
+
+/// Maximizing a stacked window unstacks it into a full-screen column (changing
+/// both window order and height) and restoring puts it back in the stack, both
+/// smoothly under the cover.
+#[test]
+fn a_stacked_window_maximize_and_restore_morph_under_the_cover() {
+    let (mut harness, log) = harness(padded_resize_config());
+    send(
+        &mut harness,
+        Event::Command {
+            command: Command::Window(Operation::Stack(crate::commands::Side::East)),
+        },
+    );
+    for _ in 0..40 {
+        harness.advance(ONE_FRAME);
+    }
+    take_pictures(&mut harness, &log);
+    let before_0 = window_frame(harness.world(), 0);
+    let before_1 = window_frame(harness.world(), 1);
+    assert!(before_0.height() < 600, "window 0 starts stacked");
+
+    let since = log.borrow().window_asks.len();
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "stacked maximize is covered");
+    let (from_0, to_0) = morph_of(&log, 0, 0);
+    let (from_1, to_1) = morph_of(&log, 0, 1);
+    assert_eq!(from_0, before_0);
+    assert_eq!(from_1, before_1);
+    assert!(
+        to_0.height() > from_0.height(),
+        "maximized window grows vertically"
+    );
+    assert!(
+        to_1.height() > from_1.height(),
+        "stackmate expands vertically too"
+    );
+    // Both grown windows get fresh pictures so cache is warm for restore.
+    let asks = window_asks_since(&log, since);
+    for (id, _, generation) in asks {
+        answer(&mut harness, id, generation);
+    }
+    frames_of(&mut harness, &[0, 1]);
+    harness.advance(ONE_FRAME);
+
+    // Restore window 0 back into the stack.
+    let morphs_before = log.borrow().morphs.len();
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "stacked restore is covered");
+    assert_eq!(log.borrow().morphs.len(), morphs_before + 1);
+    let (r_from_0, r_to_0) = morph_of(&log, morphs_before, 0);
+    assert_eq!(r_from_0, to_0);
+    assert_eq!(r_to_0, before_0);
+}
+
+/// Toggling maximize again mid-morph turns the cover smoothly from its live
+/// presented frames instead of aborting.
+#[test]
+fn a_maximize_mid_morph_turns_smoothly() {
+    let (mut harness, log) = harness(padded_resize_config());
+    take_pictures(&mut harness, &log);
+    let rest_0 = window_frame(harness.world(), 0);
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME * 2);
+    assert!(morphed(harness.world()));
+    assert_eq!(log.borrow().morphs.len(), 1);
+
+    // Restore mid-flight.
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "cover stays up and turns");
+    assert_eq!(
+        log.borrow().morphs.len(),
+        2,
+        "second morph started for the turn"
+    );
+    let (turn_from, turn_to) = morph_of(&log, 1, 0);
+    assert_eq!(turn_to, rest_0);
+    assert!(
+        turn_from.width() > rest_0.width(),
+        "turn starts from the live mid-flight frame"
+    );
+}
+
+/// Resizing a maximized window restores it and morphs both the width and
+/// edge-padding height change smoothly under the cover.
+#[test]
+fn a_resize_of_a_maximized_window_morphs_under_the_cover() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(padded_resize_config());
+    take_pictures(&mut harness, &log);
+    let since = log.borrow().window_asks.len();
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    for (id, _, generation) in window_asks_since(&log, since) {
+        answer(&mut harness, id, generation);
+    }
+    frames_of(&mut harness, &[0]);
+    harness.advance(ONE_FRAME);
+
+    let morphs_before = log.borrow().morphs.len();
+    send(&mut harness, resize(ResizeDirection::Shrink));
+    harness.advance(ONE_FRAME);
+    assert!(
+        morphed(harness.world()),
+        "resizing out of maximize runs under the cover"
+    );
+    assert_eq!(log.borrow().morphs.len(), morphs_before + 1);
+}

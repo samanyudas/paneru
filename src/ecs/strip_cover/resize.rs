@@ -41,6 +41,7 @@ use super::{
 use crate::config::Config;
 use crate::ecs::drag::DragState;
 use crate::ecs::layout::LayoutStrip;
+use crate::ecs::maximize::MaximizeMorph;
 use crate::ecs::pacing::ShownFrames;
 use crate::ecs::slice_photos::Photo;
 use crate::ecs::systems::AnimationStep;
@@ -151,12 +152,13 @@ impl CoverMorph {
         self.guard
     }
 
-    /// Each window whose frame heads wider than its picture on the cover,
-    /// with its frame, that has no fresh-picture ask for this target size yet.
+    /// Each window whose frame heads wider or taller than its picture on the
+    /// cover, with its frame, that has no fresh-picture ask for this target
+    /// size yet.
     fn outgrown(&self) -> impl Iterator<Item = &Reframe> {
         self.frames.iter().filter(|frame| {
             self.pictured(frame.entity)
-                .is_some_and(|size| frame.to.width() > size.x)
+                .is_some_and(|size| frame.to.width() > size.x || frame.to.height() > size.y)
                 && !self
                     .refresh_ask
                     .iter()
@@ -309,6 +311,7 @@ type MorphStrips<'w, 's> = Query<
         Has<NativeFullscreenMarker>,
         Has<CoverSlide>,
         Has<CoverSwipe>,
+        Has<MaximizeMorph>,
     ),
     (With<LayoutStrip>, Without<Window>),
 >;
@@ -383,6 +386,11 @@ pub(super) fn cover_resizes(
 ) {
     started.0.clear();
     let Some(mut screen) = screen else {
+        for (entity, .., maximize_morph) in &strips {
+            if maximize_morph {
+                commands.entity(entity).remove::<MaximizeMorph>();
+            }
+        }
         return;
     };
     let dragging = drag
@@ -400,10 +408,14 @@ pub(super) fn cover_resizes(
         fullscreen,
         sliding,
         swiping,
+        maximize_morph,
     ) in &mut strips
     {
+        if maximize_morph {
+            commands.entity(entity).remove::<MaximizeMorph>();
+        }
         let row = strip_windows(strip, &windows);
-        if morph.is_none() && row.iter().all(|window| window.resize.is_none()) {
+        if morph.is_none() && !maximize_morph && row.iter().all(|window| window.resize.is_none()) {
             continue;
         }
         let Ok((display, dock)) = displays.get(child.parent()) else {
@@ -430,10 +442,18 @@ pub(super) fn cover_resizes(
                 };
             }
             let same_windows = row.len() == morph.frames.len()
-                && row
-                    .iter()
-                    .zip(&morph.frames)
-                    .all(|(window, frame)| window.entity == frame.entity);
+                && if maximize_morph {
+                    row.iter().all(|window| {
+                        morph
+                            .frames
+                            .iter()
+                            .any(|frame| frame.entity == window.entity)
+                    })
+                } else {
+                    row.iter()
+                        .zip(&morph.frames)
+                        .all(|(window, frame)| window.entity == frame.entity)
+                };
             let aborted = !cover_enabled(&config)
                 || !shown_here
                 || display.id() != morph.display
@@ -444,16 +464,31 @@ pub(super) fn cover_resizes(
                 || mission_control.0
                 || !same_windows
                 || row.iter().any(|window| {
-                    window.tabbed || window.turns_height() || window.asks_refused_width()
+                    window.tabbed
+                        || (!maximize_morph && window.turns_height())
+                        || window.asks_refused_width()
                 });
             // A change that moves a window up or down, such as a stack or a
-            // vertical strip move, is no resize: the real windows take it.
+            // vertical strip move, is no resize: the real windows take it,
+            // except when a maximize or restore toggle explicitly morphs height.
             let heading = headings(&row, target);
+            let prev_frames = heading
+                .iter()
+                .filter_map(|&(win_entity, ..)| {
+                    morph
+                        .frames
+                        .iter()
+                        .find(|frame| frame.entity == win_entity)
+                        .copied()
+                })
+                .collect::<Vec<_>>();
             let aborted = aborted
-                || heading
-                    .iter()
-                    .zip(&morph.frames)
-                    .any(|((.., to), frame)| !same_rows(*to, frame.to));
+                || prev_frames.len() != heading.len()
+                || (!maximize_morph
+                    && heading
+                        .iter()
+                        .zip(&prev_frames)
+                        .any(|((.., to), frame)| !same_rows(*to, frame.to)));
             if aborted {
                 // The real windows are where the layout put them already, or
                 // ease on from there.
@@ -475,20 +510,19 @@ pub(super) fn cover_resizes(
             }
             let turned = heading
                 .iter()
-                .zip(&morph.frames)
+                .zip(&prev_frames)
                 .any(|((.., to), frame)| *to != frame.to);
             if turned {
-                // New frames while covered, such as another resize or a
-                // focus move: the pictures turn there from where they show,
+                // New frames while covered, such as another resize, maximize,
+                // or focus move: the pictures turn there from where they show,
                 // at the speed they have, and the real windows go at once.
                 let (share, rate) = morph.progress();
-                let shown = morph
-                    .frames
+                let shown = prev_frames
                     .iter()
                     .map(|frame| frame.at(share))
                     .collect::<Vec<_>>();
                 let duration = ease::duration(&config);
-                let entry = turn_entry(&morph.frames, &shown, &heading, rate, duration);
+                let entry = turn_entry(&prev_frames, &shown, &heading, rate, duration);
                 // Drop any pending fresh-picture ask (and any reply that
                 // arrived in this frame's Events pass) whose window changed
                 // its target size on this turn.
@@ -518,7 +552,7 @@ pub(super) fn cover_resizes(
                 // Drop any in-flight background or morph capture for windows
                 // whose size is changing on this turn, so a capture taken at
                 // the old size cannot land after `snap` resizes the window.
-                for (frame, &(.., to)) in morph.frames.iter().zip(&heading) {
+                for (frame, &(.., to)) in prev_frames.iter().zip(&heading) {
                     if frame.to.size() != to.size() {
                         photos.supersede(CoverSubject::Window(frame.id));
                     }
@@ -583,7 +617,7 @@ pub(super) fn cover_resizes(
             Some("drag")
         } else if mission_control.0 {
             Some("Mission Control")
-        } else if row.iter().any(StripWindow::turns_height) {
+        } else if !maximize_morph && row.iter().any(StripWindow::turns_height) {
             Some("height changes")
         } else if row.iter().any(StripWindow::asks_refused_width) {
             Some("a width the window refused before")
@@ -599,20 +633,40 @@ pub(super) fn cover_resizes(
             continue;
         };
         let same_windows = rest.frames.len() == row.len()
-            && rest
-                .frames
-                .iter()
-                .zip(&row)
-                .all(|((rested, _), window)| *rested == window.entity);
+            && if maximize_morph {
+                row.iter().all(|window| {
+                    rest.frames
+                        .iter()
+                        .any(|(rested, _)| *rested == window.entity)
+                })
+            } else {
+                rest.frames
+                    .iter()
+                    .zip(&row)
+                    .all(|((rested, _), window)| *rested == window.entity)
+            };
         if !same_windows {
+            debug!("cover skipped over resized strip {entity}: windows changed");
+            continue;
+        }
+        let matched_rest = row
+            .iter()
+            .filter_map(|window| {
+                rest.frames
+                    .iter()
+                    .find(|(rested, _)| *rested == window.entity)
+                    .map(|(_, frame)| *frame)
+            })
+            .collect::<Vec<_>>();
+        if matched_rest.len() != row.len() {
             debug!("cover skipped over resized strip {entity}: windows changed");
             continue;
         }
         let heading = headings(&row, target);
         let frames = heading
             .iter()
-            .zip(&rest.frames)
-            .map(|(&(entity, id, to), (_, frame))| Reframe {
+            .zip(&matched_rest)
+            .map(|(&(entity, id, to), frame)| Reframe {
                 entity,
                 id,
                 from: IRect::from_corners(frame.min + rest.origin, frame.max + rest.origin),
@@ -622,15 +676,15 @@ pub(super) fn cover_resizes(
         if frames.iter().all(|frame| frame.from == frame.to) {
             continue;
         }
-        if frames.iter().any(|frame| !same_rows(frame.from, frame.to)) {
+        if !maximize_morph && frames.iter().any(|frame| !same_rows(frame.from, frame.to)) {
             debug!("cover skipped over resized strip {entity}: a window moves up or down");
             continue;
         }
         // The pictures show where the windows rested.
         let before = row
             .iter()
-            .zip(&rest.frames)
-            .map(|(window, (_, frame))| StripWindow {
+            .zip(&matched_rest)
+            .map(|(window, frame)| StripWindow {
                 id: window.id,
                 entity: window.entity,
                 frame: *frame,
@@ -730,6 +784,8 @@ fn turn_entry(
             [
                 (frame.from.min.x, frame.to.min.x, shown.min.x, to.min.x),
                 (frame.from.max.x, frame.to.max.x, shown.max.x, to.max.x),
+                (frame.from.min.y, frame.to.min.y, shown.min.y, to.min.y),
+                (frame.from.max.y, frame.to.max.y, shown.max.y, to.max.y),
             ]
         });
     let Some((from, old_to, now, to)) = edges.max_by_key(|(_, _, now, to)| (to - now).abs()) else {
@@ -855,29 +911,31 @@ pub(super) fn refresh_morph_pictures(
         return;
     }
     for mut morph in &mut morphs {
-        let ready = morph
-            .outgrown()
-            .filter_map(|frame| {
-                let (window, position, bounds) = frames.get(frame.entity).ok()?;
-                let cell = IRect::from_corners(position.0, position.0 + bounds.0);
-                // The layout's frame, and no write on its way to the app.
-                let committed = window.margins().shown(cell);
-                (!window.write_pending()
-                    && close(committed.min, frame.to.min)
-                    && close(committed.max, frame.to.max))
-                .then_some((frame.entity, frame.id, frame.to))
-            })
-            .collect::<Vec<_>>();
+        let ready =
+            morph
+                .outgrown()
+                .filter_map(|frame| {
+                    let (window, position, bounds) = frames.get(frame.entity).ok()?;
+                    let cell = IRect::from_corners(position.0, position.0 + bounds.0);
+                    // The layout's committed frame (which may sit at an off-screen
+                    // sliver) matches the target size, and no write is pending.
+                    let committed = window.margins().shown(cell);
+                    (!window.write_pending() && close(committed.size(), frame.to.size()))
+                        .then_some((frame.entity, frame.id, committed, frame.to))
+                })
+                .collect::<Vec<_>>();
         if ready.is_empty() {
             continue;
         }
         // Sample off the main thread via the background shown-frame sampler.
-        let ids = ready.iter().map(|(_, id, _)| *id).collect::<Vec<_>>();
+        let ids = ready.iter().map(|(_, id, ..)| *id).collect::<Vec<_>>();
         let read = shown_frames.as_ref().map(|shown| shown.watch_morph(&ids));
-        for (entity, id, to) in ready {
+        for (entity, id, committed, to) in ready {
             let shows = read.as_ref().is_none_or(|read| {
                 read.iter().any(|(shown, frame)| {
-                    *shown == id && close(frame.min, to.min) && close(frame.max, to.max)
+                    *shown == id
+                        && close(frame.min, committed.min)
+                        && close(frame.max, committed.max)
                 })
             });
             if !shows {
@@ -947,9 +1005,9 @@ pub(super) fn apply_morph_replies(
             }
             accepted_for_morph = true;
             if let Ok(photo) = &reply.result
-                && morph
-                    .pictured(frame.entity)
-                    .is_some_and(|pictured| frame.to.width() > pictured.x)
+                && morph.pictured(frame.entity).is_some_and(|pictured| {
+                    frame.to.width() > pictured.x || frame.to.height() > pictured.y
+                })
             {
                 let fits = frame.to.size();
                 morph.pending_unveil.retain(|(e, ..)| *e != frame.entity);
@@ -1017,14 +1075,14 @@ fn unveil_ready_pictures(morphs: &mut Query<&mut CoverMorph>, screen: &mut dyn s
             else {
                 continue;
             };
-            let shown_width = frame.at(share).width();
-            if shown_width > fits.x {
+            let shown = frame.at(share);
+            if shown.width() > fits.x || shown.height() > fits.y {
                 morph.pending_unveil.push((entity, id, fits, photo));
                 continue;
             }
             if morph
                 .pictured(entity)
-                .is_some_and(|pictured| fits.x > pictured.x)
+                .is_some_and(|pictured| fits.x > pictured.x || fits.y > pictured.y)
             {
                 if screen.replace_picture(morph.display, id, fits, &photo) {
                     if let Some((_, pictured)) = morph

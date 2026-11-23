@@ -24,7 +24,7 @@
 use std::time::Duration;
 
 use bevy::app::{App, Plugin, PreUpdate, Update};
-use bevy::ecs::change_detection::DetectChangesMut as _;
+use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
@@ -34,6 +34,7 @@ use bevy::ecs::query::{Has, With};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{any_with_component, on_message};
 use bevy::ecs::system::{Commands, Local, Query, Res};
+use bevy::ecs::world::Ref;
 use bevy::math::{IRect, IVec2};
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::Time;
@@ -90,6 +91,13 @@ pub(crate) struct FloatingMaximized {
 pub(crate) struct FrameHold {
     until: Duration,
 }
+
+/// One-frame marker on a [`LayoutStrip`] whose layout just changed due to a
+/// tiled maximize or restore toggle. Consumed by `strip_cover::resize` so the
+/// picture cover morphs both horizontal and vertical frame changes (including
+/// edge-padding fill and stack unstack/restack) instead of skipping them.
+#[derive(Component, Clone, Copy, Debug)]
+pub(crate) struct MaximizeMorph;
 
 pub(crate) struct MaximizePlugin;
 
@@ -229,7 +237,7 @@ type Toggles<'w, 's> = Query<
 fn toggle_maximize(
     toggle: On<ToggleMaximize>,
     mut windows: Toggles,
-    mut strips: Query<(&mut LayoutStrip, &ChildOf)>,
+    mut strips: Query<(Entity, &mut LayoutStrip, &ChildOf)>,
     displays: Query<(&Display, Option<&DockPosition>)>,
     config: Res<Config>,
     time: Res<Time>,
@@ -252,15 +260,27 @@ fn toggle_maximize(
 
     let tiled = unmanaged
         .is_none()
-        .then(|| strips.iter_mut().find(|(strip, _)| strip.contains(entity)))
+        .then(|| {
+            strips
+                .iter_mut()
+                .find(|(_, strip, _)| strip.contains(entity))
+        })
         .flatten();
-    if let Some((mut strip, child_of)) = tiled {
+    if let Some((strip_entity, mut strip, child_of)) = tiled {
         let Ok((display, dock)) = displays.get(child_of.parent()) else {
             return;
         };
         let viewport = display.actual_display_bounds(dock, &config);
         let frame = IRect::from_corners(position.0, position.0 + bounds.0);
-        toggle_tiled(entity, frame, &mut strip, viewport, &config, &mut commands);
+        toggle_tiled(
+            entity,
+            frame,
+            strip_entity,
+            &mut strip,
+            viewport,
+            &config,
+            &mut commands,
+        );
         return;
     }
 
@@ -346,6 +366,7 @@ pub(crate) fn restore_tiled(
 fn toggle_tiled(
     entity: Entity,
     frame: IRect,
+    strip_entity: Entity,
     strip: &mut LayoutStrip,
     viewport: IRect,
     config: &Config,
@@ -361,6 +382,9 @@ fn toggle_tiled(
             entity_commands.try_insert(WidthRun {
                 anchor: restored.anchor,
             });
+        }
+        if let Ok(mut strip_commands) = commands.get_entity(strip_entity) {
+            strip_commands.try_insert(MaximizeMorph);
         }
     } else {
         let members = strip.tab_group(entity).unwrap_or_else(|| vec![entity]);
@@ -378,9 +402,16 @@ fn toggle_tiled(
             ViewportShare::of(frame.height(), viewport.height()),
             anchor,
         );
-        if let Err(err) = strip.maximize(entity, config.maximized_window_side().into(), before) {
-            debug!("no maximize: {err}");
-            return;
+        match strip.maximize(entity, config.maximized_window_side().into(), before) {
+            Ok(changed) => {
+                if changed && let Ok(mut strip_commands) = commands.get_entity(strip_entity) {
+                    strip_commands.try_insert(MaximizeMorph);
+                }
+            }
+            Err(err) => {
+                debug!("no maximize: {err}");
+                return;
+            }
         }
         // A native resize the window was settling would otherwise adopt the
         // window's old size into the column it left.
@@ -511,7 +542,7 @@ type Held<'w, 's> = Query<
         &'static Position,
         &'static Bounds,
         Option<&'static FloatingMaximized>,
-        &'static FrameHold,
+        Ref<'static, FrameHold>,
     ),
 >;
 
@@ -526,6 +557,13 @@ fn hold_frames(
 ) {
     let now = time.elapsed();
     for (entity, mut window, position, bounds, maximized, hold) in &mut windows {
+        // Wait until the toggle frame's layout and animate passes have committed
+        // the new target frame; otherwise `UpdateSet::Events` sees the old
+        // `Position` paired with a newly restored `Bounds` and writes a bogus
+        // intermediate frame before the layout or picture cover even runs.
+        if hold.is_changed() {
+            continue;
+        }
         if now >= hold.until
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
