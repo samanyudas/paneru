@@ -2757,6 +2757,41 @@ fn a_turned_restore_still_shows_the_window_as_it_was() {
     );
 }
 
+/// A turn that only moves a restore's frames, as a focus key does once the
+/// restore has its size and waits for the window, still shows the window's
+/// picture from before the maximize. The turn left it out, and the window
+/// showed the maximized picture cropped for the rest of the restore.
+#[test]
+fn a_moved_restore_at_its_size_still_shows_the_window_as_it_was() {
+    let (mut harness, log) = harness(padded_resize_config());
+    let rest = maximized_with_its_picture(&mut harness, &log);
+    // The window server shows window 1 maximized until told otherwise, so
+    // the restore waits at its size.
+    harness.mock_state.show_late(1);
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME * 20);
+    assert!(morphed(harness.world()), "the restore waits for the window");
+    assert_eq!(log.borrow().headed.len(), 1);
+    let morphs = log.borrow().morphs.len();
+
+    send(&mut harness, focus(Direction::West));
+    harness.advance(ONE_FRAME);
+    harness.mock_state.show_now(1);
+    assert_eq!(log.borrow().morphs.len(), morphs + 1, "the restore turns");
+    let (from, to) = morph_of(&log, morphs, 1);
+    assert_eq!(
+        (from.size(), to.size()),
+        (rest.size(), rest.size()),
+        "window 1 only moves"
+    );
+    assert_eq!(
+        log.borrow().headed.len(),
+        2,
+        "the turn shows its picture from before the maximize again"
+    );
+    assert_eq!(log.borrow().headed_before.last().copied(), Some(morphs));
+}
+
 /// A restore a minute or more after its window's picture from before the
 /// maximize was taken does not show it: laid over the maximized window's
 /// picture, it shows content that may have changed since, as a page that

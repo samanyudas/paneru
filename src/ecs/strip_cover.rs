@@ -325,10 +325,11 @@ impl CoverPhotos {
 
     /// The picture of window `id` at `size`, a size it had before its
     /// current one and now heads back to, if it is recent enough: younger
-    /// than [`PREVIOUS_KEEP`] for a window that `grows` back to it, and
-    /// than [`PREVIOUS_SHRINK_KEEP`] for one that shrinks.
-    fn heading(&self, id: WinID, size: IVec2, grows: bool, now: Duration) -> Option<&Photo> {
-        let keep = if grows {
+    /// than [`PREVIOUS_KEEP`] when it `replaces` the window's picture on
+    /// the cover, being no smaller, and than [`PREVIOUS_SHRINK_KEEP`] when
+    /// it lies over that larger picture.
+    fn heading(&self, id: WinID, size: IVec2, replaces: bool, now: Duration) -> Option<&Photo> {
+        let keep = if replaces {
             PREVIOUS_KEEP
         } else {
             PREVIOUS_SHRINK_KEEP

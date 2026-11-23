@@ -873,10 +873,21 @@ fn head_pictures(
     open: &[WinID],
 ) {
     for frame in &morph.frames {
-        if frame.to.size() != frame.from.size()
+        // The picture on the cover shows the window at `pictured`, whatever
+        // the frame does on the way: a frame that heads to another size
+        // shows the window as it was at that size, even when a turn only
+        // moves it, as a focus key does once a restore has its size.
+        let Some(pictured) = morph.pictured(frame.entity) else {
+            continue;
+        };
+        let to = frame.to.size();
+        // Laid over a larger picture, rather than in its place, it is kept
+        // for less time: see `CoverPhotos::heading`.
+        let replaces = to.x >= pictured.x && to.y >= pictured.y;
+        if !close(to, pictured)
             && !open.contains(&frame.id)
-            && let Some(photo) = photos.heading(frame.id, frame.to.size(), frame.grows(), now)
-            && screen.head_picture(morph.display, frame.id, frame.to.size(), photo)
+            && let Some(photo) = photos.heading(frame.id, to, replaces, now)
+            && screen.head_picture(morph.display, frame.id, to, photo)
         {
             debug!(
                 "cover over a resize shows window {} as it was at {}",
