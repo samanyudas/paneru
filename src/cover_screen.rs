@@ -823,7 +823,7 @@ impl CoverScreen for CoverScreenOS {
         // the overhang; the caller retries next frame once the layer fits.
         let presented_width = unsafe { framed.container.presentationLayer() }
             .map_or(target.width, |shown| shown.bounds().size.width);
-        if presented_width > picture_size.width + 0.5 {
+        if presented_width.max(target.width) > picture_size.width + 0.5 {
             return false;
         }
         CATransaction::begin();

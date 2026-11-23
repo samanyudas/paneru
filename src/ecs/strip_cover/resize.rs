@@ -509,7 +509,7 @@ pub(super) fn cover_resizes(
                     heading
                         .iter()
                         .find(|&&(e, _, _)| e == win_entity)
-                        .is_some_and(|&(_, _, to)| close(to.size(), size))
+                        .is_some_and(|&(_, _, to)| to.size() == size)
                 });
                 morph.frames = heading
                     .iter()
