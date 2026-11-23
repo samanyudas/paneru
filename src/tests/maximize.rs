@@ -212,6 +212,100 @@ fn a_restore_never_counts_as_refusing_the_maximized_width() {
     assert!(!is_maximized(&mut harness, 0), "window 0 is restored");
 }
 
+/// Double-clicks window `id`'s title bar, with the second press carrying
+/// `hold`, the event tap's token for it, if the tap held it.
+fn double_click_with_hold(harness: &mut TestHarness, id: WinID, hold: Option<u64>) {
+    let point = title_bar(harness, id);
+    let point = CGPoint::new(f64::from(point.x), f64::from(point.y));
+    for (clicks, hold) in [(1, None), (2, hold)] {
+        harness.world().write_message(Event::MouseDown {
+            point,
+            modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+            window_id: Some(id),
+            clicks,
+            hold,
+        });
+        harness.world().write_message(Event::MouseUp {
+            point,
+            modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+        });
+        harness.advance(Duration::from_millis(20));
+    }
+    harness.advance(SETTLE);
+}
+
+/// A double-click whose press the event tap gave up, at its time limit or
+/// for a newer press, toggles nothing: the app may have it already, and a
+/// toggle that long after the click would surprise.
+#[test]
+fn a_double_click_the_tap_gave_up_toggles_nothing() {
+    let mut harness = three_windows();
+    double_click_with_hold(&mut harness, 1, Some(u64::MAX));
+    assert!(!is_maximized(&mut harness, 1), "no toggle");
+
+    double_click_with_hold(&mut harness, 1, None);
+    assert!(
+        is_maximized(&mut harness, 1),
+        "a press the tap did not hold toggles"
+    );
+}
+
+/// Runs one engine frame for `events`.
+fn frame(harness: &mut TestHarness, events: Vec<Event>) {
+    for event in events {
+        harness.world().write_message(event);
+    }
+    harness.app.update();
+    for event in harness.mock_state.drain_events() {
+        harness.world().write_message::<Event>(event);
+    }
+}
+
+/// A maximize toggled again right after a restore counts its own refusals
+/// from none: the one its app gave the maximize before does not carry over
+/// and undo the new one at its first refusal.
+#[test]
+fn a_new_maximize_counts_its_own_refusals() {
+    use crate::ecs::maximize::RefusingWidth;
+    let mut harness = three_windows();
+    let before = frames(&harness, &[0, 1, 2]);
+    let limit = Size::new(before[0].width() + 40, 4000);
+    harness
+        .mock_state
+        .update_window(0, |window| window.maximum_size = Some(limit));
+    let entity = entity_of(&mut harness, 0);
+
+    frame(&mut harness, vec![command(Operation::Maximize)]);
+    for _ in 0..10 {
+        if harness.world().get::<RefusingWidth>(entity).is_some() {
+            break;
+        }
+        frame(&mut harness, vec![]);
+    }
+    assert!(
+        harness.world().get::<RefusingWidth>(entity).is_some(),
+        "the app refused the width once"
+    );
+    assert!(is_maximized(&mut harness, 0), "one refusal is not enough");
+
+    // Restore and maximize again, a frame each.
+    frame(&mut harness, vec![command(Operation::Maximize)]);
+    frame(&mut harness, vec![command(Operation::Maximize)]);
+    assert!(is_maximized(&mut harness, 0), "maximized again");
+    frame(&mut harness, vec![]);
+    assert!(
+        is_maximized(&mut harness, 0),
+        "the new maximize's first refusal does not undo it"
+    );
+    harness.advance(SETTLE);
+    assert!(
+        !is_maximized(&mut harness, 0),
+        "its own second refusal does"
+    );
+}
+
 /// Sends `window <verb>` as a key binding or the command line does, and
 /// lets it settle.
 fn run_window_verb(harness: &mut TestHarness, verb: &str) {

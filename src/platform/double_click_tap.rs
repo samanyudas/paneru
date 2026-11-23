@@ -85,8 +85,8 @@ enum Hold {
         flags: CGEventFlags,
         released: Option<(CGPoint, CGEventFlags)>,
     },
-    /// A press the engine took at `since`, whose release is still to come,
-    /// for [`HOLD_LIMIT`] at most.
+    /// A press made at `since` that the engine took, whose release is still
+    /// to come, for [`HOLD_LIMIT`] from the press at most.
     Consumed {
         since: Instant,
     },
@@ -183,18 +183,26 @@ impl State {
         matches!(self.hold, Hold::Waiting { token: held, .. } if held == token)
     }
 
-    fn consume(&mut self, token: u64, now: Instant) {
+    /// Takes the held press of `token` for the engine. Returns `false`
+    /// when that press is not held, or no longer is.
+    fn consume(&mut self, token: u64, now: Instant) -> bool {
         self.expire(now);
         if !self.waits(token) {
-            return;
+            return false;
         }
-        if let Hold::Waiting { released, .. } = self.hold {
+        if let Hold::Waiting {
+            since, released, ..
+        } = self.hold
+        {
+            // The hold's time limit runs from the press, whenever the
+            // engine takes it.
             self.hold = if released.is_some() {
                 Hold::Idle
             } else {
-                Hold::Consumed { since: now }
+                Hold::Consumed { since }
             };
         }
+        true
     }
 
     fn take_replay(&mut self, token: u64, now: Instant) -> Option<Replay> {
@@ -274,15 +282,17 @@ pub(crate) fn intercept(event_type: CGEventType, event: &CGEvent) -> TapAction {
 
 /// Marks the held title-bar double-click of `hold`, the token its press
 /// carried, as handled by Miri (maximize/restore), so neither the press nor
-/// its matching release reaches the app. A press the tap did not hold, or
-/// no longer holds, is left alone.
-pub(crate) fn consume(hold: Option<u64>) {
+/// its matching release reaches the app. Returns whether the engine may act
+/// on the press: `true` for a press the tap did not hold, which reached the
+/// engine alone, and for the press held now, and `false` for one the tap
+/// gave up, at its time limit or for a newer press.
+pub(crate) fn consume(hold: Option<u64>) -> bool {
     let Some(token) = hold else {
-        return;
+        return true;
     };
-    if let Ok(mut state) = STATE.lock() {
-        state.consume(token, Instant::now());
-    }
+    STATE
+        .lock()
+        .is_ok_and(|mut state| state.consume(token, Instant::now()))
 }
 
 /// Re-posts the held title-bar double-click of `hold` (and its release if
@@ -565,6 +575,85 @@ mod tests {
         assert!(
             (replayed.point.x - 300.0).abs() < f64::EPSILON,
             "the newer press is the one replayed"
+        );
+    }
+
+    /// An answer for a press the tap gave up, at its time limit or for a
+    /// newer press, tells the engine to leave the press alone.
+    #[test]
+    fn consuming_a_press_no_longer_held_says_so() {
+        let mut state = state();
+        let now = Instant::now();
+        let first = held(event(
+            &mut state,
+            CGEventType::LeftMouseDown,
+            (200.0, 50.0),
+            Some(42),
+            2,
+            now,
+        ));
+        let second = held(event(
+            &mut state,
+            CGEventType::LeftMouseDown,
+            (200.0, 50.0),
+            Some(42),
+            2,
+            now,
+        ));
+        assert!(!state.consume(first, now), "the earlier press is gone");
+        assert!(
+            !state.consume(second, now + HOLD_LIMIT),
+            "the newer one ended at the time limit"
+        );
+        let third = held(event(
+            &mut state,
+            CGEventType::LeftMouseDown,
+            (200.0, 50.0),
+            Some(42),
+            2,
+            now,
+        ));
+        assert!(state.consume(third, now), "the press held now is taken");
+    }
+
+    /// A press the engine takes late ends its hold at the time limit from
+    /// the press, not from when the engine took it.
+    #[test]
+    fn a_consumed_hold_ends_at_the_limit_from_its_press() {
+        let mut state = state();
+        let now = Instant::now();
+        let token = held(event(
+            &mut state,
+            CGEventType::LeftMouseDown,
+            (200.0, 50.0),
+            Some(42),
+            2,
+            now,
+        ));
+        let late = now + HOLD_LIMIT.saturating_sub(Duration::from_millis(100));
+        assert!(state.consume(token, late), "the engine takes it in time");
+        assert_eq!(
+            event(
+                &mut state,
+                CGEventType::LeftMouseDragged,
+                (210.0, 50.0),
+                Some(42),
+                2,
+                late
+            ),
+            TapAction::SwallowQuiet
+        );
+        assert_eq!(
+            event(
+                &mut state,
+                CGEventType::LeftMouseDragged,
+                (220.0, 50.0),
+                Some(42),
+                2,
+                now + HOLD_LIMIT
+            ),
+            TapAction::Pass,
+            "the hold ends 2 s after the press"
         );
     }
 

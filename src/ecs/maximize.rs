@@ -322,7 +322,12 @@ fn double_click_toggle(
             double_click_tap::replay(*hold);
             continue;
         }
-        double_click_tap::consume(*hold);
+        if !double_click_tap::consume(*hold) {
+            // The tap gave the press up, at its time limit or for a newer
+            // press: the app may have it, and the toggle would be late.
+            debug!("double-click on window {window_id} dropped: its hold ended");
+            continue;
+        }
         commands.trigger(ToggleMaximize {
             entity,
             at: Some(point),
@@ -698,7 +703,10 @@ fn hold_frames(
         // the new target frame; otherwise `UpdateSet::Events` sees the old
         // `Position` paired with a newly restored `Bounds` and writes a bogus
         // intermediate frame before the layout or picture cover even runs.
+        // A new hold answers a new toggle, so widths refused before count
+        // no more.
         if hold.is_changed() {
+            refusals.remove(&entity);
             continue;
         }
         // The hold ends, and with it any count of the width refused.
