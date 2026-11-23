@@ -230,6 +230,13 @@ impl CoverMorph {
         self.pending_unveil.retain(|(_, window, ..)| *window != id);
     }
 
+    /// Forgets every fresh picture the morph asked for or holds to show,
+    /// as after macOS refused pictures.
+    pub(super) fn clear_pending(&mut self) {
+        self.refresh_ask.clear();
+        self.pending_unveil.clear();
+    }
+
     /// Notes that window `entity`'s frame on the cover holds a picture of
     /// `size` now.
     fn back(&mut self, entity: Entity, size: IVec2) {

@@ -451,6 +451,13 @@ impl CoverPhotos {
         self.is_clear()
     }
 
+    /// Whether the engine keeps a picture of window `id` at `size`, as a
+    /// test sees it.
+    #[cfg(test)]
+    pub(crate) fn keeps(&self, id: WinID, size: IVec2) -> bool {
+        self.window(id, size).is_some()
+    }
+
     fn is_clear(&self) -> bool {
         self.windows.is_empty()
             && self.previous.is_empty()
@@ -719,6 +726,12 @@ fn keep_cover_photos(
         if let Event::WindowTitleChanged { window_id } = event {
             if allowed(&photos) {
                 photos.retitle(*window_id);
+            } else {
+                // No epoch counts while pictures are off, so a picture on
+                // its way, or kept from before, goes, whatever comes for
+                // it later.
+                photos.supersede(CoverSubject::Window(*window_id));
+                photos.forget_window(*window_id);
             }
             // A resize's cover asks for a picture of the new title, and
             // shows none it asked for before, even while it may take none.
@@ -754,6 +767,11 @@ fn keep_cover_photos(
             // reach the resize covers.
             apply_cover_reply(&mut photos, screen.as_deref_mut(), asked, result, now);
             replies.clear();
+            // No fresh picture a resize's cover holds to show, or waits
+            // for, may show after the refusal.
+            for mut morph in &mut morphs {
+                morph.clear_pending();
+            }
             continue;
         }
         if background {
