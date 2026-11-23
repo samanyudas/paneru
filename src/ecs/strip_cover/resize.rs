@@ -25,7 +25,7 @@ use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::resource::Resource;
-use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
+use bevy::ecs::system::{Commands, Local, NonSendMut, Query, Res, ResMut};
 use bevy::ecs::world::{Mut, Ref};
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
@@ -35,8 +35,8 @@ use tracing::debug;
 use super::{
     ASK_TIMEOUT, Access, Asked, CoverPhotos, CoverScreenHandle, CoverSlide, CoverSubject,
     CoverSwipe, CoverWindows, LANDED_FRAMES, LANDING_TIMEOUT, PATH_STEP, SHOWN_GRACE, ShownStrips,
-    StripWindow, apply_cover_reply, close, cover_enabled, end_guard, scene_of, shows,
-    strip_windows,
+    StartedCovers, StripWindow, apply_cover_reply, close, cover_enabled, end_guard, scene_of,
+    shows, strip_windows,
 };
 use crate::config::Config;
 use crate::ecs::drag::DragState;
@@ -377,9 +377,11 @@ pub(super) fn cover_resizes(
     time: Res<Time>,
     step: Res<AnimationStep>,
     mission_control: Res<MissionControlActive>,
+    mut started: ResMut<StartedCovers>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
     mut commands: Commands,
 ) {
+    started.0.clear();
     let Some(mut screen) = screen else {
         return;
     };
@@ -465,7 +467,9 @@ pub(super) fn cover_resizes(
                         .retain(|reply| reply.generation != generation);
                 }
                 end_guard(morph.guard.take(), &mut commands);
-                screen.0.hide(morph.display);
+                if !started.0.contains(&morph.display) {
+                    screen.0.hide(morph.display);
+                }
                 commands.entity(entity).remove::<CoverMorph>();
                 continue;
             }
@@ -511,6 +515,14 @@ pub(super) fn cover_resizes(
                         .find(|&&(e, _, _)| e == win_entity)
                         .is_some_and(|&(_, _, to)| to.size() == size)
                 });
+                // Drop any in-flight background or morph capture for windows
+                // whose size is changing on this turn, so a capture taken at
+                // the old size cannot land after `snap` resizes the window.
+                for (frame, &(.., to)) in morph.frames.iter().zip(&heading) {
+                    if frame.to.size() != to.size() {
+                        photos.supersede(CoverSubject::Window(frame.id));
+                    }
+                }
                 morph.frames = heading
                     .iter()
                     .zip(shown)
@@ -526,7 +538,14 @@ pub(super) fn cover_resizes(
                 morph.elapsed = 0.0;
                 morph.counted = 0.0;
                 morph.duration = duration;
-                morph.stage = Stage::Moving;
+                morph.stage = if morph.frames.iter().all(|frame| frame.from == frame.to) {
+                    Stage::Landing {
+                        deadline: time.elapsed() + LANDING_TIMEOUT,
+                        settled: 0,
+                    }
+                } else {
+                    Stage::Moving
+                };
                 let guard = morph.guard.take();
                 morph.guard = Some(snap(
                     entity,
@@ -641,6 +660,14 @@ pub(super) fn cover_resizes(
         let shown = scene.pictures.len();
         let area = scene.viewport;
         screen.0.show(&scene);
+        started.0.push(display.id());
+        // Supersede any in-flight background capture for windows whose size
+        // changes here, so an old-size ask cannot capture the snapped window.
+        for frame in &frames {
+            if frame.to.size() != frame.from.size() {
+                photos.supersede(CoverSubject::Window(frame.id));
+            }
+        }
         let duration = ease::duration(&config);
         let pictured = frames
             .iter()
@@ -737,7 +764,7 @@ fn shows_committed(
         })
         .collect::<Vec<_>>();
     let ids = committed.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-    let read = shown.now(&ids);
+    let read = shown.watch_morph(&ids);
     committed.iter().all(|(id, want)| {
         read.iter()
             .find(|(shown, _)| shown == id)
@@ -794,6 +821,7 @@ pub(super) fn lift_morphs(
 /// the fill. It asks once a window and size, and the picture arrives
 /// through [`keep_cover_photos`](super::keep_cover_photos), which hands it
 /// to [`unveil`].
+#[allow(clippy::too_many_arguments)]
 pub(super) fn refresh_morph_pictures(
     mut morphs: Query<&mut CoverMorph>,
     frames: Query<(&Window, &Position, &Bounds)>,
@@ -802,6 +830,7 @@ pub(super) fn refresh_morph_pictures(
     config: Res<Config>,
     time: Res<Time>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
+    mut watching_morph: Local<bool>,
 ) {
     let Some(mut screen) = screen else {
         return;
@@ -812,7 +841,17 @@ pub(super) fn refresh_morph_pictures(
             .morph_asked
             .retain(|asked| now.saturating_sub(asked.at) < ASK_TIMEOUT);
     }
-    if morphs.is_empty() || !cover_enabled(&config) || photos.access != Access::Allowed {
+    if morphs.is_empty() {
+        if *watching_morph {
+            if let Some(shown) = shown_frames.as_ref() {
+                shown.stop_morph();
+            }
+            *watching_morph = false;
+        }
+        return;
+    }
+    *watching_morph = true;
+    if !cover_enabled(&config) || photos.access != Access::Allowed {
         return;
     }
     for mut morph in &mut morphs {
@@ -832,10 +871,9 @@ pub(super) fn refresh_morph_pictures(
         if ready.is_empty() {
             continue;
         }
-        // One read for the few windows that widen, and only until each is
-        // asked for.
+        // Sample off the main thread via the background shown-frame sampler.
         let ids = ready.iter().map(|(_, id, _)| *id).collect::<Vec<_>>();
-        let read = shown_frames.as_ref().map(|shown| shown.now(&ids));
+        let read = shown_frames.as_ref().map(|shown| shown.watch_morph(&ids));
         for (entity, id, to) in ready {
             let shows = read.as_ref().is_none_or(|read| {
                 read.iter().any(|(shown, frame)| {

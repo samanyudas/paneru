@@ -79,6 +79,9 @@ struct Shared {
 #[derive(Default)]
 struct Watch {
     ids: Vec<WinID>,
+    /// Windows watched by active resize covers (`CoverMorph`) so they read
+    /// from the background sampler thread without main-thread `WindowServer` IPC.
+    morph_ids: Vec<WinID>,
     /// The newest frame read for each watched window. Until the first read,
     /// the frame the engine had asked for when watching began, where a
     /// window at rest is shown.
@@ -89,6 +92,22 @@ struct Watch {
     /// Bumped on each stop, so a read started before it is dropped.
     generation: u64,
     sampling: bool,
+}
+
+impl Watch {
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty() && self.morph_ids.is_empty()
+    }
+
+    fn all_ids(&self) -> Vec<WinID> {
+        let mut all = self.ids.clone();
+        for &id in &self.morph_ids {
+            if !all.contains(&id) {
+                all.push(id);
+            }
+        }
+        all
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -126,6 +145,51 @@ impl ShownFrames {
     /// app.
     pub(crate) fn now(&self, ids: &[WinID]) -> Vec<(WinID, IRect)> {
         (self.shared.read)(ids)
+    }
+
+    /// Watches `ids` on the background sampler thread for an active resize
+    /// cover and returns only frames that the sampler has actually read,
+    /// avoiding synchronous `WindowServer` IPC on the main thread.
+    pub(crate) fn watch_morph(&self, ids: &[WinID]) -> Vec<(WinID, IRect)> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let mut watch = lock(&self.shared.watch);
+        for &id in ids {
+            if !watch.morph_ids.contains(&id) {
+                watch.morph_ids.push(id);
+            }
+        }
+        if !self.sampled {
+            let frames = (self.shared.read)(ids);
+            watch.take(frames);
+        } else if !watch.sampling {
+            let shared = self.shared.clone();
+            if let Err(err) = thread::Builder::new()
+                .name("shown-frames".into())
+                .spawn(move || shared.sample())
+            {
+                warn!("cannot start the shown-frame sampler for resize cover: {err}");
+                return Vec::new();
+            }
+            watch.sampling = true;
+        }
+        self.shared.wake.notify_one();
+        ids.iter()
+            .filter(|id| !watch.unread.contains(id))
+            .filter_map(|&id| watch.shown.get(&id).map(|&frame| (id, frame)))
+            .collect()
+    }
+
+    /// Stops watching resize-cover windows once no `CoverMorph` is active.
+    pub(crate) fn stop_morph(&self) {
+        let mut watch = lock(&self.shared.watch);
+        watch.morph_ids.clear();
+        if watch.is_empty() {
+            watch.shown.clear();
+            watch.unread.clear();
+            watch.generation += 1;
+        }
     }
 
     /// Watches the windows of `asked`, each with the frame the engine last
@@ -172,9 +236,11 @@ impl ShownFrames {
     fn stop(&self) {
         let mut watch = lock(&self.shared.watch);
         watch.ids.clear();
-        watch.shown.clear();
-        watch.unread.clear();
-        watch.generation += 1;
+        if watch.is_empty() {
+            watch.shown.clear();
+            watch.unread.clear();
+            watch.generation += 1;
+        }
     }
 }
 
@@ -191,18 +257,18 @@ impl Shared {
     fn sample(&self) {
         loop {
             let mut watch = lock(&self.watch);
-            while watch.ids.is_empty() {
+            while watch.is_empty() {
                 let (woken, wait) = self
                     .wake
                     .wait_timeout(watch, SAMPLER_IDLE)
                     .unwrap_or_else(PoisonError::into_inner);
                 watch = woken;
-                if wait.timed_out() && watch.ids.is_empty() {
+                if wait.timed_out() && watch.is_empty() {
                     watch.sampling = false;
                     return;
                 }
             }
-            let (ids, generation) = (watch.ids.clone(), watch.generation);
+            let (ids, generation) = (watch.all_ids(), watch.generation);
             drop(watch);
 
             let frames = (self.read)(&ids);

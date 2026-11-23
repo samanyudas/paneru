@@ -40,8 +40,10 @@ use crate::types::commands::Side;
 const SLIDE_KEY: &str = "slide";
 
 /// The corner radius of a window's frame on a cover while a resize crops
-/// its picture or opens a strip right of it, in points.
-const FRAME_RADIUS: f64 = 10.0;
+/// its picture or opens a strip right of it, in points. Matches modern macOS
+/// window corner radii so cropped edges stay rounded and fill tucks cleanly
+/// behind the right corner cutouts.
+const FRAME_RADIUS: f64 = 14.0;
 
 /// The key of the fill opacity animation on a window's fill sublayer.
 const FILL_OPACITY_KEY: &str = "fill-opacity";
@@ -1142,7 +1144,7 @@ mod tests {
     fn fill_stays_confined_to_right_corner_and_gates_on_presented_width() {
         // A narrow picture never lets fill reach its left half.
         assert_eq!(fill_start(16.0), 8.0);
-        assert_eq!(fill_start(400.0), 390.0);
+        assert_eq!(fill_start(400.0), 386.0);
 
         // Segment [198, 206] for a 200-pt picture (threshold 200.5) crosses
         // at 2.5/8 = 0.3125 of segment 1 of 3 -> (1 + 0.3125)/3 = 0.4375.

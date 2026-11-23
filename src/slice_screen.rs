@@ -565,7 +565,7 @@ fn edge_color(format: PixelFormat, pixels: &[u8]) -> Option<[f64; 4]> {
     if width == 0 || height == 0 || row < width * 4 {
         return None;
     }
-    let x = width.saturating_sub((width / 20).max(12));
+    let x = width.saturating_sub((width / 20).clamp(12, 48));
     let (top, span) = (height / 5, height * 3 / 5);
     let (mut sum, mut count) = ([0.0_f64; 3], 0_u32);
     for sample in 0..SAMPLES {

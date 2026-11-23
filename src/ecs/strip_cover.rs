@@ -438,9 +438,17 @@ pub(crate) struct CoverSwipe {
     layout: u64,
 }
 
+/// Displays on which a cover started during this frame's `UpdateSet::Layout`
+/// pass, shared across `cover_resizes`, `cover_strip_moves`, and
+/// `cover_swipes` so an aborting strip on the same display never hides a
+/// cover another strip just put up.
+#[derive(Resource, Debug, Default)]
+pub(super) struct StartedCovers(pub(super) Vec<CGDirectDisplayID>);
+
 pub(crate) fn register(app: &mut App) {
     app.init_resource::<CoverPhotos>()
         .init_resource::<StripLayouts>()
+        .init_resource::<StartedCovers>()
         .init_resource::<resize::RestingStrips>()
         .add_systems(
             Update,
@@ -871,15 +879,13 @@ fn cover_strip_moves(
     step: Res<AnimationStep>,
     mission_control: Res<MissionControlActive>,
     layouts: Res<StripLayouts>,
+    mut started: ResMut<StartedCovers>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
     mut commands: Commands,
 ) {
     let Some(mut screen) = screen else {
         return;
     };
-    // The displays a cover went up on in this pass, which another strip's
-    // early end there must not take down.
-    let mut started = Vec::new();
     let dragging = drag
         .as_ref()
         .is_some_and(|drag| drag.held_window().is_some());
@@ -974,7 +980,7 @@ fn cover_strip_moves(
                     }
                 }
                 end_guard(slide.guard.take(), &mut commands);
-                if !started.contains(&slide.display) {
+                if !started.0.contains(&slide.display) {
                     screen.0.hide(slide.display);
                 }
                 commands.entity(entity).remove::<CoverSlide>();
@@ -1072,7 +1078,7 @@ fn cover_strip_moves(
         };
         let pictures = scene.pictures.len();
         screen.0.show(&scene);
-        started.push(display.id());
+        started.0.push(display.id());
         let mut slide = start_slide(
             display.id(),
             (display.bounds(), viewport),
@@ -1248,6 +1254,7 @@ fn cover_swipes(
     mission_control: Res<MissionControlActive>,
     layouts: Res<StripLayouts>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
+    mut started: ResMut<StartedCovers>,
     mut commands: Commands,
 ) {
     let Some(mut screen) = screen else {
@@ -1256,7 +1263,6 @@ fn cover_swipes(
     let dragging = drag
         .as_ref()
         .is_some_and(|drag| drag.held_window().is_some());
-    let mut started = Vec::new();
     for (
         entity,
         strip,
@@ -1303,7 +1309,7 @@ fn cover_swipes(
                 entity_commands.remove::<CoverSwipe>().insert(Moved);
                 if aborted {
                     debug!("cover over swiped strip {entity} ended early");
-                    if !started.contains(&swipe.display) {
+                    if !started.0.contains(&swipe.display) {
                         screen.0.hide(swipe.display);
                     }
                 } else {
@@ -1362,7 +1368,7 @@ fn cover_swipes(
         };
         let pictures = scene.pictures.len();
         screen.0.show(&scene);
-        started.push(display.id());
+        started.0.push(display.id());
         screen.0.track(display.id(), f64::from(position.0.x));
         debug!("cover over swiped strip {entity}: {pictures} pictures");
         commands.entity(entity).insert(CoverSwipe {
