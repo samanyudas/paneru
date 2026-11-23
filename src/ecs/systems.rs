@@ -1658,6 +1658,7 @@ type ActiveStripMotion<'w, 's> = Populated<
     (
         Has<Scrolling>,
         Has<crate::ecs::strip_cover::CoverSlide>,
+        Has<crate::ecs::strip_cover::CoverMorph>,
         &'static LayoutStrip,
     ),
     With<ActiveWorkspaceMarker>,
@@ -1687,12 +1688,12 @@ pub(super) fn update_overlays(
 
     // Hide overlays during swipe, mission control, native fullscreen spaces,
     // or briefly after a space change (macOS space-switch animation).
-    let Some((swiping, covered, active_strip)) = active_workspace.iter().next() else {
+    let Some((swiping, sliding, resizing, active_strip)) = active_workspace.iter().next() else {
         return;
     };
 
     // A picture cover moves pictures, not the windows the overlays follow.
-    if swiping || covered || mission_control_active.0 || active_strip.is_fullscreen() {
+    if swiping || sliding || resizing || mission_control_active.0 || active_strip.is_fullscreen() {
         overlay_mgr.hide_all();
         return;
     }

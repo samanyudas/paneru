@@ -18,7 +18,7 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::{CFData, CFRetained, CFType, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGDataProvider, CGImage, CGImageAlphaInfo, CGPreflightScreenCaptureAccess,
+    CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo, CGPreflightScreenCaptureAccess,
 };
 use objc2_foundation::{NSError, NSPoint, NSRect, NSSize};
 use objc2_quartz_core::CATransaction;
@@ -182,7 +182,9 @@ impl SliceScreenOS {
         panel.setHasShadow(false);
         panel.setHidesOnDeactivate(false);
         panel.setIgnoresMouseEvents(false);
-        panel.setLevel(NSFloatingWindowLevel - 1);
+        // Above tiled windows, and one below the picture cover, which a
+        // resize puts up while its windows cross the edge underneath.
+        panel.setLevel(NSFloatingWindowLevel - 2);
         panel.setCollectionBehavior(
             NSWindowCollectionBehavior::Transient
                 | NSWindowCollectionBehavior::IgnoresCycle
@@ -417,7 +419,12 @@ pub(crate) fn capture(
         } else {
             Digest(0)
         };
-        done(Ok(Photo { digest, image }));
+        let edge_color = sample_right_edge_color(&image, pixels);
+        done(Ok(Photo {
+            digest,
+            image,
+            edge_color,
+        }));
     });
     unsafe {
         SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
@@ -478,6 +485,116 @@ fn blank(image: &CGImage, pixels: &[u8]) -> bool {
     sampled > 0 && clear * 100 >= sampled * 99
 }
 
+/// How the bytes of one 32-bit pixel hold its channels: where red, green,
+/// blue and alpha sit, and whether the colour is premultiplied by alpha.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PixelFormat {
+    width: usize,
+    height: usize,
+    row: usize,
+    /// The byte of red, green and blue, and of alpha if the pixel has one.
+    rgb: [usize; 3],
+    alpha: Option<usize>,
+    premultiplied: bool,
+}
+
+impl PixelFormat {
+    /// The format of `image`, if its pixels are 8-bit channels packed in 32
+    /// bits, the format `ScreenCaptureKit` gives.
+    fn of(image: &CGImage) -> Option<Self> {
+        if CGImage::bits_per_pixel(Some(image)) != 32
+            || CGImage::bits_per_component(Some(image)) != 8
+        {
+            return None;
+        }
+        let alpha = CGImage::alpha_info(Some(image));
+        // Where alpha sits in the pixel as a 32-bit word: first is its high
+        // byte. A word in the default or big byte order keeps that order in
+        // memory, and a little-endian one turns it around.
+        let (first, premultiplied, skip) = match alpha {
+            CGImageAlphaInfo::PremultipliedFirst => (true, true, false),
+            CGImageAlphaInfo::PremultipliedLast => (false, true, false),
+            CGImageAlphaInfo::First => (true, false, false),
+            CGImageAlphaInfo::Last => (false, false, false),
+            CGImageAlphaInfo::NoneSkipFirst => (true, false, true),
+            CGImageAlphaInfo::NoneSkipLast => (false, false, true),
+            _ => return None,
+        };
+        let little = match CGImage::byte_order_info(Some(image)) {
+            CGImageByteOrderInfo::OrderDefault | CGImageByteOrderInfo::Order32Big => false,
+            CGImageByteOrderInfo::Order32Little => true,
+            _ => return None,
+        };
+        // The word's bytes from high to low: alpha, then red, green, blue,
+        // or red, green, blue, then alpha.
+        let (rgb, a) = if first {
+            ([1, 2, 3], 0)
+        } else {
+            ([0, 1, 2], 3)
+        };
+        let place = |byte: usize| if little { 3 - byte } else { byte };
+        Some(Self {
+            width: CGImage::width(Some(image)),
+            height: CGImage::height(Some(image)),
+            row: CGImage::bytes_per_row(Some(image)),
+            rgb: rgb.map(place),
+            alpha: (!skip).then_some(place(a)),
+            premultiplied,
+        })
+    }
+}
+
+/// The colour of the opaque surface of `image` near its right edge, as red,
+/// green, blue and alpha from 0 to 1 in the image's colour space: the
+/// average of 16 points from 20% to 80% of its height, on a column inside
+/// the edge that skips a window's border and rounded corners. `None` when
+/// no point there is opaque, or the pixels are in another format.
+pub(crate) fn sample_right_edge_color(image: &CGImage, pixels: &[u8]) -> Option<[f64; 4]> {
+    edge_color(PixelFormat::of(image)?, pixels)
+}
+
+/// The colour [`sample_right_edge_color`] samples, from pixels in `format`.
+fn edge_color(format: PixelFormat, pixels: &[u8]) -> Option<[f64; 4]> {
+    /// How many points are sampled down the column.
+    const SAMPLES: usize = 16;
+    /// The least alpha of a point that counts as opaque surface.
+    const OPAQUE: u8 = 200;
+    let PixelFormat {
+        width, height, row, ..
+    } = format;
+    if width == 0 || height == 0 || row < width * 4 {
+        return None;
+    }
+    let x = width.saturating_sub((width / 20).max(12));
+    let (top, span) = (height / 5, height * 3 / 5);
+    let (mut sum, mut count) = ([0.0_f64; 3], 0_u32);
+    for sample in 0..SAMPLES {
+        let y = top + span * sample / (SAMPLES - 1);
+        let start = y.min(height - 1) * row + x * 4;
+        let Some(pixel) = pixels.get(start..start + 4) else {
+            continue;
+        };
+        let alpha = format.alpha.map_or(u8::MAX, |byte| pixel[byte]);
+        if alpha < OPAQUE {
+            continue;
+        }
+        let scale = if format.premultiplied {
+            f64::from(alpha)
+        } else {
+            f64::from(u8::MAX)
+        };
+        for (total, byte) in sum.iter_mut().zip(format.rgb) {
+            *total += (f64::from(pixel[byte]) / scale).min(1.0);
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    let [r, g, b] = sum.map(|total| total / f64::from(count));
+    Some([r, g, b, 1.0])
+}
+
 fn digest(image: &CGImage, pixels: &[u8]) -> Digest {
     let mut hasher = DefaultHasher::new();
     CGImage::width(Some(image)).hash(&mut hasher);
@@ -491,13 +608,13 @@ mod tests {
     use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
     use objc2_core_graphics::{
         CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGImage,
-        CGImageAlphaInfo,
+        CGImageAlphaInfo, CGImageByteOrderInfo,
     };
 
     use bevy::math::IVec2;
     use objc2_screen_capture_kit::SCStreamConfiguration;
 
-    use super::{blank, configuration, pixels};
+    use super::{PixelFormat, blank, configuration, edge_color, pixels, sample_right_edge_color};
 
     /// A source rectangle makes `ScreenCaptureKit` leave out the part of a
     /// window off screen, so every photo of a tucked window, which shows 1
@@ -565,5 +682,129 @@ mod tests {
     #[test]
     fn a_photo_with_a_little_drawn_is_not_blank() {
         assert!(!is_blank(&photo(16.0, 16.0)));
+    }
+
+    /// A clear 200 by 100 photo, in the pixel layout `info` gives, with its
+    /// right part from x 150 filled with `rgba`.
+    fn edge_photo(info: u32, rgba: [f64; 4]) -> CFRetained<CGImage> {
+        let space = CGColorSpace::new_device_rgb();
+        // SAFETY: a null buffer asks Core Graphics to allocate a clear one.
+        let context = unsafe {
+            CGBitmapContextCreate(std::ptr::null_mut(), 200, 100, 8, 0, space.as_deref(), info)
+        }
+        .expect("a bitmap context");
+        let [r, g, b, a] = rgba;
+        CGContext::set_rgb_fill_color(Some(&context), r, g, b, a);
+        CGContext::fill_rect(
+            Some(&context),
+            CGRect::new(CGPoint::new(150.0, 0.0), CGSize::new(50.0, 100.0)),
+        );
+        CGBitmapContextCreateImage(Some(&context)).expect("an image")
+    }
+
+    fn edge_of(image: &CGImage) -> Option<[f64; 4]> {
+        let data = pixels(image);
+        // SAFETY: a test image nothing writes to.
+        sample_right_edge_color(
+            image,
+            data.as_deref()
+                .map_or(&[][..], |data| unsafe { data.as_bytes_unchecked() }),
+        )
+    }
+
+    fn assert_color(found: Option<[f64; 4]>, want: [f64; 4]) {
+        let found = found.expect("an edge colour");
+        assert!(
+            found
+                .iter()
+                .zip(want)
+                .all(|(found, want)| (found - want).abs() < 2.0 / 255.0),
+            "found {found:?}, want {want:?}"
+        );
+    }
+
+    #[test]
+    fn the_edge_colour_of_an_rgba_photo() {
+        let image = edge_photo(CGImageAlphaInfo::PremultipliedLast.0, [0.2, 0.4, 0.6, 1.0]);
+        assert_color(edge_of(&image), [0.2, 0.4, 0.6, 1.0]);
+    }
+
+    /// `ScreenCaptureKit` hands over BGRA pixels: alpha first in a
+    /// little-endian word.
+    #[test]
+    fn the_edge_colour_of_a_bgra_photo() {
+        let image = edge_photo(
+            CGImageAlphaInfo::PremultipliedFirst.0 | CGImageByteOrderInfo::Order32Little.0,
+            [0.8, 0.3, 0.1, 1.0],
+        );
+        assert_color(edge_of(&image), [0.8, 0.3, 0.1, 1.0]);
+    }
+
+    #[test]
+    fn a_photo_clear_at_its_right_edge_has_no_edge_colour() {
+        let image = edge_photo(CGImageAlphaInfo::PremultipliedLast.0, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(edge_of(&image), None);
+    }
+
+    /// A translucent surface is no opaque surface to fill with.
+    #[test]
+    fn a_translucent_right_edge_has_no_edge_colour() {
+        let image = edge_photo(CGImageAlphaInfo::PremultipliedLast.0, [1.0, 1.0, 1.0, 0.5]);
+        assert_eq!(edge_of(&image), None);
+    }
+
+    fn rgba(width: usize, height: usize) -> PixelFormat {
+        PixelFormat {
+            width,
+            height,
+            row: width * 4,
+            rgb: [0, 1, 2],
+            alpha: Some(3),
+            premultiplied: true,
+        }
+    }
+
+    #[test]
+    fn an_empty_or_short_photo_has_no_edge_colour() {
+        assert_eq!(edge_color(rgba(0, 10), &[]), None);
+        assert_eq!(edge_color(rgba(10, 0), &[]), None);
+        // Fewer bytes than the format says: no sample reads past them.
+        assert_eq!(edge_color(rgba(64, 64), &[255; 64]), None);
+    }
+
+    /// A photo narrower than the column inside the edge samples its left
+    /// column.
+    #[test]
+    fn a_narrow_photo_samples_its_first_column() {
+        let found = edge_color(rgba(4, 4), &[51, 102, 153, 255].repeat(16));
+        assert_color(found, [0.2, 0.4, 0.6, 1.0]);
+    }
+
+    /// Pixels in a format other than 8-bit channels in 32 bits, such as 16
+    /// bits a channel, give no edge colour rather than a wrong one.
+    #[test]
+    fn a_photo_of_another_pixel_format_has_no_edge_colour() {
+        let space = CGColorSpace::new_device_rgb();
+        // SAFETY: a null buffer asks Core Graphics to allocate a clear one.
+        let context = unsafe {
+            CGBitmapContextCreate(
+                std::ptr::null_mut(),
+                32,
+                32,
+                16,
+                0,
+                space.as_deref(),
+                CGImageAlphaInfo::PremultipliedLast.0,
+            )
+        }
+        .expect("a bitmap context");
+        CGContext::set_rgb_fill_color(Some(&context), 1.0, 1.0, 1.0, 1.0);
+        CGContext::fill_rect(
+            Some(&context),
+            CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(32.0, 32.0)),
+        );
+        let image = CGBitmapContextCreateImage(Some(&context)).expect("an image");
+        assert_eq!(PixelFormat::of(&image), None);
+        assert_eq!(edge_of(&image), None);
     }
 }

@@ -117,6 +117,11 @@ pub(crate) struct Digest(pub u64);
 pub(crate) struct Photo {
     pub digest: Digest,
     pub image: CFRetained<CGImage>,
+    /// The colour of the photo's opaque surface near its right edge, as red,
+    /// green, blue and alpha from 0 to 1 in the image's colour space. A
+    /// resize's cover fills the strip it opens right of a picture with it.
+    /// `None` when the photo shows no opaque surface there.
+    pub edge_color: Option<[f64; 4]>,
 }
 
 /// Why a photo did not arrive.

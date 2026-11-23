@@ -292,6 +292,7 @@ fn photo(digest: u64) -> Photo {
     Photo {
         digest: Digest(digest),
         image: pixel(),
+        edge_color: None,
     }
 }
 

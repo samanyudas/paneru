@@ -14,8 +14,11 @@ use objc2_app_kit::{
     NSViewLayerContentsRedrawPolicy, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
     NSWindowStyleMask,
 };
-use objc2_core_foundation::{CFType, CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{CGDirectDisplayID, CGPreflightScreenCaptureAccess};
+use objc2_core_foundation::{CFRetained, CFType, CGPoint, CGRect, CGSize};
+use objc2_core_graphics::{
+    CGColor, CGColorSpace, CGColorSpaceModel, CGDirectDisplayID, CGImage,
+    CGPreflightScreenCaptureAccess,
+};
 use objc2_foundation::{NSArray, NSError, NSNumber, NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::{CAKeyframeAnimation, CALayer, CAMediaTiming as _, CATransaction};
 use objc2_screen_capture_kit::{SCContentFilter, SCShareableContent, SCWindow};
@@ -33,6 +36,15 @@ use crate::types::commands::Side;
 /// The key of the slide animation on a cover's strip layer. A new slide
 /// replaces the one before it.
 const SLIDE_KEY: &str = "slide";
+
+/// The corner radius of a window's frame on a cover while a resize crops
+/// its picture or opens a strip right of it, in points.
+const FRAME_RADIUS: f64 = 10.0;
+
+/// How far left of a picture's right edge the fill behind it starts, in
+/// points: far enough to fill under the window's rounded right corners,
+/// and clear of its left ones.
+const FILL_OVERLAP: f64 = 32.0;
 
 /// A shown cover, as the event tap needs it on the main thread: its window,
 /// its viewport, its strip layer, and each picture's frame from the strip
@@ -84,6 +96,104 @@ pub struct CoverScreenOS {
     filters: HashMap<WinID, Arc<OnceLock<Filter>>>,
 }
 
+/// One window on a cover: a frame that a resize moves and sizes, which
+/// crops what it does not cover, and in it the window's picture at its own
+/// size from the frame's top left corner, which never stretches.
+struct Framed {
+    id: WinID,
+    /// The frame, with its anchor at its bottom left corner, so its position
+    /// is that corner and its bounds are its size.
+    container: Retained<CALayer>,
+    /// The picture, a sublayer of `container`.
+    picture: Retained<CALayer>,
+    /// The size `picture` shows the window at, in points.
+    picture_size: CGSize,
+    /// Behind the picture, from a little left of its right edge: the
+    /// colour of the window's surface there, which fills the strip a wider
+    /// frame opens. `None` when the photo has no edge colour.
+    fill: Option<Retained<CALayer>>,
+}
+
+impl Framed {
+    /// Puts the picture at the top left corner of a frame `height` points
+    /// high. A layer's space runs up from its bottom left corner.
+    fn place_picture(&self, height: f64) {
+        self.picture.setFrame(CGRect::new(
+            CGPoint::new(0.0, height - self.picture_size.height),
+            self.picture_size,
+        ));
+    }
+
+    /// Sets the frame up to move from `from` to `to`, in the strip layer's
+    /// space: a frame wider than the picture at either end shows the fill,
+    /// and one that crops or opens rounds its corners as a window's are. A
+    /// frame of the picture's own size keeps the picture as it is.
+    fn dress(&self, from: CGRect, to: CGRect) {
+        let widest = from.size.width.max(to.size.width);
+        let narrowest = from.size.width.min(to.size.width);
+        let opens = widest > self.picture_size.width + 0.5;
+        let crops = narrowest < self.picture_size.width - 0.5;
+        self.container
+            .setCornerRadius(if opens || crops { FRAME_RADIUS } else { 0.0 });
+        self.place_picture(to.size.height);
+        if let Some(fill) = &self.fill {
+            fill.setHidden(!opens);
+            let start = (self.picture_size.width - FILL_OVERLAP).max(0.0);
+            fill.setFrame(CGRect::new(
+                CGPoint::new(start, 0.0),
+                CGSize::new((widest - start).max(0.0), to.size.height),
+            ));
+        }
+    }
+}
+
+/// The colour that fills the strip a resize opens right of `photo`, in the
+/// photo's own colour space, so it matches the picture beside it.
+fn edge_fill(photo: &Photo) -> Option<CFRetained<CGColor>> {
+    let [red, green, blue, alpha] = photo.edge_color?;
+    if alpha <= 0.0 {
+        return None;
+    }
+    let space = CGImage::color_space(Some(&photo.image)).filter(|space| {
+        CGColorSpace::model(Some(space)) == CGColorSpaceModel::RGB
+            && CGColorSpace::number_of_components(Some(space)) == 3
+    });
+    let Some(space) = space else {
+        return Some(CGColor::new_srgb(red, green, blue, alpha));
+    };
+    let components = [red, green, blue, alpha];
+    // SAFETY: four components, one for each of the space's three and alpha.
+    unsafe { CGColor::new(Some(&space), components.as_ptr()) }
+}
+
+/// A layer filled with `color`, hidden until a frame opens past its picture.
+fn fill_layer(color: &CGColor) -> Retained<CALayer> {
+    let fill = CALayer::new();
+    fill.setAnchorPoint(CGPoint::new(0.0, 0.0));
+    fill.setBackgroundColor(Some(color));
+    fill.setHidden(true);
+    fill
+}
+
+/// One animated number of a morph: the frame layer, which of its numbers
+/// moves (an index into [`MORPH_TRACKS`]), and from where to where.
+struct Lead {
+    layer: Retained<CALayer>,
+    track: usize,
+    from: f64,
+    to: f64,
+}
+
+/// The numbers of a frame layer a morph animates. Its anchor is its bottom
+/// left corner, so its position is that corner and its bounds' size is its
+/// size, the two parts of the frame a morph sets.
+const MORPH_TRACKS: [&str; 4] = [
+    "position.x",
+    "position.y",
+    "bounds.size.width",
+    "bounds.size.height",
+];
+
 /// One display's cover: a panel over its viewport, the layer that holds the
 /// strip's pictures, and the viewport it covers.
 struct Cover {
@@ -92,6 +202,12 @@ struct Cover {
     viewport: IRect,
     /// Each window's picture and the frame it shows from the strip origin.
     pictures: Vec<(WinID, IRect)>,
+    /// Each window's frame and picture, which a resize moves on its own.
+    layers: Vec<Framed>,
+    /// The strip origin the cover was laid out at, which a resize keeps.
+    laid: IVec2,
+    /// The track of a morph that moves furthest, to tell how far it shows.
+    lead: Option<Lead>,
     /// Where the strip origin shows now, as far as the engine has told.
     at: IVec2,
     /// Whether the cover is up.
@@ -199,10 +315,40 @@ impl CoverScreenOS {
 
     fn picture(image: &CFType, frame: CGRect, scale: f64) -> Retained<CALayer> {
         let layer = CALayer::new();
+        layer.setAnchorPoint(CGPoint::new(0.0, 0.0));
         layer.setFrame(frame);
         unsafe { layer.setContents(Some(image.as_ref())) };
         layer.setContentsScale(scale);
         layer
+    }
+
+    /// Window `id`'s frame at `frame` in the strip layer's space, holding
+    /// `photo` at the frame's size.
+    fn framed(id: WinID, photo: &Photo, frame: CGRect, scale: f64) -> Framed {
+        let container = CALayer::new();
+        // Its position is its bottom left corner, so a resize moves the left
+        // edge and the width on their own.
+        container.setAnchorPoint(CGPoint::new(0.0, 0.0));
+        container.setFrame(frame);
+        container.setMasksToBounds(true);
+        let fill = edge_fill(photo).map(|color| fill_layer(&color));
+        if let Some(fill) = &fill {
+            container.addSublayer(fill);
+        }
+        let image: &CFType = &photo.image;
+        let picture = Self::picture(
+            image,
+            CGRect::new(CGPoint::new(0.0, 0.0), frame.size),
+            scale,
+        );
+        container.addSublayer(&picture);
+        Framed {
+            id,
+            container,
+            picture,
+            picture_size: frame.size,
+            fill,
+        }
     }
 
     /// Tells the event tap where every shown cover's pictures are: the
@@ -382,6 +528,9 @@ impl CoverScreen for CoverScreenOS {
                     strip,
                     viewport,
                     pictures: Vec::new(),
+                    layers: Vec::new(),
+                    laid: scene.strip,
+                    lead: None,
                     at: scene.strip,
                     shown: false,
                 },
@@ -417,21 +566,22 @@ impl CoverScreen for CoverScreenOS {
             CGSize::new(f64::from(viewport.width()), f64::from(viewport.height())),
         ));
         strip.setPosition(CGPoint::new(f64::from(scene.strip.x - viewport.min.x), 0.0));
-        for (_, rel, photo) in &scene.pictures {
+        let mut layers = Vec::with_capacity(scene.pictures.len());
+        for (id, rel, photo) in &scene.pictures {
             let on_screen = IRect::from_corners(
                 IVec2::new(rel.min.x + viewport.min.x, rel.min.y + scene.strip.y),
                 IVec2::new(rel.max.x + viewport.min.x, rel.max.y + scene.strip.y),
             );
-            let image: &CFType = &photo.image;
-            strip.addSublayer(&Self::picture(
-                image,
-                Self::turned(on_screen, viewport),
-                scale,
-            ));
+            let framed = Self::framed(*id, photo, Self::turned(on_screen, viewport), scale);
+            strip.addSublayer(&framed.container);
+            layers.push(framed);
         }
         root.addSublayer(&strip);
         CATransaction::commit();
         cover.strip = strip;
+        cover.layers = layers;
+        cover.laid = scene.strip;
+        cover.lead = None;
         cover.pictures = scene
             .pictures
             .iter()
@@ -457,18 +607,13 @@ impl CoverScreen for CoverScreenOS {
             return;
         };
         let origin = f64::from(cover.viewport.min.x);
-        let values = path
-            .iter()
-            .map(|x| NSNumber::new_f64(x - origin))
-            .collect::<Vec<_>>();
-        let animation =
-            CAKeyframeAnimation::animationWithKeyPath(Some(&NSString::from_str("position.x")));
-        // SAFETY: an array of numbers is an array of objects.
-        let values: Retained<NSArray> =
-            unsafe { Retained::cast_unchecked(NSArray::from_retained_slice(&values)) };
-        unsafe { animation.setValues(Some(&values)) };
+        let values = path.iter().map(|x| x - origin).collect::<Vec<_>>();
         #[allow(clippy::cast_precision_loss)]
-        animation.setDuration(step * (path.len().saturating_sub(1)) as f64);
+        let animation = keyframes(
+            "position.x",
+            &values,
+            step * (path.len().saturating_sub(1)) as f64,
+        );
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         let position = cover.strip.position();
@@ -480,6 +625,152 @@ impl CoverScreen for CoverScreenOS {
             .addAnimation_forKey(&animation, Some(&NSString::from_str(SLIDE_KEY)));
         CATransaction::commit();
         CATransaction::flush();
+    }
+
+    fn morph(
+        &mut self,
+        display: CGDirectDisplayID,
+        frames: &[(WinID, IRect, IRect)],
+        shares: &[f64],
+        step: f64,
+    ) {
+        let Some(cover) = self.covers.get_mut(&display) else {
+            return;
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let duration = step * (shares.len().saturating_sub(1)) as f64;
+        let (laid, viewport) = (cover.laid, cover.viewport);
+        // A frame in global points, in the strip layer's space.
+        let local = |rect: IRect| {
+            Self::turned(
+                IRect::from_corners(
+                    IVec2::new(rect.min.x - laid.x + viewport.min.x, rect.min.y),
+                    IVec2::new(rect.max.x - laid.x + viewport.min.x, rect.max.y),
+                ),
+                viewport,
+            )
+        };
+        let mut lead = None;
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        for (id, from, to) in frames {
+            let Some(window) = cover.layers.iter().find(|window| window.id == *id) else {
+                continue;
+            };
+            let (from, to) = (local(*from), local(*to));
+            // The frame moves and sizes, and the picture in it stays put at
+            // its own size: it crops, or opens onto the fill, never stretches.
+            let layer = &window.container;
+            window.dress(from, to);
+            layer.removeAllAnimations();
+            layer.setFrame(to);
+            let tracks = [
+                (from.origin.x, to.origin.x),
+                (from.origin.y, to.origin.y),
+                (from.size.width, to.size.width),
+                (from.size.height, to.size.height),
+            ];
+            for (track, (path, (start, end))) in MORPH_TRACKS.into_iter().zip(tracks).enumerate() {
+                if (end - start).abs() < f64::EPSILON {
+                    continue;
+                }
+                if lead
+                    .as_ref()
+                    .is_none_or(|lead: &Lead| (end - start).abs() > (lead.to - lead.from).abs())
+                {
+                    lead = Some(Lead {
+                        layer: layer.clone(),
+                        track,
+                        from: start,
+                        to: end,
+                    });
+                }
+                let values = shares
+                    .iter()
+                    .map(|share| start + (end - start) * share)
+                    .collect::<Vec<_>>();
+                layer.addAnimation_forKey(
+                    &keyframes(path, &values, duration),
+                    Some(&NSString::from_str(path)),
+                );
+            }
+        }
+        CATransaction::commit();
+        CATransaction::flush();
+        cover.lead = lead;
+        // A press goes to the window where its picture rests.
+        // In paint order, so a press where pictures overlap goes to the front.
+        cover.pictures = cover
+            .layers
+            .iter()
+            .filter_map(|framed| {
+                let (_, _, to) = frames.iter().find(|(frame, ..)| *frame == framed.id)?;
+                Some((framed.id, IRect::from_corners(to.min - laid, to.max - laid)))
+            })
+            .collect();
+        cover.at = laid;
+        self.publish_panels();
+    }
+
+    fn replace_picture(
+        &mut self,
+        display: CGDirectDisplayID,
+        window: WinID,
+        size: IVec2,
+        photo: &Photo,
+    ) {
+        let Some(cover) = self.covers.get_mut(&display).filter(|cover| cover.shown) else {
+            return;
+        };
+        let Some(framed) = cover.layers.iter_mut().find(|framed| framed.id == window) else {
+            return;
+        };
+        let picture_size = CGSize::new(f64::from(size.x), f64::from(size.y));
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        let image: &CFType = &photo.image;
+        unsafe { framed.picture.setContents(Some(image.as_ref())) };
+        framed.picture_size = picture_size;
+        // The frame's own bounds are where the morph heads: the picture
+        // goes at their top left corner, while the frame still moves.
+        let target = framed.container.bounds().size;
+        framed.place_picture(target.height);
+        // The new picture fills its frame, so the strip it opened shows the
+        // window itself now. A later morph that widens the frame past it
+        // fills with this picture's edge colour.
+        if let Some(fill) = framed.fill.take() {
+            fill.removeFromSuperlayer();
+        }
+        if let Some(color) = edge_fill(photo) {
+            let fill = fill_layer(&color);
+            framed
+                .container
+                .insertSublayer_below(&fill, Some(&framed.picture));
+            framed.fill = Some(fill);
+        }
+        // The frame keeps its rounded corners: while it still grows, it
+        // crops the new picture's right edge.
+        CATransaction::commit();
+        CATransaction::flush();
+        debug!(
+            "cover picture of window {window} replaced at {}x{}",
+            size.x, size.y
+        );
+    }
+
+    fn morph_share(&self, display: CGDirectDisplayID) -> Option<f64> {
+        let cover = self.covers.get(&display).filter(|cover| cover.shown)?;
+        let lead = cover.lead.as_ref()?;
+        // SAFETY: a plain read of the layer Core Animation shows now.
+        let shown = unsafe { lead.layer.presentationLayer() }?;
+        let (position, size) = (shown.position(), shown.bounds().size);
+        let now = [position.x, position.y, size.width, size.height][lead.track];
+        // Within half a point of the end, the morph shows landed.
+        Some(if (now - lead.to).abs() < 0.5 {
+            1.0
+        } else {
+            ((now - lead.from) / (lead.to - lead.from)).clamp(0.0, 1.0)
+        })
     }
 
     fn track(&mut self, display: CGDirectDisplayID, x: f64) {
@@ -541,6 +832,8 @@ impl CoverScreen for CoverScreenOS {
         };
         cover.shown = false;
         cover.pictures.clear();
+        cover.layers.clear();
+        cover.lead = None;
         // The pictures go with the layer that held them.
         cover.strip = CALayer::new();
         cover.window.orderOut(None::<&AnyObject>);
@@ -556,6 +849,22 @@ impl CoverScreen for CoverScreenOS {
         let id = display;
         debug!("cover hidden on display {id}");
     }
+}
+
+/// An animation of the number at `path` through `values`, evenly over
+/// `seconds`. It holds nothing at its end: the layer's own value takes over.
+fn keyframes(path: &str, values: &[f64], seconds: f64) -> Retained<CAKeyframeAnimation> {
+    let values = values
+        .iter()
+        .map(|value| NSNumber::new_f64(*value))
+        .collect::<Vec<_>>();
+    let animation = CAKeyframeAnimation::animationWithKeyPath(Some(&NSString::from_str(path)));
+    // SAFETY: an array of numbers is an array of objects.
+    let values: Retained<NSArray> =
+        unsafe { Retained::cast_unchecked(NSArray::from_retained_slice(&values)) };
+    unsafe { animation.setValues(Some(&values)) };
+    animation.setDuration(seconds);
+    animation
 }
 
 /// Where the picture of one ask goes. `ScreenCaptureKit` calls back on its

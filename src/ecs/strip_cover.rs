@@ -50,11 +50,15 @@ use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker, LayoutPosition,
     MissionControlActive, NativeFullscreenMarker, Position, PostUpdateSet, RepositionMarker,
     ResizeMarker, ScrollInput, Scrolling, SelectedVirtualMarker, SpawnCommandsExt as _, Unmanaged,
-    UpdateSet, ease, systems,
+    UpdateSet, WidthLimits, ease, systems,
 };
 use crate::events::Event;
 use crate::manager::{Display, Window, WindowManager};
 use crate::platform::WinID;
+
+mod resize;
+
+pub(crate) use resize::CoverMorph;
 
 /// How long the cover stays up after the pictures land, at most, for windows
 /// whose apps are slow to take their places.
@@ -155,6 +159,35 @@ pub(crate) trait CoverScreen {
     /// Shows the strip on the cover of `display` at strip x `x` at once, as
     /// a swipe moves it, and tells the event tap.
     fn place(&mut self, display: CGDirectDisplayID, x: f64);
+    /// Moves each window's frame on the cover of `display` from one frame
+    /// to another, in global points, along `shares`: the share of the way
+    /// it has gone every `step` seconds from now. The picture in a frame
+    /// never stretches: it stays at its own size from the frame's top left
+    /// corner, a frame narrower than it crops it, and a wider one fills the
+    /// strip it opens with the picture's edge colour. Each rests at its last
+    /// frame, and the event tap takes a press there. Replaces any morph
+    /// before it.
+    fn morph(
+        &mut self,
+        display: CGDirectDisplayID,
+        frames: &[(WinID, IRect, IRect)],
+        shares: &[f64],
+        step: f64,
+    );
+    /// Puts `photo`, a picture of `window` at `size` points, into the
+    /// window's frame on the cover of `display` at once, at its own size,
+    /// in place of the picture there. The frame keeps moving as it did.
+    fn replace_picture(
+        &mut self,
+        display: CGDirectDisplayID,
+        window: WinID,
+        size: IVec2,
+        photo: &Photo,
+    );
+    /// How far along its morph the cover of `display` shows its pictures
+    /// now, as Core Animation draws them, from 0 to 1. `None` when it
+    /// cannot tell.
+    fn morph_share(&self, display: CGDirectDisplayID) -> Option<f64>;
     /// Where the strip on the cover of `display` shows now, as Core
     /// Animation draws it. `None` when it cannot tell.
     fn showing(&self, display: CGDirectDisplayID) -> Option<f64>;
@@ -212,7 +245,11 @@ pub(crate) struct CoverPhotos {
     desktops: HashMap<CGDirectDisplayID, Kept>,
     /// Windows whose last picture came out blank, and when to try again.
     blank_until: HashMap<WinID, Duration>,
+    /// The background refresh's one picture on its way.
     asked: Option<Asked>,
+    /// The fresh pictures a resize's cover asked for, apart from the
+    /// background refresh so neither drops the other's answer.
+    morph_asked: Vec<Asked>,
     generation: u32,
     access: Access,
     checked_at: Option<Duration>,
@@ -238,6 +275,7 @@ impl CoverPhotos {
         self.desktops.clear();
         self.blank_until.clear();
         self.asked = None;
+        self.morph_asked.clear();
     }
 
     fn is_clear(&self) -> bool {
@@ -245,6 +283,7 @@ impl CoverPhotos {
             && self.desktops.is_empty()
             && self.blank_until.is_empty()
             && self.asked.is_none()
+            && self.morph_asked.is_empty()
     }
 }
 
@@ -367,6 +406,7 @@ pub(crate) struct CoverSwipe {
 pub(crate) fn register(app: &mut App) {
     app.init_resource::<CoverPhotos>()
         .init_resource::<StripLayouts>()
+        .init_resource::<resize::RestingStrips>()
         .add_systems(
             Update,
             keep_cover_photos
@@ -376,6 +416,7 @@ pub(crate) fn register(app: &mut App) {
         .add_systems(
             Update,
             (
+                resize::cover_resizes,
                 cover_strip_moves,
                 cover_swipes,
                 mark_moved,
@@ -390,7 +431,10 @@ pub(crate) fn register(app: &mut App) {
             PostUpdate,
             (
                 lift_covers,
+                resize::lift_morphs,
+                resize::refresh_morph_pictures,
                 drop_orphan_covers,
+                resize::remember_resting,
                 refresh_cover_photos.run_if(on_timer(REFRESH_TICK)),
             )
                 .chain()
@@ -410,10 +454,13 @@ fn cover_enabled(config: &Config) -> bool {
         && ease::animates(duration)
 }
 
-/// Keeps each picture that arrives for the ask it answers.
+/// Keeps each picture that arrives for the ask it answers, and shows a
+/// fresh one of a window on the cover of a resize still heading to its
+/// size.
 fn keep_cover_photos(
     mut messages: MessageReader<Event>,
     mut photos: ResMut<CoverPhotos>,
+    mut morphs: Query<&mut CoverMorph>,
     mut screen: Option<NonSendMut<CoverScreenHandle>>,
     config: Res<Config>,
     time: Res<Time>,
@@ -433,14 +480,19 @@ fn keep_cover_photos(
         else {
             continue;
         };
-        let Some(asked) = photos
-            .asked
-            .take_if(|asked| asked.generation == *generation && asked.subject == *subject)
-        else {
+        let answers = |asked: &Asked| asked.generation == *generation && asked.subject == *subject;
+        let asked = photos.asked.take_if(|asked| answers(asked)).or_else(|| {
+            let index = photos.morph_asked.iter().position(answers)?;
+            Some(photos.morph_asked.swap_remove(index))
+        });
+        let Some(asked) = asked else {
             continue;
         };
         match result {
             Ok(photo) => {
+                if let (CoverSubject::Window(id), Some(screen)) = (*subject, screen.as_mut()) {
+                    resize::unveil(&mut morphs, screen.0.as_mut(), id, asked.size, photo);
+                }
                 let kept = Kept {
                     photo: photo.clone(),
                     size: asked.size,
@@ -499,6 +551,13 @@ struct StripWindow {
     id: WinID,
     entity: Entity,
     frame: IRect,
+    /// The frame it heads to: a window being resized shows its new width.
+    heading: IRect,
+    /// Its cell's size, and the size a resize on its way asks for.
+    size: IVec2,
+    resize: Option<IVec2>,
+    /// The widths the window was found to accept, if it refused one.
+    limits: Option<WidthLimits>,
     at_rest: bool,
     tabbed: bool,
     focused: bool,
@@ -513,8 +572,9 @@ type CoverWindows<'w, 's> = Query<
         &'static Bounds,
         Option<&'static Unmanaged>,
         Has<RepositionMarker>,
-        Has<ResizeMarker>,
+        Option<&'static ResizeMarker>,
         Has<FocusedMarker>,
+        Option<&'static WidthLimits>,
     ),
 >;
 
@@ -529,22 +589,52 @@ fn strip_windows(strip: &LayoutStrip, windows: &CoverWindows) -> Vec<StripWindow
         .all_windows()
         .into_iter()
         .filter_map(|entity| {
-            let (window, layout, bounds, unmanaged, moving, resizing, focused) =
+            let (window, layout, bounds, unmanaged, moving, resize, focused, limits) =
                 windows.get(entity).ok()?;
             if unmanaged.is_some() {
                 return None;
             }
             let cell = IRect::from_corners(layout.0, layout.0 + bounds.0);
+            // A width change reserves its final slot in the layout at once,
+            // as `position_layout_windows` places it.
+            let resize_to = resize.map(|resize| bounds.0.with_x(resize.0.x));
+            let heading = IRect::from_corners(layout.0, layout.0 + resize_to.unwrap_or(bounds.0));
             Some(StripWindow {
                 id: window.id(),
                 entity,
                 frame: window.margins().shown(cell),
-                at_rest: !moving && !resizing && !window.write_pending(),
+                heading: window.margins().shown(heading),
+                size: bounds.0,
+                resize: resize.map(|resize| resize.0),
+                limits: limits.copied(),
+                at_rest: !moving && resize.is_none() && !window.write_pending(),
                 tabbed: tabbed.contains(&entity),
                 focused,
             })
         })
         .collect()
+}
+
+impl StripWindow {
+    /// The size the window's cell heads to: a resize on its way sets its
+    /// width, and the layout eases its height on its own.
+    fn resize_to(&self) -> Option<IVec2> {
+        self.resize.map(|resize| self.size.with_x(resize.x))
+    }
+
+    /// Whether a resize on its way changes the window's height.
+    fn turns_height(&self) -> bool {
+        self.resize.is_some_and(|resize| resize.y != self.size.y)
+    }
+
+    /// Whether a resize on its way asks for a width the window already
+    /// refused: the layout clamps it a pass later and moves the strip again.
+    fn asks_refused_width(&self) -> bool {
+        let (Some(resize), Some(limits)) = (self.resize, self.limits) else {
+            return false;
+        };
+        limits.min.is_some_and(|min| resize.x < min) || limits.max.is_some_and(|max| resize.x > max)
+    }
 }
 
 /// Every strip, and whether it is the selected strip of its Space, to find
@@ -577,13 +667,26 @@ fn cover_scene<'a>(
     floating: &Query<(&Window, &Unmanaged)>,
     photos: &'a CoverPhotos,
 ) -> Result<CoverScene<'a>, &'static str> {
-    let mut row = strip_windows(strip, windows);
+    let row = strip_windows(strip, windows);
     if row.is_empty() {
         return Err("no windows");
     }
     if row.iter().any(|window| !window.at_rest) {
         return Err("a window moves");
     }
+    scene_of(row, display, area, at, floating, photos)
+}
+
+/// What a cover over `area` would show of the windows in `row`, each at its
+/// `frame` from the strip origin `at`.
+fn scene_of<'a>(
+    mut row: Vec<StripWindow>,
+    display: &Display,
+    area: IRect,
+    at: IVec2,
+    floating: &Query<(&Window, &Unmanaged)>,
+    photos: &'a CoverPhotos,
+) -> Result<CoverScene<'a>, &'static str> {
     if row.iter().any(|window| window.tabbed) {
         return Err("tabbed windows");
     }
@@ -625,7 +728,10 @@ fn layout_print(strip: &LayoutStrip, windows: &CoverWindows) -> u64 {
     let mut hasher = DefaultHasher::new();
     for window in strip_windows(strip, windows) {
         window.entity.to_bits().hash(&mut hasher);
+        // Where it heads too: a resize on its way changes the layout before
+        // the window's own size does.
         (window.frame.min, window.frame.max).hash(&mut hasher);
+        (window.heading.min, window.heading.max).hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -668,6 +774,7 @@ type CoveredStrips<'w, 's> = Query<
         Has<ActiveWorkspaceMarker>,
         Has<Scrolling>,
         Has<NativeFullscreenMarker>,
+        Has<CoverMorph>,
     ),
     (With<LayoutStrip>, Without<Window>),
 >;
@@ -701,12 +808,23 @@ fn cover_strip_moves(
     let dragging = drag
         .as_ref()
         .is_some_and(|drag| drag.held_window().is_some());
-    for (entity, strip, mut position, marker, slide, child, active, scrolling, fullscreen) in
-        &mut strips
+    for (
+        entity,
+        strip,
+        mut position,
+        marker,
+        slide,
+        child,
+        active,
+        scrolling,
+        fullscreen,
+        morphing,
+    ) in &mut strips
     {
         let target = marker.as_ref().map(|marker| marker.0);
         let fresh = marker.as_ref().is_some_and(DetectChanges::is_changed);
-        if slide.is_none() && !fresh {
+        // A strip under a resize's cover moves with that cover.
+        if morphing || slide.is_none() && !fresh {
             continue;
         }
         let Ok((display, dock)) = displays.get(child.parent()) else {
@@ -972,6 +1090,7 @@ fn lift_covers(
 fn drop_orphan_covers(
     slides: Query<(Entity, &CoverSlide, Option<&ChildOf>)>,
     swipes: Query<(Entity, &CoverSwipe, Option<&ChildOf>)>,
+    morphs: Query<(Entity, &CoverMorph, Option<&ChildOf>)>,
     displays: Query<&Display>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
     mut commands: Commands,
@@ -1000,6 +1119,14 @@ fn drop_orphan_covers(
             commands.entity(entity).remove::<CoverSwipe>().insert(Moved);
         }
     }
+    for (entity, morph, child) in &morphs {
+        if on(child, morph.display()) {
+            held.push(morph.display());
+        } else {
+            end_guard(morph.guard(), &mut commands);
+            commands.entity(entity).remove::<CoverMorph>();
+        }
+    }
     for id in screen.0.shown() {
         if !held.contains(&id) {
             debug!("cover on display {id} had no move, taken down");
@@ -1019,6 +1146,7 @@ type SwipedStrips<'w, 's> = Query<
         Option<&'static mut CoverSwipe>,
         Option<Ref<'static, RepositionMarker>>,
         Has<CoverSlide>,
+        Has<CoverMorph>,
         &'static ChildOf,
         Has<ActiveWorkspaceMarker>,
         Has<NativeFullscreenMarker>,
@@ -1054,8 +1182,19 @@ fn cover_swipes(
         .as_ref()
         .is_some_and(|drag| drag.held_window().is_some());
     let mut started = Vec::new();
-    for (entity, strip, position, scrolling, swipe, marker, sliding, child, active, fullscreen) in
-        &mut strips
+    for (
+        entity,
+        strip,
+        position,
+        scrolling,
+        swipe,
+        marker,
+        sliding,
+        morphing,
+        child,
+        active,
+        fullscreen,
+    ) in &mut strips
     {
         let starts = scrolling.as_ref().is_some_and(|scrolling| {
             scrolling.is_added() && scrolling.input == ScrollInput::Gesture
@@ -1121,6 +1260,7 @@ fn cover_swipes(
         }
 
         if sliding
+            || morphing
             || !cover_enabled(&config)
             || !shown_here
             || fullscreen
@@ -1175,7 +1315,7 @@ fn mark_moved(mut strips: Query<(Entity, &mut Position), With<Moved>>, mut comma
 }
 
 /// A strip under a cover, by a move or a swipe.
-pub(crate) type UnderCover = Or<(With<CoverSlide>, With<CoverSwipe>)>;
+pub(crate) type UnderCover = Or<(With<CoverSlide>, With<CoverSwipe>, With<CoverMorph>)>;
 
 /// Every strip under a cover.
 type AnyCover<'w, 's> = Query<'w, 's, (), UnderCover>;
@@ -1341,7 +1481,7 @@ fn next_picture(
             }
             let focused = windows
                 .get(window.entity)
-                .is_ok_and(|(.., focused)| focused);
+                .is_ok_and(|(.., focused, _)| focused);
             let size = window.frame.size();
             let kept = photos.windows.get(&window.id);
             let age = kept.map_or(Duration::MAX, |kept| now.saturating_sub(kept.taken));
