@@ -689,6 +689,116 @@ fn a_strip_move_during_a_covered_swipe_slides_the_pictures_on() {
     assert!(!covered(harness.world()), "the cover lifts once it lands");
 }
 
+/// The strip under a covered swipe, once one has started.
+fn swiped_strip(world: &mut World) -> Entity {
+    world
+        .query_filtered::<Entity, With<crate::ecs::strip_cover::CoverSwipe>>()
+        .iter(world)
+        .next()
+        .expect("a swipe under the cover")
+}
+
+/// Starts a swipe under the cover, and holds the fingers still on the
+/// trackpad so the strip rests where they put it.
+fn start_covered_swipe(harness: &mut TestHarness, log: &ScreenLog) -> Entity {
+    take_pictures(harness, log);
+    send(harness, Event::TouchpadDown);
+    send(harness, swipe(0.05));
+    harness.advance(ONE_FRAME);
+    send(harness, swipe(0.05));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().shown.len(), 1, "the swipe is under a cover");
+    let strip = swiped_strip(harness.world());
+    harness
+        .world()
+        .get_mut::<crate::ecs::Scrolling>(strip)
+        .expect("the strip scrolls")
+        .velocity = 0.0;
+    strip
+}
+
+/// A move to where the strip already rests, arriving in the frame the swipe
+/// lands, lands the swipe as it would without it: the real windows take
+/// their places under the cover at once. It slid the pictures over no
+/// distance first, which only held the cover up longer.
+#[test]
+fn a_swipe_that_lands_with_a_move_to_where_it_rests_lands_at_once() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    let strip = start_covered_swipe(&mut harness, &log);
+    let slides = log.borrow().slides.len();
+    let position = harness
+        .world()
+        .get::<crate::ecs::Position>(strip)
+        .expect("a strip position")
+        .0;
+
+    let mut entity = harness.world().entity_mut(strip);
+    entity.remove::<crate::ecs::Scrolling>();
+    entity.insert(crate::ecs::RepositionMarker(position));
+    harness.advance(ONE_FRAME);
+
+    let world = harness.world();
+    assert!(
+        world
+            .get::<crate::ecs::strip_cover::CoverSwipe>(strip)
+            .is_none(),
+        "the swipe ended"
+    );
+    let slide = world
+        .get::<CoverSlide>(strip)
+        .expect("the swipe lands under the cover");
+    assert_eq!(slide.heading(), None, "it has landed already");
+    assert_eq!(
+        log.borrow().slides.len(),
+        slides,
+        "no slide over no distance"
+    );
+    assert_eq!(log.borrow().hidden, 0, "the cover stays up while it lands");
+    assert_eq!(
+        log.borrow().placed.last().copied(),
+        Some(f64::from(position.x)),
+        "the pictures rest where the strip does"
+    );
+}
+
+/// A move to where the strip already rests, arriving mid-swipe, leaves the
+/// swipe and its cover going: the fingers keep the strip.
+#[test]
+fn a_move_to_where_a_swiped_strip_rests_keeps_the_swipe() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    let strip = start_covered_swipe(&mut harness, &log);
+    let slides = log.borrow().slides.len();
+    let position = harness
+        .world()
+        .get::<crate::ecs::Position>(strip)
+        .expect("a strip position")
+        .0;
+
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(position));
+    harness.advance(ONE_FRAME);
+
+    let world = harness.world();
+    assert!(
+        world.get::<crate::ecs::Scrolling>(strip).is_some(),
+        "the fingers still drive the strip"
+    );
+    assert!(
+        world
+            .get::<crate::ecs::strip_cover::CoverSwipe>(strip)
+            .is_some(),
+        "the swipe stays under its cover"
+    );
+    assert!(world.get::<CoverSlide>(strip).is_none(), "no slide starts");
+    assert_eq!(log.borrow().slides.len(), slides, "the pictures stay put");
+    assert_eq!(log.borrow().hidden, 0, "the cover stays up");
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(SETTLE);
+    assert!(!covered(harness.world()), "the cover lifts once it lands");
+}
+
 /// A focus move into a column of stacked windows goes under the cover too.
 #[test]
 fn a_move_into_a_stack_is_covered() {

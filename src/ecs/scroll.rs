@@ -1181,20 +1181,7 @@ fn settle_strip(
         let ease = *ease;
         // The ease carries the strip's speed from here.
         scroll.velocity = 0.0;
-        let shown = if let Some(speed) = ease.flick {
-            ease::flick_offset(
-                ease.from - target,
-                speed,
-                ease.elapsed,
-                config.animation_speed(),
-            )
-            .map(|offset| target + offset)
-        } else {
-            let progress = ease::share(ease.start, ease.start + ease.elapsed / duration);
-            (progress < 1.0).then_some(ease.from + (target - ease.from) * progress)
-        };
-
-        let Some(shown) = shown else {
+        let Some(shown) = settled_at(&ease, ease.elapsed, target, &config) else {
             position.x = round_px(target);
             if let Some(window) = scroll.landing_focus.take() {
                 focus(window, strip, &scroll, &windows, &mut commands);
@@ -1204,6 +1191,35 @@ fn settle_strip(
         };
         scroll.position = shown;
     }
+}
+
+/// Where a settle along `ease` toward `target` shows the strip `elapsed`
+/// seconds in. `None` once it has landed.
+fn settled_at(ease: &SettleEase, elapsed: f64, target: f64, config: &Config) -> Option<f64> {
+    if let Some(speed) = ease.flick {
+        ease::flick_offset(ease.from - target, speed, elapsed, config.animation_speed())
+            .map(|offset| target + offset)
+    } else {
+        let duration = ease::duration(config);
+        let progress = ease::share(ease.start, ease.start + elapsed / duration);
+        (progress < 1.0).then_some(ease.from + (target - ease.from) * progress)
+    }
+}
+
+/// How fast `scroll` moves its strip now, in points per second along the
+/// strip's x, for a display whose viewport is `viewport_width` points wide.
+/// A settle carries the speed of its ease. Fingers or the wheel carry their
+/// own.
+pub(crate) fn strip_speed(scroll: &Scrolling, viewport_width: f64, config: &Config) -> f64 {
+    if let (Some(ease), Some(target)) = (scroll.ease, scroll.settle) {
+        let dt = 1e-3;
+        let at = |elapsed: f64| settled_at(&ease, elapsed.max(0.0), target, config);
+        return match (at(ease.elapsed), at(ease.elapsed - dt)) {
+            (Some(now), Some(before)) => (now - before) / dt,
+            _ => 0.0,
+        };
+    }
+    scroll.velocity * viewport_width * direction_modifier(config)
 }
 
 /// Focuses `window`, the window a settle of `strip` lands on, unless it has

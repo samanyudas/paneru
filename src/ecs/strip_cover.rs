@@ -43,6 +43,7 @@ use crate::config::Config;
 use crate::ecs::display::shown_strip;
 use crate::ecs::drag::DragState;
 use crate::ecs::layout::{Column, LayoutStrip, ensure_visible_in_strip, position_layout_strips};
+use crate::ecs::scroll;
 use crate::ecs::slice_photos::{Photo, PhotoError};
 use crate::ecs::systems::AnimationStep;
 use crate::ecs::workspace::spawn_snap_strip_guard;
@@ -1377,8 +1378,14 @@ fn cover_swipes(
         if let Some(mut swipe) = swipe {
             // A strip move that arrives during the swipe, such as a key or a
             // press on a picture, ends the cover, as does a display or Dock
-            // that changes under it, or Mission Control.
-            let moved = marker.as_ref().is_some_and(DetectChanges::is_changed);
+            // that changes under it, or Mission Control. A move to where the
+            // strip already is moves nothing: the swipe goes on, or lands as
+            // it would without it.
+            let marked = marker.as_ref().is_some_and(DetectChanges::is_changed);
+            let moved = marked && marker.as_ref().is_some_and(|marker| marker.0 != position.0);
+            if marked && !moved {
+                commands.entity(entity).remove::<RepositionMarker>();
+            }
             let same_place = display.bounds() == swipe.bounds
                 && display.actual_display_bounds(dock, &config) == swipe.viewport;
             let ended = if !cover_enabled(&config) {
@@ -1409,11 +1416,16 @@ fn cover_swipes(
             {
                 let from = f64::from(position.0.x);
                 let viewport = display.actual_display_bounds(dock, &config);
+                // The pictures carry on at the speed the strip had, so the
+                // slide does not start from rest.
+                let speed = scrolling.as_ref().map_or(0.0, |scrolling| {
+                    scroll::strip_speed(scrolling, f64::from(viewport.width()), &config)
+                });
                 let mut slide = start_slide(
                     swipe.display,
                     (display.bounds(), viewport),
                     from,
-                    0.0,
+                    speed,
                     marker.0,
                     &config,
                 );

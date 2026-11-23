@@ -3017,6 +3017,12 @@ pub(super) fn reshuffle_layout_strip(
             }
         }
 
+        // A strip that rests where it heads has no move to make. A marker
+        // for it would still count as a strip move, and end a swipe or the
+        // picture cover over it.
+        if strip_position == strip_target && strip_position == ctx.strip_origin {
+            continue;
+        }
         trace!("reshuffle_layout_strip: triggered for entity {entity}, offset {strip_position}");
         commands.reposition_entity(strip_entity, strip_position);
     }
