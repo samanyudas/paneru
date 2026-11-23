@@ -254,6 +254,7 @@ fn double_click_toggle(
             button: MouseButton::Left,
             window_id,
             clicks: 2,
+            hold,
             ..
         } = event
         else {
@@ -262,7 +263,7 @@ fn double_click_toggle(
         let Some(window_id) = window_id.or_else(|| window_manager.find_window_at_point(point).ok())
         else {
             debug!("double-click at {point:?} left to the app: no window under it");
-            double_click_tap::replay();
+            double_click_tap::replay(*hold);
             continue;
         };
         let point = origin_from(*point);
@@ -271,7 +272,7 @@ fn double_click_toggle(
             .find(|(_, window, ..)| window.id() == window_id)
         else {
             debug!("double-click on window {window_id} left to the app: not a managed window");
-            double_click_tap::replay();
+            double_click_tap::replay(*hold);
             continue;
         };
         // The engine stops reading a maximized floating window's moves, so a
@@ -281,19 +282,19 @@ fn double_click_toggle(
         }
         if !in_top_bar(&window, top_bar, point) {
             debug!("double-click on window {window_id} left to the app: below its top bar");
-            double_click_tap::replay();
+            double_click_tap::replay(*hold);
             continue;
         }
         match window.control_at(point) {
             Ok(false) => {}
             Ok(true) => {
                 debug!("double-click on window {window_id} left to the app: on a control");
-                double_click_tap::replay();
+                double_click_tap::replay(*hold);
                 continue;
             }
             Err(err) => {
                 debug!("no maximize: element under {point} unreadable: {err}");
-                double_click_tap::replay();
+                double_click_tap::replay(*hold);
                 continue;
             }
         }
@@ -302,7 +303,7 @@ fn double_click_toggle(
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<(FrameHold, RefusingWidth)>();
             }
-            double_click_tap::replay();
+            double_click_tap::replay(*hold);
             continue;
         }
         if unmanaged.is_none()
@@ -318,10 +319,10 @@ fn double_click_toggle(
             debug!(
                 "double-click on window {window_id} left to the app: it refuses the maximized width"
             );
-            double_click_tap::replay();
+            double_click_tap::replay(*hold);
             continue;
         }
-        double_click_tap::consume();
+        double_click_tap::consume(*hold);
         commands.trigger(ToggleMaximize {
             entity,
             at: Some(point),

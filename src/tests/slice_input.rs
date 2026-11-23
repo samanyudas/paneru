@@ -173,6 +173,7 @@ impl Desk {
                 button,
                 window_id: None,
                 clicks: 1,
+                hold: None,
             },
             Mouse::Dragged(button) => Event::MouseDragged {
                 point,

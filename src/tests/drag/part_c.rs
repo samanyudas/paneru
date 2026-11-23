@@ -2487,6 +2487,7 @@ fn a_press_during_late_handle_recovery_supersedes_the_old_placement() {
         button: MouseButton::Left,
         window_id: Some(2),
         clicks: 1,
+        hold: None,
         modifiers: Modifiers::empty(),
     });
     harness.advance(FRAME);
@@ -2911,6 +2912,7 @@ fn an_edge_resize_from_a_shared_column_boundary_keeps_the_users_size() {
             button: MouseButton::Left,
             window_id,
             clicks: 1,
+            hold: None,
         });
         harness.advance(FRAME);
         let tile = IRect::new(0, 20, 512, 768);

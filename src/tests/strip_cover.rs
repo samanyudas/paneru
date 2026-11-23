@@ -2317,6 +2317,7 @@ fn send_title_bar_double_click_down(
             button: MouseButton::Left,
             window_id: Some(window_id),
             clicks: 1,
+            hold: None,
         },
     );
     harness.advance(ONE_FRAME);
@@ -2337,6 +2338,7 @@ fn send_title_bar_double_click_down(
             button: MouseButton::Left,
             window_id: Some(window_id),
             clicks: 2,
+            hold: None,
         },
     );
     harness.advance(ONE_FRAME);

@@ -529,11 +529,11 @@ impl InputHandler {
             return false;
         };
 
-        let hold_double_click = match double_click_tap::intercept(event_type, event) {
-            double_click_tap::TapAction::Pass => false,
+        let hold = match double_click_tap::intercept(event_type, event) {
+            double_click_tap::TapAction::Pass => None,
             double_click_tap::TapAction::PassQuiet => return false,
             double_click_tap::TapAction::SwallowQuiet => return true,
-            double_click_tap::TapAction::HoldForEngine => true,
+            double_click_tap::TapAction::HoldForEngine(token) => Some(token),
         };
 
         let flags = CGEvent::flags(Some(event));
@@ -556,6 +556,7 @@ impl InputHandler {
                         Some(event),
                         CGEventField::MouseEventClickState,
                     ),
+                    hold,
                 })
             }
             CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {
@@ -607,7 +608,7 @@ impl InputHandler {
         }
         // Intercept only when the title-bar double-click gate is holding this
         // press for `maximize::double_click_toggle`; otherwise fall through.
-        hold_double_click
+        hold.is_some()
     }
 
     /// Use the configured modifier to scroll the strip or select an adjacent window.

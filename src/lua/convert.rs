@@ -560,6 +560,7 @@ mod tests {
                 button: crate::events::MouseButton::Left,
                 window_id: None,
                 clicks: 1,
+                hold: None,
             },
         )
         .expect("mouse_down should marshal");

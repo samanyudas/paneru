@@ -145,6 +145,10 @@ pub enum Event {
         /// Which click of a rapid series this press is: 1 for a single
         /// click, 2 for the second press of a double-click.
         clicks: i64,
+        /// The event tap's token for this press, when the tap holds it
+        /// back for the engine to take or replay. See
+        /// [`double_click_tap`](crate::platform::double_click_tap).
+        hold: Option<u64>,
     },
     /// The tap held back a press on an edge slice panel, for the engine to
     /// post again once the window is in view.

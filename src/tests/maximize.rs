@@ -1063,6 +1063,7 @@ fn press_title_bar(harness: &mut TestHarness, point: Origin) {
         button: MouseButton::Left,
         window_id: Some(1),
         clicks: 1,
+        hold: None,
     });
     harness.advance(Duration::from_millis(16));
 }

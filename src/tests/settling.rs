@@ -1109,6 +1109,7 @@ fn click_on_another_display_leaves_a_settle_to_finish() {
             button: crate::events::MouseButton::Left,
             window_id: Some(101),
             clicks: 1,
+            hold: None,
         },
     );
     harness.advance(SETTLE);

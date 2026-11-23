@@ -242,6 +242,7 @@ fn edge_resize(harness: &mut TestHarness, id: WinID, edge: Origin, size: Size) {
         button: MouseButton::Left,
         window_id: Some(id),
         clicks: 1,
+        hold: None,
     });
     harness.advance(Duration::from_millis(16));
     harness.mock_state.os_resize_window(id, size);
@@ -352,6 +353,7 @@ fn press(harness: &mut TestHarness, id: WinID, point: Origin) {
         button: MouseButton::Left,
         window_id: Some(id),
         clicks: 1,
+        hold: None,
     });
     harness.advance(Duration::from_millis(16));
 }

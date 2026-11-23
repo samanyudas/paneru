@@ -19,8 +19,14 @@
 //!   area, so the tap immediately re-posts the `clicks == 2` press (and its
 //!   release if already lifted) tagged with [`DOUBLE_CLICK_TAG`] so it passes
 //!   straight through to the app.
+//!
+//! Each held press has its own token, which its `Event::MouseDown` carries,
+//! so an answer to an earlier press never acts on a later one. A hold ends
+//! by itself after [`HOLD_LIMIT`], so a release that never arrives, or an
+//! engine that never answers, cannot keep the tap swallowing the mouse.
 
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use bevy::math::{IRect, IVec2};
 use objc2_core_foundation::CGPoint;
@@ -37,6 +43,11 @@ use crate::platform::WinID;
 /// without re-intercepting or re-notifying the ECS.
 const DOUBLE_CLICK_TAG: i64 = 0x5041_4E45_5255_4443;
 
+/// How long a hold lasts at most: an engine that waits on a busy app
+/// answers well within it, and a press held longer is dropped, so a lost
+/// release or a stalled engine never keeps the mouse from the apps.
+const HOLD_LIMIT: Duration = Duration::from_secs(2);
+
 /// What the event tap should do with a mouse event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TapAction {
@@ -44,9 +55,10 @@ pub(crate) enum TapAction {
     Pass,
     /// Let the event reach the target app without notifying Bevy (replayed).
     PassQuiet,
-    /// Send `Event::MouseDown` to Bevy, but swallow the event from the app
-    /// while waiting for `double_click_toggle` to call [`consume`] or [`replay`].
-    HoldForEngine,
+    /// Send `Event::MouseDown` to Bevy with this hold's token, but swallow
+    /// the event from the app while waiting for `double_click_toggle` to
+    /// call [`consume`] or [`replay`] with the token.
+    HoldForEngine(u64),
     /// Swallow the event completely without notifying Bevy (drag or release of
     /// a held or consumed double-click).
     SwallowQuiet,
@@ -62,23 +74,29 @@ struct Replay {
 #[derive(Clone, Copy, Debug)]
 enum Hold {
     Idle,
-    /// A held press the engine has yet to answer. It lasts until the engine
-    /// answers or the next press: an engine that answers late, as while it
-    /// waits on a busy app, still gets its press replayed, where a time
-    /// limit would drop the press.
+    /// A held press the engine has yet to answer, since `since`. It lasts
+    /// until the engine answers, the next press, or [`HOLD_LIMIT`]: an
+    /// engine that answers late, as while it waits on a busy app, still
+    /// gets its press replayed.
     Waiting {
+        token: u64,
+        since: Instant,
         point: CGPoint,
         flags: CGEventFlags,
         released: Option<(CGPoint, CGEventFlags)>,
     },
-    /// A press the engine took, whose release is still to come, however
-    /// long the button is held.
-    Consumed,
+    /// A press the engine took at `since`, whose release is still to come,
+    /// for [`HOLD_LIMIT`] at most.
+    Consumed {
+        since: Instant,
+    },
 }
 
 struct State {
     top_bars: Vec<(WinID, IRect)>,
     hold: Hold,
+    /// The token of the last press held.
+    token: u64,
 }
 
 impl State {
@@ -86,6 +104,19 @@ impl State {
         Self {
             top_bars: Vec::new(),
             hold: Hold::Idle,
+            token: 0,
+        }
+    }
+
+    /// Ends a hold that has lasted [`HOLD_LIMIT`] by `now`.
+    fn expire(&mut self, now: Instant) {
+        let since = match self.hold {
+            Hold::Idle => return,
+            Hold::Waiting { since, .. } | Hold::Consumed { since } => since,
+        };
+        if now.saturating_duration_since(since) >= HOLD_LIMIT {
+            debug!(hold = ?self.hold, "double-click hold ended at its time limit");
+            self.hold = Hold::Idle;
         }
     }
 
@@ -108,23 +139,28 @@ impl State {
         flags: CGEventFlags,
         window_id: Option<WinID>,
         clicks: i64,
+        now: Instant,
     ) -> TapAction {
+        self.expire(now);
         match event_type {
             CGEventType::LeftMouseDown => {
                 if clicks == 2 && self.in_top_bar(window_id, point) {
+                    self.token = self.token.wrapping_add(1);
                     self.hold = Hold::Waiting {
+                        token: self.token,
+                        since: now,
                         point,
                         flags,
                         released: None,
                     };
-                    TapAction::HoldForEngine
+                    TapAction::HoldForEngine(self.token)
                 } else {
                     self.hold = Hold::Idle;
                     TapAction::Pass
                 }
             }
             CGEventType::LeftMouseDragged => match self.hold {
-                Hold::Waiting { .. } | Hold::Consumed => TapAction::SwallowQuiet,
+                Hold::Waiting { .. } | Hold::Consumed { .. } => TapAction::SwallowQuiet,
                 Hold::Idle => TapAction::Pass,
             },
             CGEventType::LeftMouseUp => match &mut self.hold {
@@ -132,7 +168,7 @@ impl State {
                     *released = Some((point, flags));
                     TapAction::SwallowQuiet
                 }
-                Hold::Consumed => {
+                Hold::Consumed { .. } => {
                     self.hold = Hold::Idle;
                     TapAction::SwallowQuiet
                 }
@@ -142,17 +178,30 @@ impl State {
         }
     }
 
-    fn consume(&mut self) {
+    /// Whether the press of `token` is the one held and waiting.
+    fn waits(&self, token: u64) -> bool {
+        matches!(self.hold, Hold::Waiting { token: held, .. } if held == token)
+    }
+
+    fn consume(&mut self, token: u64, now: Instant) {
+        self.expire(now);
+        if !self.waits(token) {
+            return;
+        }
         if let Hold::Waiting { released, .. } = self.hold {
             self.hold = if released.is_some() {
                 Hold::Idle
             } else {
-                Hold::Consumed
+                Hold::Consumed { since: now }
             };
         }
     }
 
-    fn take_replay(&mut self) -> Option<Replay> {
+    fn take_replay(&mut self, token: u64, now: Instant) -> Option<Replay> {
+        self.expire(now);
+        if !self.waits(token) {
+            return None;
+        }
         let Hold::Waiting {
             point,
             flags,
@@ -207,7 +256,7 @@ pub(crate) fn intercept(event_type: CGEventType, event: &CGEvent) -> TapAction {
         return TapAction::Pass;
     };
     let held = !matches!(state.hold, Hold::Idle);
-    let action = state.handle(event_type, point, flags, window_id, clicks);
+    let action = state.handle(event_type, point, flags, window_id, clicks, Instant::now());
     // A multi-click, or any event of a held one: rare enough to log each.
     if event_type != CGEventType::LeftMouseDragged && (clicks > 1 || held) {
         debug!(
@@ -223,18 +272,31 @@ pub(crate) fn intercept(event_type: CGEventType, event: &CGEvent) -> TapAction {
     action
 }
 
-/// Marks the held title-bar double-click as handled by Miri (maximize/restore),
-/// so neither the press nor its matching release reaches the app.
-pub(crate) fn consume() {
+/// Marks the held title-bar double-click of `hold`, the token its press
+/// carried, as handled by Miri (maximize/restore), so neither the press nor
+/// its matching release reaches the app. A press the tap did not hold, or
+/// no longer holds, is left alone.
+pub(crate) fn consume(hold: Option<u64>) {
+    let Some(token) = hold else {
+        return;
+    };
     if let Ok(mut state) = STATE.lock() {
-        state.consume();
+        state.consume(token, Instant::now());
     }
 }
 
-/// Re-posts the held title-bar double-click (and its release if already lifted)
-/// to macOS so a double-click on a control, URL bar, or tab reaches the app.
-pub(crate) fn replay() {
-    let pending = STATE.lock().ok().and_then(|mut state| state.take_replay());
+/// Re-posts the held title-bar double-click of `hold` (and its release if
+/// already lifted) to macOS so a double-click on a control, URL bar, or tab
+/// reaches the app. A press the tap did not hold, or no longer holds, is
+/// left alone: it reached the app already, or was dropped.
+pub(crate) fn replay(hold: Option<u64>) {
+    let Some(token) = hold else {
+        return;
+    };
+    let pending = STATE
+        .lock()
+        .ok()
+        .and_then(|mut state| state.take_replay(token, Instant::now()));
     let Some(Replay {
         point,
         flags,
@@ -279,68 +341,87 @@ fn post_click(down: bool, point: CGPoint, flags: CGEventFlags) {
 mod tests {
     use super::*;
 
-    fn pt(x: f64, y: f64) -> CGPoint {
-        CGPoint::new(x, y)
+    const BAR: IRect = IRect {
+        min: IVec2::new(0, 30),
+        max: IVec2::new(800, 120),
+    };
+
+    fn state() -> State {
+        let mut state = State::new();
+        state.top_bars = vec![(42, BAR)];
+        state
+    }
+
+    /// Sends the tap one event of `kind` at `(x, y)` at `now`.
+    fn event(
+        state: &mut State,
+        kind: CGEventType,
+        (x, y): (f64, f64),
+        window_id: Option<WinID>,
+        clicks: i64,
+        now: Instant,
+    ) -> TapAction {
+        state.handle(
+            kind,
+            CGPoint::new(x, y),
+            CGEventFlags::empty(),
+            window_id,
+            clicks,
+            now,
+        )
+    }
+
+    /// The token of a press the tap held, or a panic.
+    fn held(action: TapAction) -> u64 {
+        let TapAction::HoldForEngine(token) = action else {
+            panic!("the press is held, got {action:?}");
+        };
+        token
     }
 
     #[test]
     fn consumed_double_click_swallows_down_drag_and_up() {
-        let mut state = State::new();
-        state.top_bars = vec![(42, IRect::new(0, 30, 800, 120))];
-
+        let mut state = state();
+        let now = Instant::now();
         // Single click passes through.
         assert_eq!(
-            state.handle(
+            event(
+                &mut state,
                 CGEventType::LeftMouseDown,
-                pt(200.0, 50.0),
-                CGEventFlags::empty(),
+                (200.0, 50.0),
                 Some(42),
                 1,
+                now
             ),
             TapAction::Pass
         );
         // Second click in top bar is held for the engine.
-        assert_eq!(
-            state.handle(
-                CGEventType::LeftMouseDown,
-                pt(200.0, 50.0),
-                CGEventFlags::empty(),
-                Some(42),
-                2,
-            ),
-            TapAction::HoldForEngine
-        );
+        let token = held(event(
+            &mut state,
+            CGEventType::LeftMouseDown,
+            (200.0, 50.0),
+            Some(42),
+            2,
+            now,
+        ));
         // Engine consumes it for maximize/restore.
-        state.consume();
+        state.consume(token, now);
         // Matching drag and release are swallowed quietly.
-        assert_eq!(
-            state.handle(
-                CGEventType::LeftMouseDragged,
-                pt(201.0, 50.0),
-                CGEventFlags::empty(),
-                Some(42),
-                2,
-            ),
-            TapAction::SwallowQuiet
-        );
-        assert_eq!(
-            state.handle(
-                CGEventType::LeftMouseUp,
-                pt(201.0, 50.0),
-                CGEventFlags::empty(),
-                Some(42),
-                2,
-            ),
-            TapAction::SwallowQuiet
-        );
+        for kind in [CGEventType::LeftMouseDragged, CGEventType::LeftMouseUp] {
+            assert_eq!(
+                event(&mut state, kind, (201.0, 50.0), Some(42), 2, now),
+                TapAction::SwallowQuiet
+            );
+        }
         // Subsequent release/click passes normally.
         assert_eq!(
-            state.handle(
+            event(
+                &mut state,
                 CGEventType::LeftMouseDown,
-                pt(200.0, 50.0),
-                CGEventFlags::empty(),
+                (200.0, 50.0),
                 Some(42),
                 1,
+                now
             ),
             TapAction::Pass
         );
@@ -348,33 +429,34 @@ mod tests {
 
     #[test]
     fn tap_to_click_replay_returns_both_down_and_up() {
-        let mut state = State::new();
-        state.top_bars = vec![(42, IRect::new(0, 30, 800, 120))];
-
-        assert_eq!(
-            state.handle(
-                CGEventType::LeftMouseDown,
-                pt(200.0, 70.0),
-                CGEventFlags::empty(),
-                Some(42),
-                2,
-            ),
-            TapAction::HoldForEngine
-        );
+        let mut state = state();
+        let now = Instant::now();
+        let token = held(event(
+            &mut state,
+            CGEventType::LeftMouseDown,
+            (200.0, 70.0),
+            Some(42),
+            2,
+            now,
+        ));
         // Tap-to-click lifts 1 ms later before engine decides.
         assert_eq!(
-            state.handle(
+            event(
+                &mut state,
                 CGEventType::LeftMouseUp,
-                pt(200.0, 70.0),
-                CGEventFlags::empty(),
+                (200.0, 70.0),
                 Some(42),
                 2,
+                now
             ),
             TapAction::SwallowQuiet
         );
-        let replayed = state.take_replay().expect("replay payload");
+        let replayed = state.take_replay(token, now).expect("replay payload");
         assert!(replayed.released.is_some(), "includes lifted MouseUp");
-        assert!(state.take_replay().is_none(), "cleared after replay");
+        assert!(
+            state.take_replay(token, now).is_none(),
+            "cleared after replay"
+        );
     }
 
     /// A real press reaches the HID tap before the window server names the
@@ -383,37 +465,37 @@ mod tests {
     /// animated for 350 ms, 23 November 2026).
     #[test]
     fn a_double_click_without_a_window_is_held_by_its_place() {
-        let mut state = State::new();
-        state.top_bars = vec![(42, IRect::new(0, 30, 800, 120))];
+        let mut state = state();
+        let now = Instant::now();
+        let token = held(event(
+            &mut state,
+            CGEventType::LeftMouseDown,
+            (200.0, 50.0),
+            None,
+            2,
+            now,
+        ));
+        state.consume(token, now);
         assert_eq!(
-            state.handle(
-                CGEventType::LeftMouseDown,
-                pt(200.0, 50.0),
-                CGEventFlags::empty(),
-                None,
-                2,
-            ),
-            TapAction::HoldForEngine
-        );
-        state.consume();
-        assert_eq!(
-            state.handle(
+            event(
+                &mut state,
                 CGEventType::LeftMouseUp,
-                pt(200.0, 50.0),
-                CGEventFlags::empty(),
+                (200.0, 50.0),
                 None,
                 2,
+                now
             ),
             TapAction::SwallowQuiet
         );
         // Outside every top bar, it passes.
         assert_eq!(
-            state.handle(
+            event(
+                &mut state,
                 CGEventType::LeftMouseDown,
-                pt(200.0, 300.0),
-                CGEventFlags::empty(),
+                (200.0, 300.0),
                 None,
                 2,
+                now
             ),
             TapAction::Pass
         );
@@ -421,30 +503,150 @@ mod tests {
 
     #[test]
     fn floating_or_content_double_click_passes_untouched() {
-        let mut state = State::new();
-        state.top_bars = vec![(42, IRect::new(0, 30, 800, 120))];
-
+        let mut state = state();
+        let now = Instant::now();
         // Different window (e.g. floating window or popover).
         assert_eq!(
-            state.handle(
+            event(
+                &mut state,
                 CGEventType::LeftMouseDown,
-                pt(200.0, 50.0),
-                CGEventFlags::empty(),
+                (200.0, 50.0),
                 Some(99),
                 2,
+                now
             ),
             TapAction::Pass
         );
         // Below top bar on tiled window.
         assert_eq!(
-            state.handle(
+            event(
+                &mut state,
                 CGEventType::LeftMouseDown,
-                pt(200.0, 300.0),
-                CGEventFlags::empty(),
+                (200.0, 300.0),
                 Some(42),
                 2,
+                now
             ),
             TapAction::Pass
+        );
+    }
+
+    /// An answer that arrives late, for a press the user has since followed
+    /// with another, acts on neither: the newer press waits for its own.
+    #[test]
+    fn a_late_answer_for_an_earlier_press_leaves_the_newer_one_held() {
+        let mut state = state();
+        let now = Instant::now();
+        let first = held(event(
+            &mut state,
+            CGEventType::LeftMouseDown,
+            (200.0, 50.0),
+            Some(42),
+            2,
+            now,
+        ));
+        let second = held(event(
+            &mut state,
+            CGEventType::LeftMouseDown,
+            (300.0, 50.0),
+            Some(42),
+            2,
+            now,
+        ));
+        assert_ne!(first, second, "each press has its own token");
+
+        state.consume(first, now);
+        assert!(
+            state.take_replay(first, now).is_none(),
+            "the earlier press is gone"
+        );
+        assert!(state.waits(second), "the newer press still waits");
+        let replayed = state.take_replay(second, now).expect("its own answer");
+        assert!(
+            (replayed.point.x - 300.0).abs() < f64::EPSILON,
+            "the newer press is the one replayed"
+        );
+    }
+
+    /// A press whose engine never answers ends its hold at the time limit,
+    /// and the mouse reaches the apps again. A late answer then does
+    /// nothing.
+    #[test]
+    fn a_press_never_answered_ends_its_hold_at_the_time_limit() {
+        let mut state = state();
+        let now = Instant::now();
+        let token = held(event(
+            &mut state,
+            CGEventType::LeftMouseDown,
+            (200.0, 50.0),
+            Some(42),
+            2,
+            now,
+        ));
+        let soon = now + HOLD_LIMIT / 2;
+        assert_eq!(
+            event(
+                &mut state,
+                CGEventType::LeftMouseDragged,
+                (210.0, 50.0),
+                Some(42),
+                2,
+                soon
+            ),
+            TapAction::SwallowQuiet,
+            "within the limit, the hold goes on"
+        );
+        let late = now + HOLD_LIMIT;
+        for kind in [CGEventType::LeftMouseDragged, CGEventType::LeftMouseUp] {
+            assert_eq!(
+                event(&mut state, kind, (220.0, 50.0), Some(42), 2, late),
+                TapAction::Pass,
+                "past the limit, {kind:?} reaches the app"
+            );
+        }
+        assert!(
+            state.take_replay(token, late).is_none(),
+            "a late replay posts nothing"
+        );
+    }
+
+    /// A press the engine took, whose release never arrives, stops holding
+    /// the mouse back at the time limit.
+    #[test]
+    fn a_consumed_press_whose_release_is_lost_ends_at_the_time_limit() {
+        let mut state = state();
+        let now = Instant::now();
+        let token = held(event(
+            &mut state,
+            CGEventType::LeftMouseDown,
+            (200.0, 50.0),
+            Some(42),
+            2,
+            now,
+        ));
+        state.consume(token, now);
+        assert_eq!(
+            event(
+                &mut state,
+                CGEventType::LeftMouseDragged,
+                (210.0, 50.0),
+                Some(42),
+                2,
+                now + HOLD_LIMIT / 2
+            ),
+            TapAction::SwallowQuiet
+        );
+        assert_eq!(
+            event(
+                &mut state,
+                CGEventType::LeftMouseDragged,
+                (220.0, 50.0),
+                Some(42),
+                1,
+                now + HOLD_LIMIT
+            ),
+            TapAction::Pass,
+            "the drag reaches the app"
         );
     }
 }

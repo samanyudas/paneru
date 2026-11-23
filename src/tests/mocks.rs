@@ -1228,6 +1228,7 @@ impl MockState {
             button: MouseButton::Left,
             window_id,
             clicks: 1,
+            hold: None,
         });
         inner.event_queue.push_back(Event::MouseUp {
             point,
@@ -1249,6 +1250,7 @@ impl MockState {
                 button: MouseButton::Left,
                 window_id,
                 clicks,
+                hold: None,
             });
             inner.event_queue.push_back(Event::MouseUp {
                 point,
@@ -1280,6 +1282,7 @@ impl MockState {
             button: MouseButton::Left,
             window_id,
             clicks: 1,
+            hold: None,
         });
         inner.event_queue.push_back(Event::MouseDragged {
             point: end_p,
