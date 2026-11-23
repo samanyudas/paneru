@@ -73,17 +73,19 @@ pub(crate) fn set_slice_panels(panels: Vec<SlicePanel>) {
 static COVER_PANELS: LazyLock<ArcSwap<Vec<SlicePanel>>> =
     LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
 
-/// Held press ids that the engine cancelled because they can no longer be
-/// replayed (for example, a window shrank past the pressed point). Drained by
-/// the OS event tap on the main thread before handling the next pointer event.
-static CANCELLED_PRESSES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// Held press ids and cancellation times that the engine cancelled because
+/// they can no longer be replayed (for example, a window shrank past the
+/// pressed point). Drained by the OS event tap on the main thread before
+/// handling the next pointer event.
+static CANCELLED_PRESSES: Mutex<Vec<(u32, Duration)>> = Mutex::new(Vec::new());
 
-/// Queues cancellation of held press `press_id` for the live event tap.
+/// Queues cancellation of held press `press_id` at the current uptime for
+/// the live event tap.
 pub(crate) fn cancel_live_press(press_id: u32) {
     CANCELLED_PRESSES
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .push(press_id);
+        .push((press_id, uptime()));
 }
 
 /// Applies press cancellations queued by the engine to `tap`.
@@ -94,10 +96,10 @@ pub(crate) fn apply_cancellations(tap: &mut SliceTap) {
     if cancelled.is_empty() {
         return;
     }
-    let ids = std::mem::take(&mut *cancelled);
+    let items = std::mem::take(&mut *cancelled);
     drop(cancelled);
-    for id in ids {
-        tap.cancel(id);
+    for (id, at) in items {
+        tap.cancel(id, at);
     }
 }
 
@@ -559,18 +561,28 @@ impl SliceTap {
         }
     }
 
-    /// Cancels held press `press_id` when the engine can no longer replay it.
+    /// Cancels held press `press_id` at `now` when the engine can no longer
+    /// replay it. Records `now` (capped at the original deadline) in
+    /// `waited_until`, so any press made while the hold was active stays
+    /// dropped while presses made after cancellation pass through immediately.
     /// If the user still holds its button, its remaining drags and release
-    /// stay swallowed while subsequent presses pass through immediately.
-    pub fn cancel(&mut self, press_id: u32) {
+    /// stay swallowed.
+    pub fn cancel(&mut self, press_id: u32, now: Duration) {
         match self.gesture {
-            Gesture::Holding { id, button, .. } if id == press_id => {
+            Gesture::Holding {
+                id,
+                button,
+                deadline,
+                ..
+            } if id == press_id => {
                 debug!("edge slice press cancelled: press {id}, button still held");
+                self.waited_until = self.waited_until.max(now.min(deadline));
                 self.dropped.push(button);
                 self.gesture = Gesture::Idle;
             }
-            Gesture::Released { id, .. } if id == press_id => {
+            Gesture::Released { id, deadline, .. } if id == press_id => {
                 debug!("edge slice press cancelled: press {id}, already released");
+                self.waited_until = self.waited_until.max(now.min(deadline));
                 self.gesture = Gesture::Idle;
             }
             _ => {}

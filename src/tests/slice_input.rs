@@ -132,7 +132,7 @@ impl Desk {
             self.harness.advance(Duration::from_millis(20));
             self.clock += Duration::from_millis(20);
             for press_id in self.harness.mock_state.take_cancelled_presses() {
-                self.tap.cancel(press_id);
+                self.tap.cancel(press_id, self.clock);
             }
             for (press, point) in self.harness.mock_state.take_posted_presses() {
                 self.posted.push((press, point));
@@ -1072,7 +1072,27 @@ fn cancelling_a_held_press_frees_subsequent_clicks() {
     )) else {
         panic!("press on cover must be held");
     };
-    tap.cancel(held.id);
+    tap.cancel(held.id, Duration::from_millis(15));
+    // A press queued before cancellation (timestamped while still held) stays
+    // dropped so it cannot hit a window the cover had obscured.
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Down(MouseButton::Right),
+            elsewhere,
+            Duration::from_millis(12),
+            None,
+        )),
+        Verdict::Swallow
+    );
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Up(MouseButton::Right),
+            elsewhere,
+            Duration::from_millis(13),
+            None,
+        )),
+        Verdict::Swallow
+    );
     assert_eq!(
         tap.handle(&make(
             Mouse::Dragged(MouseButton::Left),
@@ -1119,7 +1139,7 @@ fn cancelling_a_held_press_frees_subsequent_clicks() {
         )),
         Verdict::Swallow
     );
-    tap.cancel(released.id);
+    tap.cancel(released.id, Duration::from_millis(115));
     assert_eq!(
         tap.handle(&make(
             Mouse::Down(MouseButton::Left),

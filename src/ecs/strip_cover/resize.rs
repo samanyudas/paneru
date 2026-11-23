@@ -42,6 +42,7 @@ use crate::config::Config;
 use crate::ecs::drag::DragState;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::pacing::ShownFrames;
+use crate::ecs::slice_photos::Photo;
 use crate::ecs::systems::AnimationStep;
 use crate::ecs::workspace::spawn_snap_strip_guard;
 use crate::ecs::{
@@ -112,6 +113,11 @@ pub(crate) struct CoverMorph {
     /// paired with that ask's generation. Cleared for a window whenever a
     /// turn changes its target size.
     refresh_ask: Vec<(Entity, IVec2, u32)>,
+    /// Fresh pictures accepted for this turn whose presented frame is still
+    /// wider than the new picture (for instance after a turn back from a
+    /// wider frame). Unveiled as soon as the presented width fits the new
+    /// picture so the fill behind the old picture is never dropped early.
+    pending_unveil: Vec<(Entity, WinID, IVec2, Photo)>,
     /// Where the morph entered the curve, as a share of its time, how long it
     /// has run in animation time, and how long the whole curve lasts.
     entry: f64,
@@ -499,6 +505,12 @@ pub(super) fn cover_resizes(
                         }
                         unchanged
                     });
+                morph.pending_unveil.retain(|&(win_entity, _, size, _)| {
+                    heading
+                        .iter()
+                        .find(|&&(e, _, _)| e == win_entity)
+                        .is_some_and(|&(_, _, to)| close(to.size(), size))
+                });
                 morph.frames = heading
                     .iter()
                     .zip(shown)
@@ -643,6 +655,7 @@ pub(super) fn cover_resizes(
             hid: Vec::new(),
             pictured,
             refresh_ask: Vec::new(),
+            pending_unveil: Vec::new(),
             entry: 0.0,
             elapsed: 0.0,
             duration,
@@ -860,10 +873,12 @@ pub(super) fn refresh_morph_pictures(
 /// Validates and applies morph capture replies staged in this frame's `Events`
 /// pass, after [`cover_resizes`] has resolved any turn or abort for this
 /// frame. Replies superseded by a turn or abort have already been discarded;
-/// valid replies update the cache (including after a normal cover lift) and
-/// unveil on any live morph still heading to that size.
+/// valid replies update the cache (only when the window still exists and heads
+/// to that size if no live morph owns it) and unveil on any live morph once
+/// its presented frame fits the new picture.
 pub(super) fn apply_morph_replies(
     mut morphs: Query<&mut CoverMorph>,
+    windows: Query<(&Window, &Bounds, Option<&ResizeMarker>)>,
     mut photos: ResMut<CoverPhotos>,
     mut screen: Option<NonSendMut<CoverScreenHandle>>,
 ) {
@@ -893,30 +908,37 @@ pub(super) fn apply_morph_replies(
                 continue;
             }
             accepted_for_morph = true;
-            if let (Ok(photo), Some(screen)) = (&reply.result, screen.as_deref_mut())
+            if let Ok(photo) = &reply.result
                 && morph
                     .pictured(frame.entity)
                     .is_some_and(|pictured| frame.to.width() > pictured.x)
             {
                 let fits = frame.to.size();
-                screen
-                    .0
-                    .replace_picture(morph.display, reply.id, fits, photo);
-                if let Some((_, pictured)) = morph
-                    .pictured
-                    .iter_mut()
-                    .find(|(entity, _)| *entity == frame.entity)
-                {
-                    *pictured = fits;
-                }
-                debug!(
-                    "cover over a resize shows the fresh picture of window {}",
-                    reply.id
-                );
+                morph.pending_unveil.retain(|(e, ..)| *e != frame.entity);
+                morph
+                    .pending_unveil
+                    .push((frame.entity, reply.id, fits, photo.clone()));
             }
         }
-        if owned_by_morph && !accepted_for_morph {
-            continue;
+        if owned_by_morph {
+            if !accepted_for_morph {
+                continue;
+            }
+        } else {
+            // Without a live morph (e.g. after a normal lift), validate
+            // against the window's current resolved target size so a late
+            // reply cannot overwrite a usable cache entry after a subsequent
+            // uncovered resize.
+            let still_matches = windows
+                .iter()
+                .find(|(window, ..)| window.id() == reply.id)
+                .is_some_and(|(_, bounds, resize)| {
+                    let target = resize.map_or(bounds.0, |marker| marker.0);
+                    close(target, reply.size)
+                });
+            if !still_matches {
+                continue;
+            }
         }
         apply_cover_reply(
             &mut photos,
@@ -927,5 +949,51 @@ pub(super) fn apply_morph_replies(
             &reply.result,
             reply.taken,
         );
+    }
+
+    if let Some(mut screen) = screen {
+        unveil_ready_pictures(&mut morphs, screen.0.as_mut());
+    }
+}
+
+/// Unveils each accepted fresh picture whose presented frame now fits it
+/// (never replacing early while a turn back from a wider frame is still
+/// wider than the new picture).
+fn unveil_ready_pictures(morphs: &mut Query<&mut CoverMorph>, screen: &mut dyn super::CoverScreen) {
+    for mut morph in morphs.iter_mut() {
+        if morph.pending_unveil.is_empty() {
+            continue;
+        }
+        let share = morph.progress().0;
+        let pending = std::mem::take(&mut morph.pending_unveil);
+        for (entity, id, fits, photo) in pending {
+            let Some(frame) = morph
+                .frames
+                .iter()
+                .find(|frame| frame.entity == entity)
+                .copied()
+            else {
+                continue;
+            };
+            let shown_width = frame.at(share).width();
+            if shown_width > fits.x {
+                morph.pending_unveil.push((entity, id, fits, photo));
+                continue;
+            }
+            if morph
+                .pictured(entity)
+                .is_some_and(|pictured| fits.x > pictured.x)
+            {
+                screen.replace_picture(morph.display, id, fits, &photo);
+                if let Some((_, pictured)) = morph
+                    .pictured
+                    .iter_mut()
+                    .find(|(pictured_entity, _)| *pictured_entity == entity)
+                {
+                    *pictured = fits;
+                }
+                debug!("cover over a resize shows the fresh picture of window {id}");
+            }
+        }
     }
 }

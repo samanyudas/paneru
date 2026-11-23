@@ -1345,6 +1345,103 @@ fn a_same_frame_turn_back_keeps_the_cached_picture() {
     );
 }
 
+/// A late 75% morph reply arriving after the cover lifted and an uncovered
+/// shrink already started back to 50% must not overwrite the usable 50% cache.
+#[test]
+fn a_late_reply_after_an_uncovered_shrink_keeps_the_cached_picture() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    send(&mut harness, resize(ResizeDirection::Shrink));
+    frames_of(&mut harness, &[0]);
+    take_pictures(&mut harness, &log);
+    let since = log.borrow().window_asks.len();
+    // 50% -> 75% under cover, leaving the 75% ask unanswered until after lift.
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    let asks = window_asks_since(&log, since);
+    assert_eq!(asks.len(), 1);
+    let gen_75 = asks[0].2;
+    for _ in 0..40 {
+        if !morphed(harness.world()) {
+            break;
+        }
+        harness.advance(ONE_FRAME);
+    }
+    assert!(!morphed(harness.world()), "cover lifted with 75% pending");
+    // Shrink back to 50% immediately (uncovered, because no 75% picture is
+    // cached yet), then deliver the late 75% reply while window 0 targets 50%.
+    send(&mut harness, resize(ResizeDirection::Shrink));
+    harness.advance(ONE_FRAME);
+    assert!(!morphed(harness.world()), "shrink started uncovered");
+    answer(&mut harness, 0, gen_75);
+    harness.advance(ONE_FRAME);
+    // Let the uncovered shrink settle and rest at 50%.
+    for _ in 0..20 {
+        harness.advance(ONE_FRAME);
+    }
+    let morphs_before = log.borrow().morphs.len();
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    assert_eq!(
+        log.borrow().morphs.len(),
+        morphs_before + 1,
+        "cached 50% picture survived the late 75% reply after an uncovered shrink"
+    );
+}
+
+/// When a morph widens past the returning target (e.g. 50% -> 100% reaching
+/// ~90%, then turning back to 75%), a 75% capture that arrives while the
+/// presented frame is still wider than 75% defers `replace_picture` until the
+/// presented width fits 75%.
+#[test]
+fn a_fresh_picture_waits_until_the_presented_frame_fits() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    send(&mut harness, resize(ResizeDirection::Shrink));
+    frames_of(&mut harness, &[0]);
+    take_pictures(&mut harness, &log);
+    let since = log.borrow().window_asks.len();
+    // 50% -> 75% -> 100%, then advance until presented width exceeds 75%.
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    for _ in 0..8 {
+        harness.advance(ONE_FRAME);
+    }
+    // Turn back to 75% while presented width is > 75%.
+    send(&mut harness, resize(ResizeDirection::Shrink));
+    harness.advance(ONE_FRAME);
+    let (turn_from, turn_to) = morph_of(&log, log.borrow().morphs.len() - 1, 0);
+    assert!(
+        turn_from.width() > turn_to.width(),
+        "presented width ({}) must be wider than 75% target ({})",
+        turn_from.width(),
+        turn_to.width()
+    );
+    let asks = window_asks_since(&log, since);
+    let (_, size_75, gen_75) = *asks.last().expect("ask at 75%");
+    assert_eq!(size_75, turn_to.size());
+    // Deliver 75% immediately while the frame is still wider than 75%.
+    answer(&mut harness, 0, gen_75);
+    harness.advance(ONE_FRAME);
+    assert!(
+        log.borrow().replaced.is_empty(),
+        "replacement defers while presented frame is wider than 75%"
+    );
+    // Advance until the morph finishes; replacement fires once width fits.
+    for _ in 0..40 {
+        if !morphed(harness.world()) {
+            break;
+        }
+        harness.advance(ONE_FRAME);
+    }
+    assert_eq!(
+        log.borrow().replaced,
+        vec![(0, size_75)],
+        "replacement fired once presented frame fit 75%"
+    );
+}
+
 /// A fresh picture that arrives after the resize turned to another width
 /// shows nowhere: it shows the window at a size its frame no longer heads
 /// to. The turn asks for one at the new width.

@@ -825,14 +825,27 @@ impl CoverScreen for CoverScreenOS {
         // goes at their top left corner, while the frame still moves.
         let target = framed.container.bounds().size;
         framed.place_picture(target.height);
-        // The new picture fills its frame, so the strip it opened shows the
-        // window itself now. A later morph that widens the frame past it
-        // fills with this picture's edge colour.
+        // The new picture fills its target frame, so normally no fill shows.
+        // If Core Animation's live presented width is still wider than the new
+        // picture (for instance after a turn back from a wider frame), keep
+        // the new fill covering the overhang so desktop never shows through.
+        let presented_width = unsafe { framed.container.presentationLayer() }
+            .map_or(target.width, |shown| shown.bounds().size.width);
+        let overhang = presented_width > picture_size.width + 0.5;
         if let Some(fill) = framed.fill.take() {
             fill.removeFromSuperlayer();
         }
         if let Some(color) = edge_fill(photo) {
             let fill = fill_layer(&color);
+            if overhang {
+                let start = fill_start(picture_size.width);
+                fill.setFrame(CGRect::new(
+                    CGPoint::new(start, 0.0),
+                    CGSize::new((presented_width - start).max(0.0), target.height),
+                ));
+                fill.setHidden(false);
+                fill.setOpacity(1.0);
+            }
             framed
                 .container
                 .insertSublayer_below(&fill, Some(&framed.picture));
