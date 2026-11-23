@@ -108,6 +108,22 @@ impl Watch {
         }
         all
     }
+
+    /// Forgets what was read of each window no watch keeps, after a stop.
+    /// A read started before the stop is dropped, since it may hold one.
+    fn prune(&mut self) {
+        let Self {
+            ids,
+            morph_ids,
+            shown,
+            unread,
+            ..
+        } = self;
+        let watched = |id: &WinID| ids.contains(id) || morph_ids.contains(id);
+        shown.retain(|id, _| watched(id));
+        unread.retain(watched);
+        self.generation += 1;
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -185,11 +201,7 @@ impl ShownFrames {
     pub(crate) fn stop_morph(&self) {
         let mut watch = lock(&self.shared.watch);
         watch.morph_ids.clear();
-        if watch.is_empty() {
-            watch.shown.clear();
-            watch.unread.clear();
-            watch.generation += 1;
-        }
+        watch.prune();
     }
 
     /// Watches the windows of `asked`, each with the frame the engine last
@@ -237,11 +249,7 @@ impl ShownFrames {
     fn stop(&self) {
         let mut watch = lock(&self.shared.watch);
         watch.ids.clear();
-        if watch.is_empty() {
-            watch.shown.clear();
-            watch.unread.clear();
-            watch.generation += 1;
-        }
+        watch.prune();
     }
 }
 
@@ -1174,6 +1182,57 @@ mod tests {
         assert!(
             reads.load(Ordering::Relaxed) <= after_stop + 1,
             "the sampler stops reading once nothing is watched"
+        );
+    }
+
+    /// A stop forgets what the sampler read of the windows it stops
+    /// watching, even while another watch goes on, so watching one again
+    /// starts from the frame the engine asks for, not from an old read.
+    #[test]
+    fn a_stop_forgets_the_windows_it_stops_watching() {
+        let shown = IRect::new(70, 0, 170, 100);
+        let frames = ShownFrames::inline(move |ids| ids.iter().map(|&id| (id, shown)).collect());
+        let state = |frames: &ShownFrames| {
+            let watch = lock(&frames.shared.watch);
+            let mut kept = watch.shown.keys().copied().collect::<Vec<_>>();
+            kept.sort_unstable();
+            (kept, watch.unread.clone(), watch.generation)
+        };
+
+        frames.watch_morph(&[7]);
+        frames.watch(&[(8, IRect::new(0, 0, 100, 100))]);
+        let (_, _, generation) = state(&frames);
+        frames.stop();
+        let (kept, unread, stopped) = state(&frames);
+        assert_eq!(
+            kept,
+            vec![7],
+            "the rows' window 8 is forgotten, the resize's 7 kept"
+        );
+        assert!(
+            !unread.contains(&8),
+            "and window 8 is not waiting for a read"
+        );
+        assert!(
+            stopped > generation,
+            "a read started before the stop is dropped"
+        );
+
+        frames.watch(&[(8, IRect::new(0, 0, 100, 100))]);
+        frames.stop_morph();
+        let (kept, unread, stopped_morph) = state(&frames);
+        assert_eq!(
+            kept,
+            vec![8],
+            "the resize's window 7 is forgotten, the rows' 8 kept"
+        );
+        assert!(
+            !unread.contains(&7),
+            "and window 7 is not waiting for a read"
+        );
+        assert!(
+            stopped_morph > stopped,
+            "a read started before the stop is dropped"
         );
     }
 
