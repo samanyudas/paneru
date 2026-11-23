@@ -1769,3 +1769,110 @@ fn a_resize_of_a_maximized_window_morphs_under_the_cover() {
     );
     assert_eq!(log.borrow().morphs.len(), morphs_before + 1);
 }
+
+fn send_title_bar_double_click_down(
+    harness: &mut TestHarness,
+    window_id: WinID,
+    point: objc2_core_foundation::CGPoint,
+) {
+    use crate::events::MouseButton;
+    use crate::platform::Modifiers;
+    send(
+        harness,
+        Event::MouseDown {
+            point,
+            modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+            window_id: Some(window_id),
+            clicks: 1,
+        },
+    );
+    harness.advance(ONE_FRAME);
+    send(
+        harness,
+        Event::MouseUp {
+            point,
+            modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+        },
+    );
+    harness.advance(ONE_FRAME);
+    send(
+        harness,
+        Event::MouseDown {
+            point,
+            modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+            window_id: Some(window_id),
+            clicks: 2,
+        },
+    );
+    harness.advance(ONE_FRAME);
+}
+
+/// A real title-bar double-click delivers the second `MouseDown` frames before
+/// its `MouseUp`. It must not enter `DragState::Pressed` (which would skip the
+/// cover as a drag and hold the window back) and must morph identically to the
+/// maximize shortcut on both maximize and restore.
+#[test]
+fn a_title_bar_double_click_morphs_under_the_cover() {
+    use crate::events::MouseButton;
+    use crate::platform::Modifiers;
+    use objc2_core_foundation::CGPoint;
+
+    let (mut harness, log) = harness(padded_resize_config());
+    send(
+        &mut harness,
+        resize(crate::types::commands::ResizeDirection::Shrink),
+    );
+    frames_of(&mut harness, &[0, 1]);
+    send(&mut harness, focus(Direction::East));
+    for _ in 0..40 {
+        harness.advance(ONE_FRAME);
+    }
+    take_pictures(&mut harness, &log);
+    let rest_1 = shown_window_frame(harness.world(), 1);
+    let point = CGPoint::new(f64::from(rest_1.center().x), f64::from(rest_1.min.y + 10));
+
+    let since = log.borrow().window_asks.len();
+    send_title_bar_double_click_down(&mut harness, 1, point);
+    assert!(
+        morphed(harness.world()),
+        "title-bar double-click maximize runs under the cover on MouseDown"
+    );
+    let (from_1, to_1) = morph_of(&log, 0, 1);
+    assert_eq!(from_1, rest_1);
+    assert!(to_1.width() > from_1.width());
+    assert!(to_1.height() > from_1.height());
+    // Release click 2 mid-morph: must not abort or start a spurious second morph.
+    harness.advance(ONE_FRAME * 2);
+    send(
+        &mut harness,
+        Event::MouseUp {
+            point,
+            modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+        },
+    );
+    for (id, _, generation) in window_asks_since(&log, since) {
+        answer(&mut harness, id, generation);
+    }
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "MouseUp keeps the cover morph");
+    assert_eq!(log.borrow().morphs.len(), 1, "no spurious turn on MouseUp");
+    let max_paths = shown_frames_of(&mut harness, &[1]);
+    assert_eq!(max_paths[0], vec![to_1]);
+
+    // Double-click again to restore.
+    harness.advance(ONE_FRAME);
+    let max_point = CGPoint::new(f64::from(to_1.center().x), f64::from(to_1.min.y + 10));
+    let morphs_before = log.borrow().morphs.len();
+    send_title_bar_double_click_down(&mut harness, 1, max_point);
+    assert!(
+        morphed(harness.world()),
+        "title-bar double-click restore runs under the cover on MouseDown"
+    );
+    assert_eq!(log.borrow().morphs.len(), morphs_before + 1);
+    let restore_paths = shown_frames_of(&mut harness, &[1]);
+    assert_eq!(restore_paths[0], vec![rest_1]);
+}

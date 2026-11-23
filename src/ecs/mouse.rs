@@ -243,7 +243,10 @@ fn mouse_down_trigger(
 ) {
     for InputEvent(event) in messages.read() {
         let Event::MouseDown {
-            point, window_id, ..
+            point,
+            window_id,
+            clicks,
+            ..
         } = event
         else {
             continue;
@@ -282,8 +285,10 @@ fn mouse_down_trigger(
             }
         }
 
-        if config.window_hidden_ratio() >= 1.0 {
-            // At max hidden ratio, never reshuffle on click.
+        if *clicks > 1 || config.window_hidden_ratio() >= 1.0 {
+            // Multi-clicks (such as a title-bar double-click to maximize or
+            // restore) do not defer a second reshuffle to MouseUp, and at max
+            // hidden ratio clicks never reshuffle.
         } else {
             // Defer reshuffle until mouse-up so the window doesn't shift
             // mid-click. The Timeout auto-despawns if mouse-up is lost.
