@@ -23,7 +23,7 @@
 
 use std::time::Duration;
 
-use bevy::app::{App, Plugin, PreUpdate, Update};
+use bevy::app::{App, Plugin, PostUpdate, PreUpdate, Update};
 use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
@@ -51,11 +51,18 @@ use crate::ecs::layout::{
 use crate::ecs::state::SaveSession;
 use crate::ecs::systems::window_frame_update;
 use crate::ecs::{
-    Bounds, DockPosition, FocusedMarker, Position, PreUpdateSet, ResizeMarker,
+    Bounds, DockPosition, FocusedMarker, Position, PostUpdateSet, PreUpdateSet, ResizeMarker,
     SpawnCommandsExt as _, TopBarHeight, Unmanaged, UpdateSet, WidthAnchor, WidthRun,
 };
 use crate::events::{Event, InputEvent, MouseButton};
 use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
+use crate::platform::double_click_tap;
+
+/// Top-bar height published to the double-click gate for windows whose top bar
+/// has not been lazily measured yet. Wide enough to cover tall browser toolbars
+/// and tab strips (up to 96+ pt); clicks below the real top bar are replayed by
+/// [`double_click_toggle`] within one frame.
+const UNMEASURED_TOP_BAR_HEIGHT: i32 = 120;
 
 /// How long the engine holds a window at the frame a toggle gave it. The
 /// app answers the same double-click with its own zoom, which can land
@@ -123,6 +130,10 @@ impl Plugin for MaximizePlugin {
                     .before(window_frame_update)
                     .in_set(UpdateSet::Events)
                     .run_if(any_with_component::<FrameHold>),
+            )
+            .add_systems(
+                PostUpdate,
+                publish_top_bars.in_set(PostUpdateSet::Bookkeeping),
             );
     }
 }
@@ -157,6 +168,39 @@ type Clicked<'w, 's> = Query<
     ),
 >;
 
+type TopBarWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Window,
+        Option<&'static TopBarHeight>,
+        Option<&'static Unmanaged>,
+        Has<FloatingMaximized>,
+    ),
+>;
+
+/// Publishes the screen-space top-bar rectangles of every tiled window and
+/// command-maximized floating window to [`double_click_tap`] so the event tap
+/// can hold title-bar double-clicks without calling Accessibility IPC.
+fn publish_top_bars(windows: TopBarWindows) {
+    let bars = windows
+        .iter()
+        .filter(|(_, _, unmanaged, maximized)| unmanaged.is_none() || *maximized)
+        .map(|(window, top_bar, _, _)| {
+            let frame = window.shown_frame();
+            let height = top_bar.map_or(UNMEASURED_TOP_BAR_HEIGHT, |bar| bar.0);
+            let bar = IRect::new(
+                frame.min.x,
+                frame.min.y,
+                frame.max.x,
+                (frame.min.y + height).min(frame.max.y),
+            );
+            (window.id(), bar)
+        })
+        .collect();
+    double_click_tap::set_top_bars(bars);
+}
+
 /// Toggles a window when its title bar is double-clicked. A double-click on
 /// a control in the title bar, such as a button or tab, is the control's
 /// own, and one on a floating window that the command did not maximize is
@@ -180,6 +224,7 @@ fn double_click_toggle(
         };
         let Some(window_id) = window_id.or_else(|| window_manager.find_window_at_point(point).ok())
         else {
+            double_click_tap::replay();
             continue;
         };
         let point = origin_from(*point);
@@ -187,6 +232,7 @@ fn double_click_toggle(
             .iter_mut()
             .find(|(_, window, ..)| window.id() == window_id)
         else {
+            double_click_tap::replay();
             continue;
         };
         // The engine stops reading a maximized floating window's moves, so a
@@ -195,13 +241,18 @@ fn double_click_toggle(
             _ = window.update_frame();
         }
         if !in_top_bar(&window, top_bar, point) {
+            double_click_tap::replay();
             continue;
         }
         match window.control_at(point) {
             Ok(false) => {}
-            Ok(true) => continue,
+            Ok(true) => {
+                double_click_tap::replay();
+                continue;
+            }
             Err(err) => {
                 debug!("no maximize: element under {point} unreadable: {err}");
+                double_click_tap::replay();
                 continue;
             }
         }
@@ -210,8 +261,10 @@ fn double_click_toggle(
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<FrameHold>();
             }
+            double_click_tap::replay();
             continue;
         }
+        double_click_tap::consume();
         commands.trigger(ToggleMaximize {
             entity,
             at: Some(point),
