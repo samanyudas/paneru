@@ -707,24 +707,27 @@ fn keep_cover_photos(
     config: Res<Config>,
     time: Res<Time>,
 ) {
-    if !cover_enabled(&config) || photos.access != Access::Allowed {
-        // A picture that arrives after the switch or the permission went
-        // is dropped, never kept.
-        messages.clear();
-        return;
-    }
+    let enabled = cover_enabled(&config);
+    // A picture that arrives after the switch or the permission went, or
+    // after a refusal in this batch, is dropped, never kept.
+    let allowed = |photos: &CoverPhotos| enabled && photos.access == Access::Allowed;
     let now = time.elapsed();
     // Replies wait until every event of this batch is read, so a title
     // change that comes after a reply in the same batch still counts.
     let mut replies = Vec::new();
     for event in messages.read() {
         if let Event::WindowTitleChanged { window_id } = event {
-            photos.retitle(*window_id);
+            if allowed(&photos) {
+                photos.retitle(*window_id);
+            }
             // A resize's cover asks for a picture of the new title, and
-            // shows none it asked for before.
+            // shows none it asked for before, even while it may take none.
             for mut morph in &mut morphs {
                 morph.invalidate_title(*window_id);
             }
+            continue;
+        }
+        if !allowed(&photos) {
             continue;
         }
         let Event::CoverPhoto {
@@ -747,10 +750,11 @@ fn keep_cover_photos(
         };
         if matches!(result, Err(PhotoError::Refused)) {
             // macOS refused pictures: every picture goes, and none of this
-            // batch, before or after, comes back in.
+            // batch, before or after, comes back in. Title changes still
+            // reach the resize covers.
             apply_cover_reply(&mut photos, screen.as_deref_mut(), asked, result, now);
-            messages.clear();
-            return;
+            replies.clear();
+            continue;
         }
         if background {
             replies.push((asked, result.clone()));
@@ -764,6 +768,9 @@ fn keep_cover_photos(
                 title_epoch: asked.title_epoch,
             });
         }
+    }
+    if !allowed(&photos) {
+        return;
     }
     for (asked, result) in replies {
         // A picture of a window whose title changed since it was asked for

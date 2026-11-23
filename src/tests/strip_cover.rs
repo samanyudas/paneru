@@ -2663,6 +2663,85 @@ fn a_fresh_picture_waits_until_the_presented_frame_fits() {
     );
 }
 
+/// A title change that arrives after a refusal of pictures, in the same
+/// frame, still keeps a resize's cover from showing a fresh picture it holds
+/// until its frame fits, which shows the old title. The refusal ended the
+/// frame's events early, the title change went unread, and the cover showed
+/// the old tab once the frame fit.
+#[test]
+fn a_title_change_after_a_refusal_still_drops_a_waiting_picture() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    // A column of two stacked windows, so a resize widens both and asks for
+    // a fresh picture of each.
+    harness.run(vec![
+        focus(Direction::East),
+        Event::Command {
+            command: Command::Window(Operation::Stack(crate::commands::Side::West)),
+        },
+        focus(Direction::First),
+    ]);
+    harness.advance(SETTLE);
+    send(&mut harness, resize(ResizeDirection::Shrink));
+    frames_of(&mut harness, &[0, 1]);
+    take_pictures(&mut harness, &log);
+    let since = log.borrow().window_asks.len();
+    // 50% -> 75% -> 100%, then back to 75% while the frames are wider.
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    for _ in 0..8 {
+        harness.advance(ONE_FRAME);
+    }
+    send(&mut harness, resize(ResizeDirection::Shrink));
+    harness.advance(ONE_FRAME);
+    let (_, turn_to) = morph_of(&log, log.borrow().morphs.len() - 1, 0);
+    let asks = window_asks_since(&log, since);
+    let ask = |id: WinID| {
+        asks.iter()
+            .rev()
+            .find(|&&(window, size, _)| window == id && size == turn_to.size())
+            .map(|&(_, _, generation)| generation)
+            .expect("a fresh picture at 75%")
+    };
+    let (first, second) = (ask(0), ask(1));
+    answer(&mut harness, 0, first);
+    harness.advance(ONE_FRAME);
+    assert!(
+        log.borrow().replaced.is_empty(),
+        "window 0's picture waits for its frame to fit"
+    );
+
+    send(
+        &mut harness,
+        Event::CoverPhoto {
+            subject: CoverSubject::Window(1),
+            generation: second,
+            result: Err(crate::ecs::slice_photos::PhotoError::Refused),
+        },
+    );
+    send(&mut harness, Event::WindowTitleChanged { window_id: 0 });
+    harness.app.update();
+    assert!(
+        harness
+            .world()
+            .resource::<crate::ecs::strip_cover::CoverPhotos>()
+            .kept_nothing(),
+        "the refusal keeps no picture"
+    );
+    for _ in 0..40 {
+        if !morphed(harness.world()) {
+            break;
+        }
+        harness.advance(ONE_FRAME);
+    }
+    assert!(
+        log.borrow().replaced.is_empty(),
+        "the picture of the old title never shows: {:?}",
+        log.borrow().replaced
+    );
+}
+
 /// A fresh picture that arrives after the resize turned to another width
 /// shows nowhere: it shows the window at a size its frame no longer heads
 /// to. The turn asks for one at the new width.
