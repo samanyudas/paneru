@@ -238,6 +238,16 @@ enum Access {
     Refused,
 }
 
+/// A freshly arrived window picture waiting for the frame's resize layout
+/// to resolve before unveiling on a morph cover.
+#[derive(Debug)]
+struct ArrivedWindowPhoto {
+    id: WinID,
+    size: IVec2,
+    generation: u32,
+    photo: Photo,
+}
+
 /// The pictures the engine keeps for the cover.
 #[derive(Resource, Debug, Default)]
 pub(crate) struct CoverPhotos {
@@ -250,6 +260,12 @@ pub(crate) struct CoverPhotos {
     /// The fresh pictures a resize's cover asked for, apart from the
     /// background refresh so neither drops the other's answer.
     morph_asked: Vec<Asked>,
+    /// The newest ask generation issued for each subject, so an older
+    /// superseded reply arriving out of order never overwrites newer state.
+    latest_ask: HashMap<CoverSubject, u32>,
+    /// Accepted window pictures from this frame's `Events` pass, applied to
+    /// any live morph after `cover_resizes` resolves the frame's layout.
+    arrived: Vec<ArrivedWindowPhoto>,
     generation: u32,
     access: Access,
     checked_at: Option<Duration>,
@@ -276,6 +292,8 @@ impl CoverPhotos {
         self.blank_until.clear();
         self.asked = None;
         self.morph_asked.clear();
+        self.latest_ask.clear();
+        self.arrived.clear();
     }
 
     fn is_clear(&self) -> bool {
@@ -284,6 +302,8 @@ impl CoverPhotos {
             && self.blank_until.is_empty()
             && self.asked.is_none()
             && self.morph_asked.is_empty()
+            && self.latest_ask.is_empty()
+            && self.arrived.is_empty()
     }
 }
 
@@ -417,6 +437,7 @@ pub(crate) fn register(app: &mut App) {
             Update,
             (
                 resize::cover_resizes,
+                resize::unveil_morph_pictures,
                 cover_strip_moves,
                 cover_swipes,
                 mark_moved,
@@ -454,13 +475,13 @@ fn cover_enabled(config: &Config) -> bool {
         && ease::animates(duration)
 }
 
-/// Keeps each picture that arrives for the ask it answers, and shows a
-/// fresh one of a window on the cover of a resize still heading to its
-/// size.
+/// Keeps each picture that arrives for the ask it answers, rejecting any
+/// superseded reply so an older capture never overwrites newer state.
+/// Accepted window pictures are handed to [`resize::unveil_morph_pictures`]
+/// once the frame's layout resolves.
 fn keep_cover_photos(
     mut messages: MessageReader<Event>,
     mut photos: ResMut<CoverPhotos>,
-    mut morphs: Query<&mut CoverMorph>,
     mut screen: Option<NonSendMut<CoverScreenHandle>>,
     config: Res<Config>,
     time: Res<Time>,
@@ -488,11 +509,13 @@ fn keep_cover_photos(
         let Some(asked) = asked else {
             continue;
         };
+        // A newer ask for this subject supersedes any older reply: drop it
+        // before it can touch the cache, blank backoff, or capture filter.
+        if photos.latest_ask.get(subject) != Some(generation) {
+            continue;
+        }
         match result {
             Ok(photo) => {
-                if let (CoverSubject::Window(id), Some(screen)) = (*subject, screen.as_mut()) {
-                    resize::unveil(&mut morphs, screen.0.as_mut(), id, asked.size, photo);
-                }
                 let kept = Kept {
                     photo: photo.clone(),
                     size: asked.size,
@@ -503,6 +526,12 @@ fn keep_cover_photos(
                     CoverSubject::Window(id) => {
                         photos.blank_until.remove(&id);
                         photos.windows.insert(id, kept);
+                        photos.arrived.push(ArrivedWindowPhoto {
+                            id,
+                            size: asked.size,
+                            generation: *generation,
+                            photo: photo.clone(),
+                        });
                     }
                     CoverSubject::Desktop(display) => {
                         photos.desktops.insert(display, kept);
@@ -1392,6 +1421,10 @@ fn refresh_cover_photos(
     };
     photos.generation = photos.generation.wrapping_add(1);
     let generation = photos.generation;
+    photos.latest_ask.insert(want.subject, generation);
+    photos
+        .morph_asked
+        .retain(|asked| asked.subject != want.subject);
     match want.subject {
         CoverSubject::Window(id) => {
             screen

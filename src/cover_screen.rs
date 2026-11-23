@@ -41,25 +41,34 @@ const SLIDE_KEY: &str = "slide";
 /// its picture or opens a strip right of it, in points.
 const FRAME_RADIUS: f64 = 10.0;
 
-/// How far left of a picture's right edge the fill behind it starts, in
-/// points: far enough to fill under the window's rounded right corners,
-/// and clear of its left ones.
-const FILL_OVERLAP: f64 = 32.0;
+/// The key of the fill opacity animation on a window's fill sublayer.
+const FILL_OPACITY_KEY: &str = "fill-opacity";
 
 /// A shown cover, as the event tap needs it on the main thread: its window,
-/// its viewport, its strip layer, and each picture's frame from the strip
-/// origin, back to front.
+/// its viewport, its strip layer, and each window's frame container layer,
+/// back to front in paint order.
 struct LiveCover {
     panel: WinID,
     viewport: IRect,
-    strip_y: i32,
     strip: Retained<CALayer>,
-    pictures: Vec<(WinID, IRect)>,
+    layers: Vec<(WinID, Retained<CALayer>)>,
 }
 
 thread_local! {
     static LIVE_COVERS: std::cell::RefCell<Vec<LiveCover>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The global screen rectangle of a container layer with bottom-left anchor
+/// `(0, 0)` inside a strip layer at `strip_pos`, over `viewport`.
+fn global_rect(viewport: IRect, strip_pos: CGPoint, container: CGRect) -> IRect {
+    #[allow(clippy::cast_possible_truncation)]
+    let round = |v: f64| v.round() as i32;
+    let min_x = viewport.min.x + round(strip_pos.x + container.origin.x);
+    let max_y = viewport.max.y - round(strip_pos.y + container.origin.y);
+    let width = round(container.size.width).max(0);
+    let height = round(container.size.height).max(0);
+    IRect::new(min_x, max_y - height, min_x + width, max_y)
 }
 
 /// The pictures of every shown cover, as panels of their windows, where
@@ -70,19 +79,27 @@ pub(crate) fn live_cover_panels(_mtm: MainThreadMarker) -> Vec<SlicePanel> {
         live.borrow()
             .iter()
             .flat_map(|cover| {
-                // SAFETY: a plain read of the layer Core Animation shows now.
-                let shown = unsafe { cover.strip.presentationLayer() }
+                // SAFETY: plain reads of the layers Core Animation shows now.
+                let strip_shown = unsafe { cover.strip.presentationLayer() }
                     .unwrap_or_else(|| cover.strip.clone());
-                #[allow(clippy::cast_possible_truncation)]
-                let x = (shown.position().x + f64::from(cover.viewport.min.x)).round() as i32;
-                cover_panels(
-                    cover.panel,
-                    cover.viewport,
-                    IVec2::new(x, cover.strip_y),
-                    &cover.pictures,
-                )
-                .into_iter()
-                .rev()
+                let strip_pos = strip_shown.position();
+                let frames = cover
+                    .layers
+                    .iter()
+                    .map(|(id, container)| {
+                        let shown = unsafe { container.presentationLayer() }
+                            .unwrap_or_else(|| container.clone());
+                        let rect = global_rect(
+                            cover.viewport,
+                            strip_pos,
+                            CGRect::new(shown.position(), shown.bounds().size),
+                        );
+                        (*id, rect)
+                    })
+                    .collect::<Vec<_>>();
+                live_panels(cover.panel, cover.viewport, &frames)
+                    .into_iter()
+                    .rev()
             })
             .collect()
     })
@@ -114,6 +131,31 @@ struct Framed {
     fill: Option<Retained<CALayer>>,
 }
 
+/// Where the fill sublayer starts inside a picture of `picture_width` points:
+/// tucked only behind the right rounded corner cutout, never reaching the
+/// left half of a narrow picture.
+fn fill_start(picture_width: f64) -> f64 {
+    let overlap = FRAME_RADIUS.min(picture_width / 2.0);
+    (picture_width - overlap).max(0.0)
+}
+
+/// Per-share opacity for the fill sublayer: opaque only on samples where the
+/// presented width opens past `picture_width`, so translucent pixels inside
+/// the old picture are never altered before widening begins.
+fn fill_opacities(from_width: f64, to_width: f64, picture_width: f64, shares: &[f64]) -> Vec<f64> {
+    shares
+        .iter()
+        .map(|share| {
+            let width = from_width + (to_width - from_width) * share;
+            if width > picture_width + 0.5 {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
 impl Framed {
     /// Puts the picture at the top left corner of a frame `height` points
     /// high. A layer's space runs up from its bottom left corner.
@@ -124,11 +166,12 @@ impl Framed {
         ));
     }
 
-    /// Sets the frame up to move from `from` to `to`, in the strip layer's
-    /// space: a frame wider than the picture at either end shows the fill,
-    /// and one that crops or opens rounds its corners as a window's are. A
-    /// frame of the picture's own size keeps the picture as it is.
-    fn dress(&self, from: CGRect, to: CGRect) {
+    /// Sets the frame up to move from `from` to `to` along `shares` over
+    /// `duration` seconds, in the strip layer's space: a frame wider than the
+    /// picture shows the fill only while its presented width exceeds the
+    /// picture, and one that crops or opens rounds its corners as a window's
+    /// are. A frame of the picture's own size keeps the picture as it is.
+    fn dress(&self, from: CGRect, to: CGRect, shares: &[f64], duration: f64) {
         let widest = from.size.width.max(to.size.width);
         let narrowest = from.size.width.min(to.size.width);
         let opens = widest > self.picture_size.width + 0.5;
@@ -137,12 +180,37 @@ impl Framed {
             .setCornerRadius(if opens || crops { FRAME_RADIUS } else { 0.0 });
         self.place_picture(to.size.height);
         if let Some(fill) = &self.fill {
-            fill.setHidden(!opens);
-            let start = (self.picture_size.width - FILL_OVERLAP).max(0.0);
+            fill.removeAnimationForKey(&NSString::from_str(FILL_OPACITY_KEY));
+            if !opens {
+                fill.setHidden(true);
+                fill.setOpacity(0.0);
+                return;
+            }
+            let start = fill_start(self.picture_size.width);
             fill.setFrame(CGRect::new(
                 CGPoint::new(start, 0.0),
                 CGSize::new((widest - start).max(0.0), to.size.height),
             ));
+            fill.setHidden(false);
+            let opacities = fill_opacities(
+                from.size.width,
+                to.size.width,
+                self.picture_size.width,
+                shares,
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            let end_opacity = opacities.last().copied().unwrap_or(0.0) as f32;
+            fill.setOpacity(end_opacity);
+            if duration > 0.0
+                && opacities
+                    .first()
+                    .is_some_and(|first| opacities.iter().any(|v| (v - first).abs() > f64::EPSILON))
+            {
+                fill.addAnimation_forKey(
+                    &keyframes("opacity", &opacities, duration),
+                    Some(&NSString::from_str(FILL_OPACITY_KEY)),
+                );
+            }
         }
     }
 }
@@ -364,9 +432,12 @@ impl CoverScreenOS {
                     Some(LiveCover {
                         panel: WinID::try_from(cover.window.windowNumber()).ok()?,
                         viewport: cover.viewport,
-                        strip_y: cover.at.y,
                         strip: cover.strip.clone(),
-                        pictures: cover.pictures.clone(),
+                        layers: cover
+                            .layers
+                            .iter()
+                            .map(|framed| (framed.id, framed.container.clone()))
+                            .collect(),
                     })
                 })
                 .collect();
@@ -661,7 +732,7 @@ impl CoverScreen for CoverScreenOS {
             // The frame moves and sizes, and the picture in it stays put at
             // its own size: it crops, or opens onto the fill, never stretches.
             let layer = &window.container;
-            window.dress(from, to);
+            window.dress(from, to, shares, duration);
             layer.removeAllAnimations();
             layer.setFrame(to);
             let tracks = [
@@ -886,24 +957,20 @@ impl Reply {
     }
 }
 
-/// The pictures of a cover over `viewport`, with the strip origin at
-/// `strip`, as panels of the cover window `panel`: each picture's part in
-/// the viewport, and the part of its window that shows there, from the top
-/// left of the window's shown frame.
-pub(crate) fn cover_panels(
+/// The pictures of a cover over `viewport`, given each picture's live global
+/// frame in paint order (back to front), as panels of `panel`.
+pub(crate) fn live_panels(
     panel: WinID,
     viewport: IRect,
-    strip: IVec2,
-    pictures: &[(WinID, IRect)],
+    frames: &[(WinID, IRect)],
 ) -> Vec<SlicePanel> {
-    pictures
+    frames
         .iter()
-        .filter_map(|(window, rel)| {
-            let frame = IRect::from_corners(rel.min + strip, rel.max + strip);
+        .filter_map(|&(window, frame)| {
             let on_screen = frame.intersect(viewport);
             (!on_screen.is_empty()).then(|| SlicePanel {
                 panel,
-                window: *window,
+                window,
                 on_screen,
                 in_window: IRect::from_corners(
                     on_screen.min - frame.min,
@@ -916,11 +983,36 @@ pub(crate) fn cover_panels(
         .collect()
 }
 
+/// The pictures of a cover over `viewport`, with the strip origin at
+/// `strip`, as panels of the cover window `panel`: each picture's part in
+/// the viewport, and the part of its window that shows there, from the top
+/// left of the window's shown frame.
+pub(crate) fn cover_panels(
+    panel: WinID,
+    viewport: IRect,
+    strip: IVec2,
+    pictures: &[(WinID, IRect)],
+) -> Vec<SlicePanel> {
+    let frames = pictures
+        .iter()
+        .map(|&(window, rel)| {
+            (
+                window,
+                IRect::from_corners(rel.min + strip, rel.max + strip),
+            )
+        })
+        .collect::<Vec<_>>();
+    live_panels(panel, viewport, &frames)
+}
+
 #[cfg(test)]
 mod tests {
     use bevy::math::{IRect, IVec2};
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
-    use super::cover_panels;
+    use super::{
+        CoverScreenOS, cover_panels, fill_opacities, fill_start, global_rect, live_panels,
+    };
 
     /// A press on a picture lands on its window at the same point in the
     /// window, wherever the strip shows, and a picture cut by the
@@ -950,5 +1042,53 @@ mod tests {
             cover_panels(99, viewport, IVec2::new(-700, 0), &pictures),
             []
         );
+    }
+
+    /// `global_rect` is the inverse of `CoverScreenOS::turned` plus strip
+    /// offset, so hit-testing reads each container's exact live frame.
+    #[test]
+    fn global_rect_inverts_turned_during_morph_and_slide() {
+        let viewport = IRect::new(100, 30, 1100, 830);
+        let laid = IVec2::new(120, 38);
+        let live_global = IRect::new(250, 38, 700, 800);
+        let local = CoverScreenOS::turned(
+            IRect::from_corners(
+                IVec2::new(
+                    live_global.min.x - laid.x + viewport.min.x,
+                    live_global.min.y,
+                ),
+                IVec2::new(
+                    live_global.max.x - laid.x + viewport.min.x,
+                    live_global.max.y,
+                ),
+            ),
+            viewport,
+        );
+        let strip_pos = CGPoint::new(f64::from(laid.x - viewport.min.x), 0.0);
+        assert_eq!(global_rect(viewport, strip_pos, local), live_global);
+
+        // During a morph where A grows into B's old space, live frames still
+        // map a click on B's visible picture to B, not A.
+        let frames = [
+            (1, IRect::new(100, 38, 450, 800)),
+            (2, IRect::new(458, 38, 900, 800)),
+        ];
+        let panels = live_panels(99, viewport, &frames);
+        let click_on_b = CGPoint::new(500.0, 200.0);
+        let hit = panels.iter().rev().find(|p| p.contains(click_on_b));
+        assert_eq!(hit.map(|p| p.window), Some(2));
+    }
+
+    #[test]
+    fn fill_stays_confined_to_right_corner_and_gates_on_presented_width() {
+        // A narrow picture never lets fill reach its left half.
+        assert_eq!(fill_start(16.0), 8.0);
+        assert_eq!(fill_start(400.0), 390.0);
+
+        // Turning from narrower than picture to wider keeps fill transparent
+        // until the presented width actually exceeds the picture width.
+        let ops = fill_opacities(180.0, 220.0, 200.0, &[0.0, 0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(ops, vec![0.0, 0.0, 0.0, 1.0, 1.0]);
+        let _ = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1.0, 1.0));
     }
 }

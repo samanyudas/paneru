@@ -125,7 +125,21 @@ fn deliver_press(
     {
         return;
     }
-    let point = press.point_in(window.shown_frame());
+    let shown = window.shown_frame();
+    if press.exact
+        && (press.at.x < 0.0
+            || press.at.y < 0.0
+            || press.at.x >= f64::from(shown.width())
+            || press.at.y >= f64::from(shown.height()))
+    {
+        debug!(
+            "edge slice press dropped: press {} window {} shrank past ({:.0}, {:.0})",
+            press.id, press.window_id, press.at.x, press.at.y
+        );
+        commands.remove_resource::<PendingPress>();
+        return;
+    }
+    let point = press.point_in(shown);
     let on_display = displays
         .iter()
         .any(|display| display.bounds().contains(origin_from(point)));

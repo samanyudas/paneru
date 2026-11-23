@@ -33,15 +33,14 @@ use objc2_core_graphics::CGDirectDisplayID;
 use tracing::debug;
 
 use super::{
-    ASK_TIMEOUT, Access, Asked, CoverPhotos, CoverScreen, CoverScreenHandle, CoverSlide,
-    CoverSubject, CoverSwipe, CoverWindows, LANDED_FRAMES, LANDING_TIMEOUT, PATH_STEP, SHOWN_GRACE,
-    ShownStrips, StripWindow, close, cover_enabled, end_guard, scene_of, shows, strip_windows,
+    ASK_TIMEOUT, Access, Asked, CoverPhotos, CoverScreenHandle, CoverSlide, CoverSubject,
+    CoverSwipe, CoverWindows, LANDED_FRAMES, LANDING_TIMEOUT, PATH_STEP, SHOWN_GRACE, ShownStrips,
+    StripWindow, close, cover_enabled, end_guard, scene_of, shows, strip_windows,
 };
 use crate::config::Config;
 use crate::ecs::drag::DragState;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::pacing::ShownFrames;
-use crate::ecs::slice_photos::Photo;
 use crate::ecs::systems::AnimationStep;
 use crate::ecs::workspace::spawn_snap_strip_guard;
 use crate::ecs::{
@@ -108,9 +107,10 @@ pub(crate) struct CoverMorph {
     /// The size each window's picture on the cover shows it at: where it
     /// rested, until a fresh picture replaces it.
     pictured: Vec<(Entity, IVec2)>,
-    /// Each window and size the engine asked a fresh picture of, so it asks
-    /// once a size.
-    refreshing: Vec<(Entity, IVec2)>,
+    /// Each window's active fresh-picture ask for its current target size,
+    /// paired with that ask's generation. Cleared for a window whenever a
+    /// turn changes its target size.
+    refresh_ask: Vec<(Entity, IVec2, u32)>,
     /// Where the morph entered the curve, as a share of its time, how long it
     /// has run in animation time, and how long the whole curve lasts.
     entry: f64,
@@ -145,12 +145,15 @@ impl CoverMorph {
     }
 
     /// Each window whose frame heads wider than its picture on the cover,
-    /// with its frame, that the engine has not asked a fresh picture of yet.
+    /// with its frame, that has no fresh-picture ask for this target size yet.
     fn outgrown(&self) -> impl Iterator<Item = &Reframe> {
         self.frames.iter().filter(|frame| {
             self.pictured(frame.entity)
                 .is_some_and(|size| frame.to.width() > size.x)
-                && !self.refreshing.contains(&(frame.entity, frame.to.size()))
+                && !self
+                    .refresh_ask
+                    .iter()
+                    .any(|&(entity, size, _)| entity == frame.entity && size == frame.to.size())
         })
     }
 
@@ -359,7 +362,7 @@ pub(super) fn cover_resizes(
     windows: CoverWindows,
     floating: Query<(&Window, &Unmanaged)>,
     displays: Query<(&Display, Option<&DockPosition>)>,
-    photos: Res<CoverPhotos>,
+    mut photos: ResMut<CoverPhotos>,
     resting: Res<RestingStrips>,
     drag: Option<Res<DragState>>,
     window_manager: Res<WindowManager>,
@@ -446,6 +449,11 @@ pub(super) fn cover_resizes(
                 // The real windows are where the layout put them already, or
                 // ease on from there.
                 debug!("cover over resized strip {entity} ended early");
+                for &(_, _, generation) in &morph.refresh_ask {
+                    photos
+                        .morph_asked
+                        .retain(|asked| asked.generation != generation);
+                }
                 end_guard(morph.guard.take(), &mut commands);
                 screen.0.hide(morph.display);
                 commands.entity(entity).remove::<CoverMorph>();
@@ -467,6 +475,23 @@ pub(super) fn cover_resizes(
                     .collect::<Vec<_>>();
                 let duration = ease::duration(&config);
                 let entry = turn_entry(&morph.frames, &shown, &heading, rate, duration);
+                // Drop any pending fresh-picture ask whose window changed its
+                // target size on this turn, so a returning turn can ask anew
+                // and stale replies from an earlier width never land.
+                morph
+                    .refresh_ask
+                    .retain(|&(win_entity, ask_size, generation)| {
+                        let unchanged = heading
+                            .iter()
+                            .find(|&&(e, _, _)| e == win_entity)
+                            .is_some_and(|&(_, _, to)| to.size() == ask_size);
+                        if !unchanged {
+                            photos
+                                .morph_asked
+                                .retain(|asked| asked.generation != generation);
+                        }
+                        unchanged
+                    });
                 morph.frames = heading
                     .iter()
                     .zip(shown)
@@ -610,7 +635,7 @@ pub(super) fn cover_resizes(
             frames,
             hid: Vec::new(),
             pictured,
-            refreshing: Vec::new(),
+            refresh_ask: Vec::new(),
             entry: 0.0,
             elapsed: 0.0,
             duration,
@@ -802,17 +827,21 @@ pub(super) fn refresh_morph_pictures(
             }
             photos.generation = photos.generation.wrapping_add(1);
             let generation = photos.generation;
+            let subject = CoverSubject::Window(id);
+            photos.latest_ask.insert(subject, generation);
+            photos.morph_asked.retain(|asked| asked.subject != subject);
             screen
                 .0
                 .photograph_window(id, to.size(), morph.display, generation);
             photos.morph_asked.push(Asked {
-                subject: CoverSubject::Window(id),
+                subject,
                 generation,
                 at: now,
                 size: to.size(),
                 excluding: Vec::new(),
             });
-            morph.refreshing.push((entity, to.size()));
+            morph.refresh_ask.retain(|&(e, ..)| e != entity);
+            morph.refresh_ask.push((entity, to.size(), generation));
             debug!(
                 "fresh cover picture of window {id} asked at {}x{}",
                 to.width(),
@@ -822,40 +851,61 @@ pub(super) fn refresh_morph_pictures(
     }
 }
 
-/// Puts `photo`, a fresh picture of window `id` at `size`, on the cover of
-/// each resize whose frame of that window still heads to that size and
-/// shows an older, narrower picture of it. A picture that arrives after the
-/// cover came down, or after the resize turned to another width, shows
-/// nowhere.
-pub(super) fn unveil(
-    morphs: &mut Query<&mut CoverMorph>,
-    screen: &mut dyn CoverScreen,
-    id: WinID,
-    size: IVec2,
-    photo: &Photo,
+/// Applies window pictures that arrived this frame to any live resize cover
+/// whose current turn asked for that exact generation and still heads to
+/// that size with an older, narrower picture. Runs after [`cover_resizes`]
+/// so any turn or abort in the same frame has already resolved.
+pub(super) fn unveil_morph_pictures(
+    mut morphs: Query<&mut CoverMorph>,
+    mut photos: ResMut<CoverPhotos>,
+    screen: Option<NonSendMut<CoverScreenHandle>>,
 ) {
-    for mut morph in morphs.iter_mut() {
-        let Some(frame) = morph.frames.iter().find(|frame| frame.id == id).copied() else {
-            continue;
-        };
-        let heads_there = close(frame.to.size(), size);
-        let wider = morph
-            .pictured(frame.entity)
-            .is_some_and(|pictured| frame.to.width() > pictured.x);
-        if !heads_there || !wider {
-            continue;
+    let arrived = std::mem::take(&mut photos.arrived);
+    let Some(mut screen) = screen else {
+        return;
+    };
+    for arrived in arrived {
+        for mut morph in &mut morphs {
+            let Some(frame) = morph
+                .frames
+                .iter()
+                .find(|frame| frame.id == arrived.id)
+                .copied()
+            else {
+                continue;
+            };
+            let matches_ask = morph
+                .refresh_ask
+                .iter()
+                .any(|&(entity, ask_size, ask_gen)| {
+                    entity == frame.entity
+                        && ask_gen == arrived.generation
+                        && close(ask_size, arrived.size)
+                });
+            let heads_there = close(frame.to.size(), arrived.size);
+            let wider = morph
+                .pictured(frame.entity)
+                .is_some_and(|pictured| frame.to.width() > pictured.x);
+            if !matches_ask || !heads_there || !wider {
+                continue;
+            }
+            // At the frame's own size, which the capture matches to within its
+            // rounding.
+            let fits = frame.to.size();
+            screen
+                .0
+                .replace_picture(morph.display, arrived.id, fits, &arrived.photo);
+            if let Some((_, pictured)) = morph
+                .pictured
+                .iter_mut()
+                .find(|(entity, _)| *entity == frame.entity)
+            {
+                *pictured = fits;
+            }
+            debug!(
+                "cover over a resize shows the fresh picture of window {}",
+                arrived.id
+            );
         }
-        // At the frame's own size, which the capture matches to within its
-        // rounding.
-        let fits = frame.to.size();
-        screen.replace_picture(morph.display, id, fits, photo);
-        if let Some((_, pictured)) = morph
-            .pictured
-            .iter_mut()
-            .find(|(entity, _)| *entity == frame.entity)
-        {
-            *pictured = fits;
-        }
-        debug!("cover over a resize shows the fresh picture of window {id}");
     }
 }

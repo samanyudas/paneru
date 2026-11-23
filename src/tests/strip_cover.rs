@@ -1183,7 +1183,8 @@ fn a_fresh_picture_waits_for_the_window_server() {
     );
 }
 
-/// A fresh picture that arrives after the cover came down shows nowhere.
+/// A fresh picture that arrives right after the cover lifts (while the ask
+/// is still pending, well before `ASK_TIMEOUT`) shows nowhere on a cover.
 #[test]
 fn a_fresh_picture_after_the_cover_lifts_shows_nowhere() {
     use crate::types::commands::ResizeDirection;
@@ -1194,7 +1195,12 @@ fn a_fresh_picture_after_the_cover_lifts_shows_nowhere() {
     harness.advance(ONE_FRAME);
     let asks = window_asks_since(&log, since);
     assert_eq!(asks.len(), 1, "a fresh picture is asked for");
-    frames_of(&mut harness, &[0]);
+    for _ in 0..40 {
+        if !morphed(harness.world()) {
+            break;
+        }
+        harness.advance(ONE_FRAME);
+    }
     assert!(!morphed(harness.world()), "the cover is down");
     answer(&mut harness, 0, asks[0].2);
     harness.advance(ONE_FRAME);
@@ -1202,6 +1208,95 @@ fn a_fresh_picture_after_the_cover_lifts_shows_nowhere() {
         log.borrow().replaced.is_empty(),
         "the picture shows nowhere"
     );
+}
+
+/// An older superseded capture arriving after a newer one never overwrites
+/// the newer cached size, so the next resize still goes under the cover.
+#[test]
+fn a_superseded_fresh_picture_never_overwrites_a_newer_cached_one() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    take_pictures(&mut harness, &log);
+    let since = log.borrow().window_asks.len();
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    let first = window_asks_since(&log, since);
+    assert_eq!(first.len(), 1);
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    let asks = window_asks_since(&log, since);
+    assert_eq!(asks.len(), 2, "second width asks anew");
+    let (_, second_size, second_gen) = asks[1];
+    // Deliver the newer capture first, then the superseded older one.
+    answer(&mut harness, 0, second_gen);
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().replaced, vec![(0, second_size)]);
+    answer(&mut harness, 0, first[0].2);
+    harness.advance(ONE_FRAME);
+    assert_eq!(
+        log.borrow().replaced,
+        vec![(0, second_size)],
+        "the older reply does not replace the newer picture"
+    );
+    // Let the morph finish and rest, then start another resize: the cache
+    // must still hold `second_size`, not `first[0].1`.
+    for _ in 0..40 {
+        if !morphed(harness.world()) {
+            break;
+        }
+        harness.advance(ONE_FRAME);
+    }
+    assert!(!morphed(harness.world()));
+    harness.advance(ONE_FRAME);
+    let morphs_before = log.borrow().morphs.len();
+    send(&mut harness, resize(ResizeDirection::Shrink));
+    harness.advance(ONE_FRAME);
+    assert_eq!(
+        log.borrow().morphs.len(),
+        morphs_before + 1,
+        "next resize stays under the cover using the newer cached size"
+    );
+}
+
+/// Turning 50% -> 75% -> 100% -> 75% drops the first 75% ask on the way to
+/// 100%, asks anew on the return to 75%, and ignores any stale reply from
+/// the first 75% ask.
+#[test]
+fn a_returning_turn_asks_anew_and_rejects_an_earlier_reply() {
+    use crate::types::commands::ResizeDirection;
+    let (mut harness, log) = harness(resize_config());
+    take_pictures(&mut harness, &log);
+    let since = log.borrow().window_asks.len();
+    // 50% -> 75%
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    let first = window_asks_since(&log, since);
+    assert_eq!(first.len(), 1);
+    let (first_id, size_75, gen_first_75) = first[0];
+    assert_eq!(first_id, 0);
+    // 75% -> 100%
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(ONE_FRAME);
+    assert_eq!(window_asks_since(&log, since).len(), 2);
+    // 100% -> 75%
+    send(&mut harness, resize(ResizeDirection::Shrink));
+    harness.advance(ONE_FRAME);
+    let asks = window_asks_since(&log, since);
+    assert_eq!(asks.len(), 3, "returning to 75% asks anew");
+    let (_, returned_size, gen_second_75) = asks[2];
+    assert_eq!(returned_size, size_75);
+    assert_ne!(gen_second_75, gen_first_75);
+    // Stale reply from the first 75% turn must be rejected.
+    answer(&mut harness, 0, gen_first_75);
+    harness.advance(ONE_FRAME);
+    assert!(
+        log.borrow().replaced.is_empty(),
+        "stale first-turn reply is rejected"
+    );
+    // Current turn's reply unveils cleanly.
+    answer(&mut harness, 0, gen_second_75);
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().replaced, vec![(0, size_75)]);
 }
 
 /// A fresh picture that arrives after the resize turned to another width
