@@ -1381,21 +1381,64 @@ fn cover_swipes(
             let moved = marker.as_ref().is_some_and(DetectChanges::is_changed);
             let same_place = display.bounds() == swipe.bounds
                 && display.actual_display_bounds(dock, &config) == swipe.viewport;
-            let aborted = !cover_enabled(&config)
-                || !shown_here
-                || !same_place
-                || moved
-                || dragging
-                || mission_control.0
-                || layout_print(&strip, &windows) != swipe.layout;
+            let ended = if !cover_enabled(&config) {
+                Some("switched off")
+            } else if !shown_here {
+                Some("strip not shown")
+            } else if !same_place {
+                Some("display or viewport changed")
+            } else if dragging {
+                Some("drag")
+            } else if mission_control.0 {
+                Some("Mission Control")
+            } else if layout_print(&strip, &windows) != swipe.layout {
+                Some("layout changed")
+            } else if moved {
+                Some("strip move")
+            } else {
+                None
+            };
+            // A strip move that arrives during the swipe, such as the one
+            // that brings the newly focused column into view, carries the
+            // pictures on to where it heads. Taking the cover down there
+            // showed the real windows where the swipe began, then the
+            // desktop between them as each app moved its window.
+            if ended == Some("strip move")
+                && let Some(marker) = marker.as_ref()
+                && marker.0.y == position.0.y
+            {
+                let from = f64::from(position.0.x);
+                let viewport = display.actual_display_bounds(dock, &config);
+                let mut slide = start_slide(
+                    swipe.display,
+                    (display.bounds(), viewport),
+                    from,
+                    0.0,
+                    marker.0,
+                    &config,
+                );
+                slide.layout = swipe.layout;
+                screen.0.slide(swipe.display, &slide.path(), PATH_STEP);
+                screen.0.track(swipe.display, from);
+                debug!(
+                    "cover over swiped strip {entity} slides on from {} to {}",
+                    position.0.x, marker.0.x
+                );
+                commands
+                    .entity(entity)
+                    .remove::<(CoverSwipe, RepositionMarker, Scrolling)>()
+                    .insert(slide);
+                continue;
+            }
+            let aborted = ended.is_some();
             if aborted || scrolling.is_none() {
                 // The swipe has landed, or the cover cannot stay: the real
                 // windows take their places in one step.
                 let guard = spawn_snap_strip_guard(entity, &mut commands);
                 let mut entity_commands = commands.entity(entity);
                 entity_commands.remove::<CoverSwipe>().insert(Moved);
-                if aborted {
-                    debug!("cover over swiped strip {entity} ended early");
+                if let Some(reason) = ended {
+                    debug!("cover over swiped strip {entity} ended early: {reason}");
                     if !started.0.contains(&swipe.display) {
                         screen.0.hide(swipe.display);
                     }

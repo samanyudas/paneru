@@ -659,6 +659,36 @@ fn a_key_during_a_covered_swipe_ends_the_cover() {
     assert!(!covered(harness.world()));
 }
 
+/// A strip move that arrives during a covered swipe, as when the swipe's
+/// new focus brings its column into view, keeps the cover up and slides the
+/// pictures on to where the strip heads. Taking the cover down there showed
+/// the windows where the swipe began, then the desktop between them.
+#[test]
+fn a_strip_move_during_a_covered_swipe_slides_the_pictures_on() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.01));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().shown.len(), 1, "the swipe is under a cover");
+    let slides = log.borrow().slides.len();
+
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().hidden, 0, "the cover stays up");
+    assert!(covered(harness.world()), "the strip is still covered");
+    assert_eq!(
+        log.borrow().slides.len(),
+        slides + 1,
+        "the pictures slide on to where the strip heads"
+    );
+    assert_eq!(log.borrow().shown.len(), 1, "it is the same cover");
+
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(SETTLE);
+    assert!(!covered(harness.world()), "the cover lifts once it lands");
+}
+
 /// A focus move into a column of stacked windows goes under the cover too.
 #[test]
 fn a_move_into_a_stack_is_covered() {
