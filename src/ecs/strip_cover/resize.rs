@@ -1340,7 +1340,10 @@ pub(super) fn apply_morph_replies(
         );
     }
 
-    if let Some(mut screen) = screen {
+    // No picture first shows while pictures are not allowed.
+    if photos.access == Access::Allowed
+        && let Some(mut screen) = screen
+    {
         unveil_ready_pictures(&mut morphs, screen.0.as_mut());
     }
 }

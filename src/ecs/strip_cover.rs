@@ -444,6 +444,19 @@ impl CoverPhotos {
         self.morph_replies.clear();
     }
 
+    /// Whether the engine may take pictures, as a test sees it.
+    #[cfg(test)]
+    pub(crate) fn allows(&self) -> bool {
+        self.access == Access::Allowed
+    }
+
+    /// Stops allowing pictures until the next check, as a test asks, with
+    /// nothing else forgotten yet.
+    #[cfg(test)]
+    pub(crate) fn switch_off(&mut self) {
+        self.access = Access::Off;
+    }
+
     /// Whether the engine keeps no picture and asks for none, as a test
     /// sees it.
     #[cfg(test)]
@@ -1909,8 +1922,8 @@ fn mark_moved(mut strips: Query<(Entity, &mut Position), With<Moved>>, mut comma
 /// A strip under a cover, by a move or a swipe.
 pub(crate) type UnderCover = Or<(With<CoverSlide>, With<CoverSwipe>, With<CoverMorph>)>;
 
-/// Every strip under a cover.
-type AnyCover<'w, 's> = Query<'w, 's, (), UnderCover>;
+/// Every strip under a cover that a move or a swipe put up.
+type MovingCovers<'w, 's> = Query<'w, 's, (), Or<(With<CoverSlide>, With<CoverSwipe>)>>;
 
 /// Asks for the next picture the cover needs, one at a time: a missing or
 /// outgrown one first, then the desktop, then the focused window, then the
@@ -1918,7 +1931,8 @@ type AnyCover<'w, 's> = Query<'w, 's, (), UnderCover>;
 #[allow(clippy::too_many_arguments)]
 fn refresh_cover_photos(
     shown_strips: ShownStrips,
-    covers: AnyCover,
+    moves: MovingCovers,
+    mut morphs: Query<&mut resize::CoverMorph>,
     windows: CoverWindows,
     all_windows: Query<&Window>,
     displays: Query<&Display>,
@@ -1937,13 +1951,18 @@ fn refresh_cover_photos(
     }
     check_access(&mut photos, &config, screen.0.as_ref(), now);
     if photos.access != Access::Allowed || !cover_enabled(&config) {
+        // A resize's cover forgets the fresh pictures it asked for or holds
+        // until its frame fits, as the kept ones go.
+        for mut morph in &mut morphs {
+            morph.clear_pending();
+        }
         if !photos.is_clear() {
             photos.clear();
             screen.0.forget(None);
         }
         return;
     }
-    if !covers.is_empty() {
+    if !moves.is_empty() || !morphs.is_empty() {
         // A capture now would cost the slide frames.
         return;
     }

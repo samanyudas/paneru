@@ -2946,6 +2946,85 @@ fn a_refusal_drops_a_waiting_picture() {
     );
 }
 
+/// Runs frames until the resize's cover has let pictures back in, or
+/// shut them out, as `allowed` says.
+fn until_access(harness: &mut TestHarness, allowed: bool) {
+    for _ in 0..20 {
+        let photos = harness
+            .world()
+            .resource::<crate::ecs::strip_cover::CoverPhotos>();
+        if photos.allows() == allowed {
+            return;
+        }
+        harness.app.update();
+    }
+    panic!("pictures are allowed: {}", !allowed);
+}
+
+/// A fresh picture a resize's cover holds until its frame fits never shows
+/// once macOS stops allowing pictures, even after it allows them again
+/// before the frame fits. The background refresh forgot every kept picture
+/// but left the resize's, which showed once its frame fit.
+#[test]
+fn a_waiting_picture_never_shows_once_access_is_revoked() {
+    let (mut harness, log) = harness(resize_config());
+    a_stacked_resize_with_a_waiting_picture(&mut harness, &log);
+    let recheck = |harness: &mut TestHarness| {
+        harness.world().resource_mut::<Config>().set_changed();
+    };
+    log.borrow_mut().denied = true;
+    recheck(&mut harness);
+    until_access(&mut harness, false);
+    log.borrow_mut().denied = false;
+    recheck(&mut harness);
+    until_access(&mut harness, true);
+    assert!(morphed(harness.world()), "the resize goes on");
+    assert!(log.borrow().replaced.is_empty(), "before its frame fits");
+
+    until_unmorphed(&mut harness);
+    assert!(
+        log.borrow().replaced.is_empty(),
+        "the picture never shows: {:?}",
+        log.borrow().replaced
+    );
+}
+
+/// A resize's cover shows no fresh picture it holds while pictures are not
+/// allowed, even in the frame before the background refresh forgets it.
+#[test]
+fn a_waiting_picture_does_not_show_while_access_is_off() {
+    // How many frames the waiting picture takes to show.
+    let fits = {
+        let (mut harness, log) = harness(resize_config());
+        a_stacked_resize_with_a_waiting_picture(&mut harness, &log);
+        (1..40)
+            .find(|_| {
+                harness.app.update();
+                !log.borrow().replaced.is_empty()
+            })
+            .expect("the picture shows once its frame fits")
+    };
+    let (mut harness, log) = harness(resize_config());
+    a_stacked_resize_with_a_waiting_picture(&mut harness, &log);
+    for _ in 1..fits {
+        harness.app.update();
+    }
+    assert!(
+        log.borrow().replaced.is_empty(),
+        "the frame does not fit yet"
+    );
+    harness
+        .world()
+        .resource_mut::<crate::ecs::strip_cover::CoverPhotos>()
+        .switch_off();
+    harness.app.update();
+    assert!(
+        log.borrow().replaced.is_empty(),
+        "no picture shows as the frame fits: {:?}",
+        log.borrow().replaced
+    );
+}
+
 /// A resize's fresh picture asked for before the window's title changed,
 /// while pictures were switched off, never comes in once they are back on,
 /// before the background refresh clears what it asked for. The resize's
