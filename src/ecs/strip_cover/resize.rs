@@ -246,14 +246,18 @@ impl CoverMorph {
     }
 
     /// The share of the way the pictures show now, and how fast it grows,
-    /// per second.
+    /// per second. Pictures that wait for a window rest where they started.
     fn progress(&self) -> (f64, f64) {
-        if self.stage != Stage::Moving || self.elapsed >= self.length() {
-            return (1.0, 0.0);
+        match self.stage {
+            Stage::Waiting { .. } => (0.0, 0.0),
+            Stage::Landing { .. } => (1.0, 0.0),
+            Stage::Moving if self.elapsed >= self.length() => (1.0, 0.0),
+            Stage::Moving => {
+                let dt = 1e-3;
+                let share = self.share_at(self.elapsed);
+                (share, (share - self.share_at(self.elapsed - dt)) / dt)
+            }
         }
-        let dt = 1e-3;
-        let share = self.share_at(self.elapsed);
-        (share, (share - self.share_at(self.elapsed - dt)) / dt)
     }
 
     fn sent(&self) -> Vec<(WinID, IRect, IRect)> {

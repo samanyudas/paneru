@@ -2046,6 +2046,47 @@ fn a_maximize_of_a_slow_window_starts_at_the_wait_limit() {
     harness.mock_state.show_now(1);
 }
 
+/// A restore while a maximize's pictures still rest, waiting for the window
+/// to take its maximized frame, turns them from where they rest: nowhere,
+/// since the restore heads back there. They moved from the maximized frame
+/// back to the old one, as if the window had been maximized on screen.
+#[test]
+fn a_restore_while_a_maximize_waits_never_shows_the_maximized_frame() {
+    let (mut harness, log) = harness(padded_resize_config());
+    send(
+        &mut harness,
+        resize(crate::types::commands::ResizeDirection::Shrink),
+    );
+    frames_of(&mut harness, &[0, 1]);
+    send(&mut harness, focus(Direction::East));
+    for _ in 0..40 {
+        harness.advance(ONE_FRAME);
+    }
+    take_pictures(&mut harness, &log);
+    let rest = shown_window_frame(harness.world(), 1);
+    // The window server shows window 1's new frame late, so the pictures
+    // wait for it.
+    harness.mock_state.show_late(1);
+
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "maximize runs under a cover");
+    assert!(log.borrow().morphs.is_empty(), "the pictures wait");
+
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    harness.mock_state.show_now(1);
+    let morphs = log.borrow().morphs.clone();
+    assert_eq!(morphs.len(), 1, "the restore turns the waiting morph");
+    let (from, to) = morph_of(&log, 0, 1);
+    assert_eq!(to, rest, "back to where the window was");
+    assert_eq!(from, to, "from where the pictures rest");
+    assert!(
+        morphs[0].iter().all(|(_, from, to)| from == to),
+        "no picture moves: {morphs:?}"
+    );
+}
+
 /// A restore shows the window as it was before the maximize from its first
 /// frame, from the picture kept of that size, so its frame closes onto the
 /// layout it will have rather than onto the maximized layout's corner.
