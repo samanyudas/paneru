@@ -488,20 +488,32 @@ pub(super) fn cover_resizes(
                         .zip(&morph.frames)
                         .all(|(window, frame)| window.entity == frame.entity)
                 };
-            let aborted = !cover_enabled(&config)
-                || !shown_here
-                || display.id() != morph.display
+            let ended = if !cover_enabled(&config) {
+                Some("switched off")
+            } else if !shown_here {
+                Some("strip not shown")
+            } else if display.id() != morph.display
                 || display.bounds() != morph.bounds
                 || viewport != morph.viewport
-                || scrolling
-                || dragging
-                || mission_control.0
-                || !same_windows
-                || row.iter().any(|window| {
-                    window.tabbed
-                        || (!maximize_morph && window.turns_height())
-                        || window.asks_refused_width()
-                });
+            {
+                Some("display or viewport changed")
+            } else if scrolling {
+                Some("scroll")
+            } else if dragging {
+                Some("drag")
+            } else if mission_control.0 {
+                Some("Mission Control")
+            } else if !same_windows {
+                Some("windows changed")
+            } else if row.iter().any(|window| window.tabbed) {
+                Some("tabbed windows")
+            } else if !maximize_morph && row.iter().any(StripWindow::turns_height) {
+                Some("height changes")
+            } else if row.iter().any(StripWindow::asks_refused_width) {
+                Some("a width the window refused before")
+            } else {
+                None
+            };
             // A change that moves a window up or down, such as a stack or a
             // vertical strip move, is no resize: the real windows take it,
             // except when a maximize or restore toggle explicitly morphs height.
@@ -516,17 +528,24 @@ pub(super) fn cover_resizes(
                         .copied()
                 })
                 .collect::<Vec<_>>();
-            let aborted = aborted
-                || prev_frames.len() != heading.len()
-                || (!maximize_morph
+            let ended = ended.or_else(|| {
+                if prev_frames.len() != heading.len() {
+                    Some("windows changed")
+                } else if !maximize_morph
                     && heading
                         .iter()
                         .zip(&prev_frames)
-                        .any(|((.., to), frame)| !same_rows(*to, frame.to)));
-            if aborted {
+                        .any(|((.., to), frame)| !same_rows(*to, frame.to))
+                {
+                    Some("a window moves up or down")
+                } else {
+                    None
+                }
+            });
+            if let Some(reason) = ended {
                 // The real windows are where the layout put them already, or
                 // ease on from there.
-                debug!("cover over resized strip {entity} ended early");
+                debug!("cover over resized strip {entity} ended early: {reason}");
                 for &(_, _, generation) in &morph.refresh_ask {
                     photos
                         .morph_asked

@@ -1144,16 +1144,27 @@ fn cover_strip_moves(
                     });
                 continue;
             }
-            let aborted = !cover_enabled(&config)
-                || !shown_here
-                || !same_place
-                || scrolling.is_some()
-                || dragging
-                || mission_control.0
-                || turns_height
-                || layout_print(&strip, &windows) != slide.layout;
-            if aborted {
-                debug!("cover over strip {entity} ended early");
+            let ended = if !cover_enabled(&config) {
+                Some("switched off")
+            } else if !shown_here {
+                Some("strip not shown")
+            } else if !same_place {
+                Some("display or viewport changed")
+            } else if scrolling.is_some() {
+                Some("scroll")
+            } else if dragging {
+                Some("drag")
+            } else if mission_control.0 {
+                Some("Mission Control")
+            } else if turns_height {
+                Some("vertical move")
+            } else if layout_print(&strip, &windows) != slide.layout {
+                Some("layout changed")
+            } else {
+                None
+            };
+            if let Some(reason) = ended {
+                debug!("cover over strip {entity} ended early: {reason}");
                 // A strip moved to another display keeps where that display
                 // put it.
                 if slide.landing.is_none() && shown_here {
