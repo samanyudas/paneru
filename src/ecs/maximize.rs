@@ -188,6 +188,7 @@ type Clicked<'w, 's> = Query<
         Option<&'static TopBarHeight>,
         Option<&'static Unmanaged>,
         Has<FloatingMaximized>,
+        Option<&'static MaximizeRefused>,
     ),
 >;
 
@@ -227,11 +228,16 @@ fn publish_top_bars(windows: TopBarWindows) {
 /// Toggles a window when its title bar is double-clicked. A double-click on
 /// a control in the title bar, such as a button or tab, is the control's
 /// own, and one on a floating window that the command did not maximize is
-/// macOS's.
+/// macOS's. So is one on a tiled window whose app refused the maximized
+/// width: the engine has nothing to do with it, so the app answers it as it
+/// would without the engine.
 fn double_click_toggle(
     mut messages: MessageReader<InputEvent>,
     mut windows: Clicked,
+    strips: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -252,7 +258,7 @@ fn double_click_toggle(
             continue;
         };
         let point = origin_from(*point);
-        let Some((entity, mut window, top_bar, unmanaged, maximized)) = windows
+        let Some((entity, mut window, top_bar, unmanaged, maximized, refused)) = windows
             .iter_mut()
             .find(|(_, window, ..)| window.id() == window_id)
         else {
@@ -288,6 +294,22 @@ fn double_click_toggle(
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<FrameHold>();
             }
+            double_click_tap::replay();
+            continue;
+        }
+        if unmanaged.is_none()
+            && let Some(refused) = refused
+            && strips
+                .iter()
+                .find(|(strip, _)| strip.contains(entity))
+                .and_then(|(_, child_of)| displays.get(child_of.parent()).ok())
+                .is_some_and(|(display, dock)| {
+                    display.actual_display_bounds(dock, &config).size() == refused.viewport
+                })
+        {
+            debug!(
+                "double-click on window {window_id} left to the app: it refuses the maximized width"
+            );
             double_click_tap::replay();
             continue;
         }
