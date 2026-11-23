@@ -56,6 +56,7 @@ use crate::ecs::{
 use crate::events::Event;
 use crate::manager::{Display, Window, WindowManager};
 use crate::platform::WinID;
+use crate::util::round_px;
 
 mod resize;
 
@@ -943,7 +944,7 @@ type CoveredStrips<'w, 's> = Query<
         Option<&'static mut CoverSlide>,
         &'static ChildOf,
         Has<ActiveWorkspaceMarker>,
-        Has<Scrolling>,
+        Option<&'static mut Scrolling>,
         Has<NativeFullscreenMarker>,
         Has<CoverMorph>,
     ),
@@ -951,7 +952,9 @@ type CoveredStrips<'w, 's> = Query<
 >;
 
 /// Starts a cover for each eligible strip move, steers a cover whose strip
-/// gets a new target, and lands the real windows once the pictures do.
+/// gets a new target, and lands the real windows once the pictures do. A
+/// trackpad swipe that starts while the pictures slide or land takes them
+/// over where they show, on the same cover.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn cover_strip_moves(
     mut strips: CoveredStrips,
@@ -985,7 +988,7 @@ fn cover_strip_moves(
         slide,
         child,
         active,
-        scrolling,
+        mut scrolling,
         fullscreen,
         morphing,
     ) in &mut strips
@@ -1041,10 +1044,55 @@ fn cover_strip_moves(
                 && display.bounds() == slide.bounds
                 && viewport == slide.viewport;
             let turns_height = target.is_some_and(|target| fresh && target.y != position.0.y);
+            let keeps = cover_enabled(&config)
+                && shown_here
+                && same_place
+                && !dragging
+                && !mission_control.0
+                && layout_print(&strip, &windows) == slide.layout;
+            if keeps
+                && !fresh
+                && let Some(scroll) = scrolling
+                    .as_mut()
+                    .filter(|scroll| scroll.input == ScrollInput::Gesture)
+            {
+                // A swipe that starts while the pictures slide or land takes
+                // them over where they show, on the same cover. Taking the
+                // cover down there showed the real windows at the slide's
+                // target, then jumped them to where the fingers had moved
+                // the strip.
+                end_guard(slide.guard.take(), &mut commands);
+                if slide.landing.is_none() {
+                    // The swipe began from the real windows' place, but the
+                    // pictures show the strip elsewhere: the fingers move it
+                    // on from there, and it rests where the slide headed.
+                    let travel = scroll.position - scroll.origin;
+                    scroll.origin = showing;
+                    scroll.position = showing + travel;
+                    scroll.anchor = f64::from(slide.target.x);
+                    position.0.x = round_px(scroll.position);
+                }
+                screen.0.place(slide.display, f64::from(position.0.x));
+                debug!(
+                    "cover over strip {entity} carries on under a swipe from {}",
+                    position.0.x
+                );
+                commands
+                    .entity(entity)
+                    .remove::<(CoverSlide, RepositionMarker)>()
+                    .insert(CoverSwipe {
+                        display: slide.display,
+                        shown: position.0.x,
+                        bounds: slide.bounds,
+                        viewport: slide.viewport,
+                        layout: slide.layout,
+                    });
+                continue;
+            }
             let aborted = !cover_enabled(&config)
                 || !shown_here
                 || !same_place
-                || scrolling
+                || scrolling.is_some()
                 || dragging
                 || mission_control.0
                 || turns_height
@@ -1130,7 +1178,7 @@ fn cover_strip_moves(
             Some("switched off")
         } else if !shown_here {
             Some("strip not shown")
-        } else if scrolling {
+        } else if scrolling.is_some() {
             Some("swipe")
         } else if fullscreen {
             Some("fullscreen")

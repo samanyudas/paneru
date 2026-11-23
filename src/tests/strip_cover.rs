@@ -209,8 +209,17 @@ fn config(on: bool, animation_speed: Option<f64>) -> Config {
 /// Four 700-point columns on the 1024-point test display, the first
 /// focused, with a recording cover screen.
 fn harness(config: Config) -> (TestHarness, ScreenLog) {
+    harness_with(config, false)
+}
+
+/// As [`harness`], with every write to a window going through the engine's
+/// per-app writers when `queued`, so a test can hold writes on their way.
+fn harness_with(config: Config, queued: bool) -> (TestHarness, ScreenLog) {
     let log = ScreenLog::default();
     let mut harness = TestHarness::new().with_config(config);
+    if queued {
+        harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    }
     for id in 0..4 {
         harness = harness.with_window(id, |window| {
             window.frame.max.x = window.frame.min.x + 700;
@@ -797,6 +806,145 @@ fn a_move_to_where_a_swiped_strip_rests_keeps_the_swipe() {
     send(&mut harness, Event::TouchpadUp);
     harness.advance(SETTLE);
     assert!(!covered(harness.world()), "the cover lifts once it lands");
+}
+
+/// The strip a keyboard slide moves, and its slide.
+fn sliding_strip(world: &mut World) -> (Entity, CoverSlide) {
+    world
+        .query::<(Entity, &CoverSlide)>()
+        .iter(world)
+        .next()
+        .map(|(entity, slide)| (entity, *slide))
+        .expect("a strip under the cover")
+}
+
+fn strip_x(world: &mut World, strip: Entity) -> i32 {
+    world
+        .get::<crate::ecs::Position>(strip)
+        .expect("a strip position")
+        .0
+        .x
+}
+
+/// Whether any window of the test app has a write on its way.
+fn a_write_is_pending(world: &mut World) -> bool {
+    world
+        .query::<&Window>()
+        .iter(world)
+        .any(|window| window.write_pending())
+}
+
+/// A swipe that starts while a keyboard slide's real windows land under the
+/// cover, one of them still taking its write, carries on on the same
+/// cover. The cover came down there, showed the windows at the slide's
+/// target, and moved them again to where the fingers took the strip.
+#[test]
+fn a_swipe_during_a_slides_landing_carries_on_under_the_cover() {
+    let (mut harness, log) = harness_with(config(true, Some(14.0)), true);
+    for _ in 0..20 {
+        harness.advance(ONE_FRAME);
+        harness.mock_state.flush_writes(SETTLE);
+    }
+    take_pictures(&mut harness, &log);
+    harness.mock_state.flush_writes(SETTLE);
+
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    let (strip, _) = sliding_strip(harness.world());
+    // Core Animation shows the pictures landed, and the app is slow to
+    // take the landing's writes.
+    log.borrow_mut().showing = Some(f64::from(-STEP));
+    harness.mock_state.hold_writes(TEST_PROCESS_ID);
+    harness.advance(ONE_FRAME);
+    let (_, slide) = sliding_strip(harness.world());
+    assert_eq!(slide.heading(), None, "the real windows land");
+    assert!(
+        a_write_is_pending(harness.world()),
+        "a window still takes its write"
+    );
+    log.borrow_mut().showing = None;
+
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.02));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().hidden, 0, "the cover stays up");
+    assert_eq!(log.borrow().shown.len(), 1, "it is the same cover");
+    let world = harness.world();
+    assert!(world.get::<CoverSlide>(strip).is_none(), "the slide ended");
+    assert!(
+        world
+            .get::<crate::ecs::strip_cover::CoverSwipe>(strip)
+            .is_some(),
+        "the swipe goes under the cover"
+    );
+    let x = strip_x(harness.world(), strip);
+    assert!(x < -STEP, "the fingers move the strip on, got {x}");
+    assert_eq!(
+        log.borrow().placed.last().copied(),
+        Some(f64::from(x)),
+        "the pictures show where the fingers put the strip"
+    );
+
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    send(&mut harness, Event::TouchpadUp);
+    for _ in 0..100 {
+        harness.advance(ONE_FRAME);
+        harness.mock_state.flush_writes(SETTLE);
+    }
+    assert!(!covered(harness.world()), "the cover lifts once it lands");
+    assert_eq!(log.borrow().hidden, 1, "and comes down once");
+    assert_eq!(log.borrow().shown.len(), 1);
+}
+
+/// A swipe that catches a keyboard slide mid-way takes the pictures over
+/// where they show: the strip neither jumps to the slide's target nor back
+/// to where the real windows wait, and the cover stays up.
+#[test]
+fn a_swipe_that_catches_a_slide_takes_it_over_where_it_shows() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    let (strip, slide) = sliding_strip(harness.world());
+    let showing = -100.0;
+    log.borrow_mut().showing = Some(showing);
+    harness.advance(ONE_FRAME);
+    assert_eq!(slide.heading().map(|target| target.x), Some(-STEP));
+    let rest = strip_x(harness.world(), strip);
+    assert_eq!(rest, 0, "the real strip waits");
+
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.01));
+    harness.advance(ONE_FRAME);
+    log.borrow_mut().showing = None;
+    assert_eq!(log.borrow().hidden, 0, "the cover stays up");
+    let world = harness.world();
+    assert!(world.get::<CoverSlide>(strip).is_none(), "the slide ended");
+    assert!(
+        world
+            .get::<crate::ecs::strip_cover::CoverSwipe>(strip)
+            .is_some(),
+        "the swipe goes under the cover"
+    );
+    let x = strip_x(harness.world(), strip);
+    assert!(
+        (f64::from(x) - showing).abs() < 40.0,
+        "the strip moves on from where the pictures showed, got {x}"
+    );
+    assert_eq!(log.borrow().placed.last().copied(), Some(f64::from(x)));
+
+    // The next frame's fingers move the pictures as any covered swipe's.
+    send(&mut harness, swipe(0.02));
+    harness.advance(ONE_FRAME);
+    let next = strip_x(harness.world(), strip);
+    assert!(next < x, "the fingers move the strip on, got {next}");
+    assert_eq!(log.borrow().placed.last().copied(), Some(f64::from(next)));
+
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(SETTLE);
+    assert!(!covered(harness.world()), "the cover lifts once it lands");
+    assert_eq!(log.borrow().hidden, 1, "and comes down once");
+    assert_eq!(log.borrow().shown.len(), 1, "one cover throughout");
 }
 
 /// A focus move into a column of stacked windows goes under the cover too.
