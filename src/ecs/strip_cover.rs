@@ -353,16 +353,16 @@ impl CoverPhotos {
     }
 
     /// Keeps `kept` as the picture of window `id`. A picture of another
-    /// size that it replaces stays as the window's previous one.
+    /// size that it replaces stays as the window's previous one, unless it
+    /// was taken before the window's title last changed: it shows another
+    /// tab or document.
     fn keep_window(&mut self, id: WinID, kept: Kept) {
-        if self
-            .retitled
-            .get(&id)
-            .is_some_and(|retitled| kept.taken >= *retitled)
-        {
+        let retitled = self.retitled.get(&id).copied();
+        if retitled.is_some_and(|retitled| kept.taken >= retitled) {
             self.retitled.remove(&id);
         }
         if let Some(old) = self.windows.insert(id, kept)
+            && retitled.is_none_or(|retitled| old.taken >= retitled)
             && self
                 .windows
                 .get(&id)

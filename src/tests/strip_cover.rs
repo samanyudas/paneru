@@ -3104,6 +3104,49 @@ fn a_restore_of_a_retitled_window_does_not_show_it_as_it_was() {
     );
 }
 
+/// A window whose title changed before it was maximized, as when a new tab
+/// opened, does not show its picture from before the change on the restore,
+/// even once a fresh picture of it maximized has arrived. That arrival made
+/// the old picture the one of the size the window had before, and the
+/// restore showed the old tab.
+#[test]
+fn a_restore_after_a_title_change_before_the_maximize_does_not_show_the_old_title() {
+    let (mut harness, log) = harness(padded_resize_config());
+    send(
+        &mut harness,
+        resize(crate::types::commands::ResizeDirection::Shrink),
+    );
+    frames_of(&mut harness, &[0, 1]);
+    send(&mut harness, focus(Direction::East));
+    for _ in 0..40 {
+        harness.advance(ONE_FRAME);
+    }
+    take_pictures(&mut harness, &log);
+    let rest = shown_window_frame(harness.world(), 1);
+
+    harness.run(vec![Event::WindowTitleChanged { window_id: 1 }]);
+    let since = log.borrow().window_asks.len();
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    let fresh = window_asks_since(&log, since)
+        .into_iter()
+        .find(|&(id, size, _)| id == 1 && size.x > rest.width())
+        .expect("a fresh picture of window 1 maximized");
+    answer(&mut harness, 1, fresh.2);
+    harness.advance(ONE_FRAME);
+    shown_frames_of(&mut harness, &[1]);
+    harness.advance(ONE_FRAME);
+
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "restore runs under a cover");
+    assert!(
+        !log.borrow().headed.contains(&(1, rest.size())),
+        "the picture from before the title changed is not shown: {:?}",
+        log.borrow().headed
+    );
+}
+
 /// Maximizing a stacked window unstacks it into a full-screen column (changing
 /// both window order and height) and restoring puts it back in the stack, both
 /// smoothly under the cover.
