@@ -35,6 +35,8 @@ struct Screen {
     asked: Vec<(CoverSubject, u32)>,
     /// The strip origin and picture count of each cover shown.
     shown: Vec<(IVec2, usize)>,
+    /// Each window's picture, by its digest, on each cover shown.
+    shown_digests: Vec<Vec<(WinID, u64)>>,
     /// The first and last strip x of each slide.
     slides: Vec<(f64, f64)>,
     /// Every strip x of each slide's path, one each [`PATH_STEP`].
@@ -102,10 +104,15 @@ impl CoverScreen for RecordingScreen {
     }
 
     fn show(&mut self, scene: &CoverScene) {
-        self.0
-            .borrow_mut()
-            .shown
-            .push((scene.strip, scene.pictures.len()));
+        let mut screen = self.0.borrow_mut();
+        screen.shown.push((scene.strip, scene.pictures.len()));
+        screen.shown_digests.push(
+            scene
+                .pictures
+                .iter()
+                .map(|(id, _, photo)| (*id, photo.digest.0))
+                .collect(),
+        );
     }
 
     fn slide(&mut self, _display: CGDirectDisplayID, path: &[f64], _step: f64) {
@@ -3270,6 +3277,55 @@ fn a_background_picture_in_the_frame_of_a_title_change_is_not_shown() {
     assert!(
         !headed.contains(&(1, rest.size())),
         "the picture from before the title changed is not shown: {headed:?}"
+    );
+}
+
+/// A background picture that arrives in the frame the window's title
+/// changes and a maximize starts never shows: the cover starts from the
+/// picture kept before it, not from the old title's. It was kept before the
+/// change was read, and the maximize's cover showed it.
+#[test]
+fn a_background_picture_in_the_frame_of_a_title_change_never_starts_a_cover() {
+    let (mut harness, log) = harness(padded_resize_config());
+    let rest = window_1_at_rest_with_pictures(&mut harness, &log);
+    let old = a_background_ask_of_window_1(&mut harness, &log, rest.size());
+    let covers = log.borrow().shown_digests.len();
+    let since = log.borrow().window_asks.len();
+
+    answer(&mut harness, 1, old);
+    send(&mut harness, Event::WindowTitleChanged { window_id: 1 });
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "the maximize runs under a cover");
+    let started = log.borrow().shown_digests[covers..]
+        .first()
+        .cloned()
+        .expect("a cover goes up");
+    let shown = started
+        .iter()
+        .find(|(id, _)| *id == 1)
+        .map(|(_, digest)| *digest)
+        .expect("a picture of window 1");
+    assert_ne!(
+        shown,
+        u64::from(old),
+        "the cover starts from the picture kept before the title changed"
+    );
+
+    let fresh = window_asks_since(&log, since)
+        .into_iter()
+        .find(|&(id, size, _)| id == 1 && size.x > rest.width())
+        .expect("a fresh picture of window 1 maximized");
+    answer(&mut harness, 1, fresh.2);
+    harness.advance(ONE_FRAME);
+    shown_frames_of(&mut harness, &[1]);
+    harness.advance(ONE_FRAME);
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "restore runs under a cover");
+    assert!(
+        !log.borrow().headed.contains(&(1, rest.size())),
+        "the restore shows no picture from before the title changed"
     );
 }
 

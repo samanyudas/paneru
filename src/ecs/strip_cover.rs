@@ -706,6 +706,9 @@ fn keep_cover_photos(
         messages.clear();
         return;
     }
+    // Replies wait until every event of this batch is read, so a title
+    // change that comes after a reply in the same batch still counts.
+    let mut replies = Vec::new();
     for event in messages.read() {
         if let Event::WindowTitleChanged { window_id } = event {
             photos.retitle(*window_id);
@@ -726,13 +729,7 @@ fn keep_cover_photos(
         };
         let answers = |asked: &Asked| asked.generation == *generation && asked.subject == *subject;
         if let Some(asked) = photos.asked.take_if(|asked| answers(asked)) {
-            apply_cover_reply(
-                &mut photos,
-                screen.as_deref_mut(),
-                asked,
-                result,
-                time.elapsed(),
-            );
+            replies.push((asked, result.clone()));
             continue;
         }
         let Some(index) = photos.morph_asked.iter().position(answers) else {
@@ -740,13 +737,7 @@ fn keep_cover_photos(
         };
         let asked = photos.morph_asked.swap_remove(index);
         if matches!(result, Err(PhotoError::Refused)) {
-            apply_cover_reply(
-                &mut photos,
-                screen.as_deref_mut(),
-                asked,
-                result,
-                time.elapsed(),
-            );
+            replies.push((asked, result.clone()));
             continue;
         }
         if let CoverSubject::Window(id) = *subject {
@@ -759,6 +750,19 @@ fn keep_cover_photos(
                 title_epoch: asked.title_epoch,
             });
         }
+    }
+    let now = time.elapsed();
+    for (asked, result) in replies {
+        // A picture of a window whose title changed since it was asked for
+        // shows the old title, and neither it nor its failure counts. A
+        // refusal still counts for every picture, and a window gone is gone.
+        if let CoverSubject::Window(id) = asked.subject
+            && asked.title_epoch < photos.title_epoch(id)
+            && !matches!(result, Err(PhotoError::Refused | PhotoError::WindowGone))
+        {
+            continue;
+        }
+        apply_cover_reply(&mut photos, screen.as_deref_mut(), asked, &result, now);
     }
 }
 
