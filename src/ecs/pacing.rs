@@ -162,7 +162,7 @@ impl ShownFrames {
         }
         if !self.sampled {
             let frames = (self.shared.read)(ids);
-            watch.take(frames);
+            watch.take(ids, frames);
         } else if !watch.sampling {
             let shared = self.shared.clone();
             if let Err(err) = thread::Builder::new()
@@ -206,8 +206,9 @@ impl ShownFrames {
             }
         }
         if !self.sampled {
-            let frames = (self.shared.read)(&watch.ids);
-            watch.take(frames);
+            let ids = watch.ids.clone();
+            let frames = (self.shared.read)(&ids);
+            watch.take(&ids, frames);
         } else if !watch.sampling {
             let shared = self.shared.clone();
             if let Err(err) = thread::Builder::new()
@@ -245,7 +246,16 @@ impl ShownFrames {
 }
 
 impl Watch {
-    fn take(&mut self, frames: Vec<(WinID, IRect)>) {
+    /// Keeps `frames`, a read of the windows of `ids`. A window of `ids` the
+    /// read left out is not shown, so no frame from an earlier read stands
+    /// in for it.
+    fn take(&mut self, ids: &[WinID], frames: Vec<(WinID, IRect)>) {
+        for id in ids {
+            if !frames.iter().any(|(read, _)| read == id) {
+                self.shown.remove(id);
+                self.unread.remove(id);
+            }
+        }
         for (id, frame) in frames {
             self.unread.remove(&id);
             self.shown.insert(id, frame);
@@ -274,7 +284,7 @@ impl Shared {
             let frames = (self.read)(&ids);
             let mut watch = lock(&self.watch);
             if watch.generation == generation {
-                watch.take(frames);
+                watch.take(&ids, frames);
             }
             drop(watch);
             thread::sleep(READ_INTERVAL);
@@ -1101,6 +1111,38 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    /// A window the window server stops listing is no longer shown where
+    /// an earlier read had it, so a cover never lifts over it on a stale
+    /// frame.
+    #[test]
+    fn a_window_a_read_leaves_out_has_no_frame() {
+        let listed = Arc::new(AtomicBool::new(true));
+        let lists = listed.clone();
+        let shown = IRect::new(0, 0, 100, 100);
+        let frames = ShownFrames::inline(move |ids| {
+            ids.iter()
+                .filter(|id| **id != 8 || lists.load(Ordering::Relaxed))
+                .map(|&id| (id, shown))
+                .collect()
+        });
+        let mut read = frames.watch_morph(&[7, 8]);
+        read.sort_by_key(|(id, _)| *id);
+        assert_eq!(read, vec![(7, shown), (8, shown)], "both are listed");
+
+        listed.store(false, Ordering::Relaxed);
+        assert_eq!(
+            frames.watch_morph(&[7, 8]),
+            vec![(7, shown)],
+            "window 8 is gone from the read"
+        );
+        let asked = IRect::new(0, 0, 50, 50);
+        let watched = frames.watch(&[(8, asked)]).expect("an inline read");
+        assert!(
+            !watched.frames.contains_key(&8) || watched.frames[&8] != shown,
+            "and from the rows' watch"
+        );
+    }
 
     /// The sampler reads on its own thread, so a watch never waits on the
     /// window server: until the first read lands, a window counts as shown

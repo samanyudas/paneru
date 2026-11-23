@@ -644,6 +644,7 @@ pub(super) fn cover_resizes(
                     guard,
                     &mut commands,
                 ));
+                head_pictures(&morph, &mut *screen.0, &photos, time.elapsed(), &[]);
                 screen
                     .0
                     .morph(morph.display, &morph.sent(), &morph.shares(), PATH_STEP);
@@ -856,6 +857,21 @@ fn launch(
     for id in open {
         screen.open(morph.display, *id);
     }
+    head_pictures(morph, screen, photos, now, open);
+    screen.morph(morph.display, &morph.sent(), &morph.shares(), PATH_STEP);
+}
+
+/// Gives the next morph of `morph`'s cover the picture each window of it
+/// had at the size its frame heads to, if one is kept, but for the windows
+/// of `open`. A turn sends a morph of its own, which shows only the
+/// pictures given for it, so it gives them again.
+fn head_pictures(
+    morph: &CoverMorph,
+    screen: &mut dyn CoverScreen,
+    photos: &CoverPhotos,
+    now: Duration,
+    open: &[WinID],
+) {
     for frame in &morph.frames {
         if frame.to.size() != frame.from.size()
             && !open.contains(&frame.id)
@@ -869,7 +885,6 @@ fn launch(
             );
         }
     }
-    screen.morph(morph.display, &morph.sent(), &morph.shares(), PATH_STEP);
 }
 
 /// Whether the window server shows the window of `frame` at the frame the

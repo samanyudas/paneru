@@ -450,6 +450,69 @@ fn mask_bands(whole: CGSize, hole: CGRect) -> [CGRect; 4] {
     ]
 }
 
+/// The mask's bands for a hole that moves from `from` to `to` along
+/// `shares`, one share at each even step of the move's time, as key times
+/// from 0 to 1 with the bands at each. Core Animation moves each band in a
+/// straight line between key times, and a band held to the cover bends
+/// where the hole crosses an edge of it, so a step that crosses one gets a
+/// key time there too.
+fn mask_steps(whole: CGSize, from: CGRect, to: CGRect, shares: &[f64]) -> Vec<(f64, [CGRect; 4])> {
+    let hole_at = |share: f64| {
+        let mix = |a: f64, b: f64| a + (b - a) * share;
+        CGRect::new(
+            CGPoint::new(
+                mix(from.origin.x, to.origin.x),
+                mix(from.origin.y, to.origin.y),
+            ),
+            CGSize::new(
+                mix(from.size.width, to.size.width),
+                mix(from.size.height, to.size.height),
+            ),
+        )
+    };
+    // Each edge of a hole, with the cover's bounds along it.
+    let edges = |hole: CGRect| {
+        [
+            (hole.origin.x, whole.width),
+            (hole.origin.x + hole.size.width, whole.width),
+            (hole.origin.y, whole.height),
+            (hole.origin.y + hole.size.height, whole.height),
+        ]
+    };
+    let Some(&first) = shares.first() else {
+        return Vec::new();
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let segments = shares.len().saturating_sub(1).max(1) as f64;
+    let mut steps = vec![(0.0, first)];
+    for (index, pair) in shares.windows(2).enumerate() {
+        let (start, end) = (pair[0], pair[1]);
+        let (before, after) = (edges(hole_at(start)), edges(hole_at(end)));
+        let mut crossings = before
+            .iter()
+            .zip(&after)
+            .flat_map(|(&(a, limit), &(b, _))| {
+                [0.0, limit]
+                    .into_iter()
+                    .filter(move |bound| (a - bound) * (b - bound) < 0.0)
+                    .map(move |bound| (bound - a) / (b - a))
+            })
+            .collect::<Vec<_>>();
+        crossings.sort_by(f64::total_cmp);
+        crossings.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        #[allow(clippy::cast_precision_loss)]
+        let at = |part: f64| (index as f64 + part) / segments;
+        for part in crossings {
+            steps.push((at(part), start + (end - start) * part));
+        }
+        steps.push((at(1.0), end));
+    }
+    steps
+        .into_iter()
+        .map(|(time, share)| (time, mask_bands(whole, hole_at(share))))
+        .collect()
+}
+
 /// One animated number of a morph: the frame layer, which of its numbers
 /// moves (an index into [`MORPH_TRACKS`]), and from where to where.
 struct Lead {
@@ -617,26 +680,11 @@ impl CoverScreenOS {
         duration: f64,
     ) {
         let whole = root.bounds().size;
-        // The bands at each step of the move, from the hole held to the
-        // cover at that step, so a hole that starts or ends past an edge
-        // of the cover keeps its bands meeting it all the way.
-        let hole_at = |share: f64| {
-            let mix = |a: f64, b: f64| a + (b - a) * share;
-            CGRect::new(
-                CGPoint::new(
-                    mix(from.origin.x, to.origin.x),
-                    mix(from.origin.y, to.origin.y),
-                ),
-                CGSize::new(
-                    mix(from.size.width, to.size.width),
-                    mix(from.size.height, to.size.height),
-                ),
-            )
-        };
-        let steps = shares
-            .iter()
-            .map(|share| mask_bands(whole, hole_at(*share)))
-            .collect::<Vec<_>>();
+        // The bands at each step of the move, and at each moment between
+        // steps where the hole crosses an edge of the cover, so the bands
+        // meet the hole all the way.
+        let steps = mask_steps(whole, from, to, shares);
+        let times = steps.iter().map(|(time, _)| *time).collect::<Vec<_>>();
         let mask = CALayer::new();
         mask.setAnchorPoint(CGPoint::new(0.0, 0.0));
         mask.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), whole));
@@ -657,7 +705,7 @@ impl CoverScreenOS {
             for (number, path) in MORPH_TRACKS.into_iter().enumerate() {
                 let values = steps
                     .iter()
-                    .map(|bands| track(&bands[index])[number])
+                    .map(|(_, bands)| track(&bands[index])[number])
                     .collect::<Vec<_>>();
                 let moves = values
                     .iter()
@@ -666,7 +714,7 @@ impl CoverScreenOS {
                     continue;
                 }
                 band.addAnimation_forKey(
-                    &keyframes(path, &values, duration),
+                    &keyframes_at(path, &values, &times, duration),
                     Some(&NSString::from_str(path)),
                 );
             }
@@ -1333,6 +1381,25 @@ fn keyframes(path: &str, values: &[f64], seconds: f64) -> Retained<CAKeyframeAni
     animation
 }
 
+/// An animation of the number at `path` through `values`, each at its key
+/// time of `times`, from 0 to 1, over `seconds`. It holds nothing at its
+/// end: the layer's own value takes over.
+fn keyframes_at(
+    path: &str,
+    values: &[f64],
+    times: &[f64],
+    seconds: f64,
+) -> Retained<CAKeyframeAnimation> {
+    let animation = keyframes(path, values, seconds);
+    let times = times
+        .iter()
+        .map(|time| NSNumber::new_f64(time.clamp(0.0, 1.0)))
+        .collect::<Vec<_>>();
+    let times = NSArray::from_retained_slice(&times);
+    animation.setKeyTimes(Some(&times));
+    animation
+}
+
 /// Where the picture of one ask goes. `ScreenCaptureKit` calls back on its
 /// own queue, so the picture travels to the main thread as an [`Event`].
 #[derive(Clone)]
@@ -1407,7 +1474,7 @@ mod tests {
 
     use super::{
         CoverScreenOS, Heading, cover_panels, fill_crossing_time, fill_start, global_rect,
-        live_panels, mask_bands,
+        live_panels, mask_bands, mask_steps,
     };
 
     /// A press on a picture lands on its window at the same point in the
@@ -1506,6 +1573,57 @@ mod tests {
         let [left, right, ..] = mask_bands(whole, gone);
         assert_eq!(left, rect(0.0, 0.0, 1000.0, 800.0));
         assert_eq!(right.size.width, 0.0);
+    }
+
+    /// A hole that crosses the cover's left edge between two steps gets a
+    /// key time where it crosses, so the left band, held at nothing until
+    /// then, does not open early on a straight line between the steps.
+    #[test]
+    fn mask_steps_add_a_key_time_where_the_hole_crosses_an_edge() {
+        let whole = CGSize::new(1000.0, 800.0);
+        let from = rect(-10.0, 0.0, 100.0, 800.0);
+        let to = rect(10.0, 0.0, 100.0, 800.0);
+        let steps = mask_steps(whole, from, to, &[0.0, 1.0]);
+        let times = steps.iter().map(|(time, _)| *time).collect::<Vec<_>>();
+        assert_eq!(times, vec![0.0, 0.5, 1.0], "a key time at the crossing");
+        let left = steps
+            .iter()
+            .map(|(_, bands)| bands[0].size.width)
+            .collect::<Vec<_>>();
+        assert_eq!(left, vec![0.0, 0.0, 10.0]);
+
+        // Between key times, a straight line through the bands gives the
+        // bands of the hole there.
+        for quarter in 1..4 {
+            let time = f64::from(quarter) / 4.0;
+            let (low, high) = steps
+                .windows(2)
+                .map(|pair| (pair[0], pair[1]))
+                .find(|((start, _), (end, _))| (*start..=*end).contains(&time))
+                .expect("a step around it");
+            let part = (time - low.0) / (high.0 - low.0);
+            let width = low.1[0].size.width + (high.1[0].size.width - low.1[0].size.width) * part;
+            let hole = rect(-10.0 + 20.0 * time, 0.0, 100.0, 800.0);
+            let exact = mask_bands(whole, hole)[0].size.width;
+            assert!(
+                (width - exact).abs() < 1e-9,
+                "at {time}: {width} vs {exact}"
+            );
+        }
+    }
+
+    /// Steps that cross no edge keep their even key times.
+    #[test]
+    fn mask_steps_keep_even_key_times_inside_the_cover() {
+        let whole = CGSize::new(1000.0, 800.0);
+        let steps = mask_steps(
+            whole,
+            rect(100.0, 0.0, 300.0, 800.0),
+            rect(200.0, 0.0, 300.0, 800.0),
+            &[0.0, 0.4, 1.0],
+        );
+        let times = steps.iter().map(|(time, _)| *time).collect::<Vec<_>>();
+        assert_eq!(times, vec![0.0, 0.5, 1.0]);
     }
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> CGRect {

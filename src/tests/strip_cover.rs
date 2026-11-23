@@ -2553,6 +2553,36 @@ fn a_restore_shows_the_window_as_it_was_before_the_maximize() {
     );
 }
 
+/// A turn of a restore mid-way, as a focus key makes, shows the window's
+/// picture from before the maximize on as it heads to the same size. The
+/// turn's morph dropped it, and the window showed its maximized layout's
+/// corner for the rest of the restore.
+#[test]
+fn a_turned_restore_still_shows_the_window_as_it_was() {
+    let (mut harness, log) = harness(padded_resize_config());
+    let rest = maximized_with_its_picture(&mut harness, &log);
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().headed, vec![(1, rest.size())]);
+    let morphs = log.borrow().morphs.len();
+
+    send(&mut harness, focus(Direction::West));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().morphs.len(), morphs + 1, "the restore turns");
+    let (_, to) = morph_of(&log, morphs, 1);
+    assert_eq!(to.size(), rest.size(), "window 1 heads to the same size");
+    assert_eq!(
+        log.borrow().headed,
+        vec![(1, rest.size()), (1, rest.size())],
+        "the turn shows its picture from before the maximize again"
+    );
+    assert_eq!(
+        log.borrow().headed_before.last().copied(),
+        Some(morphs),
+        "from the start of the turn's morph"
+    );
+}
+
 /// A restore a minute or more after its window's picture from before the
 /// maximize was taken does not show it: laid over the maximized window's
 /// picture, it shows content that may have changed since, as a page that
