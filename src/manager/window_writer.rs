@@ -40,6 +40,10 @@ use crate::platform::Pid;
 /// to land. Reading before then would see the frame the window is leaving.
 pub(crate) const LANDING_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// A write the app takes longer than this to answer is logged, as the
+/// motion or cover waiting on it shows it late.
+const SLOW_WRITE: Duration = Duration::from_millis(100);
+
 /// The calls one app's writer makes, kept apart from the queueing so tests
 /// can stand in a fake app.
 pub(crate) trait WriteSink: Send + 'static {
@@ -495,7 +499,13 @@ impl<S: WriteSink> Shared<S> {
                         writes.sort_by_key(|(_, write)| write.back_first());
                         for (key, write) in writes {
                             let limited = *lock(&write.size_limited);
-                            if !Self::write(&mut sink, &write) {
+                            let asked = Instant::now();
+                            let unanswered = Self::write(&mut sink, &write);
+                            let took = asked.elapsed();
+                            if took >= SLOW_WRITE {
+                                debug!(pid, to = ?write.to, ms = took.as_millis(), "slow write");
+                            }
+                            if !unanswered {
                                 continue;
                             }
                             // An app may never apply a write it left

@@ -224,6 +224,7 @@ fn double_click_toggle(
         };
         let Some(window_id) = window_id.or_else(|| window_manager.find_window_at_point(point).ok())
         else {
+            debug!("double-click at {point:?} left to the app: no window under it");
             double_click_tap::replay();
             continue;
         };
@@ -232,6 +233,7 @@ fn double_click_toggle(
             .iter_mut()
             .find(|(_, window, ..)| window.id() == window_id)
         else {
+            debug!("double-click on window {window_id} left to the app: not a managed window");
             double_click_tap::replay();
             continue;
         };
@@ -241,12 +243,14 @@ fn double_click_toggle(
             _ = window.update_frame();
         }
         if !in_top_bar(&window, top_bar, point) {
+            debug!("double-click on window {window_id} left to the app: below its top bar");
             double_click_tap::replay();
             continue;
         }
         match window.control_at(point) {
             Ok(false) => {}
             Ok(true) => {
+                debug!("double-click on window {window_id} left to the app: on a control");
                 double_click_tap::replay();
                 continue;
             }
