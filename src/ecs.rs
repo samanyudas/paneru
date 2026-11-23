@@ -561,6 +561,11 @@ pub struct Scrolling {
     /// `scroll::constrain` turns it into the finger travel that shows the
     /// strip there, before the fingers' first movement.
     pub caught: Option<f64>,
+    /// How far the shown strip moved for each point of `position`'s
+    /// travel, at the last `scroll::constrain`: 1 while the strip follows
+    /// freely, less while it resists past an end or a column, and 0 while
+    /// it is held.
+    pub slope: f64,
 }
 
 /// The progress of a settle along its ease. See `scroll::settle_strip`.
@@ -1711,6 +1716,7 @@ mod tests {
                     fingers_down: false,
                     lifted_at: None,
                     caught: None,
+                    slope: 1.0,
                 });
             }),
             "overlay must rerun to hide when Scrolling starts"

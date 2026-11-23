@@ -25,6 +25,8 @@ use crate::platform::WinID;
 
 const SETTLE: Duration = Duration::from_secs(2);
 const ONE_FRAME: Duration = Duration::from_millis(20);
+/// The step between the points of a slide's path, as the engine sends it.
+const PATH_STEP: f64 = 1.0 / 120.0;
 
 /// What the engine asked of the cover screen.
 #[derive(Default)]
@@ -35,6 +37,8 @@ struct Screen {
     shown: Vec<(IVec2, usize)>,
     /// The first and last strip x of each slide.
     slides: Vec<(f64, f64)>,
+    /// Every strip x of each slide's path, one each [`PATH_STEP`].
+    paths: Vec<Vec<f64>>,
     /// Each strip x the engine told the tap about.
     tracked: Vec<f64>,
     /// Each strip x a swipe put the cover's strip at.
@@ -106,7 +110,9 @@ impl CoverScreen for RecordingScreen {
 
     fn slide(&mut self, _display: CGDirectDisplayID, path: &[f64], _step: f64) {
         let (first, last) = (path[0], *path.last().unwrap());
-        self.0.borrow_mut().slides.push((first, last));
+        let mut screen = self.0.borrow_mut();
+        screen.slides.push((first, last));
+        screen.paths.push(path.to_vec());
     }
 
     fn morph(
@@ -951,6 +957,367 @@ fn a_swipe_that_catches_a_slide_takes_it_over_where_it_shows() {
     assert!(!covered(harness.world()), "the cover lifts once it lands");
     assert_eq!(log.borrow().hidden, 1, "and comes down once");
     assert_eq!(log.borrow().shown.len(), 1, "one cover throughout");
+}
+
+/// How fast a slide's pictures start out, in points per second.
+fn starting_speed(path: &[f64]) -> f64 {
+    (path[1] - path[0]) / PATH_STEP
+}
+
+/// A copy of the strip's scroll state, which a test reads before the cover
+/// takes it.
+fn scrolling_of(world: &mut World, strip: Entity) -> crate::ecs::Scrolling {
+    let scroll = world
+        .get::<crate::ecs::Scrolling>(strip)
+        .expect("the strip scrolls");
+    crate::ecs::Scrolling {
+        velocity: scroll.velocity,
+        position: scroll.position,
+        is_user_swiping: scroll.is_user_swiping,
+        last_event: scroll.last_event,
+        moved_at: scroll.moved_at,
+        input: scroll.input,
+        anchor: scroll.anchor,
+        settle: scroll.settle,
+        ease: scroll.ease,
+        detent: scroll.detent,
+        origin: scroll.origin,
+        landing_focus: scroll.landing_focus,
+        focus_at_start: scroll.focus_at_start,
+        start: scroll.start,
+        fingers_down: scroll.fingers_down,
+        lifted_at: scroll.lifted_at,
+        caught: scroll.caught,
+        slope: scroll.slope,
+    }
+}
+
+/// A Snap that sets a slide's target again in the frame a swipe starts, as
+/// Snap does with the strip it moves, leaves the swipe to take the pictures
+/// over. The repeated target ended the cover, and the strip jumped to the
+/// slide's target.
+#[test]
+fn a_swipe_that_starts_as_the_slides_target_is_set_again_takes_it_over() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    let (strip, slide) = sliding_strip(harness.world());
+    let target = slide.heading().expect("the pictures slide");
+
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(target));
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.01));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().hidden, 0, "the cover stays up");
+    let world = harness.world();
+    assert!(world.get::<CoverSlide>(strip).is_none(), "the slide ended");
+    assert!(
+        world
+            .get::<crate::ecs::strip_cover::CoverSwipe>(strip)
+            .is_some(),
+        "the swipe takes the pictures over"
+    );
+    assert!(
+        world.get::<crate::ecs::RepositionMarker>(strip).is_none(),
+        "the repeated target is spent"
+    );
+}
+
+/// A new target in the frame a swipe starts over a slide turns the slide
+/// there on the same cover: the move wins, as one during a covered swipe
+/// does. It ended the cover, and the strip jumped to the old target.
+#[test]
+fn a_new_target_as_a_swipe_starts_turns_the_slide_on_its_cover() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    let (strip, slide) = sliding_strip(harness.world());
+    let target = slide.heading().expect("the pictures slide");
+    let slides = log.borrow().slides.len();
+
+    let next = target.with_x(target.x - 300);
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(next));
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.01));
+    harness.advance(ONE_FRAME);
+    assert_eq!(log.borrow().hidden, 0, "the cover stays up");
+    assert_eq!(log.borrow().slides.len(), slides + 1, "the slide turns");
+    let (_, turned) = sliding_strip(harness.world());
+    assert_eq!(turned.heading(), Some(next), "to the new target");
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::Scrolling>(strip)
+            .is_none(),
+        "the swipe gives way to the move"
+    );
+}
+
+/// The cover's config with window-landing swipes, which step one column.
+fn landing_config() -> Config {
+    Config::try_from(
+        "[options]\nanimation_speed = 14\nslide_window_pictures = true\n[swipe.gesture]\nfingers_count = 3\nwindow_landing = true\nhaptics = false\n[bindings]\n",
+    )
+    .expect("config should parse")
+}
+
+/// A swipe that catches a slide near the strip's end resists past the end
+/// from its first frame, and steps from the column the slide headed to. The
+/// scroll systems ran before the swipe moved to where the pictures showed,
+/// so the strip jumped past the end for a frame, and the landing column was
+/// the one the real windows waited at.
+#[test]
+fn a_swipe_that_catches_a_slide_resists_and_steps_from_its_first_frame() {
+    let (mut harness, log) = harness(landing_config());
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::Last));
+    harness.advance(ONE_FRAME);
+    let (strip, slide) = sliding_strip(harness.world());
+    let end = slide.heading().expect("the pictures slide").x;
+    let showing = f64::from(end) + 16.0;
+    log.borrow_mut().showing = Some(showing);
+
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.5));
+    harness.advance(ONE_FRAME);
+    log.borrow_mut().showing = None;
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::strip_cover::CoverSwipe>(strip)
+            .is_some(),
+        "the swipe takes the pictures over"
+    );
+    // Half a swipe across the 1024-point display, at the default
+    // sensitivity, toward the strip's end.
+    let unresisted = showing - 0.5 * f64::from(TEST_DISPLAY_WIDTH) * 0.35;
+    let x = strip_x(harness.world(), strip);
+    assert!(
+        f64::from(x) > unresisted + 20.0,
+        "the strip resists past its end at once: {x}, unresisted {unresisted}"
+    );
+    assert_eq!(
+        log.borrow().placed.last().copied(),
+        Some(f64::from(x)),
+        "the pictures show it there"
+    );
+    let last = entity_of(harness.world(), 3);
+    assert_eq!(
+        scrolling_of(harness.world(), strip).detent,
+        Some(last),
+        "the swipe steps from the last column, where the slide headed"
+    );
+}
+
+/// Lifts the fingers of a covered window-landing swipe, whose settle
+/// focuses its column only once it lands, and runs frames until the settle
+/// moves the strip. Returns the strip and how fast it settles.
+fn settling_covered_swipe(harness: &mut TestHarness, log: &ScreenLog) -> (Entity, f64) {
+    take_pictures(harness, log);
+    send(harness, Event::TouchpadDown);
+    for _ in 0..4 {
+        send(harness, swipe(0.05));
+        harness.advance(ONE_FRAME);
+    }
+    let strip = swiped_strip(harness.world());
+    send(harness, Event::TouchpadUp);
+    for _ in 0..20 {
+        harness.advance(ONE_FRAME);
+        let scroll = scrolling_of(harness.world(), strip);
+        let speed = crate::ecs::scroll::strip_speed(
+            &scroll,
+            f64::from(TEST_DISPLAY_WIDTH),
+            &landing_config(),
+        );
+        if scroll.ease.is_some() && speed.abs() > 300.0 {
+            return (strip, speed);
+        }
+    }
+    panic!("the swipe settles");
+}
+
+/// A move that arrives while a covered swipe settles, as Center does, slides
+/// the pictures on at the speed the settle had. The settle's state was gone
+/// before the cover saw the move, so the pictures started from rest.
+#[test]
+fn a_move_during_a_covered_settle_carries_its_speed_on() {
+    let (mut harness, log) = harness(landing_config());
+    let (strip, speed) = settling_covered_swipe(&mut harness, &log);
+    let position = harness
+        .world()
+        .get::<crate::ecs::Position>(strip)
+        .expect("a strip position")
+        .0;
+    // A short move, which a slide from rest would start far slower than
+    // the settle moves.
+    #[allow(clippy::cast_possible_truncation)]
+    let away = position.with_x(position.x + 40 * speed.signum() as i32);
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(away));
+    harness.advance(ONE_FRAME);
+
+    let (_, slide) = sliding_strip(harness.world());
+    assert_eq!(slide.heading(), Some(away), "the pictures slide on");
+    let path = log.borrow().paths.last().cloned().expect("a slide");
+    let carried = starting_speed(&path);
+    assert!(
+        carried * speed > 0.0 && carried.abs() > 0.5 * speed.abs(),
+        "the slide starts at the settle's speed: {carried} vs {speed}"
+    );
+}
+
+/// A move to where a settling covered swipe already is leaves the settle
+/// going under its cover. The settle's state was gone before the cover saw
+/// the move, so the swipe landed early, where the strip was.
+#[test]
+fn a_move_to_where_a_covered_settle_is_leaves_it_settling() {
+    let (mut harness, log) = harness(landing_config());
+    let (strip, _) = settling_covered_swipe(&mut harness, &log);
+    let position = harness
+        .world()
+        .get::<crate::ecs::Position>(strip)
+        .expect("a strip position")
+        .0;
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(position));
+    harness.advance(ONE_FRAME);
+
+    let world = harness.world();
+    assert!(
+        world.get::<crate::ecs::Scrolling>(strip).is_some(),
+        "the settle goes on"
+    );
+    assert!(
+        world
+            .get::<crate::ecs::strip_cover::CoverSwipe>(strip)
+            .is_some(),
+        "under the swipe's cover"
+    );
+    assert!(
+        world.get::<CoverSlide>(strip).is_none(),
+        "it has not landed"
+    );
+    harness.advance(ONE_FRAME * 3);
+    assert_ne!(
+        strip_x(harness.world(), strip),
+        position.x,
+        "the settle moves the strip on"
+    );
+    harness.advance(SETTLE);
+    assert!(!covered(harness.world()), "the cover lifts once it lands");
+}
+
+/// A move during a covered swipe that stretches the strip past its start
+/// carries on at the speed the strip shows, which the stretch slows, not at
+/// the fingers' speed.
+#[test]
+fn a_move_during_a_stretched_swipe_carries_the_speed_the_strip_shows() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, Event::TouchpadDown);
+    for _ in 0..4 {
+        send(&mut harness, swipe(-0.05));
+        harness.advance(ONE_FRAME);
+    }
+    let strip = swiped_strip(harness.world());
+    let position = harness
+        .world()
+        .get::<crate::ecs::Position>(strip)
+        .expect("a strip position")
+        .0;
+    assert!(position.x > 0, "the strip stretches past its start");
+    let scroll = scrolling_of(harness.world(), strip);
+    // The fingers move the strip right, toward its start.
+    let fingers = -scroll.velocity * f64::from(TEST_DISPLAY_WIDTH);
+    assert!(fingers > 200.0, "the fingers move: {fingers}");
+    assert!(scroll.slope < 0.6, "the strip resists: {}", scroll.slope);
+
+    // A short move, which a slide from rest would start far slower than
+    // the fingers move.
+    let away = position.with_x(position.x + 40);
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(away));
+    harness.advance(ONE_FRAME);
+    let (_, slide) = sliding_strip(harness.world());
+    assert_eq!(slide.heading(), Some(away), "the pictures slide on");
+    let path = log.borrow().paths.last().cloned().expect("a slide");
+    let carried = starting_speed(&path);
+    assert!(
+        carried > 0.25 * fingers && carried < 0.75 * fingers,
+        "the slide starts at the stretched strip's speed: {carried}, fingers {fingers}"
+    );
+}
+
+/// A swipe that takes over a slide's landing keeps every window the slide's
+/// cover hid, and its own landing waits for each of them, as for a window
+/// the window server still shows where it was.
+#[test]
+fn a_chained_swipe_keeps_the_windows_its_cover_hid() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    harness.mock_state.show_late(0);
+    send(&mut harness, focus(Direction::Last));
+    harness.advance(ONE_FRAME);
+    let (strip, slide) = sliding_strip(harness.world());
+    let target = slide.heading().expect("the pictures slide");
+    log.borrow_mut().showing = Some(f64::from(target.x));
+    harness.advance(ONE_FRAME);
+    log.borrow_mut().showing = None;
+    let (_, slide) = sliding_strip(harness.world());
+    assert_eq!(slide.heading(), None, "the real windows land");
+    let hid = slide.hid().to_vec();
+    let window = entity_of(harness.world(), 0);
+    assert!(hid.contains(&window), "the slide's cover hid window 0");
+
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.01));
+    harness.advance(ONE_FRAME);
+    let swiped = harness
+        .world()
+        .get::<crate::ecs::strip_cover::CoverSwipe>(strip)
+        .cloned()
+        .expect("the swipe takes the pictures over");
+    assert!(
+        hid.iter().all(|entity| swiped.hid().contains(entity)),
+        "the swipe keeps them: {hid:?} in {:?}",
+        swiped.hid()
+    );
+
+    send(&mut harness, Event::TouchpadUp);
+    for _ in 0..30 {
+        harness.advance(ONE_FRAME);
+        if harness.world().get::<CoverSlide>(strip).is_some() {
+            break;
+        }
+    }
+    let landing = harness
+        .world()
+        .get::<CoverSlide>(strip)
+        .cloned()
+        .expect("the swipe lands under the cover");
+    assert!(
+        hid.iter().all(|entity| landing.hid().contains(entity)),
+        "and so does its landing"
+    );
+    harness.advance(ONE_FRAME * 5);
+    assert!(covered(harness.world()), "it waits for window 0 to show");
+    harness.mock_state.show_now(0);
+    harness.advance(ONE_FRAME * 3);
+    assert!(!covered(harness.world()), "then lifts");
 }
 
 /// Runs a keyboard move under the cover to `direction` while the window

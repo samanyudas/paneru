@@ -27,11 +27,11 @@ use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut as _};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Has, Or, With, Without};
+use bevy::ecs::query::{Added, Has, Or, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::on_message;
-use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
+use bevy::ecs::system::{Commands, NonSend, NonSendMut, Query, Res, ResMut};
 use bevy::ecs::world::Ref;
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
@@ -458,6 +458,11 @@ pub(crate) struct CoverSlide {
     /// lands, at any start, turn, or landing of the slide: the window server
     /// may still show it there.
     hid: Vec<Entity>,
+    /// Where the pictures showed when a swipe caught them mid-way: the
+    /// swipe's scroll state was moved there before the scroll systems held
+    /// it to the strip's ends and columns, so the cover hands over to it
+    /// as it is.
+    caught: Option<f64>,
     /// How long the slide has run by the engine's count, for when Core
     /// Animation cannot tell where it shows: the landing waits at most
     /// [`SHOWN_GRACE`] past the slide's length for the screen.
@@ -476,6 +481,12 @@ impl CoverSlide {
     /// Whether the real windows land under the cover.
     fn lands(&self) -> bool {
         self.landing.is_some()
+    }
+
+    /// The windows the slide hid, as a test sees them.
+    #[cfg(test)]
+    pub(crate) fn hid(&self) -> &[Entity] {
+        &self.hid
     }
 
     /// Where the strip shows `at` seconds into the slide.
@@ -539,7 +550,7 @@ impl CoverSlide {
 /// A swipe under the cover: the pictures follow the strip, and its real
 /// windows wait where they are until the swipe lands. The landing is a
 /// [`CoverSlide`] that has landed.
-#[derive(bevy::ecs::component::Component, Clone, Copy, Debug)]
+#[derive(bevy::ecs::component::Component, Clone, Debug)]
 pub(crate) struct CoverSwipe {
     display: CGDirectDisplayID,
     /// The strip x the cover shows.
@@ -549,8 +560,20 @@ pub(crate) struct CoverSwipe {
     viewport: IRect,
     /// The part of the display the cover hides, as [`CoverSlide::area`].
     area: IRect,
+    /// Every window the cover hid since the slide or swipe that put it up,
+    /// as [`CoverSlide::hid`]: the window server may still show one where
+    /// the engine no longer has it, as a window tucked at an edge.
+    hid: Vec<Entity>,
     /// The strip's layout when the swipe began, as [`layout_print`] gives it.
     layout: u64,
+}
+
+impl CoverSwipe {
+    /// The windows the swipe's cover hid, as a test sees them.
+    #[cfg(test)]
+    pub(crate) fn hid(&self) -> &[Entity] {
+        &self.hid
+    }
 }
 
 /// Displays on which a cover started during this frame's `UpdateSet::Layout`
@@ -570,6 +593,13 @@ pub(crate) fn register(app: &mut App) {
             keep_cover_photos
                 .in_set(UpdateSet::Events)
                 .run_if(on_message::<Event>),
+        )
+        .add_systems(
+            Update,
+            catch_slides
+                .in_set(UpdateSet::Input)
+                .after(scroll::swipe_gesture)
+                .before(scroll::apply_inertia),
         )
         .add_systems(
             Update,
@@ -1097,7 +1127,16 @@ fn cover_strip_moves(
             let same_place = display.id() == slide.display
                 && display.bounds() == slide.bounds
                 && viewport == slide.viewport;
+            let mut fresh = fresh;
+            if fresh && target == Some(slide.target) {
+                // The same target set again, as a Snap can, leaves the slide
+                // as it is, and a swipe that starts with it takes it over.
+                commands.entity(entity).remove::<RepositionMarker>();
+                fresh = false;
+            }
             let turns_height = target.is_some_and(|target| fresh && target.y != position.0.y);
+            // A new target for the strip, which the slide turns to.
+            let turn = target.filter(|_| fresh && !turns_height);
             let keeps = cover_enabled(&config)
                 && shown_here
                 && same_place
@@ -1105,7 +1144,7 @@ fn cover_strip_moves(
                 && !mission_control.0
                 && layout_print(&strip, &windows) == slide.layout;
             if keeps
-                && !fresh
+                && turn.is_none()
                 && let Some(scroll) = scrolling
                     .as_mut()
                     .filter(|scroll| scroll.input == ScrollInput::Gesture)
@@ -1116,14 +1155,13 @@ fn cover_strip_moves(
                 // target, then jumped them to where the fingers had moved
                 // the strip.
                 end_guard(slide.guard.take(), &mut commands);
-                if slide.landing.is_none() {
+                if slide.landing.is_none() && slide.caught.is_none() {
                     // The swipe began from the real windows' place, but the
                     // pictures show the strip elsewhere: the fingers move it
                     // on from there, and it rests where the slide headed.
-                    let travel = scroll.position - scroll.origin;
-                    scroll.origin = showing;
-                    scroll.position = showing + travel;
-                    scroll.anchor = f64::from(slide.target.x);
+                    // [`catch_slides`] does this before the scroll systems
+                    // run, unless the swipe started without it.
+                    rebase(scroll, showing, slide.target.x);
                     position.0.x = round_px(scroll.position);
                 }
                 screen.0.place(slide.display, f64::from(position.0.x));
@@ -1140,6 +1178,7 @@ fn cover_strip_moves(
                         bounds: slide.bounds,
                         viewport: slide.viewport,
                         area: slide.area,
+                        hid: std::mem::take(&mut slide.hid),
                         layout: slide.layout,
                     });
                 continue;
@@ -1150,7 +1189,7 @@ fn cover_strip_moves(
                 Some("strip not shown")
             } else if !same_place {
                 Some("display or viewport changed")
-            } else if scrolling.is_some() {
+            } else if scrolling.is_some() && turn.is_none() {
                 Some("scroll")
             } else if dragging {
                 Some("drag")
@@ -1188,16 +1227,13 @@ fn cover_strip_moves(
                 commands.entity(entity).remove::<CoverSlide>();
                 continue;
             }
-            if target.is_some_and(|target| fresh && target == slide.target) {
-                // The same target set again leaves the slide as it is.
-                commands.entity(entity).remove::<RepositionMarker>();
-                continue;
-            }
-            if let Some(target) = target.filter(|_| fresh) {
+            if let Some(target) = turn {
                 // A new target while the pictures slide: the slide turns
                 // there from where it shows, at the speed it has. After
                 // they land, the strip already rests at the old target.
-                // A slide shown landed has no speed left to carry on.
+                // A slide shown landed has no speed left to carry on. A
+                // swipe that starts with it gives way to it, as a strip
+                // move during a covered swipe does.
                 let speed = if slide.landing.is_none() && slide.elapsed < slide.length() {
                     slide.speed_at(slide.elapsed)
                 } else {
@@ -1219,7 +1255,11 @@ fn cover_strip_moves(
                 slide.hid = hid;
                 screen.0.slide(slide.display, &slide.path(), PATH_STEP);
                 debug!("cover over strip {entity} turned to {}", target.x);
-                commands.entity(entity).remove::<RepositionMarker>();
+                let mut entity_commands = commands.entity(entity);
+                entity_commands.remove::<RepositionMarker>();
+                if scrolling.is_some() {
+                    entity_commands.remove::<Scrolling>();
+                }
                 continue;
             }
             if slide.landing.is_none() && slide.elapsed >= slide.length() {
@@ -1309,6 +1349,44 @@ fn cover_strip_moves(
     }
 }
 
+/// Moves the scroll state of a swipe that catches a slide's pictures
+/// mid-way to where they show: the swipe began from the real windows'
+/// place, but the fingers move the strip on from `showing`, and it rests at
+/// strip x `target`, where the slide headed.
+fn rebase(scroll: &mut Scrolling, showing: f64, target: i32) {
+    let travel = scroll.position - scroll.origin;
+    scroll.origin = showing;
+    scroll.position = showing + travel;
+    scroll.anchor = f64::from(target);
+}
+
+/// Moves each trackpad swipe that starts while a slide's pictures move to
+/// where they show, before the scroll systems hold the strip to its ends
+/// and columns and pick its landing column from where it rests.
+/// [`cover_strip_moves`] then hands the cover over to the swipe as it is.
+fn catch_slides(
+    mut strips: Query<(&mut CoverSlide, &mut Scrolling), Added<Scrolling>>,
+    screen: Option<NonSend<CoverScreenHandle>>,
+) {
+    let Some(screen) = screen else {
+        return;
+    };
+    for (mut slide, mut scroll) in &mut strips {
+        if scroll.input != ScrollInput::Gesture || slide.landing.is_some() {
+            continue;
+        }
+        // Where the pictures show, as in `cover_strip_moves`, which counts
+        // this frame's step later.
+        let showing = screen
+            .0
+            .showing(slide.display)
+            .filter(|_| slide.counted < slide.length() + SHOWN_GRACE)
+            .unwrap_or_else(|| slide.x_at(slide.counted));
+        rebase(&mut scroll, showing, slide.target.x);
+        slide.caught = Some(showing);
+    }
+}
+
 /// A slide from strip x `from`, moving at `speed` points per second, to
 /// `target`, under a cover that hides `area`.
 fn start_slide(
@@ -1334,6 +1412,7 @@ fn start_slide(
         viewport,
         area,
         hid: Vec::new(),
+        caught: None,
         counted: 0.0,
         layout: 0,
     }
@@ -1559,6 +1638,7 @@ fn cover_swipes(
                     &config,
                 );
                 slide.layout = swipe.layout;
+                slide.hid = std::mem::take(&mut swipe.hid);
                 note_hidden(&mut slide.hid, &strip, &windows, swipe.area, marker.0);
                 screen.0.slide(swipe.display, &slide.path(), PATH_STEP);
                 screen.0.track(swipe.display, from);
@@ -1586,7 +1666,7 @@ fn cover_swipes(
                     }
                 } else {
                     screen.0.place(swipe.display, f64::from(position.0.x));
-                    let mut hid = Vec::new();
+                    let mut hid = std::mem::take(&mut swipe.hid);
                     note_hidden(&mut hid, &strip, &windows, swipe.area, position.0);
                     entity_commands.insert(CoverSlide {
                         display: swipe.display,
@@ -1601,6 +1681,7 @@ fn cover_swipes(
                         viewport: display.actual_display_bounds(dock, &config),
                         area: swipe.area,
                         hid,
+                        caught: None,
                         counted: 0.0,
                         layout: swipe.layout,
                     });
@@ -1647,12 +1728,15 @@ fn cover_swipes(
         started.0.push(display.id());
         screen.0.track(display.id(), f64::from(position.0.x));
         debug!("cover over swiped strip {entity}: {pictures} pictures");
+        let mut hid = Vec::new();
+        note_hidden(&mut hid, &strip, &windows, area, position.0);
         commands.entity(entity).insert(CoverSwipe {
             display: display.id(),
             shown: position.0.x,
             bounds: display.bounds(),
             viewport: display.actual_display_bounds(dock, &config),
             area,
+            hid,
             layout: layout_print(&strip, &windows),
         });
     }
