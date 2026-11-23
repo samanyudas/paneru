@@ -644,7 +644,10 @@ fn hold_frames(
                 }
                 continue;
             }
-            debug!("holding window {} at {target:?}", window.id());
+            debug!(
+                "holding window {} at {target:?}, from {frame:?}",
+                window.id()
+            );
             approach(&mut window, frame, target);
         }
     }

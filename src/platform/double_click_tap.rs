@@ -21,7 +21,6 @@
 //!   straight through to the app.
 
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use bevy::math::{IRect, IVec2};
 use objc2_core_foundation::CGPoint;
@@ -29,16 +28,14 @@ use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton,
 };
 
+use tracing::debug;
+
 use crate::platform::WinID;
 
 /// Magic `EventSourceUserData` marker on double-clicks re-posted by [`replay`],
 /// distinct from `slice_tap::TAG`, so the tap lets them pass straight through
 /// without re-intercepting or re-notifying the ECS.
 const DOUBLE_CLICK_TAG: i64 = 0x5041_4E45_5255_4443;
-
-/// Maximum time the tap holds a title-bar double-click waiting for the engine's
-/// `consume` or `replay` decision before expiring cleanly.
-const HOLD_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// What the event tap should do with a mouse event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,15 +62,18 @@ struct Replay {
 #[derive(Clone, Copy, Debug)]
 enum Hold {
     Idle,
+    /// A held press the engine has yet to answer. It lasts until the engine
+    /// answers or the next press: an engine that answers late, as while it
+    /// waits on a busy app, still gets its press replayed, where a time
+    /// limit would drop the press.
     Waiting {
         point: CGPoint,
         flags: CGEventFlags,
         released: Option<(CGPoint, CGEventFlags)>,
-        deadline: Instant,
     },
-    Consumed {
-        deadline: Instant,
-    },
+    /// A press the engine took, whose release is still to come, however
+    /// long the button is held.
+    Consumed,
 }
 
 struct State {
@@ -89,24 +89,16 @@ impl State {
         }
     }
 
-    fn expire(&mut self, now: Instant) {
-        match self.hold {
-            Hold::Waiting { deadline, .. } | Hold::Consumed { deadline } if now >= deadline => {
-                self.hold = Hold::Idle;
-            }
-            _ => {}
-        }
-    }
-
+    /// Whether `point` lies in a published top bar. The HID tap sees a
+    /// press before the window server names the window under it, so a press
+    /// without a window is matched by its place alone: the engine then finds
+    /// the window, and replays a press that was another window's.
     fn in_top_bar(&self, window_id: Option<WinID>, point: CGPoint) -> bool {
-        let Some(window_id) = window_id else {
-            return false;
-        };
         #[allow(clippy::cast_possible_truncation)]
         let p = IVec2::new(point.x.round() as i32, point.y.round() as i32);
         self.top_bars
             .iter()
-            .any(|&(id, rect)| id == window_id && rect.contains(p))
+            .any(|&(id, rect)| window_id.is_none_or(|under| under == id) && rect.contains(p))
     }
 
     fn handle(
@@ -116,9 +108,7 @@ impl State {
         flags: CGEventFlags,
         window_id: Option<WinID>,
         clicks: i64,
-        now: Instant,
     ) -> TapAction {
-        self.expire(now);
         match event_type {
             CGEventType::LeftMouseDown => {
                 if clicks == 2 && self.in_top_bar(window_id, point) {
@@ -126,7 +116,6 @@ impl State {
                         point,
                         flags,
                         released: None,
-                        deadline: now + HOLD_TIMEOUT,
                     };
                     TapAction::HoldForEngine
                 } else {
@@ -135,7 +124,7 @@ impl State {
                 }
             }
             CGEventType::LeftMouseDragged => match self.hold {
-                Hold::Waiting { .. } | Hold::Consumed { .. } => TapAction::SwallowQuiet,
+                Hold::Waiting { .. } | Hold::Consumed => TapAction::SwallowQuiet,
                 Hold::Idle => TapAction::Pass,
             },
             CGEventType::LeftMouseUp => match &mut self.hold {
@@ -143,7 +132,7 @@ impl State {
                     *released = Some((point, flags));
                     TapAction::SwallowQuiet
                 }
-                Hold::Consumed { .. } => {
+                Hold::Consumed => {
                     self.hold = Hold::Idle;
                     TapAction::SwallowQuiet
                 }
@@ -154,14 +143,11 @@ impl State {
     }
 
     fn consume(&mut self) {
-        if let Hold::Waiting {
-            released, deadline, ..
-        } = self.hold
-        {
+        if let Hold::Waiting { released, .. } = self.hold {
             self.hold = if released.is_some() {
                 Hold::Idle
             } else {
-                Hold::Consumed { deadline }
+                Hold::Consumed
             };
         }
     }
@@ -220,7 +206,21 @@ pub(crate) fn intercept(event_type: CGEventType, event: &CGEvent) -> TapAction {
     let Ok(mut state) = STATE.lock() else {
         return TapAction::Pass;
     };
-    state.handle(event_type, point, flags, window_id, clicks, Instant::now())
+    let held = !matches!(state.hold, Hold::Idle);
+    let action = state.handle(event_type, point, flags, window_id, clicks);
+    // A multi-click, or any event of a held one: rare enough to log each.
+    if event_type != CGEventType::LeftMouseDragged && (clicks > 1 || held) {
+        debug!(
+            ?event_type,
+            clicks,
+            ?window_id,
+            x = point.x,
+            y = point.y,
+            ?action,
+            "multi-click at the tap"
+        );
+    }
+    action
 }
 
 /// Marks the held title-bar double-click as handled by Miri (maximize/restore),
@@ -287,7 +287,6 @@ mod tests {
     fn consumed_double_click_swallows_down_drag_and_up() {
         let mut state = State::new();
         state.top_bars = vec![(42, IRect::new(0, 30, 800, 120))];
-        let t0 = Instant::now();
 
         // Single click passes through.
         assert_eq!(
@@ -297,7 +296,6 @@ mod tests {
                 CGEventFlags::empty(),
                 Some(42),
                 1,
-                t0,
             ),
             TapAction::Pass
         );
@@ -309,7 +307,6 @@ mod tests {
                 CGEventFlags::empty(),
                 Some(42),
                 2,
-                t0,
             ),
             TapAction::HoldForEngine
         );
@@ -323,7 +320,6 @@ mod tests {
                 CGEventFlags::empty(),
                 Some(42),
                 2,
-                t0 + Duration::from_millis(20),
             ),
             TapAction::SwallowQuiet
         );
@@ -334,7 +330,6 @@ mod tests {
                 CGEventFlags::empty(),
                 Some(42),
                 2,
-                t0 + Duration::from_millis(60),
             ),
             TapAction::SwallowQuiet
         );
@@ -346,7 +341,6 @@ mod tests {
                 CGEventFlags::empty(),
                 Some(42),
                 1,
-                t0 + Duration::from_millis(80),
             ),
             TapAction::Pass
         );
@@ -356,7 +350,6 @@ mod tests {
     fn tap_to_click_replay_returns_both_down_and_up() {
         let mut state = State::new();
         state.top_bars = vec![(42, IRect::new(0, 30, 800, 120))];
-        let t0 = Instant::now();
 
         assert_eq!(
             state.handle(
@@ -365,7 +358,6 @@ mod tests {
                 CGEventFlags::empty(),
                 Some(42),
                 2,
-                t0,
             ),
             TapAction::HoldForEngine
         );
@@ -377,7 +369,6 @@ mod tests {
                 CGEventFlags::empty(),
                 Some(42),
                 2,
-                t0 + Duration::from_millis(1),
             ),
             TapAction::SwallowQuiet
         );
@@ -386,11 +377,52 @@ mod tests {
         assert!(state.take_replay().is_none(), "cleared after replay");
     }
 
+    /// A real press reaches the HID tap before the window server names the
+    /// window under it. Left to pass for that, a title-bar double-click
+    /// reached the app, whose own zoom then fought the engine's (Helium's
+    /// animated for 350 ms, 23 November 2026).
+    #[test]
+    fn a_double_click_without_a_window_is_held_by_its_place() {
+        let mut state = State::new();
+        state.top_bars = vec![(42, IRect::new(0, 30, 800, 120))];
+        assert_eq!(
+            state.handle(
+                CGEventType::LeftMouseDown,
+                pt(200.0, 50.0),
+                CGEventFlags::empty(),
+                None,
+                2,
+            ),
+            TapAction::HoldForEngine
+        );
+        state.consume();
+        assert_eq!(
+            state.handle(
+                CGEventType::LeftMouseUp,
+                pt(200.0, 50.0),
+                CGEventFlags::empty(),
+                None,
+                2,
+            ),
+            TapAction::SwallowQuiet
+        );
+        // Outside every top bar, it passes.
+        assert_eq!(
+            state.handle(
+                CGEventType::LeftMouseDown,
+                pt(200.0, 300.0),
+                CGEventFlags::empty(),
+                None,
+                2,
+            ),
+            TapAction::Pass
+        );
+    }
+
     #[test]
     fn floating_or_content_double_click_passes_untouched() {
         let mut state = State::new();
         state.top_bars = vec![(42, IRect::new(0, 30, 800, 120))];
-        let t0 = Instant::now();
 
         // Different window (e.g. floating window or popover).
         assert_eq!(
@@ -400,7 +432,6 @@ mod tests {
                 CGEventFlags::empty(),
                 Some(99),
                 2,
-                t0,
             ),
             TapAction::Pass
         );
@@ -412,7 +443,6 @@ mod tests {
                 CGEventFlags::empty(),
                 Some(42),
                 2,
-                t0,
             ),
             TapAction::Pass
         );
