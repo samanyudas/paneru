@@ -32,7 +32,7 @@ use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::Added;
+use bevy::ecs::query::{Added, Has};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Local, Query, Res, ResMut};
 use bevy::math::{IRect, IVec2};
@@ -45,7 +45,7 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::shared_edge::Slide;
 use crate::ecs::systems::ease_step;
 use crate::ecs::{
-    Bounds, FocusedMarker, Position, PresentedOrigin, RepositionMarker, ResizeMarker,
+    Bounds, FocusedMarker, InstantMotion, Position, PresentedOrigin, RepositionMarker, ResizeMarker,
 };
 use crate::events::Event;
 use crate::manager::window_writer::LANDING_TIMEOUT;
@@ -546,6 +546,7 @@ type RowWindows<'w, 's> = Query<
         Option<&'static PositionEase>,
         Option<&'static SlideEase>,
         Option<(&'static Slide, &'static PresentedOrigin)>,
+        Has<InstantMotion>,
     ),
 >;
 
@@ -686,8 +687,11 @@ fn member(
     (first_t, animates): (f32, bool),
     now: Duration,
 ) -> Option<Member> {
-    let (window, position, bounds, to, resize, position_ease, slide_ease, slide) =
+    let (window, position, bounds, to, resize, position_ease, slide_ease, slide, instant) =
         windows.get(entity).ok()?;
+    // A window that a resize moves at once takes its whole move as its first
+    // step, as with animation off.
+    let first_t = if instant { 1.0 } else { first_t };
     let id = window.id();
     let asked = Edges::from(window.frame());
     let shown_edges = shown
@@ -950,7 +954,7 @@ fn landed(rows: &[Vec<Vec<Entity>>], windows: &RowWindows, shown: &Shown) -> Ent
         .flatten()
         .copied()
         .filter(|&entity| {
-            windows.get(entity).is_ok_and(|(window, .., slide)| {
+            windows.get(entity).is_ok_and(|(window, .., slide, _)| {
                 matches!(slide, Some((Slide::Landing { .. }, _)))
                     && !shown.unread.contains(&window.id())
                     && shown
@@ -979,7 +983,7 @@ fn moving_rows(strips: &Query<&LayoutStrip>, windows: &RowWindows) -> Vec<Vec<Ve
             row.iter().flatten().any(|&entity| {
                 windows
                     .get(entity)
-                    .is_ok_and(|(_, _, _, to, resize, _, _, slide)| {
+                    .is_ok_and(|(_, _, _, to, resize, _, _, slide, _)| {
                         to.is_some()
                             || resize.is_some()
                             || slide

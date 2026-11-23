@@ -22,8 +22,8 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     AccessibilityProbe, ActiveDisplayMarker, AwaitingAccessibility, BProcess, ExistingMarker,
-    FreshMarker, RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
-    VerifyWindowPosition, VerifyWindowSize,
+    FreshMarker, InstantMotion, RepositionMarker, ResizeMarker, RetryFrontSwitch,
+    SpawnWindowTrigger, Timeout, VerifyWindowPosition, VerifyWindowSize,
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
@@ -754,6 +754,31 @@ pub(crate) fn ease_step(current: Origin, target: Origin, t: f32) -> (Origin, boo
     }
 }
 
+/// Each moving entity, its ease, and whether it moves at once.
+type Moves = (
+    &'static mut Position,
+    Entity,
+    Ref<'static, RepositionMarker>,
+    &'static mut PositionEase,
+    Has<InstantMotion>,
+);
+
+/// Each resizing entity, its ease, and whether it resizes at once.
+type Resizes = (
+    &'static mut Bounds,
+    Entity,
+    Ref<'static, ResizeMarker>,
+    &'static mut SizeEase,
+    Has<InstantMotion>,
+);
+
+/// An entity whose instant motion has no move or resize left.
+type InstantMotionsDone = (
+    With<InstantMotion>,
+    Without<RepositionMarker>,
+    Without<ResizeMarker>,
+);
+
 /// This is a Bevy system that runs on `Update`. It moves windows to their
 /// target positions, as indicated by the `RepositionMarker` component, along
 /// the curve in [`ease`](crate::ecs::ease), which `animation_speed` in the
@@ -766,19 +791,15 @@ pub(crate) fn ease_step(current: Origin, target: Origin, t: f32) -> (Origin, boo
 /// [`finish_repositions`] ends the move once the window is at its target.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(
-        &mut Position,
-        Entity,
-        Ref<RepositionMarker>,
-        &mut PositionEase,
-    )>,
+    animate: Populated<Moves>,
     step: Res<AnimationStep>,
     time: Res<Time>,
     config: Res<Config>,
 ) {
-    let duration = ease::duration(&config);
+    let eased = ease::duration(&config);
     let now = time.elapsed_secs_f64();
-    for (mut position, entity, marker, mut ease) in animate {
+    for (mut position, entity, marker, mut ease, instant) in animate {
+        let duration = if instant { 0.0 } else { eased };
         let RepositionMarker(origin) = *marker;
         let t = ease.0.step(
             position.0,
@@ -819,14 +840,15 @@ pub(super) fn finish_repositions(
 /// [`finish_resizes`] ends the resize once the window has its target size.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
-    animate: Populated<(&mut Bounds, Entity, Ref<ResizeMarker>, &mut SizeEase)>,
+    animate: Populated<Resizes>,
     step: Res<AnimationStep>,
     time: Res<Time>,
     config: Res<Config>,
 ) {
-    let duration = ease::duration(&config);
+    let eased = ease::duration(&config);
     let now = time.elapsed_secs_f64();
-    for (mut bounds, entity, marker, mut ease) in animate {
+    for (mut bounds, entity, marker, mut ease, instant) in animate {
+        let duration = if instant { 0.0 } else { eased };
         let ResizeMarker(size) = *marker;
         let t = ease.0.step(
             bounds.0,
@@ -855,6 +877,18 @@ pub(super) fn finish_resizes(
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
             entity_commands.try_remove::<ResizeMarker>();
+        }
+    }
+}
+
+/// Ends the [`InstantMotion`] of each entity with no move or resize left.
+pub(super) fn finish_instant_motions(
+    done: Populated<Entity, InstantMotionsDone>,
+    mut commands: Commands,
+) {
+    for entity in &done {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<InstantMotion>();
         }
     }
 }
@@ -1614,7 +1648,6 @@ type ActiveStripMotion<'w, 's> = Populated<
     (
         Has<Scrolling>,
         Has<crate::ecs::strip_cover::CoverSlide>,
-        Has<crate::ecs::strip_cover::CoverMorph>,
         &'static LayoutStrip,
     ),
     With<ActiveWorkspaceMarker>,
@@ -1644,12 +1677,12 @@ pub(super) fn update_overlays(
 
     // Hide overlays during swipe, mission control, native fullscreen spaces,
     // or briefly after a space change (macOS space-switch animation).
-    let Some((swiping, sliding, resizing, active_strip)) = active_workspace.iter().next() else {
+    let Some((swiping, covered, active_strip)) = active_workspace.iter().next() else {
         return;
     };
 
     // A picture cover moves pictures, not the windows the overlays follow.
-    if swiping || sliding || resizing || mission_control_active.0 || active_strip.is_fullscreen() {
+    if swiping || covered || mission_control_active.0 || active_strip.is_fullscreen() {
         overlay_mgr.hide_all();
         return;
     }

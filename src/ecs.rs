@@ -178,16 +178,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
                           mut scrolling_removed: RemovedComponents<Scrolling>,
                           mut covers_removed: RemovedComponents<strip_cover::CoverSlide>,
                           covers_added: Query<(), Added<strip_cover::CoverSlide>>,
-                          mut morphs_removed: RemovedComponents<strip_cover::CoverMorph>,
-                          morphs_added: Query<(), Added<strip_cover::CoverMorph>>,
                           focus_gained: Query<(), Added<FocusedMarker>>,
                           workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
                           focused_moved: OverlayFocusedMoved| {
         let scrolling_ended = scrolling_removed.read().count() > 0
             || covers_removed.read().count() > 0
-            || !covers_added.is_empty()
-            || morphs_removed.read().count() > 0
-            || !morphs_added.is_empty();
+            || !covers_added.is_empty();
         let Some(config) = config else {
             return false;
         };
@@ -338,6 +334,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             pacing::pace_rows.run_if(not(resource_exists::<Initializing>)),
             systems::finish_repositions,
             systems::finish_resizes,
+            systems::finish_instant_motions,
             systems::commit_window_frame.run_if(not(resource_exists::<Initializing>)),
             systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
             triggers::window_resize_verifier,
@@ -933,6 +930,14 @@ pub(crate) enum WidthAnchor {
 pub(crate) struct WidthRun {
     pub(crate) anchor: WidthAnchor,
 }
+
+/// A window, or a strip, that a width command just moved. It takes the new
+/// layout in one step instead of easing there, so a resize shows each app at
+/// its new size at once rather than as a slow ease of late frames. Pacing still
+/// holds a window beside a slower one until that one shows its move. Removed
+/// once the entity has neither a move nor a resize left.
+#[derive(Component)]
+pub(crate) struct InstantMotion;
 
 /// A width command's finite request for native readback and anchored placement.
 #[derive(Component)]

@@ -31,10 +31,10 @@ use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowCtx, Windows};
 use crate::ecs::scroll::{PageFocusRequest, PageGestureState, PageInFlight};
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, ManualStripOffset,
-    MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, Position, RaiseWindow,
-    RepositionMarker, SelectedVirtualMarker, SpawnCommandsExt, StepPartners, Timeout, Unmanaged,
-    VerifyWindowSize, WidthAnchor, WidthRun, WindowProperties,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, InstantMotion,
+    ManualStripOffset, MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, Position,
+    RaiseWindow, RepositionMarker, SelectedVirtualMarker, SpawnCommandsExt, StepPartners, Timeout,
+    Unmanaged, VerifyWindowSize, WidthAnchor, WidthRun, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -1352,6 +1352,11 @@ fn resize_window(
 
     commands.resize_entity(entity, size);
     commands.reshuffle_around(entity);
+    for moved in std::iter::once(strip_entity).chain(strip.all_windows()) {
+        if let Ok(mut cmds) = commands.get_entity(moved) {
+            cmds.try_insert(InstantMotion);
+        }
+    }
 }
 
 /// One step from `ratio` in `direction`, kept between one step and `maximum`.

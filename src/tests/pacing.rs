@@ -971,3 +971,49 @@ fn a_window_that_leads_the_row_in_keeps_its_first_step_while_one_behind_it_only_
         "window 1 waits at its first step while its app shows nothing: {places:?}"
     );
 }
+
+/// The engine frame of each of windows 0, 1 and 2.
+fn engine_frames(world: &mut World) -> Vec<IRect> {
+    (0..3).map(|id| engine_frame(world, id)).collect()
+}
+
+/// A width command moves the row to its new layout without easing there:
+/// once each app has shown the first frame, every window has its final
+/// frame. The slow window 1 still sets when its neighbours may follow.
+#[test]
+fn a_resize_takes_its_new_layout_at_once() {
+    let mut harness = harness();
+    let start = engine_frames(harness.world());
+
+    harness
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    harness.advance(FRAME);
+    land_slow_writes(&mut harness);
+    harness.advance(FRAME);
+    let early = engine_frames(harness.world());
+    settle(&mut harness);
+    assert_landed(&mut harness);
+
+    let end = engine_frames(harness.world());
+    assert_ne!(start, end, "the resize changed the row");
+    assert_eq!(early, end, "the row had its new layout after two frames");
+}
+
+/// A motion after a resize, such as a focus move, still eases.
+#[test]
+fn a_focus_move_after_a_resize_still_eases() {
+    let mut harness = harness();
+    harness
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    settle(&mut harness);
+
+    harness.world().write_message(focus(Direction::Last));
+    harness.advance(FRAME);
+    land_slow_writes(&mut harness);
+    harness.advance(FRAME);
+    assert!(moving(harness.world()), "the focus move eases over frames");
+    settle(&mut harness);
+    assert_landed(&mut harness);
+}

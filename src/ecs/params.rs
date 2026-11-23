@@ -208,7 +208,6 @@ pub struct FrameActivity<'w, 's> {
     slides: Query<'w, 's, (), With<crate::ecs::shared_edge::Slide>>,
     covers: Query<'w, 's, (), With<crate::ecs::strip_cover::CoverSlide>>,
     swipe_covers: Query<'w, 's, (), With<crate::ecs::strip_cover::CoverSwipe>>,
-    resize_covers: Query<'w, 's, (), With<crate::ecs::strip_cover::CoverMorph>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -227,7 +226,6 @@ impl FrameActivity<'_, '_> {
             || !self.slides.is_empty()
             || !self.covers.is_empty()
             || !self.swipe_covers.is_empty()
-            || !self.resize_covers.is_empty()
             || self
                 .native_resizes
                 .iter()

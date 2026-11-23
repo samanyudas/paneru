@@ -34,9 +34,6 @@ use crate::types::commands::Side;
 /// replaces the one before it.
 const SLIDE_KEY: &str = "slide";
 
-/// The key of the fade animation on a cover's root layer.
-const FADE_KEY: &str = "fade";
-
 /// A shown cover, as the event tap needs it on the main thread: its window,
 /// its viewport, its strip layer, and each picture's frame from the strip
 /// origin, back to front.
@@ -87,23 +84,6 @@ pub struct CoverScreenOS {
     filters: HashMap<WinID, Arc<OnceLock<Filter>>>,
 }
 
-/// One animated number of a morph: the picture layer, which of its numbers
-/// moves (an index into [`MORPH_TRACKS`]), and from where to where.
-struct Lead {
-    layer: Retained<CALayer>,
-    track: usize,
-    from: f64,
-    to: f64,
-}
-
-/// The numbers of a picture layer a morph animates.
-const MORPH_TRACKS: [&str; 4] = [
-    "position.x",
-    "position.y",
-    "bounds.size.width",
-    "bounds.size.height",
-];
-
 /// One display's cover: a panel over its viewport, the layer that holds the
 /// strip's pictures, and the viewport it covers.
 struct Cover {
@@ -112,12 +92,6 @@ struct Cover {
     viewport: IRect,
     /// Each window's picture and the frame it shows from the strip origin.
     pictures: Vec<(WinID, IRect)>,
-    /// Each window's picture layer, which a resize moves on its own.
-    layers: Vec<(WinID, Retained<CALayer>)>,
-    /// The strip origin the cover was laid out at, which a resize keeps.
-    laid: IVec2,
-    /// The track of a morph that moves furthest, to tell how far it shows.
-    lead: Option<Lead>,
     /// Where the strip origin shows now, as far as the engine has told.
     at: IVec2,
     /// Whether the cover is up.
@@ -185,10 +159,8 @@ impl CoverScreenOS {
             NSBackingStoreType::Buffered,
             false,
         );
-        // The desktop picture fills the cover, and the cover fades out over
-        // the real windows after a resize, so the panel lets them through.
-        panel.setOpaque(false);
-        panel.setBackgroundColor(Some(&NSColor::clearColor()));
+        panel.setOpaque(true);
+        panel.setBackgroundColor(Some(&NSColor::blackColor()));
         panel.setHasShadow(false);
         panel.setHidesOnDeactivate(false);
         // A press on a picture never reaches the panel: the event tap holds
@@ -227,9 +199,6 @@ impl CoverScreenOS {
 
     fn picture(image: &CFType, frame: CGRect, scale: f64) -> Retained<CALayer> {
         let layer = CALayer::new();
-        // Its position is its bottom left corner, so a resize moves the left
-        // edge and the width on their own.
-        layer.setAnchorPoint(CGPoint::new(0.0, 0.0));
         layer.setFrame(frame);
         unsafe { layer.setContents(Some(image.as_ref())) };
         layer.setContentsScale(scale);
@@ -413,9 +382,6 @@ impl CoverScreen for CoverScreenOS {
                     strip,
                     viewport,
                     pictures: Vec::new(),
-                    layers: Vec::new(),
-                    laid: scene.strip,
-                    lead: None,
                     at: scene.strip,
                     shown: false,
                 },
@@ -433,8 +399,6 @@ impl CoverScreen for CoverScreenOS {
         };
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        root.removeAnimationForKey(&NSString::from_str(FADE_KEY));
-        root.setOpacity(1.0);
         root.setMasksToBounds(true);
         // SAFETY: no layer of the cover is in use elsewhere.
         unsafe { root.setSublayers(None) };
@@ -453,23 +417,21 @@ impl CoverScreen for CoverScreenOS {
             CGSize::new(f64::from(viewport.width()), f64::from(viewport.height())),
         ));
         strip.setPosition(CGPoint::new(f64::from(scene.strip.x - viewport.min.x), 0.0));
-        let mut layers = Vec::with_capacity(scene.pictures.len());
-        for (id, rel, photo) in &scene.pictures {
+        for (_, rel, photo) in &scene.pictures {
             let on_screen = IRect::from_corners(
                 IVec2::new(rel.min.x + viewport.min.x, rel.min.y + scene.strip.y),
                 IVec2::new(rel.max.x + viewport.min.x, rel.max.y + scene.strip.y),
             );
             let image: &CFType = &photo.image;
-            let layer = Self::picture(image, Self::turned(on_screen, viewport), scale);
-            strip.addSublayer(&layer);
-            layers.push((*id, layer));
+            strip.addSublayer(&Self::picture(
+                image,
+                Self::turned(on_screen, viewport),
+                scale,
+            ));
         }
         root.addSublayer(&strip);
         CATransaction::commit();
         cover.strip = strip;
-        cover.layers = layers;
-        cover.laid = scene.strip;
-        cover.lead = None;
         cover.pictures = scene
             .pictures
             .iter()
@@ -495,13 +457,18 @@ impl CoverScreen for CoverScreenOS {
             return;
         };
         let origin = f64::from(cover.viewport.min.x);
-        let values = path.iter().map(|x| x - origin).collect::<Vec<_>>();
+        let values = path
+            .iter()
+            .map(|x| NSNumber::new_f64(x - origin))
+            .collect::<Vec<_>>();
+        let animation =
+            CAKeyframeAnimation::animationWithKeyPath(Some(&NSString::from_str("position.x")));
+        // SAFETY: an array of numbers is an array of objects.
+        let values: Retained<NSArray> =
+            unsafe { Retained::cast_unchecked(NSArray::from_retained_slice(&values)) };
+        unsafe { animation.setValues(Some(&values)) };
         #[allow(clippy::cast_precision_loss)]
-        let animation = keyframes(
-            "position.x",
-            &values,
-            step * (path.len().saturating_sub(1)) as f64,
-        );
+        animation.setDuration(step * (path.len().saturating_sub(1)) as f64);
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         let position = cover.strip.position();
@@ -513,127 +480,6 @@ impl CoverScreen for CoverScreenOS {
             .addAnimation_forKey(&animation, Some(&NSString::from_str(SLIDE_KEY)));
         CATransaction::commit();
         CATransaction::flush();
-    }
-
-    fn morph(
-        &mut self,
-        display: CGDirectDisplayID,
-        frames: &[(WinID, IRect, IRect)],
-        shares: &[f64],
-        step: f64,
-    ) {
-        let Some(cover) = self.covers.get_mut(&display) else {
-            return;
-        };
-        #[allow(clippy::cast_precision_loss)]
-        let duration = step * (shares.len().saturating_sub(1)) as f64;
-        let (laid, viewport) = (cover.laid, cover.viewport);
-        // A frame in global points, in the strip layer's space.
-        let local = |rect: IRect| {
-            Self::turned(
-                IRect::from_corners(
-                    IVec2::new(rect.min.x - laid.x + viewport.min.x, rect.min.y),
-                    IVec2::new(rect.max.x - laid.x + viewport.min.x, rect.max.y),
-                ),
-                viewport,
-            )
-        };
-        let mut lead = None;
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        if let Some(root) = cover.window.contentView().and_then(|view| view.layer()) {
-            root.removeAnimationForKey(&NSString::from_str(FADE_KEY));
-            root.setOpacity(1.0);
-        }
-        for (id, from, to) in frames {
-            let Some((_, layer)) = cover.layers.iter().find(|(layer_id, _)| layer_id == id) else {
-                continue;
-            };
-            let (from, to) = (local(*from), local(*to));
-            layer.removeAllAnimations();
-            layer.setFrame(to);
-            let tracks = [
-                (from.origin.x, to.origin.x),
-                (from.origin.y, to.origin.y),
-                (from.size.width, to.size.width),
-                (from.size.height, to.size.height),
-            ];
-            for (track, (path, (start, end))) in MORPH_TRACKS.into_iter().zip(tracks).enumerate() {
-                if (end - start).abs() < f64::EPSILON {
-                    continue;
-                }
-                if lead
-                    .as_ref()
-                    .is_none_or(|lead: &Lead| (end - start).abs() > (lead.to - lead.from).abs())
-                {
-                    lead = Some(Lead {
-                        layer: layer.clone(),
-                        track,
-                        from: start,
-                        to: end,
-                    });
-                }
-                let values = shares
-                    .iter()
-                    .map(|share| start + (end - start) * share)
-                    .collect::<Vec<_>>();
-                layer.addAnimation_forKey(
-                    &keyframes(path, &values, duration),
-                    Some(&NSString::from_str(path)),
-                );
-            }
-        }
-        CATransaction::commit();
-        CATransaction::flush();
-        cover.lead = lead;
-        // A press goes to the window where its picture rests.
-        // In paint order, so a press where pictures overlap goes to the front.
-        cover.pictures = cover
-            .layers
-            .iter()
-            .filter_map(|(id, _)| {
-                let (_, _, to) = frames.iter().find(|(frame, ..)| frame == id)?;
-                Some((*id, IRect::from_corners(to.min - laid, to.max - laid)))
-            })
-            .collect();
-        cover.at = laid;
-        self.publish_panels();
-    }
-
-    fn fade(&mut self, display: CGDirectDisplayID, seconds: f64) {
-        let Some(root) = self
-            .covers
-            .get(&display)
-            .filter(|cover| cover.shown)
-            .and_then(|cover| cover.window.contentView())
-            .and_then(|view| view.layer())
-        else {
-            return;
-        };
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        root.setOpacity(0.0);
-        root.addAnimation_forKey(
-            &keyframes("opacity", &[1.0, 0.0], seconds),
-            Some(&NSString::from_str(FADE_KEY)),
-        );
-        CATransaction::commit();
-        CATransaction::flush();
-    }
-
-    fn morph_share(&self, display: CGDirectDisplayID) -> Option<f64> {
-        let cover = self.covers.get(&display).filter(|cover| cover.shown)?;
-        let lead = cover.lead.as_ref()?;
-        // SAFETY: a plain read of the layer Core Animation shows now.
-        let shown = unsafe { lead.layer.presentationLayer() }?;
-        let (position, size) = (shown.position(), shown.bounds().size);
-        let now = [position.x, position.y, size.width, size.height][lead.track];
-        // Within half a point of the end, the morph shows landed.
-        Some(if (now - lead.to).abs() < 0.5 {
-            1.0
-        } else {
-            ((now - lead.from) / (lead.to - lead.from)).clamp(0.0, 1.0)
-        })
     }
 
     fn track(&mut self, display: CGDirectDisplayID, x: f64) {
@@ -695,8 +541,6 @@ impl CoverScreen for CoverScreenOS {
         };
         cover.shown = false;
         cover.pictures.clear();
-        cover.layers.clear();
-        cover.lead = None;
         // The pictures go with the layer that held them.
         cover.strip = CALayer::new();
         cover.window.orderOut(None::<&AnyObject>);
@@ -712,22 +556,6 @@ impl CoverScreen for CoverScreenOS {
         let id = display;
         debug!("cover hidden on display {id}");
     }
-}
-
-/// An animation of the number at `path` through `values`, evenly over
-/// `seconds`. It holds nothing at its end: the layer's own value takes over.
-fn keyframes(path: &str, values: &[f64], seconds: f64) -> Retained<CAKeyframeAnimation> {
-    let values = values
-        .iter()
-        .map(|value| NSNumber::new_f64(*value))
-        .collect::<Vec<_>>();
-    let animation = CAKeyframeAnimation::animationWithKeyPath(Some(&NSString::from_str(path)));
-    // SAFETY: an array of numbers is an array of objects.
-    let values: Retained<NSArray> =
-        unsafe { Retained::cast_unchecked(NSArray::from_retained_slice(&values)) };
-    unsafe { animation.setValues(Some(&values)) };
-    animation.setDuration(seconds);
-    animation
 }
 
 /// Where the picture of one ask goes. `ScreenCaptureKit` calls back on its
