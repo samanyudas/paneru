@@ -3161,6 +3161,64 @@ fn a_restore_of_a_retitled_window_does_not_show_it_as_it_was() {
     );
 }
 
+/// Puts window 1 at rest beside window 0, focused, with a picture of every
+/// window, and returns window 1's frame there.
+fn window_1_at_rest_with_pictures(harness: &mut TestHarness, log: &ScreenLog) -> IRect {
+    send(
+        harness,
+        resize(crate::types::commands::ResizeDirection::Shrink),
+    );
+    frames_of(harness, &[0, 1]);
+    send(harness, focus(Direction::East));
+    for _ in 0..40 {
+        harness.advance(ONE_FRAME);
+    }
+    take_pictures(harness, log);
+    shown_window_frame(harness.world(), 1)
+}
+
+/// Maximizes window 1, which rests at `rest`, answers the fresh picture of
+/// it maximized, lets the cover lift, and starts the restore. Returns the
+/// pictures the cover was given at the sizes their frames head to.
+fn maximize_and_restore(
+    harness: &mut TestHarness,
+    log: &ScreenLog,
+    rest: IRect,
+) -> Vec<(WinID, IVec2)> {
+    let since = log.borrow().window_asks.len();
+    send(harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    let fresh = window_asks_since(log, since)
+        .into_iter()
+        .find(|&(id, size, _)| id == 1 && size.x > rest.width())
+        .expect("a fresh picture of window 1 maximized");
+    answer(harness, 1, fresh.2);
+    harness.advance(ONE_FRAME);
+    shown_frames_of(harness, &[1]);
+    harness.advance(ONE_FRAME);
+
+    send(harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "restore runs under a cover");
+    log.borrow().headed.clone()
+}
+
+/// Runs frames until the background refresh asks for a picture of window 1
+/// at `size`, and returns that ask's generation, unanswered.
+fn a_background_ask_of_window_1(harness: &mut TestHarness, log: &ScreenLog, size: IVec2) -> u32 {
+    let since = log.borrow().window_asks.len();
+    for _ in 0..200 {
+        harness.advance(ONE_FRAME);
+        if let Some(&(_, _, generation)) = window_asks_since(log, since)
+            .iter()
+            .find(|&&(id, asked, _)| id == 1 && asked == size)
+        {
+            return generation;
+        }
+    }
+    panic!("the background refresh asks for window 1");
+}
+
 /// A window whose title changed before it was maximized, as when a new tab
 /// opened, does not show its picture from before the change on the restore,
 /// even once a fresh picture of it maximized has arrived. That arrival made
@@ -3169,38 +3227,85 @@ fn a_restore_of_a_retitled_window_does_not_show_it_as_it_was() {
 #[test]
 fn a_restore_after_a_title_change_before_the_maximize_does_not_show_the_old_title() {
     let (mut harness, log) = harness(padded_resize_config());
-    send(
-        &mut harness,
-        resize(crate::types::commands::ResizeDirection::Shrink),
-    );
-    frames_of(&mut harness, &[0, 1]);
-    send(&mut harness, focus(Direction::East));
-    for _ in 0..40 {
-        harness.advance(ONE_FRAME);
-    }
-    take_pictures(&mut harness, &log);
-    let rest = shown_window_frame(harness.world(), 1);
-
+    let rest = window_1_at_rest_with_pictures(&mut harness, &log);
     harness.run(vec![Event::WindowTitleChanged { window_id: 1 }]);
+    let headed = maximize_and_restore(&mut harness, &log, rest);
+    assert!(
+        !headed.contains(&(1, rest.size())),
+        "the picture from before the title changed is not shown: {headed:?}"
+    );
+}
+
+/// A background picture asked for before the window's title changed, and
+/// answered after, shows the old title: it is dropped. Kept, it counted as
+/// taken after the change, and a restore showed the old tab.
+#[test]
+fn a_background_picture_asked_before_a_title_change_is_dropped() {
+    let (mut harness, log) = harness(padded_resize_config());
+    let rest = window_1_at_rest_with_pictures(&mut harness, &log);
+    let old = a_background_ask_of_window_1(&mut harness, &log, rest.size());
+    send(&mut harness, Event::WindowTitleChanged { window_id: 1 });
+    harness.advance(ONE_FRAME);
+    answer(&mut harness, 1, old);
+    harness.advance(ONE_FRAME);
+    let headed = maximize_and_restore(&mut harness, &log, rest);
+    assert!(
+        !headed.contains(&(1, rest.size())),
+        "the picture from before the title changed is not shown: {headed:?}"
+    );
+}
+
+/// A background picture that arrives in the frame the window's title
+/// changes, ahead of the change, shows the old title too. It counted as
+/// taken at the moment of the change, and a restore showed the old tab.
+#[test]
+fn a_background_picture_in_the_frame_of_a_title_change_is_not_shown() {
+    let (mut harness, log) = harness(padded_resize_config());
+    let rest = window_1_at_rest_with_pictures(&mut harness, &log);
+    let old = a_background_ask_of_window_1(&mut harness, &log, rest.size());
+    answer(&mut harness, 1, old);
+    send(&mut harness, Event::WindowTitleChanged { window_id: 1 });
+    harness.advance(ONE_FRAME);
+    let headed = maximize_and_restore(&mut harness, &log, rest);
+    assert!(
+        !headed.contains(&(1, rest.size())),
+        "the picture from before the title changed is not shown: {headed:?}"
+    );
+}
+
+/// A resize's fresh picture that arrives in the frame the window's title
+/// changes shows the old title: the cover drops it, shows nothing of it,
+/// and asks for a picture of the new title.
+#[test]
+fn a_fresh_picture_in_the_frame_of_a_title_change_is_asked_for_again() {
+    let (mut harness, log) = harness(padded_resize_config());
+    let rest = window_1_at_rest_with_pictures(&mut harness, &log);
     let since = log.borrow().window_asks.len();
     send(&mut harness, maximize_cmd());
     harness.advance(ONE_FRAME);
-    let fresh = window_asks_since(&log, since)
+    let (_, maximized, old) = window_asks_since(&log, since)
         .into_iter()
         .find(|&(id, size, _)| id == 1 && size.x > rest.width())
         .expect("a fresh picture of window 1 maximized");
-    answer(&mut harness, 1, fresh.2);
-    harness.advance(ONE_FRAME);
-    shown_frames_of(&mut harness, &[1]);
-    harness.advance(ONE_FRAME);
 
-    send(&mut harness, maximize_cmd());
+    answer(&mut harness, 1, old);
+    send(&mut harness, Event::WindowTitleChanged { window_id: 1 });
     harness.advance(ONE_FRAME);
-    assert!(morphed(harness.world()), "restore runs under a cover");
     assert!(
-        !log.borrow().headed.contains(&(1, rest.size())),
-        "the picture from before the title changed is not shown: {:?}",
-        log.borrow().headed
+        log.borrow().replaced.is_empty(),
+        "the picture of the old title shows nowhere"
+    );
+    harness.advance(ONE_FRAME);
+    let again = window_asks_since(&log, since)
+        .into_iter()
+        .find(|&(id, size, generation)| id == 1 && size == maximized && generation != old)
+        .expect("a picture of the new title is asked for");
+    answer(&mut harness, 1, again.2);
+    harness.advance(ONE_FRAME);
+    assert_eq!(
+        log.borrow().replaced,
+        vec![(1, maximized)],
+        "and it shows once it arrives"
     );
 }
 

@@ -215,6 +215,21 @@ impl CoverMorph {
             .map(|(_, size)| *size)
     }
 
+    /// Forgets every fresh picture of window `id` the morph asked for or
+    /// holds to show: its title changed, so they show another tab or
+    /// document, and the morph asks for a picture of the new one.
+    pub(super) fn invalidate_title(&mut self, id: WinID) {
+        let entities = self
+            .frames
+            .iter()
+            .filter(|frame| frame.id == id)
+            .map(|frame| frame.entity)
+            .collect::<Vec<_>>();
+        self.refresh_ask
+            .retain(|(entity, ..)| !entities.contains(entity));
+        self.pending_unveil.retain(|(_, window, ..)| *window != id);
+    }
+
     /// Notes that window `entity`'s frame on the cover holds a picture of
     /// `size` now.
     fn back(&mut self, entity: Entity, size: IVec2) {
@@ -1198,6 +1213,7 @@ pub(super) fn refresh_morph_pictures(
             photos.generation = photos.generation.wrapping_add(1);
             let generation = photos.generation;
             let subject = CoverSubject::Window(id);
+            let title_epoch = photos.title_epoch(id);
             photos.supersede(subject);
             screen
                 .0
@@ -1208,6 +1224,7 @@ pub(super) fn refresh_morph_pictures(
                 at: now,
                 size: to.size(),
                 excluding: Vec::new(),
+                title_epoch,
             });
             morph.refresh_ask.retain(|&(e, ..)| e != entity);
             morph.refresh_ask.push((entity, to.size(), generation));
@@ -1234,6 +1251,11 @@ pub(super) fn apply_morph_replies(
 ) {
     let replies = std::mem::take(&mut photos.morph_replies);
     for reply in replies {
+        if reply.title_epoch < photos.title_epoch(reply.id) {
+            // Asked for before the window's title changed, it shows another
+            // tab or document.
+            continue;
+        }
         let mut owned_by_morph = false;
         let mut accepted_for_morph = false;
         for mut morph in &mut morphs {
@@ -1294,12 +1316,18 @@ pub(super) fn apply_morph_replies(
                 continue;
             }
         }
+        let asked = Asked {
+            subject: CoverSubject::Window(reply.id),
+            generation: reply.generation,
+            at: reply.taken,
+            size: reply.size,
+            excluding: Vec::new(),
+            title_epoch: reply.title_epoch,
+        };
         apply_cover_reply(
             &mut photos,
             screen.as_deref_mut(),
-            CoverSubject::Window(reply.id),
-            reply.size,
-            Vec::new(),
+            asked,
             &reply.result,
             reply.taken,
         );

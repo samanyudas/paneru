@@ -250,6 +250,9 @@ struct Kept {
     taken: Duration,
     /// For a desktop, the windows it leaves out.
     excluding: Vec<WinID>,
+    /// For a window, its title epoch when the picture was asked for: see
+    /// [`CoverPhotos::title_epoch`]. 0 for a desktop.
+    title_epoch: u64,
 }
 
 /// A picture on its way.
@@ -260,6 +263,8 @@ struct Asked {
     at: Duration,
     size: IVec2,
     excluding: Vec<WinID>,
+    /// For a window, its title epoch when it was asked for.
+    title_epoch: u64,
 }
 
 /// Whether the engine may take pictures for the cover.
@@ -285,6 +290,8 @@ struct MorphReply {
     generation: u32,
     result: Result<Photo, PhotoError>,
     taken: Duration,
+    /// The window's title epoch when the picture was asked for.
+    title_epoch: u64,
 }
 
 /// The pictures the engine keeps for the cover.
@@ -296,9 +303,13 @@ pub(crate) struct CoverPhotos {
     /// the size a window heads to is here, and the cover shows the window as
     /// it will be laid out, rather than its old layout cropped or padded.
     previous: HashMap<WinID, Kept>,
-    /// When each window's title last changed. A picture taken before shows
-    /// another tab or document, so it is retaken first.
-    retitled: HashMap<WinID, Duration>,
+    /// How many times each window's title has changed, in the order the
+    /// changes arrived. A picture asked for at an earlier epoch shows
+    /// another tab or document: it is retaken first, and never shown as
+    /// the window heads to its size. Counting in event order, not by time,
+    /// holds even for a picture that arrives in the frame the title changes,
+    /// or after.
+    title_epoch: HashMap<WinID, u64>,
     desktops: HashMap<CGDirectDisplayID, Kept>,
     /// Windows whose last picture came out blank, and when to try again.
     blank_until: HashMap<WinID, Duration>,
@@ -323,46 +334,56 @@ impl CoverPhotos {
             .map(|kept| &kept.photo)
     }
 
+    /// Window `id`'s title epoch: how many title changes of it have
+    /// arrived.
+    fn title_epoch(&self, id: WinID) -> u64 {
+        self.title_epoch.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Whether `kept`, a picture of window `id`, was asked for before the
+    /// window's title last changed, so it shows another tab or document.
+    fn is_retitled(&self, id: WinID, kept: &Kept) -> bool {
+        kept.title_epoch < self.title_epoch(id)
+    }
+
     /// A kept picture of window `id` at `size`, the size it heads to, if it
     /// is recent enough: younger than [`PREVIOUS_KEEP`] when it `replaces`
     /// the window's picture on the cover, being no smaller, and than
     /// [`PREVIOUS_SHRINK_KEEP`] when it lies over that larger picture. The
     /// picture of the size it had before its current one comes first, then
     /// its current one, which a turn back to where a resize began finds
-    /// before a fresh picture of the new size replaces it, unless the
-    /// window's title changed since.
+    /// before a fresh picture of the new size replaces it. Neither may be
+    /// from before the window's title last changed.
     fn heading(&self, id: WinID, size: IVec2, replaces: bool, now: Duration) -> Option<&Photo> {
         let keep = if replaces {
             PREVIOUS_KEEP
         } else {
             PREVIOUS_SHRINK_KEEP
         };
-        let usable = |kept: &&Kept| close(kept.size, size) && now.saturating_sub(kept.taken) < keep;
-        let current = || {
-            self.windows.get(&id).filter(usable).filter(|kept| {
-                self.retitled
-                    .get(&id)
-                    .is_none_or(|retitled| kept.taken >= *retitled)
-            })
+        let epoch = self.title_epoch(id);
+        let usable = |kept: &&Kept| {
+            close(kept.size, size)
+                && now.saturating_sub(kept.taken) < keep
+                && kept.title_epoch == epoch
         };
         self.previous
             .get(&id)
             .filter(usable)
-            .or_else(current)
+            .or_else(|| self.windows.get(&id).filter(usable))
             .map(|kept| &kept.photo)
     }
 
     /// Keeps `kept` as the picture of window `id`. A picture of another
     /// size that it replaces stays as the window's previous one, unless it
-    /// was taken before the window's title last changed: it shows another
-    /// tab or document.
+    /// was asked for before the window's title last changed: it shows
+    /// another tab or document. Such a picture is never kept at all.
     fn keep_window(&mut self, id: WinID, kept: Kept) {
-        let retitled = self.retitled.get(&id).copied();
-        if retitled.is_some_and(|retitled| kept.taken >= retitled) {
-            self.retitled.remove(&id);
+        let epoch = self.title_epoch(id);
+        if kept.title_epoch < epoch {
+            return;
         }
         if let Some(old) = self.windows.insert(id, kept)
-            && retitled.is_none_or(|retitled| old.taken >= retitled)
+            && old.title_epoch == epoch
             && self
                 .windows
                 .get(&id)
@@ -376,16 +397,16 @@ impl CoverPhotos {
     fn forget_window(&mut self, id: WinID) {
         self.windows.remove(&id);
         self.previous.remove(&id);
-        self.retitled.remove(&id);
+        self.title_epoch.remove(&id);
     }
 
-    /// Notes that window `id` changed its title at `now`: its previous
-    /// picture shows what it held before, and its current one is retaken.
-    fn retitle(&mut self, id: WinID, now: Duration) {
+    /// Notes that window `id` changed its title: its previous picture shows
+    /// what it held before, its current one is retaken, and a picture on
+    /// its way shows the old title too, so it is dropped.
+    fn retitle(&mut self, id: WinID) {
+        *self.title_epoch.entry(id).or_insert(0) += 1;
         self.previous.remove(&id);
-        if self.windows.contains_key(&id) {
-            self.retitled.insert(id, now);
-        }
+        self.supersede(CoverSubject::Window(id));
     }
 
     fn desktop(&self, display: CGDirectDisplayID, excluding: &[WinID]) -> Option<&Photo> {
@@ -415,7 +436,7 @@ impl CoverPhotos {
     fn clear(&mut self) {
         self.windows.clear();
         self.previous.clear();
-        self.retitled.clear();
+        self.title_epoch.clear();
         self.desktops.clear();
         self.blank_until.clear();
         self.asked = None;
@@ -426,7 +447,7 @@ impl CoverPhotos {
     fn is_clear(&self) -> bool {
         self.windows.is_empty()
             && self.previous.is_empty()
-            && self.retitled.is_empty()
+            && self.title_epoch.is_empty()
             && self.desktops.is_empty()
             && self.blank_until.is_empty()
             && self.asked.is_none()
@@ -674,6 +695,7 @@ fn cover_enabled(config: &Config) -> bool {
 fn keep_cover_photos(
     mut messages: MessageReader<Event>,
     mut photos: ResMut<CoverPhotos>,
+    mut morphs: Query<&mut CoverMorph>,
     mut screen: Option<NonSendMut<CoverScreenHandle>>,
     config: Res<Config>,
     time: Res<Time>,
@@ -686,7 +708,12 @@ fn keep_cover_photos(
     }
     for event in messages.read() {
         if let Event::WindowTitleChanged { window_id } = event {
-            photos.retitle(*window_id, time.elapsed());
+            photos.retitle(*window_id);
+            // A resize's cover asks for a picture of the new title, and
+            // shows none it asked for before.
+            for mut morph in &mut morphs {
+                morph.invalidate_title(*window_id);
+            }
             continue;
         }
         let Event::CoverPhoto {
@@ -702,9 +729,7 @@ fn keep_cover_photos(
             apply_cover_reply(
                 &mut photos,
                 screen.as_deref_mut(),
-                *subject,
-                asked.size,
-                asked.excluding,
+                asked,
                 result,
                 time.elapsed(),
             );
@@ -718,9 +743,7 @@ fn keep_cover_photos(
             apply_cover_reply(
                 &mut photos,
                 screen.as_deref_mut(),
-                *subject,
-                asked.size,
-                asked.excluding,
+                asked,
                 result,
                 time.elapsed(),
             );
@@ -733,28 +756,30 @@ fn keep_cover_photos(
                 generation: *generation,
                 result: result.clone(),
                 taken: time.elapsed(),
+                title_epoch: asked.title_epoch,
             });
         }
     }
 }
 
-/// Applies one accepted capture reply to `photos` and `screen`.
+/// Applies one accepted capture reply, to the ask `asked`, to `photos` and
+/// `screen`.
 fn apply_cover_reply(
     photos: &mut CoverPhotos,
     screen: Option<&mut CoverScreenHandle>,
-    subject: CoverSubject,
-    size: IVec2,
-    excluding: Vec<WinID>,
+    asked: Asked,
     result: &Result<Photo, PhotoError>,
     now: Duration,
 ) {
+    let subject = asked.subject;
     match result {
         Ok(photo) => {
             let kept = Kept {
                 photo: photo.clone(),
-                size,
+                size: asked.size,
                 taken: now,
-                excluding,
+                excluding: asked.excluding,
+                title_epoch: asked.title_epoch,
             };
             match subject {
                 CoverSubject::Window(id) => {
@@ -1890,6 +1915,9 @@ fn refresh_cover_photos(
         photos.forget_window(id);
         screen.0.forget(Some(id));
     }
+    // A window that changed its title without a kept picture still has an
+    // epoch, which goes with the window.
+    photos.title_epoch.retain(|id, _| alive.contains(id));
 
     // The strip each display shows, so every display's next move is ready.
     let rows = displays
@@ -1918,12 +1946,17 @@ fn refresh_cover_photos(
                 .photograph_desktop(display, &want.excluding, generation);
         }
     }
+    let title_epoch = match want.subject {
+        CoverSubject::Window(id) => photos.title_epoch(id),
+        CoverSubject::Desktop(_) => 0,
+    };
     photos.asked = Some(Asked {
         subject: want.subject,
         generation,
         at: now,
         size: want.size,
         excluding: want.excluding,
+        title_epoch,
     });
 }
 
@@ -1999,12 +2032,7 @@ fn next_picture(
             let size = window.frame.size();
             let kept = photos.windows.get(&window.id);
             let age = kept.map_or(Duration::MAX, |kept| now.saturating_sub(kept.taken));
-            let retitled = kept.is_some_and(|kept| {
-                photos
-                    .retitled
-                    .get(&window.id)
-                    .is_some_and(|retitled| kept.taken < *retitled)
-            });
+            let retitled = kept.is_some_and(|kept| photos.is_retitled(window.id, kept));
             let priority = match kept {
                 None => 0,
                 Some(kept) if !close(kept.size, size) => 0,
