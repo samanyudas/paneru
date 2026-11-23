@@ -1,14 +1,12 @@
 use bevy::app::{App, Plugin, PreUpdate, Update};
-use bevy::ecs::change_detection::DetectChanges as _;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::{Message, MessageReader, MessageWriter};
-use bevy::ecs::query::{Has, With, Without};
+use bevy::ecs::query::{Changed, Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::SystemCondition as _;
 use bevy::ecs::system::{Commands, Local, Populated, Query, Res, ResMut, Single};
-use bevy::ecs::world::Ref;
 use bevy::math::IRect;
 use bevy::time::Time;
 use std::collections::VecDeque;
@@ -210,9 +208,29 @@ type SettlingStrip = (
     Has<NativeFullscreenMarker>,
     &'static mut Position,
     &'static mut Scrolling,
-    Option<Ref<'static, RepositionMarker>>,
-    Has<crate::ecs::strip_cover::CoverSwipe>,
+    Has<RepositionMarker>,
 );
+
+/// The strips under a covered swipe that a strip move has just reached.
+type CoverMoves<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    (
+        With<crate::ecs::strip_cover::CoverSwipe>,
+        Changed<RepositionMarker>,
+    ),
+>;
+
+/// Whether strip `entity`, its fingers lifted, waits for its covered swipe
+/// to take a strip move that has just reached it. The cover first tells a
+/// move from one to where the strip already is, and carries a move on from
+/// where the strip shows at the speed it has, so no scroll system moves the
+/// strip, holds it, or slows it in the meantime. The fingers keep a strip
+/// they drive.
+fn awaits_cover(entity: Entity, scroll: &Scrolling, moves: &CoverMoves) -> bool {
+    !scroll.is_user_swiping && moves.contains(entity)
+}
 
 impl Plugin for ScrollEventsPlugin {
     fn build(&self, app: &mut App) {
@@ -742,12 +760,16 @@ fn land_unshown_strips(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn apply_inertia(
     mut strips: Populated<(Entity, &mut Scrolling), With<LayoutStrip>>,
+    moves: CoverMoves,
     time: Res<Time>,
     config: Res<Config>,
 ) {
     let dt = time.delta_secs_f64();
-    for (_, mut scroll) in &mut strips {
-        if scroll.is_user_swiping || scroll.settle.is_some() {
+    for (entity, mut scroll) in &mut strips {
+        if scroll.is_user_swiping
+            || scroll.settle.is_some()
+            || awaits_cover(entity, &scroll, &moves)
+        {
             continue;
         }
 
@@ -766,6 +788,7 @@ pub(crate) fn apply_inertia(
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_snap_force(
     strips: ScrollingStrips,
+    moves: CoverMoves,
     displays: StripDisplays,
     windows: Windows,
     config: Res<Config>,
@@ -778,7 +801,10 @@ fn apply_snap_force(
         return;
     }
 
-    for (_, strip, child, _, position, mut scroll) in strips {
+    for (entity, strip, child, _, position, mut scroll) in strips {
+        if awaits_cover(entity, &scroll, &moves) {
+            continue;
+        }
         let Some((_, viewport)) = viewports(child, &displays, &config) else {
             continue;
         };
@@ -1114,6 +1140,7 @@ pub(super) fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn settle_strip(
     strips: Populated<SettlingStrip, (With<LayoutStrip>, Without<Window>)>,
+    moves: CoverMoves,
     displays: StripDisplays,
     windows: Windows,
     focus_history: Res<FocusHistory>,
@@ -1122,8 +1149,7 @@ fn settle_strip(
     mut haptics: MessageWriter<PageHapticRequest>,
     mut commands: Commands,
 ) {
-    for (entity, strip, child, fullscreen, mut position, mut scroll, reposition, covered) in strips
-    {
+    for (entity, strip, child, fullscreen, mut position, mut scroll, repositioning) in strips {
         if !settles(&config, fullscreen) || scroll.is_user_swiping {
             continue;
         }
@@ -1132,15 +1158,12 @@ fn settle_strip(
                 entity_commands.try_remove::<Scrolling>();
             }
         };
-        // A deliberate move (keyboard focus, Center) has taken the strip over.
-        // Under the picture cover, the covered swipe first tells a move from
-        // one to where the strip already is: it carries a move on at the
-        // speed the settle has, and lets the settle go on past one that moves
-        // nothing.
-        if let Some(reposition) = reposition {
-            if covered && reposition.is_changed() {
-                continue;
-            }
+        // A deliberate move (keyboard focus, Center) has taken the strip over,
+        // once a covered swipe has had it first.
+        if awaits_cover(entity, &scroll, &moves) {
+            continue;
+        }
+        if repositioning {
             finish(&mut commands);
             continue;
         }
@@ -1377,6 +1400,7 @@ fn direction_modifier(config: &Config) -> f64 {
 #[instrument(level = Level::TRACE, skip_all)]
 fn scrolling_integrator(
     strips: ScrollingStrips,
+    moves: CoverMoves,
     displays: StripDisplays,
     time: Res<Time>,
     config: Res<Config>,
@@ -1384,7 +1408,10 @@ fn scrolling_integrator(
     let dt = time.delta_secs_f64().min(MAX_STEP_SECS);
     let direction = direction_modifier(&config);
 
-    for (_, _, child, fullscreen, _, mut scroll) in strips {
+    for (entity, _, child, fullscreen, _, mut scroll) in strips {
+        if awaits_cover(entity, &scroll, &moves) {
+            continue;
+        }
         let Some((_, viewport)) = viewports(child, &displays, &config) else {
             continue;
         };
@@ -1406,11 +1433,15 @@ fn scrolling_integrator(
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_scrolling_constraints(
     strips: ScrollingStrips,
+    moves: CoverMoves,
     displays: StripDisplays,
     windows: Windows,
     config: Res<Config>,
 ) {
-    for (_, strip, child, fullscreen, mut position, mut scroll) in strips {
+    for (entity, strip, child, fullscreen, mut position, mut scroll) in strips {
+        if awaits_cover(entity, &scroll, &moves) {
+            continue;
+        }
         let Some((_, viewport)) = viewports(child, &displays, &config) else {
             continue;
         };

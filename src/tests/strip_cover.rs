@@ -1725,6 +1725,70 @@ fn a_move_during_a_stretched_swipe_carries_the_speed_the_strip_shows() {
     );
 }
 
+/// A move that arrives once the fingers lift from a stretched covered
+/// swipe, before its settle starts, slides the pictures on from where the
+/// strip shows, at the speed it shows. The scroll systems first coasted the
+/// strip a frame on and held it to its start, so the pictures jumped there
+/// and slid on from rest.
+#[test]
+fn a_move_as_a_stretched_swipe_lifts_slides_on_from_where_it_shows() {
+    let config = config(true, Some(14.0));
+    let (mut harness, log) = harness(config.clone());
+    take_pictures(&mut harness, &log);
+    send(&mut harness, Event::TouchpadDown);
+    for _ in 0..4 {
+        send(&mut harness, swipe(-0.05));
+        harness.advance(ONE_FRAME);
+    }
+    let strip = swiped_strip(harness.world());
+    let position = harness
+        .world()
+        .get::<crate::ecs::Position>(strip)
+        .expect("a strip position")
+        .0;
+    assert!(position.x > 0, "the strip stretches past its start");
+    // The fingers lift, and the swipe has timed out with no settle yet.
+    {
+        let mut scroll = harness
+            .world()
+            .get_mut::<crate::ecs::Scrolling>(strip)
+            .expect("the strip scrolls");
+        scroll.is_user_swiping = false;
+        scroll.fingers_down = false;
+        assert!(scroll.settle.is_none(), "no settle has started");
+    }
+    let scroll = scrolling_of(harness.world(), strip);
+    let shows = crate::ecs::scroll::strip_speed(&scroll, f64::from(TEST_DISPLAY_WIDTH), &config);
+    assert!(shows > 100.0, "the strip still moves: {shows}");
+
+    let away = position.with_x(position.x + 40);
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(away));
+    harness.advance(ONE_FRAME);
+    let (_, slide) = sliding_strip(harness.world());
+    assert_eq!(slide.heading(), Some(away), "the pictures slide on");
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::Scrolling>(strip)
+            .is_none(),
+        "the swipe gives way to the move"
+    );
+    let path = log.borrow().paths.last().cloned().expect("a slide");
+    assert_eq!(
+        path.first().copied(),
+        Some(f64::from(position.x)),
+        "the slide starts where the strip shows"
+    );
+    let carried = starting_speed(&path);
+    assert!(
+        carried > 0.5 * shows,
+        "at the speed it shows: {carried} vs {shows}"
+    );
+}
+
 /// A swipe that takes over a slide's landing keeps every window the slide's
 /// cover hid, and its own landing waits for each of them, as for a window
 /// the window server still shows where it was.
