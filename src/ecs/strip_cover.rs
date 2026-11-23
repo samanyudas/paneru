@@ -1402,9 +1402,9 @@ fn rebase(scroll: &mut Scrolling, showing: f64, target: i32) {
     scroll.caught = Some(showing);
 }
 
-/// Moves each trackpad swipe that starts while a slide's pictures move to
-/// where they show, before the scroll systems hold the strip to its ends
-/// and columns and pick its landing column from where it rests.
+/// Moves each trackpad swipe that starts while a slide's pictures move or
+/// rest landed to where they show, before the scroll systems hold the strip
+/// to its ends and columns and pick its landing column from where it rests.
 /// [`cover_strip_moves`] then hands the cover over to the swipe as it is.
 fn catch_slides(
     mut strips: Query<(&mut CoverSlide, &mut Scrolling), Added<Scrolling>>,
@@ -1416,10 +1416,16 @@ fn catch_slides(
         return;
     };
     for (mut slide, mut scroll) in &mut strips {
-        if scroll.input != ScrollInput::Gesture || slide.landing.is_some() {
+        if scroll.input != ScrollInput::Gesture {
             continue;
         }
-        let showing = sample(&mut slide, screen.0.as_ref(), step.secs(), time.elapsed());
+        // Landed pictures rest at the slide's target, which may lie past an
+        // end, as a centered strip does, while the real windows catch up.
+        let showing = if slide.landing.is_none() {
+            sample(&mut slide, screen.0.as_ref(), step.secs(), time.elapsed())
+        } else {
+            f64::from(slide.target.x)
+        };
         rebase(&mut scroll, showing, slide.target.x);
         slide.caught = Some(showing);
     }

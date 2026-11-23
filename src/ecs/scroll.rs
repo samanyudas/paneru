@@ -551,6 +551,7 @@ pub(crate) fn swipe_gesture(
                 lifted_at: None,
                 caught: None,
                 slope: 1.0,
+                excess: None,
             });
         }
     }
@@ -885,37 +886,69 @@ fn unresist(shown: f64, viewport_width: f64) -> f64 {
     shown * limit / (RUBBER_BAND * (limit - shown.abs()))
 }
 
-/// How far a strip stretched past `edge`, an end of the offsets `range`
-/// it settles in, moves for each point of finger travel. At the hold, a
-/// viewport `width` past either end, fingers that push on outward move
-/// nothing.
-fn stretch_slope(
+/// Whether the fingers push a strip at `position` on outward while it is
+/// held at either bound of `(low, high)`, so it does not move with them.
+fn pushed_against(
     scroll: &Scrolling,
-    edge: f64,
-    (start, end): (f64, f64),
-    width: f64,
+    position: f64,
+    (low, high): (f64, f64),
     config: &Config,
-) -> f64 {
+) -> bool {
     let outward = scroll.velocity * direction_modifier(config);
-    let held = (scroll.position <= start - width + 1e-6 && outward <= 0.0)
-        || (scroll.position >= end + width - 1e-6 && outward >= 0.0);
-    if held {
-        0.0
-    } else {
-        resist_slope(scroll.position - edge, width)
-    }
+    (position <= low + 1e-6 && outward < 0.0) || (position >= high - 1e-6 && outward > 0.0)
 }
 
-/// Turns `scroll.position`, which holds where the strip shows, `caught`,
-/// plus the fingers' travel since, into the finger travel that shows the
-/// strip there when it resists past either edge of `edges`, so the
-/// resistance is not laid on twice. Does nothing without `caught`.
+/// Where the strip shows for `scroll.position`, and how far it moves for
+/// each point of finger travel: freely between the `edges`, and with
+/// rubber-band resistance past them, or around them when they meet. The
+/// part of a caught place that resistance cannot show, `scroll.excess`,
+/// fades as the stretch eases back toward the edge, and goes once it is
+/// gone or the fingers cross the edge.
+fn resisted(scroll: &mut Scrolling, edges: (f64, f64), width: f64) -> (f64, f64) {
+    let (low, high) = (edges.0.min(edges.1), edges.0.max(edges.1));
+    let edge = scroll.position.clamp(low, high);
+    let stretch = scroll.position - edge;
+    let (mut shown, mut slope) = if low < high && stretch == 0.0 {
+        (scroll.position, 1.0)
+    } else {
+        (edge + resist(stretch, width), resist_slope(stretch, width))
+    };
+    if let Some((excess, caught)) = scroll.excess {
+        let share = if caught == 0.0 {
+            0.0
+        } else {
+            (stretch / caught).clamp(0.0, 1.0)
+        };
+        shown += excess * share;
+        if share > 0.0 && share < 1.0 {
+            slope += excess / caught;
+        }
+        if share <= 0.0 {
+            scroll.excess = None;
+        }
+    }
+    (shown, slope)
+}
+
+/// Turns `scroll.position` and `scroll.origin`, which hold where the strip
+/// shows, `caught`, plus the fingers' travel since, into the finger travel
+/// that shows the strip there when it resists past either edge of `edges`,
+/// so the resistance is not laid on twice and the travel since the catch
+/// stays the fingers' own. The stretch is held to a viewport `width`, as an
+/// overflowing strip's is, and what resistance cannot show of a place
+/// further out is kept as `scroll.excess`. Does nothing without `caught`.
 fn catch_at(scroll: &mut Scrolling, caught: Option<f64>, edges: (f64, f64), width: f64) {
     let Some(shown) = caught else {
         return;
     };
     let edge = shown.clamp(edges.0.min(edges.1), edges.0.max(edges.1));
-    scroll.position += edge + unresist(shown - edge, width) - shown;
+    let past = shown - edge;
+    let stretch = unresist(past, width).clamp(-width, width);
+    let excess = past - resist(stretch, width);
+    let correction = edge + stretch - shown;
+    scroll.position += correction;
+    scroll.origin += correction;
+    scroll.excess = (excess.abs() >= 0.5).then_some((excess, stretch));
 }
 
 /// How fast a resisting strip moves for each point the fingers move, at
@@ -1418,9 +1451,9 @@ fn constrain(
         // eases off along the same curve when the fingers turn back.
         let anchor = scroll.anchor.clamp(fitted.0, fitted.1);
         catch_at(scroll, caught, (anchor, anchor), width);
-        let stretch = scroll.position - anchor;
-        position.x = round_px(anchor + resist(stretch, width));
-        scroll.slope = resist_slope(stretch, width);
+        let (shown, slope) = resisted(scroll, (anchor, anchor), width);
+        position.x = round_px(shown);
+        scroll.slope = slope;
         return;
     }
 
@@ -1446,18 +1479,7 @@ fn constrain(
         };
         if let (Some(next), Some(previous)) = (reach(true), reach(false)) {
             catch_at(scroll, caught, (next, previous), width);
-            let (shown, slope) = if scroll.position < next {
-                let stretch = scroll.position - next;
-                (next + resist(stretch, width), resist_slope(stretch, width))
-            } else if scroll.position > previous {
-                let stretch = scroll.position - previous;
-                (
-                    previous + resist(stretch, width),
-                    resist_slope(stretch, width),
-                )
-            } else {
-                (scroll.position, 1.0)
-            };
+            let (shown, slope) = resisted(scroll, (next, previous), width);
             position.x = round_px(shown);
             scroll.slope = slope;
             return;
@@ -1476,14 +1498,19 @@ fn constrain(
         if swiping {
             catch_at(scroll, caught, (start, end), width);
         }
-        let edge = scroll.position.clamp(start, end);
         let past_an_end = !(start..=end).contains(&scroll.position);
-        if swiping && past_an_end {
+        if swiping && (past_an_end || scroll.excess.is_some()) {
             // Held within a viewport past either end, so fingers that turn
             // back soon move the strip again.
-            scroll.position = scroll.position.clamp(start - width, end + width);
-            position.x = round_px(edge + resist(scroll.position - edge, width));
-            scroll.slope = stretch_slope(scroll, edge, (start, end), width, config);
+            let hold = (start - width, end + width);
+            scroll.position = scroll.position.clamp(hold.0, hold.1);
+            let (shown, slope) = resisted(scroll, (start, end), width);
+            position.x = round_px(shown);
+            scroll.slope = if pushed_against(scroll, scroll.position, hold, config) {
+                0.0
+            } else {
+                slope
+            };
             return;
         }
         if !scroll.is_user_swiping && scroll.settle.is_some() && past_an_end {
@@ -1505,11 +1532,19 @@ fn constrain(
         config,
     ) {
         position.x = clamped_offset;
-        // A strip the clamp holds at an end does not move with the fingers.
-        scroll.slope = if clamped_offset == round_px(scroll.position) {
-            1.0
-        } else {
+        // A strip the clamp holds at an end does not move with the fingers,
+        // nor one at the end that they push on past it.
+        let rounded = round_px(scroll.position);
+        let outward = scroll.velocity * direction_modifier(config);
+        #[allow(clippy::cast_possible_truncation)]
+        let pushed = rounded + outward.signum() as i32;
+        let held = outward != 0.0
+            && clamp_viewport_offset(pushed, strip, windows, &get_window_frame, &viewport, config)
+                == Some(clamped_offset);
+        scroll.slope = if clamped_offset != rounded || held {
             0.0
+        } else {
+            1.0
         };
         // A settle's last pixels move less than one per frame, so it keeps
         // the fraction rounding would discard unless the clamp bit.

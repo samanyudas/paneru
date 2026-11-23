@@ -566,6 +566,11 @@ pub struct Scrolling {
     /// freely, less while it resists past an end or a column, and 0 while
     /// it is held.
     pub slope: f64,
+    /// The part of a caught place that resistance cannot show, and the
+    /// stretch past the edge that stood for the rest of it when the
+    /// fingers caught the strip. It fades as the fingers bring the strip
+    /// back toward the edge, so a caught strip never jumps.
+    pub excess: Option<(f64, f64)>,
 }
 
 /// The progress of a settle along its ease. See `scroll::settle_strip`.
@@ -1717,6 +1722,7 @@ mod tests {
                     lifted_at: None,
                     caught: None,
                     slope: 1.0,
+                    excess: None,
                 });
             }),
             "overlay must rerun to hide when Scrolling starts"
