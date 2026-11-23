@@ -52,6 +52,8 @@ struct Screen {
     /// Each picture a resize's cover put in place of an older one, and the
     /// size it shows.
     replaced: Vec<(WinID, IVec2)>,
+    /// Each picture shown at the size its window heads to.
+    headed: Vec<(WinID, IVec2)>,
     hidden: usize,
 }
 
@@ -121,6 +123,17 @@ impl CoverScreen for RecordingScreen {
         _photo: &Photo,
     ) -> bool {
         self.0.borrow_mut().replaced.push((window, size));
+        true
+    }
+
+    fn head_picture(
+        &mut self,
+        _display: CGDirectDisplayID,
+        window: WinID,
+        size: IVec2,
+        _photo: &Photo,
+    ) -> bool {
+        self.0.borrow_mut().headed.push((window, size));
         true
     }
 
@@ -1658,6 +1671,72 @@ fn a_maximize_and_restore_morph_under_the_cover() {
         "real window snaps directly to restored frame with no premature hold write"
     );
     assert_eq!(restore_paths[0].last().copied(), Some(rest_0));
+}
+
+/// Maximizes window 1 of two side by side, answers the fresh picture of
+/// its maximized frame, and lets the cover lift. Returns window 1's frame
+/// at rest before the maximize.
+fn maximized_with_its_picture(harness: &mut TestHarness, log: &ScreenLog) -> IRect {
+    send(
+        harness,
+        resize(crate::types::commands::ResizeDirection::Shrink),
+    );
+    frames_of(harness, &[0, 1]);
+    send(harness, focus(Direction::East));
+    for _ in 0..40 {
+        harness.advance(ONE_FRAME);
+    }
+    take_pictures(harness, log);
+    let rest = shown_window_frame(harness.world(), 1);
+    let since = log.borrow().window_asks.len();
+    send(harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    let asks = window_asks_since(log, since);
+    assert_eq!(asks.len(), 1, "fresh picture asked for maximized window");
+    answer(harness, 1, asks[0].2);
+    harness.advance(ONE_FRAME);
+    shown_frames_of(harness, &[1]);
+    harness.advance(ONE_FRAME);
+    rest
+}
+
+/// A restore shows the window as it was before the maximize from its first
+/// frame, from the picture kept of that size, so its frame closes onto the
+/// layout it will have rather than onto the maximized layout's corner.
+#[test]
+fn a_restore_shows_the_window_as_it_was_before_the_maximize() {
+    let (mut harness, log) = harness(padded_resize_config());
+    let rest = maximized_with_its_picture(&mut harness, &log);
+    assert!(
+        log.borrow().headed.is_empty(),
+        "the first maximize has no picture of the maximized window"
+    );
+
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "restore runs under a cover");
+    assert_eq!(
+        log.borrow().headed,
+        vec![(1, rest.size())],
+        "the restore shows window 1's picture from before the maximize"
+    );
+}
+
+/// A window whose title changed while it was maximized shows another tab or
+/// document, so its picture from before is not shown.
+#[test]
+fn a_restore_of_a_retitled_window_does_not_show_it_as_it_was() {
+    let (mut harness, log) = harness(padded_resize_config());
+    maximized_with_its_picture(&mut harness, &log);
+
+    harness.run(vec![Event::WindowTitleChanged { window_id: 1 }]);
+    send(&mut harness, maximize_cmd());
+    harness.advance(ONE_FRAME);
+    assert!(morphed(harness.world()), "restore runs under a cover");
+    assert!(
+        log.borrow().headed.is_empty(),
+        "the picture from before the title changed is not shown"
+    );
 }
 
 /// Maximizing a stacked window unstacks it into a full-screen column (changing

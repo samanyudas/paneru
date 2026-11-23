@@ -71,6 +71,12 @@ const LANDED_FRAMES: u8 = 2;
 /// How often the focused window's picture is refreshed, so typing shows.
 const FOCUSED_REFRESH: Duration = Duration::from_secs(1);
 
+/// How long a window's picture at the size it had before is kept. A window
+/// that returns to that size, as a maximized window that is restored does,
+/// shows it while it gets there. An older one shows too little of what the
+/// window holds now.
+const PREVIOUS_KEEP: Duration = Duration::from_mins(10);
+
 /// How often every other window's picture is refreshed.
 const WINDOW_REFRESH: Duration = Duration::from_secs(6);
 
@@ -186,6 +192,19 @@ pub(crate) trait CoverScreen {
         size: IVec2,
         photo: &Photo,
     ) -> bool;
+    /// Shows `photo`, a picture of `window` at the `size` its frame on the
+    /// cover of `display` heads to, at once: in place of the picture there
+    /// when the frame grows to that size, and over that picture's top left
+    /// corner when the frame shrinks to it. The window then shows as it
+    /// will be laid out while its frame gets there. Returns `false`, and
+    /// changes nothing, when the frame does not head to `size`.
+    fn head_picture(
+        &mut self,
+        display: CGDirectDisplayID,
+        window: WinID,
+        size: IVec2,
+        photo: &Photo,
+    ) -> bool;
     /// How far along its morph the cover of `display` shows its pictures
     /// now, as Core Animation draws them, from 0 to 1. `None` when it
     /// cannot tell.
@@ -255,6 +274,14 @@ struct MorphReply {
 #[derive(Resource, Debug, Default)]
 pub(crate) struct CoverPhotos {
     windows: HashMap<WinID, Kept>,
+    /// Each window's last picture at the size it had before its current one.
+    /// A maximize and its restore go between two sizes, so the picture of
+    /// the size a window heads to is here, and the cover shows the window as
+    /// it will be laid out, rather than its old layout cropped or padded.
+    previous: HashMap<WinID, Kept>,
+    /// When each window's title last changed. A picture taken before shows
+    /// another tab or document, so it is retaken first.
+    retitled: HashMap<WinID, Duration>,
     desktops: HashMap<CGDirectDisplayID, Kept>,
     /// Windows whose last picture came out blank, and when to try again.
     blank_until: HashMap<WinID, Duration>,
@@ -277,6 +304,52 @@ impl CoverPhotos {
             .get(&id)
             .filter(|kept| close(kept.size, size))
             .map(|kept| &kept.photo)
+    }
+
+    /// The picture of window `id` at `size`, a size it had before its
+    /// current one and now heads back to, if it is recent enough.
+    fn heading(&self, id: WinID, size: IVec2, now: Duration) -> Option<&Photo> {
+        self.previous
+            .get(&id)
+            .filter(|kept| close(kept.size, size))
+            .filter(|kept| now.saturating_sub(kept.taken) < PREVIOUS_KEEP)
+            .map(|kept| &kept.photo)
+    }
+
+    /// Keeps `kept` as the picture of window `id`. A picture of another
+    /// size that it replaces stays as the window's previous one.
+    fn keep_window(&mut self, id: WinID, kept: Kept) {
+        if self
+            .retitled
+            .get(&id)
+            .is_some_and(|retitled| kept.taken >= *retitled)
+        {
+            self.retitled.remove(&id);
+        }
+        if let Some(old) = self.windows.insert(id, kept)
+            && self
+                .windows
+                .get(&id)
+                .is_some_and(|new| !close(old.size, new.size))
+        {
+            self.previous.insert(id, old);
+        }
+    }
+
+    /// Forgets every picture of window `id`.
+    fn forget_window(&mut self, id: WinID) {
+        self.windows.remove(&id);
+        self.previous.remove(&id);
+        self.retitled.remove(&id);
+    }
+
+    /// Notes that window `id` changed its title at `now`: its previous
+    /// picture shows what it held before, and its current one is retaken.
+    fn retitle(&mut self, id: WinID, now: Duration) {
+        self.previous.remove(&id);
+        if self.windows.contains_key(&id) {
+            self.retitled.insert(id, now);
+        }
     }
 
     fn desktop(&self, display: CGDirectDisplayID, excluding: &[WinID]) -> Option<&Photo> {
@@ -305,6 +378,8 @@ impl CoverPhotos {
 
     fn clear(&mut self) {
         self.windows.clear();
+        self.previous.clear();
+        self.retitled.clear();
         self.desktops.clear();
         self.blank_until.clear();
         self.asked = None;
@@ -314,6 +389,8 @@ impl CoverPhotos {
 
     fn is_clear(&self) -> bool {
         self.windows.is_empty()
+            && self.previous.is_empty()
+            && self.retitled.is_empty()
             && self.desktops.is_empty()
             && self.blank_until.is_empty()
             && self.asked.is_none()
@@ -516,6 +593,10 @@ fn keep_cover_photos(
         return;
     }
     for event in messages.read() {
+        if let Event::WindowTitleChanged { window_id } = event {
+            photos.retitle(*window_id, time.elapsed());
+            continue;
+        }
         let Event::CoverPhoto {
             subject,
             generation,
@@ -586,7 +667,7 @@ fn apply_cover_reply(
             match subject {
                 CoverSubject::Window(id) => {
                     photos.blank_until.remove(&id);
-                    photos.windows.insert(id, kept);
+                    photos.keep_window(id, kept);
                 }
                 CoverSubject::Desktop(display) => {
                     photos.desktops.insert(display, kept);
@@ -603,7 +684,7 @@ fn apply_cover_reply(
             // A failed lookup is looked up afresh next time.
             if let CoverSubject::Window(id) = subject {
                 if *error == PhotoError::WindowGone {
-                    photos.windows.remove(&id);
+                    photos.forget_window(id);
                 }
                 if let Some(screen) = screen {
                     screen.0.forget(Some(id));
@@ -1455,7 +1536,7 @@ fn refresh_cover_photos(
         .copied()
         .collect::<Vec<_>>();
     for id in gone {
-        photos.windows.remove(&id);
+        photos.forget_window(id);
         screen.0.forget(Some(id));
     }
 
@@ -1567,9 +1648,18 @@ fn next_picture(
             let size = window.frame.size();
             let kept = photos.windows.get(&window.id);
             let age = kept.map_or(Duration::MAX, |kept| now.saturating_sub(kept.taken));
+            let retitled = kept.is_some_and(|kept| {
+                photos
+                    .retitled
+                    .get(&window.id)
+                    .is_some_and(|retitled| kept.taken < *retitled)
+            });
             let priority = match kept {
                 None => 0,
                 Some(kept) if !close(kept.size, size) => 0,
+                // Its title changed since, so it shows another tab or
+                // document.
+                Some(_) if retitled => 1,
                 Some(_) if focused && age >= FOCUSED_REFRESH => 2,
                 Some(_) if age >= WINDOW_REFRESH => 4,
                 Some(_) => continue,

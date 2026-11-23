@@ -214,6 +214,14 @@ impl Framed {
         self.picture.setPosition(CGPoint::new(0.0, height));
     }
 
+    /// Takes away the picture [`CoverScreen::head_picture`] laid over this
+    /// one's top left corner, if any.
+    fn drop_heading(&self) {
+        // SAFETY: the picture layer's only sublayers are the ones
+        // `head_picture` added.
+        unsafe { self.picture.setSublayers(None) };
+    }
+
     /// Sets the frame up to move from `from` to `to` along `shares` over
     /// `duration` seconds, in the strip layer's space: a frame wider or taller
     /// than the picture shows the fill only while its presented size exceeds
@@ -232,6 +240,9 @@ impl Framed {
             narrowest < self.picture_size.width - 0.5 || shortest < self.picture_size.height - 0.5;
         self.container
             .setCornerRadius(if opens || crops { FRAME_RADIUS } else { 0.0 });
+        // A picture of where the last morph headed is not where this one
+        // heads.
+        self.drop_heading();
         self.picture.removeAllAnimations();
         self.place_picture(to.size.height);
         if duration > 0.0 && (to.size.height - from.size.height).abs() >= f64::EPSILON {
@@ -880,6 +891,7 @@ impl CoverScreen for CoverScreenOS {
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         let image: &CFType = &photo.image;
+        framed.drop_heading();
         unsafe { framed.picture.setContents(Some(image.as_ref())) };
         framed.picture_size = picture_size;
         // Because `picture` is anchored at its top-left `(0, 1)` and its
@@ -908,6 +920,63 @@ impl CoverScreen for CoverScreenOS {
         CATransaction::flush();
         debug!(
             "cover picture of window {window} replaced at {}x{}",
+            size.x, size.y
+        );
+        true
+    }
+
+    fn head_picture(
+        &mut self,
+        display: CGDirectDisplayID,
+        window: WinID,
+        size: IVec2,
+        photo: &Photo,
+    ) -> bool {
+        let scale = self.scale_at(Self::display_bounds(display));
+        let Some(framed) = self
+            .covers
+            .get(&display)
+            .filter(|cover| cover.shown)
+            .and_then(|cover| cover.layers.iter().find(|framed| framed.id == window))
+        else {
+            return false;
+        };
+        let heading = CGSize::new(f64::from(size.x), f64::from(size.y));
+        // The frame's own size is the one its morph ends at.
+        let target = framed.container.bounds().size;
+        if (target.width - heading.width).abs() > 0.5
+            || (target.height - heading.height).abs() > 0.5
+        {
+            return false;
+        }
+        let shown = framed.picture_size;
+        if heading.width >= shown.width - 0.5 && heading.height >= shown.height - 0.5 {
+            // The frame grows to `size`: it opens onto this picture, which
+            // shows the window as wide as it will be, in place of the fill.
+            return self.replace_picture(display, window, size, photo);
+        }
+        if heading.width > shown.width + 0.5 || heading.height > shown.height + 0.5 {
+            // Wider and shorter, or taller and narrower: neither picture
+            // covers the other.
+            return false;
+        }
+        // The frame shrinks to `size`: this picture lies over the top left
+        // corner of the larger one, which shows on around it until the
+        // frame has closed over it.
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        framed.drop_heading();
+        let image: &CFType = &photo.image;
+        let over = Self::picture(
+            image,
+            CGRect::new(CGPoint::new(0.0, shown.height - heading.height), heading),
+            scale,
+        );
+        framed.picture.addSublayer(&over);
+        CATransaction::commit();
+        CATransaction::flush();
+        debug!(
+            "cover picture of window {window} headed to {}x{}",
             size.x, size.y
         );
         true

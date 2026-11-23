@@ -756,6 +756,24 @@ pub(super) fn cover_resizes(
         screen
             .0
             .morph(display.id(), &morph.sent(), &morph.shares(), PATH_STEP);
+        // A window that returns to a size it had before, as a maximized
+        // window that is restored does, shows its picture at that size from
+        // the start. A window that grows still gets a fresh picture once it
+        // shows its new frame, which then takes this one's place unseen.
+        for frame in &morph.frames {
+            if frame.to.size() != frame.from.size()
+                && let Some(photo) = photos.heading(frame.id, frame.to.size(), time.elapsed())
+                && screen
+                    .0
+                    .head_picture(display.id(), frame.id, frame.to.size(), photo)
+            {
+                debug!(
+                    "cover over resized strip {entity} shows window {} as it was at {}",
+                    frame.id,
+                    frame.to.size()
+                );
+            }
+        }
         debug!("cover over resized strip {entity}: {shown} pictures");
         commands.entity(entity).insert(morph);
     }
