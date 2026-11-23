@@ -932,9 +932,13 @@ pub(super) fn apply_morph_replies(
             let still_matches = windows
                 .iter()
                 .find(|(window, ..)| window.id() == reply.id)
-                .is_some_and(|(_, bounds, resize)| {
-                    let target = resize.map_or(bounds.0, |marker| marker.0);
-                    close(target, reply.size)
+                .is_some_and(|(window, bounds, resize)| {
+                    let cell = resize.map_or(bounds.0, |marker| marker.0);
+                    let shown_target = window
+                        .margins()
+                        .shown(IRect::from_corners(IVec2::ZERO, cell))
+                        .size();
+                    close(shown_target, reply.size)
                 });
             if !still_matches {
                 continue;
@@ -984,15 +988,18 @@ fn unveil_ready_pictures(morphs: &mut Query<&mut CoverMorph>, screen: &mut dyn s
                 .pictured(entity)
                 .is_some_and(|pictured| fits.x > pictured.x)
             {
-                screen.replace_picture(morph.display, id, fits, &photo);
-                if let Some((_, pictured)) = morph
-                    .pictured
-                    .iter_mut()
-                    .find(|(pictured_entity, _)| *pictured_entity == entity)
-                {
-                    *pictured = fits;
+                if screen.replace_picture(morph.display, id, fits, &photo) {
+                    if let Some((_, pictured)) = morph
+                        .pictured
+                        .iter_mut()
+                        .find(|(pictured_entity, _)| *pictured_entity == entity)
+                    {
+                        *pictured = fits;
+                    }
+                    debug!("cover over a resize shows the fresh picture of window {id}");
+                } else {
+                    morph.pending_unveil.push((entity, id, fits, photo));
                 }
-                debug!("cover over a resize shows the fresh picture of window {id}");
             }
         }
     }

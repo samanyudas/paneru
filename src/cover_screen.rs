@@ -808,14 +808,24 @@ impl CoverScreen for CoverScreenOS {
         window: WinID,
         size: IVec2,
         photo: &Photo,
-    ) {
+    ) -> bool {
         let Some(cover) = self.covers.get_mut(&display).filter(|cover| cover.shown) else {
-            return;
+            return false;
         };
         let Some(framed) = cover.layers.iter_mut().find(|framed| framed.id == window) else {
-            return;
+            return false;
         };
         let picture_size = CGSize::new(f64::from(size.x), f64::from(size.y));
+        let target = framed.container.bounds().size;
+        // If Core Animation's live presented width is still wider than the
+        // fresh picture (e.g. a centered turn back with fractional rounding),
+        // leave the old picture and fill untouched so desktop never shows in
+        // the overhang; the caller retries next frame once the layer fits.
+        let presented_width = unsafe { framed.container.presentationLayer() }
+            .map_or(target.width, |shown| shown.bounds().size.width);
+        if presented_width > picture_size.width + 0.5 {
+            return false;
+        }
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         let image: &CFType = &photo.image;
@@ -823,29 +833,15 @@ impl CoverScreen for CoverScreenOS {
         framed.picture_size = picture_size;
         // The frame's own bounds are where the morph heads: the picture
         // goes at their top left corner, while the frame still moves.
-        let target = framed.container.bounds().size;
         framed.place_picture(target.height);
-        // The new picture fills its target frame, so normally no fill shows.
-        // If Core Animation's live presented width is still wider than the new
-        // picture (for instance after a turn back from a wider frame), keep
-        // the new fill covering the overhang so desktop never shows through.
-        let presented_width = unsafe { framed.container.presentationLayer() }
-            .map_or(target.width, |shown| shown.bounds().size.width);
-        let overhang = presented_width > picture_size.width + 0.5;
+        // The new picture fits the live presented frame, so no fill is
+        // needed now. A later morph that widens past it uses this photo's
+        // edge colour.
         if let Some(fill) = framed.fill.take() {
             fill.removeFromSuperlayer();
         }
         if let Some(color) = edge_fill(photo) {
             let fill = fill_layer(&color);
-            if overhang {
-                let start = fill_start(picture_size.width);
-                fill.setFrame(CGRect::new(
-                    CGPoint::new(start, 0.0),
-                    CGSize::new((presented_width - start).max(0.0), target.height),
-                ));
-                fill.setHidden(false);
-                fill.setOpacity(1.0);
-            }
             framed
                 .container
                 .insertSublayer_below(&fill, Some(&framed.picture));
@@ -859,6 +855,7 @@ impl CoverScreen for CoverScreenOS {
             "cover picture of window {window} replaced at {}x{}",
             size.x, size.y
         );
+        true
     }
 
     fn morph_share(&self, display: CGDirectDisplayID) -> Option<f64> {

@@ -176,14 +176,16 @@ pub(crate) trait CoverScreen {
     );
     /// Puts `photo`, a picture of `window` at `size` points, into the
     /// window's frame on the cover of `display` at once, at its own size,
-    /// in place of the picture there. The frame keeps moving as it did.
+    /// in place of the picture there. Returns `false` if the live layer's
+    /// presented width is still wider than `size` (leaving the old picture
+    /// and fill untouched so the caller keeps the swap pending).
     fn replace_picture(
         &mut self,
         display: CGDirectDisplayID,
         window: WinID,
         size: IVec2,
         photo: &Photo,
-    );
+    ) -> bool;
     /// How far along its morph the cover of `display` shows its pictures
     /// now, as Core Animation draws them, from 0 to 1. `None` when it
     /// cannot tell.

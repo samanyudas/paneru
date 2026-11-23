@@ -119,8 +119,9 @@ impl CoverScreen for RecordingScreen {
         window: WinID,
         size: IVec2,
         _photo: &Photo,
-    ) {
+    ) -> bool {
         self.0.borrow_mut().replaced.push((window, size));
+        true
     }
 
     fn morph_share(&self, _display: CGDirectDisplayID) -> Option<f64> {
