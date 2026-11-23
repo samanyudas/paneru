@@ -1372,6 +1372,46 @@ fn a_swipe_over_a_landing_past_the_start_shows_the_strip_where_it_is() {
     );
 }
 
+/// A swipe that caught a strip further past its start than a stretch can
+/// show, as Center leaves a narrow first column of an overflowing strip,
+/// settles from where the strip shows once the fingers lift. The settle
+/// began from the stretch alone, and the strip jumped most of the way back.
+#[test]
+fn a_caught_strip_settles_from_where_it_shows() {
+    let (mut harness, log) = harness_of(config(true, Some(14.0)), &[300, 700, 700, 700]);
+    take_pictures(&mut harness, &log);
+    // Center puts the 300-point first column in the middle of the display.
+    let strip = cover_move_to(&mut harness, 362);
+    log.borrow_mut().showing = Some(362.0);
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.0001));
+    harness.advance(ONE_FRAME);
+    log.borrow_mut().showing = None;
+    assert_eq!(strip_x(harness.world(), strip), 362, "the catch keeps it");
+    assert!(
+        scrolling_of(harness.world(), strip).excess.is_some(),
+        "further out than a stretch can show"
+    );
+
+    send(&mut harness, Event::TouchpadUp);
+    let mut path = vec![362];
+    for _ in 0..40 {
+        harness.advance(ONE_FRAME);
+        path.push(strip_x(harness.world(), strip));
+    }
+    let first = path.iter().copied().find(|x| *x != 362);
+    assert!(
+        first.is_some_and(|x| x > 250),
+        "the settle starts where the strip shows: {path:?}"
+    );
+    assert!(
+        path.windows(2)
+            .all(|pair| pair[1] <= pair[0] && pair[0] - pair[1] < 120),
+        "and eases back without a jump: {path:?}"
+    );
+    assert_eq!(path.last().copied(), Some(0), "to the strip's start");
+}
+
 /// With `auto_center`, a strip held at its start shows no speed for fingers
 /// that push on past it, even in a frame whose push rounds to nothing: a
 /// move then starts from rest.

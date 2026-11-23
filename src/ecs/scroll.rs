@@ -1154,6 +1154,11 @@ fn settle_strip(
         let px_per_velocity = viewport_width * direction_modifier(&config);
         let deceleration = config.swipe_deceleration();
 
+        if scroll.settle.is_none() {
+            // The settle starts where the strip shows, which holds any part
+            // of a caught place that a stretch could not show.
+            scroll.excess = None;
+        }
         let target = if let Some(target) = scroll.settle {
             target
         } else if let Some(fitted) = fitted_offsets(strip, &windows, viewport) {
@@ -1193,15 +1198,12 @@ fn settle_strip(
             };
             let target = f64::from(target);
             scroll.settle = Some(target);
-            if !window_landing && let Some(range) = settle_range(strip, &windows, viewport) {
-                // A strip stretched past an end starts its ease where it
-                // shows, at the speed it moves there.
-                let stretch = scroll.position
-                    - scroll
-                        .position
-                        .clamp(f64::from(*range.start()), f64::from(*range.end()));
-                scroll.velocity *= resist_slope(stretch, viewport_width);
-                scroll.position += resist(stretch, viewport_width) - stretch;
+            if !window_landing {
+                // A strip stretched past an end, or caught further out than
+                // a stretch shows, starts its ease where it shows, at the
+                // speed it moves there.
+                scroll.position = f64::from(position.x);
+                scroll.velocity *= scroll.slope;
             }
             if window_landing {
                 // The fingers chose the step. The ease starts from where the
@@ -1514,9 +1516,13 @@ fn constrain(
             return;
         }
         if !scroll.is_user_swiping && scroll.settle.is_some() && past_an_end {
+            // A settle swings a little past an end, and never past where it
+            // began, which a strip stretched or caught further out may be.
             let swing = width / 8.0;
-            let held = !(start - swing..=end + swing).contains(&scroll.position);
-            position.x = round_px(scroll.position.clamp(start - swing, end + swing));
+            let from = scroll.ease.map_or(scroll.position, |ease| ease.from);
+            let (low, high) = ((start - swing).min(from), (end + swing).max(from));
+            let held = !(low..=high).contains(&scroll.position);
+            position.x = round_px(scroll.position.clamp(low, high));
             scroll.slope = if held { 0.0 } else { 1.0 };
             return;
         }
