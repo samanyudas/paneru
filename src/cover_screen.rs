@@ -430,6 +430,26 @@ fn fill_layer(color: &CGColor) -> Retained<CALayer> {
     fill
 }
 
+/// The four bands of a cover's mask around `hole`, in a cover of size
+/// `whole`: left of it, right of it, below it, and above it. The hole is
+/// held to the cover first, so a hole partly past an edge leaves no band
+/// reaching past the cover or short of the hole.
+fn mask_bands(whole: CGSize, hole: CGRect) -> [CGRect; 4] {
+    let left = hole.origin.x.clamp(0.0, whole.width);
+    let bottom = hole.origin.y.clamp(0.0, whole.height);
+    let right = (hole.origin.x + hole.size.width).clamp(left, whole.width);
+    let top = (hole.origin.y + hole.size.height).clamp(bottom, whole.height);
+    let rect = |x: f64, y: f64, width: f64, height: f64| {
+        CGRect::new(CGPoint::new(x, y), CGSize::new(width, height))
+    };
+    [
+        rect(0.0, 0.0, left, whole.height),
+        rect(right, 0.0, whole.width - right, whole.height),
+        rect(left, 0.0, right - left, bottom),
+        rect(left, top, right - left, whole.height - top),
+    ]
+}
+
 /// One animated number of a morph: the frame layer, which of its numbers
 /// moves (an index into [`MORPH_TRACKS`]), and from where to where.
 struct Lead {
@@ -597,52 +617,54 @@ impl CoverScreenOS {
         duration: f64,
     ) {
         let whole = root.bounds().size;
-        // The bands left of, right of, below and above a hole.
-        let bands = |hole: CGRect| {
-            let (x, y) = (hole.origin.x, hole.origin.y);
-            let (right, top) = (x + hole.size.width, y + hole.size.height);
-            [
-                CGRect::new(
-                    CGPoint::new(0.0, 0.0),
-                    CGSize::new(x.max(0.0), whole.height),
+        // The bands at each step of the move, from the hole held to the
+        // cover at that step, so a hole that starts or ends past an edge
+        // of the cover keeps its bands meeting it all the way.
+        let hole_at = |share: f64| {
+            let mix = |a: f64, b: f64| a + (b - a) * share;
+            CGRect::new(
+                CGPoint::new(
+                    mix(from.origin.x, to.origin.x),
+                    mix(from.origin.y, to.origin.y),
                 ),
-                CGRect::new(
-                    CGPoint::new(right, 0.0),
-                    CGSize::new((whole.width - right).max(0.0), whole.height),
+                CGSize::new(
+                    mix(from.size.width, to.size.width),
+                    mix(from.size.height, to.size.height),
                 ),
-                CGRect::new(
-                    CGPoint::new(x, 0.0),
-                    CGSize::new(hole.size.width, y.max(0.0)),
-                ),
-                CGRect::new(
-                    CGPoint::new(x, top),
-                    CGSize::new(hole.size.width, (whole.height - top).max(0.0)),
-                ),
-            ]
+            )
         };
+        let steps = shares
+            .iter()
+            .map(|share| mask_bands(whole, hole_at(*share)))
+            .collect::<Vec<_>>();
         let mask = CALayer::new();
         mask.setAnchorPoint(CGPoint::new(0.0, 0.0));
         mask.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), whole));
         let solid = CGColor::new_srgb(0.0, 0.0, 0.0, 1.0);
-        for (from, to) in bands(from).into_iter().zip(bands(to)) {
+        for (index, to) in mask_bands(whole, to).into_iter().enumerate() {
             let band = CALayer::new();
             band.setAnchorPoint(CGPoint::new(0.0, 0.0));
             band.setBackgroundColor(Some(&solid));
             band.setFrame(to);
-            let tracks = [
-                (from.origin.x, to.origin.x),
-                (from.origin.y, to.origin.y),
-                (from.size.width, to.size.width),
-                (from.size.height, to.size.height),
-            ];
-            for (path, (start, end)) in MORPH_TRACKS.into_iter().zip(tracks) {
-                if duration <= 0.0 || (end - start).abs() < f64::EPSILON {
+            let track = |rect: &CGRect| {
+                [
+                    rect.origin.x,
+                    rect.origin.y,
+                    rect.size.width,
+                    rect.size.height,
+                ]
+            };
+            for (number, path) in MORPH_TRACKS.into_iter().enumerate() {
+                let values = steps
+                    .iter()
+                    .map(|bands| track(&bands[index])[number])
+                    .collect::<Vec<_>>();
+                let moves = values
+                    .iter()
+                    .any(|value| (value - track(&to)[number]).abs() >= f64::EPSILON);
+                if duration <= 0.0 || !moves {
                     continue;
                 }
-                let values = shares
-                    .iter()
-                    .map(|share| start + (end - start) * share)
-                    .collect::<Vec<_>>();
                 band.addAnimation_forKey(
                     &keyframes(path, &values, duration),
                     Some(&NSString::from_str(path)),
@@ -1385,7 +1407,7 @@ mod tests {
 
     use super::{
         CoverScreenOS, Heading, cover_panels, fill_crossing_time, fill_start, global_rect,
-        live_panels,
+        live_panels, mask_bands,
     };
 
     /// A press on a picture lands on its window at the same point in the
@@ -1451,6 +1473,43 @@ mod tests {
         let click_on_b = CGPoint::new(500.0, 200.0);
         let hit = panels.iter().rev().find(|p| p.contains(click_on_b));
         assert_eq!(hit.map(|p| p.window), Some(2));
+    }
+
+    /// The bands around a hole inside the cover meet it on every side and
+    /// cover the rest of the cover once.
+    #[test]
+    fn mask_bands_meet_a_hole_inside_the_cover() {
+        let whole = CGSize::new(1000.0, 800.0);
+        let hole = CGRect::new(CGPoint::new(100.0, 50.0), CGSize::new(300.0, 400.0));
+        let [left, right, below, above] = mask_bands(whole, hole);
+        assert_eq!(left, rect(0.0, 0.0, 100.0, 800.0));
+        assert_eq!(right, rect(400.0, 0.0, 600.0, 800.0));
+        assert_eq!(below, rect(100.0, 0.0, 300.0, 50.0));
+        assert_eq!(above, rect(100.0, 450.0, 300.0, 350.0));
+    }
+
+    /// A hole that starts past the cover's left edge, as a window that
+    /// opens from off screen does, leaves no band past the edge: one would
+    /// reach under the window's own place, or leave a seam beside it.
+    #[test]
+    fn mask_bands_hold_a_hole_past_an_edge_to_the_cover() {
+        let whole = CGSize::new(1000.0, 800.0);
+        let hole = CGRect::new(CGPoint::new(-200.0, -30.0), CGSize::new(500.0, 900.0));
+        let [left, right, below, above] = mask_bands(whole, hole);
+        assert_eq!(left, rect(0.0, 0.0, 0.0, 800.0), "nothing left of it");
+        assert_eq!(right, rect(300.0, 0.0, 700.0, 800.0));
+        assert_eq!(below, rect(0.0, 0.0, 300.0, 0.0), "nothing below it");
+        assert_eq!(above, rect(0.0, 800.0, 300.0, 0.0), "nothing above it");
+
+        // A hole wholly past the right edge leaves the cover whole.
+        let gone = CGRect::new(CGPoint::new(1200.0, 0.0), CGSize::new(300.0, 800.0));
+        let [left, right, ..] = mask_bands(whole, gone);
+        assert_eq!(left, rect(0.0, 0.0, 1000.0, 800.0));
+        assert_eq!(right.size.width, 0.0);
+    }
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> CGRect {
+        CGRect::new(CGPoint::new(x, y), CGSize::new(width, height))
     }
 
     /// A picture of the size a frame heads to takes the frame's picture's
