@@ -48,7 +48,8 @@ use crate::ecs::systems::AnimationStep;
 use crate::ecs::workspace::spawn_snap_strip_guard;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, MissionControlActive, NativeFullscreenMarker,
-    Position, RepositionMarker, ResizeMarker, ResizeMotion, Scrolling, Unmanaged, ease,
+    PlacedUnderCover, Position, RepositionMarker, ResizeMarker, ResizeMotion, Scrolling, Unmanaged,
+    ease,
 };
 use crate::manager::{Display, Window, WindowManager};
 use crate::platform::WinID;
@@ -374,6 +375,8 @@ fn snap(
         // The layout places every window again from the new origin, so a
         // move asked for before, such as the resize's own, is spent.
         entity_commands.try_remove::<(RepositionMarker, ResizeMotion)>();
+        // The cover hides how the window gets to its frame.
+        entity_commands.try_insert(PlacedUnderCover);
         if let Some(size) = window.resize_to() {
             entity_commands
                 .try_insert(Bounds(size))
@@ -889,7 +892,12 @@ pub(super) fn start_waiting_morphs(
             morph.stage = Stage::Waiting { waited };
             continue;
         }
-        if !ready {
+        if ready {
+            debug!(
+                "cover over a maximize opens onto the window after {:.0} ms",
+                waited * 1000.0
+            );
+        } else {
             debug!("cover over a maximize waited its limit for the window");
             morph.open.clear();
         }

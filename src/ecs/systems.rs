@@ -22,7 +22,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     AccessibilityProbe, ActiveDisplayMarker, AwaitingAccessibility, BProcess, ExistingMarker,
-    FreshMarker, RepositionMarker, ResizeMarker, ResizeMotion, RetryFrontSwitch,
+    FreshMarker, PlacedUnderCover, RepositionMarker, ResizeMarker, ResizeMotion, RetryFrontSwitch,
     SpawnWindowTrigger, Timeout, VerifyWindowPosition, VerifyWindowSize,
 };
 
@@ -96,6 +96,7 @@ type ChangedWindowFrames<'w, 's> = Populated<
         Option<Ref<'static, Position>>,
         Option<Ref<'static, Bounds>>,
         Option<&'static mut WidthRatio>,
+        Has<PlacedUnderCover>,
     ),
     (
         Or<(Changed<Position>, Changed<Bounds>)>,
@@ -1782,7 +1783,7 @@ pub(super) fn commit_window_frame(
     let display_bounds = active_display.map(|display| display.bounds());
     windows
         .par_iter_mut()
-        .for_each(|(mut window, position, bounds, width_ratio)| {
+        .for_each(|(mut window, position, bounds, width_ratio, covered)| {
             let size = match (bounds, width_ratio, display_bounds) {
                 (Some(bounds), Some(mut width_ratio), Some(display_bounds)) => {
                     if bounds.is_changed() {
@@ -1794,13 +1795,30 @@ pub(super) fn commit_window_frame(
             };
             objc2::rc::autoreleasepool(|_| match (position, size) {
                 (Some(position), Some(size)) => {
-                    window.place(IRect::from_corners(position.0, position.0 + size));
+                    let frame = IRect::from_corners(position.0, position.0 + size);
+                    if covered {
+                        window.place_moved_first(frame);
+                    } else {
+                        window.place(frame);
+                    }
                 }
                 (Some(position), None) => window.reposition(position.0),
                 (None, Some(size)) => window.resize(size),
                 (None, None) => {}
             });
         });
+}
+
+/// Ends each window's [`PlacedUnderCover`] once its frame is written.
+pub(super) fn finish_covered_placements(
+    placed: Populated<Entity, With<PlacedUnderCover>>,
+    mut commands: Commands,
+) {
+    for entity in &placed {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<PlacedUnderCover>();
+        }
+    }
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
@@ -2520,6 +2538,7 @@ mod frame_commit_tests {
                     position: true,
                     size: true,
                     size_limited: Arc::default(),
+                    move_first: false,
                 },
             );
         });

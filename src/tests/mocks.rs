@@ -1501,6 +1501,14 @@ impl MockState {
             s.mock_reposition(id, ax_generation, frame.min);
             s.mock_resize(id, ax_generation, frame.size());
         });
+        // Under a picture cover the window moves first and is sized once.
+        let s = self.clone();
+        mw.expect_place_moved_first()
+            .returning(move |frame: IRect| {
+                let frame = fill_margins(&s.inner, id).shown(frame);
+                s.mock_reposition(id, ax_generation, frame.min);
+                s.mock_resize(id, ax_generation, frame.size());
+            });
 
         let s = self.clone();
         mw.expect_update_frame().returning(move || {
@@ -1557,8 +1565,14 @@ impl MockState {
             }
         });
         let w = writes.clone();
+        let to = window.clone();
         mw.expect_place()
-            .returning(move |frame: IRect| lock(&w).place(Some(pid), &window, frame));
+            .returning(move |frame: IRect| lock(&w).place(Some(pid), &to, frame));
+        let w = writes.clone();
+        mw.expect_place_moved_first()
+            .returning(move |frame: IRect| {
+                lock(&w).place_moved_first(Some(pid), &window, frame);
+            });
         let s = self.clone();
         let w = writes.clone();
         mw.expect_update_frame().returning(move || {

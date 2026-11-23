@@ -340,6 +340,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::finish_resizes,
             systems::finish_resize_motions,
             systems::commit_window_frame.run_if(not(resource_exists::<Initializing>)),
+            systems::finish_covered_placements,
             systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
             triggers::window_resize_verifier,
             triggers::settle_width_requests,
@@ -943,6 +944,12 @@ pub(crate) struct WidthRun {
 /// move. Removed once the entity has neither a move nor a resize left.
 #[derive(Component)]
 pub(crate) struct ResizeMotion;
+
+/// A window whose next frame lands under a picture cover, which hides how it
+/// gets there. Its write moves it before it sizes it, so its app lays it out
+/// once. Removed once the frame is written.
+#[derive(Component)]
+pub(crate) struct PlacedUnderCover;
 
 /// A width command's finite request for native readback and anchored placement.
 #[derive(Component)]

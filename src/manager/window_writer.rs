@@ -88,6 +88,12 @@ pub(crate) struct PendingWrite<W> {
     pub to: IRect,
     pub position: bool,
     pub size: bool,
+    /// Whether a write of both parts moves before it sizes even when the
+    /// window grows. A write that lands under a picture cover asks for it:
+    /// nothing shows the gap a move opens, and a window sized where it will
+    /// sit is laid out once, where one sized past a display edge first is
+    /// limited there and laid out again after the move.
+    pub move_first: bool,
     /// The size the app last took, if smaller than the engine asked for.
     /// The engine only writes a size when it changes, so the writer asks for
     /// it again after each later move, as the app may allow it at the new
@@ -115,6 +121,7 @@ impl<W> PendingWrite<W> {
         self.to = newer.to;
         self.position |= newer.position;
         self.size |= newer.size;
+        self.move_first |= newer.move_first;
     }
 }
 
@@ -139,7 +146,7 @@ fn apply_from<S: WriteSink>(
     let size = write.to.size();
     let narrows = size.x < taken.x && write.to.min.y == write.from.min.y;
     match (write.position, write.size) {
-        (true, true) if narrows => {
+        (true, true) if narrows || write.move_first => {
             sink.set_position(window, write.to.min);
             let moved = IRect::from_corners(write.to.min, write.to.min + taken);
             resize(sink, window, moved, size, write.to.min).frame
@@ -729,7 +736,7 @@ impl<S: WriteSink> FrameWrites<S> {
             return;
         }
         let to = IRect::from_corners(origin, origin + self.frame.size());
-        self.request(pid, window(), to, true, false);
+        self.request(pid, window(), to, true, false, false);
     }
 
     pub fn resize(&mut self, pid: Option<Pid>, window: impl FnOnce() -> S::Window, size: Size) {
@@ -738,7 +745,7 @@ impl<S: WriteSink> FrameWrites<S> {
             return;
         }
         let to = IRect::from_corners(self.frame.min, self.frame.min + size);
-        self.request(pid, window(), to, false, true);
+        self.request(pid, window(), to, false, true, false);
     }
 
     /// Moves and resizes in one write, in the order [`apply`] describes.
@@ -749,7 +756,24 @@ impl<S: WriteSink> FrameWrites<S> {
             trace!("already in place.");
             return;
         }
-        self.request(pid, window(), frame, position, size);
+        self.request(pid, window(), frame, position, size, false);
+    }
+
+    /// [`Self::place`] for a frame that lands under a picture cover: the
+    /// window moves before it sizes, so it is laid out once.
+    pub fn place_moved_first(
+        &mut self,
+        pid: Option<Pid>,
+        window: impl FnOnce() -> S::Window,
+        frame: IRect,
+    ) {
+        let position = self.frame.min != frame.min;
+        let size = self.frame.size() != frame.size();
+        if !position && !size {
+            trace!("already in place.");
+            return;
+        }
+        self.request(pid, window(), frame, position, size, true);
     }
 
     fn request(
@@ -759,6 +783,7 @@ impl<S: WriteSink> FrameWrites<S> {
         to: IRect,
         position: bool,
         size: bool,
+        move_first: bool,
     ) {
         let write = PendingWrite {
             window,
@@ -767,6 +792,7 @@ impl<S: WriteSink> FrameWrites<S> {
             position,
             size,
             size_limited: self.size_limited.clone(),
+            move_first,
         };
         self.frame = to;
         match pid {
@@ -877,6 +903,7 @@ mod tests {
                 position: true,
                 size: true,
                 size_limited: Arc::default(),
+                move_first: false,
             },
         );
         (app.frame, app.ops)
@@ -951,6 +978,7 @@ mod tests {
                 position: true,
                 size: true,
                 size_limited: Arc::new(Mutex::new(Some(Size::new(400, 400)))),
+                move_first: false,
             },
         );
         assert_eq!(app.frame, target);
@@ -1033,6 +1061,7 @@ mod tests {
                 position: false,
                 size: true,
                 size_limited: Arc::default(),
+                move_first: false,
             },
         );
 
@@ -1090,6 +1119,7 @@ mod tests {
                 position: true,
                 size: true,
                 size_limited: Arc::default(),
+                move_first: false,
             },
         );
         app.ops
@@ -1113,6 +1143,35 @@ mod tests {
                 Op::Position(target.min),
                 Op::Size(target.size()),
             ]
+        );
+    }
+
+    /// A maximize under a picture cover moves the window to its target and
+    /// sizes it there once. Sized first where it sat, past the display's
+    /// edge, a browser was limited there and laid out again after the move,
+    /// and the cover waited on both.
+    #[test]
+    fn a_covered_maximize_moves_then_sizes_once() {
+        let target = IRect::new(45, -1046, 1957, -4);
+        let mut app = Scripted {
+            reads: vec![target],
+            ops: Vec::new(),
+        };
+        apply(
+            &mut app,
+            &PendingWrite {
+                window: (),
+                from: IRect::new(1311, -1046, 1957, -4),
+                to: target,
+                position: true,
+                size: true,
+                size_limited: Arc::default(),
+                move_first: true,
+            },
+        );
+        assert_eq!(
+            app.ops,
+            vec![Op::Position(target.min), Op::Size(target.size())]
         );
     }
 
@@ -1403,6 +1462,7 @@ mod writer_tests {
             position: true,
             size: false,
             size_limited: Arc::default(),
+            move_first: false,
         }
     }
 
@@ -1414,6 +1474,7 @@ mod writer_tests {
             position: true,
             size: false,
             size_limited: Arc::default(),
+            move_first: false,
         }
     }
 
@@ -1425,6 +1486,7 @@ mod writer_tests {
             position: false,
             size: true,
             size_limited: Arc::default(),
+            move_first: false,
         }
     }
 
