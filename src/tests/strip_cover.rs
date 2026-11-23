@@ -814,7 +814,7 @@ fn sliding_strip(world: &mut World) -> (Entity, CoverSlide) {
         .query::<(Entity, &CoverSlide)>()
         .iter(world)
         .next()
-        .map(|(entity, slide)| (entity, *slide))
+        .map(|(entity, slide)| (entity, slide.clone()))
         .expect("a strip under the cover")
 }
 
@@ -945,6 +945,71 @@ fn a_swipe_that_catches_a_slide_takes_it_over_where_it_shows() {
     assert!(!covered(harness.world()), "the cover lifts once it lands");
     assert_eq!(log.borrow().hidden, 1, "and comes down once");
     assert_eq!(log.borrow().shown.len(), 1, "one cover throughout");
+}
+
+/// Runs a keyboard move under the cover to `direction` while the window
+/// server shows window `late` where it was, and returns once the real
+/// windows have landed and waited a few frames, within the landing's time
+/// limit.
+fn land_with_a_late_window(
+    harness: &mut TestHarness,
+    log: &ScreenLog,
+    direction: Direction,
+    late: WinID,
+) {
+    take_pictures(harness, log);
+    harness.mock_state.show_late(late);
+    send(harness, focus(direction));
+    harness.advance(ONE_FRAME);
+    let (strip, slide) = sliding_strip(harness.world());
+    let target = slide.heading().expect("the pictures slide");
+    log.borrow_mut().showing = Some(f64::from(target.x));
+    harness.advance(ONE_FRAME);
+    log.borrow_mut().showing = None;
+    let slide = harness
+        .world()
+        .get::<CoverSlide>(strip)
+        .cloned()
+        .expect("the slide lands under the cover");
+    assert_eq!(slide.heading(), None, "the real windows land");
+    harness.advance(ONE_FRAME * 5);
+}
+
+/// A slide's cover stays up after its windows took their writes while the
+/// window server still shows one where it was, as an app that takes its
+/// new place after the write returned does, and comes down once it shows
+/// the new one.
+#[test]
+fn a_slide_waits_for_the_window_server_to_show_the_landing() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    land_with_a_late_window(&mut harness, &log, Direction::East, 1);
+    assert!(covered(harness.world()), "the cover is still up");
+    assert_eq!(log.borrow().hidden, 0, "it stays while the old frame shows");
+    harness.mock_state.show_now(1);
+    harness.advance(ONE_FRAME * 3);
+    assert!(!covered(harness.world()), "the move is done");
+    assert_eq!(log.borrow().hidden, 1, "the cover comes down once it shows");
+}
+
+/// A window the move parks at the display's edge is still checked before the
+/// cover comes down: the window server may still show it where it was, in
+/// full, under the cover.
+#[test]
+fn a_slide_waits_for_a_window_it_parks_at_the_edge() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    let before = window_frame(harness.world(), 0);
+    land_with_a_late_window(&mut harness, &log, Direction::Last, 0);
+    let after = window_frame(harness.world(), 0);
+    assert!(
+        before.min.x >= 0 && after.max.x < 50,
+        "window 0 leaves the display but for its edge: {before:?} to {after:?}"
+    );
+    assert!(covered(harness.world()), "the cover is still up");
+    harness.mock_state.show_now(0);
+    harness.advance(ONE_FRAME * 3);
+    assert!(!covered(harness.world()), "the move is done");
+    assert_eq!(log.borrow().hidden, 1);
 }
 
 /// A focus move into a column of stacked windows goes under the cover too.

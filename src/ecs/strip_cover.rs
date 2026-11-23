@@ -43,6 +43,7 @@ use crate::config::Config;
 use crate::ecs::display::shown_strip;
 use crate::ecs::drag::DragState;
 use crate::ecs::layout::{Column, LayoutStrip, ensure_visible_in_strip, position_layout_strips};
+use crate::ecs::pacing::ShownFrames;
 use crate::ecs::scroll;
 use crate::ecs::slice_photos::{Photo, PhotoError};
 use crate::ecs::systems::AnimationStep;
@@ -412,7 +413,7 @@ fn close(a: IVec2, b: IVec2) -> bool {
 }
 
 /// A strip move under the cover.
-#[derive(bevy::ecs::component::Component, Clone, Copy, Debug)]
+#[derive(bevy::ecs::component::Component, Clone, Debug)]
 pub(crate) struct CoverSlide {
     display: CGDirectDisplayID,
     /// Where the strip origin starts, in global points, and where it heads.
@@ -434,6 +435,13 @@ pub(crate) struct CoverSlide {
     /// A display or a Dock that changed since has placed the strip anew.
     bounds: IRect,
     viewport: IRect,
+    /// The part of the display the cover hides: the visible area, with its
+    /// edge padding.
+    area: IRect,
+    /// Every window whose frame met `area` where it showed or where it
+    /// lands, at any start, turn, or landing of the slide: the window server
+    /// may still show it there.
+    hid: Vec<Entity>,
     /// How long the slide has run by the engine's count, for when Core
     /// Animation cannot tell where it shows: the landing waits at most
     /// [`SHOWN_GRACE`] past the slide's length for the screen.
@@ -447,6 +455,11 @@ impl CoverSlide {
     /// strip is there already.
     pub(crate) fn heading(&self) -> Option<IVec2> {
         self.landing.is_none().then_some(self.target)
+    }
+
+    /// Whether the real windows land under the cover.
+    fn lands(&self) -> bool {
+        self.landing.is_some()
     }
 
     /// Where the strip shows `at` seconds into the slide.
@@ -518,6 +531,8 @@ pub(crate) struct CoverSwipe {
     /// The display's bounds and the strip's viewport when the swipe began.
     bounds: IRect,
     viewport: IRect,
+    /// The part of the display the cover hides, as [`CoverSlide::area`].
+    area: IRect,
     /// The strip's layout when the swipe began, as [`layout_print`] gives it.
     layout: u64,
 }
@@ -908,6 +923,29 @@ fn layout_print(strip: &LayoutStrip, windows: &CoverWindows) -> u64 {
     hasher.finish()
 }
 
+/// Adds to `hid` each tiled window of `strip` whose frame meets `area`
+/// where the window shows now, or where it lands with the strip origin at
+/// `at`: a cover over `area` hides it there, and the window server may
+/// still show it there as the cover comes down.
+fn note_hidden(
+    hid: &mut Vec<Entity>,
+    strip: &LayoutStrip,
+    windows: &CoverWindows,
+    area: IRect,
+    at: IVec2,
+) {
+    let meets = |rect: IRect| !rect.intersect(area).is_empty();
+    for window in strip_windows(strip, windows) {
+        let lands = IRect::from_corners(window.frame.min + at, window.frame.max + at);
+        let shows = windows
+            .get(window.entity)
+            .is_ok_and(|(found, ..)| meets(found.shown_frame()));
+        if (shows || meets(lands)) && !hid.contains(&window.entity) {
+            hid.push(window.entity);
+        }
+    }
+}
+
 /// Each strip's [`layout_print`] at the end of the last pass, so a move can
 /// tell whether its strip's layout changed in this pass.
 #[derive(Resource, Debug, Default)]
@@ -1085,6 +1123,7 @@ fn cover_strip_moves(
                         shown: position.0.x,
                         bounds: slide.bounds,
                         viewport: slide.viewport,
+                        area: slide.area,
                         layout: slide.layout,
                     });
                 continue;
@@ -1138,9 +1177,11 @@ fn cover_strip_moves(
                     0.0
                 };
                 let (guard, layout) = (slide.guard, slide.layout);
+                let mut hid = std::mem::take(&mut slide.hid);
+                note_hidden(&mut hid, &strip, &windows, slide.area, target);
                 *slide = start_slide(
                     slide.display,
-                    (slide.bounds, slide.viewport),
+                    (slide.bounds, slide.viewport, slide.area),
                     showing,
                     speed,
                     target,
@@ -1148,6 +1189,7 @@ fn cover_strip_moves(
                 );
                 slide.guard = guard;
                 slide.layout = layout;
+                slide.hid = hid;
                 screen.0.slide(slide.display, &slide.path(), PATH_STEP);
                 debug!("cover over strip {entity} turned to {}", target.x);
                 commands.entity(entity).remove::<RepositionMarker>();
@@ -1156,6 +1198,8 @@ fn cover_strip_moves(
             if slide.landing.is_none() && slide.elapsed >= slide.length() {
                 // The pictures have landed: the real windows follow in one
                 // step under the cover.
+                let (area, target) = (slide.area, slide.target);
+                note_hidden(&mut slide.hid, &strip, &windows, area, target);
                 position.0 = slide.target;
                 end_guard(slide.guard.take(), &mut commands);
                 slide.guard = Some(spawn_snap_strip_guard(entity, &mut commands));
@@ -1212,18 +1256,19 @@ fn cover_strip_moves(
                 continue;
             }
         };
-        let pictures = scene.pictures.len();
+        let (pictures, area) = (scene.pictures.len(), scene.viewport);
         screen.0.show(&scene);
         started.0.push(display.id());
         let mut slide = start_slide(
             display.id(),
-            (display.bounds(), viewport),
+            (display.bounds(), viewport, area),
             f64::from(from),
             0.0,
             target,
             &config,
         );
         slide.layout = layout_print(&strip, &windows);
+        note_hidden(&mut slide.hid, &strip, &windows, area, target);
         screen.0.slide(display.id(), &slide.path(), PATH_STEP);
         screen.0.track(display.id(), f64::from(from));
         debug!(
@@ -1238,10 +1283,10 @@ fn cover_strip_moves(
 }
 
 /// A slide from strip x `from`, moving at `speed` points per second, to
-/// `target`.
+/// `target`, under a cover that hides `area`.
 fn start_slide(
     display: CGDirectDisplayID,
-    (bounds, viewport): (IRect, IRect),
+    (bounds, viewport, area): (IRect, IRect, IRect),
     from: f64,
     speed: f64,
     target: IVec2,
@@ -1260,16 +1305,23 @@ fn start_slide(
         guard: None,
         bounds,
         viewport,
+        area,
+        hid: Vec::new(),
         counted: 0.0,
         layout: 0,
     }
 }
 
 /// Takes each cover down once the real windows under it have taken their
-/// places, or once it has waited [`LANDING_TIMEOUT`].
+/// places, and the window server shows each window the cover hid at the
+/// frame the layout committed it to, or once it has waited
+/// [`LANDING_TIMEOUT`]. A write can return before its app shows the new
+/// frame, so the cover came down over a window still where it was.
 fn lift_covers(
     mut strips: Query<(Entity, &LayoutStrip, &mut CoverSlide)>,
     windows: CoverWindows,
+    frames: Query<(&Window, &Position, &Bounds)>,
+    shown_frames: Option<Res<ShownFrames>>,
     time: Res<Time>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
     mut commands: Commands,
@@ -1281,9 +1333,11 @@ fn lift_covers(
         let Some((deadline, settled)) = slide.landing else {
             continue;
         };
-        let in_place = strip_windows(strip, &windows)
-            .iter()
-            .all(|window| window.at_rest);
+        let row = strip_windows(strip, &windows);
+        let in_place = row.iter().all(|window| window.at_rest)
+            && shown_frames.as_ref().is_none_or(|shown| {
+                resize::shows_committed(&row, &frames, slide.area, &slide.hid, shown)
+            });
         let settled = if in_place { settled + 1 } else { 0 };
         if settled >= LANDED_FRAMES || time.elapsed() >= deadline {
             let late = if settled >= LANDED_FRAMES {
@@ -1471,13 +1525,14 @@ fn cover_swipes(
                 });
                 let mut slide = start_slide(
                     swipe.display,
-                    (display.bounds(), viewport),
+                    (display.bounds(), viewport, swipe.area),
                     from,
                     speed,
                     marker.0,
                     &config,
                 );
                 slide.layout = swipe.layout;
+                note_hidden(&mut slide.hid, &strip, &windows, swipe.area, marker.0);
                 screen.0.slide(swipe.display, &slide.path(), PATH_STEP);
                 screen.0.track(swipe.display, from);
                 debug!(
@@ -1504,6 +1559,8 @@ fn cover_swipes(
                     }
                 } else {
                     screen.0.place(swipe.display, f64::from(position.0.x));
+                    let mut hid = Vec::new();
+                    note_hidden(&mut hid, &strip, &windows, swipe.area, position.0);
                     entity_commands.insert(CoverSlide {
                         display: swipe.display,
                         from: f64::from(position.0.x),
@@ -1515,6 +1572,8 @@ fn cover_swipes(
                         guard: Some(guard),
                         bounds: display.bounds(),
                         viewport: display.actual_display_bounds(dock, &config),
+                        area: swipe.area,
+                        hid,
                         counted: 0.0,
                         layout: swipe.layout,
                     });
@@ -1556,7 +1615,7 @@ fn cover_swipes(
                 continue;
             }
         };
-        let pictures = scene.pictures.len();
+        let (pictures, area) = (scene.pictures.len(), scene.viewport);
         screen.0.show(&scene);
         started.0.push(display.id());
         screen.0.track(display.id(), f64::from(position.0.x));
@@ -1566,6 +1625,7 @@ fn cover_swipes(
             shown: position.0.x,
             bounds: display.bounds(),
             viewport: display.actual_display_bounds(dock, &config),
+            area,
             layout: layout_print(&strip, &windows),
         });
     }

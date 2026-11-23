@@ -965,28 +965,30 @@ fn turn_entry(
     ease::entry_for_speed(speed, f64::from(to - now), duration)
 }
 
-/// Whether the window server shows each window of `row` that the cover of
-/// `morph` hides, before or after the resize, at the frame the layout
-/// committed it to. A write call can return before its app shows the new
-/// frame, and an app that is late can have its old frame read back as the
-/// window's own, so the check goes by the layout's frame, and a window the
-/// window server does not list is not there yet. Windows the cover never
-/// hides cannot show an overlap as it comes down, and are left out to keep
-/// the read short.
-fn shows_committed(
+/// Whether the window server shows each window of `row` that a cover over
+/// `area` hides, at the frame the layout committed it to: one whose
+/// committed frame meets `area`, or one of `hid`, which met it before. A
+/// write call can return before its app shows the new frame, and an app
+/// that is late can have its old frame read back as the window's own, so
+/// the check goes by the layout's frame, and a window the window server
+/// does not list is not there yet. Windows the cover never hides cannot
+/// show an overlap as it comes down, and are left out to keep the read
+/// short.
+pub(super) fn shows_committed(
     row: &[StripWindow],
     frames: &Query<(&Window, &Position, &Bounds)>,
-    morph: &CoverMorph,
+    area: IRect,
+    hid: &[Entity],
     shown: &ShownFrames,
 ) -> bool {
-    let hidden = |rect: IRect| !rect.intersect(morph.area).is_empty();
+    let hidden = |rect: IRect| !rect.intersect(area).is_empty();
     let committed = row
         .iter()
         .filter_map(|window| {
             let (found, position, bounds) = frames.get(window.entity).ok()?;
             let cell = IRect::from_corners(position.0, position.0 + bounds.0);
             let frame = found.margins().shown(cell);
-            (hidden(frame) || morph.hid.contains(&window.entity)).then_some((found.id(), frame))
+            (hidden(frame) || hid.contains(&window.entity)).then_some((found.id(), frame))
         })
         .collect::<Vec<_>>();
     let ids = committed.iter().map(|(id, _)| *id).collect::<Vec<_>>();
@@ -1023,7 +1025,7 @@ pub(super) fn lift_morphs(
         let in_place = row.iter().all(|window| window.at_rest)
             && shown_frames
                 .as_ref()
-                .is_none_or(|shown| shows_committed(&row, &frames, &morph, shown));
+                .is_none_or(|shown| shows_committed(&row, &frames, morph.area, &morph.hid, shown));
         let settled = if in_place { settled + 1 } else { 0 };
         if settled < LANDED_FRAMES && now < deadline {
             morph.stage = Stage::Landing { deadline, settled };
@@ -1050,6 +1052,7 @@ pub(super) fn lift_morphs(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn refresh_morph_pictures(
     mut morphs: Query<&mut CoverMorph>,
+    slides: Query<&CoverSlide>,
     frames: Query<(&Window, &Position, &Bounds)>,
     shown_frames: Option<Res<ShownFrames>>,
     mut photos: ResMut<CoverPhotos>,
@@ -1067,7 +1070,10 @@ pub(super) fn refresh_morph_pictures(
             .morph_asked
             .retain(|asked| now.saturating_sub(asked.at) < ASK_TIMEOUT);
     }
-    if morphs.is_empty() {
+    // A resize's cover and a landing slide's both watch where the window
+    // server shows their windows: the watch stops once neither is left.
+    let watched = !morphs.is_empty() || slides.iter().any(CoverSlide::lands);
+    if !watched {
         if *watching_morph {
             if let Some(shown) = shown_frames.as_ref() {
                 shown.stop_morph();
@@ -1077,6 +1083,9 @@ pub(super) fn refresh_morph_pictures(
         return;
     }
     *watching_morph = true;
+    if morphs.is_empty() {
+        return;
+    }
     if !cover_enabled(&config) || photos.access != Access::Allowed {
         return;
     }
