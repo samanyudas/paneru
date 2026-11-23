@@ -827,6 +827,72 @@ fn a_move_to_where_a_swiped_strip_rests_keeps_the_swipe() {
     assert!(!covered(harness.world()), "the cover lifts once it lands");
 }
 
+/// A move to where a covered swipe is, arriving once the fingers lift and
+/// before its settle starts, stops the strip there, as it does a strip
+/// without the cover: the real windows land there under the cover at once.
+/// It went unheeded, and the strip settled on past it.
+#[test]
+fn a_move_to_where_a_lifted_covered_swipe_is_lands_it_there() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, Event::TouchpadDown);
+    for _ in 0..2 {
+        send(&mut harness, swipe(0.05));
+        harness.advance(ONE_FRAME);
+    }
+    let strip = swiped_strip(harness.world());
+    {
+        let mut scroll = harness
+            .world()
+            .get_mut::<crate::ecs::Scrolling>(strip)
+            .expect("the strip scrolls");
+        scroll.is_user_swiping = false;
+        scroll.fingers_down = false;
+        assert!(scroll.velocity.abs() > 0.1, "the strip still moves");
+        assert!(scroll.settle.is_none(), "no settle has started");
+    }
+    let position = harness
+        .world()
+        .get::<crate::ecs::Position>(strip)
+        .expect("a strip position")
+        .0;
+    let slides = log.borrow().slides.len();
+
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(position));
+    harness.advance(ONE_FRAME);
+    let world = harness.world();
+    assert!(
+        world
+            .get::<crate::ecs::strip_cover::CoverSwipe>(strip)
+            .is_none(),
+        "the swipe ended"
+    );
+    assert!(
+        world.get::<crate::ecs::Scrolling>(strip).is_none(),
+        "and stopped"
+    );
+    let slide = world
+        .get::<CoverSlide>(strip)
+        .expect("the swipe lands under the cover");
+    assert_eq!(slide.heading(), None, "where it is");
+    assert_eq!(log.borrow().slides.len(), slides, "with no slide");
+    assert_eq!(
+        log.borrow().placed.last().copied(),
+        Some(f64::from(position.x)),
+        "the pictures rest where the strip is"
+    );
+    harness.advance(SETTLE);
+    assert!(!covered(harness.world()), "the cover lifts once it lands");
+    assert_eq!(
+        strip_x(harness.world(), strip),
+        position.x,
+        "the strip stays"
+    );
+}
+
 /// The strip a keyboard slide moves, and its slide.
 fn sliding_strip(world: &mut World) -> (Entity, CoverSlide) {
     world
@@ -1639,11 +1705,11 @@ fn a_move_during_a_covered_settle_carries_its_speed_on() {
     );
 }
 
-/// A move to where a settling covered swipe already is leaves the settle
-/// going under its cover. The settle's state was gone before the cover saw
-/// the move, so the swipe landed early, where the strip was.
+/// A move to where a settling covered swipe already is stops the settle
+/// there, as it stops a settle without the cover: the real windows land
+/// there under the cover at once. A settle that heads there goes on.
 #[test]
-fn a_move_to_where_a_covered_settle_is_leaves_it_settling() {
+fn a_move_to_where_a_covered_settle_is_lands_it_there() {
     let (mut harness, log) = harness(landing_config());
     let (strip, _) = settling_covered_swipe(&mut harness, &log);
     let position = harness
@@ -1651,6 +1717,51 @@ fn a_move_to_where_a_covered_settle_is_leaves_it_settling() {
         .get::<crate::ecs::Position>(strip)
         .expect("a strip position")
         .0;
+    let target = scrolling_of(harness.world(), strip)
+        .settle
+        .expect("the strip settles");
+    assert_ne!(target.round(), f64::from(position.x), "elsewhere");
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(position));
+    harness.advance(ONE_FRAME);
+
+    let world = harness.world();
+    assert!(
+        world.get::<crate::ecs::Scrolling>(strip).is_none(),
+        "the settle stops"
+    );
+    let slide = world
+        .get::<CoverSlide>(strip)
+        .expect("the swipe lands under the cover");
+    assert_eq!(slide.heading(), None, "where the strip is");
+    harness.advance(SETTLE);
+    assert!(!covered(harness.world()), "the cover lifts once it lands");
+    assert_eq!(
+        strip_x(harness.world(), strip),
+        position.x,
+        "the strip stays"
+    );
+}
+
+/// A move to where a covered settle heads, arriving as it gets there,
+/// leaves the settle going under its cover.
+#[test]
+fn a_move_to_where_a_covered_settle_heads_leaves_it_settling() {
+    let (mut harness, log) = harness(landing_config());
+    let (strip, _) = settling_covered_swipe(&mut harness, &log);
+    let position = harness
+        .world()
+        .get::<crate::ecs::Position>(strip)
+        .expect("a strip position")
+        .0;
+    // The settle heads where the strip shows now, as in its last frame.
+    harness
+        .world()
+        .get_mut::<crate::ecs::Scrolling>(strip)
+        .expect("the strip scrolls")
+        .settle = Some(f64::from(position.x));
     harness
         .world()
         .entity_mut(strip)
@@ -1667,16 +1778,6 @@ fn a_move_to_where_a_covered_settle_is_leaves_it_settling() {
             .get::<crate::ecs::strip_cover::CoverSwipe>(strip)
             .is_some(),
         "under the swipe's cover"
-    );
-    assert!(
-        world.get::<CoverSlide>(strip).is_none(),
-        "it has not landed"
-    );
-    harness.advance(ONE_FRAME * 3);
-    assert_ne!(
-        strip_x(harness.world(), strip),
-        position.x,
-        "the settle moves the strip on"
     );
     harness.advance(SETTLE);
     assert!(!covered(harness.world()), "the cover lifts once it lands");

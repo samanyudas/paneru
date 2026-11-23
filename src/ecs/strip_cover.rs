@@ -1711,10 +1711,19 @@ fn cover_swipes(
             // A strip move that arrives during the swipe, such as a key or a
             // press on a picture, ends the cover, as does a display or Dock
             // that changes under it, or Mission Control. A move to where the
-            // strip already is moves nothing: the swipe goes on, or lands as
-            // it would without it.
+            // strip already is moves nothing while the fingers drive the
+            // strip or its settle heads there: the swipe goes on. Otherwise
+            // it stops the strip where it is, as it stops one without the
+            // cover, and the swipe lands there.
             let marked = marker.as_ref().is_some_and(DetectChanges::is_changed);
             let moved = marked && marker.as_ref().is_some_and(|marker| marker.0 != position.0);
+            let goes_on = scrolling.as_ref().is_some_and(|scrolling| {
+                scrolling.is_user_swiping
+                    || scrolling
+                        .settle
+                        .is_some_and(|target| round_px(target) == position.0.x)
+            });
+            let stopped = marked && !moved && !goes_on;
             if marked && !moved {
                 commands.entity(entity).remove::<RepositionMarker>();
             }
@@ -1781,12 +1790,15 @@ fn cover_swipes(
                 continue;
             }
             let aborted = ended.is_some();
-            if aborted || scrolling.is_none() {
+            if aborted || scrolling.is_none() || stopped {
                 // The swipe has landed, or the cover cannot stay: the real
                 // windows take their places in one step.
                 let guard = spawn_snap_strip_guard(entity, &mut commands);
                 let mut entity_commands = commands.entity(entity);
                 entity_commands.remove::<CoverSwipe>().insert(Moved);
+                if stopped {
+                    entity_commands.remove::<Scrolling>();
+                }
                 if let Some(reason) = ended {
                     debug!("cover over swiped strip {entity} ended early: {reason}");
                     if !started.0.contains(&swipe.display) {
