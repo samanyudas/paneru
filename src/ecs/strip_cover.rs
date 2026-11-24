@@ -18,7 +18,7 @@
 //! that lacks a picture it would show, or that the cover would get wrong,
 //! moves the real windows as before.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::time::Duration;
 
@@ -45,6 +45,7 @@ use crate::ecs::drag::DragState;
 use crate::ecs::layout::{Column, LayoutStrip, ensure_visible_in_strip, position_layout_strips};
 use crate::ecs::pacing::ShownFrames;
 use crate::ecs::scroll;
+use crate::ecs::shared_edge::EdgeSlice;
 use crate::ecs::slice_photos::{Photo, PhotoError};
 use crate::ecs::systems::AnimationStep;
 use crate::ecs::workspace::spawn_snap_strip_guard;
@@ -97,6 +98,9 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long a window whose picture came out blank waits before another try.
 const BLANK_RETRY: Duration = Duration::from_secs(6);
+
+/// How long a subject whose capture failed or timed out waits before another try.
+const FAILED_RETRY: Duration = Duration::from_secs(6);
 
 /// How often the engine looks for a picture to refresh.
 const REFRESH_TICK: Duration = Duration::from_millis(100);
@@ -313,6 +317,10 @@ pub(crate) struct CoverPhotos {
     desktops: HashMap<CGDirectDisplayID, Kept>,
     /// Windows whose last picture came out blank, and when to try again.
     blank_until: HashMap<WinID, Duration>,
+    /// Subjects that timed out once without a reply and are deprioritized before retry.
+    timed_out: HashSet<CoverSubject>,
+    /// Subjects whose capture failed or timed out repeatedly, and when to try again.
+    failed_until: HashMap<CoverSubject, Duration>,
     /// The background refresh's one picture on its way.
     asked: Option<Asked>,
     /// The fresh pictures a resize's cover asked for, apart from the
@@ -398,6 +406,8 @@ impl CoverPhotos {
         self.windows.remove(&id);
         self.previous.remove(&id);
         self.title_epoch.remove(&id);
+        self.timed_out.remove(&CoverSubject::Window(id));
+        self.failed_until.remove(&CoverSubject::Window(id));
     }
 
     /// Notes that window `id` changed its title: its previous picture shows
@@ -439,6 +449,8 @@ impl CoverPhotos {
         self.title_epoch.clear();
         self.desktops.clear();
         self.blank_until.clear();
+        self.timed_out.clear();
+        self.failed_until.clear();
         self.asked = None;
         self.morph_asked.clear();
         self.morph_replies.clear();
@@ -477,6 +489,8 @@ impl CoverPhotos {
             && self.title_epoch.is_empty()
             && self.desktops.is_empty()
             && self.blank_until.is_empty()
+            && self.timed_out.is_empty()
+            && self.failed_until.is_empty()
             && self.asked.is_none()
             && self.morph_asked.is_empty()
             && self.morph_replies.is_empty()
@@ -715,6 +729,11 @@ fn cover_enabled(config: &Config) -> bool {
         && ease::animates(duration)
 }
 
+/// Whether the engine currently has capture access to take or show pictures.
+pub(super) fn has_access(photos: &CoverPhotos) -> bool {
+    photos.access == Access::Allowed
+}
+
 /// Keeps each background picture that arrives for the ask it answers, and
 /// stages morph replies for [`resize::apply_morph_replies`] so they are
 /// validated against the frame's resolved turns and aborts before touching
@@ -829,6 +848,8 @@ fn apply_cover_reply(
     let subject = asked.subject;
     match result {
         Ok(photo) => {
+            photos.timed_out.remove(&subject);
+            photos.failed_until.remove(&subject);
             let kept = Kept {
                 photo: photo.clone(),
                 size: asked.size,
@@ -852,15 +873,25 @@ fn apply_cover_reply(
                 photos.blank_until.insert(id, now + BLANK_RETRY);
             }
         }
-        Err(error @ (PhotoError::WindowGone | PhotoError::Failed)) => {
-            // A failed lookup is looked up afresh next time.
+        Err(PhotoError::WindowGone) => {
+            photos.timed_out.remove(&subject);
+            photos.failed_until.remove(&subject);
             if let CoverSubject::Window(id) = subject {
-                if *error == PhotoError::WindowGone {
-                    photos.forget_window(id);
-                }
+                photos.forget_window(id);
                 if let Some(screen) = screen {
                     screen.0.forget(Some(id));
                 }
+            }
+        }
+        Err(PhotoError::Failed) => {
+            // Back off repeated failures so a stuck app does not block the desktop
+            // or other windows from being photographed.
+            photos.timed_out.remove(&subject);
+            photos.failed_until.insert(subject, now + FAILED_RETRY);
+            if let CoverSubject::Window(id) = subject
+                && let Some(screen) = screen
+            {
+                screen.0.forget(Some(id));
             }
         }
         Err(PhotoError::Refused) => {
@@ -911,6 +942,7 @@ type CoverWindows<'w, 's> = Query<
         Option<&'static ResizeMarker>,
         Has<FocusedMarker>,
         Option<&'static WidthLimits>,
+        Has<EdgeSlice>,
     ),
 >;
 
@@ -925,7 +957,7 @@ fn strip_windows(strip: &LayoutStrip, windows: &CoverWindows) -> Vec<StripWindow
         .all_windows()
         .into_iter()
         .filter_map(|entity| {
-            let (window, layout, bounds, unmanaged, moving, resize, focused, limits) =
+            let (window, layout, bounds, unmanaged, moving, resize, focused, limits, _) =
                 windows.get(entity).ok()?;
             if unmanaged.is_some() {
                 return None;
@@ -1072,6 +1104,13 @@ fn layout_print(strip: &LayoutStrip, windows: &CoverWindows) -> u64 {
     hasher.finish()
 }
 
+/// Whether `rect` lies at the left or right edge of `area` as a parked
+/// off-screen sliver, including up to a few points of macOS `WindowServer` edge
+/// clamping.
+pub(super) fn is_horizontal_sliver(rect: IRect, area: IRect, sliver: i32) -> bool {
+    rect.max.x <= area.min.x + sliver + 8 || rect.min.x >= area.max.x - sliver - 8
+}
+
 /// Adds to `hid` each tiled window of `strip` whose frame meets `area`
 /// where the window shows now, or where it lands with the strip origin at
 /// `at`: a cover over `area` hides it there, and the window server may
@@ -1082,13 +1121,15 @@ fn note_hidden(
     windows: &CoverWindows,
     area: IRect,
     at: IVec2,
+    sliver: i32,
 ) {
     let meets = |rect: IRect| !rect.intersect(area).is_empty();
     for window in strip_windows(strip, windows) {
         let lands = IRect::from_corners(window.frame.min + at, window.frame.max + at);
-        let shows = windows
-            .get(window.entity)
-            .is_ok_and(|(found, ..)| meets(found.shown_frame()));
+        let shows = windows.get(window.entity).is_ok_and(|(found, .., tucked)| {
+            let shown = found.shown_frame();
+            !tucked && meets(shown) && !is_horizontal_sliver(shown, area, sliver)
+        });
         if (shows || meets(lands)) && !hid.contains(&window.entity) {
             hid.push(window.entity);
         }
@@ -1223,6 +1264,7 @@ fn cover_strip_moves(
             // A new target for the strip, which the slide turns to.
             let turn = target.filter(|_| fresh && !turns_height);
             let keeps = cover_enabled(&config)
+                && has_access(&photos)
                 && shown_here
                 && same_place
                 && !dragging
@@ -1273,6 +1315,8 @@ fn cover_strip_moves(
             }
             let ended = if !cover_enabled(&config) {
                 Some("switched off")
+            } else if !has_access(&photos) {
+                Some("capture access lost")
             } else if !shown_here {
                 Some("strip not shown")
             } else if !same_place {
@@ -1329,7 +1373,14 @@ fn cover_strip_moves(
                 };
                 let (guard, layout) = (slide.guard, slide.layout);
                 let mut hid = std::mem::take(&mut slide.hid);
-                note_hidden(&mut hid, &strip, &windows, slide.area, target);
+                note_hidden(
+                    &mut hid,
+                    &strip,
+                    &windows,
+                    slide.area,
+                    target,
+                    config.sliver_width(),
+                );
                 let rest = slide.rest;
                 *slide = start_slide(
                     slide.display,
@@ -1360,7 +1411,14 @@ fn cover_strip_moves(
                 // The pictures have landed: the real windows follow in one
                 // step under the cover.
                 let (area, target) = (slide.area, slide.target);
-                note_hidden(&mut slide.hid, &strip, &windows, area, target);
+                note_hidden(
+                    &mut slide.hid,
+                    &strip,
+                    &windows,
+                    area,
+                    target,
+                    config.sliver_width(),
+                );
                 position.0 = slide.target;
                 slide.rest = slide.target.x;
                 end_guard(slide.guard.take(), &mut commands);
@@ -1382,6 +1440,8 @@ fn cover_strip_moves(
         }
         let refused = if !cover_enabled(&config) {
             Some("switched off")
+        } else if !has_access(&photos) {
+            Some("capture access lost")
         } else if !shown_here {
             Some("strip not shown")
         } else if scrolling.is_some() {
@@ -1430,7 +1490,14 @@ fn cover_strip_moves(
             &config,
         );
         slide.layout = layout_print(&strip, &windows);
-        note_hidden(&mut slide.hid, &strip, &windows, area, target);
+        note_hidden(
+            &mut slide.hid,
+            &strip,
+            &windows,
+            area,
+            target,
+            config.sliver_width(),
+        );
         screen.0.slide(display.id(), &slide.path(), PATH_STEP);
         screen.0.track(display.id(), f64::from(from));
         debug!(
@@ -1560,11 +1627,13 @@ fn start_slide(
 /// frame the layout committed it to, or once it has waited
 /// [`LANDING_TIMEOUT`]. A write can return before its app shows the new
 /// frame, so the cover came down over a window still where it was.
+#[allow(clippy::too_many_arguments)]
 fn lift_covers(
     mut strips: Query<(Entity, &LayoutStrip, &mut CoverSlide)>,
     windows: CoverWindows,
-    frames: Query<(&Window, &Position, &Bounds)>,
+    frames: Query<(&Window, &Position, &Bounds, Has<EdgeSlice>)>,
     shown_frames: Option<Res<ShownFrames>>,
+    config: Res<Config>,
     time: Res<Time>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
     mut commands: Commands,
@@ -1572,6 +1641,7 @@ fn lift_covers(
     let Some(mut screen) = screen else {
         return;
     };
+    let sliver = config.sliver_width();
     for (entity, strip, mut slide) in &mut strips {
         let Some((deadline, settled)) = slide.landing else {
             continue;
@@ -1579,13 +1649,21 @@ fn lift_covers(
         let row = strip_windows(strip, &windows);
         let in_place = row.iter().all(|window| window.at_rest)
             && shown_frames.as_ref().is_none_or(|shown| {
-                resize::shows_committed(&row, &frames, slide.area, &slide.hid, shown)
+                resize::shows_committed(&row, &frames, slide.area, &slide.hid, shown, sliver)
             });
         let settled = if in_place { settled + 1 } else { 0 };
         if settled >= LANDED_FRAMES || time.elapsed() >= deadline {
             let late = if settled >= LANDED_FRAMES {
                 ""
             } else {
+                if let Some(shown) = shown_frames.as_ref() {
+                    let mismatches = resize::uncommitted_frames(
+                        &row, &frames, slide.area, &slide.hid, shown, sliver,
+                    );
+                    if !mismatches.is_empty() {
+                        debug!("cover over strip {entity} landing mismatch: {mismatches:?}");
+                    }
+                }
                 " at its time limit"
             };
             debug!("cover over strip {entity} lifted{late}");
@@ -1744,6 +1822,8 @@ fn cover_swipes(
                 && display.actual_display_bounds(dock, &config) == swipe.viewport;
             let ended = if !cover_enabled(&config) {
                 Some("switched off")
+            } else if !has_access(&photos) {
+                Some("capture access lost")
             } else if !shown_here {
                 Some("strip not shown")
             } else if !same_place {
@@ -1785,7 +1865,14 @@ fn cover_swipes(
                 );
                 slide.layout = swipe.layout;
                 slide.hid = std::mem::take(&mut swipe.hid);
-                note_hidden(&mut slide.hid, &strip, &windows, swipe.area, marker.0);
+                note_hidden(
+                    &mut slide.hid,
+                    &strip,
+                    &windows,
+                    swipe.area,
+                    marker.0,
+                    config.sliver_width(),
+                );
                 // The real windows wait where the swipe found them until the
                 // slide lands, not where the fingers last took the strip.
                 slide.rest = swipe.rest;
@@ -1820,7 +1907,14 @@ fn cover_swipes(
                 } else {
                     screen.0.place(swipe.display, f64::from(position.0.x));
                     let mut hid = std::mem::take(&mut swipe.hid);
-                    note_hidden(&mut hid, &strip, &windows, swipe.area, position.0);
+                    note_hidden(
+                        &mut hid,
+                        &strip,
+                        &windows,
+                        swipe.area,
+                        position.0,
+                        config.sliver_width(),
+                    );
                     entity_commands.insert(CoverSlide {
                         display: swipe.display,
                         from: f64::from(position.0.x),
@@ -1859,6 +1953,7 @@ fn cover_swipes(
             || morphing
             || moving
             || !cover_enabled(&config)
+            || !has_access(&photos)
             || !shown_here
             || fullscreen
             || dragging
@@ -1888,7 +1983,14 @@ fn cover_swipes(
         screen.0.track(display.id(), f64::from(position.0.x));
         debug!("cover over swiped strip {entity}: {pictures} pictures");
         let mut hid = Vec::new();
-        note_hidden(&mut hid, &strip, &windows, area, position.0);
+        note_hidden(
+            &mut hid,
+            &strip,
+            &windows,
+            area,
+            position.0,
+            config.sliver_width(),
+        );
         commands.entity(entity).insert(CoverSwipe {
             display: display.id(),
             shown: position.0.x,
@@ -1966,12 +2068,15 @@ fn refresh_cover_photos(
         // A capture now would cost the slide frames.
         return;
     }
-    if photos
-        .asked
-        .as_ref()
-        .is_some_and(|asked| now.saturating_sub(asked.at) < ASK_TIMEOUT)
-    {
-        return;
+    if let Some(asked) = &photos.asked {
+        if now.saturating_sub(asked.at) < ASK_TIMEOUT {
+            return;
+        }
+        let subject = asked.subject;
+        if !photos.timed_out.insert(subject) {
+            photos.timed_out.remove(&subject);
+            photos.failed_until.insert(subject, now + FAILED_RETRY);
+        }
     }
     photos.asked = None;
     let alive = all_windows
@@ -1991,6 +2096,15 @@ fn refresh_cover_photos(
     // A window that changed its title without a kept picture still has an
     // epoch, which goes with the window.
     photos.title_epoch.retain(|id, _| alive.contains(id));
+    let retain_subject = |subject: &CoverSubject, _: &mut Duration| match subject {
+        CoverSubject::Window(id) => alive.contains(id),
+        CoverSubject::Desktop(_) => true,
+    };
+    photos.timed_out.retain(|subject| match subject {
+        CoverSubject::Window(id) => alive.contains(id),
+        CoverSubject::Desktop(_) => true,
+    });
+    photos.failed_until.retain(retain_subject);
 
     // The strip each display shows, so every display's next move is ready.
     let rows = displays
@@ -2078,30 +2192,48 @@ fn next_picture(
     for (display, strip) in rows {
         let row = strip_windows(strip, windows);
         let excluding = row.iter().map(|window| window.id).collect::<Vec<_>>();
-        match photos.desktops.get(&display.id()) {
-            Some(kept)
-                if excluding.iter().all(|id| kept.excluding.contains(id))
-                    && now.saturating_sub(kept.taken) < DESKTOP_REFRESH => {}
-            kept => wanted.push(Want {
-                priority: if kept.is_none() { 1 } else { 3 },
-                taken: kept.map_or(Duration::ZERO, |kept| kept.taken),
-                subject: CoverSubject::Desktop(display.id()),
-                size: display.physical_bounds().size(),
-                display: display.id(),
-                excluding: excluding.clone(),
-            }),
+        let desktop_subject = CoverSubject::Desktop(display.id());
+        if photos
+            .failed_until
+            .get(&desktop_subject)
+            .is_none_or(|until| now >= *until)
+        {
+            match photos.desktops.get(&display.id()) {
+                Some(kept)
+                    if excluding.iter().all(|id| kept.excluding.contains(id))
+                        && now.saturating_sub(kept.taken) < DESKTOP_REFRESH => {}
+                kept => wanted.push(Want {
+                    priority: if photos.timed_out.contains(&desktop_subject) {
+                        5
+                    } else if kept.is_none() {
+                        1
+                    } else {
+                        3
+                    },
+                    taken: kept.map_or(Duration::ZERO, |kept| kept.taken),
+                    subject: desktop_subject,
+                    size: display.physical_bounds().size(),
+                    display: display.id(),
+                    excluding: excluding.clone(),
+                }),
+            }
         }
         for window in row.iter().filter(|window| window.at_rest && !window.tabbed) {
+            let subject = CoverSubject::Window(window.id);
             if photos
                 .blank_until
                 .get(&window.id)
                 .is_some_and(|until| now < *until)
+                || photos
+                    .failed_until
+                    .get(&subject)
+                    .is_some_and(|until| now < *until)
             {
                 continue;
             }
             let focused = windows
                 .get(window.entity)
-                .is_ok_and(|(.., focused, _)| focused);
+                .is_ok_and(|(.., focused, _, _)| focused);
             let size = window.frame.size();
             let kept = photos.windows.get(&window.id);
             let age = kept.map_or(Duration::MAX, |kept| now.saturating_sub(kept.taken));
@@ -2116,10 +2248,15 @@ fn next_picture(
                 Some(_) if age >= WINDOW_REFRESH => 4,
                 Some(_) => continue,
             };
+            let priority = if photos.timed_out.contains(&subject) {
+                5
+            } else {
+                priority
+            };
             wanted.push(Want {
                 priority,
                 taken: kept.map_or(Duration::ZERO, |kept| kept.taken),
-                subject: CoverSubject::Window(window.id),
+                subject,
                 size,
                 display: display.id(),
                 excluding: Vec::new(),

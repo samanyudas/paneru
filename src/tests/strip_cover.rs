@@ -2961,10 +2961,9 @@ fn until_access(harness: &mut TestHarness, allowed: bool) {
     panic!("pictures are allowed: {}", !allowed);
 }
 
-/// A fresh picture a resize's cover holds until its frame fits never shows
-/// once macOS stops allowing pictures, even after it allows them again
-/// before the frame fits. The background refresh forgot every kept picture
-/// but left the resize's, which showed once its frame fit.
+/// Loss of capture access aborts an active resize cover immediately and drops
+/// any fresh picture it held until its frame fit, so no waiting picture
+/// shows even if access is restored afterward.
 #[test]
 fn a_waiting_picture_never_shows_once_access_is_revoked() {
     let (mut harness, log) = harness(resize_config());
@@ -2975,12 +2974,17 @@ fn a_waiting_picture_never_shows_once_access_is_revoked() {
     log.borrow_mut().denied = true;
     recheck(&mut harness);
     until_access(&mut harness, false);
+    harness.app.update();
+    assert!(
+        !morphed(harness.world()),
+        "revoking access aborts the resize cover"
+    );
+    assert!(log.borrow().hidden >= 1, "the cover hides immediately");
+    assert!(log.borrow().replaced.is_empty(), "no waiting picture shows");
+
     log.borrow_mut().denied = false;
     recheck(&mut harness);
     until_access(&mut harness, true);
-    assert!(morphed(harness.world()), "the resize goes on");
-    assert!(log.borrow().replaced.is_empty(), "before its frame fits");
-
     until_unmorphed(&mut harness);
     assert!(
         log.borrow().replaced.is_empty(),
@@ -4058,4 +4062,281 @@ fn a_title_bar_double_click_morphs_under_the_cover() {
     assert_eq!(log.borrow().morphs.len(), morphs_before + 1);
     let restore_paths = shown_frames_of(&mut harness, &[1]);
     assert_eq!(restore_paths[0], vec![rest_1]);
+}
+
+/// A bottom-tucked window that macOS clamps slightly higher than its committed
+/// bottom-edge position lifts the cover once it lands instead of forcing the
+/// full `LANDING_TIMEOUT`, while still holding while the OS shows it inside
+/// the viewport.
+#[test]
+fn a_clamped_bottom_tucked_window_lifts_before_the_time_limit() {
+    let left = IRect::new(-EXT_DISPLAY_WIDTH, 0, 0, EXT_DISPLAY_HEIGHT);
+    let log = ScreenLog::default();
+    let mut harness = TestHarness::new()
+        .with_config(config(true, Some(14.0)))
+        .with_display(EXT_DISPLAY_ID, left, vec![EXT_WORKSPACE_ID]);
+    for id in 0..4 {
+        harness = harness.with_window(id, |window| {
+            window.frame.max.x = window.frame.min.x + 700;
+        });
+    }
+    harness
+        .world()
+        .insert_non_send(CoverScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        focus(Direction::First),
+    ]);
+    harness.advance(SETTLE);
+    take_pictures(&mut harness, &log);
+
+    // Move right so window 0 goes past the left display boundary onto the bottom
+    // tuck. Simulate macOS WindowServer clamping y 20 px above the committed frame.
+    let before_0 = window_frame(harness.world(), 0);
+    harness.mock_state.show_at(0, before_0);
+    send(&mut harness, focus(Direction::Last));
+    harness.advance(ONE_FRAME);
+    let (strip, slide) = sliding_strip(harness.world());
+    let target = slide.heading().expect("the pictures slide");
+    log.borrow_mut().showing = Some(f64::from(target.x));
+    harness.advance(ONE_FRAME);
+    log.borrow_mut().showing = None;
+    let landed = harness
+        .world()
+        .get::<CoverSlide>(strip)
+        .cloned()
+        .expect("slide lands under the cover");
+    assert_eq!(landed.heading(), None);
+    harness.advance(ONE_FRAME * 4);
+    assert!(
+        covered(harness.world()),
+        "cover holds while OS still shows window 0 in the viewport interior"
+    );
+
+    let committed_0 = shown_window_frame(harness.world(), 0);
+    assert!(
+        committed_0.min.y >= TEST_DISPLAY_HEIGHT - 20,
+        "window 0 committed to bottom tuck: {committed_0:?}"
+    );
+    let clamped_0 = IRect::from_corners(
+        committed_0.min - IVec2::new(0, 20),
+        committed_0.max - IVec2::new(0, 20),
+    );
+    harness.mock_state.show_at(0, clamped_0);
+    // Advance well under LANDING_TIMEOUT (350 ms): 4 * 20ms = 80ms + earlier 80ms = 160ms total.
+    harness.advance(ONE_FRAME * 4);
+    assert!(
+        !covered(harness.world()),
+        "clamped bottom-tucked frame lifts before LANDING_TIMEOUT"
+    );
+}
+
+/// A parked off-screen sliver whose OS frame sits up to a few points inside the
+/// display edge does not hold the cover down past the spring on neighboring moves.
+#[test]
+fn a_parked_sliver_with_os_clamping_does_not_hold_the_landing_cover() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    // Move to the last column so window 0 is parked as a left sliver, then move
+    // back to window 2 while window 0 stays parked.
+    send(&mut harness, focus(Direction::Last));
+    harness.advance(SETTLE);
+    let sliver_0 = shown_window_frame(harness.world(), 0);
+    // Clamp window 0's left sliver 3 px inside the display edge (like WindowServer).
+    let clamped_0 = IRect::from_corners(
+        sliver_0.min + IVec2::new(3, 0),
+        sliver_0.max + IVec2::new(3, 0),
+    );
+    harness.mock_state.show_at(0, clamped_0);
+
+    let hidden_before = log.borrow().hidden;
+    send(&mut harness, focus(Direction::West));
+    // Slide is ~237 ms + 2 landing frames (~40 ms) = ~280 ms. 16 * 20 ms = 320 ms,
+    // which is < 237 + 350 = 587 ms if LANDING_TIMEOUT had been triggered.
+    harness.advance(ONE_FRAME * 16);
+    assert!(
+        !covered(harness.world()),
+        "clamped parked left sliver must not force LANDING_TIMEOUT"
+    );
+    assert_eq!(log.borrow().hidden, hidden_before + 1);
+}
+
+/// Shifting the viewport while a strip has an active `CoverSlide` translates
+/// the slide's destination instead of snapping back from the pre-slide rest x.
+#[test]
+fn follow_viewport_translates_an_active_slide_destination() {
+    use crate::ecs::{DockPosition, SetDock};
+    use crate::manager::Display;
+
+    let log = ScreenLog::default();
+    let mut harness = TestHarness::new().with_config(config(true, Some(14.0)));
+    for (id, width) in [(0, 700), (1, 700), (2, 500)] {
+        harness = harness.with_window(id, move |window| {
+            window.frame.max.x = window.frame.min.x + width;
+        });
+    }
+    harness
+        .world()
+        .insert_non_send(CoverScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        focus(Direction::First),
+    ]);
+    harness.advance(SETTLE);
+    let display = harness
+        .world()
+        .query_filtered::<Entity, With<Display>>()
+        .iter(harness.world())
+        .next()
+        .expect("display entity");
+    harness.world().trigger(SetDock {
+        display,
+        dock: DockPosition::Left(80),
+    });
+    harness.advance(SETTLE);
+    take_pictures(&mut harness, &log);
+
+    send(&mut harness, focus(Direction::Last));
+    harness.advance(ONE_FRAME);
+    let (strip, slide) = sliding_strip(harness.world());
+    let target = slide.heading().expect("active slide heading");
+    assert!(target.x < -STEP, "slide heads to last column: {target:?}");
+
+    harness.world().trigger(SetDock {
+        display,
+        dock: DockPosition::Hidden,
+    });
+    harness.advance(ONE_FRAME);
+
+    let queued = harness
+        .world()
+        .get::<crate::ecs::RepositionMarker>(strip)
+        .map(|marker| marker.0);
+    assert_eq!(
+        queued,
+        Some(target + IVec2::new(-80, 0)),
+        "destination translates from slide heading {target:?}, not rest origin"
+    );
+}
+
+/// Repeated capture failures or timed-out asks back off that subject so the
+/// desktop and later windows still get photographed.
+#[test]
+fn failed_and_timed_out_captures_back_off_to_let_desktop_capture() {
+    use crate::ecs::slice_photos::PhotoError;
+
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    let mut seen_subjects = Vec::new();
+    let mut answered = log.borrow().asked.len();
+
+    // Fail window 0 explicitly first, then drop every reply for another window so
+    // two consecutive ASK_TIMEOUTs put it on cooldown, while Desktop and the
+    // other windows still get captured within 5.4 s (< FAILED_RETRY = 6 s).
+    let mut timed_out_subject = None;
+    for step in 0..45 {
+        harness.advance(Duration::from_millis(120));
+        let asked = log.borrow().asked.clone();
+        for &(subject, generation) in &asked[answered..] {
+            seen_subjects.push(subject);
+            if subject == CoverSubject::Window(0) {
+                send(
+                    &mut harness,
+                    Event::CoverPhoto {
+                        subject,
+                        generation,
+                        result: Err(PhotoError::Failed),
+                    },
+                );
+                continue;
+            }
+            if timed_out_subject.is_none() && step > 0 && matches!(subject, CoverSubject::Window(_))
+            {
+                timed_out_subject = Some(subject);
+            }
+            if Some(subject) == timed_out_subject {
+                // Intentionally drop every reply so consecutive ASK_TIMEOUTs happen.
+                continue;
+            }
+            send(
+                &mut harness,
+                Event::CoverPhoto {
+                    subject,
+                    generation,
+                    result: Ok(Photo {
+                        digest: Digest(u64::from(generation)),
+                        image: pixel(),
+                        edge_color: None,
+                    }),
+                },
+            );
+        }
+        answered = asked.len();
+    }
+
+    let window_0_asks = seen_subjects
+        .iter()
+        .filter(|s| **s == CoverSubject::Window(0))
+        .count();
+    assert!(
+        window_0_asks <= 2,
+        "window 0 backed off instead of spinning forever (asked {window_0_asks} times)"
+    );
+    assert!(
+        seen_subjects
+            .iter()
+            .any(|s| matches!(s, CoverSubject::Desktop(_))),
+        "desktop capture proceeded despite earlier window failure/timeout: {seen_subjects:?}"
+    );
+    if let Some(timed_out) = timed_out_subject {
+        let count = seen_subjects.iter().filter(|s| **s == timed_out).count();
+        assert!(
+            count <= 2,
+            "timed-out subject {timed_out:?} also backed off (asked {count} times)"
+        );
+    }
+}
+
+/// Losing capture access aborts active swipe covers (even while fingers remain
+/// down) and active slide covers immediately.
+#[test]
+fn losing_capture_access_aborts_active_swipe_and_slide_covers() {
+    let recheck = |harness: &mut TestHarness| {
+        harness.world().resource_mut::<Config>().set_changed();
+    };
+
+    // Subcase 1: active CoverSwipe with fingers still down on the trackpad.
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    let _strip = start_covered_swipe(&mut harness, &log);
+    let hidden_before = log.borrow().hidden;
+    log.borrow_mut().denied = true;
+    recheck(&mut harness);
+    until_access(&mut harness, false);
+    harness.app.update();
+    assert!(
+        harness
+            .world()
+            .query::<&crate::ecs::strip_cover::CoverSwipe>()
+            .iter(harness.world())
+            .next()
+            .is_none(),
+        "CoverSwipe aborted on capture access loss while fingers stay down"
+    );
+    assert_eq!(log.borrow().hidden, hidden_before + 1);
+
+    // Subcase 2: active CoverSlide.
+    let (mut harness, log) = self::harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    assert!(covered(harness.world()), "CoverSlide started");
+    let hidden_before = log.borrow().hidden;
+    log.borrow_mut().denied = true;
+    recheck(&mut harness);
+    until_access(&mut harness, false);
+    harness.app.update();
+    assert!(
+        !covered(harness.world()),
+        "CoverSlide aborted on access loss"
+    );
+    assert_eq!(log.borrow().hidden, hidden_before + 1);
 }

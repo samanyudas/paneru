@@ -36,13 +36,14 @@ use super::{
     ASK_TIMEOUT, Access, Asked, CoverPhotos, CoverScreen, CoverScreenHandle, CoverSlide,
     CoverSubject, CoverSwipe, CoverWindows, LANDED_FRAMES, LANDING_TIMEOUT, PATH_STEP, SHOWN_GRACE,
     ShownStrips, StartedCovers, StripWindow, apply_cover_reply, close, cover_enabled, end_guard,
-    scene_of, shows, strip_windows,
+    has_access, is_horizontal_sliver, scene_of, shows, strip_windows,
 };
 use crate::config::Config;
 use crate::ecs::drag::DragState;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::maximize::{MaximizeMorph, RefusingWidth};
 use crate::ecs::pacing::ShownFrames;
+use crate::ecs::shared_edge::EdgeSlice;
 use crate::ecs::slice_photos::Photo;
 use crate::ecs::systems::AnimationStep;
 use crate::ecs::workspace::spawn_snap_strip_guard;
@@ -533,6 +534,8 @@ pub(super) fn cover_resizes(
                 };
             let ended = if !cover_enabled(&config) {
                 Some("switched off")
+            } else if !has_access(&photos) {
+                Some("capture access lost")
             } else if !shown_here {
                 Some("strip not shown")
             } else if display.id() != morph.display
@@ -706,6 +709,8 @@ pub(super) fn cover_resizes(
 
         let refused = if !cover_enabled(&config) {
             Some("switched off")
+        } else if !has_access(&photos) {
+            Some("capture access lost")
         } else if !shown_here {
             Some("strip not shown")
         } else if sliding || swiping || scrolling {
@@ -1062,6 +1067,68 @@ fn turn_entry(
     ease::entry_for_speed(speed, f64::from(to - now), duration)
 }
 
+/// Target frame and classification for a window watched under a landing cover.
+struct CommittedTarget {
+    id: WinID,
+    want: IRect,
+    tucked: bool,
+    is_sliver: bool,
+}
+
+fn committed_targets(
+    row: &[StripWindow],
+    frames: &Query<(&Window, &Position, &Bounds, Has<EdgeSlice>)>,
+    area: IRect,
+    hid: &[Entity],
+    sliver: i32,
+) -> Vec<CommittedTarget> {
+    row.iter()
+        .filter_map(|window| {
+            let (found, position, bounds, tucked) = frames.get(window.entity).ok()?;
+            let cell = IRect::from_corners(position.0, position.0 + bounds.0);
+            let want = found.margins().shown(cell);
+            let is_sliver = !tucked && is_horizontal_sliver(want, area, sliver);
+            let visible = !tucked && !is_sliver && !want.intersect(area).is_empty();
+            (visible || hid.contains(&window.entity)).then_some(CommittedTarget {
+                id: found.id(),
+                want,
+                tucked,
+                is_sliver,
+            })
+        })
+        .collect()
+}
+
+fn close_axis(a: i32, b: i32) -> bool {
+    (a - b).abs() <= 2
+}
+
+fn matches_committed(target: &CommittedTarget, frame: IRect, area: IRect, sliver: i32) -> bool {
+    if close(frame.min, target.want.min) && close(frame.max, target.want.max) {
+        return true;
+    }
+    if target.tucked {
+        // macOS WindowServer clamps bottom-tucked windows above the display bottom so
+        // the titlebar stays reachable; accept the clamped position once horizontally
+        // in place and tucked near the bottom edge.
+        return close_axis(frame.min.x, target.want.min.x)
+            && close_axis(frame.max.x, target.want.max.x)
+            && close(frame.size(), target.want.size())
+            && frame.min.y >= area.max.y.min(target.want.min.y) - 64
+            && frame.min.y <= target.want.min.y + 2;
+    }
+    if target.is_sliver {
+        let left_sliver =
+            target.want.max.x <= area.min.x + sliver + 8 && frame.max.x <= area.min.x + sliver + 8;
+        let right_sliver =
+            target.want.min.x >= area.max.x - sliver - 8 && frame.min.x >= area.max.x - sliver - 8;
+        return close_axis(frame.min.y, target.want.min.y)
+            && close(frame.size(), target.want.size())
+            && (left_sliver || right_sliver);
+    }
+    false
+}
+
 /// Whether the window server shows each window of `row` that a cover over
 /// `area` hides, at the frame the layout committed it to: one whose
 /// committed frame meets `area`, or one of `hid`, which met it before. A
@@ -1073,39 +1140,59 @@ fn turn_entry(
 /// short.
 pub(super) fn shows_committed(
     row: &[StripWindow],
-    frames: &Query<(&Window, &Position, &Bounds)>,
+    frames: &Query<(&Window, &Position, &Bounds, Has<EdgeSlice>)>,
     area: IRect,
     hid: &[Entity],
     shown: &ShownFrames,
+    sliver: i32,
 ) -> bool {
-    let hidden = |rect: IRect| !rect.intersect(area).is_empty();
-    let committed = row
-        .iter()
-        .filter_map(|window| {
-            let (found, position, bounds) = frames.get(window.entity).ok()?;
-            let cell = IRect::from_corners(position.0, position.0 + bounds.0);
-            let frame = found.margins().shown(cell);
-            (hidden(frame) || hid.contains(&window.entity)).then_some((found.id(), frame))
-        })
-        .collect::<Vec<_>>();
-    let ids = committed.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let committed = committed_targets(row, frames, area, hid, sliver);
+    let ids = committed.iter().map(|target| target.id).collect::<Vec<_>>();
     let read = shown.watch_morph(&ids);
-    committed.iter().all(|(id, want)| {
+    committed.iter().all(|target| {
         read.iter()
-            .find(|(shown, _)| shown == id)
-            .is_some_and(|(_, frame)| close(frame.min, want.min) && close(frame.max, want.max))
+            .find(|(shown, _)| *shown == target.id)
+            .is_some_and(|(_, frame)| matches_committed(target, *frame, area, sliver))
     })
+}
+
+/// Returns numeric `(window_id, shown_frame, want_frame)` for any committed
+/// window that does not currently match [`shows_committed`], for diagnostics.
+pub(super) fn uncommitted_frames(
+    row: &[StripWindow],
+    frames: &Query<(&Window, &Position, &Bounds, Has<EdgeSlice>)>,
+    area: IRect,
+    hid: &[Entity],
+    shown: &ShownFrames,
+    sliver: i32,
+) -> Vec<(WinID, Option<IRect>, IRect)> {
+    let committed = committed_targets(row, frames, area, hid, sliver);
+    let ids = committed.iter().map(|target| target.id).collect::<Vec<_>>();
+    let read = shown.watch_morph(&ids);
+    committed
+        .iter()
+        .filter_map(|target| {
+            let found = read
+                .iter()
+                .find(|(shown, _)| *shown == target.id)
+                .map(|(_, frame)| *frame);
+            let ok = found.is_some_and(|frame| matches_committed(target, frame, area, sliver));
+            (!ok).then_some((target.id, found, target.want))
+        })
+        .collect()
 }
 
 /// Takes each resize's cover down at once when its pictures have landed
 /// and its windows rest at their new frames, or when it has waited
 /// [`LANDING_TIMEOUT`]. It never fades: a fade over the real windows shows
 /// the old picture and the new layout as one blurred double image.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lift_morphs(
     mut strips: Query<(Entity, &LayoutStrip, &mut CoverMorph)>,
     windows: CoverWindows,
-    frames: Query<(&Window, &Position, &Bounds)>,
+    frames: Query<(&Window, &Position, &Bounds, Has<EdgeSlice>)>,
     shown_frames: Option<Res<ShownFrames>>,
+    config: Res<Config>,
     time: Res<Time>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
     mut commands: Commands,
@@ -1113,6 +1200,7 @@ pub(super) fn lift_morphs(
     let Some(mut screen) = screen else {
         return;
     };
+    let sliver = config.sliver_width();
     let now = time.elapsed();
     for (entity, strip, mut morph) in &mut strips {
         let Stage::Landing { deadline, settled } = morph.stage else {
@@ -1120,9 +1208,9 @@ pub(super) fn lift_morphs(
         };
         let row = strip_windows(strip, &windows);
         let in_place = row.iter().all(|window| window.at_rest)
-            && shown_frames
-                .as_ref()
-                .is_none_or(|shown| shows_committed(&row, &frames, morph.area, &morph.hid, shown));
+            && shown_frames.as_ref().is_none_or(|shown| {
+                shows_committed(&row, &frames, morph.area, &morph.hid, shown, sliver)
+            });
         let settled = if in_place { settled + 1 } else { 0 };
         if settled < LANDED_FRAMES && now < deadline {
             morph.stage = Stage::Landing { deadline, settled };
@@ -1131,6 +1219,13 @@ pub(super) fn lift_morphs(
         let late = if settled >= LANDED_FRAMES {
             ""
         } else {
+            if let Some(shown) = shown_frames.as_ref() {
+                let mismatches =
+                    uncommitted_frames(&row, &frames, morph.area, &morph.hid, shown, sliver);
+                if !mismatches.is_empty() {
+                    debug!("cover over resized strip {entity} landing mismatch: {mismatches:?}");
+                }
+            }
             " at its time limit"
         };
         debug!("cover over resized strip {entity} lifted{late}");

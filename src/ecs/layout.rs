@@ -2607,6 +2607,7 @@ type ViewportStrips<'w, 's> = Query<
         Option<&'static Scrolling>,
         Has<SelectedVirtualMarker>,
         Has<PreviousStripPosition>,
+        Option<&'static crate::ecs::strip_cover::CoverSlide>,
     ),
 >;
 
@@ -2680,7 +2681,9 @@ fn follow_viewport(
     commands: &mut Commands,
 ) {
     let focused = windows.focused().map(|(_, entity)| entity);
-    for (entity, mut strip, child, position, reposition, scrolling, selected, parked) in strips {
+    for (entity, mut strip, child, position, reposition, scrolling, selected, parked, cover) in
+        strips
+    {
         let Some(shift) = shift(child.parent()) else {
             continue;
         };
@@ -2688,7 +2691,7 @@ fn follow_viewport(
         if !selected || parked {
             continue;
         }
-        let destination = strip_destination(position, reposition, scrolling, None);
+        let destination = strip_destination(position, reposition, scrolling, cover);
         let target = displays
             .get(child.parent())
             .ok()

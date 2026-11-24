@@ -1449,6 +1449,12 @@ impl MockState {
         inner.shown_late.insert(id, frame);
     }
 
+    /// Makes the window server keep showing window `id` at `frame` until
+    /// [`Self::show_now`], whatever frame its app has taken.
+    pub fn show_at(&self, id: WinID, frame: IRect) {
+        self.inner.force_write().shown_late.insert(id, frame);
+    }
+
     pub fn show_now(&self, id: WinID) {
         self.inner.force_write().shown_late.remove(&id);
     }
