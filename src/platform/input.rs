@@ -271,8 +271,9 @@ enum CommitCheck {
     /// Cumulative and excluded-contact checks passed; only recent commit-frame
     /// coherence failed, so arming should remain pending rather than rejecting.
     NeedsRecentMotion,
-    /// Cumulative threshold, axis dominance, finger count, or excluded-contact
-    /// stationarity failed.
+    /// An excluded (non-selected) contact moved past `MIN_FINGER_ARM_MM`.
+    ExcludedMoved,
+    /// Cumulative threshold, axis dominance, or finger count did not pass yet.
     NotReady,
 }
 
@@ -288,6 +289,12 @@ fn subset_commits(
     if indices.len() != configured_fingers || indices.is_empty() {
         return CommitCheck::NotReady;
     }
+    for (idx, (&p, &c)) in primary_mm.iter().zip(cross_mm).enumerate() {
+        if !indices.contains(&idx) && (p.abs() >= MIN_FINGER_ARM_MM || c.abs() >= MIN_FINGER_ARM_MM)
+        {
+            return CommitCheck::ExcludedMoved;
+        }
+    }
     let count = len_as_f64(indices.len());
     let mean_primary = indices.iter().map(|&i| primary_mm[i]).sum::<f64>() / count;
     let mean_cross = indices.iter().map(|&i| cross_mm[i]).sum::<f64>() / count;
@@ -295,12 +302,6 @@ fn subset_commits(
         || mean_primary.abs() < AXIS_DOMINANCE * mean_cross.abs()
     {
         return CommitCheck::NotReady;
-    }
-    for (idx, (&p, &c)) in primary_mm.iter().zip(cross_mm).enumerate() {
-        if !indices.contains(&idx) && (p.abs() >= MIN_FINGER_ARM_MM || c.abs() >= MIN_FINGER_ARM_MM)
-        {
-            return CommitCheck::NotReady;
-        }
     }
     let sign = mean_primary.signum();
     let max_frame = indices
@@ -631,6 +632,15 @@ impl<I: Clone> SwipeAccumulator<I> {
         }
     }
 
+    fn reset_arming(&mut self, touches: Vec<SwipeSample<I>>, now: Instant) -> SwipeSampleOutcome {
+        self.state = SwipeState::Arming {
+            start_anchors: touches,
+            prev_frame: Vec::new(),
+            prev_frame_at: now,
+        };
+        SwipeSampleOutcome::Pending
+    }
+
     fn sample_arming(
         &mut self,
         touches: Vec<SwipeSample<I>>,
@@ -649,11 +659,12 @@ impl<I: Clone> SwipeAccumulator<I> {
         };
 
         if start_anchors.len() != touches.len() {
-            self.state = SwipeState::Arming {
-                start_anchors: touches,
-                prev_frame: Vec::new(),
-                prev_frame_at: now,
-            };
+            return self.reset_arming(touches, now);
+        }
+
+        if now.saturating_duration_since(*prev_frame_at) >= RECENT_MOTION_WINDOW {
+            *prev_frame = touches;
+            *prev_frame_at = now;
             return SwipeSampleOutcome::Pending;
         }
 
@@ -665,12 +676,7 @@ impl<I: Clone> SwipeAccumulator<I> {
         let Some(metrics) =
             ArmingMetrics::measure(start_anchors, reference, &touches, same_identity)
         else {
-            self.state = SwipeState::Arming {
-                start_anchors: touches,
-                prev_frame: Vec::new(),
-                prev_frame_at: now,
-            };
-            return SwipeSampleOutcome::Pending;
+            return self.reset_arming(touches, now);
         };
 
         let horiz_moving = coherent_moving_indices(&metrics.horiz_mm);
@@ -688,7 +694,7 @@ impl<I: Clone> SwipeAccumulator<I> {
                 Self::advance_arming_reference(prev_frame, prev_frame_at, touches, &metrics, now);
                 return SwipeSampleOutcome::Pending;
             }
-            CommitCheck::NotReady => {}
+            CommitCheck::ExcludedMoved | CommitCheck::NotReady => {}
         }
 
         let vert_moving = coherent_moving_indices(&metrics.vert_mm);
@@ -696,6 +702,7 @@ impl<I: Clone> SwipeAccumulator<I> {
             let mean_vert = mean_selected(&metrics.vert_mm, &vert_moving).abs();
             let mean_horiz = mean_selected(&metrics.horiz_mm, &vert_moving).abs();
             if mean_vert >= ARM_DISTANCE_MM && mean_vert > mean_horiz {
+                let mut vert_excluded_moved = false;
                 if vertical_enabled {
                     match subset_commits(
                         &vert_moving,
@@ -722,10 +729,14 @@ impl<I: Clone> SwipeAccumulator<I> {
                             );
                             return SwipeSampleOutcome::Pending;
                         }
+                        CommitCheck::ExcludedMoved => vert_excluded_moved = true,
                         CommitCheck::NotReady => {}
                     }
                 }
-                if !vertical_enabled || max_abs(&metrics.vert_mm) >= REJECT_DISAGREE_MM {
+                if !vertical_enabled
+                    || (max_abs(&metrics.vert_mm) >= REJECT_DISAGREE_MM
+                        && (vert_moving.len() != configured_fingers || vert_excluded_moved))
+                {
                     return self.reject_touches(touches);
                 }
             }
@@ -2221,6 +2232,18 @@ mod tests {
             );
             assert!(!swipe.is_active());
         }
+
+        // Frame 19: after a 160 ms gap, a single 0.16 mm drift on all three contacts
+        // expires the stale reference before checking commit, so it still does not commit.
+        for f in &mut step {
+            f.x += 0.16 / 127.0;
+        }
+        assert_eq!(
+            swipe.sample(step, 3, false, now + Duration::from_millis(320), |a, b| a
+                == b),
+            SwipeSampleOutcome::Pending
+        );
+        assert!(!swipe.is_active());
     }
 
     #[test]
@@ -2397,6 +2420,46 @@ mod tests {
             SwipeSampleOutcome::Rejected
         );
         assert!(!swipe.is_active());
+    }
+
+    #[test]
+    fn ambiguous_diagonal_vertical_candidate_stays_pending_then_commits() {
+        let now = Instant::now();
+        let mut swipe = SwipeAccumulator::default();
+        let mut start = three_fingers(0.5);
+        start.push(SwipeSample {
+            identity: 99,
+            x: 0.05,
+            y: 0.05,
+            device_width_points: 360.0,
+            device_height_points: 240.0,
+        });
+        swipe.sample(start.clone(), 3, true, now, |a, b| a == b);
+
+        // 3 fingers reach 7 mm sideways and 9 mm vertically with a stationary palm:
+        // fails AXIS_DOMINANCE (9 < 1.5 * 7 = 10.5), must stay Pending (not Rejected).
+        let mut step1 = start;
+        for f in &mut step1[0..3] {
+            f.x += 7.0 / 127.0;
+            f.y += 9.0 / 84.7;
+        }
+        assert_eq!(
+            swipe.sample(step1.clone(), 3, true, now, |a, b| a == b),
+            SwipeSampleOutcome::Pending
+        );
+
+        // Next frame moves 3 mm further vertically (12 mm >= 1.5 * 7 = 10.5 mm) -> commits.
+        let mut step2 = step1;
+        for f in &mut step2[0..3] {
+            f.y += 3.0 / 84.7;
+        }
+        assert!(matches!(
+            swipe.sample(step2, 3, true, now, |a, b| a == b),
+            SwipeSampleOutcome::Movement {
+                movement: SwipeMovement::Vertical(_),
+                just_committed: true
+            }
+        ));
     }
 
     #[test]
