@@ -662,13 +662,11 @@ impl<I: Clone> SwipeAccumulator<I> {
             return self.reset_arming(touches, now);
         }
 
-        if now.saturating_duration_since(*prev_frame_at) >= RECENT_MOTION_WINDOW {
-            *prev_frame = touches;
-            *prev_frame_at = now;
-            return SwipeSampleOutcome::Pending;
-        }
-
-        let reference = if prev_frame.len() == touches.len() {
+        let reference_expired =
+            now.saturating_duration_since(*prev_frame_at) >= RECENT_MOTION_WINDOW;
+        let reference = if reference_expired {
+            &touches
+        } else if prev_frame.len() == touches.len() {
             &*prev_frame
         } else {
             &*start_anchors
@@ -2397,15 +2395,17 @@ mod tests {
         });
         swipe.sample(start.clone(), 3, true, now, |a, b| a == b);
 
-        // Four contacts at vertical offsets [9, 9, 9, -4] mm -> 4th contact is moving,
-        // so this must Reject (not stay Pending).
+        // Four contacts at vertical offsets [9, 9, 9, -4] mm after a 100 ms gap
+        // (past RECENT_MOTION_WINDOW) -> 4th contact is moving, so this must still
+        // Reject rather than returning Pending on reference expiry.
         let mut step1 = start.clone();
         for f in &mut step1[0..3] {
             f.y += 9.0 / 84.7;
         }
         step1[3].y -= 4.0 / 84.7;
         assert_eq!(
-            swipe.sample(step1, 3, true, now, |a, b| a == b),
+            swipe.sample(step1, 3, true, now + Duration::from_millis(100), |a, b| a
+                == b),
             SwipeSampleOutcome::Rejected
         );
 
@@ -2416,7 +2416,8 @@ mod tests {
             f.y += 10.0 / 84.7;
         }
         assert_eq!(
-            swipe.sample(step2, 3, true, now, |a, b| a == b),
+            swipe.sample(step2, 3, true, now + Duration::from_millis(110), |a, b| a
+                == b),
             SwipeSampleOutcome::Rejected
         );
         assert!(!swipe.is_active());
