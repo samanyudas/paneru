@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use bevy::ecs::system::SystemState;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, TaskPoolBuilder};
 use bevy::time::TimeUpdateStrategy;
@@ -15,6 +16,7 @@ use crate::ecs::focus::FocusEventsPlugin;
 use crate::ecs::layout::LayoutEventsPlugin;
 use crate::ecs::mouse::MouseEventsPlugin;
 use crate::ecs::pacing::ShownFrames;
+use crate::ecs::params::FrameActivity;
 use crate::ecs::scroll::ScrollEventsPlugin;
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::WorkspaceEventsPlugin;
@@ -35,20 +37,21 @@ use super::*;
 /// clamped physics production never sees.
 const FRAME: Duration = Duration::from_millis(20);
 
+/// Coarser tick used while the engine is idle (`!FrameActivity::mid_frame()` and
+/// no pending mock events), staying under Bevy's default 250 ms `max_delta`
+/// while avoiding dozens of no-op frames during multi-second settle windows.
+const IDLE_FRAME: Duration = Duration::from_millis(200);
+
 /// How much simulated time each command in [`TestHarness::run`] is given to
 /// play out.
 const COMMAND_WINDOW: Duration = Duration::from_millis(500);
-
-/// Derived rather than written out, so that retuning [`FRAME`] keeps the
-/// simulated time per command fixed instead of silently rescaling every
-/// timing-sensitive expectation in the suite.
-const UPDATES_PER_COMMAND: usize = (COMMAND_WINDOW.as_millis() / FRAME.as_millis()) as usize;
 
 type VerifierFunc = Box<dyn FnMut(&mut World, MockState)>;
 pub(crate) struct TestHarness {
     pub(crate) app: App,
     pub(crate) mock_state: MockState,
     pub(crate) verifiers: HashMap<usize, VerifierFunc>,
+    activity: SystemState<FrameActivity<'static, 'static>>,
 }
 
 impl TestHarness {
@@ -79,10 +82,13 @@ impl TestHarness {
         world.insert_resource(WindowManager(Box::new(wm)));
         world.insert_resource(ShownFrames::inline(mock_state.shown_frames()));
 
+        let activity = SystemState::new(app.world_mut());
+
         Self {
             app,
             mock_state,
             verifiers: HashMap::new(),
+            activity,
         }
     }
 
@@ -211,6 +217,13 @@ impl TestHarness {
         self
     }
 
+    fn is_mid_frame(&mut self) -> bool {
+        self.activity
+            .get(self.app.world())
+            .expect("frame activity")
+            .mid_frame()
+    }
+
     /// Runs the app for `duration` of simulated time, draining the mock
     /// platform's events each frame just as [`Self::run`] does.
     ///
@@ -218,14 +231,72 @@ impl TestHarness {
     /// target — have to be expressed in time, not in a frame count: a frame is
     /// [`FRAME`] long, so a bare `for _ in 0..10 { app.update() }` silently
     /// changes how long it waits whenever that constant is retuned.
+    ///
+    /// While the engine has active frame work or mock events arriving, each
+    /// step uses [`FRAME`] so animations and physics match production. Once two
+    /// consecutive frames finish idle, remaining time steps in [`IDLE_FRAME`]
+    /// chunks (still under Bevy's 250 ms `max_delta`), mirroring how production
+    /// `pump_events` backs off when `!FrameActivity::mid_frame()`.
     pub(crate) fn advance(&mut self, duration: Duration) {
+        const TAIL_FRAMES: u32 = 3;
+
         let frames = duration.as_millis().div_ceil(FRAME.as_millis());
-        for _ in 0..frames {
+        let base_step = match *self.app.world().resource::<TimeUpdateStrategy>() {
+            TimeUpdateStrategy::ManualDuration(d) => Some(d),
+            _ => None,
+        };
+        // Tests that explicitly override `TimeUpdateStrategy` expect every
+        // frame to advance with their configured delta untouched.
+        if base_step != Some(FRAME) {
+            for _ in 0..frames {
+                self.app.update();
+                for event in self.mock_state.drain_events() {
+                    self.app.world_mut().write_message::<Event>(event);
+                }
+            }
+            return;
+        }
+
+        let tail = FRAME * TAIL_FRAMES;
+        let total_ms = u64::try_from(frames * FRAME.as_millis()).expect("duration fits in u64 ms");
+        let mut remaining = Duration::from_millis(total_ms);
+        let mut current_step = FRAME;
+        let mut idle_streak: u8 = 0;
+
+        while remaining > Duration::ZERO {
+            let step = if idle_streak >= 2 {
+                remaining
+                    .checked_sub(tail)
+                    .filter(|excess| !excess.is_zero())
+                    .map_or_else(|| remaining.min(FRAME), |excess| excess.min(IDLE_FRAME))
+            } else {
+                remaining.min(FRAME)
+            };
+            if current_step != step {
+                *self.app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+                    TimeUpdateStrategy::ManualDuration(step);
+                current_step = step;
+            }
+
             self.app.update();
 
-            for event in self.mock_state.drain_events() {
+            let events = self.mock_state.drain_events();
+            let had_events = !events.is_empty();
+            for event in events {
                 self.app.world_mut().write_message::<Event>(event);
             }
+
+            remaining = remaining.saturating_sub(step);
+            if had_events || self.is_mid_frame() {
+                idle_streak = 0;
+            } else {
+                idle_streak = idle_streak.saturating_add(1);
+            }
+        }
+
+        if current_step != FRAME {
+            *self.app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+                TimeUpdateStrategy::ManualDuration(FRAME);
         }
     }
 
@@ -244,15 +315,7 @@ impl TestHarness {
         }
         for (iteration, command) in commands.into_iter().enumerate() {
             self.app.world_mut().write_message::<Event>(command);
-
-            for _ in 0..UPDATES_PER_COMMAND {
-                self.app.update();
-
-                // Drain and process events from our virtual OS
-                for event in self.mock_state.drain_events() {
-                    self.app.world_mut().write_message::<Event>(event);
-                }
-            }
+            self.advance(COMMAND_WINDOW);
 
             if let Some(mut verifier) = self.verifiers.remove(&iteration) {
                 verifier(self.app.world_mut(), self.mock_state.clone());
