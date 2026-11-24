@@ -525,6 +525,7 @@ impl<S: WriteSink> Shared<S> {
                             if let Some(newer) = lock(&mailbox.queue).pending.get_mut(&key) {
                                 newer.position |= write.position;
                                 newer.size |= write.size;
+                                newer.move_first |= write.move_first;
                                 continue;
                             }
                             debug!(pid, to = ?write.to, "writing a frame again that the app left unanswered");
@@ -1526,6 +1527,30 @@ mod writer_tests {
                 Op::Begin,
                 Op::Size(7, Size::new(100, 200)),
                 Op::Position(7, Origin::new(10, 0)),
+                Op::Finish,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_newer_resize_keeps_move_first_from_an_unanswered_write() {
+        let (probe, entered) = Probe::new();
+        let writers = writers(&probe, SECOND, SETTLE);
+        probe.hold(1);
+        let mut first = moved(7, 10);
+        first.move_first = true;
+        writers.push(1, key(7), first);
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+        probe.unanswered.store(1, Ordering::SeqCst);
+        writers.push(1, key(7), resized(7, IRect::new(10, 0, 110, 200)));
+        probe.release(1);
+        assert!(writers.flush(SECOND));
+        assert_eq!(
+            probe.log(1),
+            vec![
+                Op::Begin,
+                Op::Position(7, Origin::new(10, 0)),
+                Op::Size(7, Size::new(100, 200)),
                 Op::Finish,
             ]
         );

@@ -3431,3 +3431,92 @@ fn leaving_to_tucking_eases_photo_from_rest_after_edge_wait() {
         "Leaving -> Tucking eases the photo across multiple frames after edge wait: {tuck_xs:?}"
     );
 }
+
+#[test]
+fn moving_photo_held_by_pacing_eases_after_hold_releases() {
+    use crate::ecs::shared_edge::Slide;
+    use crate::manager::Window;
+
+    const FAST_APP: crate::platform::Pid = 2;
+    let faster: Config = (
+        MainOptions {
+            shared_edge_slices: Some(true),
+            // ~166 ms curve finishes well inside the 250 ms pacing LANDING_TIMEOUT.
+            animation_speed: Some(20.0),
+            ..MainOptions::default()
+        },
+        vec![],
+    )
+        .into();
+    let log = Rc::new(RefCell::new(Screen::default()));
+    let mut harness = TestHarness::new()
+        .with_config(faster)
+        .with_display(EXT_DISPLAY_ID, RIGHT, vec![EXT_WORKSPACE_ID])
+        .with_app(FAST_APP, "fast", "FastApp", |_| {});
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    for (id, width) in (0..).zip([200, 400, 424, 200, 200]) {
+        let pid = if id == 1 { TEST_PROCESS_ID } else { FAST_APP };
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness
+        .world()
+        .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    for _ in 0..100 {
+        queued_frame(&mut harness, true);
+    }
+    paint_asked(&mut harness, &log, &[3]);
+
+    // Slide window 3 left into view and push slow window 1 past x = 0, then hold
+    // window 1 and reverse rightward toward Nth(1) for ~200 ms (> 166 ms ease
+    // duration, < 250 ms LANDING_TIMEOUT) so pacing holds window 2's
+    // RepositionMarker and window 3's Slide::Moving below x = 824.
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Last)));
+    for _ in 0..5 {
+        queued_frame(&mut harness, true);
+    }
+    harness.mock_state.hold_writes(TEST_PROCESS_ID);
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Nth(1))));
+    for _ in 0..10 {
+        queued_frame(&mut harness, false);
+    }
+    let held_moving = harness
+        .world()
+        .query::<(&Window, &Slide)>()
+        .iter(harness.world())
+        .find(|(w, _)| w.id() == 3)
+        .is_some_and(|(_, s)| matches!(s, Slide::Moving { at, .. } if at.x < 824));
+    assert!(
+        held_moving,
+        "window 3 remains in Slide::Moving short of x = 824 while held"
+    );
+
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    let mut move_xs = Vec::new();
+    for _ in 0..20 {
+        queued_frame(&mut harness, true);
+        if let Some(rect) = panel_photo(&log, 3)
+            && move_xs.last().copied() != Some(rect.min.x)
+        {
+            move_xs.push(rect.min.x);
+        }
+    }
+    assert!(
+        move_xs.len() >= 3,
+        "Slide::Moving eases smoothly once pacing hold releases: {move_xs:?}"
+    );
+}

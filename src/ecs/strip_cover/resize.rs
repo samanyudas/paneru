@@ -35,8 +35,8 @@ use tracing::debug;
 use super::{
     ASK_TIMEOUT, Access, Asked, CoverPhotos, CoverScreen, CoverScreenHandle, CoverSlide,
     CoverSubject, CoverSwipe, CoverWindows, LANDED_FRAMES, LANDING_TIMEOUT, PATH_STEP, SHOWN_GRACE,
-    ShownStrips, StartedCovers, StripWindow, apply_cover_reply, close, cover_enabled, end_guard,
-    has_access, is_horizontal_sliver, scene_of, shows, strip_windows,
+    SLIVER_TOLERANCE, ShownStrips, StartedCovers, StripWindow, apply_cover_reply, close,
+    cover_enabled, end_guard, has_access, is_horizontal_sliver, scene_of, shows, strip_windows,
 };
 use crate::config::Config;
 use crate::ecs::drag::DragState;
@@ -1138,10 +1138,12 @@ fn matches_committed(target: &CommittedTarget, frame: IRect, area: IRect, sliver
             && frame.min.y <= target.want.min.y + 2;
     }
     if target.is_sliver {
-        let left_sliver =
-            target.want.max.x <= area.min.x + sliver + 8 && frame.max.x <= area.min.x + sliver + 8;
-        let right_sliver =
-            target.want.min.x >= area.max.x - sliver - 8 && frame.min.x >= area.max.x - sliver - 8;
+        let left_sliver = target.want.max.x <= area.min.x + sliver + SLIVER_TOLERANCE
+            && frame.max.x >= target.want.max.x - SLIVER_TOLERANCE
+            && frame.max.x <= area.min.x + sliver + SLIVER_TOLERANCE;
+        let right_sliver = target.want.min.x >= area.max.x - sliver - SLIVER_TOLERANCE
+            && frame.min.x >= area.max.x - sliver - SLIVER_TOLERANCE
+            && frame.min.x <= target.want.min.x + SLIVER_TOLERANCE;
         return close_axis(frame.min.y, target.want.min.y)
             && close(frame.size(), target.want.size())
             && (left_sliver || right_sliver);
@@ -1503,5 +1505,40 @@ fn unveil_ready_pictures(morphs: &mut Query<&mut CoverMorph>, screen: &mut dyn s
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::math::IRect;
+
+    use super::{CommittedTarget, matches_committed};
+
+    #[test]
+    fn sliver_matches_clamped_edge_and_rejects_far_offscreen_frames() {
+        let area = IRect::new(0, 20, 1024, 768);
+        let sliver = 5;
+
+        let left = CommittedTarget {
+            id: 1,
+            want: IRect::new(-695, 20, 5, 768),
+            tucked: false,
+            is_sliver: true,
+        };
+        let clamped_left = IRect::new(-692, 20, 8, 768);
+        assert!(matches_committed(&left, clamped_left, area, sliver));
+        let far_left = IRect::new(-795, 20, -95, 768);
+        assert!(!matches_committed(&left, far_left, area, sliver));
+
+        let right = CommittedTarget {
+            id: 2,
+            want: IRect::new(1019, 20, 1719, 768),
+            tucked: false,
+            is_sliver: true,
+        };
+        let clamped_right = IRect::new(1016, 20, 1716, 768);
+        assert!(matches_committed(&right, clamped_right, area, sliver));
+        let far_right = IRect::new(1119, 20, 1819, 768);
+        assert!(!matches_committed(&right, far_right, area, sliver));
     }
 }

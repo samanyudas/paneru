@@ -4297,9 +4297,9 @@ fn failed_and_timed_out_captures_back_off_to_let_desktop_capture() {
         .iter()
         .filter(|s| **s == CoverSubject::Window(0))
         .count();
-    assert!(
-        window_0_asks <= 2,
-        "window 0 backed off instead of spinning forever (asked {window_0_asks} times)"
+    assert_eq!(
+        window_0_asks, 1,
+        "window 0 received one Failed reply and stayed in cooldown"
     );
     assert!(
         seen_subjects
@@ -4307,13 +4307,19 @@ fn failed_and_timed_out_captures_back_off_to_let_desktop_capture() {
             .any(|s| matches!(s, CoverSubject::Desktop(_))),
         "desktop capture proceeded despite earlier window failure/timeout: {seen_subjects:?}"
     );
-    if let Some(timed_out) = timed_out_subject {
-        let count = seen_subjects.iter().filter(|s| **s == timed_out).count();
-        assert!(
-            count <= 2,
-            "timed-out subject {timed_out:?} also backed off (asked {count} times)"
-        );
-    }
+    let timed_out =
+        timed_out_subject.expect("a window was selected for consecutive timeout backoff");
+    let count = seen_subjects.iter().filter(|s| **s == timed_out).count();
+    assert_eq!(
+        count, 2,
+        "timed-out subject {timed_out:?} received two unanswered asks and stayed in cooldown"
+    );
+    assert!(
+        seen_subjects
+            .iter()
+            .any(|s| matches!(s, CoverSubject::Window(id) if *id != 0 && *s != timed_out)),
+        "another healthy window capture proceeded despite cooldowns: {seen_subjects:?}"
+    );
 }
 
 /// Losing capture access aborts active swipe covers (even while fingers remain
@@ -4670,59 +4676,202 @@ fn cover_swipe_handoff_uses_display_width_when_dock_narrows_viewport() {
 
 #[test]
 fn auto_center_swiping_timeout_preserves_scrolling_while_awaiting_cover() {
-    let auto_center_config: Config = (
-        MainOptions {
-            auto_center: Some(true),
-            slide_window_pictures: Some(true),
-            animation_speed: Some(14.0),
-            swipe_gesture_fingers: Some(3),
-            ..MainOptions::default()
-        },
-        vec![],
-    )
-        .into();
-    let (mut harness, log) = harness(auto_center_config);
-    take_pictures(&mut harness, &log);
-    harness.advance(Duration::from_secs(3));
+    let measure = |velocity: f64| -> f64 {
+        let auto_center_config: Config = (
+            MainOptions {
+                auto_center: Some(true),
+                slide_window_pictures: Some(true),
+                animation_speed: Some(14.0),
+                swipe_gesture_fingers: Some(3),
+                ..MainOptions::default()
+            },
+            vec![],
+        )
+            .into();
+        let (mut harness, log) = harness(auto_center_config);
+        take_pictures(&mut harness, &log);
+        harness.advance(Duration::from_secs(3));
 
-    let strip = start_covered_swipe(&mut harness, &log);
-    {
-        let mut scroll = harness
+        let strip = start_covered_swipe(&mut harness, &log);
+        {
+            let mut scroll = harness
+                .world()
+                .get_mut::<crate::ecs::Scrolling>(strip)
+                .expect("the strip scrolls");
+            scroll.velocity = velocity;
+            scroll.is_user_swiping = false;
+            scroll.fingers_down = false;
+            // Older than idle threshold so swiping_timeout would drop Scrolling if not awaiting cover.
+            scroll.last_event = Duration::ZERO;
+        }
+        let position = harness
             .world()
-            .get_mut::<crate::ecs::Scrolling>(strip)
-            .expect("the strip scrolls");
-        scroll.velocity = -0.4;
-        scroll.is_user_swiping = false;
-        scroll.fingers_down = false;
-        // Older than idle threshold so swiping_timeout would drop Scrolling if not awaiting cover.
-        scroll.last_event = Duration::ZERO;
-    }
-    let position = harness
-        .world()
-        .get::<crate::ecs::Position>(strip)
-        .expect("a strip position")
-        .0;
-    let away = position.with_x(position.x + 80);
-    let slides_before = log.borrow().slides.len();
-    harness
-        .world()
-        .entity_mut(strip)
-        .insert(crate::ecs::RepositionMarker(away));
-    harness.advance(ONE_FRAME);
-
-    // If swiping_timeout had removed Scrolling prematurely before cover_swipes ran,
-    // no CoverSlide or carried velocity would have started on this move.
-    assert!(
-        covered(harness.world()) && log.borrow().slides.len() > slides_before,
-        "swiping_timeout preserved Scrolling while awaiting cover under auto_center"
-    );
-    harness.advance(SETTLE);
-    assert!(
+            .get::<crate::ecs::Position>(strip)
+            .expect("a strip position")
+            .0;
+        let away = position.with_x(position.x + 80);
+        let slides_before = log.borrow().slides.len();
         harness
             .world()
-            .entity(strip)
-            .get::<crate::ecs::Scrolling>()
-            .is_none(),
-        "Scrolling clears once the cover finishes"
+            .entity_mut(strip)
+            .insert(crate::ecs::RepositionMarker(away));
+        harness.advance(ONE_FRAME);
+
+        assert!(
+            covered(harness.world()) && log.borrow().slides.len() > slides_before,
+            "cover slide started while awaiting cover under auto_center"
+        );
+        let speed = starting_speed(log.borrow().paths.last().expect("a slide path"));
+        harness.advance(SETTLE);
+        assert!(
+            harness
+                .world()
+                .entity(strip)
+                .get::<crate::ecs::Scrolling>()
+                .is_none(),
+            "Scrolling clears once the cover finishes"
+        );
+        speed
+    };
+
+    let zero_speed = measure(0.0);
+    let carried_speed = measure(-0.4);
+    assert!(
+        carried_speed > zero_speed + 100.0,
+        "swiping_timeout preserved Scrolling so cover_swipes carried velocity ({carried_speed} vs {zero_speed})"
+    );
+}
+
+#[test]
+fn window_gone_on_live_window_backs_off_to_let_desktop_capture() {
+    use crate::ecs::slice_photos::PhotoError;
+
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    let mut seen_subjects = Vec::new();
+    let mut answered = log.borrow().asked.len();
+
+    for _ in 0..45 {
+        harness.advance(Duration::from_millis(120));
+        let asked = log.borrow().asked.clone();
+        for &(subject, generation) in &asked[answered..] {
+            seen_subjects.push(subject);
+            if subject == CoverSubject::Window(0) {
+                send(
+                    &mut harness,
+                    Event::CoverPhoto {
+                        subject,
+                        generation,
+                        result: Err(PhotoError::WindowGone),
+                        excluded: None,
+                    },
+                );
+                continue;
+            }
+            send(
+                &mut harness,
+                Event::CoverPhoto {
+                    subject,
+                    generation,
+                    result: Ok(Photo {
+                        digest: Digest(u64::from(generation)),
+                        image: pixel(),
+                        edge_color: None,
+                    }),
+                    excluded: None,
+                },
+            );
+        }
+        answered = asked.len();
+    }
+
+    let window_0_asks = seen_subjects
+        .iter()
+        .filter(|s| **s == CoverSubject::Window(0))
+        .count();
+    assert_eq!(
+        window_0_asks, 1,
+        "live WindowGone asks once and enters 6 s cooldown"
+    );
+    assert!(
+        seen_subjects
+            .iter()
+            .any(|s| matches!(s, CoverSubject::Desktop(_))),
+        "desktop capture proceeds while omitted live window is in cooldown"
+    );
+    assert!(
+        seen_subjects
+            .iter()
+            .any(|s| matches!(s, CoverSubject::Window(id) if *id != 0)),
+        "other window captures proceed while omitted live window is in cooldown"
+    );
+
+    harness.mock_state.os_close_window(0);
+    for _ in 0..20 {
+        harness.advance(ONE_FRAME);
+        if log.borrow().forgotten.contains(&Some(0)) {
+            break;
+        }
+    }
+    assert!(
+        log.borrow().forgotten.contains(&Some(0)),
+        "closed window still cleans up normally"
+    );
+}
+
+#[test]
+fn a_sliver_jumping_to_the_opposite_edge_stays_in_hid() {
+    const SLOW_APP: crate::platform::Pid = 2;
+
+    let log = ScreenLog::default();
+    let mut harness = TestHarness::new()
+        .with_config(config(true, Some(14.0)))
+        .with_app(SLOW_APP, "slow", "SlowApp", |_| {});
+    harness.mock_state.queue_writes(SLOW_APP);
+    for (id, width) in (0..).zip([500, 524, 500, 600, 600]) {
+        let pid = if id == 2 { SLOW_APP } else { TEST_PROCESS_ID };
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness
+        .world()
+        .insert_non_send(CoverScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        focus(Direction::First),
+    ]);
+    for _ in 0..100 {
+        harness.advance(ONE_FRAME);
+        assert!(harness.mock_state.flush_writes(Duration::from_secs(1)));
+    }
+    take_pictures(&mut harness, &log);
+
+    // Window 2 rests as a right sliver before jumping to Last, where it lands
+    // wholly off-screen on the left (outside `area`).
+    let right_sliver_2 = shown_window_frame(harness.world(), 2);
+    assert!(
+        right_sliver_2.min.x >= TEST_DISPLAY_WIDTH - 5 - 8,
+        "window 2 starts as a right sliver: {right_sliver_2:?}"
+    );
+
+    harness.mock_state.hold_writes(SLOW_APP);
+    send(&mut harness, focus(Direction::Last));
+    harness.advance(ONE_FRAME * 16);
+    assert!(
+        covered(harness.world()),
+        "cover stays up while window 2 still shows at old right sliver on opposite edge"
+    );
+
+    harness.mock_state.release_writes(SLOW_APP);
+    assert!(harness.mock_state.flush_writes(Duration::from_secs(1)));
+    harness.advance(ONE_FRAME * 4);
+    assert!(
+        !covered(harness.world()),
+        "cover lifts once window 2 leaves the old right sliver"
     );
 }

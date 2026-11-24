@@ -1041,7 +1041,7 @@ fn slide_photos(
     time: Res<Time>,
     mut commands: Commands,
 ) {
-    for (entity, window, mut slide, mut position, presented, tucked, ease) in &mut sliding {
+    for (entity, window, mut slide, mut position, presented, tucked, mut ease) in &mut sliding {
         // The slide's ease has stepped this frame, before pacing.
         let t = ease.0.t();
         let id = window.id();
@@ -1051,9 +1051,12 @@ fn slide_photos(
         match *slide {
             Slide::Moving { at, from } => {
                 let shows = slices.has_photo(id, from.slice.size);
-                let (next, arrived) = ease_step(at, presented.0, t);
-                let next = holds.limit(entity, at, next);
+                let (stepped, arrived) = ease_step(at, presented.0, t);
+                let next = holds.limit(entity, at, stepped);
                 let arrived = arrived && next == presented.0;
+                if stepped != at && next == at && !arrived {
+                    ease.0.restart();
+                }
                 let moved = displays
                     .get(from.slice.display)
                     .ok()

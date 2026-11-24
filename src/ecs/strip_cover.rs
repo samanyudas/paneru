@@ -902,6 +902,7 @@ fn apply_cover_reply(
             photos.failed_until.remove(&subject);
             if let CoverSubject::Window(id) = subject {
                 photos.forget_window(id);
+                photos.failed_until.insert(subject, now + FAILED_RETRY);
                 if let Some(screen) = screen {
                     screen.0.forget(Some(id));
                 }
@@ -1128,11 +1129,33 @@ fn layout_print(strip: &LayoutStrip, windows: &CoverWindows) -> u64 {
     hasher.finish()
 }
 
+/// Pixel tolerance when matching a parked horizontal sliver against the
+/// display edge after macOS `WindowServer` edge clamping.
+pub(super) const SLIVER_TOLERANCE: i32 = 8;
+
+/// Which horizontal edge of the display viewport a parked sliver sits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SliverSide {
+    Left,
+    Right,
+}
+
+/// Which horizontal edge of `area` `rect` rests on as a parked sliver, if any.
+pub(super) fn horizontal_sliver_side(rect: IRect, area: IRect, sliver: i32) -> Option<SliverSide> {
+    if rect.max.x <= area.min.x + sliver + SLIVER_TOLERANCE {
+        Some(SliverSide::Left)
+    } else if rect.min.x >= area.max.x - sliver - SLIVER_TOLERANCE {
+        Some(SliverSide::Right)
+    } else {
+        None
+    }
+}
+
 /// Whether `rect` lies at the left or right edge of `area` as a parked
 /// off-screen sliver, including up to a few points of macOS `WindowServer` edge
 /// clamping.
 pub(super) fn is_horizontal_sliver(rect: IRect, area: IRect, sliver: i32) -> bool {
-    rect.max.x <= area.min.x + sliver + 8 || rect.min.x >= area.max.x - sliver - 8
+    horizontal_sliver_side(rect, area, sliver).is_some()
 }
 
 /// Adds to `hid` each tiled window of `strip` whose frame meets `area`
@@ -1150,9 +1173,13 @@ fn note_hidden(
     let meets = |rect: IRect| !rect.intersect(area).is_empty();
     for window in strip_windows(strip, windows) {
         let lands = IRect::from_corners(window.frame.min + at, window.frame.max + at);
+        let lands_side = horizontal_sliver_side(lands, area, sliver);
         let shows = windows.get(window.entity).is_ok_and(|(found, .., tucked)| {
             let shown = found.shown_frame();
-            !tucked && meets(shown) && !is_horizontal_sliver(shown, area, sliver)
+            !tucked
+                && meets(shown)
+                && !horizontal_sliver_side(shown, area, sliver)
+                    .is_some_and(|side| Some(side) == lands_side)
         });
         if (shows || meets(lands)) && !hid.contains(&window.entity) {
             hid.push(window.entity);
