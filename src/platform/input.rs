@@ -470,6 +470,16 @@ impl<I: Clone> SwipeAccumulator<I> {
         matches!(self.state, SwipeState::Active { .. })
     }
 
+    fn is_active_compatible(&self, configured_fingers: usize, vertical_enabled: bool) -> bool {
+        match &self.state {
+            SwipeState::Active { axis, anchors, .. } => {
+                anchors.len() == configured_fingers
+                    && (*axis == SwipeAxis::Horizontal || vertical_enabled)
+            }
+            _ => true,
+        }
+    }
+
     #[cfg(test)]
     fn reset(&mut self) {
         self.state = SwipeState::Idle;
@@ -678,6 +688,7 @@ impl<I: Clone> SwipeAccumulator<I> {
         };
 
         let horiz_moving = coherent_moving_indices(&metrics.horiz_mm);
+        let mut horiz_excluded_moved = false;
         match subset_commits(
             &horiz_moving,
             configured_fingers,
@@ -692,7 +703,8 @@ impl<I: Clone> SwipeAccumulator<I> {
                 Self::advance_arming_reference(prev_frame, prev_frame_at, touches, &metrics, now);
                 return SwipeSampleOutcome::Pending;
             }
-            CommitCheck::ExcludedMoved | CommitCheck::NotReady => {}
+            CommitCheck::ExcludedMoved => horiz_excluded_moved = true,
+            CommitCheck::NotReady => {}
         }
 
         let vert_moving = coherent_moving_indices(&metrics.vert_mm);
@@ -741,7 +753,7 @@ impl<I: Clone> SwipeAccumulator<I> {
         }
 
         if max_abs(&metrics.horiz_mm) >= REJECT_DISAGREE_MM
-            && horiz_moving.len() != configured_fingers
+            && (horiz_moving.len() != configured_fingers || horiz_excluded_moved)
         {
             return self.reject_touches(touches);
         }
@@ -1032,6 +1044,7 @@ impl InputHandler {
 
     fn uninstall_tap(&mut self) {
         self.slice_tap.reset();
+        self.clear_swipe_on_tap_reset();
         self.taps = None;
     }
 
@@ -1061,7 +1074,9 @@ impl InputHandler {
                 CGEvent::tap_enable(&tap.port, true);
             }
         }
-        if taps.iter().all(|tap| CGEvent::tap_is_enabled(&tap.port)) {
+        let reenabled = taps.iter().all(|tap| CGEvent::tap_is_enabled(&tap.port));
+        self.clear_swipe_on_tap_reset();
+        if reenabled {
             warn!("event tap was disabled, re-enabled it");
             TapHealth::Reenabled
         } else {
@@ -1118,6 +1133,7 @@ impl InputHandler {
     fn rearm_taps(&mut self) {
         warn!("Tap Disabled, re-enabling");
         self.slice_tap.reset();
+        self.clear_swipe_on_tap_reset();
         double_click_tap::reset();
         for tap in self.taps.iter().flatten() {
             if tap.port.is_valid() {
@@ -1284,12 +1300,30 @@ impl InputHandler {
         self.last_swipe_time = None;
     }
 
+    fn clear_swipe_on_tap_reset(&mut self) {
+        if self.swipe_accumulator.end(Instant::now()) {
+            self.send_touchpad_up();
+        }
+        self.swipe_accumulator.clear_retouch();
+    }
+
+    fn ensure_active_swipe_compatible(&mut self, now: Instant) {
+        let Some(configured_fingers) = self.configured_swipe_fingers() else {
+            self.cancel_disabled_swipe(now);
+            return;
+        };
+        if !self
+            .swipe_accumulator
+            .is_active_compatible(configured_fingers, self.config.swipe_vertical())
+        {
+            self.cancel_disabled_swipe(now);
+        }
+    }
+
     /// Use the configured modifier to scroll the strip or select an adjacent window.
     fn handle_scroll_wheel(&mut self, event: &CGEvent) -> bool {
         let now = Instant::now();
-        if self.configured_swipe_fingers().is_none() {
-            self.cancel_disabled_swipe(now);
-        }
+        self.ensure_active_swipe_compatible(now);
 
         let is_continuous =
             CGEvent::integer_value_field(Some(event), CGEventField::ScrollWheelEventIsContinuous)
@@ -1414,6 +1448,12 @@ impl InputHandler {
             self.cancel_disabled_swipe(now);
             return false;
         };
+        if !self
+            .swipe_accumulator
+            .is_active_compatible(configured_fingers, self.config.swipe_vertical())
+        {
+            self.cancel_disabled_swipe(now);
+        }
 
         objc2::rc::autoreleasepool(|_| {
             let Some(ns_event) = NSEvent::eventWithCGEvent(event) else {
@@ -1424,10 +1464,14 @@ impl InputHandler {
                 return false;
             }
 
-            // Fingers lifted off touchpad.
+            // Fingers lifted off touchpad or gesture cancelled.
             let phase = ns_event.phase();
-            if phase.0 & NS_EVENT_PHASE_CANCELLED != 0 || phase.0 & NS_EVENT_PHASE_ENDED != 0 {
+            let cancelled = phase.0 & NS_EVENT_PHASE_CANCELLED != 0;
+            if cancelled || phase.0 & NS_EVENT_PHASE_ENDED != 0 {
                 self.finish_active_swipe(now);
+                if cancelled {
+                    self.swipe_accumulator.clear_retouch();
+                }
                 self.invalid_device_size_warned = false;
                 return false;
             }
@@ -2461,6 +2505,44 @@ mod tests {
                 just_committed: true
             }
         ));
+    }
+
+    #[test]
+    fn participating_fourth_contact_rejects_horizontal_swipe_even_if_it_returns() {
+        let now = Instant::now();
+        let mut swipe = SwipeAccumulator::default();
+        let mut start = three_fingers(0.5);
+        start.push(SwipeSample {
+            identity: 99,
+            x: 0.2,
+            y: 0.5,
+            device_width_points: 360.0,
+            device_height_points: 240.0,
+        });
+        swipe.sample(start.clone(), 3, false, now, |a, b| a == b);
+
+        // Horizontal offsets [9, 9, 9, -4] mm -> 4th contact moved, must Reject.
+        let mut step1 = start.clone();
+        for f in &mut step1[0..3] {
+            f.x += 9.0 / 127.0;
+        }
+        step1[3].x -= 4.0 / 127.0;
+        assert_eq!(
+            swipe.sample(step1, 3, false, now, |a, b| a == b),
+            SwipeSampleOutcome::Rejected
+        );
+
+        // Even if the 4th contact returns to 0 on the next frame ([10, 10, 10, 0] mm),
+        // the rejected touch set stays rejected.
+        let mut step2 = start;
+        for f in &mut step2[0..3] {
+            f.x += 10.0 / 127.0;
+        }
+        assert_eq!(
+            swipe.sample(step2, 3, false, now, |a, b| a == b),
+            SwipeSampleOutcome::Rejected
+        );
+        assert!(!swipe.is_active());
     }
 
     #[test]
