@@ -20,6 +20,8 @@ use stdext::function_name;
 use tracing::{debug, error};
 
 use super::skylight::_SLPSGetFrontProcess;
+use super::window_writer::Answer;
+use super::windows::ask_app;
 use super::{AXUIElementCopyAttributeValue, ProcessApi, Window, WindowOS, ax_window_id};
 use crate::config::Config;
 use crate::errors::{Error, Result};
@@ -123,6 +125,11 @@ pub trait ApplicationApi: Send + Sync {
     ///
     /// Returns an `Error` if the focused window cannot be determined.
     fn focused_window_id(&self) -> Result<WinID>;
+    /// Asks for the ID of the app's focused window without waiting on the
+    /// app, after the moves, resizes, and raise asked for its windows so
+    /// far. A busy app can take the whole Accessibility timeout to answer,
+    /// and a frame that waited on it stopped every window.
+    fn ask_focused_window_id(&self) -> Answer<Result<WinID>>;
     /// Returns the currently focused window for this application, if any.
     fn focused_window(&self, config: &Config) -> Option<Window>;
     /// Returns the manageable windows of this application.
@@ -310,6 +317,11 @@ impl ApplicationApi for ApplicationOS {
     /// `Ok(WinID)` with the focused window ID if successful, otherwise `Err(Error)`.
     fn focused_window_id(&self) -> Result<WinID> {
         self.element.focused_window_id()
+    }
+
+    fn ask_focused_window_id(&self) -> Answer<Result<WinID>> {
+        let element = self.element.clone();
+        ask_app(self.pid, move || element.focused_window_id())
     }
 
     fn focused_window(&self, config: &Config) -> Option<Window> {

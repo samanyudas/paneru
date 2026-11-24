@@ -24,6 +24,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::ptr::null_mut;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
+use std::task::Poll;
 use std::thread;
 use std::time::Duration;
 use stdext::function_name;
@@ -35,7 +36,7 @@ use super::skylight::{
     AXUIElementCopyAttributeValue, AXUIElementPerformAction, AXUIElementSetAttributeValue,
     SLPSPostEventRecordTo, SLSWindowIteratorAdvance,
 };
-use super::window_writer::{FrameWrites, WindowWriters, WriteSink};
+use super::window_writer::{Answer, FrameWrites, WindowWriters, WriteSink};
 use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::manager::{Origin, Size, irect_from};
@@ -275,6 +276,18 @@ const WRITER_SETTLE: Duration = Duration::from_secs(1);
 /// back. Returns whether all of them did.
 pub(super) fn flush_window_writes(timeout: Duration) -> bool {
     WRITERS.flush(timeout)
+}
+
+/// Asks `pid`'s app `question` on its window writer, after the moves,
+/// resizes, and raise asked for it so far. Waits only briefly on the app, so
+/// an app that answers at once has its answer ready.
+pub(super) fn ask_app<T: Send + 'static>(
+    pid: Pid,
+    question: impl FnOnce() -> T + Send + 'static,
+) -> Answer<T> {
+    let answer = WRITERS.ask(pid, question);
+    WRITERS.wait_briefly(pid, &answer);
+    answer
 }
 
 type RestoreEnhancedUi = Box<dyn FnOnce() -> Result<()> + Send>;
@@ -527,6 +540,14 @@ pub trait WindowApi: Send + Sync {
     /// land, and fails if it has not. A system that must never wait on an
     /// app checks [`Self::write_pending`] first.
     fn update_frame(&mut self) -> Result<IRect>;
+    /// Reads the window's frame back from the OS, on its app's writer after
+    /// the engine's own moves and resizes, waiting only briefly on the app.
+    /// An app that answers at once gives the frame now. Otherwise this
+    /// returns `Pending`, and a later call returns the frame once the app
+    /// answered. A busy app can take the whole Accessibility timeout to
+    /// answer, and a frame that waited on it stopped every window. `fresh`
+    /// says the app reported a move or resize since the last call.
+    fn poll_frame(&mut self, fresh: bool) -> Poll<Result<IRect>>;
     /// Whether a move or resize the engine asked for has yet to reach the
     /// window. Until it does, the OS reports the frame the window is
     /// leaving, and [`Self::frame`] is the frame the engine asked for.
@@ -1376,6 +1397,14 @@ impl WindowApi for WindowOS {
         let element = &self.ax_element;
         self.writes
             .update_frame(pid, || Ok(margins.tracked(ax_frame(element)?)))
+    }
+
+    fn poll_frame(&mut self, fresh: bool) -> Poll<Result<IRect>> {
+        let pid = self.pid().ok();
+        let window = self.ax_window();
+        self.writes.poll_frame(pid, fresh, move || {
+            Ok(window.margins.tracked(ax_frame(&window.element)?))
+        })
     }
 
     fn write_pending(&self) -> bool {

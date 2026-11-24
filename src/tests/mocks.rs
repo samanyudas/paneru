@@ -10,7 +10,7 @@ use stdext::prelude::RwLockExt;
 use crate::errors::Error;
 use crate::events::{DestroySource, Event, MouseButton};
 use crate::manager::app::{MockApplicationApi, WindowList};
-use crate::manager::window_writer::{FrameWrites, WindowWriters, WriteSink};
+use crate::manager::window_writer::{Answer, FrameWrites, WindowWriters, WriteSink};
 use crate::manager::{
     Application, Display, Margins, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin,
     Size, Window, WindowPadding, origin_from, origin_to,
@@ -18,6 +18,7 @@ use crate::manager::{
 use crate::platform::slice_tap::SlicePress;
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::util::AXUIWrapper;
+use std::task::Poll;
 
 use super::*;
 
@@ -38,6 +39,10 @@ pub(crate) struct MockAppData {
     pub(crate) queued_writes: bool,
     /// How long each queued position or size write takes, like a busy app.
     pub(crate) write_delay: std::time::Duration,
+    /// Reads of the app's window frames and focused window wait while its
+    /// writes are held, as a busy app answers neither. A read that would
+    /// wait on the engine's thread fails the test.
+    pub(crate) reads_wait_on_hold: bool,
     /// macOS reports a regular activation policy, as for an app with a Dock
     /// icon. A menu-bar-only app reports another policy.
     pub(crate) regular: bool,
@@ -339,7 +344,7 @@ impl WriteHolds {
                 || std::thread::current()
                     .name()
                     .is_some_and(|name| name.starts_with("window-writer-")),
-            "a write for held app {pid} ran on the engine's thread"
+            "an Accessibility call for held app {pid} ran on the engine's thread"
         );
         let _ = self
             .released
@@ -646,6 +651,7 @@ impl MockState {
                 connection: Some(0),
                 queued_writes: false,
                 write_delay: std::time::Duration::ZERO,
+                reads_wait_on_hold: false,
                 regular: true,
                 ax_busy: false,
                 answers_probes: false,
@@ -1394,6 +1400,25 @@ impl MockState {
         self.update_app(pid, |app| app.write_delay = delay);
     }
 
+    /// Makes reads of `pid`'s window frames and focused window wait while
+    /// its writes are held, like an app too busy to answer either.
+    pub fn hold_reads_with_writes(&self, pid: Pid) {
+        self.update_app(pid, |app| app.reads_wait_on_hold = true);
+    }
+
+    /// Waits while `pid` is held, if its reads wait on holds.
+    fn read_waits(&self, pid: Pid) {
+        let waits = self
+            .inner
+            .force_read()
+            .apps
+            .get(&pid)
+            .is_some_and(|app| app.reads_wait_on_hold);
+        if waits {
+            self.holds.wait_while_held(pid);
+        }
+    }
+
     /// Makes `pid`'s writer hang inside its next write until released.
     pub fn hold_writes(&self, pid: Pid) {
         self.holds
@@ -1410,6 +1435,15 @@ impl MockState {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&pid);
         self.holds.released.notify_all();
+    }
+
+    fn focused_window_id_of(&self, pid: Pid) -> crate::errors::Result<WinID> {
+        self.inner
+            .force_read()
+            .apps
+            .get(&pid)
+            .and_then(|a| a.focused_window_id)
+            .ok_or(Error::InvalidWindow)
     }
 
     /// How many times the engine started a frame read or a flush while a
@@ -1524,6 +1558,13 @@ impl MockState {
             let margins = fill_margins(&s.inner, id);
             mock_read_frame(&s.inner, id, ax_generation).map(|frame| margins.tracked(frame))
         });
+        let s = self.clone();
+        mw.expect_poll_frame().returning(move |_fresh| {
+            let margins = fill_margins(&s.inner, id);
+            Poll::Ready(
+                mock_read_frame(&s.inner, id, ax_generation).map(|frame| margins.tracked(frame)),
+            )
+        });
 
         let s = self.clone();
         mw.expect_set_fill().returning(move |fill| {
@@ -1591,6 +1632,17 @@ impl MockState {
                 s.engine_waits.fetch_add(1, Ordering::Relaxed);
             }
             writes.update_frame(Some(pid), || {
+                s.read_waits(pid);
+                mock_read_frame(&s.inner, id, ax_generation).map(|frame| margins.tracked(frame))
+            })
+        });
+        let s = self.clone();
+        let w = writes.clone();
+        mw.expect_poll_frame().returning(move |fresh| {
+            let margins = fill_margins(&s.inner, id);
+            let s = s.clone();
+            lock(&w).poll_frame(Some(pid), fresh, move || {
+                s.read_waits(pid);
                 mock_read_frame(&s.inner, id, ax_generation).map(|frame| margins.tracked(frame))
             })
         });
@@ -1930,12 +1982,28 @@ impl MockState {
 
         let s = self.clone();
         ma.expect_focused_window_id().returning(move || {
-            s.inner
+            s.read_waits(pid);
+            s.focused_window_id_of(pid)
+        });
+        let s = self.clone();
+        ma.expect_ask_focused_window_id().returning(move || {
+            let queued = s
+                .inner
                 .force_read()
                 .apps
                 .get(&pid)
-                .and_then(|a| a.focused_window_id)
-                .ok_or(Error::InvalidWindow)
+                .is_some_and(|app| app.queued_writes);
+            if !queued {
+                return Answer::ready(s.focused_window_id_of(pid));
+            }
+            // Asked on the app's writer, as `ApplicationOS` asks it.
+            let asked = s.clone();
+            let answer = s.writers.ask(pid, move || {
+                asked.read_waits(pid);
+                asked.focused_window_id_of(pid)
+            });
+            s.writers.wait_briefly(pid, &answer);
+            answer
         });
 
         let s = self.clone();

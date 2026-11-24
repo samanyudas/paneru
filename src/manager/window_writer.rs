@@ -21,13 +21,21 @@
 //! writer keeps only the newest raise asked for, because raising a window
 //! of the frontmost app also focuses it, and an older raise landing late
 //! would take focus back from the newer one.
+//!
+//! A read is a round-trip too: a busy app leaves it unanswered for the whole
+//! accessibility timeout, and an engine frame that waited on it stopped every
+//! app's windows. The engine asks such questions through
+//! [`WindowWriters::ask`] instead. The writer answers them after the raise
+//! and writes taken with them, and the engine picks the [`Answer`] up on a
+//! later frame.
 
 use bevy::math::IRect;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::task::Poll;
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
@@ -65,6 +73,65 @@ pub(crate) trait WriteSink: Send + 'static {
     /// flush asks for it.
     fn finish(&mut self);
 }
+
+/// How long the engine frame waits for an app to answer a question, so an
+/// app that answers at once is read in the same frame, as before questions
+/// went to its writer. Most apps answer within a millisecond or two.
+const ANSWER_WAIT: Duration = Duration::from_millis(8);
+
+/// How long the engine does not wait at all on an app that took longer than
+/// [`ANSWER_WAIT`]. A busy app stays busy for hundreds of milliseconds, and
+/// waiting on each of its windows in turn would add up within one frame.
+const BUSY_FOR: Duration = Duration::from_millis(250);
+
+/// The app's answer to a question asked through [`WindowWriters::ask`],
+/// once its writer has asked the app.
+pub struct Answer<T>(Arc<(Mutex<Option<T>>, Condvar)>);
+
+impl<T> Answer<T> {
+    /// An answer known without asking the app.
+    pub fn ready(value: T) -> Self {
+        Self(Arc::new((Mutex::new(Some(value)), Condvar::new())))
+    }
+
+    fn waiting() -> Self {
+        Self(Arc::new((Mutex::new(None), Condvar::new())))
+    }
+
+    fn give(slot: &Weak<(Mutex<Option<T>>, Condvar)>, value: T) {
+        if let Some(slot) = slot.upgrade() {
+            *lock(&slot.0) = Some(value);
+            slot.1.notify_all();
+        }
+    }
+
+    /// Waits up to `timeout` for the app to give the answer. Returns whether
+    /// it did.
+    fn wait(&self, timeout: Duration) -> bool {
+        let given = lock(&self.0.0);
+        self.0
+            .1
+            .wait_timeout_while(given, timeout, |given| given.is_none())
+            .unwrap_or_else(PoisonError::into_inner)
+            .0
+            .is_some()
+    }
+
+    /// The answer, once the app gave it. Each answer is taken once.
+    pub fn take(&self) -> Option<T> {
+        lock(&self.0.0).take()
+    }
+}
+
+impl<T> fmt::Debug for Answer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let given = lock(&self.0.0).is_some();
+        f.debug_tuple("Answer").field(&given).finish()
+    }
+}
+
+/// A question for an app, answered on its writer.
+type Question = Box<dyn FnOnce() + Send>;
 
 /// Names the writes of one window handle. A window whose app replaced its AX
 /// element gets a new handle and so a new key, and never waits on writes
@@ -286,6 +353,9 @@ struct Shared<S: WriteSink> {
     open_sink: Box<dyn Fn(Option<Pid>) -> S + Send + Sync>,
     idle: Duration,
     settle: Duration,
+    /// Until when the engine does not wait on each app that missed an
+    /// [`ANSWER_WAIT`].
+    busy: Mutex<HashMap<Pid, Instant>>,
 }
 
 struct Mailbox<W> {
@@ -307,6 +377,9 @@ struct Queue<W> {
     begun: bool,
     /// A flush waits for the writer to finish its sink.
     finish_now: bool,
+    /// Questions for the app, asked after the raise and writes taken with
+    /// them.
+    questions: Vec<Question>,
 }
 
 impl<W> Queue<W> {
@@ -315,7 +388,14 @@ impl<W> Queue<W> {
     }
 
     fn is_empty(&self) -> bool {
-        self.pending.is_empty() && self.in_flight.is_empty() && self.has_no_raises()
+        self.pending.is_empty()
+            && self.in_flight.is_empty()
+            && self.has_no_raises()
+            && self.questions.is_empty()
+    }
+
+    fn has_work(&self) -> bool {
+        !self.pending.is_empty() || self.raise.is_some() || !self.questions.is_empty()
     }
 
     fn has_no_raises(&self) -> bool {
@@ -330,11 +410,12 @@ impl<W> Queue<W> {
 /// What a writer does next.
 enum Next<W> {
     /// Raises `raise`, then writes a batch, after beginning the sink if
-    /// `begin`.
+    /// `begin`, then asks `questions`.
     Write {
         raise: Option<W>,
         batch: HashMap<WriteKey, PendingWrite<W>>,
         begin: bool,
+        questions: Vec<Question>,
     },
     /// Finishes the sink.
     Finish,
@@ -352,6 +433,7 @@ impl<W> Mailbox<W> {
                 raising: false,
                 begun: false,
                 finish_now: false,
+                questions: Vec::new(),
             }),
             work: Condvar::new(),
             landed: Condvar::new(),
@@ -364,7 +446,7 @@ impl<W> Mailbox<W> {
         let mut queue = lock(&self.queue);
         let deadline = Instant::now() + if queue.begun { settle } else { idle };
         loop {
-            if !queue.pending.is_empty() || queue.raise.is_some() {
+            if queue.has_work() {
                 let raise = queue.raise.take();
                 queue.raising = raise.is_some();
                 let batch = std::mem::take(&mut queue.pending);
@@ -376,6 +458,7 @@ impl<W> Mailbox<W> {
                     raise,
                     batch,
                     begin,
+                    questions: std::mem::take(&mut queue.questions),
                 };
             }
             if queue.begun && queue.finish_now {
@@ -474,7 +557,7 @@ impl<S: WriteSink> Shared<S> {
     fn retire(&self, pid: Pid, mailbox: &Arc<Mailbox<S::Window>>) -> bool {
         let mut writers = lock(&self.writers);
         let queue = lock(&mailbox.queue);
-        if !queue.pending.is_empty() || queue.raise.is_some() {
+        if queue.has_work() {
             return false;
         }
         drop(queue);
@@ -495,6 +578,7 @@ impl<S: WriteSink> Shared<S> {
                     raise,
                     batch,
                     begin,
+                    questions,
                 } => {
                     objc2::rc::autoreleasepool(|_| {
                         if let Some(window) = &raise {
@@ -505,6 +589,7 @@ impl<S: WriteSink> Shared<S> {
                         }
                         let mut writes = batch.into_iter().collect::<Vec<_>>();
                         writes.sort_by_key(|(_, write)| write.back_first());
+                        let mut again = Vec::new();
                         for (key, write) in writes {
                             let limited = *lock(&write.size_limited);
                             let asked = Instant::now();
@@ -513,15 +598,20 @@ impl<S: WriteSink> Shared<S> {
                             if took >= SLOW_WRITE {
                                 debug!(pid, to = ?write.to, ms = took.as_millis(), "slow write");
                             }
-                            if !unanswered {
-                                continue;
+                            if unanswered {
+                                // An app may never apply a write it left
+                                // unanswered, so it gets the frame once
+                                // more, with any size it limited before.
+                                *lock(&write.size_limited) = limited;
+                                again.push((key, write));
                             }
-                            // An app may never apply a write it left
-                            // unanswered, so it gets the frame once more,
-                            // with any size it limited before. A newer
-                            // frame for the window takes on this one's
-                            // parts instead.
-                            *lock(&write.size_limited) = limited;
+                        }
+                        // The app's other windows in the batch go first:
+                        // writing again at once held each of them for
+                        // another timeout behind the app that was busy.
+                        for (key, write) in again {
+                            // A newer frame for the window takes on this
+                            // one's parts instead.
                             if let Some(newer) = lock(&mailbox.queue).pending.get_mut(&key) {
                                 newer.position |= write.position;
                                 newer.size |= write.size;
@@ -533,6 +623,11 @@ impl<S: WriteSink> Shared<S> {
                         }
                     });
                     mailbox.land();
+                    // Asked after the batch lands, so a wait on the writes
+                    // never waits on a question as well.
+                    for question in questions {
+                        objc2::rc::autoreleasepool(|_| question());
+                    }
                 }
                 Next::Finish => {
                     objc2::rc::autoreleasepool(|_| sink.finish());
@@ -563,6 +658,7 @@ impl<S: WriteSink> WindowWriters<S> {
                 open_sink: Box::new(open_sink),
                 idle,
                 settle,
+                busy: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -624,6 +720,53 @@ impl<S: WriteSink> WindowWriters<S> {
         lock(&mailbox.queue).raise = Some(window);
         drop(writers);
         mailbox.work.notify_one();
+    }
+
+    /// Asks `pid`'s app `question` on its writer, after the raise and writes
+    /// queued for it so far, and returns the answer to come. Never waits on
+    /// the app.
+    pub fn ask<T: Send + 'static>(
+        &self,
+        pid: Pid,
+        question: impl FnOnce() -> T + Send + 'static,
+    ) -> Answer<T> {
+        let mut writers = lock(&self.shared.writers);
+        let Some(mailbox) = self.writer(&mut writers, pid) else {
+            drop(writers);
+            return Answer::ready(question());
+        };
+        let answer = Answer::waiting();
+        let given = Arc::downgrade(&answer.0);
+        lock(&mailbox.queue).questions.push(Box::new(move || {
+            // Skip the call when nobody is waiting for the answer anymore, so
+            // superseded or timed-out questions never pile up behind a busy app.
+            if given.upgrade().is_none() {
+                return;
+            }
+            Answer::give(&given, question());
+        }));
+        drop(writers);
+        mailbox.work.notify_one();
+        answer
+    }
+
+    /// Waits up to [`ANSWER_WAIT`] for `pid`'s app to give `answer`, unless
+    /// the app missed that wait within the last [`BUSY_FOR`]. Returns
+    /// whether the app gave it.
+    pub fn wait_briefly<T>(&self, pid: Pid, answer: &Answer<T>) -> bool {
+        let now = Instant::now();
+        let busy = lock(&self.shared.busy)
+            .get(&pid)
+            .is_some_and(|until| now < *until);
+        if busy {
+            return lock(&answer.0.0).is_some();
+        }
+        let given = answer.wait(ANSWER_WAIT);
+        if !given {
+            trace!(pid, "app did not answer within {ANSWER_WAIT:?}");
+            lock(&self.shared.busy).insert(pid, Instant::now() + BUSY_FOR);
+        }
+        given
     }
 
     /// Raises `window` on the calling thread.
@@ -688,6 +831,9 @@ pub(crate) struct FrameWrites<S: WriteSink> {
     key: WriteKey,
     frame: IRect,
     size_limited: Arc<Mutex<Option<Size>>>,
+    /// A read [`Self::poll_frame`] asked the app's writer for. Dropped on any
+    /// newer write or fresh notification so the writer skips superseded reads.
+    asked: Option<Answer<Result<IRect>>>,
 }
 
 impl<S: WriteSink> fmt::Debug for FrameWrites<S> {
@@ -706,6 +852,7 @@ impl<S: WriteSink> FrameWrites<S> {
             key: WriteKey::next(),
             frame: IRect::default(),
             size_limited: Arc::default(),
+            asked: None,
         }
     }
 
@@ -797,6 +944,8 @@ impl<S: WriteSink> FrameWrites<S> {
             move_first,
         };
         self.frame = to;
+        // Drop any pending read now so the writer skips it before the new write.
+        self.asked = None;
         match pid {
             Some(pid) => self.writers.push(pid, self.key, write),
             // No app to queue behind: write it here.
@@ -838,7 +987,51 @@ impl<S: WriteSink> FrameWrites<S> {
             ));
         }
         self.frame = read()?;
+        // A read asked for earlier may answer with an older frame.
+        self.asked = None;
         Ok(self.frame)
+    }
+
+    /// Reads the window's frame with `read` on `pid`'s writer, after the
+    /// engine's own writes to it, waiting at most [`ANSWER_WAIT`] on the app.
+    /// An app that answers by then is read at once. Otherwise this returns
+    /// `Pending`, and a later call returns the frame once the app answered.
+    /// `fresh` says the app reported a move or resize since the last call,
+    /// so a read asked before then is asked again: it may have been answered
+    /// before that change. A read that a newer write may have overtaken is
+    /// asked again too, so the frame read is never older than the frame the
+    /// engine last asked for. With no app to ask, reads at once.
+    ///
+    /// # Errors
+    ///
+    /// The ready result fails if `read` failed.
+    pub fn poll_frame(
+        &mut self,
+        pid: Option<Pid>,
+        fresh: bool,
+        read: impl FnOnce() -> Result<IRect> + Send + 'static,
+    ) -> Poll<Result<IRect>> {
+        let Some(pid) = pid else {
+            return Poll::Ready(read().inspect(|&frame| self.frame = frame));
+        };
+        if fresh {
+            self.asked = None;
+        }
+        if let Some(answer) = &self.asked {
+            let Some(result) = answer.take() else {
+                return Poll::Pending;
+            };
+            self.asked = None;
+            return Poll::Ready(result.inspect(|&frame| self.frame = frame));
+        }
+        let answer = self.writers.ask(pid, read);
+        if self.writers.wait_briefly(pid, &answer)
+            && let Some(result) = answer.take()
+        {
+            return Poll::Ready(result.inspect(|&frame| self.frame = frame));
+        }
+        self.asked = Some(answer);
+        Poll::Pending
     }
 }
 
@@ -1988,5 +2181,255 @@ mod writer_tests {
         let res = resize(&mut already, &(), from, size, origin);
         assert!(res.placed);
         assert_eq!(already.positions, vec![Origin::new(-300, 0)]);
+    }
+
+    /// Waits up to a second for `answer`, then takes it.
+    fn answered<T>(answer: &Answer<T>) -> Option<T> {
+        answer.wait(SECOND);
+        answer.take()
+    }
+
+    /// Polls `writes` until its read is ready, for up to a second.
+    fn read_ready(
+        writes: &mut FrameWrites<FakeApp>,
+        read: impl Fn() -> Result<IRect> + Clone + Send + 'static,
+    ) -> Result<IRect> {
+        let deadline = Instant::now() + SECOND;
+        loop {
+            if let Poll::Ready(frame) = writes.poll_frame(Some(1), false, read.clone()) {
+                return frame;
+            }
+            assert!(Instant::now() < deadline, "the read was never answered");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    const READ_A: IRect = IRect {
+        min: bevy::math::IVec2::new(10, 0),
+        max: bevy::math::IVec2::new(110, 100),
+    };
+    const READ_B: IRect = IRect {
+        min: bevy::math::IVec2::new(20, 0),
+        max: bevy::math::IVec2::new(120, 100),
+    };
+
+    /// A question goes to the app after the writes queued before it, so its
+    /// answer sees them.
+    #[test]
+    fn a_question_is_asked_after_the_writes_queued_before_it() {
+        let (probe, _entered) = Probe::new();
+        let writers = writers(&probe, SECOND, SETTLE);
+        writers.push(1, key(7), moved(7, 10));
+        let seen = probe.clone();
+        let answer = writers.ask(1, move || seen.log(1));
+        assert_eq!(
+            answered(&answer),
+            Some(vec![Op::Begin, Op::Position(7, Origin::new(10, 0))])
+        );
+    }
+
+    /// Asking a hung app does not wait for it. Waiting briefly gives up, and
+    /// the next brief wait on that app returns at once, so a frame that asks
+    /// about each of a busy app's windows waits for it only once.
+    #[test]
+    fn a_question_does_not_wait_for_a_hung_app() {
+        let (probe, entered) = Probe::new();
+        let writers = writers(&probe, SECOND, SETTLE);
+        probe.hold(1);
+        writers.push(1, key(7), moved(7, 10));
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+
+        let started = Instant::now();
+        let answer = writers.ask(1, || 5);
+        let gave_up = !writers.wait_briefly(1, &answer);
+        let first_wait = started.elapsed();
+        let again = Instant::now();
+        let second = writers.ask(1, || 6);
+        let gave_up_again = !writers.wait_briefly(1, &second);
+        let second_wait = again.elapsed();
+        probe.release(1);
+
+        assert!(gave_up && gave_up_again, "the hung app answered");
+        assert!(
+            first_wait < Duration::from_millis(100),
+            "the first wait took {first_wait:?}"
+        );
+        assert!(
+            second_wait < ANSWER_WAIT,
+            "the second wait took {second_wait:?}"
+        );
+        assert_eq!(answered(&answer), Some(5));
+        assert_eq!(answered(&second), Some(6));
+    }
+
+    /// An app that left a write unanswered gets it again only after the
+    /// batch's other windows, which no longer wait behind the retry.
+    #[test]
+    fn a_retry_waits_for_the_other_windows_of_its_batch() {
+        let (probe, entered) = Probe::new();
+        let writers = writers(&probe, SECOND, SETTLE);
+        // A held raise keeps both writes queued for one batch.
+        probe.hold(1);
+        writers.raise(1, 9);
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+        writers.push(1, key(7), moved(7, 10));
+        writers.push(1, key(8), moved(8, 20));
+        probe.unanswered.store(1, Ordering::SeqCst);
+        probe.release(1);
+        assert!(writers.flush(SECOND));
+        assert_eq!(
+            probe.log(1),
+            vec![
+                Op::Raise(9),
+                Op::Begin,
+                Op::Position(8, Origin::new(20, 0)),
+                Op::Position(7, Origin::new(10, 0)),
+                Op::Finish,
+            ]
+        );
+    }
+
+    /// An app that answers at once has its frame read in the same call.
+    #[test]
+    fn a_frame_read_of_an_app_that_answers_at_once_is_ready_at_once() {
+        let (probe, _entered) = Probe::new();
+        let mut writes = FrameWrites::new(Arc::new(writers(&probe, SECOND, SETTLE)));
+        assert!(matches!(
+            writes.poll_frame(Some(1), false, || Ok(READ_A)),
+            Poll::Ready(Ok(READ_A))
+        ));
+        assert_eq!(writes.frame(), READ_A);
+    }
+
+    /// A hung app holds up no read of its window's frame. The read is
+    /// ready once the app answers.
+    #[test]
+    fn a_frame_read_does_not_wait_for_a_hung_app() {
+        let (probe, entered) = Probe::new();
+        let mut writes = FrameWrites::new(Arc::new(writers(&probe, SECOND, SETTLE)));
+        probe.hold(1);
+        writes.reposition(Some(1), || 7, Origin::new(10, 0));
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+
+        let started = Instant::now();
+        let first = writes.poll_frame(Some(1), false, || Ok(READ_A));
+        let second = writes.poll_frame(Some(1), false, || Ok(READ_B));
+        let took = started.elapsed();
+        probe.release(1);
+
+        assert!(first.is_pending() && second.is_pending());
+        assert!(took < Duration::from_millis(100), "the reads took {took:?}");
+        assert_eq!(read_ready(&mut writes, || Ok(READ_B)).ok(), Some(READ_A));
+    }
+
+    /// A move the app reports after a read was asked may come after the
+    /// app answered it, so the read is asked again.
+    #[test]
+    fn a_fresh_notification_asks_for_the_frame_again() {
+        let (probe, entered) = Probe::new();
+        let mut writes = FrameWrites::new(Arc::new(writers(&probe, SECOND, SETTLE)));
+        probe.hold(1);
+        writes.reposition(Some(1), || 7, Origin::new(10, 0));
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+
+        assert!(
+            writes
+                .poll_frame(Some(1), false, || Ok(READ_A))
+                .is_pending()
+        );
+        assert!(writes.poll_frame(Some(1), true, || Ok(READ_B)).is_pending());
+        probe.release(1);
+
+        assert_eq!(read_ready(&mut writes, || Ok(READ_A)).ok(), Some(READ_B));
+    }
+
+    /// A read overtaken by a newer write is dropped immediately so the writer
+    /// skips the stale read and runs only the read asked after the write.
+    #[test]
+    fn a_frame_read_a_newer_write_overtook_is_asked_again() {
+        let (probe, entered) = Probe::new();
+        let mut writes = FrameWrites::new(Arc::new(writers(&probe, SECOND, SETTLE)));
+        probe.hold(1);
+        writes.reposition(Some(1), || 7, Origin::new(10, 0));
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+        let overtaken_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = overtaken_calls.clone();
+        assert!(
+            writes
+                .poll_frame(Some(1), false, move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(READ_A)
+                })
+                .is_pending()
+        );
+        writes.reposition(Some(1), || 7, Origin::new(20, 0));
+        probe.release(1);
+
+        assert_eq!(read_ready(&mut writes, || Ok(READ_B)).ok(), Some(READ_B));
+        assert_eq!(
+            overtaken_calls.load(Ordering::SeqCst),
+            0,
+            "the overtaken read must be skipped once the newer write drops it"
+        );
+    }
+
+    /// A queued question whose caller already dropped its `Answer` is skipped
+    /// by the writer without calling the app, so abandoned reads never pile
+    /// up behind a busy app.
+    #[test]
+    fn an_abandoned_question_is_skipped_by_the_writer() {
+        let (probe, entered) = Probe::new();
+        let writers = writers(&probe, SECOND, SETTLE);
+        probe.hold(1);
+        writers.push(1, key(7), moved(7, 10));
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+
+        let abandoned_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = abandoned_calls.clone();
+        let dropped = writers.ask(1, move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            1
+        });
+        let kept = writers.ask(1, || 2);
+        drop(dropped);
+        probe.release(1);
+
+        assert_eq!(answered(&kept), Some(2));
+        assert_eq!(
+            abandoned_calls.load(Ordering::SeqCst),
+            0,
+            "the dropped question must not run on the writer"
+        );
+    }
+
+    /// Replacing a pending frame read with a fresh one drops the old `Answer`,
+    /// so the writer skips the superseded read instead of running both.
+    #[test]
+    fn a_fresh_frame_read_skips_the_superseded_read() {
+        let (probe, entered) = Probe::new();
+        let mut writes = FrameWrites::new(Arc::new(writers(&probe, SECOND, SETTLE)));
+        probe.hold(1);
+        writes.reposition(Some(1), || 7, Origin::new(10, 0));
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+
+        let stale_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = stale_calls.clone();
+        assert!(
+            writes
+                .poll_frame(Some(1), false, move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(READ_A)
+                })
+                .is_pending()
+        );
+        assert!(writes.poll_frame(Some(1), true, || Ok(READ_B)).is_pending());
+        probe.release(1);
+
+        assert_eq!(read_ready(&mut writes, || Ok(READ_A)).ok(), Some(READ_B));
+        assert_eq!(
+            stale_calls.load(Ordering::SeqCst),
+            0,
+            "the superseded frame read must not run on the writer"
+        );
     }
 }

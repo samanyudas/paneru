@@ -209,6 +209,10 @@ pub struct FrameActivity<'w, 's> {
     covers: Query<'w, 's, (), With<crate::ecs::strip_cover::CoverSlide>>,
     swipe_covers: Query<'w, 's, (), With<crate::ecs::strip_cover::CoverSwipe>>,
     resize_covers: Query<'w, 's, (), With<crate::ecs::strip_cover::CoverMorph>>,
+    frame_reads: Query<'w, 's, &'static crate::ecs::systems::DeferredFrameRead>,
+    focus_checks: Query<'w, 's, &'static crate::ecs::VerifyFocus>,
+    front_switches: Query<'w, 's, &'static crate::ecs::FrontSwitchQuestion>,
+    window_focus_questions: Query<'w, 's, (), With<crate::ecs::WindowFocusQuestion>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -241,6 +245,22 @@ impl FrameActivity<'_, '_> {
                 .pointer_resize
                 .as_ref()
                 .is_some_and(|resize| !matches!(**resize, crate::ecs::drag::PointerResize::Idle))
+            || self.awaits_an_app()
+    }
+
+    /// Whether a question asked of an app's writer waits for its answer,
+    /// which only a later frame reads.
+    fn awaits_an_app(&self) -> bool {
+        self.frame_reads.iter().any(|read| read.asked)
+            || self
+                .focus_checks
+                .iter()
+                .any(|verify| verify.answer.is_some())
+            || self
+                .front_switches
+                .iter()
+                .any(|question| question.answer.is_some())
+            || !self.window_focus_questions.is_empty()
     }
 }
 

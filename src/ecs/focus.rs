@@ -8,7 +8,7 @@ use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
-use bevy::ecs::message::{Message, MessageReader, MessageWriter};
+use bevy::ecs::message::{Message, MessageCursor, MessageReader, MessageWriter, Messages};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Changed, Has, With, Without};
 use bevy::ecs::resource::Resource;
@@ -25,7 +25,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     FocusedMarker, MouseHeldMarker, PointerFollowsFocus, SystemTheme, Timeout, Unmanaged,
-    VerifyFocus,
+    VerifyFocus, WindowFocusQuestion,
 };
 use crate::config::Config;
 use crate::ecs::drag::DragState;
@@ -47,6 +47,10 @@ const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
 pub(crate) const VERIFY_FOCUS_TIMEOUT: Duration = Duration::from_millis(300);
 /// How long a busy application gets to answer the repeated focus request.
 const VERIFY_FOCUS_AGAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a focus check waits, each time, for a busy application to say
+/// which window it focused, and how many times.
+const VERIFY_FOCUS_ANSWER_WAIT: Duration = Duration::from_millis(500);
+const VERIFY_FOCUS_ANSWER_WAITS: u8 = 4;
 
 type MouseFocusStrips<'w, 's> = Query<
     'w,
@@ -464,39 +468,99 @@ fn maintain_verify_focus_singleton(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn detect_focus_rejection(
     mut pending: Populated<(Entity, &Window, &ChildOf, &mut Timeout, &mut VerifyFocus)>,
     apps: Query<&Application>,
     mut workspaces: Query<(Entity, &mut LayoutStrip)>,
     windows: Windows,
+    events: Option<Res<Messages<Event>>>,
+    mut event_cursor: Local<MessageCursor<Event>>,
     mut commands: Commands,
 ) {
+    let mut focused_apps = Vec::new();
+    let mut untracked_focus = false;
+    if let Some(events) = &events {
+        for event in event_cursor.read(events) {
+            if let Event::WindowFocused { window_id } = *event {
+                match windows.find_parent(window_id) {
+                    Some((_, _, parent)) => {
+                        if !focused_apps.contains(&parent) {
+                            focused_apps.push(parent);
+                        }
+                    }
+                    // A newly opened dialog can report focus before Paneru
+                    // tracks its window ID, so conservatively re-ask.
+                    None => untracked_focus = true,
+                }
+            }
+        }
+    }
+
     for (target_entity, target_window, child_of, mut timeout, mut verify) in &mut pending {
-        if !timeout.timer.is_finished() {
+        // An answer on its way is read in the first frame it is there.
+        if !timeout.timer.is_finished() && verify.answer.is_none() {
             continue;
         }
+        // The answer or leaving frontmost ends the check, unless it asks again
+        // below. A settle timeout that waited for the answer would otherwise
+        // keep running frames until it expired.
+        let end_check = |commands: &mut Commands| {
+            if let Ok(mut entity_commands) = commands.get_entity(target_entity) {
+                entity_commands.try_remove::<(Timeout, VerifyFocus)>();
+            }
+        };
         let Ok(app) = apps.get(child_of.parent()) else {
+            end_check(&mut commands);
             continue;
         };
         // Only treat as a rejection if the target window's application is
         // currently frontmost and reports a different window of the same app
         // as focused.
         if !app.is_frontmost() {
+            end_check(&mut commands);
             continue;
         }
-        let Ok(actual_window_id) = app.focused_window_id() else {
+        // A newer focus notification from the same app (or an untracked window
+        // such as a newly focused dialog) can outdate an answer captured before
+        // the app finished switching, so ask again instead of floating on a
+        // stale mismatch.
+        if verify.answer.is_some() && (untracked_focus || focused_apps.contains(&child_of.parent()))
+        {
+            verify.answer = None;
+        }
+        // A busy app can take the whole Accessibility timeout to answer, so
+        // its writer asks it, and a later frame reads the answer. The check
+        // lasts until then, for up to `VERIFY_FOCUS_ANSWER_WAITS` waits. An
+        // app that cannot say which window it focused ends the check.
+        let answer = verify
+            .answer
+            .get_or_insert_with(|| app.ask_focused_window_id());
+        let Some(answer) = answer.take() else {
+            if timeout.timer.is_finished() && verify.answer_waits < VERIFY_FOCUS_ANSWER_WAITS {
+                verify.answer_waits += 1;
+                timeout.timer = Timer::new(VERIFY_FOCUS_ANSWER_WAIT, TimerMode::Once);
+            }
+            continue;
+        };
+        verify.answer = None;
+        let Ok(actual_window_id) = answer else {
+            end_check(&mut commands);
             continue;
         };
         if actual_window_id == target_window.id() {
+            end_check(&mut commands);
             continue;
         }
         let Some((actual_window, actual_entity, actual_parent)) =
             windows.find_parent(actual_window_id)
         else {
+            end_check(&mut commands);
             continue;
         };
         if actual_parent != child_of.parent() {
+            end_check(&mut commands);
             continue;
         }
         // If focus in the ECS world has already moved to a third window (neither
@@ -505,6 +569,7 @@ fn detect_focus_rejection(
             .focused()
             .is_some_and(|(_, focused)| focused != target_entity && focused != actual_entity)
         {
+            end_check(&mut commands);
             continue;
         }
 
@@ -517,6 +582,7 @@ fn detect_focus_rejection(
             debug!(
                 "focus landed on tab sibling {actual_entity} of {target_entity}; not a rejection.",
             );
+            end_check(&mut commands);
             continue;
         }
 
@@ -531,6 +597,7 @@ fn detect_focus_rejection(
                 target_window.id(),
             );
             verify.asked_again = true;
+            verify.answer_waits = 0;
             timeout.timer = Timer::new(VERIFY_FOCUS_AGAIN_TIMEOUT, TimerMode::Once);
             commands.trigger(FocusWindow {
                 entity: target_entity,
@@ -783,6 +850,7 @@ fn focus_window_trigger(
     windows: Windows,
     apps: Query<&Application>,
     verifying: Query<Entity, With<VerifyFocus>>,
+    focus_questions: Query<Entity, With<WindowFocusQuestion>>,
     mut commands: Commands,
 ) {
     let FocusWindow { entity, raise } = *trigger.event();
@@ -791,6 +859,13 @@ fn focus_window_trigger(
             && let Ok(mut entity_commands) = commands.get_entity(other)
         {
             entity_commands.try_remove::<(Timeout, VerifyFocus)>();
+        }
+    }
+    // A newer focus request supersedes any deferred OS focus confirmation so
+    // an older answer cannot pull FocusedMarker back before macOS reports it.
+    for question in focus_questions {
+        if let Ok(mut entity_commands) = commands.get_entity(question) {
+            entity_commands.try_despawn();
         }
     }
     let Some(window) = windows.get(entity) else {
@@ -1123,8 +1198,8 @@ pub(super) fn stray_focus_observer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manager::MockWindowApi;
     use crate::manager::app::MockApplicationApi;
+    use crate::manager::{Answer, MockWindowApi};
     use crate::platform::WinID;
     use bevy::ecs::system::IntoSystem as _;
     use bevy::ecs::world::World;
@@ -1159,6 +1234,8 @@ mod tests {
         api.expect_is_frontmost().returning(move || frontmost);
         api.expect_focused_window_id()
             .returning(move || Ok(focused_id));
+        api.expect_ask_focused_window_id()
+            .returning(move || Answer::ready(Ok(focused_id)));
         world.spawn(Application::new(Box::new(api))).id()
     }
 
@@ -1166,8 +1243,11 @@ mod tests {
     fn spawn_app_with_focus(world: &mut World, focused_id: Arc<AtomicI32>) -> Entity {
         let mut api = MockApplicationApi::new();
         api.expect_is_frontmost().returning(|| true);
+        let answered = focused_id.clone();
         api.expect_focused_window_id()
             .returning(move || Ok(focused_id.load(Ordering::SeqCst)));
+        api.expect_ask_focused_window_id()
+            .returning(move || Answer::ready(Ok(answered.load(Ordering::SeqCst))));
         world.spawn(Application::new(Box::new(api))).id()
     }
 
@@ -1620,5 +1700,114 @@ mod tests {
             harness.world().resource::<FocusHistory>().last_managed(2),
             None
         );
+    }
+
+    #[test]
+    fn detect_focus_rejection_resets_answer_waits_on_retry() {
+        let mut world = World::new();
+        let app = spawn_app(&mut world, true, 2);
+        let (target, _) = two_columns_verifying(&mut world, app);
+        world
+            .get_mut::<VerifyFocus>(target)
+            .expect("verify focus")
+            .answer_waits = VERIFY_FOCUS_ANSWER_WAITS;
+        let system_id = world.register_system(detect_focus_rejection);
+
+        _ = world.run_system(system_id);
+
+        let verify = world
+            .get::<VerifyFocus>(target)
+            .expect("retry keeps VerifyFocus");
+        assert!(verify.asked_again);
+        assert_eq!(
+            verify.answer_waits, 0,
+            "retry must reset answer_waits so a slow answer is not dropped at once"
+        );
+    }
+
+    #[test]
+    fn detect_focus_rejection_ends_check_when_app_leaves_front_while_waiting() {
+        let mut world = World::new();
+        let app = spawn_app(&mut world, false, 2);
+        let (target, _) = two_columns_verifying(&mut world, app);
+        // Simulate a check whose settle timer was extended while waiting on an answer.
+        let mut timeout = Timeout::for_component::<VerifyFocus>(VERIFY_FOCUS_ANSWER_WAIT);
+        timeout.timer.tick(Duration::from_millis(10));
+        world.entity_mut(target).insert((
+            timeout,
+            VerifyFocus {
+                asked_again: false,
+                answer: Some(Answer::ready(Ok(2))),
+                answer_waits: 1,
+            },
+        ));
+        let system_id = world.register_system(detect_focus_rejection);
+
+        _ = world.run_system(system_id);
+
+        assert!(
+            world.get::<VerifyFocus>(target).is_none(),
+            "leaving frontmost must end the check instead of keeping VerifyFocus alive"
+        );
+        assert!(world.get::<Timeout>(target).is_none());
+    }
+
+    #[test]
+    fn detect_focus_rejection_reasks_when_same_app_focus_event_arrives_before_delayed_answer() {
+        let mut world = World::new();
+        let mut events = Messages::<Event>::default();
+        events.write(Event::WindowFocused { window_id: 1 });
+        world.insert_resource(events);
+        // The app has now focused target window 1, while a delayed answer
+        // cached earlier still names window 2.
+        let app = spawn_app(&mut world, true, 1);
+        let (target, _) = two_columns_verifying(&mut world, app);
+        world.entity_mut(target).insert((
+            expired_verify_timeout(),
+            VerifyFocus {
+                asked_again: true,
+                answer: Some(Answer::ready(Ok(2))),
+                answer_waits: 1,
+            },
+        ));
+        let system_id = world.register_system(detect_focus_rejection);
+
+        _ = world.run_system(system_id);
+
+        assert!(
+            world.get::<Unmanaged>(target).is_none(),
+            "a stale mismatch must not float a window that just reported focus"
+        );
+        assert!(in_strip(&mut world, target));
+        assert!(world.get::<VerifyFocus>(target).is_none());
+    }
+
+    #[test]
+    fn detect_focus_rejection_reasks_when_untracked_window_reports_focus() {
+        let mut world = World::new();
+        let mut events = Messages::<Event>::default();
+        // Window 99 is not yet tracked (e.g. a newly focused dialog).
+        events.write(Event::WindowFocused { window_id: 99 });
+        world.insert_resource(events);
+        let app = spawn_app(&mut world, true, 99);
+        let (target, _) = two_columns_verifying(&mut world, app);
+        world.entity_mut(target).insert((
+            expired_verify_timeout(),
+            VerifyFocus {
+                asked_again: true,
+                answer: Some(Answer::ready(Ok(2))),
+                answer_waits: 1,
+            },
+        ));
+        let system_id = world.register_system(detect_focus_rejection);
+
+        _ = world.run_system(system_id);
+
+        assert!(
+            world.get::<Unmanaged>(target).is_none(),
+            "an untracked focus notification must invalidate a stale mismatch"
+        );
+        assert!(in_strip(&mut world, target));
+        assert!(world.get::<VerifyFocus>(target).is_none());
     }
 }
