@@ -4239,86 +4239,123 @@ fn follow_viewport_translates_an_active_slide_destination() {
 
 /// Repeated capture failures or timed-out asks back off that subject so the
 /// desktop and later windows still get photographed.
+fn send_cover_reply(
+    harness: &mut TestHarness,
+    subject: CoverSubject,
+    generation: u32,
+    result: Result<Photo, crate::ecs::slice_photos::PhotoError>,
+) {
+    send(
+        harness,
+        Event::CoverPhoto {
+            subject,
+            generation,
+            result,
+            excluded: None,
+        },
+    );
+}
+
 #[test]
 fn failed_and_timed_out_captures_back_off_to_let_desktop_capture() {
     use crate::ecs::slice_photos::PhotoError;
 
-    let (mut harness, log) = harness(config(true, Some(14.0)));
+    const ASK_TIMEOUT: Duration = Duration::from_secs(2);
+    const FAILED_RETRY: Duration = Duration::from_secs(6);
+
+    let (mut harness, log) = harness(config(false, Some(14.0)));
+    *harness.world().resource_mut::<Config>() = config(true, Some(14.0));
     let mut seen_subjects = Vec::new();
     let mut answered = log.borrow().asked.len();
 
     // Fail window 0 explicitly first, then drop every reply for another window so
-    // two consecutive ASK_TIMEOUTs put it on cooldown, while Desktop and the
-    // other windows still get captured within 5.4 s (< FAILED_RETRY = 6 s).
-    let mut timed_out_subject = None;
-    for step in 0..45 {
-        harness.advance(Duration::from_millis(120));
+    // two consecutive ASK_TIMEOUTs put it on cooldown, then advance past the
+    // second ASK_TIMEOUT (inside window 0's FAILED_RETRY window) and trigger a
+    // healthy window capture to prove neither subject retries during cooldown.
+    let mut window_0_failed_at: Option<Duration> = None;
+    let mut timed_out_subject: Option<CoverSubject> = None;
+    let mut timed_out_ask_times: Vec<Duration> = Vec::new();
+    let mut after_second_timeout = Vec::new();
+    let mut triggered_after_cooldown = false;
+
+    for _ in 0..450 {
+        harness.advance(ONE_FRAME);
+        let elapsed = harness.world().resource::<bevy::time::Time>().elapsed();
+        let past_second_timeout = timed_out_ask_times
+            .get(1)
+            .is_some_and(|&second| elapsed > second + ASK_TIMEOUT);
+        if past_second_timeout && !triggered_after_cooldown {
+            triggered_after_cooldown = true;
+            send(&mut harness, Event::WindowTitleChanged { window_id: 2 });
+        }
         let asked = log.borrow().asked.clone();
         for &(subject, generation) in &asked[answered..] {
             seen_subjects.push(subject);
+            if past_second_timeout {
+                after_second_timeout.push(subject);
+            }
             if subject == CoverSubject::Window(0) {
-                send(
-                    &mut harness,
-                    Event::CoverPhoto {
-                        subject,
-                        generation,
-                        result: Err(PhotoError::Failed),
-                        excluded: None,
-                    },
-                );
+                window_0_failed_at.get_or_insert(elapsed);
+                send_cover_reply(&mut harness, subject, generation, Err(PhotoError::Failed));
                 continue;
             }
-            if timed_out_subject.is_none() && step > 0 && matches!(subject, CoverSubject::Window(_))
+            if timed_out_subject.is_none()
+                && window_0_failed_at.is_some()
+                && matches!(subject, CoverSubject::Window(_))
             {
                 timed_out_subject = Some(subject);
             }
             if Some(subject) == timed_out_subject {
-                // Intentionally drop every reply so consecutive ASK_TIMEOUTs happen.
+                timed_out_ask_times.push(elapsed);
                 continue;
             }
-            send(
-                &mut harness,
-                Event::CoverPhoto {
-                    subject,
-                    generation,
-                    result: Ok(Photo {
-                        digest: Digest(u64::from(generation)),
-                        image: pixel(),
-                        edge_color: None,
-                    }),
-                    excluded: None,
-                },
-            );
+            let ok = Ok(Photo {
+                digest: Digest(u64::from(generation)),
+                image: pixel(),
+                edge_color: None,
+            });
+            send_cover_reply(&mut harness, subject, generation, ok);
         }
         answered = asked.len();
+        if window_0_failed_at.is_some()
+            && let Some(&second) = timed_out_ask_times.get(1)
+            && elapsed >= second + ASK_TIMEOUT + Duration::from_secs(1)
+        {
+            break;
+        }
     }
 
+    let failed_at = window_0_failed_at.expect("window 0 received an explicit Failed reply");
+    let timed_out =
+        timed_out_subject.expect("a window was selected for consecutive timeout backoff");
+    assert_eq!(
+        timed_out_ask_times.len(),
+        2,
+        "asks: {timed_out_ask_times:?}"
+    );
+    assert!(timed_out_ask_times[1].saturating_sub(timed_out_ask_times[0]) >= ASK_TIMEOUT);
+    let final_elapsed = harness.world().resource::<bevy::time::Time>().elapsed();
+    assert!(final_elapsed >= timed_out_ask_times[1] + ASK_TIMEOUT + Duration::from_secs(1));
+    assert!(final_elapsed < failed_at + FAILED_RETRY);
     let window_0_asks = seen_subjects
         .iter()
         .filter(|s| **s == CoverSubject::Window(0))
         .count();
-    assert_eq!(
-        window_0_asks, 1,
-        "window 0 received one Failed reply and stayed in cooldown"
-    );
+    assert_eq!(window_0_asks, 1, "window 0 stayed in cooldown");
     assert!(
         seen_subjects
             .iter()
             .any(|s| matches!(s, CoverSubject::Desktop(_))),
-        "desktop capture proceeded despite earlier window failure/timeout: {seen_subjects:?}"
-    );
-    let timed_out =
-        timed_out_subject.expect("a window was selected for consecutive timeout backoff");
-    let count = seen_subjects.iter().filter(|s| **s == timed_out).count();
-    assert_eq!(
-        count, 2,
-        "timed-out subject {timed_out:?} received two unanswered asks and stayed in cooldown"
+        "desktop capture proceeded: {seen_subjects:?}"
     );
     assert!(
-        seen_subjects
-            .iter()
-            .any(|s| matches!(s, CoverSubject::Window(id) if *id != 0 && *s != timed_out)),
-        "another healthy window capture proceeded despite cooldowns: {seen_subjects:?}"
+        !after_second_timeout.contains(&CoverSubject::Window(0))
+            && !after_second_timeout.contains(&timed_out),
+        "cooldown subjects did not retry after second timeout: {after_second_timeout:?}"
+    );
+    assert!(
+        after_second_timeout.contains(&CoverSubject::Window(2)),
+        "healthy window 2 proceeded strictly after second timeout: {after_second_timeout:?}"
     );
 }
 
