@@ -99,6 +99,10 @@ impl Watch {
         self.ids.is_empty() && self.morph_ids.is_empty()
     }
 
+    fn is_watched(&self, id: WinID) -> bool {
+        self.ids.contains(&id) || self.morph_ids.contains(&id)
+    }
+
     fn all_ids(&self) -> Vec<WinID> {
         let mut all = self.ids.clone();
         for &id in &self.morph_ids {
@@ -109,19 +113,15 @@ impl Watch {
         all
     }
 
-    /// Forgets what was read of each window no watch keeps, after a stop.
-    /// A read started before the stop is dropped, since it may hold one.
+    /// Forgets what was read of each window no watch keeps, after a stop or
+    /// dropped row window. A read started before the change is dropped, since
+    /// it may hold one.
     fn prune(&mut self) {
-        let Self {
-            ids,
-            morph_ids,
-            shown,
-            unread,
-            ..
-        } = self;
-        let watched = |id: &WinID| ids.contains(id) || morph_ids.contains(id);
-        shown.retain(|id, _| watched(id));
-        unread.retain(watched);
+        let watched = self.ids.clone();
+        let morph = self.morph_ids.clone();
+        let keep = |id: &WinID| watched.contains(id) || morph.contains(id);
+        self.shown.retain(|id, _| keep(id));
+        self.unread.retain(keep);
         self.generation += 1;
     }
 }
@@ -209,8 +209,15 @@ impl ShownFrames {
     /// `None` when no sampler can run.
     fn watch(&self, asked: &[(WinID, IRect)]) -> Option<Shown> {
         let mut watch = lock(&self.shared.watch);
+        let dropped = watch
+            .ids
+            .iter()
+            .any(|id| !asked.iter().any(|&(a, _)| a == *id));
         watch.ids.clear();
         watch.ids.extend(asked.iter().map(|&(id, _)| id));
+        if dropped {
+            watch.prune();
+        }
         for &(id, frame) in asked {
             if let Entry::Vacant(entry) = watch.shown.entry(id) {
                 entry.insert(frame);
@@ -259,14 +266,16 @@ impl Watch {
     /// in for it.
     fn take(&mut self, ids: &[WinID], frames: Vec<(WinID, IRect)>) {
         for id in ids {
-            if !frames.iter().any(|(read, _)| read == id) {
+            if self.is_watched(*id) && !frames.iter().any(|(read, _)| read == id) {
                 self.shown.remove(id);
                 self.unread.remove(id);
             }
         }
         for (id, frame) in frames {
-            self.unread.remove(&id);
-            self.shown.insert(id, frame);
+            if self.is_watched(id) {
+                self.unread.remove(&id);
+                self.shown.insert(id, frame);
+            }
         }
     }
 }
@@ -393,8 +402,9 @@ struct Held {
 
 impl Tracked {
     /// Takes in that the engine asked for the window at `asked` last frame
-    /// and the window server shows it at `shown`, if it lists it.
-    fn see(&mut self, asked: Edges, shown: Option<Edges>, now: Duration) -> Pacer {
+    /// and the window server shows it at `shown` (`observed` when read back by
+    /// the sampler rather than provisionally seeded), if it lists it.
+    fn see(&mut self, asked: Edges, shown: Option<Edges>, observed: bool, now: Duration) -> Pacer {
         self.start.get_or_insert(asked);
         let before = self.asked.replace(asked);
         match shown {
@@ -414,11 +424,19 @@ impl Tracked {
                     Pacer::Shown(edges)
                 }
             }
-            _ => {
+            Some(_) => {
                 self.late = None;
-                if before.is_some_and(|before| before != asked) {
+                if observed && before.is_some_and(|before| before != asked) {
                     self.on_time = true;
                 }
+                if self.prompt {
+                    Pacer::Asked
+                } else {
+                    Pacer::Shown(asked)
+                }
+            }
+            None => {
+                self.late = None;
                 if self.prompt {
                     Pacer::Asked
                 } else {
@@ -788,6 +806,7 @@ fn member(
     };
     let id = window.id();
     let asked = Edges::from(window.frame());
+    let observed = !shown.unread.contains(&id);
     let shown_edges = shown
         .frames
         .get(&id)
@@ -805,7 +824,7 @@ fn member(
         // leaving for its tuck moves itself, as late as its app takes the
         // move.
         let pacer = match slide {
-            Some((Slide::Leaving { .. }, _)) => record.see(asked, shown_edges, now),
+            Some((Slide::Leaving { .. }, _)) => record.see(asked, shown_edges, observed, now),
             _ => Pacer::Asked,
         };
         return Some(Member {
@@ -828,7 +847,7 @@ fn member(
         });
     }
     let record = tracked.entry(entity).or_default();
-    let pacer = record.see(asked, shown_edges, now);
+    let pacer = record.see(asked, shown_edges, observed, now);
     let unmoved = record.unmoved(shown_edges);
     // A window landing under its photo shows where its photo rests, however
     // far its app has yet to take it, and has no move of its own yet but
@@ -1240,13 +1259,12 @@ mod tests {
     /// is only the one the engine asked for, and does not count as read.
     #[test]
     fn a_window_counts_as_read_only_once_the_sampler_has_read_it() {
+        let read_frame = IRect::new(20, 0, 120, 100);
         let answers = Arc::new(AtomicBool::new(false));
         let answering = answers.clone();
         let frames = ShownFrames::new(move |ids| {
             if answering.load(Ordering::Relaxed) {
-                ids.iter()
-                    .map(|&id| (id, IRect::new(0, 0, 100, 100)))
-                    .collect()
+                ids.iter().map(|&id| (id, read_frame)).collect()
             } else {
                 Vec::new()
             }
@@ -1262,9 +1280,78 @@ mod tests {
 
         answers.store(true, Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while watch(&frames).unread.contains(&7) {
+        loop {
+            let shown = watch(&frames);
+            if !shown.unread.contains(&7) && shown.frames.get(&7) == Some(&read_frame) {
+                break;
+            }
             assert!(Instant::now() < deadline, "the sampler read window 7");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn dropping_a_window_from_the_row_watch_prunes_stale_state_and_keeps_morphs() {
+        let mut watch = Watch {
+            ids: vec![1, 2],
+            morph_ids: vec![3],
+            shown: HashMap::from([
+                (1, IRect::new(0, 0, 100, 100)),
+                (2, IRect::new(100, 0, 200, 100)),
+                (3, IRect::new(200, 0, 300, 100)),
+            ]),
+            unread: HashSet::from([1, 2, 3]),
+            generation: 0,
+            sampling: false,
+        };
+        watch.ids = vec![2];
+        watch.prune();
+
+        assert!(!watch.is_watched(1));
+        assert!(watch.is_watched(2));
+        assert!(watch.is_watched(3));
+        assert_eq!(watch.generation, 1);
+        assert!(!watch.shown.contains_key(&1));
+        assert!(!watch.unread.contains(&1));
+        assert!(watch.shown.contains_key(&2));
+        assert!(watch.shown.contains_key(&3));
+        assert!(watch.unread.contains(&3));
+
+        // A late sample mentioning dropped window 1 does not repopulate it,
+        // while still marking active window 2 as read.
+        let read_2 = IRect::new(110, 0, 210, 100);
+        watch.take(&[1, 2], vec![(1, IRect::new(5, 0, 105, 100)), (2, read_2)]);
+        assert!(!watch.shown.contains_key(&1));
+        assert_eq!(watch.shown.get(&2), Some(&read_2));
+        assert!(!watch.unread.contains(&2));
+    }
+
+    #[test]
+    fn tracked_on_time_ignores_provisional_or_missing_reads() {
+        let mut tracked = Tracked::default();
+        let start = Edges::from(IRect::new(0, 0, 100, 100));
+        let next = Edges::from(IRect::new(50, 0, 150, 100));
+        let later = Edges::from(IRect::new(100, 0, 200, 100));
+        let final_edges = Edges::from(IRect::new(150, 0, 250, 100));
+
+        tracked.see(start, Some(start), false, Duration::from_millis(20));
+        assert!(!tracked.on_time);
+
+        // Matching provisional ask without sampler observation keeps on_time false.
+        tracked.see(next, Some(next), false, Duration::from_millis(40));
+        assert!(!tracked.on_time);
+
+        // Missing server read also keeps on_time false even when observed is true.
+        tracked.see(later, None, true, Duration::from_millis(60));
+        assert!(!tracked.on_time);
+
+        // Only a matching sampler-observed move marks the motion on time.
+        tracked.see(
+            final_edges,
+            Some(final_edges),
+            true,
+            Duration::from_millis(80),
+        );
+        assert!(tracked.on_time);
     }
 }

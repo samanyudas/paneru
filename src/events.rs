@@ -285,6 +285,7 @@ pub enum Event {
             crate::ecs::slice_photos::Photo,
             crate::ecs::slice_photos::PhotoError,
         >,
+        excluded: Option<Vec<WinID>>,
     },
 
     /// A client has read or written the script state store. Answered

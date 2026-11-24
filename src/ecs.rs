@@ -582,6 +582,9 @@ pub struct SettleEase {
     /// `ease::entry_for_speed`.
     pub start: f64,
     pub elapsed: f64,
+    /// The `animation_speed` captured when the settle began, so reloading
+    /// config mid-flick never shifts the remaining trajectory.
+    pub animation_speed: f64,
     /// The strip's speed at the lift, in points per second, when the
     /// fingers flicked it toward its landing. The settle then follows
     /// `ease::flick_offset`, which swings a little past the landing.

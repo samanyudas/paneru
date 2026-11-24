@@ -660,6 +660,7 @@ fn new_swipe_target(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn swiping_timeout(
     strips: ScrollingStrips,
+    moves: CoverMoves,
     displays: StripDisplays,
     time: Res<Time>,
     window_manager: Res<WindowManager>,
@@ -690,7 +691,7 @@ pub(super) fn swiping_timeout(
             // `settle_strip` owns the strip from here, active or not, and
             // focus goes to the column it lands on, not to whatever slid
             // under the pointer.
-            if settles(&config, fullscreen) {
+            if settles(&config, fullscreen) || awaits_cover(entity, &scroll, &moves) {
                 continue;
             }
 
@@ -1168,13 +1169,14 @@ fn settle_strip(
             continue;
         }
         // A strip whose display is gone has nowhere to settle.
-        let Some((_, viewport)) = viewports(child, &displays, &config) else {
+        let Some((bounds, viewport)) = viewports(child, &displays, &config) else {
             finish(&mut commands);
             continue;
         };
 
+        let travel_width = f64::from(bounds.width());
         let viewport_width = f64::from(viewport.width());
-        let px_per_velocity = viewport_width * direction_modifier(&config);
+        let px_per_velocity = travel_width * direction_modifier(&config);
         let deceleration = config.swipe_deceleration();
 
         if scroll.settle.is_none() {
@@ -1272,6 +1274,7 @@ fn settle_strip(
             from,
             start: ease::entry_for_speed(speed, target - from, duration),
             elapsed: 0.0,
+            animation_speed: config.animation_speed(),
             flick: flicked.then_some(speed),
         });
         ease.elapsed += step.secs();
@@ -1294,21 +1297,25 @@ fn settle_strip(
 /// seconds in. `None` once it has landed.
 fn settled_at(ease: &SettleEase, elapsed: f64, target: f64, config: &Config) -> Option<f64> {
     if let Some(speed) = ease.flick {
-        ease::flick_offset(ease.from - target, speed, elapsed, config.animation_speed())
+        ease::flick_offset(ease.from - target, speed, elapsed, ease.animation_speed)
             .map(|offset| target + offset)
     } else {
         let duration = ease::duration(config);
+        if !ease::animates(duration) {
+            return None;
+        }
         let progress = ease::share(ease.start, ease.start + elapsed / duration);
         (progress < 1.0).then_some(ease.from + (target - ease.from) * progress)
     }
 }
 
 /// How fast `scroll` shows its strip moving now, in points per second
-/// along the strip's x, in a viewport `viewport_width` points wide, the
-/// display's width less its Dock and edge padding. A settle moves at the
-/// speed of its ease, and fingers or the wheel at their own, each slowed as
-/// the strip resists past an end or a column.
-pub(crate) fn strip_speed(scroll: &Scrolling, viewport_width: f64, config: &Config) -> f64 {
+/// along the strip's x, on a display `display_width` points wide (matching
+/// the width used by `swipe_gesture` to convert gesture deltas and
+/// velocity). A settle moves at the speed of its ease, and fingers or the
+/// wheel at their own, each slowed as the strip resists past an end or a
+/// column.
+pub(crate) fn strip_speed(scroll: &Scrolling, display_width: f64, config: &Config) -> f64 {
     let raw = if let (Some(ease), Some(target)) = (scroll.ease, scroll.settle) {
         let dt = 1e-3;
         let at = |elapsed: f64| settled_at(&ease, elapsed.max(0.0), target, config);
@@ -1317,7 +1324,7 @@ pub(crate) fn strip_speed(scroll: &Scrolling, viewport_width: f64, config: &Conf
             _ => 0.0,
         }
     } else {
-        scroll.velocity * viewport_width * direction_modifier(config)
+        scroll.velocity * display_width * direction_modifier(config)
     };
     raw * scroll.slope
 }
@@ -1412,10 +1419,10 @@ fn scrolling_integrator(
         if awaits_cover(entity, &scroll, &moves) {
             continue;
         }
-        let Some((_, viewport)) = viewports(child, &displays, &config) else {
+        let Some((bounds, _)) = viewports(child, &displays, &config) else {
             continue;
         };
-        let viewport_width = f64::from(viewport.width());
+        let travel_width = f64::from(bounds.width());
         // A window-landing swipe keeps the strip under the fingers, so its
         // velocity only decides a flick, never adds travel of its own.
         if scroll.is_user_swiping
@@ -1425,7 +1432,7 @@ fn scrolling_integrator(
             continue;
         }
         if scroll.settle.is_none() && scroll.velocity.abs() > 0.0001 {
-            scroll.position += scroll.velocity * dt * viewport_width * direction;
+            scroll.position += scroll.velocity * dt * travel_width * direction;
         }
     }
 }
@@ -1642,6 +1649,7 @@ where
 #[cfg(test)]
 mod paging_tests {
     use super::*;
+    use crate::config::MainOptions;
 
     #[test]
     fn large_swipe_preserves_every_earned_step_without_expanding_the_queue() {
@@ -1667,5 +1675,61 @@ mod paging_tests {
             ..Default::default()
         };
         assert!(state.has_work());
+    }
+
+    #[test]
+    fn settled_at_handles_disabled_non_flick_and_keeps_flick_speed_across_config_reloads() {
+        let ease = SettleEase {
+            from: 0.0,
+            start: 0.0,
+            elapsed: 0.016,
+            animation_speed: 14.0,
+            flick: None,
+        };
+        let off: Config = (
+            MainOptions {
+                animation_speed: None,
+                ..MainOptions::default()
+            },
+            vec![],
+        )
+            .into();
+        assert_eq!(settled_at(&ease, 0.016, -200.0, &off), None);
+
+        let sub_frame: Config = (
+            MainOptions {
+                animation_speed: Some(1000.0),
+                ..MainOptions::default()
+            },
+            vec![],
+        )
+            .into();
+        assert_eq!(settled_at(&ease, 0.016, -200.0, &sub_frame), None);
+
+        let flick_ease = SettleEase {
+            flick: Some(1500.0),
+            ..ease
+        };
+        let fast: Config = (
+            MainOptions {
+                animation_speed: Some(40.0),
+                ..MainOptions::default()
+            },
+            vec![],
+        )
+            .into();
+        let slow: Config = (
+            MainOptions {
+                animation_speed: Some(4.0),
+                ..MainOptions::default()
+            },
+            vec![],
+        )
+            .into();
+        assert_eq!(
+            settled_at(&flick_ease, 0.05, -200.0, &fast),
+            settled_at(&flick_ease, 0.05, -200.0, &slow),
+            "flick keeps the animation_speed captured when the settle began"
+        );
     }
 }

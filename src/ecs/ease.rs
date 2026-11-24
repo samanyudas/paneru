@@ -239,7 +239,11 @@ impl Curve {
             return 1.0;
         }
         let start = self.at(from);
-        ((self.at(to) - start) / (1.0 - start)).clamp(0.0, 1.0)
+        let remaining = 1.0 - start;
+        if remaining <= 0.0 {
+            return 1.0;
+        }
+        ((self.at(to) - start) / remaining).clamp(0.0, 1.0)
     }
 
     /// Moves `progress`, a motion's place along the curve, on by `dt`
@@ -354,6 +358,25 @@ impl Ease {
         self.t
     }
 
+    /// Holds the motion in place for this frame with zero movement share,
+    /// as while a photo waits for its window's native tuck write to land.
+    pub(crate) fn hold(&mut self) {
+        self.t = 0.0;
+    }
+
+    /// Whether the active motion has reached the end of its curve.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.progress >= 1.0 || self.t >= 1.0
+    }
+
+    /// Clears the active motion target and progress so the next step enters
+    /// the curve afresh from the current position.
+    pub(crate) fn restart(&mut self) {
+        self.to = None;
+        self.progress = 0.0;
+        self.t = 0.0;
+    }
+
     /// Where a value at `value` enters the curve toward `to` at `now`, from
     /// how fast it moved toward `to` since its last step.
     fn entry_toward(&self, curve: Curve, value: IVec2, to: IVec2, now: f64, duration: f64) -> f64 {
@@ -412,11 +435,18 @@ pub(crate) fn step_slides(
     for (window, slide, presented, mut ease) in slides {
         let waits = matches!(*slide, Slide::Tucking { until, .. }
             if window.write_pending() && time.elapsed() < until);
-        let dt = if waits { 0.0 } else { step.secs() };
         match slide_heading(&slide, presented.0) {
             Some((at, to)) => {
-                let now = time.elapsed_secs_f64();
-                ease.0.step(at, to, slide.is_added(), (now, dt), duration);
+                if slide.is_added() {
+                    ease.0.restart();
+                }
+                if waits {
+                    ease.0.hold();
+                } else {
+                    let now = time.elapsed_secs_f64();
+                    ease.0
+                        .step(at, to, slide.is_added(), (now, step.secs()), duration);
+                }
             }
             None => ease.0 = Ease::default(),
         }
@@ -738,5 +768,34 @@ mod tests {
             DURATION,
         );
         assert!((f64::from(t) - share(0.0, DT / DURATION)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn curve_share_returns_one_when_no_time_remains() {
+        assert_eq!(Curve::EaseOut.share(0.99999, 0.99999), 1.0);
+    }
+
+    #[test]
+    fn hold_clears_step_and_reset_clears_motion_progress() {
+        let mut ease = Ease::default();
+        let first = ease.step(IVec2::ZERO, IVec2::new(600, 0), true, (0.0, DT), DURATION);
+        assert!(first > 0.0);
+        ease.hold();
+        assert_eq!(ease.t, 0.0);
+        let progress_before = ease.progress;
+        assert!(progress_before > 0.0);
+
+        ease.restart();
+        assert_eq!(ease.to, None);
+        assert_eq!(ease.progress, 0.0);
+        assert_eq!(ease.t, 0.0);
+        let restarted = ease.step(
+            IVec2::new(600, 0),
+            IVec2::ZERO,
+            false,
+            (DURATION * 2.0, DT),
+            DURATION,
+        );
+        assert!((f64::from(restarted) - share(0.0, DT / DURATION)).abs() < 1e-6);
     }
 }

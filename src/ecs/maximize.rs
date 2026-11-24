@@ -135,7 +135,7 @@ const REFUSED_SLACK: i32 = 2;
 /// picture cover morphs both horizontal and vertical frame changes (including
 /// edge-padding fill and stack unstack/restack) instead of skipping them.
 #[derive(Component, Clone, Copy, Debug)]
-pub(crate) struct MaximizeMorph;
+pub(crate) struct MaximizeMorph(pub(crate) Entity);
 
 pub(crate) struct MaximizePlugin;
 
@@ -311,6 +311,7 @@ fn double_click_toggle(
             && strips
                 .iter()
                 .find(|(strip, _)| strip.contains(entity))
+                .filter(|(strip, _)| strip.maximized(entity).is_none())
                 .and_then(|(_, child_of)| displays.get(child_of.parent()).ok())
                 .is_some_and(|(display, dock)| {
                     display.actual_display_bounds(dock, &config).size() == refused.viewport
@@ -515,7 +516,7 @@ fn toggle_tiled(
             });
         }
         if let Ok(mut strip_commands) = commands.get_entity(strip_entity) {
-            strip_commands.try_insert(MaximizeMorph);
+            strip_commands.try_insert(MaximizeMorph(entity));
         }
     } else {
         let members = strip.tab_group(entity).unwrap_or_else(|| vec![entity]);
@@ -536,7 +537,7 @@ fn toggle_tiled(
         match strip.maximize(entity, config.maximized_window_side().into(), before) {
             Ok(changed) => {
                 if changed && let Ok(mut strip_commands) = commands.get_entity(strip_entity) {
-                    strip_commands.try_insert(MaximizeMorph);
+                    strip_commands.try_insert(MaximizeMorph(entity));
                 }
             }
             Err(err) => {
@@ -843,7 +844,7 @@ fn undo_refused_maximize(
             .try_remove::<RefusingWidth>();
     }
     if let Ok(mut strip_commands) = commands.get_entity(strip_entity) {
-        strip_commands.try_insert(MaximizeMorph);
+        strip_commands.try_insert(MaximizeMorph(entity));
     }
     commands.reshuffle_around(entity);
     true

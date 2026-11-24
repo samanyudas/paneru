@@ -401,10 +401,11 @@ impl CoverPhotos {
         }
     }
 
-    /// Forgets every picture of window `id`.
+    /// Forgets every picture and retry state of window `id`.
     fn forget_window(&mut self, id: WinID) {
         self.windows.remove(&id);
         self.previous.remove(&id);
+        self.blank_until.remove(&id);
         self.title_epoch.remove(&id);
         self.timed_out.remove(&CoverSubject::Window(id));
         self.failed_until.remove(&CoverSubject::Window(id));
@@ -419,10 +420,17 @@ impl CoverPhotos {
         self.supersede(CoverSubject::Window(id));
     }
 
-    fn desktop(&self, display: CGDirectDisplayID, excluding: &[WinID]) -> Option<&Photo> {
+    fn desktop(
+        &self,
+        display: CGDirectDisplayID,
+        size: IVec2,
+        excluding: &[WinID],
+    ) -> Option<&Photo> {
         self.desktops
             .get(&display)
-            .filter(|kept| excluding.iter().all(|id| kept.excluding.contains(id)))
+            .filter(|kept| {
+                kept.size == size && excluding.iter().all(|id| kept.excluding.contains(id))
+            })
             .map(|kept| &kept.photo)
     }
 
@@ -779,6 +787,7 @@ fn keep_cover_photos(
             subject,
             generation,
             result,
+            excluded,
         } = event
         else {
             continue;
@@ -797,7 +806,14 @@ fn keep_cover_photos(
             // macOS refused pictures: every picture goes, and none of this
             // batch, before or after, comes back in. Title changes still
             // reach the resize covers.
-            apply_cover_reply(&mut photos, screen.as_deref_mut(), asked, result, now);
+            apply_cover_reply(
+                &mut photos,
+                screen.as_deref_mut(),
+                asked,
+                result,
+                excluded.as_deref(),
+                now,
+            );
             replies.clear();
             // No fresh picture a resize's cover holds to show, or waits
             // for, may show after the refusal.
@@ -807,7 +823,7 @@ fn keep_cover_photos(
             continue;
         }
         if background {
-            replies.push((asked, result.clone()));
+            replies.push((asked, result.clone(), excluded.clone()));
         } else if let CoverSubject::Window(id) = *subject {
             photos.morph_replies.push(MorphReply {
                 id,
@@ -822,7 +838,7 @@ fn keep_cover_photos(
     if !allowed(&photos) {
         return;
     }
-    for (asked, result) in replies {
+    for (asked, result, excluded) in replies {
         // A picture of a window whose title changed since it was asked for
         // shows the old title, and neither it nor its failure counts. A
         // window gone is gone.
@@ -832,7 +848,14 @@ fn keep_cover_photos(
         {
             continue;
         }
-        apply_cover_reply(&mut photos, screen.as_deref_mut(), asked, &result, now);
+        apply_cover_reply(
+            &mut photos,
+            screen.as_deref_mut(),
+            asked,
+            &result,
+            excluded.as_deref(),
+            now,
+        );
     }
 }
 
@@ -843,6 +866,7 @@ fn apply_cover_reply(
     screen: Option<&mut CoverScreenHandle>,
     asked: Asked,
     result: &Result<Photo, PhotoError>,
+    excluded: Option<&[WinID]>,
     now: Duration,
 ) {
     let subject = asked.subject;
@@ -854,7 +878,7 @@ fn apply_cover_reply(
                 photo: photo.clone(),
                 size: asked.size,
                 taken: now,
-                excluding: asked.excluding,
+                excluding: excluded.map_or(asked.excluding, <[WinID]>::to_vec),
                 title_epoch: asked.title_epoch,
             };
             match subject {
@@ -1066,7 +1090,7 @@ fn scene_of<'a>(
     }
     let excluding = row.iter().map(|window| window.id).collect::<Vec<_>>();
     let desktop = photos
-        .desktop(display.id(), &excluding)
+        .desktop(display.id(), display.physical_bounds().size(), &excluding)
         .ok_or("no desktop picture")?;
     row.sort_by_key(|window| window.focused);
     let pictures = row
@@ -1141,12 +1165,28 @@ fn note_hidden(
 #[derive(Resource, Debug, Default)]
 pub(crate) struct StripLayouts(HashMap<Entity, u64>);
 
-/// Remembers each strip's layout for the next pass.
+#[cfg(test)]
+impl StripLayouts {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Remembers each strip's layout for the next pass, or clears stored
+/// snapshots when picture covers are disabled so re-enabling establishes a
+/// clean baseline before covering a move.
 fn remember_layouts(
     strips: Query<(Entity, &LayoutStrip)>,
     windows: CoverWindows,
+    config: Res<Config>,
     mut layouts: ResMut<StripLayouts>,
 ) {
+    if !cover_enabled(&config) {
+        if !layouts.0.is_empty() {
+            layouts.0.clear();
+        }
+        return;
+    }
     layouts.0 = strips
         .iter()
         .map(|(entity, strip)| (entity, layout_print(strip, &windows)))
@@ -1853,7 +1893,7 @@ fn cover_swipes(
                 // The pictures carry on at the speed the strip had, so the
                 // slide does not start from rest.
                 let speed = scrolling.as_ref().map_or(0.0, |scrolling| {
-                    scroll::strip_speed(scrolling, f64::from(viewport.width()), &config)
+                    scroll::strip_speed(scrolling, f64::from(display.bounds().width()), &config)
                 });
                 let mut slide = start_slide(
                     swipe.display,
@@ -2083,28 +2123,7 @@ fn refresh_cover_photos(
         .iter()
         .map(|window| window.id())
         .collect::<Vec<_>>();
-    let gone = photos
-        .windows
-        .keys()
-        .filter(|id| !alive.contains(id))
-        .copied()
-        .collect::<Vec<_>>();
-    for id in gone {
-        photos.forget_window(id);
-        screen.0.forget(Some(id));
-    }
-    // A window that changed its title without a kept picture still has an
-    // epoch, which goes with the window.
-    photos.title_epoch.retain(|id, _| alive.contains(id));
-    let retain_subject = |subject: &CoverSubject, _: &mut Duration| match subject {
-        CoverSubject::Window(id) => alive.contains(id),
-        CoverSubject::Desktop(_) => true,
-    };
-    photos.timed_out.retain(|subject| match subject {
-        CoverSubject::Window(id) => alive.contains(id),
-        CoverSubject::Desktop(_) => true,
-    });
-    photos.failed_until.retain(retain_subject);
+    forget_closed_windows(&alive, &mut photos, screen.0.as_mut());
 
     // The strip each display shows, so every display's next move is ready.
     let rows = displays
@@ -2145,6 +2164,38 @@ fn refresh_cover_photos(
         excluding: want.excluding,
         title_epoch,
     });
+}
+
+/// Forgets cached pictures, retry timers, and screen panels for closed windows.
+fn forget_closed_windows(alive: &[WinID], photos: &mut CoverPhotos, screen: &mut dyn CoverScreen) {
+    let mut gone = photos
+        .windows
+        .keys()
+        .chain(photos.previous.keys())
+        .chain(photos.blank_until.keys())
+        .chain(photos.title_epoch.keys())
+        .chain(photos.timed_out.iter().filter_map(|subject| match subject {
+            CoverSubject::Window(id) => Some(id),
+            CoverSubject::Desktop(_) => None,
+        }))
+        .chain(
+            photos
+                .failed_until
+                .keys()
+                .filter_map(|subject| match subject {
+                    CoverSubject::Window(id) => Some(id),
+                    CoverSubject::Desktop(_) => None,
+                }),
+        )
+        .filter(|id| !alive.contains(id))
+        .copied()
+        .collect::<Vec<_>>();
+    gone.sort_unstable();
+    gone.dedup();
+    for id in gone {
+        photos.forget_window(id);
+        screen.forget(Some(id));
+    }
 }
 
 /// Asks macOS every [`ACCESS_CHECK`] whether the engine may take pictures.
@@ -2193,6 +2244,7 @@ fn next_picture(
         let row = strip_windows(strip, windows);
         let excluding = row.iter().map(|window| window.id).collect::<Vec<_>>();
         let desktop_subject = CoverSubject::Desktop(display.id());
+        let display_size = display.physical_bounds().size();
         if photos
             .failed_until
             .get(&desktop_subject)
@@ -2200,19 +2252,20 @@ fn next_picture(
         {
             match photos.desktops.get(&display.id()) {
                 Some(kept)
-                    if excluding.iter().all(|id| kept.excluding.contains(id))
+                    if kept.size == display_size
+                        && excluding.iter().all(|id| kept.excluding.contains(id))
                         && now.saturating_sub(kept.taken) < DESKTOP_REFRESH => {}
                 kept => wanted.push(Want {
                     priority: if photos.timed_out.contains(&desktop_subject) {
                         5
-                    } else if kept.is_none() {
+                    } else if kept.is_none_or(|kept| kept.size != display_size) {
                         1
                     } else {
                         3
                     },
                     taken: kept.map_or(Duration::ZERO, |kept| kept.taken),
                     subject: desktop_subject,
-                    size: display.physical_bounds().size(),
+                    size: display_size,
                     display: display.id(),
                     excluding: excluding.clone(),
                 }),

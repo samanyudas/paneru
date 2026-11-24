@@ -143,16 +143,16 @@ fn fill_start(picture_width: f64) -> f64 {
     (picture_width - overlap).max(0.0)
 }
 
-/// The normalized time in `(0.0, 1.0]` when the linearly interpolated size
-/// across `shares` crosses `picture_size + 0.5` on either axis, paired with
-/// whether the frame is open (`true`) or closed (`false`) after the crossing.
-/// `None` when the size stays on one side of the threshold throughout.
-fn fill_crossing_time(
+/// Discrete `(values, key_times)` for the fill layer's opacity across
+/// `shares`, emitting a transition whenever the frame crosses
+/// `picture_size + 0.5` on either axis (including multiple crossings within
+/// one segment). `None` when the open state never changes.
+fn fill_opacity_steps(
     from_size: CGSize,
     to_size: CGSize,
     picture_size: CGSize,
     shares: &[f64],
-) -> Option<(f64, bool)> {
+) -> Option<(Vec<f64>, Vec<f64>)> {
     let w_thresh = picture_size.width + 0.5;
     let h_thresh = picture_size.height + 0.5;
     let size_at = |share: f64| {
@@ -177,31 +177,57 @@ fn fill_crossing_time(
         return None;
     }
     let (w_start, h_start) = size_at(shares[0]);
-    let start_open = w_start > w_thresh || h_start > h_thresh;
+    let mut cur_open = w_start > w_thresh || h_start > h_thresh;
+    let mut values = vec![if cur_open { 1.0 } else { 0.0 }];
+    let mut times = vec![0.0];
+    let mut emit = |t: f64, open: bool| {
+        if open != cur_open {
+            cur_open = open;
+            let val = if open { 1.0 } else { 0.0 };
+            if t <= times.last().copied().unwrap_or(0.0) + 1e-9 {
+                if let Some(last) = values.last_mut() {
+                    *last = val;
+                }
+            } else {
+                times.push(t);
+                values.push(val);
+            }
+        }
+    };
     for (idx, pair) in shares.windows(2).enumerate() {
         let (w0, h0) = size_at(pair[0]);
         let (w1, h1) = size_at(pair[1]);
-        let open1 = w1 > w_thresh || h1 > h_thresh;
-        if open1 != start_open {
-            let fw = axis_cross(w0, w1, w_thresh);
-            let fh = axis_cross(h0, h1, h_thresh);
-            let frac = match (fw, fh) {
-                (Some(a), Some(b)) => {
-                    if open1 {
-                        a.min(b)
-                    } else {
-                        a.max(b)
-                    }
-                }
-                (Some(a), None) | (None, Some(a)) => a,
-                (None, None) => 0.0,
-            };
+        let mut crossings = [axis_cross(w0, w1, w_thresh), axis_cross(h0, h1, h_thresh)]
+            .into_iter()
+            .flatten()
+            .filter(|&f| f > 1e-9 && f < 1.0 - 1e-9)
+            .collect::<Vec<_>>();
+        crossings.sort_by(f64::total_cmp);
+        crossings.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        let mut pts = Vec::with_capacity(crossings.len() + 2);
+        pts.push(0.0);
+        pts.extend(crossings);
+        pts.push(1.0);
+        for sub in pts.windows(2) {
+            let mid_share = pair[0] + (pair[1] - pair[0]) * f64::midpoint(sub[0], sub[1]);
+            let (wm, hm) = size_at(mid_share);
+            let open_mid = wm > w_thresh || hm > h_thresh;
             #[allow(clippy::cast_precision_loss)]
-            let cross = ((idx as f64 + frac) / segments as f64).clamp(0.0, 1.0);
-            return Some((cross, open1));
+            let t = ((idx as f64 + sub[0]) / segments as f64).clamp(0.0, 1.0);
+            emit(t, open_mid);
+        }
+        let open_end = w1 > w_thresh || h1 > h_thresh;
+        if idx + 1 < segments {
+            #[allow(clippy::cast_precision_loss)]
+            let t = ((idx + 1) as f64 / segments as f64).clamp(0.0, 1.0);
+            emit(t, open_end);
         }
     }
-    None
+    if values.len() < 2 {
+        return None;
+    }
+    times.push(1.0);
+    Some((values, times))
 }
 
 /// How a picture of the size a frame heads to goes with the picture in the
@@ -389,12 +415,11 @@ impl Framed {
                 || to.size.height > self.picture_size.height + 0.5;
             fill.setOpacity(if end_open { 1.0 } else { 0.0 });
             if duration > 0.0
-                && let Some((cross_t, open_after)) =
-                    fill_crossing_time(from.size, to.size, self.picture_size, shares)
+                && let Some((values, times)) =
+                    fill_opacity_steps(from.size, to.size, self.picture_size, shares)
             {
-                let (before, after) = if open_after { (0.0, 1.0) } else { (1.0, 0.0) };
                 fill.addAnimation_forKey(
-                    &discrete_step("opacity", before, after, cross_t, duration),
+                    &discrete_steps("opacity", &values, &times, duration),
                     Some(&NSString::from_str(FILL_OPACITY_KEY)),
                 );
             }
@@ -907,14 +932,21 @@ impl CoverScreen for CoverScreenOS {
                     return;
                 };
                 // The strip's windows and the engine's own panels stay out.
+                let mut matched = Vec::new();
                 let left_out = unsafe { content.windows() }
                     .iter()
                     .filter(|window| {
                         let id = unsafe { window.windowID() };
-                        excluding.iter().any(|left| left.cast_unsigned() == id)
-                            || unsafe { window.owningApplication() }.is_some_and(|app| {
+                        if let Some(&wanted) =
+                            excluding.iter().find(|left| left.cast_unsigned() == id)
+                        {
+                            matched.push(wanted);
+                            true
+                        } else {
+                            unsafe { window.owningApplication() }.is_some_and(|app| {
                                 u32::try_from(unsafe { app.processID() }) == Ok(own)
                             })
+                        }
                     })
                     .collect::<Vec<Retained<SCWindow>>>();
                 let left_out = NSArray::from_retained_slice(&left_out);
@@ -927,13 +959,13 @@ impl CoverScreen for CoverScreenOS {
                 };
                 let reply = reply.clone();
                 capture(&filter, bounds.size(), scale, false, move |result| {
-                    reply.send(result);
+                    reply.send_excluded(result, Some(matched.clone()));
                 });
             },
         );
         unsafe {
             SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-                false, true, &found,
+                false, false, &found,
             );
         }
     }
@@ -1335,22 +1367,23 @@ impl CoverScreen for CoverScreenOS {
     }
 }
 
-/// A discrete step animation on `path`: holds `before` for `[0, cross_t)`
-/// and jumps to `after` for `[cross_t, 1]` over `seconds`, with zero linear
-/// interpolation before the crossing instant.
-fn discrete_step(
+/// A discrete step animation on `path`: holds `values[i]` for
+/// `[times[i], times[i + 1])` over `seconds`, with no interpolation between
+/// transitions.
+fn discrete_steps(
     path: &str,
-    before: f64,
-    after: f64,
-    cross_t: f64,
+    values: &[f64],
+    times: &[f64],
     seconds: f64,
 ) -> Retained<CAKeyframeAnimation> {
-    let values = [NSNumber::new_f64(before), NSNumber::new_f64(after)];
-    let times = [
-        NSNumber::new_f64(0.0),
-        NSNumber::new_f64(cross_t.clamp(0.0, 1.0)),
-        NSNumber::new_f64(1.0),
-    ];
+    let values = values
+        .iter()
+        .map(|value| NSNumber::new_f64(*value))
+        .collect::<Vec<_>>();
+    let times = times
+        .iter()
+        .map(|time| NSNumber::new_f64(time.clamp(0.0, 1.0)))
+        .collect::<Vec<_>>();
     let animation = CAKeyframeAnimation::animationWithKeyPath(Some(&NSString::from_str(path)));
     // SAFETY: an array of numbers is an array of objects.
     let values: Retained<NSArray> =
@@ -1411,10 +1444,15 @@ struct Reply {
 
 impl Reply {
     fn send(&self, result: Result<Photo, PhotoError>) {
+        self.send_excluded(result, None);
+    }
+
+    fn send_excluded(&self, result: Result<Photo, PhotoError>, excluded: Option<Vec<WinID>>) {
         _ = self.events.send(Event::CoverPhoto {
             subject: self.subject,
             generation: self.generation,
             result,
+            excluded,
         });
     }
 }
@@ -1473,7 +1511,7 @@ mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
     use super::{
-        CoverScreenOS, Heading, cover_panels, fill_crossing_time, fill_start, global_rect,
+        CoverScreenOS, Heading, cover_panels, fill_opacity_steps, fill_start, global_rect,
         live_panels, mask_bands, mask_steps,
     };
 
@@ -1662,26 +1700,51 @@ mod tests {
 
         // Segment [198, 206] for a 200-pt picture (threshold 200.5) crosses
         // at 2.5/8 = 0.3125 of segment 1 of 3 -> (1 + 0.3125)/3 = 0.4375.
-        let cross = fill_crossing_time(
+        let (values, times) = fill_opacity_steps(
             CGSize::new(180.0, 500.0),
             CGSize::new(220.0, 500.0),
             CGSize::new(200.0, 500.0),
             &[0.0, 0.45, 0.65, 1.0],
+        )
+        .expect("crosses threshold");
+        assert_eq!(values, [0.0, 1.0]);
+        assert_eq!(times.len(), 3);
+        assert_eq!(times[0], 0.0);
+        assert!(
+            (times[1] - (1.0 + 2.5 / 8.0) / 3.0).abs() < 1e-9,
+            "got {}",
+            times[1]
         );
-        let (t, open_after) = cross.expect("crosses threshold");
-        assert!(open_after);
-        assert!((t - (1.0 + 2.5 / 8.0) / 3.0).abs() < 1e-9, "got {t}");
+        assert_eq!(times[2], 1.0);
 
         // Height-only growth crosses on the vertical threshold too.
-        let cross_h = fill_crossing_time(
+        let (values_h, times_h) = fill_opacity_steps(
             CGSize::new(200.0, 480.0),
             CGSize::new(200.0, 520.0),
             CGSize::new(200.0, 500.0),
             &[0.0, 0.45, 0.65, 1.0],
+        )
+        .expect("crosses vertical threshold");
+        assert_eq!(values_h, [0.0, 1.0]);
+        assert_eq!(times_h.len(), 3);
+        assert!(
+            (times_h[1] - (1.0 + 2.5 / 8.0) / 3.0).abs() < 1e-9,
+            "got {}",
+            times_h[1]
         );
-        let (th, open_after_h) = cross_h.expect("crosses vertical threshold");
-        assert!(open_after_h);
-        assert!((th - (1.0 + 2.5 / 8.0) / 3.0).abs() < 1e-9, "got {th}");
         let _ = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1.0, 1.0));
+    }
+
+    #[test]
+    fn fill_tracks_multi_step_visibility_across_shrink_then_grow() {
+        let (values, times) = fill_opacity_steps(
+            CGSize::new(202.0, 498.0),
+            CGSize::new(198.0, 502.0),
+            CGSize::new(200.0, 500.0),
+            &[0.0, 1.0],
+        )
+        .expect("crosses width then height thresholds");
+        assert_eq!(values, [1.0, 0.0, 1.0]);
+        assert_eq!(times, [0.0, 0.375, 0.625, 1.0]);
     }
 }

@@ -223,13 +223,14 @@ fn resize<S: WriteSink>(
         sink.set_size(window, size);
     }
 
-    let Some(staging_origin) = staged else {
+    if staged.is_none() {
         return Resized {
             frame: last,
             placed: false,
         };
-    };
-    if let Some(settled) = sink.read_frame(window) {
+    }
+    let settled = sink.read_frame(window);
+    if let Some(settled) = settled {
         debug!(
             requested_width = size.x,
             actual_width = settled.width(),
@@ -237,7 +238,7 @@ fn resize<S: WriteSink>(
         );
         last = Some(settled);
     }
-    if staging_origin != origin {
+    if settled.is_none_or(|frame| frame.min != origin) {
         sink.set_position(window, origin);
     }
     Resized {
@@ -1896,5 +1897,71 @@ mod writer_tests {
                 .collect::<Vec<_>>()
         );
         assert!(probe.opened.load(Ordering::SeqCst) > 1);
+    }
+
+    #[test]
+    fn staged_resize_places_window_unless_settled_already_at_origin() {
+        struct StageSink {
+            reads: Vec<Option<IRect>>,
+            positions: Vec<Origin>,
+        }
+
+        impl WriteSink for StageSink {
+            type Window = ();
+
+            fn begin(&mut self) {}
+
+            fn set_position(&mut self, (): &(), origin: Origin) {
+                self.positions.push(origin);
+            }
+
+            fn set_size(&mut self, (): &(), _size: Size) {}
+
+            fn read_frame(&mut self, (): &()) -> Option<IRect> {
+                self.reads.remove(0)
+            }
+
+            fn raise(&mut self, (): &()) {}
+
+            fn take_unanswered(&mut self) -> bool {
+                false
+            }
+
+            fn finish(&mut self) {}
+        }
+
+        let from = IRect::new(0, 0, 100, 100);
+        let size = Size::new(500, 100);
+        let origin = Origin::new(300, 0);
+        let partial = IRect::new(0, 0, 200, 100);
+        let staged_full = IRect::new(-300, 0, 200, 100);
+
+        // Settled frame still sits at staging origin -> moves to target origin.
+        let mut moved = StageSink {
+            reads: vec![Some(partial), Some(staged_full), Some(staged_full)],
+            positions: Vec::new(),
+        };
+        let res = resize(&mut moved, &(), from, size, origin);
+        assert!(res.placed);
+        assert_eq!(moved.positions, vec![Origin::new(-300, 0), origin]);
+
+        // Unreadable settled frame -> conservatively moves to target origin.
+        let mut unreadable = StageSink {
+            reads: vec![Some(partial), Some(staged_full), None],
+            positions: Vec::new(),
+        };
+        let res = resize(&mut unreadable, &(), from, size, origin);
+        assert!(res.placed);
+        assert_eq!(unreadable.positions, vec![Origin::new(-300, 0), origin]);
+
+        // Settled frame already sits at target origin -> skips redundant move.
+        let at_origin = IRect::new(300, 0, 800, 100);
+        let mut already = StageSink {
+            reads: vec![Some(partial), Some(staged_full), Some(at_origin)],
+            positions: Vec::new(),
+        };
+        let res = resize(&mut already, &(), from, size, origin);
+        assert!(res.placed);
+        assert_eq!(already.positions, vec![Origin::new(-300, 0)]);
     }
 }

@@ -1054,10 +1054,21 @@ fn a_second_resize_mid_motion_heads_on_without_gaps() {
     }
     settle(&mut harness);
     assert_landed(&mut harness);
-    assert_ne!(
-        harness.mock_state.ax_frame(0).width(),
-        start.width(),
-        "window 0 has a new width"
+
+    let mut reference = self::harness();
+    reference
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    settle(&mut reference);
+    reference
+        .world()
+        .write_message(window(Operation::Resize(ResizeDirection::Grow)));
+    settle(&mut reference);
+    let _ = start;
+    assert_eq!(
+        engine_frames(harness.world()),
+        engine_frames(reference.world()),
+        "the row reached the second Grow's target"
     );
 }
 

@@ -1687,6 +1687,10 @@ pub(super) fn update_overlays(
     let dim_opacity = config.dim_inactive_opacity();
     let border_enabled = config.border_active_window();
 
+    if config.is_changed() {
+        window_config_cache.window_id = None;
+    }
+
     // Hide overlays during swipe, mission control, native fullscreen spaces,
     // or briefly after a space change (macOS space-switch animation).
     let Some((swiping, sliding, resizing, active_strip)) = active_workspace.iter().next() else {

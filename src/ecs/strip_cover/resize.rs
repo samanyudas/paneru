@@ -150,6 +150,9 @@ pub(crate) struct CoverMorph {
     /// wider frame). Unveiled as soon as the presented width fits the new
     /// picture so the fill behind the old picture is never dropped early.
     pending_unveil: Vec<(Entity, WinID, IVec2, Photo)>,
+    /// Windows whose installed picture became stale after a title change, so
+    /// even a same-size target requests and unveils a fresh picture.
+    stale_title: Vec<Entity>,
     /// Where the morph entered the curve, as a share of its time, how long it
     /// has run in animation time, and how long the whole curve lasts.
     entry: f64,
@@ -186,13 +189,22 @@ impl CoverMorph {
         self.guard
     }
 
-    /// Each window whose frame heads wider or taller than its picture on the
-    /// cover, with its frame, that has no fresh-picture ask for this target
-    /// size yet.
+    /// Whether window `entity`'s installed picture needs a fresh capture at
+    /// `target`: either it became stale on a title change or `target` exceeds
+    /// the installed picture's size.
+    fn needs_picture(&self, entity: Entity, target: IVec2) -> bool {
+        self.stale_title.contains(&entity)
+            || self
+                .pictured(entity)
+                .is_some_and(|size| target.x > size.x || target.y > size.y)
+    }
+
+    /// Each window whose frame needs a fresh picture on the cover (outgrown
+    /// its picture or invalidated by a title change), with its frame, that has
+    /// no fresh-picture ask for this target size yet.
     fn outgrown(&self) -> impl Iterator<Item = &Reframe> {
         self.frames.iter().filter(|frame| {
-            self.pictured(frame.entity)
-                .is_some_and(|size| frame.to.width() > size.x || frame.to.height() > size.y)
+            self.needs_picture(frame.entity, frame.to.size())
                 && !self
                     .refresh_ask
                     .iter()
@@ -226,6 +238,11 @@ impl CoverMorph {
             .filter(|frame| frame.id == id)
             .map(|frame| frame.entity)
             .collect::<Vec<_>>();
+        for &entity in &entities {
+            if !self.stale_title.contains(&entity) {
+                self.stale_title.push(entity);
+            }
+        }
         self.refresh_ask
             .retain(|(entity, ..)| !entities.contains(entity));
         self.pending_unveil.retain(|(_, window, ..)| *window != id);
@@ -387,7 +404,7 @@ type MorphStrips<'w, 's> = Query<
         Has<NativeFullscreenMarker>,
         Has<CoverSlide>,
         Has<CoverSwipe>,
-        Has<MaximizeMorph>,
+        Option<&'static MaximizeMorph>,
     ),
     (With<LayoutStrip>, Without<Window>),
 >;
@@ -465,7 +482,7 @@ pub(super) fn cover_resizes(
     started.0.clear();
     let Some(mut screen) = screen else {
         for (entity, .., maximize_morph) in &strips {
-            if maximize_morph {
+            if maximize_morph.is_some() {
                 commands.entity(entity).remove::<MaximizeMorph>();
             }
         }
@@ -489,6 +506,8 @@ pub(super) fn cover_resizes(
         maximize_morph,
     ) in &mut strips
     {
+        let maximize_target = maximize_morph.map(|morph| morph.0);
+        let maximize_morph = maximize_target.is_some();
         if maximize_morph {
             commands.entity(entity).remove::<MaximizeMorph>();
         }
@@ -842,6 +861,7 @@ pub(super) fn cover_resizes(
             pictured,
             refresh_ask: Vec::new(),
             pending_unveil: Vec::new(),
+            stale_title: Vec::new(),
             entry: 0.0,
             elapsed: 0.0,
             duration,
@@ -864,18 +884,17 @@ pub(super) fn cover_resizes(
         // fill, so the pictures rest until the window has its new frame,
         // and the frame then opens onto the window itself.
         let now = time.elapsed();
-        morph.open = if maximize_morph {
+        morph.open = if let Some(target_entity) = maximize_target {
             morph
                 .frames
                 .iter()
-                .filter(|frame| frame.grows())
+                .filter(|frame| frame.entity == target_entity && frame.grows())
                 .filter(|frame| {
                     photos
                         .heading(frame.id, frame.to.size(), true, now)
                         .is_none()
                 })
                 .map(|frame| frame.id)
-                .take(1)
                 .collect()
         } else {
             Vec::new()
@@ -940,6 +959,7 @@ fn head_pictures(
         {
             if replaces {
                 morph.back(frame.entity, to);
+                morph.stale_title.retain(|&stale| stale != frame.entity);
             }
             debug!(
                 "cover over a resize shows window {} as it was at {}",
@@ -1383,9 +1403,7 @@ pub(super) fn apply_morph_replies(
             }
             accepted_for_morph = true;
             if let Ok(photo) = &reply.result
-                && morph.pictured(frame.entity).is_some_and(|pictured| {
-                    frame.to.width() > pictured.x || frame.to.height() > pictured.y
-                })
+                && morph.needs_picture(frame.entity, frame.to.size())
             {
                 let fits = frame.to.size();
                 morph.pending_unveil.retain(|(e, ..)| *e != frame.entity);
@@ -1431,6 +1449,7 @@ pub(super) fn apply_morph_replies(
             screen.as_deref_mut(),
             asked,
             &reply.result,
+            None,
             reply.taken,
         );
     }
@@ -1467,12 +1486,10 @@ fn unveil_ready_pictures(morphs: &mut Query<&mut CoverMorph>, screen: &mut dyn s
                 morph.pending_unveil.push((entity, id, fits, photo));
                 continue;
             }
-            if morph
-                .pictured(entity)
-                .is_some_and(|pictured| fits.x > pictured.x || fits.y > pictured.y)
-            {
+            if morph.needs_picture(entity, fits) {
                 if screen.replace_picture(morph.display, id, fits, &photo) {
                     morph.back(entity, fits);
+                    morph.stale_title.retain(|&stale| stale != entity);
                     if let Some((_, pictured)) = morph
                         .pictured
                         .iter_mut()

@@ -2142,3 +2142,70 @@ fn an_empty_dock_frame_is_no_reading() {
     let frame = IRect::new(727, 1358, 1833, 1430);
     assert_eq!(DockFrame::shown(frame), Some(DockFrame::Shown(frame)));
 }
+
+#[test]
+fn double_click_restores_maximized_window_at_previously_refused_viewport_but_skips_unmaximized() {
+    use crate::ecs::maximize::MaximizeRefused;
+
+    let mut harness = three_windows();
+    let area = usable_area(&mut harness);
+    let before = frames(&harness, &[0, 1, 2]);
+    harness.mock_state.update_window(0, |window| {
+        window.maximum_size = Some(Size::new(area.width() - 200, 4000));
+    });
+
+    double_click_title_bar(&mut harness, 0);
+    assert!(!is_maximized(&mut harness, 0));
+    let entity = entity_of(&mut harness, 0);
+    assert!(
+        harness.world().get::<MaximizeRefused>(entity).is_some(),
+        "refused width recorded for this viewport"
+    );
+
+    // While unmaximized at the refused viewport, another double-click stays a passthrough.
+    double_click_title_bar(&mut harness, 0);
+    assert!(!is_maximized(&mut harness, 0));
+    assert_eq!(frames(&harness, &[0, 1, 2]), before);
+
+    // Shrink the viewport with a left Dock so the window can maximize within its cap.
+    harness
+        .mock_state
+        .os_set_dock_frame(Some(DockFrame::Shown(IRect::new(
+            0,
+            0,
+            250,
+            TEST_DISPLAY_HEIGHT,
+        ))));
+    harness.run(vec![Event::DockDidChangePref { msg: String::new() }]);
+    harness.advance(Duration::from_secs(3));
+    double_click_title_bar(&mut harness, 0);
+    assert!(
+        is_maximized(&mut harness, 0),
+        "window maximizes at narrower docked viewport"
+    );
+    assert!(
+        harness.world().get::<MaximizeRefused>(entity).is_some(),
+        "MaximizeRefused from original viewport stays present"
+    );
+
+    // Lift the app cap and hide the Dock back to the original viewport; restoring must work.
+    harness
+        .mock_state
+        .update_window(0, |window| window.maximum_size = None);
+    harness
+        .mock_state
+        .os_set_dock_frame(Some(DockFrame::AutoHidden));
+    harness.run(vec![Event::DockDidChangePref { msg: String::new() }]);
+    harness.advance(Duration::from_secs(3));
+    assert_eq!(usable_area(&mut harness), area);
+    assert!(
+        is_maximized(&mut harness, 0),
+        "stays maximized when returning to original viewport"
+    );
+
+    double_click_title_bar(&mut harness, 0);
+    assert!(
+        !is_maximized(&mut harness, 0),
+        "double-click restores maximized window even at previously refused viewport"
+    );
+}

@@ -1022,7 +1022,7 @@ type Sliding<'w, 's> = Query<
         &'static mut Position,
         &'static PresentedOrigin,
         Has<EdgeSlice>,
-        &'static SlideEase,
+        &'static mut SlideEase,
     ),
 >;
 
@@ -1122,7 +1122,7 @@ fn slide_photos_out(
 ) {
     let mut moved_out = Vec::<Out>::new();
     for (entity, waits) in Out::nearest_first(&sliding, &slices, time.elapsed()) {
-        let Ok((entity, window, mut slide, mut position, presented, _, ease)) =
+        let Ok((entity, window, mut slide, mut position, presented, _, mut ease)) =
             sliding.get_mut(entity)
         else {
             continue;
@@ -1144,6 +1144,9 @@ fn slide_photos_out(
                 let photo = slices.photo(id);
                 if photo.is_some_and(|photo| photo.shown().is_some()) {
                     position.0 = presented.0;
+                    if ease.0.is_finished() {
+                        ease.0.restart();
+                    }
                     *slide = Slide::Tucking {
                         at,
                         to,
@@ -1226,10 +1229,14 @@ fn slide_photos_out(
                 if position.0 != presented.0 {
                     position.0 = presented.0;
                 }
-                let (next, arrived) = ease_step(at, to, t);
-                let next = Out::of(&slide).map_or(next, |out| out.beside(&moved_out, next, false));
+                let (stepped, arrived) = ease_step(at, to, t);
+                let next =
+                    Out::of(&slide).map_or(stepped, |out| out.beside(&moved_out, stepped, false));
                 let next = holds.limit(entity, at, next);
                 let arrived = arrived && next == to;
+                if stepped != at && next == at && !arrived {
+                    ease.0.restart();
+                }
                 let moved = displays
                     .get(slice.display)
                     .ok()

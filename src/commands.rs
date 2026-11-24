@@ -1223,7 +1223,7 @@ fn resize_window(
         if restored.is_some()
             && let Ok(mut strip_commands) = commands.get_entity(strip_entity)
         {
-            strip_commands.try_insert(MaximizeMorph);
+            strip_commands.try_insert(MaximizeMorph(entity));
         }
         restored
     } else {

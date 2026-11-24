@@ -66,6 +66,7 @@ struct Screen {
     /// picture shows from the start of the next one.
     headed_before: Vec<usize>,
     hidden: usize,
+    forgotten: Vec<Option<WinID>>,
 }
 
 type ScreenLog = Rc<RefCell<Screen>>;
@@ -191,7 +192,9 @@ impl CoverScreen for RecordingScreen {
         self.0.borrow_mut().hidden += 1;
     }
 
-    fn forget(&mut self, _window: Option<WinID>) {}
+    fn forget(&mut self, window: Option<WinID>) {
+        self.0.borrow_mut().forgotten.push(window);
+    }
 }
 
 fn pixel() -> CFRetained<CGImage> {
@@ -299,6 +302,7 @@ fn take_pictures(harness: &mut TestHarness, log: &ScreenLog) {
                         image: pixel(),
                         edge_color: None,
                     }),
+                    excluded: None,
                 },
             );
         }
@@ -2026,17 +2030,22 @@ fn a_move_into_a_stack_is_covered() {
     ]);
     harness.advance(SETTLE);
     take_pictures(&mut harness, &log);
+    send(&mut harness, focus(Direction::East));
+    harness.advance(SETTLE);
     let before = log.borrow().shown.len();
     send(&mut harness, focus(Direction::East));
     harness.advance(ONE_FRAME);
-    send(&mut harness, focus(Direction::East));
-    harness.advance(ONE_FRAME);
+    assert!(
+        covered(harness.world()) && log.borrow().shown.len() > before,
+        "moving into a stack goes under the cover"
+    );
     harness.advance(SETTLE);
+    let before = log.borrow().shown.len();
     send(&mut harness, focus(Direction::West));
     harness.advance(ONE_FRAME);
     assert!(
-        log.borrow().shown.len() > before,
-        "moves around a stack go under the cover"
+        covered(harness.world()) && log.borrow().shown.len() > before,
+        "moving out of a stack goes under the cover"
     );
 }
 
@@ -2495,6 +2504,7 @@ fn answer(harness: &mut TestHarness, id: WinID, generation: u32) {
                 image: pixel(),
                 edge_color: Some([0.2, 0.4, 0.6, 1.0]),
             }),
+            excluded: None,
         },
     );
 }
@@ -2884,6 +2894,7 @@ fn refuse_window_1(harness: &mut TestHarness, generation: u32, then: Vec<Event>)
             subject: CoverSubject::Window(1),
             generation,
             result: Err(crate::ecs::slice_photos::PhotoError::Refused),
+            excluded: None,
         },
     );
     for event in then {
@@ -3783,6 +3794,7 @@ fn a_refusal_keeps_no_picture_that_arrives_after_it() {
             subject: CoverSubject::Window(1),
             generation: fresh,
             result: Err(crate::ecs::slice_photos::PhotoError::Refused),
+            excluded: None,
         },
     );
     send(
@@ -3795,6 +3807,7 @@ fn a_refusal_keeps_no_picture_that_arrives_after_it() {
                 image: pixel(),
                 edge_color: None,
             }),
+            excluded: None,
         },
     );
     harness.app.update();
@@ -3868,6 +3881,11 @@ fn a_stacked_window_maximize_and_restore_morph_under_the_cover() {
     harness.advance(ONE_FRAME);
     assert!(morphed(harness.world()), "stacked maximize is covered");
     until_morphs(&mut harness, &log, 1);
+    assert_eq!(
+        log.borrow().opened,
+        vec![0],
+        "opens onto the maximized window, not its stackmate"
+    );
     let (from_0, to_0) = morph_of(&log, 0, 0);
     let (from_1, to_1) = morph_of(&log, 0, 1);
     assert_eq!(from_0, before_0);
@@ -4245,6 +4263,7 @@ fn failed_and_timed_out_captures_back_off_to_let_desktop_capture() {
                         subject,
                         generation,
                         result: Err(PhotoError::Failed),
+                        excluded: None,
                     },
                 );
                 continue;
@@ -4267,6 +4286,7 @@ fn failed_and_timed_out_captures_back_off_to_let_desktop_capture() {
                         image: pixel(),
                         edge_color: None,
                     }),
+                    excluded: None,
                 },
             );
         }
@@ -4339,4 +4359,370 @@ fn losing_capture_access_aborts_active_swipe_and_slide_covers() {
         "CoverSlide aborted on access loss"
     );
     assert_eq!(log.borrow().hidden, hidden_before + 1);
+}
+
+#[test]
+fn disabling_and_reenabling_covers_clears_remembered_layouts() {
+    use crate::ecs::strip_cover::StripLayouts;
+
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    assert!(
+        !harness.world().resource::<StripLayouts>().is_empty(),
+        "StripLayouts populated while covers are enabled"
+    );
+
+    // Disable covers and let remember_layouts clear StripLayouts.
+    *harness.world().resource_mut::<Config>() = config(false, Some(14.0));
+    harness.advance(ONE_FRAME);
+    assert!(
+        harness.world().resource::<StripLayouts>().is_empty(),
+        "disabling covers clears remembered strip layouts"
+    );
+
+    // Re-enable covers and move immediately on the same frame before a fresh
+    // baseline is recorded; because StripLayouts is empty, no stale baseline covers.
+    *harness.world().resource_mut::<Config>() = config(true, Some(14.0));
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    assert!(
+        !covered(harness.world()),
+        "re-enabling covers establishes a clean layout baseline first"
+    );
+
+    // Re-capture pictures cleared when disabled and settle on the new baseline.
+    harness.advance(SETTLE);
+    take_pictures(&mut harness, &log);
+    assert!(
+        !harness.world().resource::<StripLayouts>().is_empty(),
+        "StripLayouts repopulated once re-enabled"
+    );
+    send(&mut harness, focus(Direction::West));
+    harness.advance(ONE_FRAME);
+    assert!(
+        covered(harness.world()),
+        "subsequent move after baseline is covered"
+    );
+}
+
+#[test]
+fn closing_a_blank_only_window_forgets_its_cover_state() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    let mut answered = 0;
+    let mut blanked = false;
+    let reply_pending = |harness: &mut TestHarness, answered: &mut usize, blanked: &mut bool| {
+        let asked = log.borrow().asked.clone();
+        for (subject, generation) in asked.iter().skip(*answered) {
+            if *subject == CoverSubject::Window(0) {
+                send(
+                    harness,
+                    Event::CoverPhoto {
+                        subject: *subject,
+                        generation: *generation,
+                        result: Err(crate::ecs::slice_photos::PhotoError::Blank),
+                        excluded: None,
+                    },
+                );
+                *blanked = true;
+            } else {
+                send(
+                    harness,
+                    Event::CoverPhoto {
+                        subject: *subject,
+                        generation: *generation,
+                        result: Ok(Photo {
+                            digest: Digest(u64::from(*generation)),
+                            image: pixel(),
+                            edge_color: None,
+                        }),
+                        excluded: None,
+                    },
+                );
+            }
+        }
+        *answered = asked.len();
+    };
+
+    for _ in 0..40 {
+        harness.advance(ONE_FRAME);
+        reply_pending(&mut harness, &mut answered, &mut blanked);
+        if blanked {
+            break;
+        }
+    }
+    assert!(blanked, "window 0 recorded only Blank state");
+
+    harness.mock_state.os_close_window(0);
+    for _ in 0..20 {
+        harness.advance(ONE_FRAME);
+        reply_pending(&mut harness, &mut answered, &mut blanked);
+        if log.borrow().forgotten.contains(&Some(0)) {
+            break;
+        }
+    }
+    assert!(
+        log.borrow().forgotten.contains(&Some(0)),
+        "closing a Blank-only window invokes screen.forget(Some(0))"
+    );
+}
+
+#[test]
+fn desktop_display_size_change_invalidates_cached_desktop_photo() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    take_pictures(&mut harness, &log);
+    let mut answered = log.borrow().asked.len();
+    let count_desktop_asks = || {
+        log.borrow()
+            .asked
+            .iter()
+            .filter(|(subject, _)| matches!(subject, CoverSubject::Desktop(TEST_DISPLAY_ID)))
+            .count()
+    };
+    let before = count_desktop_asks();
+    assert!(before >= 1, "desktop picture was asked initially");
+
+    harness
+        .mock_state
+        .set_display_bounds(TEST_DISPLAY_ID, IRect::new(0, 0, 1280, 800));
+    harness.run(vec![Event::DisplayResized {
+        display_id: TEST_DISPLAY_ID,
+    }]);
+    for _ in 0..80 {
+        harness.advance(ONE_FRAME);
+        let asked = log.borrow().asked.clone();
+        for (subject, generation) in asked.iter().skip(answered) {
+            send(
+                &mut harness,
+                Event::CoverPhoto {
+                    subject: *subject,
+                    generation: *generation,
+                    result: Ok(Photo {
+                        digest: Digest(u64::from(*generation)),
+                        image: pixel(),
+                        edge_color: None,
+                    }),
+                    excluded: None,
+                },
+            );
+        }
+        answered = asked.len();
+        if count_desktop_asks() > before {
+            break;
+        }
+    }
+    assert!(
+        count_desktop_asks() > before,
+        "display size change immediately invalidates cached desktop photo before TTL"
+    );
+}
+
+#[test]
+fn desktop_reply_records_actual_excluded_windows() {
+    let (mut harness, log) = harness(config(true, Some(14.0)));
+    let mut answered = 0;
+    let mut desktop_asks = 0usize;
+    let pump = |harness: &mut TestHarness,
+                answered: &mut usize,
+                desktop_asks: &mut usize,
+                desktop_excluded: &[WinID]| {
+        for _ in 0..30 {
+            harness.advance(ONE_FRAME);
+            let asked = log.borrow().asked.clone();
+            for (subject, generation) in asked.iter().skip(*answered) {
+                let excluded = if matches!(subject, CoverSubject::Desktop(_)) {
+                    *desktop_asks += 1;
+                    Some(desktop_excluded.to_vec())
+                } else {
+                    None
+                };
+                send(
+                    harness,
+                    Event::CoverPhoto {
+                        subject: *subject,
+                        generation: *generation,
+                        result: Ok(Photo {
+                            digest: Digest(u64::from(*generation)),
+                            image: pixel(),
+                            edge_color: None,
+                        }),
+                        excluded,
+                    },
+                );
+            }
+            *answered = asked.len();
+        }
+    };
+
+    pump(&mut harness, &mut answered, &mut desktop_asks, &[0]);
+    assert!(desktop_asks >= 1);
+
+    // Partial desktop exclusion ([0]) does not satisfy a move covering [0, 1, 2, 3].
+    send(&mut harness, focus(Direction::East));
+    harness.advance(ONE_FRAME);
+    assert!(
+        !covered(harness.world()),
+        "incomplete desktop exclusion does not cover the strip"
+    );
+    harness.advance(SETTLE);
+
+    let before_fresh = desktop_asks;
+    pump(
+        &mut harness,
+        &mut answered,
+        &mut desktop_asks,
+        &[0, 1, 2, 3],
+    );
+    assert!(
+        desktop_asks > before_fresh,
+        "re-asks when cached desktop excluded list is incomplete"
+    );
+
+    send(&mut harness, focus(Direction::West));
+    harness.advance(ONE_FRAME);
+    assert!(
+        covered(harness.world()),
+        "complete excluded list in reply satisfies cover"
+    );
+}
+
+#[test]
+fn stale_title_mid_morph_requests_and_replaces_same_size_picture() {
+    use crate::types::commands::ResizeDirection;
+
+    let (mut harness, log) = harness(padded_resize_config());
+    take_pictures(&mut harness, &log);
+    let since = log.borrow().window_asks.len();
+    send(&mut harness, resize(ResizeDirection::Grow));
+    harness.advance(Duration::from_millis(8));
+    let (_, to_size, gen_1) = window_asks_since(&log, since)[0];
+    answer(&mut harness, 0, gen_1);
+    harness.advance(Duration::from_millis(8));
+    assert_eq!(log.borrow().replaced, vec![(0, to_size)]);
+    assert!(morphed(harness.world()), "morph still in flight");
+
+    // Retitling mid-morph invalidates the installed picture even though target size matches.
+    let mid_since = log.borrow().window_asks.len();
+    send(&mut harness, Event::WindowTitleChanged { window_id: 0 });
+    harness.advance(Duration::from_millis(8));
+    let mid_asks = window_asks_since(&log, mid_since);
+    let (_, retry_size, gen_2) = *mid_asks
+        .iter()
+        .find(|(id, ..)| *id == 0)
+        .expect("asks for fresh picture at same target size after title change");
+    assert_eq!(retry_size, to_size);
+
+    answer(&mut harness, 0, gen_2);
+    harness.advance(Duration::from_millis(8));
+    assert_eq!(
+        log.borrow().replaced,
+        vec![(0, to_size), (0, to_size)],
+        "unveils fresh picture at the same target size"
+    );
+}
+
+#[test]
+fn cover_swipe_handoff_uses_display_width_when_dock_narrows_viewport() {
+    use crate::manager::DockFrame;
+
+    let measure = |left_dock: i32| {
+        let (mut harness, log) = harness(landing_config());
+        if left_dock > 0 {
+            harness
+                .mock_state
+                .os_set_dock_frame(Some(DockFrame::Shown(IRect::new(
+                    0,
+                    0,
+                    left_dock,
+                    TEST_DISPLAY_HEIGHT,
+                ))));
+            harness.run(vec![Event::DockDidChangePref { msg: String::new() }]);
+            harness.advance(Duration::from_secs(3));
+        }
+        take_pictures(&mut harness, &log);
+        let strip = start_covered_swipe(&mut harness, &log);
+        harness
+            .world()
+            .get_mut::<crate::ecs::Scrolling>(strip)
+            .expect("the strip scrolls")
+            .velocity = -0.4;
+        let position = harness
+            .world()
+            .get::<crate::ecs::Position>(strip)
+            .expect("a strip position")
+            .0;
+        let away = position.with_x(position.x + 120);
+        harness
+            .world()
+            .entity_mut(strip)
+            .insert(crate::ecs::RepositionMarker(away));
+        harness.advance(ONE_FRAME);
+        let path = log.borrow().paths.last().cloned().expect("a slide");
+        starting_speed(&path)
+    };
+
+    let full_width_speed = measure(0);
+    let docked_speed = measure(200);
+    assert!(
+        (docked_speed - full_width_speed).abs() < 1e-6,
+        "covered swipe handoff uses full display width ({docked_speed} vs {full_width_speed})"
+    );
+}
+
+#[test]
+fn auto_center_swiping_timeout_preserves_scrolling_while_awaiting_cover() {
+    let auto_center_config: Config = (
+        MainOptions {
+            auto_center: Some(true),
+            slide_window_pictures: Some(true),
+            animation_speed: Some(14.0),
+            swipe_gesture_fingers: Some(3),
+            ..MainOptions::default()
+        },
+        vec![],
+    )
+        .into();
+    let (mut harness, log) = harness(auto_center_config);
+    take_pictures(&mut harness, &log);
+    harness.advance(Duration::from_secs(3));
+
+    let strip = start_covered_swipe(&mut harness, &log);
+    {
+        let mut scroll = harness
+            .world()
+            .get_mut::<crate::ecs::Scrolling>(strip)
+            .expect("the strip scrolls");
+        scroll.velocity = -0.4;
+        scroll.is_user_swiping = false;
+        scroll.fingers_down = false;
+        // Older than idle threshold so swiping_timeout would drop Scrolling if not awaiting cover.
+        scroll.last_event = Duration::ZERO;
+    }
+    let position = harness
+        .world()
+        .get::<crate::ecs::Position>(strip)
+        .expect("a strip position")
+        .0;
+    let away = position.with_x(position.x + 80);
+    let slides_before = log.borrow().slides.len();
+    harness
+        .world()
+        .entity_mut(strip)
+        .insert(crate::ecs::RepositionMarker(away));
+    harness.advance(ONE_FRAME);
+
+    // If swiping_timeout had removed Scrolling prematurely before cover_swipes ran,
+    // no CoverSlide or carried velocity would have started on this move.
+    assert!(
+        covered(harness.world()) && log.borrow().slides.len() > slides_before,
+        "swiping_timeout preserved Scrolling while awaiting cover under auto_center"
+    );
+    harness.advance(SETTLE);
+    assert!(
+        harness
+            .world()
+            .entity(strip)
+            .get::<crate::ecs::Scrolling>()
+            .is_none(),
+        "Scrolling clears once the cover finishes"
+    );
 }

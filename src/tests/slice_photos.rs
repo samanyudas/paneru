@@ -3267,3 +3267,167 @@ fn a_window_pushed_by_a_photo_sliding_in_keeps_its_slide_while_its_app_shows_not
         "the photo of window 3 never passes where window 2 is asked for: {places:?}"
     );
 }
+
+#[test]
+fn step_slides_holds_zero_step_while_tucking_waits_with_animation_off() {
+    use crate::ecs::ease::SlideEase;
+    use crate::ecs::shared_edge::Slide;
+    use crate::manager::Window;
+
+    const FAST_APP: crate::platform::Pid = 2;
+    let log = Rc::new(RefCell::new(Screen::default()));
+    let mut harness = TestHarness::new()
+        .with_config(animated())
+        .with_display(EXT_DISPLAY_ID, LEFT, vec![EXT_WORKSPACE_ID])
+        .with_app(FAST_APP, "fast", "FastApp", |_| {});
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    for (id, width) in (0..).zip([600, 900, 400]) {
+        let pid = if id == 0 { TEST_PROCESS_ID } else { FAST_APP };
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness
+        .world()
+        .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    for _ in 0..100 {
+        queued_frame(&mut harness, true);
+    }
+    assert!(
+        in_view(harness.mock_state.ax_frame(0)),
+        "window 0 rests in view"
+    );
+
+    harness.mock_state.hold_writes(TEST_PROCESS_ID);
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::East)));
+    for _ in 0..10 {
+        queued_frame(&mut harness, false);
+        if !asks_for(&log, 0).is_empty() {
+            let ask = last_ask(&log, 0);
+            arrive(&mut harness, 0, ask, Ok(photo(7)));
+            queued_frame(&mut harness, false);
+            break;
+        }
+    }
+
+    let tucking_now = harness
+        .world()
+        .query::<(&Window, &Slide)>()
+        .iter(harness.world())
+        .any(|(w, s)| w.id() == 0 && matches!(s, Slide::Tucking { .. }) && w.write_pending());
+    assert!(
+        tucking_now,
+        "window 0 enters Slide::Tucking with pending write"
+    );
+
+    // Disable animation while Slide::Tucking still waits on window 0's pending write.
+    *harness.world().resource_mut::<Config>() = switch(true);
+    queued_frame(&mut harness, false);
+
+    let step = harness
+        .world()
+        .query::<(&Window, &Slide, &SlideEase)>()
+        .iter(harness.world())
+        .find(|(w, _, _)| w.id() == 0)
+        .map(|(_, s, ease)| {
+            assert!(
+                matches!(s, Slide::Tucking { .. }),
+                "stays in Slide::Tucking while waiting: {s:?}"
+            );
+            ease.0.t()
+        })
+        .expect("window 0 keeps SlideEase while waiting");
+    assert_eq!(
+        step, 0.0,
+        "step_slides holds zero step while Slide::Tucking waits with animation off"
+    );
+
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    for _ in 0..100 {
+        queued_frame(&mut harness, true);
+    }
+    assert!(
+        !in_view(harness.mock_state.ax_frame(0)),
+        "window 0 finishes tucking once writes release"
+    );
+}
+
+#[test]
+fn leaving_to_tucking_eases_photo_from_rest_after_edge_wait() {
+    use crate::ecs::shared_edge::Slide;
+    use crate::manager::Window;
+
+    let log = Rc::new(RefCell::new(Screen::default()));
+    let mut harness = TestHarness::new().with_config(animated()).with_display(
+        EXT_DISPLAY_ID,
+        LEFT,
+        vec![EXT_WORKSPACE_ID],
+    );
+    for (id, width) in (0..).zip([600, 900, 400]) {
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness
+        .world()
+        .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+    }
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::East)));
+    // Wait longer than the ~237 ms slide ease while withholding window 0's photo
+    // while window 0 stays in Slide::Leaving.
+    for _ in 0..18 {
+        harness.advance(Duration::from_millis(20));
+    }
+    let still_leaving = harness
+        .world()
+        .query::<(&Window, &Slide)>()
+        .iter(harness.world())
+        .find(|(w, _)| w.id() == 0)
+        .is_some_and(|(_, s)| matches!(s, Slide::Leaving { .. }));
+    assert!(
+        still_leaving,
+        "window 0 stays in Slide::Leaving before photo arrives"
+    );
+
+    let ask = last_ask(&log, 0);
+    arrive(&mut harness, 0, ask, Ok(photo(7)));
+
+    let mut tuck_xs = Vec::new();
+    for _ in 0..20 {
+        harness.advance(Duration::from_millis(20));
+        if let Some(photo_rect) = panel_photo(&log, 0)
+            && tuck_xs.last().copied() != Some(photo_rect.max.x)
+        {
+            tuck_xs.push(photo_rect.max.x);
+        }
+    }
+    assert!(
+        tuck_xs.len() >= 3,
+        "Leaving -> Tucking eases the photo across multiple frames after edge wait: {tuck_xs:?}"
+    );
+}

@@ -410,10 +410,11 @@ impl Config {
         self.inner().options.clone()
     }
 
-    // How fast window motions run. Every motion follows the spring in
-    // `ecs::ease` and lasts about 237 ms * 14 / speed, so higher is shorter,
-    // and a value that makes a motion shorter than a frame lands it in one
-    // step. Unset = instant (no animation).
+    // Scales window motion duration (higher is shorter, not pixels per
+    // second; unset = instant with no animation). Ordinary moves and slides
+    // follow the critically damped spring in `ecs::ease` (~237 ms * 14 /
+    // speed), while `ResizeMotion` uses a shorter quartic ease-out
+    // (`120 ms * 14 / speed`).
     pub fn animation_speed(&self) -> f64 {
         self.options()
             .animation_speed
@@ -1371,7 +1372,9 @@ pub struct MainOptions {
     /// a window vertically inside a stack.
     #[serde(default = "default_preset_stack_heights")]
     pub preset_stack_heights: Vec<f64>,
-    /// The animation speed for window movements in pixels per second.
+    /// Scales window motion durations (higher is shorter, not pixels per
+    /// second). At `14`, moves follow a ~237 ms spring and column resizes a
+    /// 120 ms ease-out; unset means instant moves without animation.
     pub animation_speed: Option<f64>,
     /// Automatically center the window when switching focus with keyboard.
     pub auto_center: Option<bool>,
@@ -1475,8 +1478,10 @@ pub struct MainOptions {
 
     /// During a keyboard strip move or a strip swipe, slide pictures of the
     /// strip's windows on a cover over the display, then move the real
-    /// windows once in one step. Needs the Screen Recording permission,
-    /// which the engine never asks for. Default: false.
+    /// windows once in one step. Also requires `animation_speed` to be set
+    /// (for example `animation_speed = 14`; unset keeps moves instant with
+    /// no cover) and Screen Recording permission, which the engine never asks
+    /// for. Default: false.
     pub slide_window_pictures: Option<bool>,
 }
 
