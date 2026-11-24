@@ -10,11 +10,11 @@ use objc2_app_kit::{
 type CFTypeRef = *const c_void;
 type ActuateFn = unsafe extern "C" fn(CFTypeRef, i32, u32, f32, f32) -> i32;
 
-/// A medium trackpad actuation, which a moving hand still feels without it
+/// A light trackpad actuation, which a moving hand still feels without it
 /// standing out. `NSHapticFeedbackManager`'s generic pattern is faint enough
-/// that three fingers sliding over the glass hide it, and actuation 6, the
-/// strongest, felt too strong as a detent.
-const ACTUATION: i32 = 4;
+/// that three fingers sliding over the glass hide it, and stronger actuations
+/// (4 to 6) felt too heavy as a detent.
+const ACTUATION: i32 = 3;
 
 /// Every trackpad that can actuate, opened through the private
 /// `MultitouchSupport` framework, and the call that pulses one.
