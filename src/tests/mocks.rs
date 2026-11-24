@@ -245,6 +245,7 @@ struct MockStateInner {
     left_button_down: bool,
     /// The presses the engine posted, oldest first, each where it posted it.
     posted_presses: Vec<(SlicePress, CGPoint)>,
+    cancelled_presses: Vec<u32>,
     /// Windows raised above the rest, bottom to top. Windows not in it sit
     /// below, the lowest ID on top, so overlapping windows resolve the same
     /// way on every run.
@@ -556,6 +557,7 @@ impl MockState {
             ignores_desktop_focus: false,
             left_button_down: false,
             posted_presses: Vec::new(),
+            cancelled_presses: Vec::new(),
             raised: Vec::new(),
             event_queue: VecDeque::new(),
             stale_window_ids: HashMap::new(),
@@ -1226,6 +1228,7 @@ impl MockState {
             button: MouseButton::Left,
             window_id,
             clicks: 1,
+            hold: None,
         });
         inner.event_queue.push_back(Event::MouseUp {
             point,
@@ -1247,6 +1250,7 @@ impl MockState {
                 button: MouseButton::Left,
                 window_id,
                 clicks,
+                hold: None,
             });
             inner.event_queue.push_back(Event::MouseUp {
                 point,
@@ -1278,6 +1282,7 @@ impl MockState {
             button: MouseButton::Left,
             window_id,
             clicks: 1,
+            hold: None,
         });
         inner.event_queue.push_back(Event::MouseDragged {
             point: end_p,
@@ -1352,6 +1357,10 @@ impl MockState {
     /// Takes the presses the engine posted since the last call.
     pub fn take_posted_presses(&self) -> Vec<(SlicePress, CGPoint)> {
         std::mem::take(&mut self.inner.force_write().posted_presses)
+    }
+
+    pub fn take_cancelled_presses(&self) -> Vec<u32> {
+        std::mem::take(&mut self.inner.force_write().cancelled_presses)
     }
 
     pub fn focused_desktop(&self) -> Option<IRect> {
@@ -1440,6 +1449,12 @@ impl MockState {
         inner.shown_late.insert(id, frame);
     }
 
+    /// Makes the window server keep showing window `id` at `frame` until
+    /// [`Self::show_now`], whatever frame its app has taken.
+    pub fn show_at(&self, id: WinID, frame: IRect) {
+        self.inner.force_write().shown_late.insert(id, frame);
+    }
+
     pub fn show_now(&self, id: WinID) {
         self.inner.force_write().shown_late.remove(&id);
     }
@@ -1495,6 +1510,14 @@ impl MockState {
             s.mock_reposition(id, ax_generation, frame.min);
             s.mock_resize(id, ax_generation, frame.size());
         });
+        // Under a picture cover the window moves first and is sized once.
+        let s = self.clone();
+        mw.expect_place_moved_first()
+            .returning(move |frame: IRect| {
+                let frame = fill_margins(&s.inner, id).shown(frame);
+                s.mock_reposition(id, ax_generation, frame.min);
+                s.mock_resize(id, ax_generation, frame.size());
+            });
 
         let s = self.clone();
         mw.expect_update_frame().returning(move || {
@@ -1551,8 +1574,14 @@ impl MockState {
             }
         });
         let w = writes.clone();
+        let to = window.clone();
         mw.expect_place()
-            .returning(move |frame: IRect| lock(&w).place(Some(pid), &window, frame));
+            .returning(move |frame: IRect| lock(&w).place(Some(pid), &to, frame));
+        let w = writes.clone();
+        mw.expect_place_moved_first()
+            .returning(move |frame: IRect| {
+                lock(&w).place_moved_first(Some(pid), &window, frame);
+            });
         let s = self.clone();
         let w = writes.clone();
         mw.expect_update_frame().returning(move || {
@@ -2235,6 +2264,11 @@ impl MockState {
         let s = self.clone();
         wm.expect_post_press().returning(move |press, point| {
             s.inner.force_write().posted_presses.push((*press, point));
+        });
+
+        let s = self.clone();
+        wm.expect_cancel_press().returning(move |press_id| {
+            s.inner.force_write().cancelled_presses.push(press_id);
         });
 
         let s = self.clone();

@@ -28,7 +28,7 @@ use crate::config::swipe::focus_direction;
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender, MouseButton};
 use crate::platform::slice_tap::{self, Mouse, Pointer, SliceTap, Verdict};
-use crate::platform::{Modifiers, WinID};
+use crate::platform::{Modifiers, WinID, double_click_tap};
 
 const NX_DEVICEFNKEYMASK: u64 = 0x0080_0100;
 
@@ -456,6 +456,44 @@ impl InputHandler {
         unsafe { event_ref.as_mut() }
     }
 
+    fn rearm_taps(&mut self) {
+        warn!("Tap Disabled, re-enabling");
+        self.slice_tap.reset();
+        double_click_tap::reset();
+        for tap in self.taps.iter().flatten() {
+            if tap.port.is_valid() {
+                CGEvent::tap_enable(&tap.port, true);
+            }
+        }
+    }
+
+    fn handle_slice_tap(&mut self, mouse: Mouse, event: &CGEvent) -> Option<bool> {
+        slice_tap::apply_cancellations(&mut self.slice_tap);
+        let pointer = Pointer::read(mouse, event);
+        match self.slice_tap.handle(&pointer) {
+            Verdict::Pass => None,
+            Verdict::Quiet => Some(false),
+            Verdict::Swallow => Some(true),
+            Verdict::Move(to) => {
+                CGEvent::set_location(Some(event), to);
+                None
+            }
+            Verdict::Hold(press) => {
+                if let Some(events) = &self.events
+                    && let Err(err) = events.send(Event::SlicePress { press })
+                {
+                    error!("error sending event: {err}");
+                    self.events = None;
+                }
+                Some(true)
+            }
+            Verdict::PassAndRelease { id, button } => {
+                slice_tap::post(id, button, false, pointer.point, pointer.flags);
+                None
+            }
+        }
+    }
+
     /// Handles various input events received from the `CGEventTap` callback. It sends corresponding `Event`s.
     ///
     /// # Arguments
@@ -474,39 +512,29 @@ impl InputHandler {
             event_type,
             CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
         ) {
-            warn!("Tap Disabled, re-enabling");
-            self.slice_tap.reset();
-            for tap in self.taps.iter().flatten() {
-                if tap.port.is_valid() {
-                    CGEvent::tap_enable(&tap.port, true);
-                }
-            }
+            self.rearm_taps();
             return false;
         }
 
+        if double_click_tap::is_replayed(event) {
+            return false;
+        }
+
+        if let Some(mouse) = Mouse::of(event_type)
+            && let Some(intercept) = self.handle_slice_tap(mouse, event)
+        {
+            return intercept;
+        }
         let Some(events) = &self.events else {
             return false;
         };
 
-        if let Some(mouse) = Mouse::of(event_type) {
-            let pointer = Pointer::read(mouse, event);
-            match self.slice_tap.handle(&pointer) {
-                Verdict::Pass => {}
-                Verdict::Quiet => return false,
-                Verdict::Swallow => return true,
-                Verdict::Move(to) => CGEvent::set_location(Some(event), to),
-                Verdict::Hold(press) => {
-                    if let Err(err) = events.send(Event::SlicePress { press }) {
-                        error!("error sending event: {err}");
-                        self.events = None;
-                    }
-                    return true;
-                }
-                Verdict::PassAndRelease { id, button } => {
-                    slice_tap::post(id, button, false, pointer.point, pointer.flags);
-                }
-            }
-        }
+        let hold = match double_click_tap::intercept(event_type, event) {
+            double_click_tap::TapAction::Pass => None,
+            double_click_tap::TapAction::PassQuiet => return false,
+            double_click_tap::TapAction::SwallowQuiet => return true,
+            double_click_tap::TapAction::HoldForEngine(token) => Some(token),
+        };
 
         let flags = CGEvent::flags(Some(event));
         let modifiers = get_modifiers(flags);
@@ -528,6 +556,7 @@ impl InputHandler {
                         Some(event),
                         CGEventField::MouseEventClickState,
                     ),
+                    hold,
                 })
             }
             CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {
@@ -577,8 +606,9 @@ impl InputHandler {
             // Trigger cleanup destructor, unregistering the handler.
             self.events = None;
         }
-        // Do not intercept this event, let it fall through.
-        false
+        // Intercept only when the title-bar double-click gate is holding this
+        // press for `maximize::double_click_toggle`; otherwise fall through.
+        hold.is_some()
     }
 
     /// Use the configured modifier to scroll the strip or select an adjacent window.

@@ -1,0 +1,801 @@
+//! The curves that the window motions the engine animates follow.
+//!
+//! A column resize follows a short quartic ease-out, [`Curve::EaseOut`]:
+//! a keyboard action repeated many times a day answers at once and lands in
+//! about 100 ms. Every other motion follows a critically damped spring, the
+//! bounce-free spring that Apple's fluid interfaces use for motion that
+//! follows a gesture. With a [`RESPONSE`] of 0.2 s, a motion from rest
+//! covers half its distance in about 54 ms and lands in about 237 ms. It
+//! moves from the first frame, slows into its target, and never overshoots.
+//!
+//! A spring never quite stops, so a motion lands once less than
+//! [`LEFT_AT_LANDING`] of its distance is left, which sets its duration.
+//!
+//! A motion keeps its place along the curve, from 0 at its start to 1 at its
+//! end. Each pass steps a value by the share of what is left that the curve
+//! covers in the pass's time, so a value that something else holds back,
+//! such as pacing, still lands when the curve ends. A motion whose target
+//! changes enters the curve again where the curve's speed toward the new
+//! target matches the speed the value had, so it neither jumps nor stalls.
+//! For a spring that is exact: the curve from rest, entered later, is the
+//! same spring started with that speed.
+
+use bevy::ecs::change_detection::{DetectChanges as _, Ref};
+use bevy::ecs::component::Component;
+use bevy::ecs::system::{Populated, Res};
+use bevy::math::{DVec2, IVec2};
+use bevy::time::Time;
+
+use crate::config::Config;
+use crate::ecs::PresentedOrigin;
+use crate::ecs::shared_edge::Slide;
+use crate::ecs::systems::{AnimationStep, LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS};
+use crate::manager::Window;
+
+/// The spring's response at Miri's `animation_speed` of 14, in seconds: the
+/// period it would swing at without damping. A shorter response is a stiffer,
+/// faster spring.
+const RESPONSE: f64 = 0.2;
+const MIRI_SPEED: f64 = 14.0;
+
+/// The share of a motion's distance left when it lands.
+const LEFT_AT_LANDING: f64 = 0.005;
+
+/// The spring's angular frequency times the motion's duration: where
+/// `(1 + x) e^-x`, the share of the distance a spring from rest has left
+/// after `x / ω` seconds, reaches [`LEFT_AT_LANDING`].
+const SPAN: f64 = 7.430_129_500_280_122;
+
+/// The damping ratio of the settle after a trackpad flick. Below 1, the
+/// spring swings a little past its target and back, which Apple's fluid
+/// interfaces keep for motion a gesture threw.
+const FLICK_DAMPING: f64 = 0.8;
+
+/// A flick's settle lands once its swing stays within this many points.
+const FLICK_LANDS_WITHIN: f64 = 0.5;
+
+/// The fastest a flick's settle starts toward its target, as a multiple of
+/// the spring's angular frequency times the distance. A flick that lands
+/// close, such as at a strip end, would otherwise swing far past it; at this
+/// limit the swing stays under about 2% of the distance.
+const FLICK_ENTRY_LIMIT: f64 = 0.5;
+
+/// Where a flick's settle is `elapsed` seconds after it began, at an
+/// `animation_speed` of `speed`, as points from its target: it began `from`
+/// points from the target, moving at `velocity` points per second. `None`
+/// once its swing stays within [`FLICK_LANDS_WITHIN`], where it lands.
+///
+/// The spring has the curve's [`RESPONSE`] and [`FLICK_DAMPING`], so it
+/// swings past the target by about 2% of its distance and comes back. A
+/// start faster than [`FLICK_ENTRY_LIMIT`] allows starts at that limit.
+pub(crate) fn flick_offset(from: f64, velocity: f64, elapsed: f64, speed: f64) -> Option<f64> {
+    if speed.is_nan() || speed <= 0.0 || !animates(duration_at(speed)) {
+        return None;
+    }
+    let omega = std::f64::consts::TAU / RESPONSE * speed / MIRI_SPEED;
+    let fastest = FLICK_ENTRY_LIMIT * omega * from.abs();
+    let velocity = if -velocity * from.signum() > fastest {
+        -fastest * from.signum()
+    } else {
+        velocity
+    };
+    let decay = FLICK_DAMPING * omega;
+    let swing = omega * (1.0 - FLICK_DAMPING * FLICK_DAMPING).sqrt();
+    let sine = (velocity + decay * from) / swing;
+    let envelope = (-decay * elapsed).exp();
+    if from.hypot(sine) * envelope < FLICK_LANDS_WITHIN {
+        return None;
+    }
+    let (sin, cos) = (swing * elapsed).sin_cos();
+    Some(envelope * (from * cos + sine * sin))
+}
+
+/// One active frame, in seconds. A motion shorter than this lands in one
+/// step.
+fn frame_secs() -> f64 {
+    f64::from(LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS) / 1000.0
+}
+
+/// How long a motion lasts, in seconds: about 237 ms at Miri's
+/// `animation_speed` of 14, and shorter at a faster speed. The unset default
+/// speed makes it far shorter than a frame, so each motion lands in one step.
+pub(crate) fn duration(config: &Config) -> f64 {
+    duration_at(config.animation_speed())
+}
+
+/// How long a motion lasts at an `animation_speed` of `speed`, in seconds.
+pub(crate) fn duration_at(speed: f64) -> f64 {
+    let omega = std::f64::consts::TAU / RESPONSE;
+    SPAN / omega * MIRI_SPEED / speed
+}
+
+/// How long a column resize lasts at Miri's `animation_speed` of 14, in
+/// seconds. A width command is a keyboard action repeated many times a day,
+/// so it moves for half as long as other motions, on [`Curve::EaseOut`].
+const RESIZE_DURATION: f64 = 0.12;
+
+/// How long a column resize lasts, in seconds: 120 ms at Miri's
+/// `animation_speed` of 14, scaled with the speed as [`duration`] is.
+pub(crate) fn resize_duration(config: &Config) -> f64 {
+    resize_duration_at(config.animation_speed())
+}
+
+/// How long a column resize lasts at an `animation_speed` of `speed`.
+pub(crate) fn resize_duration_at(speed: f64) -> f64 {
+    RESIZE_DURATION * MIRI_SPEED / speed
+}
+
+/// Whether a motion of `duration` seconds takes more than one step.
+pub(crate) fn animates(duration: f64) -> bool {
+    duration >= frame_secs()
+}
+
+/// The share of its distance a spring from rest has left at `s` of the
+/// motion's time.
+fn spring_left(s: f64) -> f64 {
+    let x = SPAN * s;
+    (1.0 + x) * (-x).exp()
+}
+
+/// How far along its distance a motion is at `s` of its time, from 0 to 1.
+/// The spring is scaled so it lands exactly at 1.
+pub(crate) fn curve(s: f64) -> f64 {
+    let s = s.clamp(0.0, 1.0);
+    (1.0 - spring_left(s)) / (1.0 - LEFT_AT_LANDING)
+}
+
+/// The curve's slope at `s`: its speed as a multiple of the motion's average
+/// speed.
+fn curve_slope(s: f64) -> f64 {
+    let s = s.clamp(0.0, 1.0);
+    let x = SPAN * s;
+    SPAN * x * (-x).exp() / (1.0 - LEFT_AT_LANDING)
+}
+
+/// The curve's speed at `s` toward its end, as a multiple of the average
+/// speed that would cover what is left of the distance in the whole time.
+/// It rises from 0 at the start toward infinity at the end.
+fn speed_for_what_is_left(s: f64) -> f64 {
+    let left = 1.0 - curve(s);
+    if left <= 1e-12 {
+        return f64::INFINITY;
+    }
+    curve_slope(s) / left
+}
+
+/// Where to enter the curve so that it starts at `speed`, a multiple of the
+/// average speed that covers the whole distance in the whole time. A speed
+/// at or below the curve's own start enters at its start.
+pub(crate) fn entry(speed: f64) -> f64 {
+    if speed.is_nan() || speed <= speed_for_what_is_left(0.0) {
+        return 0.0;
+    }
+    let (mut low, mut high) = (0.0, 1.0);
+    for _ in 0..48 {
+        let mid = f64::midpoint(low, high);
+        if speed_for_what_is_left(mid) < speed {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+/// Where to enter the curve for a value moving at `speed` points per second
+/// toward a target `distance` points away, over a motion of `duration`
+/// seconds. A value moving away from the target, or at rest, enters at the
+/// curve's start.
+pub(crate) fn entry_for_speed(speed: f64, distance: f64, duration: f64) -> f64 {
+    Curve::Spring.entry_for_speed(speed, distance, duration)
+}
+
+/// The shape of a motion along its time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Curve {
+    /// The critically damped spring from rest, for every motion but a
+    /// resize.
+    #[default]
+    Spring,
+    /// A quartic ease-out, `1 - (1 - s)^4`: at its fastest on the first
+    /// frame, so a resize answers the key at once, and gentle as it lands.
+    EaseOut,
+}
+
+impl Curve {
+    /// How far along its distance a motion is at `s` of its time.
+    pub(crate) fn at(self, s: f64) -> f64 {
+        match self {
+            Self::Spring => curve(s),
+            Self::EaseOut => 1.0 - (1.0 - s.clamp(0.0, 1.0)).powi(4),
+        }
+    }
+
+    /// Where to enter the curve so that it starts at `speed`, a multiple of
+    /// the average speed that covers the whole distance in the whole time.
+    pub(crate) fn entry(self, speed: f64) -> f64 {
+        match self {
+            Self::Spring => entry(speed),
+            // Its speed for what is left, `4 / (1 - s)`, starts at 4.
+            Self::EaseOut if speed.is_nan() || speed <= 4.0 => 0.0,
+            Self::EaseOut => 1.0 - 4.0 / speed,
+        }
+    }
+
+    /// Where to enter the curve for a value moving at `speed` points per
+    /// second toward a target `distance` points away, over a motion of
+    /// `duration` seconds.
+    pub(crate) fn entry_for_speed(self, speed: f64, distance: f64, duration: f64) -> f64 {
+        if distance.abs() < f64::EPSILON || duration <= 0.0 {
+            return 0.0;
+        }
+        self.entry(speed * duration / distance)
+    }
+
+    /// The share of what is left at `from` that the curve covers by `to`,
+    /// both as shares of the motion's time.
+    pub(crate) fn share(self, from: f64, to: f64) -> f64 {
+        if to >= 1.0 {
+            return 1.0;
+        }
+        let start = self.at(from);
+        let remaining = 1.0 - start;
+        if remaining <= 0.0 {
+            return 1.0;
+        }
+        ((self.at(to) - start) / remaining).clamp(0.0, 1.0)
+    }
+
+    /// Moves `progress`, a motion's place along the curve, on by `dt`
+    /// seconds of a motion of `duration` seconds, and returns the share of
+    /// what was left that the step covers. A motion shorter than a frame
+    /// lands at once.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a share in [0, 1], well within f32's range; only sub-pixel precision is lost"
+    )]
+    pub(crate) fn advance(self, progress: &mut f64, dt: f64, duration: f64) -> f32 {
+        if !animates(duration) {
+            *progress = 1.0;
+            return 1.0;
+        }
+        let next = (*progress + dt.max(0.0) / duration).min(1.0);
+        let t = self.share(*progress, next);
+        *progress = next;
+        t as f32
+    }
+
+    /// The share of the whole distance that the first active frame of a
+    /// motion from rest covers.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a share in [0, 1], well within f32's range; only sub-pixel precision is lost"
+    )]
+    pub(crate) fn first_share(self, duration: f64) -> f32 {
+        let mut progress = 0.0;
+        self.advance(&mut progress, frame_secs(), duration);
+        self.at(progress) as f32
+    }
+}
+
+/// The share of what is left at `from` that the spring covers by `to`, both
+/// as shares of the motion's time.
+pub(crate) fn share(from: f64, to: f64) -> f64 {
+    Curve::Spring.share(from, to)
+}
+
+/// The share of the whole distance that the first active frame of a spring
+/// motion from rest covers.
+pub(crate) fn first_share(duration: f64) -> f32 {
+    Curve::Spring.first_share(duration)
+}
+
+/// How long after its last step a value still counts as moving, in
+/// seconds: about three frames. A motion that starts later starts from rest.
+const MOVING_WITHIN: f64 = 0.05;
+
+/// One value's motion along the curve toward a target.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Ease {
+    /// Where the motion heads. `None` before its first step.
+    to: Option<IVec2>,
+    /// The motion's place along the curve, from 0 to 1 of its time.
+    progress: f64,
+    /// The share of what was left that the last step covered.
+    t: f32,
+    /// Where the value was as the last step with time began, and when, in
+    /// seconds of engine time, which tell its speed when a new motion
+    /// starts.
+    last: Option<(IVec2, f64)>,
+}
+
+impl Ease {
+    /// Steps the motion by `dt` seconds of a motion of `duration` seconds,
+    /// for a value at `value` that heads for `to`, at `now` seconds of
+    /// engine time, and returns the share of what is left that this step
+    /// covers.
+    ///
+    /// A new motion starts when `to` changes, or when `fresh` says the
+    /// target was set afresh, such as a marker inserted again after its
+    /// last motion ended. It enters the curve where the curve's speed toward
+    /// `to` matches the value's speed over its last step, so a target that
+    /// changes mid-motion neither jumps nor stalls. A value at rest, or
+    /// moving away from `to`, starts at the curve's start.
+    pub(crate) fn step(
+        &mut self,
+        value: IVec2,
+        to: IVec2,
+        fresh: bool,
+        clock: (f64, f64),
+        duration: f64,
+    ) -> f32 {
+        self.step_on(Curve::Spring, value, to, fresh, clock, duration)
+    }
+
+    /// [`Ease::step`] along `curve`.
+    pub(crate) fn step_on(
+        &mut self,
+        curve: Curve,
+        value: IVec2,
+        to: IVec2,
+        fresh: bool,
+        (now, dt): (f64, f64),
+        duration: f64,
+    ) -> f32 {
+        if fresh || self.to != Some(to) {
+            self.progress = self.entry_toward(curve, value, to, now, duration);
+            self.to = Some(to);
+        }
+        self.t = curve.advance(&mut self.progress, dt, duration);
+        if dt > 0.0 {
+            self.last = Some((value, now));
+        }
+        self.t
+    }
+
+    /// The share of what was left that the last step covered.
+    pub(crate) fn t(&self) -> f32 {
+        self.t
+    }
+
+    /// Holds the motion in place for this frame with zero movement share,
+    /// as while a photo waits for its window's native tuck write to land.
+    pub(crate) fn hold(&mut self) {
+        self.t = 0.0;
+    }
+
+    /// Whether the active motion has reached the end of its curve.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.progress >= 1.0 || self.t >= 1.0
+    }
+
+    /// Clears the active motion target and progress so the next step enters
+    /// the curve afresh from the current position.
+    pub(crate) fn restart(&mut self) {
+        self.to = None;
+        self.progress = 0.0;
+        self.t = 0.0;
+    }
+
+    /// Where a value at `value` enters the curve toward `to` at `now`, from
+    /// how fast it moved toward `to` since its last step.
+    fn entry_toward(&self, curve: Curve, value: IVec2, to: IVec2, now: f64, duration: f64) -> f64 {
+        let Some((before, then)) = self.last else {
+            return 0.0;
+        };
+        let elapsed = now - then;
+        if elapsed <= 0.0 || elapsed > MOVING_WITHIN {
+            return 0.0;
+        }
+        let left = (to - value).as_dvec2();
+        let distance = left.length();
+        if distance < 1.0 {
+            return 0.0;
+        }
+        let moved: DVec2 = (value - before).as_dvec2();
+        curve.entry_for_speed(moved.dot(left) / distance / elapsed, distance, duration)
+    }
+}
+
+/// The motion of an entity's `Position` toward its `RepositionMarker`.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub(crate) struct PositionEase(pub(crate) Ease);
+
+/// The motion of an entity's `Bounds` toward its `ResizeMarker`.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub(crate) struct SizeEase(pub(crate) Ease);
+
+/// The motion of a sliding photo, or of a window that leaves for its tuck,
+/// toward where its slide heads.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub(crate) struct SlideEase(pub(crate) Ease);
+
+/// Where a slide shows now, and where it heads. `None` while it lands, at
+/// rest under its photo.
+pub(crate) fn slide_heading(slide: &Slide, presented: IVec2) -> Option<(IVec2, IVec2)> {
+    match *slide {
+        Slide::Moving { at, .. } => Some((at, presented)),
+        Slide::Leaving { at, to, .. } | Slide::Tucking { at, to, .. } => Some((at, to)),
+        Slide::Landing { .. } => None,
+    }
+}
+
+/// Steps the ease of each slide, before pacing reads how far each photo
+/// steps this frame and the photos step by it. A photo that waits for its
+/// window to tuck under it holds its place on the curve, as it does not
+/// move. A slide that lands forgets its motion, so the next one starts from
+/// rest.
+pub(crate) fn step_slides(
+    slides: Populated<(&Window, Ref<Slide>, &PresentedOrigin, &mut SlideEase)>,
+    step: Res<AnimationStep>,
+    time: Res<Time>,
+    config: Res<Config>,
+) {
+    let duration = duration(&config);
+    for (window, slide, presented, mut ease) in slides {
+        let waits = matches!(*slide, Slide::Tucking { until, .. }
+            if window.write_pending() && time.elapsed() < until);
+        match slide_heading(&slide, presented.0) {
+            Some((at, to)) => {
+                if slide.is_added() {
+                    ease.0.restart();
+                }
+                if waits {
+                    ease.0.hold();
+                } else {
+                    let now = time.elapsed_secs_f64();
+                    ease.0
+                        .step(at, to, slide.is_added(), (now, step.secs()), duration);
+                }
+            }
+            None => ease.0 = Ease::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Samples a flick's settle every millisecond until it lands: the
+    /// furthest it swings past its target, and when it lands, in seconds.
+    fn flick_path(from: f64, velocity: f64) -> (f64, f64) {
+        let mut past = 0.0_f64;
+        for ms in 0..2000 {
+            let elapsed = f64::from(ms) / 1000.0;
+            let Some(offset) = flick_offset(from, velocity, elapsed, MIRI_SPEED) else {
+                return (past, elapsed);
+            };
+            // `from` is on one side of the target, so past it has the other sign.
+            past = past.max(-offset * from.signum());
+        }
+        panic!("a flick's settle lands");
+    }
+
+    #[test]
+    fn a_flick_settle_starts_where_and_how_fast_the_strip_moves() {
+        let (from, velocity) = (-500.0, 3000.0);
+        let start = flick_offset(from, velocity, 0.0, MIRI_SPEED).unwrap();
+        assert!((start - from).abs() < 1e-9, "starts at {start}");
+        let dt = 1e-6;
+        let next = flick_offset(from, velocity, dt, MIRI_SPEED).unwrap();
+        let speed = (next - start) / dt;
+        assert!((speed - velocity).abs() < 1.0, "starts at {speed} pt/s");
+    }
+
+    #[test]
+    fn a_flick_settle_swings_a_little_past_and_lands() {
+        for velocity in [600.0, 3000.0, 8000.0] {
+            let (past, lands) = flick_path(-1000.0, velocity);
+            assert!(past > 5.0, "swings past at {velocity} pt/s, by {past}");
+            assert!(past < 20.0, "by under 2% at {velocity} pt/s, by {past}");
+            assert!(lands < 0.35, "lands at {velocity} pt/s after {lands} s");
+        }
+    }
+
+    #[test]
+    fn a_hard_flick_that_lands_close_swings_no_further() {
+        let (past, lands) = flick_path(-100.0, 20_000.0);
+        assert!(past < 2.0, "swings past by {past}");
+        assert!(lands < 0.35, "lands after {lands} s");
+    }
+
+    #[test]
+    fn the_curve_follows_a_critically_damped_spring() {
+        // Computed in Python from 1 - (1 + x) e^-x at x = 7.4301295 s,
+        // divided by 0.995.
+        for (s, want) in [
+            (0.1, 0.171_744_836_577_587_35),
+            (0.25, 0.556_845_594_073_891_4),
+            (0.5, 0.889_618_043_845_977_9),
+            (0.75, 0.979_919_806_262_001_8),
+        ] {
+            assert!(
+                (curve(s) - want).abs() < 1e-9,
+                "at {s}: {} not {want}",
+                curve(s)
+            );
+        }
+        assert!(curve(0.0).abs() < 1e-12);
+        assert!((curve(1.0) - 1.0).abs() < 1e-12);
+        assert!((spring_left(1.0) - LEFT_AT_LANDING).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_curve_starts_from_rest_and_covers_half_its_distance_in_a_quarter_of_its_time() {
+        assert!(curve_slope(0.0).abs() < 1e-12);
+        assert!(speed_for_what_is_left(0.0).abs() < 1e-12);
+        assert!(curve(0.22) < 0.5 && curve(0.24) > 0.5);
+    }
+
+    #[test]
+    fn the_curve_speed_for_what_is_left_only_rises() {
+        let mut previous = 0.0;
+        for step in 0..1000 {
+            let speed = speed_for_what_is_left(f64::from(step) / 1000.0);
+            assert!(
+                speed >= previous,
+                "at step {step}: {speed} after {previous}"
+            );
+            previous = speed;
+        }
+    }
+
+    #[test]
+    fn a_motion_lasts_237_ms_at_miri_speed_and_scales_with_speed() {
+        let at = |speed: f64| {
+            let config: Config = (
+                crate::config::MainOptions {
+                    animation_speed: Some(speed),
+                    ..Default::default()
+                },
+                vec![],
+            )
+                .into();
+            duration(&config)
+        };
+        let miri = 0.236_508_367_556_499_12;
+        assert!((at(14.0) - miri).abs() < 1e-12, "{}", at(14.0));
+        assert!((at(28.0) - miri / 2.0).abs() < 1e-12);
+        assert!((at(7.0) - miri * 2.0).abs() < 1e-12);
+        assert!(animates(at(14.0)));
+        assert!(!animates(at(10_000.0)));
+    }
+
+    /// A resize lasts 120 ms at Miri's speed, scales with the speed, and
+    /// lands in one step with animation off.
+    #[test]
+    fn a_resize_lasts_120_ms_at_miri_speed() {
+        assert!((resize_duration_at(14.0) - 0.12).abs() < 1e-12);
+        assert!((resize_duration_at(28.0) - 0.06).abs() < 1e-12);
+        assert!(animates(resize_duration_at(14.0)));
+        assert!(!animates(resize_duration(&Config::default())));
+    }
+
+    /// The ease-out is fastest at its start, four times the average speed,
+    /// and lands at 1.
+    #[test]
+    fn the_ease_out_starts_fast_and_lands() {
+        let curve = Curve::EaseOut;
+        assert!(curve.at(0.0).abs() < 1e-12);
+        assert!((curve.at(1.0) - 1.0).abs() < 1e-12);
+        let h = 1e-6;
+        let slope = (curve.at(h) - curve.at(0.0)) / h;
+        assert!((slope - 4.0).abs() < 1e-4, "{slope}");
+        // A resize's first 16 ms frame covers about 44% of its distance.
+        let first = curve.first_share(0.12);
+        assert!((0.4..0.5).contains(&first), "{first}");
+    }
+
+    /// Entering the ease-out at a speed finds the place where the curve
+    /// moves at that speed toward what is left.
+    #[test]
+    fn the_ease_out_entry_matches_the_speed() {
+        let curve = Curve::EaseOut;
+        assert!(curve.entry(0.0).abs() < 1e-12);
+        assert!(curve.entry(4.0).abs() < 1e-12);
+        for speed in [5.0, 8.0, 40.0] {
+            let s = curve.entry(speed);
+            let h = 1e-7;
+            let slope = (curve.at(s + h) - curve.at(s)) / h;
+            let found = slope / (1.0 - curve.at(s));
+            assert!((found - speed).abs() < 1e-3, "{speed}: {found}");
+        }
+    }
+
+    /// A resize that heads on to a new target mid-motion keeps moving at
+    /// once, without stalling.
+    #[test]
+    fn a_resize_retargeted_mid_motion_keeps_moving() {
+        let mut ease = Ease::default();
+        let mut at = IVec2::ZERO;
+        let mut now = 0.0;
+        for to in [IVec2::new(400, 0), IVec2::new(800, 0)] {
+            for _ in 0..2 {
+                let t = ease.step_on(Curve::EaseOut, at, to, false, (now, DT), 0.12);
+                let (next, _) = crate::ecs::systems::ease_step(at, to, t);
+                assert!(next.x > at.x, "steps from {at} toward {to}");
+                at = next;
+                now += DT;
+            }
+        }
+    }
+
+    /// With animation off, the unset default speed, the first step lands.
+    #[test]
+    fn the_default_speed_lands_in_one_step() {
+        let config = Config::default();
+        assert!(config.options().animation_speed.is_none());
+        let duration = duration(&config);
+        assert!(!animates(duration));
+        for dt in [0.0, 0.004, 0.016] {
+            let mut ease = Ease::default();
+            let t = ease.step(IVec2::ZERO, IVec2::new(900, 0), true, (0.0, dt), duration);
+            assert!(
+                (t - 1.0).abs() < f32::EPSILON,
+                "a step of {dt} s covers {t}"
+            );
+        }
+    }
+
+    const DURATION: f64 = 0.236_508_367_556_499_12;
+    const DT: f64 = 1.0 / 60.0;
+
+    /// A window that an ease steps at 60 fps, as each pass moves one.
+    struct Moving {
+        ease: Ease,
+        at: IVec2,
+        now: f64,
+    }
+
+    impl Moving {
+        fn new(at: IVec2) -> Self {
+            Self {
+                ease: Ease::default(),
+                at,
+                now: 0.0,
+            }
+        }
+
+        /// One pass toward `to`, which covers how far the window moved.
+        fn step(&mut self, to: IVec2, fresh: bool) -> i32 {
+            let t = self.ease.step(self.at, to, fresh, (self.now, DT), DURATION);
+            let next = self.at.as_vec2().lerp(to.as_vec2(), t).round().as_ivec2();
+            let moved = next.x - self.at.x;
+            self.at = next;
+            self.now += DT;
+            moved
+        }
+
+        /// Passes toward `to` until the window lands, with where each put it.
+        fn run(&mut self, to: IVec2) -> Vec<IVec2> {
+            let mut path = Vec::new();
+            for _ in 0..1000 {
+                self.step(to, false);
+                path.push(self.at);
+                if self.at == to {
+                    break;
+                }
+            }
+            path
+        }
+    }
+
+    /// Stepping by the share of what is left keeps a window on the curve,
+    /// and it lands as the curve ends.
+    #[test]
+    fn steps_follow_the_curve_and_land_on_time() {
+        let mut window = Moving::new(IVec2::ZERO);
+        let path = window.run(IVec2::new(1000, 0));
+        assert_eq!(path.len(), 15, "{path:?}");
+        for (index, at) in path.iter().enumerate() {
+            #[allow(clippy::cast_precision_loss, reason = "a few dozen passes")]
+            let want = 1000.0 * curve((index + 1) as f64 * DT / DURATION);
+            // Each pass rounds to whole points from the last.
+            assert!(
+                (f64::from(at.x) - want).abs() <= 2.0,
+                "pass {index}: {at} not {want:.1}"
+            );
+        }
+    }
+
+    /// A target that changes mid-motion carries the window's speed on: the
+    /// next step moves at least as far as the last, with no stall, and the
+    /// spring then pulls the window on toward the new target.
+    #[test]
+    fn a_new_target_mid_motion_carries_the_speed_on() {
+        let mut window = Moving::new(IVec2::ZERO);
+        let mut speed = 0;
+        for _ in 0..8 {
+            speed = window.step(IVec2::new(600, 0), false);
+        }
+        assert!(speed > 20, "moving at {speed} a pass");
+        let to = IVec2::new(1200, 0);
+        let step = window.step(to, false);
+        // The spring pulls harder toward a target that moved further away,
+        // so the step can be longer, but never shorter.
+        assert!(
+            step >= speed && step <= speed * 4,
+            "the step after the new target moved {step}, the one before {speed}"
+        );
+        let from = window.at.x;
+        let rest = window.run(to);
+        assert_eq!(rest.last(), Some(&to));
+        let mut previous = from;
+        for x in rest.iter().map(|at| at.x) {
+            assert!(x >= previous, "turned back: {rest:?}");
+            previous = x;
+        }
+        assert!(
+            rest.len() < 15,
+            "lands sooner than a whole motion: {rest:?}"
+        );
+    }
+
+    /// A target behind the window starts a new motion from rest.
+    #[test]
+    fn a_target_behind_starts_from_rest() {
+        let mut window = Moving::new(IVec2::ZERO);
+        for _ in 0..8 {
+            window.step(IVec2::new(600, 0), false);
+        }
+        let path = window.run(IVec2::new(-400, 0));
+        // A whole motion, less the last few points that snap.
+        assert!((14..=15).contains(&path.len()), "a whole motion: {path:?}");
+    }
+
+    /// A motion that ends and has a new target set at once carries its speed
+    /// on, as a window that chases a moving target does. One set after the
+    /// window has rested starts from rest.
+    #[test]
+    fn a_target_set_afresh_starts_from_the_speed_the_window_had() {
+        let mut window = Moving::new(IVec2::ZERO);
+        let mut speed = 0;
+        for _ in 0..8 {
+            speed = window.step(IVec2::new(600, 0), false);
+        }
+        let step = window.step(IVec2::new(1200, 0), true);
+        assert!(step >= speed, "moved {step} after {speed}");
+
+        let mut window = Moving::new(IVec2::ZERO);
+        window.run(IVec2::new(600, 0));
+        window.now += 0.5;
+        let t = window.ease.step(
+            window.at,
+            IVec2::new(1200, 0),
+            true,
+            (window.now, DT),
+            DURATION,
+        );
+        assert!((f64::from(t) - share(0.0, DT / DURATION)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn curve_share_returns_one_when_no_time_remains() {
+        assert_eq!(Curve::EaseOut.share(0.99999, 0.99999), 1.0);
+    }
+
+    #[test]
+    fn hold_clears_step_and_reset_clears_motion_progress() {
+        let mut ease = Ease::default();
+        let first = ease.step(IVec2::ZERO, IVec2::new(600, 0), true, (0.0, DT), DURATION);
+        assert!(first > 0.0);
+        ease.hold();
+        assert_eq!(ease.t, 0.0);
+        let progress_before = ease.progress;
+        assert!(progress_before > 0.0);
+
+        ease.restart();
+        assert_eq!(ease.to, None);
+        assert_eq!(ease.progress, 0.0);
+        assert_eq!(ease.t, 0.0);
+        let restarted = ease.step(
+            IVec2::new(600, 0),
+            IVec2::ZERO,
+            false,
+            (DURATION * 2.0, DT),
+            DURATION,
+        );
+        assert!((f64::from(restarted) - share(0.0, DT / DURATION)).abs() < 1e-6);
+    }
+}

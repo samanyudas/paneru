@@ -45,6 +45,7 @@ use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 pub mod display;
 mod display_homes;
 pub mod drag;
+pub(crate) mod ease;
 pub mod focus;
 pub mod layout;
 #[cfg(feature = "lua")]
@@ -62,6 +63,7 @@ mod shown_space;
 pub(crate) mod slice_input;
 pub(crate) mod slice_photos;
 pub mod state;
+pub(crate) mod strip_cover;
 pub(crate) mod systems;
 pub mod tile_overrides;
 mod triggers;
@@ -166,6 +168,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.init_resource::<systems::AnimationStep>();
     shared_edge::register(app);
     slice_photos::register(app);
+    strip_cover::register(app);
     slice_input::register(app);
 
     let overlays_dirty = |config: Option<Res<Config>>,
@@ -173,10 +176,18 @@ pub fn register_systems(app: &mut bevy::app::App) {
                           mission_control: Option<Res<MissionControlActive>>,
                           strip_changed: OverlayStripChanged,
                           mut scrolling_removed: RemovedComponents<Scrolling>,
+                          mut covers_removed: RemovedComponents<strip_cover::CoverSlide>,
+                          covers_added: Query<(), Added<strip_cover::CoverSlide>>,
+                          mut morphs_removed: RemovedComponents<strip_cover::CoverMorph>,
+                          morphs_added: Query<(), Added<strip_cover::CoverMorph>>,
                           focus_gained: Query<(), Added<FocusedMarker>>,
                           workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
                           focused_moved: OverlayFocusedMoved| {
-        let scrolling_ended = scrolling_removed.read().count() > 0;
+        let scrolling_ended = scrolling_removed.read().count() > 0
+            || covers_removed.read().count() > 0
+            || !covers_added.is_empty()
+            || morphs_removed.read().count() > 0
+            || !morphs_added.is_empty();
         let Some(config) = config else {
             return false;
         };
@@ -323,10 +334,13 @@ pub fn register_systems(app: &mut bevy::app::App) {
         ((
             systems::animate_entities,
             systems::animate_resize_entities,
+            ease::step_slides,
             pacing::pace_rows.run_if(not(resource_exists::<Initializing>)),
             systems::finish_repositions,
             systems::finish_resizes,
+            systems::finish_resize_motions,
             systems::commit_window_frame.run_if(not(resource_exists::<Initializing>)),
+            systems::finish_covered_placements,
             systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
             triggers::window_resize_verifier,
             triggers::settle_width_requests,
@@ -431,12 +445,16 @@ pub struct FreshMarker;
 #[derive(Component)]
 pub struct ExistingMarker;
 
-/// Component representing a request to reposition a window.
+/// Component representing a request to reposition a window. The move follows
+/// the curve in [`ease`], whose progress [`ease::PositionEase`] keeps.
 #[derive(Component, Debug, Deref, DerefMut)]
+#[require(ease::PositionEase)]
 pub struct RepositionMarker(pub Origin);
 
-/// Component representing a request to resize a window.
+/// Component representing a request to resize a window. The resize follows
+/// the curve in [`ease`], whose progress [`ease::SizeEase`] keeps.
 #[derive(Component, Debug, Deref, DerefMut)]
+#[require(ease::SizeEase)]
 pub struct ResizeMarker(pub Size);
 
 /// Marker component indicating that windows around the marked entity need to be reshuffled.
@@ -500,6 +518,9 @@ pub struct Scrolling {
     pub is_user_swiping: bool,
     /// Last time a physical swipe event was received.
     pub last_event: Duration,
+    /// When the fingers or the wheel last moved the strip. Unlike
+    /// `last_event`, a touch-down that continues the swipe leaves it.
+    pub moved_at: Duration,
     /// The kind of input driving the strip, which decides how long a pause
     /// in it counts as the fingers lifting.
     pub input: ScrollInput,
@@ -535,16 +556,39 @@ pub struct Scrolling {
     /// A touch-down soon after it, before the settle starts, continues this
     /// swipe; see `scroll::continues_swipe`.
     pub lifted_at: Option<Duration>,
+    /// Where the strip showed when fingers touched down on its settle, in
+    /// this frame. A settle's `position` is where the strip shows, so
+    /// `scroll::constrain` turns it into the finger travel that shows the
+    /// strip there, before the fingers' first movement.
+    pub caught: Option<f64>,
+    /// How far the shown strip moved for each point of `position`'s
+    /// travel, at the last `scroll::constrain`: 1 while the strip follows
+    /// freely, less while it resists past an end or a column, and 0 while
+    /// it is held.
+    pub slope: f64,
+    /// The part of a caught place that resistance cannot show, and the
+    /// stretch past the edge that stood for the rest of it when the
+    /// fingers caught the strip. It fades as the fingers bring the strip
+    /// back toward the edge, so a caught strip never jumps.
+    pub excess: Option<(f64, f64)>,
 }
 
 /// The progress of a settle along its ease. See `scroll::settle_strip`.
 #[derive(Clone, Copy, Debug)]
 pub struct SettleEase {
     pub from: f64,
+    /// Where the settle entered the curve, as a share of the curve's time,
+    /// which carries on the strip's speed at the lift. See
+    /// `ease::entry_for_speed`.
+    pub start: f64,
     pub elapsed: f64,
-    /// The ease's starting slope, which carries on the strip's speed at the
-    /// lift. See `scroll::handoff_slope`.
-    pub slope: f64,
+    /// The `animation_speed` captured when the settle began, so reloading
+    /// config mid-flick never shifts the remaining trajectory.
+    pub animation_speed: f64,
+    /// The strip's speed at the lift, in points per second, when the
+    /// fingers flicked it toward its landing. The settle then follows
+    /// `ease::flick_offset`, which swings a little past the landing.
+    pub flick: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -904,6 +948,21 @@ pub(crate) enum WidthAnchor {
 pub(crate) struct WidthRun {
     pub(crate) anchor: WidthAnchor,
 }
+
+/// A window, or a strip, that a width command just moved. It eases to the
+/// new layout on the short [`ease::Curve::EaseOut`] instead of the spring, so
+/// a resize answers the key at once and lands in about 100 ms: a slower
+/// resize gives each app's late frames time to overlap their neighbours.
+/// Pacing still holds a window beside a slower one until that one shows its
+/// move. Removed once the entity has neither a move nor a resize left.
+#[derive(Component)]
+pub(crate) struct ResizeMotion;
+
+/// A window whose next frame lands under a picture cover, which hides how it
+/// gets there. Its write moves it before it sizes it, so its app lays it out
+/// once. Removed once the frame is written.
+#[derive(Component)]
+pub(crate) struct PlacedUnderCover;
 
 /// A width command's finite request for native readback and anchored placement.
 #[derive(Component)]
@@ -1365,6 +1424,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     crate::menubar::load_menu_bar_preference(&mut app);
     let menu_events = sender.clone();
     let slice_events = sender.clone();
+    let cover_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
     let config = platform_callbacks.setup_handlers()?;
     let mtm = platform_callbacks.main_thread_marker;
@@ -1376,6 +1436,9 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_non_send(drag::DragOverlayHandle(Box::new(DragOverlay::new(mtm))))
         .insert_non_send(slice_photos::SliceScreenHandle(Box::new(
             crate::slice_screen::SliceScreenOS::new(mtm, slice_events),
+        )))
+        .insert_non_send(strip_cover::CoverScreenHandle(Box::new(
+            crate::cover_screen::CoverScreenOS::new(mtm, cover_events),
         )))
         .insert_non_send(receiver);
 
@@ -1648,6 +1711,7 @@ mod tests {
                     position: 0.0,
                     is_user_swiping: true,
                     last_event,
+                    moved_at: last_event,
                     input: super::ScrollInput::Gesture,
                     anchor: 0.0,
                     settle: None,
@@ -1659,6 +1723,9 @@ mod tests {
                     start: None,
                     fingers_down: false,
                     lifted_at: None,
+                    caught: None,
+                    slope: 1.0,
+                    excess: None,
                 });
             }),
             "overlay must rerun to hide when Scrolling starts"

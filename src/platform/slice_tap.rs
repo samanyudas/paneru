@@ -4,7 +4,7 @@
 //! window is in view, and the tap then lets that press and the rest of the
 //! gesture through.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -48,6 +48,9 @@ pub(crate) struct SlicePanel {
     /// shown frame.
     pub in_window: IRect,
     pub side: Side,
+    /// A picture on a strip cover: a scroll over it reaches the engine, and
+    /// a press on it lands at its exact point in the window.
+    pub cover: bool,
 }
 
 impl SlicePanel {
@@ -65,25 +68,77 @@ pub(crate) fn set_slice_panels(panels: Vec<SlicePanel>) {
     SLICE_PANELS.store(Arc::new(panels));
 }
 
+/// The pictures on the strip covers, each as a panel of the window it shows,
+/// so a press on a picture reaches its window once the window is in place.
+static COVER_PANELS: LazyLock<ArcSwap<Vec<SlicePanel>>> =
+    LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
+
+/// Held press ids and cancellation times that the engine cancelled because
+/// they can no longer be replayed (for example, a window shrank past the
+/// pressed point). Drained by the OS event tap on the main thread before
+/// handling the next pointer event.
+static CANCELLED_PRESSES: Mutex<Vec<(u32, Duration)>> = Mutex::new(Vec::new());
+
+/// Queues cancellation of held press `press_id` at the current uptime for
+/// the live event tap.
+pub(crate) fn cancel_live_press(press_id: u32) {
+    CANCELLED_PRESSES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((press_id, uptime()));
+}
+
+/// Applies press cancellations queued by the engine to `tap`.
+pub(crate) fn apply_cancellations(tap: &mut SliceTap) {
+    let mut cancelled = CANCELLED_PRESSES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if cancelled.is_empty() {
+        return;
+    }
+    let items = std::mem::take(&mut *cancelled);
+    drop(cancelled);
+    for (id, at) in items {
+        tap.cancel(id, at);
+    }
+}
+
+/// Replaces the cover pictures the tap and the window lookups know of.
+pub(crate) fn set_cover_panels(panels: Vec<SlicePanel>) {
+    COVER_PANELS.store(Arc::new(panels));
+}
+
 pub(crate) fn is_slice_panel(window: WinID) -> bool {
     SLICE_PANELS
         .load()
         .iter()
+        .chain(COVER_PANELS.load().iter())
         .any(|panel| panel.panel == window)
 }
 
 /// The panel that a press at `point` would reach, as the window server
 /// decides it.
 fn panel_at(point: CGPoint) -> Option<SlicePanel> {
-    let panels = SLICE_PANELS.load();
-    let panel = panels.iter().find(|panel| panel.contains(point))?;
     let mtm = MainThreadMarker::new()?;
+    // The cover pictures where Core Animation shows them now, which can be
+    // ahead of what the engine last published.
+    let covers = crate::cover_screen::live_cover_panels(mtm);
+    let slices = SLICE_PANELS.load();
+    let mut panels = slices
+        .iter()
+        .chain(covers.iter())
+        .filter(|panel| panel.contains(point))
+        .peekable();
+    panels.peek()?;
     let hit = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(
         NSPoint::new(point.x, primary_screen_height(mtm) - point.y),
         0,
         mtm,
     );
-    (WinID::try_from(hit).ok() == Some(panel.panel)).then_some(*panel)
+    // An edge slice and a cover picture can both hold the point: the one
+    // the window server shows on top takes the press.
+    let hit = WinID::try_from(hit).ok();
+    panels.find(|panel| Some(panel.panel) == hit).copied()
 }
 
 /// A press the tap held back on a panel, for the engine to post again once
@@ -97,6 +152,9 @@ pub(crate) struct SlicePress {
     /// shown frame.
     pub at: CGPoint,
     pub side: Side,
+    /// Lands at `at` exactly, with no inset from an edge, as a press on a
+    /// cover picture does.
+    pub exact: bool,
     pub button: MouseButton,
     pub flags: CGEventFlags,
 }
@@ -110,6 +168,7 @@ impl SlicePress {
         let inset = EDGE_INSET.min((max - min) / 2.0);
         let x = min + self.at.x;
         let x = match self.side {
+            _ if self.exact => x,
             Side::West => x.min(max - inset),
             Side::East => x.max(min + inset),
         };
@@ -352,7 +411,9 @@ impl SliceTap {
                 self.passing(pointer, passed)
             }
             (Mouse::Moved, _) if pointer.panel.is_some() => Verdict::Quiet,
-            (Mouse::Scrolled, _) if pointer.panel.is_some() => Verdict::Swallow,
+            (Mouse::Scrolled, _) if pointer.panel.is_some_and(|panel| !panel.cover) => {
+                Verdict::Swallow
+            }
             _ => Verdict::Pass,
         }
     }
@@ -405,6 +466,7 @@ impl SliceTap {
                 y - f64::from(panel.on_screen.min.y) + f64::from(panel.in_window.min.y),
             ),
             side: panel.side,
+            exact: panel.cover,
             button,
             flags: pointer.flags,
         })
@@ -496,6 +558,34 @@ impl SliceTap {
                 debug!("edge slice press dropped: press {tag} is no longer held");
                 Verdict::Swallow
             }
+        }
+    }
+
+    /// Cancels held press `press_id` at `now` when the engine can no longer
+    /// replay it. Records `now` (capped at the original deadline) in
+    /// `waited_until`, so any press made while the hold was active stays
+    /// dropped while presses made after cancellation pass through immediately.
+    /// If the user still holds its button, its remaining drags and release
+    /// stay swallowed.
+    pub fn cancel(&mut self, press_id: u32, now: Duration) {
+        match self.gesture {
+            Gesture::Holding {
+                id,
+                button,
+                deadline,
+                ..
+            } if id == press_id => {
+                debug!("edge slice press cancelled: press {id}, button still held");
+                self.waited_until = self.waited_until.max(now.min(deadline));
+                self.dropped.push(button);
+                self.gesture = Gesture::Idle;
+            }
+            Gesture::Released { id, deadline, .. } if id == press_id => {
+                debug!("edge slice press cancelled: press {id}, already released");
+                self.waited_until = self.waited_until.max(now.min(deadline));
+                self.gesture = Gesture::Idle;
+            }
+            _ => {}
         }
     }
 

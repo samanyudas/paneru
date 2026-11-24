@@ -70,6 +70,7 @@ impl Desk {
                 on_screen: slice.on_screen,
                 in_window: slice.in_window,
                 side: slice.side,
+                cover: false,
             },
             tap: SliceTap::default(),
             reached: Vec::new(),
@@ -130,6 +131,9 @@ impl Desk {
         for _ in 0..duration.as_millis().div_ceil(20) {
             self.harness.advance(Duration::from_millis(20));
             self.clock += Duration::from_millis(20);
+            for press_id in self.harness.mock_state.take_cancelled_presses() {
+                self.tap.cancel(press_id, self.clock);
+            }
             for (press, point) in self.harness.mock_state.take_posted_presses() {
                 self.posted.push((press, point));
                 let pointer = Pointer {
@@ -169,6 +173,7 @@ impl Desk {
                 button,
                 window_id: None,
                 clicks: 1,
+                hold: None,
             },
             Mouse::Dragged(button) => Event::MouseDragged {
                 point,
@@ -754,6 +759,7 @@ fn the_tap_lets_through_only_the_posted_press_it_waits_for() {
         on_screen: IRect::new(1019, 20, 1024, 200),
         in_window: IRect::new(395, 0, 400, 180),
         side: Side::West,
+        cover: false,
     };
     let user = |mouse, x, y, panel| Pointer {
         mouse,
@@ -809,6 +815,7 @@ fn west_panel() -> SlicePanel {
         on_screen: IRect::new(1019, 20, 1024, 200),
         in_window: IRect::new(395, 0, 400, 180),
         side: Side::West,
+        cover: false,
     }
 }
 
@@ -991,4 +998,156 @@ fn a_click_released_after_its_press_was_posted_reaches_the_app_where_the_press_d
             released_at.y
         );
     }
+}
+
+/// A press on a cover picture lands at its exact point in the window, even
+/// at the window's edge, and a scroll over a cover picture reaches the
+/// engine, which may be scrolling the strip under it.
+#[test]
+fn a_cover_picture_keeps_the_exact_point_and_lets_scrolls_through() {
+    let press = SlicePress {
+        id: 1,
+        window_id: 42,
+        at: CGPoint::new(395.0, 10.0),
+        side: Side::West,
+        exact: true,
+        button: MouseButton::Left,
+        flags: objc2_core_graphics::CGEventFlags::empty(),
+    };
+    let shown = IRect::new(100, 20, 500, 200);
+    assert_eq!(press.point_in(shown), CGPoint::new(495.0, 30.0));
+    let inset = SlicePress {
+        exact: false,
+        ..press
+    };
+    assert!(
+        inset.point_in(shown).x < 495.0,
+        "an edge slice keeps its inset"
+    );
+
+    let mut tap = SliceTap::default();
+    let cover = SlicePanel {
+        cover: true,
+        ..west_panel()
+    };
+    let scroll = |panel| Pointer {
+        mouse: Mouse::Scrolled,
+        point: CGPoint::new(1020.0, 50.0),
+        flags: objc2_core_graphics::CGEventFlags::empty(),
+        time: Duration::ZERO,
+        tag: None,
+        panel: Some(panel),
+    };
+    assert_eq!(tap.handle(&scroll(cover)), Verdict::Pass);
+    assert_eq!(tap.handle(&scroll(west_panel())), Verdict::Swallow);
+}
+
+/// Cancelling a held press whose replay became impossible releases the tap
+/// immediately so subsequent clicks pass through, while still swallowing any
+/// remaining drag or release of the cancelled button.
+#[test]
+fn cancelling_a_held_press_frees_subsequent_clicks() {
+    let mut tap = SliceTap::default();
+    let cover = SlicePanel {
+        cover: true,
+        ..west_panel()
+    };
+    let at_panel = CGPoint::new(1020.0, 50.0);
+    let elsewhere = CGPoint::new(200.0, 200.0);
+    let make = |mouse, point, time, panel| Pointer {
+        mouse,
+        point,
+        flags: objc2_core_graphics::CGEventFlags::empty(),
+        time,
+        tag: None,
+        panel,
+    };
+
+    // Case 1: cancelled while still held. Drag and release stay swallowed,
+    // then the next click passes immediately (not waiting 1.5 s).
+    let Verdict::Hold(held) = tap.handle(&make(
+        Mouse::Down(MouseButton::Left),
+        at_panel,
+        Duration::from_millis(10),
+        Some(cover),
+    )) else {
+        panic!("press on cover must be held");
+    };
+    tap.cancel(held.id, Duration::from_millis(15));
+    // A press queued before cancellation (timestamped while still held) stays
+    // dropped so it cannot hit a window the cover had obscured.
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Down(MouseButton::Right),
+            elsewhere,
+            Duration::from_millis(12),
+            None,
+        )),
+        Verdict::Swallow
+    );
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Up(MouseButton::Right),
+            elsewhere,
+            Duration::from_millis(13),
+            None,
+        )),
+        Verdict::Swallow
+    );
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Dragged(MouseButton::Left),
+            at_panel,
+            Duration::from_millis(20),
+            None,
+        )),
+        Verdict::Swallow
+    );
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Up(MouseButton::Left),
+            at_panel,
+            Duration::from_millis(30),
+            None,
+        )),
+        Verdict::Swallow
+    );
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Down(MouseButton::Left),
+            elsewhere,
+            Duration::from_millis(40),
+            None,
+        )),
+        Verdict::Pass
+    );
+
+    // Case 2: cancelled after release. Next click passes immediately.
+    let Verdict::Hold(released) = tap.handle(&make(
+        Mouse::Down(MouseButton::Left),
+        at_panel,
+        Duration::from_millis(100),
+        Some(cover),
+    )) else {
+        panic!("press on cover must be held");
+    };
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Up(MouseButton::Left),
+            at_panel,
+            Duration::from_millis(110),
+            None,
+        )),
+        Verdict::Swallow
+    );
+    tap.cancel(released.id, Duration::from_millis(115));
+    assert_eq!(
+        tap.handle(&make(
+            Mouse::Down(MouseButton::Left),
+            elsewhere,
+            Duration::from_millis(120),
+            None,
+        )),
+        Verdict::Pass
+    );
 }

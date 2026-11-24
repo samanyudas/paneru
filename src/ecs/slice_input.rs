@@ -8,7 +8,7 @@ use bevy::app::{App, PostUpdate, Update};
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_exists};
-use bevy::prelude::{Commands, Entity, Has, Query, Res, Resource, Time, With};
+use bevy::prelude::{ChildOf, Commands, Entity, Has, Query, Res, Resource, Time, With};
 use tracing::debug;
 
 use crate::commands::{FocusSource, focus_with_verification};
@@ -46,6 +46,7 @@ pub(crate) fn register(app: &mut App) {
 fn reveal_pressed(
     mut messages: MessageReader<Event>,
     windows: Windows,
+    window_manager: Res<WindowManager>,
     time: Res<Time>,
     mut commands: Commands,
 ) {
@@ -59,6 +60,7 @@ fn reveal_pressed(
                 "edge slice press dropped: window {} is gone",
                 press.window_id
             );
+            window_manager.cancel_press(press.id);
             continue;
         };
         focus_with_verification(
@@ -83,9 +85,12 @@ fn reveal_pressed(
 
 /// Posts the press once its window rests on a display where the window
 /// server sends the press to it, with no photo of it sliding or over it.
+#[allow(clippy::too_many_arguments)]
 fn deliver_press(
     pending: Res<PendingPress>,
     windows: Query<(&Window, Has<RepositionMarker>, Has<ResizeMarker>)>,
+    parents: Query<&ChildOf>,
+    covered: Query<(), crate::ecs::strip_cover::UnderCover>,
     sliding: Query<(), With<Slide>>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
@@ -106,13 +111,39 @@ fn deliver_press(
             "edge slice press dropped: window {} is gone",
             press.window_id
         );
+        window_manager.cancel_press(press.id);
         commands.remove_resource::<PendingPress>();
         return;
     };
-    if moving || resizing || sliding.contains(pending.window) || window.write_pending() {
+    // A window under a picture cover sits where the move began until the
+    // cover lifts, so its press waits for that.
+    let under_cover = parents
+        .get(pending.window)
+        .is_ok_and(|parent| covered.contains(parent.parent()));
+    if moving
+        || resizing
+        || under_cover
+        || sliding.contains(pending.window)
+        || window.write_pending()
+    {
         return;
     }
-    let point = press.point_in(window.shown_frame());
+    let shown = window.shown_frame();
+    if press.exact
+        && (press.at.x < 0.0
+            || press.at.y < 0.0
+            || press.at.x >= f64::from(shown.width())
+            || press.at.y >= f64::from(shown.height()))
+    {
+        debug!(
+            "edge slice press dropped: press {} window {} shrank past ({:.0}, {:.0})",
+            press.id, press.window_id, press.at.x, press.at.y
+        );
+        window_manager.cancel_press(press.id);
+        commands.remove_resource::<PendingPress>();
+        return;
+    }
+    let point = press.point_in(shown);
     let on_display = displays
         .iter()
         .any(|display| display.bounds().contains(origin_from(point)));

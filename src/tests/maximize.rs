@@ -104,6 +104,208 @@ fn a_title_bar_double_click_maximizes_and_the_next_restores() {
     assert_eq!(frames(&harness, &[0, 1, 2]), before);
 }
 
+/// Whether window `id` is maximized in its strip.
+fn is_maximized(harness: &mut TestHarness, id: WinID) -> bool {
+    let world = harness.world();
+    let entity = world
+        .query::<(Entity, &Window)>()
+        .iter(world)
+        .find(|(_, window)| window.id() == id)
+        .map(|(entity, _)| entity)
+        .expect("window not found");
+    world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .any(|strip| strip.maximized(entity).is_some())
+}
+
+/// An app that refuses the width of a maximized column, as System Settings
+/// does, would stand at the column's left edge with the desktop beside it.
+/// Its maximize is undone: it goes back to its column, and the next toggle
+/// leaves it there.
+#[test]
+fn a_window_that_refuses_the_maximized_width_goes_back_to_its_column() {
+    let mut harness = three_windows();
+    let before = frames(&harness, &[0, 1, 2]);
+    let limit = Size::new(before[0].width() + 40, 4000);
+    harness
+        .mock_state
+        .update_window(0, |window| window.maximum_size = Some(limit));
+
+    harness.run(vec![command(Operation::Maximize)]);
+    harness.advance(SETTLE);
+    assert!(
+        !is_maximized(&mut harness, 0),
+        "the maximize the app refused is undone"
+    );
+    assert_eq!(
+        frames(&harness, &[0, 1, 2]),
+        before,
+        "every window is back where it was"
+    );
+
+    harness.run(vec![command(Operation::Maximize)]);
+    harness.advance(SETTLE);
+    assert!(
+        !is_maximized(&mut harness, 0),
+        "the window is not maximized again"
+    );
+    assert_eq!(frames(&harness, &[0, 1, 2]), before);
+}
+
+fn entity_of(harness: &mut TestHarness, id: WinID) -> Entity {
+    let world = harness.world();
+    world
+        .query::<(Entity, &Window)>()
+        .iter(world)
+        .find(|(_, window)| window.id() == id)
+        .map(|(entity, _)| entity)
+        .expect("window not found")
+}
+
+/// A window's mark as refusing the maximized width ends with the frame hold
+/// it answered. Left behind, it kept a later maximize's cover resting on
+/// for its longer wait.
+#[test]
+fn a_refused_width_ends_with_its_frame_hold() {
+    use crate::ecs::maximize::{FrameHold, RefusingWidth};
+    let mut harness = three_windows();
+    let entity = entity_of(&mut harness, 0);
+    let now = harness.world().resource::<bevy::time::Time>().elapsed();
+    harness.world().entity_mut(entity).insert((
+        FrameHold::until(now + Duration::from_millis(100)),
+        RefusingWidth,
+    ));
+    harness.advance(SETTLE);
+    let world = harness.world();
+    assert!(world.get::<FrameHold>(entity).is_none(), "the hold ended");
+    assert!(
+        world.get::<RefusingWidth>(entity).is_none(),
+        "and the window no longer counts as refusing the width"
+    );
+}
+
+/// A restored window whose app answers its column's width with a narrower
+/// frame refuses no maximized width: it is not maximized.
+#[test]
+fn a_restore_never_counts_as_refusing_the_maximized_width() {
+    use crate::ecs::maximize::RefusingWidth;
+    let mut harness = three_windows();
+    let before = frames(&harness, &[0, 1, 2]);
+    harness.run(vec![command(Operation::Maximize)]);
+    harness.advance(SETTLE);
+    assert!(is_maximized(&mut harness, 0), "window 0 maximizes");
+    let entity = entity_of(&mut harness, 0);
+    let limit = Size::new(before[0].width() - 40, 4000);
+    harness
+        .mock_state
+        .update_window(0, |window| window.maximum_size = Some(limit));
+
+    harness.run(vec![command(Operation::Maximize)]);
+    for frame in 0..60 {
+        harness.advance(Duration::from_millis(20));
+        assert!(
+            harness.world().get::<RefusingWidth>(entity).is_none(),
+            "the restore is no refusal, frame {frame}"
+        );
+    }
+    assert!(!is_maximized(&mut harness, 0), "window 0 is restored");
+}
+
+/// Double-clicks window `id`'s title bar, with the second press carrying
+/// `hold`, the event tap's token for it, if the tap held it.
+fn double_click_with_hold(harness: &mut TestHarness, id: WinID, hold: Option<u64>) {
+    let point = title_bar(harness, id);
+    let point = CGPoint::new(f64::from(point.x), f64::from(point.y));
+    for (clicks, hold) in [(1, None), (2, hold)] {
+        harness.world().write_message(Event::MouseDown {
+            point,
+            modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+            window_id: Some(id),
+            clicks,
+            hold,
+        });
+        harness.world().write_message(Event::MouseUp {
+            point,
+            modifiers: Modifiers::empty(),
+            button: MouseButton::Left,
+        });
+        harness.advance(Duration::from_millis(20));
+    }
+    harness.advance(SETTLE);
+}
+
+/// A double-click whose press the event tap gave up, at its time limit or
+/// for a newer press, toggles nothing: the app may have it already, and a
+/// toggle that long after the click would surprise.
+#[test]
+fn a_double_click_the_tap_gave_up_toggles_nothing() {
+    let mut harness = three_windows();
+    double_click_with_hold(&mut harness, 1, Some(u64::MAX));
+    assert!(!is_maximized(&mut harness, 1), "no toggle");
+
+    double_click_with_hold(&mut harness, 1, None);
+    assert!(
+        is_maximized(&mut harness, 1),
+        "a press the tap did not hold toggles"
+    );
+}
+
+/// Runs one engine frame for `events`.
+fn frame(harness: &mut TestHarness, events: Vec<Event>) {
+    for event in events {
+        harness.world().write_message(event);
+    }
+    harness.app.update();
+    for event in harness.mock_state.drain_events() {
+        harness.world().write_message::<Event>(event);
+    }
+}
+
+/// A maximize toggled again right after a restore counts its own refusals
+/// from none: the one its app gave the maximize before does not carry over
+/// and undo the new one at its first refusal.
+#[test]
+fn a_new_maximize_counts_its_own_refusals() {
+    use crate::ecs::maximize::RefusingWidth;
+    let mut harness = three_windows();
+    let before = frames(&harness, &[0, 1, 2]);
+    let limit = Size::new(before[0].width() + 40, 4000);
+    harness
+        .mock_state
+        .update_window(0, |window| window.maximum_size = Some(limit));
+    let entity = entity_of(&mut harness, 0);
+
+    frame(&mut harness, vec![command(Operation::Maximize)]);
+    for _ in 0..10 {
+        if harness.world().get::<RefusingWidth>(entity).is_some() {
+            break;
+        }
+        frame(&mut harness, vec![]);
+    }
+    assert!(
+        harness.world().get::<RefusingWidth>(entity).is_some(),
+        "the app refused the width once"
+    );
+    assert!(is_maximized(&mut harness, 0), "one refusal is not enough");
+
+    // Restore and maximize again, a frame each.
+    frame(&mut harness, vec![command(Operation::Maximize)]);
+    frame(&mut harness, vec![command(Operation::Maximize)]);
+    assert!(is_maximized(&mut harness, 0), "maximized again");
+    frame(&mut harness, vec![]);
+    assert!(
+        is_maximized(&mut harness, 0),
+        "the new maximize's first refusal does not undo it"
+    );
+    harness.advance(SETTLE);
+    assert!(
+        !is_maximized(&mut harness, 0),
+        "its own second refusal does"
+    );
+}
+
 /// Sends `window <verb>` as a key binding or the command line does, and
 /// lets it settle.
 fn run_window_verb(harness: &mut TestHarness, verb: &str) {
@@ -955,6 +1157,7 @@ fn press_title_bar(harness: &mut TestHarness, point: Origin) {
         button: MouseButton::Left,
         window_id: Some(1),
         clicks: 1,
+        hold: None,
     });
     harness.advance(Duration::from_millis(16));
 }
@@ -1938,4 +2141,71 @@ fn an_empty_dock_frame_is_no_reading() {
     assert_eq!(DockFrame::shown(IRect::new(0, 0, 0, 0)), None);
     let frame = IRect::new(727, 1358, 1833, 1430);
     assert_eq!(DockFrame::shown(frame), Some(DockFrame::Shown(frame)));
+}
+
+#[test]
+fn double_click_restores_maximized_window_at_previously_refused_viewport_but_skips_unmaximized() {
+    use crate::ecs::maximize::MaximizeRefused;
+
+    let mut harness = three_windows();
+    let area = usable_area(&mut harness);
+    let before = frames(&harness, &[0, 1, 2]);
+    harness.mock_state.update_window(0, |window| {
+        window.maximum_size = Some(Size::new(area.width() - 200, 4000));
+    });
+
+    double_click_title_bar(&mut harness, 0);
+    assert!(!is_maximized(&mut harness, 0));
+    let entity = entity_of(&mut harness, 0);
+    assert!(
+        harness.world().get::<MaximizeRefused>(entity).is_some(),
+        "refused width recorded for this viewport"
+    );
+
+    // While unmaximized at the refused viewport, another double-click stays a passthrough.
+    double_click_title_bar(&mut harness, 0);
+    assert!(!is_maximized(&mut harness, 0));
+    assert_eq!(frames(&harness, &[0, 1, 2]), before);
+
+    // Shrink the viewport with a left Dock so the window can maximize within its cap.
+    harness
+        .mock_state
+        .os_set_dock_frame(Some(DockFrame::Shown(IRect::new(
+            0,
+            0,
+            250,
+            TEST_DISPLAY_HEIGHT,
+        ))));
+    harness.run(vec![Event::DockDidChangePref { msg: String::new() }]);
+    harness.advance(Duration::from_secs(3));
+    double_click_title_bar(&mut harness, 0);
+    assert!(
+        is_maximized(&mut harness, 0),
+        "window maximizes at narrower docked viewport"
+    );
+    assert!(
+        harness.world().get::<MaximizeRefused>(entity).is_some(),
+        "MaximizeRefused from original viewport stays present"
+    );
+
+    // Lift the app cap and hide the Dock back to the original viewport; restoring must work.
+    harness
+        .mock_state
+        .update_window(0, |window| window.maximum_size = None);
+    harness
+        .mock_state
+        .os_set_dock_frame(Some(DockFrame::AutoHidden));
+    harness.run(vec![Event::DockDidChangePref { msg: String::new() }]);
+    harness.advance(Duration::from_secs(3));
+    assert_eq!(usable_area(&mut harness), area);
+    assert!(
+        is_maximized(&mut harness, 0),
+        "stays maximized when returning to original viewport"
+    );
+
+    double_click_title_bar(&mut harness, 0);
+    assert!(
+        !is_maximized(&mut harness, 0),
+        "double-click restores maximized window even at previously refused viewport"
+    );
 }

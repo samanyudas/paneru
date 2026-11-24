@@ -23,6 +23,7 @@ mod slice_photos;
 mod slide_ease;
 mod stacks;
 mod state;
+mod strip_cover;
 mod tabbed_display;
 mod tabs;
 mod tiling;

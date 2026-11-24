@@ -107,8 +107,8 @@ fn swipe_settles_a_partly_hidden_column_flush_with_the_viewport_edge() {
 
 /// A flick past the end of the strip lands on the last column, and the strip
 /// end comes back to the viewport edge. Continuous swipe lets the fingers
-/// pull the last column to the far edge, but no settle leaves empty space
-/// beside an overflowing strip.
+/// pull the last column toward the far edge, against resistance, but no
+/// settle leaves empty space beside an overflowing strip.
 #[test]
 fn swipe_past_the_end_settles_with_the_strip_end_on_the_viewport_edge() {
     for animation_speed in [None, Some(14.0)] {
@@ -366,7 +366,7 @@ fn swipe_on_a_fitting_strip_resists_and_springs_back() {
     harness.advance(ONE_FRAME * 2);
     let stretched = window_x(harness.world(), 0);
     assert!(
-        stretched < 0 && stretched > -TEST_DISPLAY_WIDTH / 8,
+        stretched < 0 && stretched > -TEST_DISPLAY_WIDTH / 4,
         "the strip gives a little with resistance, got x {stretched}"
     );
 
@@ -375,6 +375,240 @@ fn swipe_on_a_fitting_strip_resists_and_springs_back() {
     assert_eq!(window_x(harness.world(), 0), 0);
     assert_eq!(window_x(harness.world(), 1), 400);
     assert_focused!(harness.world(), 0);
+}
+
+/// Past the end of a strip that overflows the display, the fingers stretch
+/// the strip with resistance, never pulling it freely, and when they lift it
+/// springs back from where it shows, with no jump.
+#[test]
+fn swipe_past_the_end_of_an_overflowing_strip_resists_and_springs_back() {
+    let mut harness = harness_with_widths(&[400, 400, 400, 400, 400], Some(14.0));
+    harness.mock_state.set_cursor_position(IVec2::new(1000, 5));
+    harness.run(vec![focus(Direction::Last)]);
+    harness.advance(SETTLE);
+    let end = TEST_DISPLAY_WIDTH - 400;
+    assert_eq!(window_x(harness.world(), 4), end);
+
+    send(&mut harness, Event::TouchpadDown);
+    move_fingers(&mut harness, 0.02, 20);
+    let stretched = end - window_x(harness.world(), 4);
+    assert!(
+        stretched > 0 && stretched < TEST_DISPLAY_WIDTH / 4,
+        "the strip gives a little with resistance, got {stretched}"
+    );
+
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(ONE_FRAME * 4);
+    let first = end - window_x(harness.world(), 4);
+    assert!(
+        first <= stretched,
+        "the settle starts from where the strip shows, got {first} after {stretched}"
+    );
+    assert_focused!(harness.world(), 4);
+
+    // Fingers that catch the strip on its way back hold it where it shows.
+    harness.advance(ONE_FRAME);
+    let caught = window_x(harness.world(), 4);
+    assert!(caught < end, "still past the end, got x {caught}");
+    send(&mut harness, Event::TouchpadDown);
+    harness.advance(ONE_FRAME);
+    assert_eq!(
+        window_x(harness.world(), 4),
+        caught,
+        "the catch does not jump"
+    );
+    send(&mut harness, Event::TouchpadUp);
+
+    // Fingers that touch down again after the lift, before the settle
+    // starts, hold the strip where it shows too.
+    let mut harness = harness_with_widths(&[400, 400, 400, 400, 400], Some(14.0));
+    harness.mock_state.set_cursor_position(IVec2::new(1000, 5));
+    harness.run(vec![focus(Direction::Last)]);
+    harness.advance(SETTLE);
+    send(&mut harness, Event::TouchpadDown);
+    move_fingers(&mut harness, 0.02, 19);
+    send(&mut harness, swipe(0.02));
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(ONE_FRAME * 3);
+    let held = window_x(harness.world(), 4);
+    assert!(held < end, "still past the end, got x {held}");
+    send(&mut harness, Event::TouchpadDown);
+    harness.advance(ONE_FRAME);
+    assert_eq!(
+        window_x(harness.world(), 4),
+        held,
+        "the touch-down does not jump"
+    );
+    send(&mut harness, Event::TouchpadUp);
+
+    // A wheel tick catches the strip on its way back where it shows too.
+    let mut harness = harness_with_widths(&[400, 400, 400, 400, 400], Some(14.0));
+    harness.mock_state.set_cursor_position(IVec2::new(1000, 5));
+    harness.run(vec![focus(Direction::Last)]);
+    harness.advance(SETTLE);
+    send(&mut harness, Event::TouchpadDown);
+    move_fingers(&mut harness, 0.02, 20);
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(ONE_FRAME * 5);
+    let caught = window_x(harness.world(), 4);
+    assert!(caught < end, "still past the end, got x {caught}");
+    send(&mut harness, Event::Scroll { delta: 1.0 });
+    harness.advance(ONE_FRAME);
+    let moved = window_x(harness.world(), 4) - caught;
+    assert!(
+        (-10..=0).contains(&moved),
+        "a wheel tick moves the caught strip on a little, never back, got {moved}"
+    );
+
+    // A movement that arrives with the touch-down resists from the start.
+    let mut harness = harness_with_widths(&[400, 400, 400, 400, 400], Some(14.0));
+    harness.mock_state.set_cursor_position(IVec2::new(1000, 5));
+    harness.run(vec![focus(Direction::Last)]);
+    harness.advance(SETTLE);
+    send(&mut harness, Event::TouchpadDown);
+    move_fingers(&mut harness, 0.02, 20);
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(ONE_FRAME * 5);
+    let caught = window_x(harness.world(), 4);
+    assert!(caught < end, "still past the end, got x {caught}");
+    send(&mut harness, Event::TouchpadDown);
+    send(&mut harness, swipe(0.05));
+    harness.advance(ONE_FRAME);
+    let moved = caught - window_x(harness.world(), 4);
+    let fingers = 0.05 * f64::from(TEST_DISPLAY_WIDTH) * 0.35;
+    assert!(
+        moved > 0 && f64::from(moved) < fingers * 0.75,
+        "the strip moves {moved} with resistance, the fingers {fingers}"
+    );
+
+    harness.advance(SETTLE);
+    assert!(!is_scrolling(harness.world()), "the settle has finished");
+    assert_eq!(window_x(harness.world(), 4), end);
+}
+
+/// A full-width end column stretches past the end with resistance too, and a
+/// flick onto it swings a little past it and back.
+#[test]
+fn a_full_width_end_column_stretches_and_a_flick_onto_it_swings_past() {
+    let widths = [TEST_DISPLAY_WIDTH; 3];
+    let mut harness = harness_with_widths(&widths, Some(14.0));
+    harness.mock_state.set_cursor_position(IVec2::new(1000, 5));
+    harness.run(vec![focus(Direction::Last)]);
+    harness.advance(SETTLE);
+    assert_eq!(window_x(harness.world(), 2), 0);
+
+    send(&mut harness, Event::TouchpadDown);
+    move_fingers(&mut harness, 0.02, 20);
+    let stretched = -window_x(harness.world(), 2);
+    assert!(
+        stretched > 0 && stretched < TEST_DISPLAY_WIDTH / 4,
+        "the strip gives a little with resistance, got {stretched}"
+    );
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(SETTLE);
+    assert_eq!(window_x(harness.world(), 2), 0);
+
+    let mut harness = harness_with_widths(&widths, Some(14.0));
+    harness.mock_state.set_cursor_position(IVec2::new(1000, 5));
+    harness.run(vec![focus(Direction::East)]);
+    harness.advance(SETTLE);
+    let start = window_x(harness.world(), 2);
+    send(&mut harness, swipe(0.3));
+    let past = furthest_past(&mut harness, 2, start, 0);
+    assert_focused!(harness.world(), 2);
+    assert_eq!(window_x(harness.world(), 2), 0);
+    assert!(
+        past > 0 && past < 30,
+        "a flick swings a little past the end, by {past}"
+    );
+}
+
+/// Steps `harness` one frame at a time until the strip stops scrolling, and
+/// returns how far `id` ever went past `landing`, coming from `start`.
+fn furthest_past(harness: &mut TestHarness, id: WinID, start: i32, landing: i32) -> i32 {
+    let mut past = 0;
+    for _ in 0..150 {
+        harness.advance(ONE_FRAME);
+        let x = window_x(harness.world(), id);
+        past = past.max((x - landing) * (landing - start).signum());
+        if !is_scrolling(harness.world()) {
+            return past;
+        }
+    }
+    panic!("the settle has finished");
+}
+
+/// A flick swings the strip a little past the column it lands on and back,
+/// as a thrown object would. A slow lift lands without passing it.
+#[test]
+fn a_flick_swings_a_little_past_its_landing_and_a_slow_lift_does_not() {
+    let mut harness = harness_with_widths(&[700, 700, 700, 700], Some(14.0));
+    let landing = TEST_DISPLAY_WIDTH - 700;
+    send(&mut harness, swipe(0.05));
+    let past = furthest_past(&mut harness, 1, 700, landing);
+    assert!(
+        past > 0 && past < 20,
+        "a flick swings a little past, by {past}"
+    );
+    assert_focused!(harness.world(), 1);
+    assert_eq!(window_x(harness.world(), 1), landing);
+
+    let mut harness = harness_with_widths(&[700, 700, 700, 700], Some(14.0));
+    // Slow fingers carry the strip most of the way to the next column, too
+    // slowly to throw it.
+    send(&mut harness, Event::TouchpadDown);
+    move_fingers(&mut harness, 0.01, 30);
+    let lifted = window_x(harness.world(), 1);
+    let landing = TEST_DISPLAY_WIDTH - 700;
+    assert!(
+        lifted < 700 && lifted > landing,
+        "the fingers moved the strip short of the next column, got x {lifted}"
+    );
+    send(&mut harness, Event::TouchpadUp);
+    let past = furthest_past(&mut harness, 1, lifted, landing);
+    assert_eq!(past, 0, "a slow lift never passes its landing");
+    assert_focused!(harness.world(), 1);
+    assert_eq!(window_x(harness.world(), 1), landing);
+
+    // Fingers that hold still after a fast move settle the strip under them,
+    // which throws nothing.
+    let mut harness = harness_with_widths(&[700, 700, 700, 700], Some(14.0));
+    send(&mut harness, Event::TouchpadDown);
+    move_fingers(&mut harness, 0.05, 1);
+    let start = window_x(harness.world(), 1);
+    let past = furthest_past(&mut harness, 1, start, TEST_DISPLAY_WIDTH - 700);
+    assert_eq!(past, 0, "held fingers never swing the strip past");
+    send(&mut harness, Event::TouchpadUp);
+
+    // Fingers that pause, then lift just as the pause settles the strip,
+    // threw nothing either.
+    for held in 2..=4 {
+        let mut harness = harness_with_widths(&[700, 700, 700, 700], Some(14.0));
+        send(&mut harness, Event::TouchpadDown);
+        move_fingers(&mut harness, 0.05, 1);
+        let start = window_x(harness.world(), 1);
+        harness.advance(ONE_FRAME * held);
+        send(&mut harness, Event::TouchpadUp);
+        let past = furthest_past(&mut harness, 1, start, TEST_DISPLAY_WIDTH - 700);
+        assert_eq!(
+            past, 0,
+            "a lift after {held} still frames never swings past"
+        );
+    }
+
+    // A finger that lifts and touches down again for a moment moves nothing,
+    // so the pause runs from the fingers' last movement.
+    let mut harness = harness_with_widths(&[700, 700, 700, 700], Some(14.0));
+    send(&mut harness, Event::TouchpadDown);
+    move_fingers(&mut harness, 0.05, 1);
+    let start = window_x(harness.world(), 1);
+    send(&mut harness, Event::TouchpadUp);
+    harness.advance(ONE_FRAME);
+    send(&mut harness, Event::TouchpadDown);
+    harness.advance(ONE_FRAME * 2);
+    send(&mut harness, Event::TouchpadUp);
+    let past = furthest_past(&mut harness, 1, start, TEST_DISPLAY_WIDTH - 700);
+    assert_eq!(past, 0, "a retouch and a pause never swing past");
 }
 
 /// Modifier-scroll with a mouse wheel arrives as separate ticks. A short gap
@@ -474,8 +708,8 @@ fn touch_down_mid_settle_catches_the_strip() {
     let mut harness = harness_with_widths(&[700, 700, 700, 700], Some(14.0));
 
     send(&mut harness, swipe(0.05));
-    // Past the middle of the 0.5 s ease, so the strip is nearer column 1.
-    harness.advance(ONE_FRAME * 16);
+    // Past the middle of the ease, so the strip is nearer column 1.
+    harness.advance(ONE_FRAME * 8);
     assert!(is_scrolling(harness.world()), "still settling");
     send(&mut harness, Event::TouchpadDown);
     harness.advance(ONE_FRAME);
@@ -875,6 +1109,7 @@ fn click_on_another_display_leaves_a_settle_to_finish() {
             button: crate::events::MouseButton::Left,
             window_id: Some(101),
             clicks: 1,
+            hold: None,
         },
     );
     harness.advance(SETTLE);
@@ -1188,7 +1423,7 @@ fn window_landing_resists_past_the_next_column() {
     let stretched = window_x(harness.world(), 1);
     let landed = TEST_DISPLAY_WIDTH - 700;
     assert!(
-        stretched < landed && stretched > landed - TEST_DISPLAY_WIDTH / 8,
+        stretched < landed && stretched > landed - TEST_DISPLAY_WIDTH / 4,
         "stretched only a little past the landing, got x {stretched}"
     );
     send(&mut harness, Event::TouchpadUp);

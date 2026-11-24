@@ -519,6 +519,9 @@ pub trait WindowApi: Send + Sync {
     /// it at the old position. A write that only narrows the window moves it
     /// first.
     fn place(&mut self, frame: IRect);
+    /// [`Self::place`] for a frame that lands under a picture cover: the
+    /// window moves before it sizes, so its app lays it out once.
+    fn place_moved_first(&mut self, frame: IRect);
     /// Reads the window's frame back from the OS. Waits first, up to
     /// `LANDING_TIMEOUT`, for any move or resize the engine asked for to
     /// land, and fails if it has not. A system that must never wait on an
@@ -1357,6 +1360,13 @@ impl WindowApi for WindowOS {
         let pid = self.pid().ok();
         let window = self.ax_window();
         self.writes.place(pid, || window, frame);
+    }
+
+    #[instrument(level = Level::TRACE)]
+    fn place_moved_first(&mut self, frame: IRect) {
+        let pid = self.pid().ok();
+        let window = self.ax_window();
+        self.writes.place_moved_first(pid, || window, frame);
     }
 
     /// Reads the window's frame back from Accessibility, padding included.

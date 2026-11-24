@@ -267,6 +267,7 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::WindowSetQuery { .. }
             | Event::StateSubscribe { .. }
             | Event::SlicePhoto { .. }
+            | Event::CoverPhoto { .. }
             | Event::SlicePress { .. }
             | Event::ScriptState { .. } => return Err(NotMarshallable),
         })
@@ -559,6 +560,7 @@ mod tests {
                 button: crate::events::MouseButton::Left,
                 window_id: None,
                 clicks: 1,
+                hold: None,
             },
         )
         .expect("mouse_down should marshal");

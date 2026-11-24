@@ -467,7 +467,7 @@ fn app_moves_back_to_ext(harness: &mut TestHarness, id: WinID) {
 /// after the slide lands, and the window still goes home.
 #[test]
 fn a_carried_window_moved_back_after_a_slow_slide_home_stays_in_its_strip() {
-    let mut harness = two_displays("[options]\nanimation_speed = 8\n", EXT_DISPLAY_HEIGHT);
+    let mut harness = two_displays("[options]\nanimation_speed = 5\n", EXT_DISPLAY_HEIGHT);
     harness.mock_state.set_spaces_follow_frames(true);
     let home = middle_of(harness.world(), 2, 600);
     press_and_drag(&mut harness, 2, home);
@@ -2487,6 +2487,7 @@ fn a_press_during_late_handle_recovery_supersedes_the_old_placement() {
         button: MouseButton::Left,
         window_id: Some(2),
         clicks: 1,
+        hold: None,
         modifiers: Modifiers::empty(),
     });
     harness.advance(FRAME);
@@ -2911,6 +2912,7 @@ fn an_edge_resize_from_a_shared_column_boundary_keeps_the_users_size() {
             button: MouseButton::Left,
             window_id,
             clicks: 1,
+            hold: None,
         });
         harness.advance(FRAME);
         let tile = IRect::new(0, 20, 512, 768);

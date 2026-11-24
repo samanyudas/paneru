@@ -1227,6 +1227,7 @@ fn mouse_down(point: Origin, window_id: Option<WinID>) -> Event {
         button: MouseButton::Left,
         window_id,
         clicks: 1,
+        hold: None,
     }
 }
 

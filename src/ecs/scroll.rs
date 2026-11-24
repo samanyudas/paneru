@@ -2,7 +2,7 @@ use bevy::app::{App, Plugin, PreUpdate, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::{Message, MessageReader, MessageWriter};
-use bevy::ecs::query::{Has, With, Without};
+use bevy::ecs::query::{Changed, Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::SystemCondition as _;
@@ -17,6 +17,7 @@ use crate::commands::{Direction, FocusSource, focus_with_verification};
 use crate::config::Config;
 use crate::config::swipe::{SwipeGestureDirection, SwipeTarget, focus_direction};
 use crate::ecs::display::shown_strip;
+use crate::ecs::ease;
 use crate::ecs::focus::{FocusHistory, PageHapticRequest};
 use crate::ecs::layout::{Column, LayoutStrip, strip_content_range};
 use crate::ecs::params::Windows;
@@ -210,6 +211,27 @@ type SettlingStrip = (
     Has<RepositionMarker>,
 );
 
+/// The strips under a covered swipe that a strip move has just reached.
+type CoverMoves<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    (
+        With<crate::ecs::strip_cover::CoverSwipe>,
+        Changed<RepositionMarker>,
+    ),
+>;
+
+/// Whether strip `entity`, its fingers lifted, waits for its covered swipe
+/// to take a strip move that has just reached it. The cover first tells a
+/// move from one to where the strip already is, and carries a move on from
+/// where the strip shows at the speed it has, so no scroll system moves the
+/// strip, holds it, or slows it in the meantime. The fingers keep a strip
+/// they drive.
+fn awaits_cover(entity: Entity, scroll: &Scrolling, moves: &CoverMoves) -> bool {
+    !scroll.is_user_swiping && moves.contains(entity)
+}
+
 impl Plugin for ScrollEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PageGestureState>();
@@ -331,7 +353,7 @@ fn paging_gesture(
 /// display meanwhile; [`swiped_strip`] picks it.
 #[instrument(level = Level::TRACE, skip_all)]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn swipe_gesture(
+pub(crate) fn swipe_gesture(
     mut messages: MessageReader<InputEvent>,
     mut strips: SwipedStrips,
     displays: StripDisplays,
@@ -474,6 +496,9 @@ fn swipe_gesture(
         if let Some(target) = scrolling.settle {
             scrolling.anchor = target;
         }
+        // Only a settle holds where the strip shows; before it starts,
+        // `position` is still the fingers' travel.
+        scrolling.caught = scrolling.settle.map(|_| scrolling.position);
         scrolling.origin = scrolling.position;
         scrolling.detent = None;
         scrolling.start = scrolling.landing_focus.take();
@@ -500,6 +525,12 @@ fn swipe_gesture(
         };
 
         if let Some(scrolling) = scrolling.as_mut() {
+            // A wheel tick, or a swipe that arrived without a touch-down,
+            // catches a settle too: it holds where the strip shows.
+            if scrolling.settle.is_some() && scrolling.caught.is_none() {
+                scrolling.caught = Some(scrolling.position);
+                scrolling.lifted_at = None;
+            }
             // Native modifier-scroll events already include macOS momentum.
             // Add synthetic inertia only for raw multi-finger gestures.
             scrolling.velocity = if has_gesture_event {
@@ -510,6 +541,7 @@ fn swipe_gesture(
             };
             scrolling.is_user_swiping = true;
             scrolling.last_event = time.elapsed();
+            scrolling.moved_at = time.elapsed();
             scrolling.input = input;
             scrolling.settle = None;
             scrolling.ease = None;
@@ -521,6 +553,7 @@ fn swipe_gesture(
                     + total_delta * viewport_width * direction * swipe_sensitivity,
                 is_user_swiping: true,
                 last_event: time.elapsed(),
+                moved_at: time.elapsed(),
                 input,
                 // A strip still animating is headed for its target, so that is
                 // where it rests.
@@ -534,6 +567,9 @@ fn swipe_gesture(
                 start: None,
                 fingers_down: *fingers_down,
                 lifted_at: None,
+                caught: None,
+                slope: 1.0,
+                excess: None,
             });
         }
     }
@@ -624,6 +660,7 @@ fn new_swipe_target(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn swiping_timeout(
     strips: ScrollingStrips,
+    moves: CoverMoves,
     displays: StripDisplays,
     time: Res<Time>,
     window_manager: Res<WindowManager>,
@@ -654,7 +691,7 @@ pub(super) fn swiping_timeout(
             // `settle_strip` owns the strip from here, active or not, and
             // focus goes to the column it lands on, not to whatever slid
             // under the pointer.
-            if settles(&config, fullscreen) {
+            if settles(&config, fullscreen) || awaits_cover(entity, &scroll, &moves) {
                 continue;
             }
 
@@ -722,14 +759,18 @@ fn land_unshown_strips(
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
-fn apply_inertia(
+pub(crate) fn apply_inertia(
     mut strips: Populated<(Entity, &mut Scrolling), With<LayoutStrip>>,
+    moves: CoverMoves,
     time: Res<Time>,
     config: Res<Config>,
 ) {
     let dt = time.delta_secs_f64();
-    for (_, mut scroll) in &mut strips {
-        if scroll.is_user_swiping || scroll.settle.is_some() {
+    for (entity, mut scroll) in &mut strips {
+        if scroll.is_user_swiping
+            || scroll.settle.is_some()
+            || awaits_cover(entity, &scroll, &moves)
+        {
             continue;
         }
 
@@ -748,6 +789,7 @@ fn apply_inertia(
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_snap_force(
     strips: ScrollingStrips,
+    moves: CoverMoves,
     displays: StripDisplays,
     windows: Windows,
     config: Res<Config>,
@@ -760,7 +802,10 @@ fn apply_snap_force(
         return;
     }
 
-    for (_, strip, child, _, position, mut scroll) in strips {
+    for (entity, strip, child, _, position, mut scroll) in strips {
+        if awaits_cover(entity, &scroll, &moves) {
+            continue;
+        }
         let Some((_, viewport)) = viewports(child, &displays, &config) else {
             continue;
         };
@@ -844,11 +889,113 @@ fn fitted_offsets(strip: &LayoutStrip, windows: &Windows, viewport: IRect) -> Op
     })
 }
 
-/// Rubber-band resistance: the strip follows a stretch almost one to one at
-/// first, and never travels more than an eighth of the viewport.
+/// How much of the fingers' first movement past an end a resisting strip
+/// follows: Apple's rubber-band constant.
+const RUBBER_BAND: f64 = 0.55;
+
+/// The furthest a resisting strip ever travels, as a share of the viewport.
+fn stretch_limit(viewport_width: f64) -> f64 {
+    viewport_width / 4.0
+}
+
+/// Rubber-band resistance, Apple's `x d c / (d + c |x|)`: the strip follows
+/// [`RUBBER_BAND`] of a stretch at first, then less and less, and never
+/// travels a quarter of the viewport.
 fn resist(stretch: f64, viewport_width: f64) -> f64 {
-    let limit = viewport_width / 8.0;
-    stretch * limit / (limit + stretch.abs())
+    let limit = stretch_limit(viewport_width);
+    stretch * limit * RUBBER_BAND / (limit + RUBBER_BAND * stretch.abs())
+}
+
+/// The stretch that [`resist`] shows at `shown`: its inverse.
+fn unresist(shown: f64, viewport_width: f64) -> f64 {
+    let limit = stretch_limit(viewport_width);
+    let shown = shown.clamp(-0.999 * limit, 0.999 * limit);
+    shown * limit / (RUBBER_BAND * (limit - shown.abs()))
+}
+
+/// Whether the fingers push a strip at `position` on outward while it is
+/// held at either bound of `(low, high)`, so it does not move with them.
+fn pushed_against(
+    scroll: &Scrolling,
+    position: f64,
+    (low, high): (f64, f64),
+    config: &Config,
+) -> bool {
+    let outward = scroll.velocity * direction_modifier(config);
+    (position <= low + 1e-6 && outward < 0.0) || (position >= high - 1e-6 && outward > 0.0)
+}
+
+/// Where the strip shows for `scroll.position`, and how far it moves for
+/// each point of finger travel: freely between the `edges`, and with
+/// rubber-band resistance past them, or around them when they meet. The
+/// part of a caught place that resistance cannot show, `scroll.excess`,
+/// fades as the stretch eases back toward the edge, and goes once it is
+/// gone or the fingers cross the edge.
+fn resisted(scroll: &mut Scrolling, edges: (f64, f64), width: f64) -> (f64, f64) {
+    let (low, high) = (edges.0.min(edges.1), edges.0.max(edges.1));
+    let edge = scroll.position.clamp(low, high);
+    let stretch = scroll.position - edge;
+    let (mut shown, mut slope) = if low < high && stretch == 0.0 {
+        (scroll.position, 1.0)
+    } else {
+        (edge + resist(stretch, width), resist_slope(stretch, width))
+    };
+    if let Some((excess, caught)) = scroll.excess {
+        let share = if caught == 0.0 {
+            0.0
+        } else {
+            (stretch / caught).clamp(0.0, 1.0)
+        };
+        shown += excess * share;
+        if share > 0.0 && share < 1.0 {
+            slope += excess / caught;
+        }
+        if share <= 0.0 {
+            scroll.excess = None;
+        }
+    }
+    (shown, slope)
+}
+
+/// Turns `scroll.position` and `scroll.origin`, which hold where the strip
+/// shows, `caught`, plus the fingers' travel since, into the finger travel
+/// that shows the strip there when it resists past either edge of `edges`,
+/// so the resistance is not laid on twice and the travel since the catch
+/// stays the fingers' own. The stretch is held to a viewport `width`, as an
+/// overflowing strip's is, and what resistance cannot show of a place
+/// further out is kept as `scroll.excess`. Does nothing without `caught`.
+fn catch_at(scroll: &mut Scrolling, caught: Option<f64>, edges: (f64, f64), width: f64) {
+    let Some(shown) = caught else {
+        return;
+    };
+    let edge = shown.clamp(edges.0.min(edges.1), edges.0.max(edges.1));
+    let past = shown - edge;
+    let stretch = unresist(past, width).clamp(-width, width);
+    let excess = past - resist(stretch, width);
+    let correction = edge + stretch - shown;
+    scroll.position += correction;
+    scroll.origin += correction;
+    scroll.excess = (excess.abs() >= 0.5).then_some((excess, stretch));
+}
+
+/// How fast a resisting strip moves for each point the fingers move, at
+/// `stretch`: the slope of [`resist`].
+fn resist_slope(stretch: f64, viewport_width: f64) -> f64 {
+    let limit = stretch_limit(viewport_width);
+    RUBBER_BAND * (limit / (limit + RUBBER_BAND * stretch.abs())).powi(2)
+}
+
+/// The offsets a settle can leave an overflowing strip at, from its end on
+/// the viewport's right edge to its start on the left edge, so no empty
+/// space shows beside it.
+fn settle_range(
+    strip: &LayoutStrip,
+    windows: &Windows,
+    viewport: IRect,
+) -> Option<std::ops::RangeInclusive<i32>> {
+    let content = strip_content_range(strip, windows)?;
+    let start = viewport.min.x - content.start;
+    Some((viewport.max.x - content.end).min(start)..=start)
 }
 
 /// The column a strip resting at offset `resting` lands on, and the offset
@@ -856,8 +1003,9 @@ fn resist(stretch: f64, viewport_width: f64) -> f64 {
 /// partly hidden one ends with its edge on the viewport edge, and a fully
 /// visible one leaves the strip where it rests. This is the projection
 /// `ensure_visible_in_strip` makes for keyboard focus. Continuous swipe lets
-/// the fingers pull an end column to the far edge, so the offset is then
-/// held to the range that leaves no empty space beside the overflowing strip.
+/// the fingers pull an end column as far as the far edge, against
+/// resistance, so the offset is then held to the range that leaves no empty
+/// space beside the overflowing strip.
 ///
 /// A window-landing `step` instead lands one column on from the column the
 /// swipe began on, whatever the column widths, or springs back to where the
@@ -869,9 +1017,7 @@ fn landing(
     windows: &Windows,
     viewport: IRect,
 ) -> Option<(Column, i32)> {
-    let content = strip_content_range(strip, windows)?;
-    let edges = (viewport.max.x - content.end).min(viewport.min.x - content.start)
-        ..=(viewport.min.x - content.start);
+    let edges = settle_range(strip, windows, viewport)?;
     let center = viewport.center().x;
     let columns: Vec<_> = strip
         .columns()
@@ -984,9 +1130,9 @@ pub(super) fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
 /// picks the column [`landing`] gives for that offset, and focuses the window
 /// in it that had focus last. A strip that fits the viewport springs back to
 /// where the swipe began instead, and focus stays. The strip then slides
-/// there over [`settle_duration`] on [`settle_curve`]: it carries on at the
-/// speed it had when the fingers lifted, or gathers speed from rest, then
-/// slows into the column.
+/// there along the curve in [`ease`] that every window motion follows: it
+/// enters the curve where the curve's speed matches the speed it had when
+/// the fingers lifted, or starts from rest, then slows into the column.
 ///
 /// A window-landing swipe ignores the momentum: it lands one column on from
 /// where it began, or back there, as [`Step`] decides, and pulses if that is
@@ -995,6 +1141,7 @@ pub(super) fn lands_on_window(config: &Config, input: ScrollInput) -> bool {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn settle_strip(
     strips: Populated<SettlingStrip, (With<LayoutStrip>, Without<Window>)>,
+    moves: CoverMoves,
     displays: StripDisplays,
     windows: Windows,
     focus_history: Res<FocusHistory>,
@@ -1012,21 +1159,31 @@ fn settle_strip(
                 entity_commands.try_remove::<Scrolling>();
             }
         };
-        // A deliberate move (keyboard focus, Center) has taken the strip over.
+        // A deliberate move (keyboard focus, Center) has taken the strip over,
+        // once a covered swipe has had it first.
+        if awaits_cover(entity, &scroll, &moves) {
+            continue;
+        }
         if repositioning {
             finish(&mut commands);
             continue;
         }
         // A strip whose display is gone has nowhere to settle.
-        let Some((_, viewport)) = viewports(child, &displays, &config) else {
+        let Some((bounds, viewport)) = viewports(child, &displays, &config) else {
             finish(&mut commands);
             continue;
         };
 
+        let travel_width = f64::from(bounds.width());
         let viewport_width = f64::from(viewport.width());
-        let px_per_velocity = viewport_width * direction_modifier(&config);
+        let px_per_velocity = travel_width * direction_modifier(&config);
         let deceleration = config.swipe_deceleration();
 
+        if scroll.settle.is_none() {
+            // The settle starts where the strip shows, which holds any part
+            // of a caught place that a stretch could not show.
+            scroll.excess = None;
+        }
         let target = if let Some(target) = scroll.settle {
             target
         } else if let Some(fitted) = fitted_offsets(strip, &windows, viewport) {
@@ -1066,13 +1223,14 @@ fn settle_strip(
             };
             let target = f64::from(target);
             scroll.settle = Some(target);
-            if window_landing {
-                // The fingers chose the step. The ease starts from where the
-                // resisting strip shows.
-                scroll.position = f64::from(position.x);
-                if config.swipe_gesture_haptics() && column.top() != scroll.detent {
-                    haptics.write(PageHapticRequest);
-                }
+            // The fingers' own speed chose the landing. A strip stretched
+            // past an end or a column, or caught further out than a stretch
+            // shows, starts its ease where it shows, at the speed it moves
+            // there, so a resisting release flicks only as fast as it shows.
+            scroll.position = f64::from(position.x);
+            scroll.velocity *= scroll.slope;
+            if window_landing && config.swipe_gesture_haptics() && column.top() != scroll.detent {
+                haptics.write(PageHapticRequest);
             }
             if let Some(window) = focus_history.last_focused_in(&column) {
                 if window_landing {
@@ -1098,65 +1256,77 @@ fn settle_strip(
             continue;
         }
 
-        let duration = settle_duration(&config);
+        let duration = ease::duration(&config);
         let from = scroll.position;
-        let slope = handoff_slope(scroll.velocity * px_per_velocity, target - from, duration);
-        let ease = scroll.ease.get_or_insert(SettleEase {
+        let speed = scroll.velocity * px_per_velocity;
+        // Only fingers that threw the strip toward its landing and lifted
+        // while still moving make it swing past; a slow lift, fingers that
+        // hold still, a spring-back, or the wheel does not.
+        let moving_at_lift = !scroll.fingers_down
+            && scroll.lifted_at.is_none_or(|lifted| {
+                lifted.abs_diff(scroll.moved_at) <= scroll.input.idle_threshold()
+            });
+        let flicked = scroll.input == ScrollInput::Gesture
+            && moving_at_lift
+            && (target - from).abs() >= 1.0
+            && speed * (target - from).signum() > FLICK_SPEED * viewport_width;
+        let ease = scroll.ease.get_or_insert_with(|| SettleEase {
             from,
+            start: ease::entry_for_speed(speed, target - from, duration),
             elapsed: 0.0,
-            slope,
+            animation_speed: config.animation_speed(),
+            flick: flicked.then_some(speed),
         });
         ease.elapsed += step.secs();
         let ease = *ease;
         // The ease carries the strip's speed from here.
         scroll.velocity = 0.0;
-        let progress = settle_curve(ease.elapsed / duration, ease.slope);
-        let from = ease.from;
-
-        if progress >= 1.0 {
+        let Some(shown) = settled_at(&ease, ease.elapsed, target, &config) else {
             position.x = round_px(target);
             if let Some(window) = scroll.landing_focus.take() {
                 focus(window, strip, &scroll, &windows, &mut commands);
             }
             finish(&mut commands);
             continue;
+        };
+        scroll.position = shown;
+    }
+}
+
+/// Where a settle along `ease` toward `target` shows the strip `elapsed`
+/// seconds in. `None` once it has landed.
+fn settled_at(ease: &SettleEase, elapsed: f64, target: f64, config: &Config) -> Option<f64> {
+    if let Some(speed) = ease.flick {
+        ease::flick_offset(ease.from - target, speed, elapsed, ease.animation_speed)
+            .map(|offset| target + offset)
+    } else {
+        let duration = ease::duration(config);
+        if !ease::animates(duration) {
+            return None;
         }
-        scroll.position = from + (target - from) * progress;
+        let progress = ease::share(ease.start, ease.start + elapsed / duration);
+        (progress < 1.0).then_some(ease.from + (target - ease.from) * progress)
     }
 }
 
-/// How long a settle lasts, in keyboard ease time constants
-/// (`1 / animation_speed`).
-const SETTLE_TIME_CONSTANTS: f64 = 7.0;
-
-/// How long a settle lasts: 0.5 s at Miri's `animation_speed` of 14. A faster
-/// `animation_speed` settles sooner, as it slides sooner.
-fn settle_duration(config: &Config) -> f64 {
-    SETTLE_TIME_CONSTANTS / config.animation_speed()
-}
-
-/// The steepest start [`settle_curve`] takes without overshooting.
-const MAX_HANDOFF_SLOPE: f64 = 3.0;
-
-/// The starting slope of [`settle_curve`] that carries on `velocity`, in
-/// points per second, for a settle that moves `distance` points over
-/// `duration` seconds. A strip moving away from its target, or still, starts
-/// from rest. A slope of 1 starts at the settle's average speed, and the slope
-/// is capped where the curve would overshoot.
-pub(crate) fn handoff_slope(velocity: f64, distance: f64, duration: f64) -> f64 {
-    if distance.abs() < f64::EPSILON {
-        return 0.0;
-    }
-    (velocity * duration / distance).clamp(0.0, MAX_HANDOFF_SLOPE)
-}
-
-/// The share of a settle covered at `progress` through its time, from 0 to 1:
-/// a cubic that starts at `slope` times the average speed and ends at rest.
-/// From rest it is smoothstep, whose fastest moment, halfway, is 1.5 times the
-/// average speed. At [`MAX_HANDOFF_SLOPE`] it is the cubic ease-out.
-pub(crate) fn settle_curve(progress: f64, slope: f64) -> f64 {
-    let u = progress.clamp(0.0, 1.0);
-    slope * u * (1.0 - u).powi(2) + u * u * (3.0 - 2.0 * u)
+/// How fast `scroll` shows its strip moving now, in points per second
+/// along the strip's x, on a display `display_width` points wide (matching
+/// the width used by `swipe_gesture` to convert gesture deltas and
+/// velocity). A settle moves at the speed of its ease, and fingers or the
+/// wheel at their own, each slowed as the strip resists past an end or a
+/// column.
+pub(crate) fn strip_speed(scroll: &Scrolling, display_width: f64, config: &Config) -> f64 {
+    let raw = if let (Some(ease), Some(target)) = (scroll.ease, scroll.settle) {
+        let dt = 1e-3;
+        let at = |elapsed: f64| settled_at(&ease, elapsed.max(0.0), target, config);
+        match (at(ease.elapsed), at(ease.elapsed - dt)) {
+            (Some(now), Some(before)) => (now - before) / dt,
+            _ => 0.0,
+        }
+    } else {
+        scroll.velocity * display_width * direction_modifier(config)
+    };
+    raw * scroll.slope
 }
 
 /// Focuses `window`, the window a settle of `strip` lands on, unless it has
@@ -1237,6 +1407,7 @@ fn direction_modifier(config: &Config) -> f64 {
 #[instrument(level = Level::TRACE, skip_all)]
 fn scrolling_integrator(
     strips: ScrollingStrips,
+    moves: CoverMoves,
     displays: StripDisplays,
     time: Res<Time>,
     config: Res<Config>,
@@ -1244,11 +1415,14 @@ fn scrolling_integrator(
     let dt = time.delta_secs_f64().min(MAX_STEP_SECS);
     let direction = direction_modifier(&config);
 
-    for (_, _, child, fullscreen, _, mut scroll) in strips {
-        let Some((_, viewport)) = viewports(child, &displays, &config) else {
+    for (entity, _, child, fullscreen, _, mut scroll) in strips {
+        if awaits_cover(entity, &scroll, &moves) {
+            continue;
+        }
+        let Some((bounds, _)) = viewports(child, &displays, &config) else {
             continue;
         };
-        let viewport_width = f64::from(viewport.width());
+        let travel_width = f64::from(bounds.width());
         // A window-landing swipe keeps the strip under the fingers, so its
         // velocity only decides a flick, never adds travel of its own.
         if scroll.is_user_swiping
@@ -1258,7 +1432,7 @@ fn scrolling_integrator(
             continue;
         }
         if scroll.settle.is_none() && scroll.velocity.abs() > 0.0001 {
-            scroll.position += scroll.velocity * dt * viewport_width * direction;
+            scroll.position += scroll.velocity * dt * travel_width * direction;
         }
     }
 }
@@ -1266,11 +1440,15 @@ fn scrolling_integrator(
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_scrolling_constraints(
     strips: ScrollingStrips,
+    moves: CoverMoves,
     displays: StripDisplays,
     windows: Windows,
     config: Res<Config>,
 ) {
-    for (_, strip, child, fullscreen, mut position, mut scroll) in strips {
+    for (entity, strip, child, fullscreen, mut position, mut scroll) in strips {
+        if awaits_cover(entity, &scroll, &moves) {
+            continue;
+        }
         let Some((_, viewport)) = viewports(child, &displays, &config) else {
             continue;
         };
@@ -1297,6 +1475,8 @@ fn constrain(
     windows: &Windows,
     config: &Config,
 ) {
+    let caught = std::mem::take(&mut scroll.caught);
+    let width = f64::from(viewport.width());
     if scroll.is_user_swiping
         && settling
         && let Some(fitted) = fitted_offsets(strip, windows, viewport)
@@ -1304,8 +1484,10 @@ fn constrain(
         // Keep the raw finger position in `scroll.position`, so the stretch
         // eases off along the same curve when the fingers turn back.
         let anchor = scroll.anchor.clamp(fitted.0, fitted.1);
-        let stretch = scroll.position - anchor;
-        position.x = round_px(anchor + resist(stretch, f64::from(viewport.width())));
+        catch_at(scroll, caught, (anchor, anchor), width);
+        let (shown, slope) = resisted(scroll, (anchor, anchor), width);
+        position.x = round_px(shown);
+        scroll.slope = slope;
         return;
     }
 
@@ -1330,14 +1512,50 @@ fn constrain(
             landing(from, Some(step), strip, windows, viewport).map(|(_, offset)| f64::from(offset))
         };
         if let (Some(next), Some(previous)) = (reach(true), reach(false)) {
-            let shown = if scroll.position < next {
-                next + resist(scroll.position - next, f64::from(viewport.width()))
-            } else if scroll.position > previous {
-                previous + resist(scroll.position - previous, f64::from(viewport.width()))
-            } else {
-                scroll.position
-            };
+            catch_at(scroll, caught, (next, previous), width);
+            let (shown, slope) = resisted(scroll, (next, previous), width);
             position.x = round_px(shown);
+            scroll.slope = slope;
+            return;
+        }
+    }
+
+    // Past either end of a strip that overflows, the fingers stretch it with
+    // resistance, as they stretch a strip that fits, and a settle can swing a
+    // little past an end before it lands there.
+    if settling
+        && fitted_offsets(strip, windows, viewport).is_none()
+        && let Some(range) = settle_range(strip, windows, viewport)
+    {
+        let (start, end) = (f64::from(*range.start()), f64::from(*range.end()));
+        let swiping = scroll.is_user_swiping && !lands_on_window(config, scroll.input);
+        if swiping {
+            catch_at(scroll, caught, (start, end), width);
+        }
+        let past_an_end = !(start..=end).contains(&scroll.position);
+        if swiping && (past_an_end || scroll.excess.is_some()) {
+            // Held within a viewport past either end, so fingers that turn
+            // back soon move the strip again.
+            let hold = (start - width, end + width);
+            scroll.position = scroll.position.clamp(hold.0, hold.1);
+            let (shown, slope) = resisted(scroll, (start, end), width);
+            position.x = round_px(shown);
+            scroll.slope = if pushed_against(scroll, scroll.position, hold, config) {
+                0.0
+            } else {
+                slope
+            };
+            return;
+        }
+        if !scroll.is_user_swiping && scroll.settle.is_some() && past_an_end {
+            // A settle swings a little past an end, and never past where it
+            // began, which a strip stretched or caught further out may be.
+            let swing = width / 8.0;
+            let from = scroll.ease.map_or(scroll.position, |ease| ease.from);
+            let (low, high) = ((start - swing).min(from), (end + swing).max(from));
+            let held = !(low..=high).contains(&scroll.position);
+            position.x = round_px(scroll.position.clamp(low, high));
+            scroll.slope = if held { 0.0 } else { 1.0 };
             return;
         }
     }
@@ -1352,6 +1570,20 @@ fn constrain(
         config,
     ) {
         position.x = clamped_offset;
+        // A strip the clamp holds at an end does not move with the fingers,
+        // nor one at the end that they push on past it.
+        let rounded = round_px(scroll.position);
+        let outward = scroll.velocity * direction_modifier(config);
+        #[allow(clippy::cast_possible_truncation)]
+        let pushed = rounded + outward.signum() as i32;
+        let held = outward != 0.0
+            && clamp_viewport_offset(pushed, strip, windows, &get_window_frame, &viewport, config)
+                == Some(clamped_offset);
+        scroll.slope = if clamped_offset != rounded || held {
+            0.0
+        } else {
+            1.0
+        };
         // A settle's last pixels move less than one per frame, so it keeps
         // the fraction rounding would discard unless the clamp bit.
         if scroll.settle.is_none() || clamped_offset != round_px(scroll.position) {
@@ -1359,6 +1591,7 @@ fn constrain(
         }
     } else {
         scroll.velocity = 0.0;
+        scroll.slope = 0.0;
     }
 }
 
@@ -1416,6 +1649,7 @@ where
 #[cfg(test)]
 mod paging_tests {
     use super::*;
+    use crate::config::MainOptions;
 
     #[test]
     fn large_swipe_preserves_every_earned_step_without_expanding_the_queue() {
@@ -1441,5 +1675,61 @@ mod paging_tests {
             ..Default::default()
         };
         assert!(state.has_work());
+    }
+
+    #[test]
+    fn settled_at_handles_disabled_non_flick_and_keeps_flick_speed_across_config_reloads() {
+        let ease = SettleEase {
+            from: 0.0,
+            start: 0.0,
+            elapsed: 0.016,
+            animation_speed: 14.0,
+            flick: None,
+        };
+        let off: Config = (
+            MainOptions {
+                animation_speed: None,
+                ..MainOptions::default()
+            },
+            vec![],
+        )
+            .into();
+        assert_eq!(settled_at(&ease, 0.016, -200.0, &off), None);
+
+        let sub_frame: Config = (
+            MainOptions {
+                animation_speed: Some(1000.0),
+                ..MainOptions::default()
+            },
+            vec![],
+        )
+            .into();
+        assert_eq!(settled_at(&ease, 0.016, -200.0, &sub_frame), None);
+
+        let flick_ease = SettleEase {
+            flick: Some(1500.0),
+            ..ease
+        };
+        let fast: Config = (
+            MainOptions {
+                animation_speed: Some(40.0),
+                ..MainOptions::default()
+            },
+            vec![],
+        )
+            .into();
+        let slow: Config = (
+            MainOptions {
+                animation_speed: Some(4.0),
+                ..MainOptions::default()
+            },
+            vec![],
+        )
+            .into();
+        assert_eq!(
+            settled_at(&flick_ease, 0.05, -200.0, &fast),
+            settled_at(&flick_ease, 0.05, -200.0, &slow),
+            "flick keeps the animation_speed captured when the settle began"
+        );
     }
 }

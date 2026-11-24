@@ -1,6 +1,7 @@
-//! A keyboard slide eases out from the key press. The engine's sleep before
-//! the press is not animation time, so the first step covers the share of one
-//! animation frame, as every later step does.
+//! A keyboard slide eases along the curve every window motion follows, from
+//! the key press. The engine's sleep before the press is not animation time,
+//! so the first step covers one animation frame of the curve, as every later
+//! step does.
 
 use std::time::Duration;
 
@@ -9,8 +10,7 @@ use bevy::time::TimeUpdateStrategy;
 
 use crate::commands::{Command, Direction, Operation};
 use crate::config::{Config, MainOptions};
-use crate::ecs::scroll::{handoff_slope, settle_curve};
-use crate::ecs::systems::ease_out_factor;
+use crate::ecs::ease;
 use crate::ecs::{RepositionMarker, Scrolling};
 use crate::events::Event;
 use crate::platform::WinID;
@@ -129,10 +129,22 @@ fn swap_steps(idle: Duration, frame: Duration, frames: usize) -> Vec<f64> {
         .collect()
 }
 
-/// How far an ease-out of `delta` goes, as a share of the whole move, after
-/// `covered` of it is behind.
-fn ease_share(delta: Duration, covered: f64) -> f64 {
-    f64::from(ease_out_factor(SPEED, delta.as_secs_f64())) * (1.0 - covered)
+/// How far the passes of a slide go, as shares of the whole move, when
+/// they follow each other by `deltas`.
+fn ease_shares(deltas: &[Duration]) -> Vec<f64> {
+    let duration = ease::duration_at(SPEED);
+    let mut elapsed = 0.0;
+    let mut previous = 0.0;
+    deltas
+        .iter()
+        .map(|delta| {
+            elapsed += delta.as_secs_f64();
+            let at = ease::curve(elapsed / duration);
+            let share = at - previous;
+            previous = at;
+            share
+        })
+        .collect()
 }
 
 /// Rounding to whole points can move a step by one point.
@@ -147,17 +159,10 @@ fn assert_share(step: f64, want: f64, what: &str) {
 #[test]
 fn a_swap_after_an_idle_sleep_starts_with_one_frame_of_ease() {
     let steps = swap_steps(IDLE_SLEEP, ACTIVE_FRAME, 2);
+    let want = ease_shares(&[ACTIVE_FRAME, ACTIVE_FRAME]);
 
-    assert_share(
-        steps[0],
-        ease_share(ACTIVE_FRAME, 0.0),
-        "the pass the key woke",
-    );
-    assert_share(
-        steps[1],
-        ease_share(ACTIVE_FRAME, steps[0]),
-        "the next pass",
-    );
+    assert_share(steps[0], want[0], "the pass the key woke");
+    assert_share(steps[1], want[1], "the next pass");
 }
 
 /// A frame that runs late during a slide still counts its whole time, so the
@@ -166,12 +171,9 @@ fn a_swap_after_an_idle_sleep_starts_with_one_frame_of_ease() {
 fn a_late_frame_during_a_swap_counts_its_whole_time() {
     let late = Duration::from_millis(25);
     let steps = swap_steps(ACTIVE_FRAME, late, 2);
+    let want = ease_shares(&[ACTIVE_FRAME, late]);
 
-    assert_share(
-        steps[1],
-        ease_share(late, steps[0]),
-        "the late pass after the start",
-    );
+    assert_share(steps[1], want[1], "the late pass after the start");
 }
 
 /// Whether the fingers are on the trackpad, while a swipe or its settle runs.
@@ -183,9 +185,10 @@ fn swiping(world: &mut World) -> Option<bool> {
         .map(|scrolling| scrolling.is_user_swiping)
 }
 
-/// Once the fingers lift, a strip that fits the display slides back over
-/// 7 / `animation_speed` seconds. It resisted the fingers, so it starts from
-/// rest, with no jump at the lift, and slows into where it was.
+/// Once the fingers lift, a strip that fits the display slides back along
+/// the curve every window motion follows, over about 237 ms at Miri's speed. It
+/// resisted the fingers, so it starts from rest, with no jump at the lift,
+/// and slows into where it was.
 #[test]
 fn a_spring_back_eases_in_and_out() {
     let mut harness = harness();
@@ -209,13 +212,13 @@ fn a_spring_back_eases_in_and_out() {
     assert_eq!(x(&harness), rest, "the strip springs back to where it was");
     assert!(left[0].abs() > 10.0, "the swipe moved the strip: {left:?}");
 
-    let duration = 7.0 / SPEED;
+    let duration = ease::duration_at(SPEED);
     let frame = ACTIVE_FRAME.as_secs_f64();
-    // 0.5 s of 16 ms passes.
-    assert_eq!(left.len(), 32, "the settle lasts {duration} s: {left:?}");
+    // 237 ms of 16 ms passes, after the pass the fingers lifted on.
+    assert_eq!(left.len(), 15, "the settle lasts {duration} s: {left:?}");
     for (pass, at) in left.iter().enumerate().skip(1) {
         #[allow(clippy::cast_precision_loss, reason = "a few dozen passes")]
-        let progress = settle_curve(pass as f64 * frame / duration, 0.0);
+        let progress = ease::curve(pass as f64 * frame / duration);
         let want = left[0] * (1.0 - progress);
         assert!(
             (at - want).abs() <= 1.0,
@@ -224,41 +227,34 @@ fn a_spring_back_eases_in_and_out() {
     }
 }
 
-/// The settle curve runs from 0 to 1 without overshooting, for every slope
-/// a hand-off can give it, and starts at that slope.
-#[test]
-fn the_settle_curve_starts_at_its_slope_and_never_overshoots() {
-    for slope in [0.0, 0.5, 1.0, 2.0, 3.0] {
-        assert!(settle_curve(0.0, slope).abs() < 1e-12);
-        assert!((settle_curve(1.0, slope) - 1.0).abs() < 1e-12);
-        let h = 1e-6;
-        let start = settle_curve(h, slope) / h;
-        assert!(
-            (start - slope).abs() < 1e-3,
-            "slope {slope} starts at {start}"
-        );
-        let mut previous = 0.0;
-        for step in 1..=1000 {
-            let at = settle_curve(f64::from(step) / 1000.0, slope);
-            assert!(
-                at >= previous && at <= 1.0 + 1e-12,
-                "slope {slope}: {at} after {previous}"
-            );
-            previous = at;
-        }
-    }
+/// How fast the curve moves at `s` toward its end, as a multiple of the
+/// average speed that would cover what is left in the whole time.
+fn speed_for_what_is_left(s: f64) -> f64 {
+    let h = 1e-6;
+    (ease::curve(s + h) - ease::curve(s)) / h / (1.0 - ease::curve(s))
 }
 
-/// A strip moving toward its landing carries its speed into the settle. One
-/// moving away, or still, starts from rest, and a fast one is capped where
-/// the curve would overshoot.
+/// A strip moving toward its landing carries its speed into the settle: it
+/// enters the curve where the curve moves at that speed. One moving away,
+/// or still, starts from rest, and so does one already at its landing.
 #[test]
 fn a_settle_carries_on_the_speed_toward_its_landing() {
     // 400 points over 0.5 s averages 800 points per second.
-    assert!((handoff_slope(800.0, 400.0, 0.5) - 1.0).abs() < 1e-12);
-    assert!((handoff_slope(-800.0, -400.0, 0.5) - 1.0).abs() < 1e-12);
-    assert!(handoff_slope(-800.0, 400.0, 0.5).abs() < 1e-12);
-    assert!(handoff_slope(0.0, 400.0, 0.5).abs() < 1e-12);
-    assert!(handoff_slope(800.0, 0.0, 0.5).abs() < 1e-12);
-    assert!((handoff_slope(10_000.0, 400.0, 0.5) - 3.0).abs() < 1e-12);
+    for (velocity, distance) in [(800.0, 400.0), (-800.0, -400.0), (4000.0, 400.0)] {
+        let start = ease::entry_for_speed(velocity, distance, 0.5);
+        assert!(start > 0.0 && start < 1.0, "{velocity} enters at {start}");
+        let want = velocity * 0.5 / distance;
+        let speed = speed_for_what_is_left(start);
+        assert!(
+            (speed - want).abs() < 1e-3 * want,
+            "{velocity} enters at {start}, moving at {speed}, not {want}"
+        );
+    }
+    assert!(ease::entry_for_speed(-800.0, 400.0, 0.5).abs() < 1e-12);
+    assert!(ease::entry_for_speed(0.0, 400.0, 0.5).abs() < 1e-12);
+    assert!(ease::entry_for_speed(800.0, 0.0, 0.5).abs() < 1e-12);
+    // The curve starts from rest, so even a slow strip enters a little way
+    // in.
+    let slow = ease::entry_for_speed(100.0, 400.0, 0.5);
+    assert!(slow > 0.0 && slow < 0.05, "100 enters at {slow}");
 }

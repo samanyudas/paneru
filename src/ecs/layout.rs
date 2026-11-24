@@ -89,16 +89,22 @@ type StripPlacements<'w, 's> = Query<
         Option<&'static RepositionMarker>,
         Option<&'static Scrolling>,
         Has<PreviousStripPosition>,
+        Option<&'static crate::ecs::strip_cover::CoverSlide>,
     ),
 >;
 
-/// Where a strip is headed: the target of an animation in flight, else the
-/// offset a swipe is settling on, else where it is now.
+/// Where a strip is headed: the target of an animation in flight or of a
+/// slide under the picture cover, else the offset a swipe is settling on,
+/// else where it is now.
 fn strip_destination(
     position: &Position,
     reposition: Option<&RepositionMarker>,
     scrolling: Option<&Scrolling>,
+    cover: Option<&crate::ecs::strip_cover::CoverSlide>,
 ) -> Origin {
+    if let Some(heading) = cover.and_then(crate::ecs::strip_cover::CoverSlide::heading) {
+        return heading;
+    }
     reposition.map_or_else(
         || {
             scrolling
@@ -140,7 +146,12 @@ type StripsForWindowPositioning<'w, 's> = Query<
         Has<Scrolling>,
         &'static ChildOf,
     ),
-    With<LayoutStrip>,
+    // A strip swiped under the picture cover keeps its windows where they
+    // are until the swipe lands.
+    (
+        With<LayoutStrip>,
+        Without<crate::ecs::strip_cover::CoverSwipe>,
+    ),
 >;
 
 /// Windows whose size or target size changed this tick — the strip holding them
@@ -2596,6 +2607,7 @@ type ViewportStrips<'w, 's> = Query<
         Option<&'static Scrolling>,
         Has<SelectedVirtualMarker>,
         Has<PreviousStripPosition>,
+        Option<&'static crate::ecs::strip_cover::CoverSlide>,
     ),
 >;
 
@@ -2669,7 +2681,9 @@ fn follow_viewport(
     commands: &mut Commands,
 ) {
     let focused = windows.focused().map(|(_, entity)| entity);
-    for (entity, mut strip, child, position, reposition, scrolling, selected, parked) in strips {
+    for (entity, mut strip, child, position, reposition, scrolling, selected, parked, cover) in
+        strips
+    {
         let Some(shift) = shift(child.parent()) else {
             continue;
         };
@@ -2677,7 +2691,7 @@ fn follow_viewport(
         if !selected || parked {
             continue;
         }
-        let destination = strip_destination(position, reposition, scrolling);
+        let destination = strip_destination(position, reposition, scrolling, cover);
         let target = displays
             .get(child.parent())
             .ok()
@@ -2812,9 +2826,15 @@ fn resolve_strip_scroll_context<'a>(
         strip_reposition,
         strip_scrolling,
         has_previous_position,
+        strip_cover,
     ) = strips.into_iter().find(|strip| strip.0.contains(entity))?;
     let (display, dock) = displays.get(child.parent()).ok()?;
-    let strip_target = strip_destination(strip_position, strip_reposition, strip_scrolling);
+    let strip_target = strip_destination(
+        strip_position,
+        strip_reposition,
+        strip_scrolling,
+        strip_cover,
+    );
     Some(StripScrollContext {
         strip,
         strip_entity,
@@ -3000,6 +3020,12 @@ pub(super) fn reshuffle_layout_strip(
             }
         }
 
+        // A strip that rests where it heads has no move to make. A marker
+        // for it would still count as a strip move, and end a swipe or the
+        // picture cover over it.
+        if strip_position == strip_target && strip_position == ctx.strip_origin {
+            continue;
+        }
         trace!("reshuffle_layout_strip: triggered for entity {entity}, offset {strip_position}");
         commands.reposition_entity(strip_entity, strip_position);
     }
@@ -3013,7 +3039,7 @@ pub(super) fn reshuffle_layout_strip(
 /// shortfall — never to anchor the entity to a particular position.
 #[allow(clippy::type_complexity)]
 #[instrument(level = Level::DEBUG, skip_all)]
-fn ensure_visible_in_strip(
+pub(crate) fn ensure_visible_in_strip(
     markers: Query<(Entity, &LayoutPosition, &EnsureVisibleMarker)>,
     mut strip_params: ParamSet<(
         StripPlacements,
@@ -3098,7 +3124,7 @@ fn ensure_visible_in_strip(
 /// Reacts to changes in the position or target offset of the `LayoutStrip`, and
 /// marks all the windows in the strip as requiring re-positioning.
 #[instrument(level = Level::DEBUG, skip_all)]
-pub(super) fn position_layout_strips(
+pub(crate) fn position_layout_strips(
     moved_strips: MovedStrips,
     mut windows: Query<&mut LayoutPosition, (With<Window>, Without<LayoutStrip>)>,
 ) {

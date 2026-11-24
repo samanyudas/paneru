@@ -27,13 +27,14 @@ use objc2_core_graphics::CGImage;
 use tracing::{debug, warn};
 
 use crate::config::Config;
+use crate::ecs::ease::SlideEase;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{LayoutStrip, lies_mostly_elsewhere};
 use crate::ecs::pacing::{self, SlideHolds};
 use crate::ecs::shared_edge::{
     EdgeSlice, Hold, PhotoWait, Slide, showing_edge_slices, showing_may_change, shown_in,
 };
-use crate::ecs::systems::{self, AnimationStep, ease_out_factor, ease_step};
+use crate::ecs::systems::{self, ease_step};
 use crate::ecs::{
     Position, PostUpdateSet, PresentedOrigin, RepositionMarker, Scrolling, SelectedVirtualMarker,
     UpdateSet,
@@ -116,6 +117,11 @@ pub(crate) struct Digest(pub u64);
 pub(crate) struct Photo {
     pub digest: Digest,
     pub image: CFRetained<CGImage>,
+    /// The colour of the photo's opaque surface near its right edge, as red,
+    /// green, blue and alpha from 0 to 1 in the image's colour space. A
+    /// resize's cover fills the strip it opens right of a picture with it.
+    /// `None` when the photo shows no opaque surface there.
+    pub edge_color: Option<[f64; 4]>,
 }
 
 /// Why a photo did not arrive.
@@ -1016,10 +1022,11 @@ type Sliding<'w, 's> = Query<
         &'static mut Position,
         &'static PresentedOrigin,
         Has<EdgeSlice>,
+        &'static mut SlideEase,
     ),
 >;
 
-/// Moves each sliding photo one step of the row's ease toward where layout
+/// Moves each sliding photo one step of its slide's ease toward where layout
 /// puts its window. Once the photo arrives, the window moves there under it,
 /// and the photo closes when the window server shows the window there, or
 /// after [`LANDING_TIMEOUT`] if it does not. Until then the window holds
@@ -1032,12 +1039,11 @@ fn slide_photos(
     slices: Res<Slices>,
     holds: Res<SlideHolds>,
     time: Res<Time>,
-    step: Res<AnimationStep>,
-    config: Res<Config>,
     mut commands: Commands,
 ) {
-    let t = ease_out_factor(config.animation_speed(), step.secs());
-    for (entity, window, mut slide, mut position, presented, tucked) in &mut sliding {
+    for (entity, window, mut slide, mut position, presented, tucked, mut ease) in &mut sliding {
+        // The slide's ease has stepped this frame, before pacing.
+        let t = ease.0.t();
         let id = window.id();
         let Ok(mut entity_commands) = commands.get_entity(entity) else {
             continue;
@@ -1045,9 +1051,12 @@ fn slide_photos(
         match *slide {
             Slide::Moving { at, from } => {
                 let shows = slices.has_photo(id, from.slice.size);
-                let (next, arrived) = ease_step(at, presented.0, t);
-                let next = holds.limit(entity, at, next);
+                let (stepped, arrived) = ease_step(at, presented.0, t);
+                let next = holds.limit(entity, at, stepped);
                 let arrived = arrived && next == presented.0;
+                if stepped != at && next == at && !arrived {
+                    ease.0.restart();
+                }
                 let moved = displays
                     .get(from.slice.display)
                     .ok()
@@ -1111,17 +1120,18 @@ fn slide_photos_out(
     holds: Res<SlideHolds>,
     access: Res<SliceAccess>,
     time: Res<Time>,
-    step: Res<AnimationStep>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let t = ease_out_factor(config.animation_speed(), step.secs());
     let mut moved_out = Vec::<Out>::new();
     for (entity, waits) in Out::nearest_first(&sliding, &slices, time.elapsed()) {
-        let Ok((entity, window, mut slide, mut position, presented, _)) = sliding.get_mut(entity)
+        let Ok((entity, window, mut slide, mut position, presented, _, mut ease)) =
+            sliding.get_mut(entity)
         else {
             continue;
         };
+        // The slide's ease has stepped this frame, before pacing.
+        let t = ease.0.t();
         let id = window.id();
         let Ok(mut entity_commands) = commands.get_entity(entity) else {
             continue;
@@ -1137,6 +1147,9 @@ fn slide_photos_out(
                 let photo = slices.photo(id);
                 if photo.is_some_and(|photo| photo.shown().is_some()) {
                     position.0 = presented.0;
+                    if ease.0.is_finished() {
+                        ease.0.restart();
+                    }
                     *slide = Slide::Tucking {
                         at,
                         to,
@@ -1219,10 +1232,14 @@ fn slide_photos_out(
                 if position.0 != presented.0 {
                     position.0 = presented.0;
                 }
-                let (next, arrived) = ease_step(at, to, t);
-                let next = Out::of(&slide).map_or(next, |out| out.beside(&moved_out, next, false));
+                let (stepped, arrived) = ease_step(at, to, t);
+                let next =
+                    Out::of(&slide).map_or(stepped, |out| out.beside(&moved_out, stepped, false));
                 let next = holds.limit(entity, at, next);
                 let arrived = arrived && next == to;
+                if stepped != at && next == at && !arrived {
+                    ease.0.restart();
+                }
                 let moved = displays
                     .get(slice.display)
                     .ok()

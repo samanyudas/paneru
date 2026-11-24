@@ -1364,24 +1364,35 @@ fn drag_input(
             point,
             button,
             window_id,
+            clicks,
             ..
         } => {
-            // The window the tap saw under the press, because by now the
-            // pressed window may have moved off the point.
-            let on_top = window_id.and_then(find).or_else(|| {
-                window_manager
-                    .find_window_at_point(point)
-                    .ok()
-                    .and_then(find)
-            });
+            // A multi-click (such as a title-bar double-click to maximize or
+            // restore) never starts a window drag, and ends any pending
+            // press/release hold from the first click so layout and the
+            // picture cover run on the same frame as the toggle.
+            let window = if *clicks > 1 {
+                None
+            } else {
+                // The window the tap saw under the press, because by now the
+                // pressed window may have moved off the point.
+                let on_top = window_id.and_then(find).or_else(|| {
+                    window_manager
+                        .find_window_at_point(point)
+                        .ok()
+                        .and_then(find)
+                });
+                pressed_window(origin_from(*point), on_top, moves, presented, placements).map(
+                    |window| PressedWindow {
+                        on_resize_edge: resize.resizes(window.entity, now),
+                        ..window
+                    },
+                )
+            };
             DragInput::Down {
                 point: origin_from(*point),
                 button: *button,
-                window: pressed_window(origin_from(*point), on_top, moves, presented, placements)
-                    .map(|window| PressedWindow {
-                        on_resize_edge: resize.resizes(window.entity, now),
-                        ..window
-                    }),
+                window,
             }
         }
         Event::MouseDragged {

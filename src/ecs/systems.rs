@@ -22,8 +22,8 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     AccessibilityProbe, ActiveDisplayMarker, AwaitingAccessibility, BProcess, ExistingMarker,
-    FreshMarker, RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
-    VerifyWindowPosition, VerifyWindowSize,
+    FreshMarker, PlacedUnderCover, RepositionMarker, ResizeMarker, ResizeMotion, RetryFrontSwitch,
+    SpawnWindowTrigger, Timeout, VerifyWindowPosition, VerifyWindowSize,
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
@@ -31,6 +31,7 @@ use crate::ecs::display::FloatingLayer;
 use crate::ecs::drag::{
     DragOverlayHandle, DragState, NativeFrame, NativeResizeStart, TilingRestore, tiled_in,
 };
+use crate::ecs::ease::{self, PositionEase, SizeEase};
 use crate::ecs::layout::{Column, LayoutStrip, RestoreTo};
 use crate::ecs::maximize::{FloatingMaximized, FrameHold};
 use crate::ecs::native_membership::{NativeMembership, NativeScope, stranded};
@@ -95,6 +96,7 @@ type ChangedWindowFrames<'w, 's> = Populated<
         Option<Ref<'static, Position>>,
         Option<Ref<'static, Bounds>>,
         Option<&'static mut WidthRatio>,
+        Has<PlacedUnderCover>,
     ),
     (
         Or<(Changed<Position>, Changed<Bounds>)>,
@@ -741,21 +743,9 @@ pub(crate) fn step_animation_clock(
     step.secs = animation_step(time.delta_secs_f64(), step.idle_sleep, activity.mid_frame());
 }
 
-/// Fraction of the remaining distance an exponential ease-out consumes in a
-/// frame, given a decay `rate` (per second) and the pass's [`AnimationStep`]
-/// `delta` in seconds. Shared by every animator so they never drift out of step.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "clamped to [0, 1], well within f32's range; only sub-pixel precision is lost"
-)]
-pub(crate) fn ease_out_factor(rate: f64, delta: f64) -> f32 {
-    (1.0 - (-rate * delta).exp()).clamp(0.0, 1.0) as f32
-}
-
-/// One step of the reposition ease from `current` toward `target` by the
-/// fraction `t`: where it lands, and whether that is `target`. Snaps once
-/// within a pixel of the target (or after one effectively-complete tick), so
-/// the move ends promptly.
+/// One step of an ease from `current` toward `target` by the fraction `t`
+/// of what is left: where it lands, and whether that is `target`. Snaps
+/// once within a few points of the target, so the move ends promptly.
 pub(crate) fn ease_step(current: Origin, target: Origin, t: f32) -> (Origin, bool) {
     let lerped = current.as_vec2().lerp(target.as_vec2(), t);
     if (target.as_vec2() - lerped).length() <= ANIAMTE_SNAP_THRESHOLD {
@@ -765,40 +755,77 @@ pub(crate) fn ease_step(current: Origin, target: Origin, t: f32) -> (Origin, boo
     }
 }
 
-/// This is a Bevy system that runs on `Update`. It smoothly moves windows to their target
-/// positions, as indicated by the `RepositionMarker` component.
-/// Animation speed is controlled by the `animation_speed` in the `Config`.
-/// When a window reaches its target position, the `RepositionMarker` is removed.
-///
-/// # Arguments
-///
-/// * `windows` - A `Populated` query for `(&mut Window, Entity, &RepositionMarker)` components.
-/// * `displays` - A query for all `Display` entities, used to get display bounds and menubar height.
-/// * `step` - The pass's [`AnimationStep`], the time each ease steps by.
-/// * `config` - The `Config` resource, used for animation speed.
+/// The curve and duration of a motion: a resize's short ease-out, or the
+/// spring.
+fn motion_curve(resizing: bool, config: &Config) -> (ease::Curve, f64) {
+    if resizing {
+        (ease::Curve::EaseOut, ease::resize_duration(config))
+    } else {
+        (ease::Curve::Spring, ease::duration(config))
+    }
+}
+
+/// Each moving entity, its ease, and whether a resize moves it.
+type Moves = (
+    &'static mut Position,
+    Entity,
+    Ref<'static, RepositionMarker>,
+    &'static mut PositionEase,
+    Has<ResizeMotion>,
+);
+
+/// Each resizing entity, its ease, and whether a resize moves it.
+type Resizes = (
+    &'static mut Bounds,
+    Entity,
+    Ref<'static, ResizeMarker>,
+    &'static mut SizeEase,
+    Has<ResizeMotion>,
+);
+
+/// An entity whose resize motion has no move or resize left.
+type ResizeMotionsDone = (
+    With<ResizeMotion>,
+    Without<RepositionMarker>,
+    Without<ResizeMarker>,
+);
+
+/// This is a Bevy system that runs on `Update`. It moves windows to their
+/// target positions, as indicated by the `RepositionMarker` component, along
+/// the curve in [`ease`](crate::ecs::ease), which `animation_speed` in the
+/// `Config` makes shorter or longer. Each new target, or a marker set afresh,
+/// starts a motion that carries on the speed the window had, so a window that
+/// chases a target that moves keeps up with it. The window's
+/// [`PositionEase`] stays once the move ends, so a move that follows at once
+/// carries its speed on.
 ///
 /// [`finish_repositions`] ends the move once the window is at its target.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
+    animate: Populated<Moves>,
     step: Res<AnimationStep>,
+    time: Res<Time>,
     config: Res<Config>,
 ) {
-    // Frame-rate-independent exponential smoothing (ease-out).
-    // `animation_speed` is the decay rate (per second); higher = snappier.
-    let t = ease_out_factor(config.animation_speed(), step.secs());
-
-    animate
-        .into_iter()
-        .for_each(|(mut position, entity, RepositionMarker(origin))| {
-            let (new_pos, _) = ease_step(position.0, *origin, t);
-
-            trace!(
-                "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
-                position.0,
-            );
-            position.0 = new_pos;
-        });
+    let now = time.elapsed_secs_f64();
+    for (mut position, entity, marker, mut ease, resizing) in animate {
+        let (curve, duration) = motion_curve(resizing, &config);
+        let RepositionMarker(origin) = *marker;
+        let t = ease.0.step_on(
+            curve,
+            position.0,
+            origin,
+            marker.is_added(),
+            (now, step.secs()),
+            duration,
+        );
+        let (new_pos, _) = ease_step(position.0, origin, t);
+        trace!(
+            "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
+            position.0,
+        );
+        position.0 = new_pos;
+    }
 }
 
 /// Removes the `RepositionMarker` of each entity at its target. Runs after
@@ -817,43 +844,37 @@ pub(super) fn finish_repositions(
 }
 
 /// Animates window resizing.
-/// This is a Bevy system that runs on `Update`. It resizes windows to their target
-/// dimensions, as indicated by the `ResizeMarker` component.
+/// This is a Bevy system that runs on `Update`. It resizes windows to their
+/// target dimensions, as indicated by the `ResizeMarker` component, along the
+/// same curve and at the same pace as [`animate_entities`], so a window that
+/// moves and resizes at once keeps both in step.
 /// [`finish_resizes`] ends the resize once the window has its target size.
-///
-/// # Arguments
-///
-/// * `windows` - A `Populated` query for `(&mut Window, Entity, &ResizeMarker)` components.
-/// * `active_display` - An `ActiveDisplay` system parameter providing immutable access to the active display.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
-    animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
+    animate: Populated<Resizes>,
     step: Res<AnimationStep>,
+    time: Res<Time>,
     config: Res<Config>,
 ) {
-    // Matches animate_entities: exponential ease-out, frame-rate independent.
-    let t = ease_out_factor(config.animation_speed(), step.secs());
-
-    animate
-        .into_iter()
-        .for_each(|(mut bounds, entity, ResizeMarker(size))| {
-            let target = size.as_vec2();
-            let current = bounds.0.as_vec2();
-            let lerped = current.lerp(target, t);
-
-            let finished = (target - lerped).length() <= ANIAMTE_SNAP_THRESHOLD;
-            let new_size = if finished {
-                *size
-            } else {
-                lerped.round().as_ivec2()
-            };
-
-            trace!(
-                "entity {entity} source {} dest {size} t {t:.3} resizing to {new_size}",
-                bounds.0,
-            );
-            bounds.0 = new_size;
-        });
+    let now = time.elapsed_secs_f64();
+    for (mut bounds, entity, marker, mut ease, resizing) in animate {
+        let (curve, duration) = motion_curve(resizing, &config);
+        let ResizeMarker(size) = *marker;
+        let t = ease.0.step_on(
+            curve,
+            bounds.0,
+            size,
+            marker.is_added(),
+            (now, step.secs()),
+            duration,
+        );
+        let (new_size, _) = ease_step(bounds.0, size, t);
+        trace!(
+            "entity {entity} source {} dest {size} t {t:.3} resizing to {new_size}",
+            bounds.0,
+        );
+        bounds.0 = new_size;
+    }
 }
 
 /// Removes the `ResizeMarker` of each entity at its target size. Runs after
@@ -867,6 +888,18 @@ pub(super) fn finish_resizes(
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
             entity_commands.try_remove::<ResizeMarker>();
+        }
+    }
+}
+
+/// Ends the [`ResizeMotion`] of each entity with no move or resize left.
+pub(super) fn finish_resize_motions(
+    done: Populated<Entity, ResizeMotionsDone>,
+    mut commands: Commands,
+) {
+    for entity in &done {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<ResizeMotion>();
         }
     }
 }
@@ -1619,9 +1652,22 @@ pub(super) struct OverlayWindowConfigCache {
     detected_border_radius: Option<f64>,
 }
 
+/// The active strip, and whether a swipe or a picture cover moves it.
+type ActiveStripMotion<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Has<Scrolling>,
+        Has<crate::ecs::strip_cover::CoverSlide>,
+        Has<crate::ecs::strip_cover::CoverMorph>,
+        &'static LayoutStrip,
+    ),
+    With<ActiveWorkspaceMarker>,
+>;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_overlays(
-    active_workspace: Populated<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
+    active_workspace: ActiveStripMotion,
     windows: Windows,
     applications: Query<&Application>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
@@ -1641,13 +1687,18 @@ pub(super) fn update_overlays(
     let dim_opacity = config.dim_inactive_opacity();
     let border_enabled = config.border_active_window();
 
+    if config.is_changed() {
+        window_config_cache.window_id = None;
+    }
+
     // Hide overlays during swipe, mission control, native fullscreen spaces,
     // or briefly after a space change (macOS space-switch animation).
-    let Some((swiping, active_strip)) = active_workspace.iter().next() else {
+    let Some((swiping, sliding, resizing, active_strip)) = active_workspace.iter().next() else {
         return;
     };
 
-    if swiping || mission_control_active.0 || active_strip.is_fullscreen() {
+    // A picture cover moves pictures, not the windows the overlays follow.
+    if swiping || sliding || resizing || mission_control_active.0 || active_strip.is_fullscreen() {
         overlay_mgr.hide_all();
         return;
     }
@@ -1736,7 +1787,7 @@ pub(super) fn commit_window_frame(
     let display_bounds = active_display.map(|display| display.bounds());
     windows
         .par_iter_mut()
-        .for_each(|(mut window, position, bounds, width_ratio)| {
+        .for_each(|(mut window, position, bounds, width_ratio, covered)| {
             let size = match (bounds, width_ratio, display_bounds) {
                 (Some(bounds), Some(mut width_ratio), Some(display_bounds)) => {
                     if bounds.is_changed() {
@@ -1748,13 +1799,30 @@ pub(super) fn commit_window_frame(
             };
             objc2::rc::autoreleasepool(|_| match (position, size) {
                 (Some(position), Some(size)) => {
-                    window.place(IRect::from_corners(position.0, position.0 + size));
+                    let frame = IRect::from_corners(position.0, position.0 + size);
+                    if covered {
+                        window.place_moved_first(frame);
+                    } else {
+                        window.place(frame);
+                    }
                 }
                 (Some(position), None) => window.reposition(position.0),
                 (None, Some(size)) => window.resize(size),
                 (None, None) => {}
             });
         });
+}
+
+/// Ends each window's [`PlacedUnderCover`] once its frame is written.
+pub(super) fn finish_covered_placements(
+    placed: Populated<Entity, With<PlacedUnderCover>>,
+    mut commands: Commands,
+) {
+    for entity in &placed {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<PlacedUnderCover>();
+        }
+    }
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
@@ -1795,6 +1863,7 @@ pub(super) fn verify_window_position(
 /// and puts every tiled window where [`exit_frame`] says, so none is left
 /// parked off-screen. A window in a strip stays on that strip's display.
 /// Floating, minimized, and hidden windows stay where they are.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
     mut all_windows: Query<ExitWindow>,
@@ -1803,8 +1872,14 @@ pub(crate) fn cleanup_on_exit(
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mut drag_overlay: Option<NonSendMut<DragOverlayHandle>>,
+    mut covers: Option<NonSendMut<crate::ecs::strip_cover::CoverScreenHandle>>,
 ) {
     for _ in exit_events.read() {
+        if let Some(ref mut covers) = covers {
+            for display in covers.0.shown() {
+                covers.0.hide(display);
+            }
+        }
         // First, because restoring windows below goes through slow
         // accessibility calls, and a drag line or symbol must not stay on
         // screen meanwhile.
@@ -2467,6 +2542,7 @@ mod frame_commit_tests {
                     position: true,
                     size: true,
                     size_limited: Arc::default(),
+                    move_first: false,
                 },
             );
         });

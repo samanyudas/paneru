@@ -292,6 +292,7 @@ fn photo(digest: u64) -> Photo {
     Photo {
         digest: Digest(digest),
         image: pixel(),
+        edge_color: None,
     }
 }
 
@@ -954,10 +955,17 @@ fn assert_slides_out(laid_out: (TestHarness, ScreenLog), id: WinID, focus: (Dire
         "window {id} moves with the row before its photo arrives: {:?} from {start:?}",
         seen[0].window
     );
-    assert_eq!(
-        seen[waiting].photo,
-        Some(seen[waiting - 1].window.intersect(DISPLAY)),
-        "the photo first shows where window {id} was"
+    // The window still moves when its photo arrives, so the photo first
+    // shows where it was or one step of its slide on, where the engine
+    // last asked for it.
+    let was = seen[waiting - 1].window.intersect(DISPLAY);
+    let step = seen[waiting - 2].window.intersect(DISPLAY).width() - was.width();
+    let first = seen[waiting].photo.expect("the photo shows");
+    assert!(
+        (first.min.x == was.min.x || first.max.x == was.max.x)
+            && (first.min.y, first.max.y) == (was.min.y, was.max.y)
+            && (0..=2 * step + 1).contains(&(was.width() - first.width())),
+        "the photo first shows where window {id} was, {was:?}, or a step of {step} on: {first:?}"
     );
     let mut places = seen[waiting..]
         .iter()
@@ -970,7 +978,9 @@ fn assert_slides_out(laid_out: (TestHarness, ScreenLog), id: WinID, focus: (Dire
         );
     }
     places.dedup();
-    assert!(places.len() >= 5, "the photo slides through {places:?}");
+    // The window covers most of its way in the 5 frames before its photo
+    // arrives, so the photo slides the rest in a few steps.
+    assert!(places.len() >= 3, "the photo slides through {places:?}");
 }
 
 #[test]
@@ -1351,7 +1361,8 @@ fn focus_away_during_a_slide_in_slides_the_photo_back_out() {
     harness
         .world()
         .write_message(command(Operation::Focus(Direction::Last)));
-    harness.advance(Duration::from_millis(60));
+    // Halfway along the curve, which starts gently, the photo is well in.
+    harness.advance(Duration::from_millis(160));
     let turned_at = panel().expect("the photo slides in");
 
     harness
@@ -3105,7 +3116,8 @@ fn the_column_ahead_waits_for_a_slow_window_landing_under_its_photo() {
             let photo = scanline(&harness, &log, &ids)
                 .into_iter()
                 .find(|run| run.window == SLOW && run.photo);
-            let near_rest = photo.is_some_and(|photo| photo.shown.min.x > -60);
+            // The curve lands the last stretch in a few frames.
+            let near_rest = photo.is_some_and(|photo| photo.shown.min.x > -120);
             if near_rest {
                 harness.mock_state.hold_writes(TEST_PROCESS_ID);
             }
@@ -3159,7 +3171,7 @@ fn the_column_ahead_waits_for_a_slow_window_landing_under_its_photo() {
 }
 
 /// The photo of window 3 slides in at the shared edge and pushes window 2,
-/// whose app shows nothing for four frames. Window 2 keeps its slide beside
+/// whose app shows nothing for nine frames. Window 2 keeps its slide beside
 /// the photo all the same, rather than only its first step: a photo shows
 /// each step at once and does not wait for the window ahead of it, so it
 /// would cover window 2 for the rest of the slide (miri#500).
@@ -3205,7 +3217,9 @@ fn a_window_pushed_by_a_photo_sliding_in_keeps_its_slide_while_its_app_shows_not
     // server.
     harness.advance(Duration::from_millis(20));
     let mut places = Vec::new();
-    for _ in 0..3 {
+    // The curve starts gently, so the photo leaves the edge after a few
+    // frames.
+    for _ in 0..8 {
         harness.advance(Duration::from_millis(20));
         let photo = log
             .borrow()
@@ -3230,9 +3244,279 @@ fn a_window_pushed_by_a_photo_sliding_in_keeps_its_slide_while_its_app_shows_not
         "window 2 moves on from {start}: {places:?}"
     );
     assert!(
-        places
-            .iter()
-            .all(|&(photo, asked)| photo.is_some_and(|photo| photo >= asked)),
+        places.iter().all(|&(photo, _)| photo.is_some()),
+        "the photo of window 3 shows: {places:?}"
+    );
+    // At the edge, the photo shows the sliver it rests as, over window 2 as
+    // at rest. Once it leaves the edge, it shows beside window 2.
+    let edge = TEST_DISPLAY_WIDTH - 5;
+    let off_edge = places
+        .iter()
+        .filter_map(|&(photo, asked)| {
+            photo
+                .filter(|&photo| photo < edge)
+                .map(|photo| (photo, asked))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        off_edge.len() >= 3,
+        "the photo of window 3 slides in while window 2's app shows nothing: {places:?}"
+    );
+    assert!(
+        off_edge.iter().all(|&(photo, asked)| photo >= asked),
         "the photo of window 3 never passes where window 2 is asked for: {places:?}"
+    );
+}
+
+#[test]
+fn step_slides_holds_zero_step_while_tucking_waits_with_animation_off() {
+    use crate::ecs::ease::SlideEase;
+    use crate::ecs::shared_edge::Slide;
+    use crate::manager::Window;
+
+    const FAST_APP: crate::platform::Pid = 2;
+    let log = Rc::new(RefCell::new(Screen::default()));
+    let mut harness = TestHarness::new()
+        .with_config(animated())
+        .with_display(EXT_DISPLAY_ID, LEFT, vec![EXT_WORKSPACE_ID])
+        .with_app(FAST_APP, "fast", "FastApp", |_| {});
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    for (id, width) in (0..).zip([600, 900, 400]) {
+        let pid = if id == 0 { TEST_PROCESS_ID } else { FAST_APP };
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness
+        .world()
+        .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    for _ in 0..100 {
+        queued_frame(&mut harness, true);
+    }
+    assert!(
+        in_view(harness.mock_state.ax_frame(0)),
+        "window 0 rests in view"
+    );
+
+    harness.mock_state.hold_writes(TEST_PROCESS_ID);
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::East)));
+    for _ in 0..10 {
+        queued_frame(&mut harness, false);
+        if !asks_for(&log, 0).is_empty() {
+            let ask = last_ask(&log, 0);
+            arrive(&mut harness, 0, ask, Ok(photo(7)));
+            queued_frame(&mut harness, false);
+            break;
+        }
+    }
+
+    let tucking_now = harness
+        .world()
+        .query::<(&Window, &Slide)>()
+        .iter(harness.world())
+        .any(|(w, s)| w.id() == 0 && matches!(s, Slide::Tucking { .. }) && w.write_pending());
+    assert!(
+        tucking_now,
+        "window 0 enters Slide::Tucking with pending write"
+    );
+
+    // Disable animation while Slide::Tucking still waits on window 0's pending write.
+    *harness.world().resource_mut::<Config>() = switch(true);
+    queued_frame(&mut harness, false);
+
+    let step = harness
+        .world()
+        .query::<(&Window, &Slide, &SlideEase)>()
+        .iter(harness.world())
+        .find(|(w, _, _)| w.id() == 0)
+        .map(|(_, s, ease)| {
+            assert!(
+                matches!(s, Slide::Tucking { .. }),
+                "stays in Slide::Tucking while waiting: {s:?}"
+            );
+            ease.0.t()
+        })
+        .expect("window 0 keeps SlideEase while waiting");
+    assert_eq!(
+        step, 0.0,
+        "step_slides holds zero step while Slide::Tucking waits with animation off"
+    );
+
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    for _ in 0..100 {
+        queued_frame(&mut harness, true);
+    }
+    assert!(
+        !in_view(harness.mock_state.ax_frame(0)),
+        "window 0 finishes tucking once writes release"
+    );
+}
+
+#[test]
+fn leaving_to_tucking_eases_photo_from_rest_after_edge_wait() {
+    use crate::ecs::shared_edge::Slide;
+    use crate::manager::Window;
+
+    let log = Rc::new(RefCell::new(Screen::default()));
+    let mut harness = TestHarness::new().with_config(animated()).with_display(
+        EXT_DISPLAY_ID,
+        LEFT,
+        vec![EXT_WORKSPACE_ID],
+    );
+    for (id, width) in (0..).zip([600, 900, 400]) {
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness
+        .world()
+        .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    for _ in 0..100 {
+        harness.advance(Duration::from_millis(20));
+    }
+
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::East)));
+    // Wait longer than the ~237 ms slide ease while withholding window 0's photo
+    // while window 0 stays in Slide::Leaving.
+    for _ in 0..18 {
+        harness.advance(Duration::from_millis(20));
+    }
+    let still_leaving = harness
+        .world()
+        .query::<(&Window, &Slide)>()
+        .iter(harness.world())
+        .find(|(w, _)| w.id() == 0)
+        .is_some_and(|(_, s)| matches!(s, Slide::Leaving { .. }));
+    assert!(
+        still_leaving,
+        "window 0 stays in Slide::Leaving before photo arrives"
+    );
+
+    let ask = last_ask(&log, 0);
+    arrive(&mut harness, 0, ask, Ok(photo(7)));
+
+    let mut tuck_xs = Vec::new();
+    for _ in 0..20 {
+        harness.advance(Duration::from_millis(20));
+        if let Some(photo_rect) = panel_photo(&log, 0)
+            && tuck_xs.last().copied() != Some(photo_rect.max.x)
+        {
+            tuck_xs.push(photo_rect.max.x);
+        }
+    }
+    assert!(
+        tuck_xs.len() >= 3,
+        "Leaving -> Tucking eases the photo across multiple frames after edge wait: {tuck_xs:?}"
+    );
+}
+
+#[test]
+fn moving_photo_held_by_pacing_eases_after_hold_releases() {
+    use crate::ecs::shared_edge::Slide;
+    use crate::manager::Window;
+
+    const FAST_APP: crate::platform::Pid = 2;
+    let faster: Config = (
+        MainOptions {
+            shared_edge_slices: Some(true),
+            // ~166 ms curve finishes well inside the 250 ms pacing LANDING_TIMEOUT.
+            animation_speed: Some(20.0),
+            ..MainOptions::default()
+        },
+        vec![],
+    )
+        .into();
+    let log = Rc::new(RefCell::new(Screen::default()));
+    let mut harness = TestHarness::new()
+        .with_config(faster)
+        .with_display(EXT_DISPLAY_ID, RIGHT, vec![EXT_WORKSPACE_ID])
+        .with_app(FAST_APP, "fast", "FastApp", |_| {});
+    harness.mock_state.queue_writes(TEST_PROCESS_ID);
+    for (id, width) in (0..).zip([200, 400, 424, 200, 200]) {
+        let pid = if id == 1 { TEST_PROCESS_ID } else { FAST_APP };
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness
+        .world()
+        .insert_non_send(SliceScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        command(Operation::Focus(Direction::First)),
+    ]);
+    for _ in 0..100 {
+        queued_frame(&mut harness, true);
+    }
+    paint_asked(&mut harness, &log, &[3]);
+
+    // Slide window 3 left into view and push slow window 1 past x = 0, then hold
+    // window 1 and reverse rightward toward Nth(1) for ~200 ms (> 166 ms ease
+    // duration, < 250 ms LANDING_TIMEOUT) so pacing holds window 2's
+    // RepositionMarker and window 3's Slide::Moving below x = 824.
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Last)));
+    for _ in 0..5 {
+        queued_frame(&mut harness, true);
+    }
+    harness.mock_state.hold_writes(TEST_PROCESS_ID);
+    harness
+        .world()
+        .write_message(command(Operation::Focus(Direction::Nth(1))));
+    for _ in 0..10 {
+        queued_frame(&mut harness, false);
+    }
+    let held_moving = harness
+        .world()
+        .query::<(&Window, &Slide)>()
+        .iter(harness.world())
+        .find(|(w, _)| w.id() == 3)
+        .is_some_and(|(_, s)| matches!(s, Slide::Moving { at, .. } if at.x < 824));
+    assert!(
+        held_moving,
+        "window 3 remains in Slide::Moving short of x = 824 while held"
+    );
+
+    harness.mock_state.release_writes(TEST_PROCESS_ID);
+    let mut move_xs = Vec::new();
+    for _ in 0..20 {
+        queued_frame(&mut harness, true);
+        if let Some(rect) = panel_photo(&log, 3)
+            && move_xs.last().copied() != Some(rect.min.x)
+        {
+            move_xs.push(rect.min.x);
+        }
+    }
+    assert!(
+        move_xs.len() >= 3,
+        "Slide::Moving eases smoothly once pacing hold releases: {move_xs:?}"
     );
 }

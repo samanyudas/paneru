@@ -32,7 +32,7 @@ use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::Added;
+use bevy::ecs::query::{Added, Has};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Local, Query, Res, ResMut};
 use bevy::math::{IRect, IVec2};
@@ -40,13 +40,12 @@ use bevy::time::Time;
 use tracing::{debug, warn};
 
 use crate::config::Config;
+use crate::ecs::ease::{self, PositionEase, SlideEase};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::shared_edge::Slide;
-use crate::ecs::systems::{
-    AnimationStep, LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, ease_out_factor, ease_step,
-};
+use crate::ecs::systems::ease_step;
 use crate::ecs::{
-    Bounds, FocusedMarker, Position, PresentedOrigin, RepositionMarker, ResizeMarker,
+    Bounds, FocusedMarker, Position, PresentedOrigin, RepositionMarker, ResizeMarker, ResizeMotion,
 };
 use crate::events::Event;
 use crate::manager::window_writer::LANDING_TIMEOUT;
@@ -80,6 +79,9 @@ struct Shared {
 #[derive(Default)]
 struct Watch {
     ids: Vec<WinID>,
+    /// Windows watched by active resize covers (`CoverMorph`) so they read
+    /// from the background sampler thread without main-thread `WindowServer` IPC.
+    morph_ids: Vec<WinID>,
     /// The newest frame read for each watched window. Until the first read,
     /// the frame the engine had asked for when watching began, where a
     /// window at rest is shown.
@@ -90,6 +92,38 @@ struct Watch {
     /// Bumped on each stop, so a read started before it is dropped.
     generation: u64,
     sampling: bool,
+}
+
+impl Watch {
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty() && self.morph_ids.is_empty()
+    }
+
+    fn is_watched(&self, id: WinID) -> bool {
+        self.ids.contains(&id) || self.morph_ids.contains(&id)
+    }
+
+    fn all_ids(&self) -> Vec<WinID> {
+        let mut all = self.ids.clone();
+        for &id in &self.morph_ids {
+            if !all.contains(&id) {
+                all.push(id);
+            }
+        }
+        all
+    }
+
+    /// Forgets what was read of each window no watch keeps, after a stop or
+    /// dropped row window. A read started before the change is dropped, since
+    /// it may hold one.
+    fn prune(&mut self) {
+        let watched = self.ids.clone();
+        let morph = self.morph_ids.clone();
+        let keep = |id: &WinID| watched.contains(id) || morph.contains(id);
+        self.shown.retain(|id, _| keep(id));
+        self.unread.retain(keep);
+        self.generation += 1;
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -129,13 +163,61 @@ impl ShownFrames {
         (self.shared.read)(ids)
     }
 
+    /// Watches `ids` on the background sampler thread for an active resize
+    /// cover and returns only frames that the sampler has actually read,
+    /// avoiding synchronous `WindowServer` IPC on the main thread.
+    pub(crate) fn watch_morph(&self, ids: &[WinID]) -> Vec<(WinID, IRect)> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let mut watch = lock(&self.shared.watch);
+        for &id in ids {
+            if !watch.morph_ids.contains(&id) {
+                watch.morph_ids.push(id);
+            }
+        }
+        if !self.sampled {
+            let frames = (self.shared.read)(ids);
+            watch.take(ids, frames);
+        } else if !watch.sampling {
+            let shared = self.shared.clone();
+            if let Err(err) = thread::Builder::new()
+                .name("shown-frames".into())
+                .spawn(move || shared.sample())
+            {
+                warn!("cannot start the shown-frame sampler for resize cover: {err}");
+                return Vec::new();
+            }
+            watch.sampling = true;
+        }
+        self.shared.wake.notify_one();
+        ids.iter()
+            .filter(|id| !watch.unread.contains(id))
+            .filter_map(|&id| watch.shown.get(&id).map(|&frame| (id, frame)))
+            .collect()
+    }
+
+    /// Stops watching resize-cover windows once no `CoverMorph` is active.
+    pub(crate) fn stop_morph(&self) {
+        let mut watch = lock(&self.shared.watch);
+        watch.morph_ids.clear();
+        watch.prune();
+    }
+
     /// Watches the windows of `asked`, each with the frame the engine last
     /// asked for, and returns where each is shown as of the newest read.
     /// `None` when no sampler can run.
     fn watch(&self, asked: &[(WinID, IRect)]) -> Option<Shown> {
         let mut watch = lock(&self.shared.watch);
+        let dropped = watch
+            .ids
+            .iter()
+            .any(|id| !asked.iter().any(|&(a, _)| a == *id));
         watch.ids.clear();
         watch.ids.extend(asked.iter().map(|&(id, _)| id));
+        if dropped {
+            watch.prune();
+        }
         for &(id, frame) in asked {
             if let Entry::Vacant(entry) = watch.shown.entry(id) {
                 entry.insert(frame);
@@ -143,8 +225,9 @@ impl ShownFrames {
             }
         }
         if !self.sampled {
-            let frames = (self.shared.read)(&watch.ids);
-            watch.take(frames);
+            let ids = watch.ids.clone();
+            let frames = (self.shared.read)(&ids);
+            watch.take(&ids, frames);
         } else if !watch.sampling {
             let shared = self.shared.clone();
             if let Err(err) = thread::Builder::new()
@@ -173,17 +256,26 @@ impl ShownFrames {
     fn stop(&self) {
         let mut watch = lock(&self.shared.watch);
         watch.ids.clear();
-        watch.shown.clear();
-        watch.unread.clear();
-        watch.generation += 1;
+        watch.prune();
     }
 }
 
 impl Watch {
-    fn take(&mut self, frames: Vec<(WinID, IRect)>) {
+    /// Keeps `frames`, a read of the windows of `ids`. A window of `ids` the
+    /// read left out is not shown, so no frame from an earlier read stands
+    /// in for it.
+    fn take(&mut self, ids: &[WinID], frames: Vec<(WinID, IRect)>) {
+        for id in ids {
+            if self.is_watched(*id) && !frames.iter().any(|(read, _)| read == id) {
+                self.shown.remove(id);
+                self.unread.remove(id);
+            }
+        }
         for (id, frame) in frames {
-            self.unread.remove(&id);
-            self.shown.insert(id, frame);
+            if self.is_watched(id) {
+                self.unread.remove(&id);
+                self.shown.insert(id, frame);
+            }
         }
     }
 }
@@ -192,24 +284,24 @@ impl Shared {
     fn sample(&self) {
         loop {
             let mut watch = lock(&self.watch);
-            while watch.ids.is_empty() {
+            while watch.is_empty() {
                 let (woken, wait) = self
                     .wake
                     .wait_timeout(watch, SAMPLER_IDLE)
                     .unwrap_or_else(PoisonError::into_inner);
                 watch = woken;
-                if wait.timed_out() && watch.ids.is_empty() {
+                if wait.timed_out() && watch.is_empty() {
                     watch.sampling = false;
                     return;
                 }
             }
-            let (ids, generation) = (watch.ids.clone(), watch.generation);
+            let (ids, generation) = (watch.all_ids(), watch.generation);
             drop(watch);
 
             let frames = (self.read)(&ids);
             let mut watch = lock(&self.watch);
             if watch.generation == generation {
-                watch.take(frames);
+                watch.take(&ids, frames);
             }
             drop(watch);
             thread::sleep(READ_INTERVAL);
@@ -252,16 +344,6 @@ impl SlideHolds {
     /// engine put it.
     pub(crate) fn landed(&self, entity: Entity) -> bool {
         self.landed.contains(&entity)
-    }
-}
-
-/// Where a sliding window or its photo shows now, and where it heads.
-/// `None` while it lands, at rest under its photo.
-fn heading(slide: &Slide, presented: IVec2) -> Option<(IVec2, IVec2)> {
-    match *slide {
-        Slide::Moving { at, .. } => Some((at, presented)),
-        Slide::Leaving { at, to, .. } | Slide::Tucking { at, to, .. } => Some((at, to)),
-        Slide::Landing { .. } => None,
     }
 }
 
@@ -320,8 +402,9 @@ struct Held {
 
 impl Tracked {
     /// Takes in that the engine asked for the window at `asked` last frame
-    /// and the window server shows it at `shown`, if it lists it.
-    fn see(&mut self, asked: Edges, shown: Option<Edges>, now: Duration) -> Pacer {
+    /// and the window server shows it at `shown` (`observed` when read back by
+    /// the sampler rather than provisionally seeded), if it lists it.
+    fn see(&mut self, asked: Edges, shown: Option<Edges>, observed: bool, now: Duration) -> Pacer {
         self.start.get_or_insert(asked);
         let before = self.asked.replace(asked);
         match shown {
@@ -341,11 +424,19 @@ impl Tracked {
                     Pacer::Shown(edges)
                 }
             }
-            _ => {
+            Some(_) => {
                 self.late = None;
-                if before.is_some_and(|before| before != asked) {
+                if observed && before.is_some_and(|before| before != asked) {
                     self.on_time = true;
                 }
+                if self.prompt {
+                    Pacer::Asked
+                } else {
+                    Pacer::Shown(asked)
+                }
+            }
+            None => {
+                self.late = None;
                 if self.prompt {
                     Pacer::Asked
                 } else {
@@ -554,7 +645,10 @@ type RowWindows<'w, 's> = Query<
         &'static mut Bounds,
         Option<&'static RepositionMarker>,
         Option<&'static ResizeMarker>,
+        Option<&'static PositionEase>,
+        Option<&'static SlideEase>,
         Option<(&'static Slide, &'static PresentedOrigin)>,
+        Has<ResizeMotion>,
     ),
 >;
 
@@ -574,7 +668,6 @@ pub(super) fn pace_rows(
     strips: Query<&LayoutStrip>,
     mut windows: RowWindows,
     time: Res<Time>,
-    step: Res<AnimationStep>,
     config: Res<Config>,
     mut slide_holds: ResMut<SlideHolds>,
     mut tracked: Local<EntityHashMap<Tracked>>,
@@ -619,20 +712,21 @@ pub(super) fn pace_rows(
     slide_holds.landed = landed(&rows, &windows, &shown);
 
     let now = time.elapsed();
-    let t = ease_out_factor(config.animation_speed(), step.secs());
-    let first_t = ease_out_factor(
-        config.animation_speed(),
-        f64::from(LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS) / 1000.0,
-    );
+    let duration = ease::duration(&config);
+    let resize_duration = ease::resize_duration(&config);
+    let steps = Steps {
+        first_t: ease::first_share(duration),
+        animates: ease::animates(duration),
+        resize_first_t: ease::Curve::EaseOut.first_share(resize_duration),
+        resize_animates: ease::animates(resize_duration),
+    };
     for row in rows {
         let mut row = row
             .into_iter()
             .map(|column| {
                 column
                     .into_iter()
-                    .filter_map(|entity| {
-                        member(entity, &windows, &shown, &mut tracked, (t, first_t), now)
-                    })
+                    .filter_map(|entity| member(entity, &windows, &shown, &mut tracked, steps, now))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -678,27 +772,51 @@ pub(super) fn pace_rows(
     }
 }
 
-/// The row window `entity` as pacing sees it this frame, with `t` the
-/// row's ease this frame, `first_t` the ease of a slide's first step, and
-/// `tracked` what the engine has seen of each app.
+/// How a motion's first frame steps: the share of its distance it covers,
+/// and whether it takes more than one step, for the spring and for a
+/// resize's ease-out.
+#[derive(Clone, Copy)]
+struct Steps {
+    first_t: f32,
+    animates: bool,
+    resize_first_t: f32,
+    resize_animates: bool,
+}
+
+/// The row window `entity` as pacing sees it this frame, with `steps` how
+/// the first frame of its motion steps, and `tracked` what the engine has
+/// seen of each app. Each
+/// window's own ease gives the share of what is left that it steps by this
+/// frame: its move's, or its photo's while it slides.
 fn member(
     entity: Entity,
     windows: &RowWindows,
     shown: &Shown,
     tracked: &mut EntityHashMap<Tracked>,
-    (t, first_t): (f32, f32),
+    steps: Steps,
     now: Duration,
 ) -> Option<Member> {
-    let (window, position, bounds, to, resize, slide) = windows.get(entity).ok()?;
+    let (window, position, bounds, to, resize, position_ease, slide_ease, slide, resizing) =
+        windows.get(entity).ok()?;
+    // A window that a resize moves steps on the resize's own curve.
+    let (first_t, animates) = if resizing {
+        (steps.resize_first_t, steps.resize_animates)
+    } else {
+        (steps.first_t, steps.animates)
+    };
     let id = window.id();
     let asked = Edges::from(window.frame());
+    let observed = !shown.unread.contains(&id);
     let shown_edges = shown
         .frames
         .get(&id)
         .map(|&frame| Edges::from(window.margins().tracked(frame)));
     let width = bounds.0.x;
-    if let Some((at, heading_to)) = slide.and_then(|(slide, presented)| heading(slide, presented.0))
+    if let Some((at, heading_to)) =
+        slide.and_then(|(slide, presented)| ease::slide_heading(slide, presented.0))
     {
+        // The photo steps by its slide's ease, which has stepped this frame.
+        let t = slide_ease.map_or(1.0, |ease| ease.0.t());
         let (step, _) = ease_step(at, heading_to, t);
         let record = tracked.entry(entity).or_default();
         let from = *record.slid_from.get_or_insert(at.x);
@@ -706,7 +824,7 @@ fn member(
         // leaving for its tuck moves itself, as late as its app takes the
         // move.
         let pacer = match slide {
-            Some((Slide::Leaving { .. }, _)) => record.see(asked, shown_edges, now),
+            Some((Slide::Leaving { .. }, _)) => record.see(asked, shown_edges, observed, now),
             _ => Pacer::Asked,
         };
         return Some(Member {
@@ -729,7 +847,7 @@ fn member(
         });
     }
     let record = tracked.entry(entity).or_default();
-    let pacer = record.see(asked, shown_edges, now);
+    let pacer = record.see(asked, shown_edges, observed, now);
     let unmoved = record.unmoved(shown_edges);
     // A window landing under its photo shows where its photo rests, however
     // far its app has yet to take it, and has no move of its own yet but
@@ -741,6 +859,8 @@ fn member(
     let target_width = resize.map_or(width, |resize| resize.0.x);
     let in_motion = to.is_some() && slide.is_none();
     let (free, first) = if in_motion && resize.is_none() {
+        // The move's ease has stepped this frame, before pacing.
+        let t = position_ease.map_or(1.0, |ease| ease.0.t());
         let led = record.held.is_none();
         let free = record.free(position.0.x, target, t);
         let start = record.start.map_or(asked.left, |start| start.left);
@@ -781,7 +901,7 @@ fn member(
         width,
         // With animation off the resize lands in one step, so pacing holds no
         // width.
-        held_right: (resize.is_some() && slide.is_none() && t < 1.0)
+        held_right: (resize.is_some() && slide.is_none() && animates)
             .then_some(position.0.x + width),
         target,
         target_right: target + target_width,
@@ -947,7 +1067,7 @@ fn landed(rows: &[Vec<Vec<Entity>>], windows: &RowWindows, shown: &Shown) -> Ent
         .flatten()
         .copied()
         .filter(|&entity| {
-            windows.get(entity).is_ok_and(|(window, .., slide)| {
+            windows.get(entity).is_ok_and(|(window, .., slide, _)| {
                 matches!(slide, Some((Slide::Landing { .. }, _)))
                     && !shown.unread.contains(&window.id())
                     && shown
@@ -976,7 +1096,7 @@ fn moving_rows(strips: &Query<&LayoutStrip>, windows: &RowWindows) -> Vec<Vec<Ve
             row.iter().flatten().any(|&entity| {
                 windows
                     .get(entity)
-                    .is_ok_and(|(_, _, _, to, resize, slide)| {
+                    .is_ok_and(|(_, _, _, to, resize, _, _, slide, _)| {
                         to.is_some()
                             || resize.is_some()
                             || slide
@@ -1019,6 +1139,38 @@ mod tests {
 
     use super::*;
 
+    /// A window the window server stops listing is no longer shown where
+    /// an earlier read had it, so a cover never lifts over it on a stale
+    /// frame.
+    #[test]
+    fn a_window_a_read_leaves_out_has_no_frame() {
+        let listed = Arc::new(AtomicBool::new(true));
+        let lists = listed.clone();
+        let shown = IRect::new(0, 0, 100, 100);
+        let frames = ShownFrames::inline(move |ids| {
+            ids.iter()
+                .filter(|id| **id != 8 || lists.load(Ordering::Relaxed))
+                .map(|&id| (id, shown))
+                .collect()
+        });
+        let mut read = frames.watch_morph(&[7, 8]);
+        read.sort_by_key(|(id, _)| *id);
+        assert_eq!(read, vec![(7, shown), (8, shown)], "both are listed");
+
+        listed.store(false, Ordering::Relaxed);
+        assert_eq!(
+            frames.watch_morph(&[7, 8]),
+            vec![(7, shown)],
+            "window 8 is gone from the read"
+        );
+        let asked = IRect::new(0, 0, 50, 50);
+        let watched = frames.watch(&[(8, asked)]).expect("an inline read");
+        assert!(
+            !watched.frames.contains_key(&8) || watched.frames[&8] != shown,
+            "and from the rows' watch"
+        );
+    }
+
     /// The sampler reads on its own thread, so a watch never waits on the
     /// window server: until the first read lands, a window counts as shown
     /// where the engine asked for it.
@@ -1052,17 +1204,67 @@ mod tests {
         );
     }
 
+    /// A stop forgets what the sampler read of the windows it stops
+    /// watching, even while another watch goes on, so watching one again
+    /// starts from the frame the engine asks for, not from an old read.
+    #[test]
+    fn a_stop_forgets_the_windows_it_stops_watching() {
+        let shown = IRect::new(70, 0, 170, 100);
+        let frames = ShownFrames::inline(move |ids| ids.iter().map(|&id| (id, shown)).collect());
+        let state = |frames: &ShownFrames| {
+            let watch = lock(&frames.shared.watch);
+            let mut kept = watch.shown.keys().copied().collect::<Vec<_>>();
+            kept.sort_unstable();
+            (kept, watch.unread.clone(), watch.generation)
+        };
+
+        frames.watch_morph(&[7]);
+        frames.watch(&[(8, IRect::new(0, 0, 100, 100))]);
+        let (_, _, generation) = state(&frames);
+        frames.stop();
+        let (kept, unread, stopped) = state(&frames);
+        assert_eq!(
+            kept,
+            vec![7],
+            "the rows' window 8 is forgotten, the resize's 7 kept"
+        );
+        assert!(
+            !unread.contains(&8),
+            "and window 8 is not waiting for a read"
+        );
+        assert!(
+            stopped > generation,
+            "a read started before the stop is dropped"
+        );
+
+        frames.watch(&[(8, IRect::new(0, 0, 100, 100))]);
+        frames.stop_morph();
+        let (kept, unread, stopped_morph) = state(&frames);
+        assert_eq!(
+            kept,
+            vec![8],
+            "the resize's window 7 is forgotten, the rows' 8 kept"
+        );
+        assert!(
+            !unread.contains(&7),
+            "and window 7 is not waiting for a read"
+        );
+        assert!(
+            stopped_morph > stopped,
+            "a read started before the stop is dropped"
+        );
+    }
+
     /// Until the sampler has read a window, the frame a watch returns for it
     /// is only the one the engine asked for, and does not count as read.
     #[test]
     fn a_window_counts_as_read_only_once_the_sampler_has_read_it() {
+        let read_frame = IRect::new(20, 0, 120, 100);
         let answers = Arc::new(AtomicBool::new(false));
         let answering = answers.clone();
         let frames = ShownFrames::new(move |ids| {
             if answering.load(Ordering::Relaxed) {
-                ids.iter()
-                    .map(|&id| (id, IRect::new(0, 0, 100, 100)))
-                    .collect()
+                ids.iter().map(|&id| (id, read_frame)).collect()
             } else {
                 Vec::new()
             }
@@ -1078,9 +1280,78 @@ mod tests {
 
         answers.store(true, Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while watch(&frames).unread.contains(&7) {
+        loop {
+            let shown = watch(&frames);
+            if !shown.unread.contains(&7) && shown.frames.get(&7) == Some(&read_frame) {
+                break;
+            }
             assert!(Instant::now() < deadline, "the sampler read window 7");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn dropping_a_window_from_the_row_watch_prunes_stale_state_and_keeps_morphs() {
+        let mut watch = Watch {
+            ids: vec![1, 2],
+            morph_ids: vec![3],
+            shown: HashMap::from([
+                (1, IRect::new(0, 0, 100, 100)),
+                (2, IRect::new(100, 0, 200, 100)),
+                (3, IRect::new(200, 0, 300, 100)),
+            ]),
+            unread: HashSet::from([1, 2, 3]),
+            generation: 0,
+            sampling: false,
+        };
+        watch.ids = vec![2];
+        watch.prune();
+
+        assert!(!watch.is_watched(1));
+        assert!(watch.is_watched(2));
+        assert!(watch.is_watched(3));
+        assert_eq!(watch.generation, 1);
+        assert!(!watch.shown.contains_key(&1));
+        assert!(!watch.unread.contains(&1));
+        assert!(watch.shown.contains_key(&2));
+        assert!(watch.shown.contains_key(&3));
+        assert!(watch.unread.contains(&3));
+
+        // A late sample mentioning dropped window 1 does not repopulate it,
+        // while still marking active window 2 as read.
+        let read_2 = IRect::new(110, 0, 210, 100);
+        watch.take(&[1, 2], vec![(1, IRect::new(5, 0, 105, 100)), (2, read_2)]);
+        assert!(!watch.shown.contains_key(&1));
+        assert_eq!(watch.shown.get(&2), Some(&read_2));
+        assert!(!watch.unread.contains(&2));
+    }
+
+    #[test]
+    fn tracked_on_time_ignores_provisional_or_missing_reads() {
+        let mut tracked = Tracked::default();
+        let start = Edges::from(IRect::new(0, 0, 100, 100));
+        let next = Edges::from(IRect::new(50, 0, 150, 100));
+        let later = Edges::from(IRect::new(100, 0, 200, 100));
+        let final_edges = Edges::from(IRect::new(150, 0, 250, 100));
+
+        tracked.see(start, Some(start), false, Duration::from_millis(20));
+        assert!(!tracked.on_time);
+
+        // Matching provisional ask without sampler observation keeps on_time false.
+        tracked.see(next, Some(next), false, Duration::from_millis(40));
+        assert!(!tracked.on_time);
+
+        // Missing server read also keeps on_time false even when observed is true.
+        tracked.see(later, None, true, Duration::from_millis(60));
+        assert!(!tracked.on_time);
+
+        // Only a matching sampler-observed move marks the motion on time.
+        tracked.see(
+            final_edges,
+            Some(final_edges),
+            true,
+            Duration::from_millis(80),
+        );
+        assert!(tracked.on_time);
     }
 }

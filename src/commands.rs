@@ -26,15 +26,15 @@ use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, RestoreTo, StackItem, anchored_origin,
     clamp_origin_to_viewport, effective_stack_limit, hold_minimum_heights, strip_signature,
 };
-use crate::ecs::maximize::{FloatingMaximized, restore_tiled};
+use crate::ecs::maximize::{FloatingMaximized, MaximizeMorph, restore_tiled};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowCtx, Windows};
 use crate::ecs::scroll::{PageFocusRequest, PageGestureState, PageInFlight};
 use crate::ecs::tile_overrides::TileOverrides;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, ManualStripOffset,
     MinimumHeight, NativeFullscreenMarker, PendingWidthSettlement, Position, RaiseWindow,
-    RepositionMarker, SelectedVirtualMarker, SpawnCommandsExt, StepPartners, Timeout, Unmanaged,
-    VerifyWindowSize, WidthAnchor, WidthRun, WindowProperties,
+    RepositionMarker, ResizeMotion, SelectedVirtualMarker, SpawnCommandsExt, StepPartners, Timeout,
+    Unmanaged, VerifyWindowSize, WidthAnchor, WidthRun, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -1212,13 +1212,20 @@ fn resize_window(
         } = ctx.p0();
         let viewport = active_display.actual_bounds(&config);
         let limit = effective_stack_limit(&config, viewport.height());
-        restore_tiled(
+        let strip_entity = active_display.active_strip_entity();
+        let restored = restore_tiled(
             entity,
             active_display.active_strip(),
             RestoreTo::Home { limit },
             viewport,
             &mut commands,
-        )
+        );
+        if restored.is_some()
+            && let Ok(mut strip_commands) = commands.get_entity(strip_entity)
+        {
+            strip_commands.try_insert(MaximizeMorph(entity));
+        }
+        restored
     } else {
         None
     };
@@ -1352,6 +1359,11 @@ fn resize_window(
 
     commands.resize_entity(entity, size);
     commands.reshuffle_around(entity);
+    for moved in std::iter::once(strip_entity).chain(strip.all_windows()) {
+        if let Ok(mut cmds) = commands.get_entity(moved) {
+            cmds.try_insert(ResizeMotion);
+        }
+    }
 }
 
 /// One step from `ratio` in `direction`, kept between one step and `maximum`.

@@ -40,6 +40,10 @@ use crate::platform::Pid;
 /// to land. Reading before then would see the frame the window is leaving.
 pub(crate) const LANDING_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// A write the app takes longer than this to answer is logged, as the
+/// motion or cover waiting on it shows it late.
+const SLOW_WRITE: Duration = Duration::from_millis(100);
+
 /// The calls one app's writer makes, kept apart from the queueing so tests
 /// can stand in a fake app.
 pub(crate) trait WriteSink: Send + 'static {
@@ -84,6 +88,12 @@ pub(crate) struct PendingWrite<W> {
     pub to: IRect,
     pub position: bool,
     pub size: bool,
+    /// Whether a write of both parts moves before it sizes even when the
+    /// window grows. A write that lands under a picture cover asks for it:
+    /// nothing shows the gap a move opens, and a window sized where it will
+    /// sit is laid out once, where one sized past a display edge first is
+    /// limited there and laid out again after the move.
+    pub move_first: bool,
     /// The size the app last took, if smaller than the engine asked for.
     /// The engine only writes a size when it changes, so the writer asks for
     /// it again after each later move, as the app may allow it at the new
@@ -111,6 +121,7 @@ impl<W> PendingWrite<W> {
         self.to = newer.to;
         self.position |= newer.position;
         self.size |= newer.size;
+        self.move_first |= newer.move_first;
     }
 }
 
@@ -135,18 +146,24 @@ fn apply_from<S: WriteSink>(
     let size = write.to.size();
     let narrows = size.x < taken.x && write.to.min.y == write.from.min.y;
     match (write.position, write.size) {
-        (true, true) if narrows => {
+        (true, true) if narrows || write.move_first => {
             sink.set_position(window, write.to.min);
             let moved = IRect::from_corners(write.to.min, write.to.min + taken);
-            resize(sink, window, moved, size, write.to.min)
+            resize(sink, window, moved, size, write.to.min).frame
         }
         (true, true) => {
-            let observed = resize(sink, window, write.from, size, write.from.min);
-            sink.set_position(window, write.to.min);
-            match observed {
+            // A size staged offscreen ends at the target position, not back
+            // where the window was: each move after a large resize waits for
+            // the app to draw at its new size, which can take a busy browser
+            // hundreds of milliseconds.
+            let resized = resize(sink, window, write.from, size, write.to.min);
+            if !resized.placed {
+                sink.set_position(window, write.to.min);
+            }
+            match resized.frame {
                 Some(observed) if observed.size() != size => {
                     let moved = IRect::from_corners(write.to.min, write.to.min + observed.size());
-                    resize(sink, window, moved, size, write.to.min)
+                    resize(sink, window, moved, size, write.to.min).frame
                 }
                 observed => observed
                     .map(|frame| IRect::from_corners(write.to.min, write.to.min + frame.size())),
@@ -156,26 +173,35 @@ fn apply_from<S: WriteSink>(
             sink.set_position(window, write.to.min);
             None
         }
-        (false, true) => resize(sink, window, write.from, size, write.to.min),
+        (false, true) => resize(sink, window, write.from, size, write.to.min).frame,
         (false, false) => None,
     }
 }
 
+/// What [`resize`] left the window at.
+struct Resized {
+    /// The last frame read back, if any read succeeded.
+    frame: Option<IRect>,
+    /// Whether the window was staged offscreen and so already put at the
+    /// origin it was given.
+    placed: bool,
+}
+
 /// Sets `size`, and retries from an offscreen origin while the app only
-/// partly applies a wider size, then puts the window back at `origin`.
-/// Returns the last frame read back, if any read succeeded.
+/// partly applies a wider size, then puts a staged window at `origin`,
+/// unless the last staging origin already was `origin`.
 fn resize<S: WriteSink>(
     sink: &mut S,
     window: &S::Window,
     from: IRect,
     size: Size,
     origin: Origin,
-) -> Option<IRect> {
+) -> Resized {
     sink.set_size(window, size);
 
     let mut observed = from;
     let mut last = None;
-    let mut staged = false;
+    let mut staged = None;
     for attempt in 1..=3 {
         let Some(actual) = sink.read_frame(window) else {
             break;
@@ -191,25 +217,34 @@ fn resize<S: WriteSink>(
             staging_x = staging_origin.x,
             "retrying partially constrained AX resize from an offscreen origin"
         );
-        staged = true;
+        staged = Some(staging_origin);
         observed = actual;
         sink.set_position(window, staging_origin);
         sink.set_size(window, size);
     }
 
-    if staged {
-        if let Some(settled) = sink.read_frame(window) {
-            debug!(
-                requested_width = size.x,
-                actual_width = settled.width(),
-                "completed staged AX resize"
-            );
-            last = Some(settled);
-        }
-        sink.set_position(window, origin);
-        last = last.map(|frame| IRect::from_corners(origin, origin + frame.size()));
+    if staged.is_none() {
+        return Resized {
+            frame: last,
+            placed: false,
+        };
     }
-    last
+    let settled = sink.read_frame(window);
+    if let Some(settled) = settled {
+        debug!(
+            requested_width = size.x,
+            actual_width = settled.width(),
+            "completed staged AX resize"
+        );
+        last = Some(settled);
+    }
+    if settled.is_none_or(|frame| frame.min != origin) {
+        sink.set_position(window, origin);
+    }
+    Resized {
+        frame: last.map(|frame| IRect::from_corners(origin, origin + frame.size())),
+        placed: true,
+    }
 }
 
 /// macOS may partially apply an AX width increase when the requested right edge
@@ -417,7 +452,7 @@ impl<S: WriteSink> Shared<S> {
             Some(taken) if !write.size => {
                 sink.set_position(&write.window, write.to.min);
                 let moved = IRect::from_corners(write.to.min, write.to.min + taken);
-                resize(sink, &write.window, moved, write.to.size(), write.to.min)
+                resize(sink, &write.window, moved, write.to.size(), write.to.min).frame
             }
             Some(taken) => apply_from(sink, write, taken),
             None => apply(sink, write),
@@ -472,7 +507,13 @@ impl<S: WriteSink> Shared<S> {
                         writes.sort_by_key(|(_, write)| write.back_first());
                         for (key, write) in writes {
                             let limited = *lock(&write.size_limited);
-                            if !Self::write(&mut sink, &write) {
+                            let asked = Instant::now();
+                            let unanswered = Self::write(&mut sink, &write);
+                            let took = asked.elapsed();
+                            if took >= SLOW_WRITE {
+                                debug!(pid, to = ?write.to, ms = took.as_millis(), "slow write");
+                            }
+                            if !unanswered {
                                 continue;
                             }
                             // An app may never apply a write it left
@@ -484,6 +525,7 @@ impl<S: WriteSink> Shared<S> {
                             if let Some(newer) = lock(&mailbox.queue).pending.get_mut(&key) {
                                 newer.position |= write.position;
                                 newer.size |= write.size;
+                                newer.move_first |= write.move_first;
                                 continue;
                             }
                             debug!(pid, to = ?write.to, "writing a frame again that the app left unanswered");
@@ -696,7 +738,7 @@ impl<S: WriteSink> FrameWrites<S> {
             return;
         }
         let to = IRect::from_corners(origin, origin + self.frame.size());
-        self.request(pid, window(), to, true, false);
+        self.request(pid, window(), to, true, false, false);
     }
 
     pub fn resize(&mut self, pid: Option<Pid>, window: impl FnOnce() -> S::Window, size: Size) {
@@ -705,7 +747,7 @@ impl<S: WriteSink> FrameWrites<S> {
             return;
         }
         let to = IRect::from_corners(self.frame.min, self.frame.min + size);
-        self.request(pid, window(), to, false, true);
+        self.request(pid, window(), to, false, true, false);
     }
 
     /// Moves and resizes in one write, in the order [`apply`] describes.
@@ -716,7 +758,24 @@ impl<S: WriteSink> FrameWrites<S> {
             trace!("already in place.");
             return;
         }
-        self.request(pid, window(), frame, position, size);
+        self.request(pid, window(), frame, position, size, false);
+    }
+
+    /// [`Self::place`] for a frame that lands under a picture cover: the
+    /// window moves before it sizes, so it is laid out once.
+    pub fn place_moved_first(
+        &mut self,
+        pid: Option<Pid>,
+        window: impl FnOnce() -> S::Window,
+        frame: IRect,
+    ) {
+        let position = self.frame.min != frame.min;
+        let size = self.frame.size() != frame.size();
+        if !position && !size {
+            trace!("already in place.");
+            return;
+        }
+        self.request(pid, window(), frame, position, size, true);
     }
 
     fn request(
@@ -726,6 +785,7 @@ impl<S: WriteSink> FrameWrites<S> {
         to: IRect,
         position: bool,
         size: bool,
+        move_first: bool,
     ) {
         let write = PendingWrite {
             window,
@@ -734,6 +794,7 @@ impl<S: WriteSink> FrameWrites<S> {
             position,
             size,
             size_limited: self.size_limited.clone(),
+            move_first,
         };
         self.frame = to;
         match pid {
@@ -844,6 +905,7 @@ mod tests {
                 position: true,
                 size: true,
                 size_limited: Arc::default(),
+                move_first: false,
             },
         );
         (app.frame, app.ops)
@@ -918,6 +980,7 @@ mod tests {
                 position: true,
                 size: true,
                 size_limited: Arc::new(Mutex::new(Some(Size::new(400, 400)))),
+                move_first: false,
             },
         );
         assert_eq!(app.frame, target);
@@ -1000,6 +1063,7 @@ mod tests {
                 position: false,
                 size: true,
                 size_limited: Arc::default(),
+                move_first: false,
             },
         );
 
@@ -1013,6 +1077,123 @@ mod tests {
                 Op::Position(Origin::new(-2096, 40)),
                 Op::Size(size),
                 Op::Position(Origin::new(-400, 40)),
+            ]
+        );
+    }
+
+    /// An app that answers each frame read from a script, and records each
+    /// write.
+    struct Scripted {
+        reads: Vec<IRect>,
+        ops: Vec<Op>,
+    }
+
+    impl WriteSink for Scripted {
+        type Window = ();
+        fn begin(&mut self) {}
+        fn set_position(&mut self, (): &(), origin: Origin) {
+            self.ops.push(Op::Position(origin));
+        }
+        fn set_size(&mut self, (): &(), size: Size) {
+            self.ops.push(Op::Size(size));
+        }
+        fn read_frame(&mut self, (): &()) -> Option<IRect> {
+            (!self.reads.is_empty()).then(|| self.reads.remove(0))
+        }
+        fn raise(&mut self, _window: &()) {}
+        fn finish(&mut self) {}
+    }
+
+    /// A maximize: the window grows from 646 to 1912 points and moves left
+    /// to the display's edge. The app takes only part of the width where the
+    /// window sits, so the size is staged where the rest fits.
+    fn maximize(reads: Vec<IRect>, to: IRect) -> Vec<Op> {
+        let mut app = Scripted {
+            reads,
+            ops: Vec::new(),
+        };
+        apply(
+            &mut app,
+            &PendingWrite {
+                window: (),
+                from: IRect::new(1311, -1046, 1957, -4),
+                to,
+                position: true,
+                size: true,
+                size_limited: Arc::default(),
+                move_first: false,
+            },
+        );
+        app.ops
+    }
+
+    /// A staged maximize that the staging already left at its target is not
+    /// moved again. Moving it back to where it was, then to the target, made
+    /// a busy browser hold the writer for 400 ms while it drew at the new
+    /// size, and the cover over the maximize waited on that write.
+    #[test]
+    fn a_staged_maximize_that_lands_on_its_target_is_not_moved_again() {
+        let target = IRect::new(45, -1046, 1957, -4);
+        let ops = maximize(
+            vec![IRect::new(67, -1046, 1957, -4), target, target],
+            target,
+        );
+        assert_eq!(
+            ops,
+            vec![
+                Op::Size(target.size()),
+                Op::Position(target.min),
+                Op::Size(target.size()),
+            ]
+        );
+    }
+
+    /// A maximize under a picture cover moves the window to its target and
+    /// sizes it there once. Sized first where it sat, past the display's
+    /// edge, a browser was limited there and laid out again after the move,
+    /// and the cover waited on both.
+    #[test]
+    fn a_covered_maximize_moves_then_sizes_once() {
+        let target = IRect::new(45, -1046, 1957, -4);
+        let mut app = Scripted {
+            reads: vec![target],
+            ops: Vec::new(),
+        };
+        apply(
+            &mut app,
+            &PendingWrite {
+                window: (),
+                from: IRect::new(1311, -1046, 1957, -4),
+                to: target,
+                position: true,
+                size: true,
+                size_limited: Arc::default(),
+                move_first: true,
+            },
+        );
+        assert_eq!(
+            app.ops,
+            vec![Op::Position(target.min), Op::Size(target.size())]
+        );
+    }
+
+    /// A staged maximize that the staging left short of its target goes
+    /// straight there, not back where the window was first.
+    #[test]
+    fn a_staged_maximize_goes_straight_to_its_target() {
+        let target = IRect::new(100, -1046, 2012, -4);
+        let staged = IRect::new(45, -1046, 1957, -4);
+        let ops = maximize(
+            vec![IRect::new(67, -1046, 1957, -4), staged, staged],
+            target,
+        );
+        assert_eq!(
+            ops,
+            vec![
+                Op::Size(target.size()),
+                Op::Position(staged.min),
+                Op::Size(target.size()),
+                Op::Position(target.min),
             ]
         );
     }
@@ -1283,6 +1464,7 @@ mod writer_tests {
             position: true,
             size: false,
             size_limited: Arc::default(),
+            move_first: false,
         }
     }
 
@@ -1294,6 +1476,7 @@ mod writer_tests {
             position: true,
             size: false,
             size_limited: Arc::default(),
+            move_first: false,
         }
     }
 
@@ -1305,6 +1488,7 @@ mod writer_tests {
             position: false,
             size: true,
             size_limited: Arc::default(),
+            move_first: false,
         }
     }
 
@@ -1343,6 +1527,30 @@ mod writer_tests {
                 Op::Begin,
                 Op::Size(7, Size::new(100, 200)),
                 Op::Position(7, Origin::new(10, 0)),
+                Op::Finish,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_newer_resize_keeps_move_first_from_an_unanswered_write() {
+        let (probe, entered) = Probe::new();
+        let writers = writers(&probe, SECOND, SETTLE);
+        probe.hold(1);
+        let mut first = moved(7, 10);
+        first.move_first = true;
+        writers.push(1, key(7), first);
+        assert_eq!(entered.recv_timeout(SECOND), Ok(1));
+        probe.unanswered.store(1, Ordering::SeqCst);
+        writers.push(1, key(7), resized(7, IRect::new(10, 0, 110, 200)));
+        probe.release(1);
+        assert!(writers.flush(SECOND));
+        assert_eq!(
+            probe.log(1),
+            vec![
+                Op::Begin,
+                Op::Position(7, Origin::new(10, 0)),
+                Op::Size(7, Size::new(100, 200)),
                 Op::Finish,
             ]
         );
@@ -1714,5 +1922,71 @@ mod writer_tests {
                 .collect::<Vec<_>>()
         );
         assert!(probe.opened.load(Ordering::SeqCst) > 1);
+    }
+
+    #[test]
+    fn staged_resize_places_window_unless_settled_already_at_origin() {
+        struct StageSink {
+            reads: Vec<Option<IRect>>,
+            positions: Vec<Origin>,
+        }
+
+        impl WriteSink for StageSink {
+            type Window = ();
+
+            fn begin(&mut self) {}
+
+            fn set_position(&mut self, (): &(), origin: Origin) {
+                self.positions.push(origin);
+            }
+
+            fn set_size(&mut self, (): &(), _size: Size) {}
+
+            fn read_frame(&mut self, (): &()) -> Option<IRect> {
+                self.reads.remove(0)
+            }
+
+            fn raise(&mut self, (): &()) {}
+
+            fn take_unanswered(&mut self) -> bool {
+                false
+            }
+
+            fn finish(&mut self) {}
+        }
+
+        let from = IRect::new(0, 0, 100, 100);
+        let size = Size::new(500, 100);
+        let origin = Origin::new(300, 0);
+        let partial = IRect::new(0, 0, 200, 100);
+        let staged_full = IRect::new(-300, 0, 200, 100);
+
+        // Settled frame still sits at staging origin -> moves to target origin.
+        let mut moved = StageSink {
+            reads: vec![Some(partial), Some(staged_full), Some(staged_full)],
+            positions: Vec::new(),
+        };
+        let res = resize(&mut moved, &(), from, size, origin);
+        assert!(res.placed);
+        assert_eq!(moved.positions, vec![Origin::new(-300, 0), origin]);
+
+        // Unreadable settled frame -> conservatively moves to target origin.
+        let mut unreadable = StageSink {
+            reads: vec![Some(partial), Some(staged_full), None],
+            positions: Vec::new(),
+        };
+        let res = resize(&mut unreadable, &(), from, size, origin);
+        assert!(res.placed);
+        assert_eq!(unreadable.positions, vec![Origin::new(-300, 0), origin]);
+
+        // Settled frame already sits at target origin -> skips redundant move.
+        let at_origin = IRect::new(300, 0, 800, 100);
+        let mut already = StageSink {
+            reads: vec![Some(partial), Some(staged_full), Some(at_origin)],
+            positions: Vec::new(),
+        };
+        let res = resize(&mut already, &(), from, size, origin);
+        assert!(res.placed);
+        assert_eq!(already.positions, vec![Origin::new(-300, 0)]);
     }
 }
