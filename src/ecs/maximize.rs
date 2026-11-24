@@ -3,8 +3,8 @@
 //! maximize command toggles the focused window.
 //!
 //! A maximized tiled window is a column of its strip as wide as the
-//! viewport, and the window fills the usable area of its display: it is
-//! drawn over the edge padding, without its window padding. It scrolls with
+//! viewport, keeping the configured display edge and window gaps like any
+//! other tiled column. It scrolls with
 //! the strip like any column, and moves with it to another display or
 //! workspace. A stacked window leaves its stack for a column of its own to
 //! the right of the stack, and goes back to its place there on restore when

@@ -644,7 +644,9 @@ fn a_window_returns_to_a_slot_that_ends_near_the_screen_edge() {
     assert_eq!(before[1].max.y, TEST_DISPLAY_HEIGHT - 8);
 
     double_click_title_bar(&mut harness, 1);
-    assert_eq!(os_frame(&harness, 1), usable_area(&mut harness));
+    let area = usable_area(&mut harness);
+    let padded = IRect::from_corners(area.min + IVec2::new(0, 8), area.max - IVec2::new(0, 8));
+    assert_eq!(os_frame(&harness, 1), padded);
 
     double_click_title_bar(&mut harness, 1);
     assert_eq!(frames(&harness, &[0, 1, 2]), before);
@@ -1402,8 +1404,9 @@ fn a_swipe_scrolls_past_a_maximized_window() {
 }
 
 /// With Miri's default gaps (outer 8 and inner 8, so an edge padding of 4
-/// and a window padding of 4), a maximized window fills the usable area
-/// exactly, and no neighbour shows over it.
+/// and a window padding of 4), a maximized window keeps the 8-point outer gap
+/// on all four sides and the 8-point inner gap beside its neighbours, and no
+/// neighbour shows over it.
 #[test]
 fn no_neighbor_covers_a_maximized_window_with_gaps() {
     let options = MainOptions {
@@ -1428,13 +1431,18 @@ fn no_neighbor_covers_a_maximized_window_with_gaps() {
 
     double_click_title_bar(&mut harness, 1);
     let area = usable_area(&mut harness);
-    assert_eq!(os_frame(&harness, 1), area, "no edge or window padding");
+    let padded = IRect::from_corners(area.min + IVec2::splat(4), area.max - IVec2::splat(4));
+    assert_eq!(os_frame(&harness, 1), padded, "keeps edge padding");
     assert_nothing_covers(&mut harness, 1, &[0, 2]);
 
     focus(&mut harness, Direction::East);
+    assert!(
+        os_frame(&harness, 2).min.x >= os_frame(&harness, 1).max.x,
+        "window 1 stays clear of its neighbour"
+    );
     assert_nothing_covers(&mut harness, 1, &[0, 2]);
     focus(&mut harness, Direction::West);
-    assert_eq!(os_frame(&harness, 1), area);
+    assert_eq!(os_frame(&harness, 1), padded);
     assert_nothing_covers(&mut harness, 1, &[0, 2]);
 }
 
@@ -1578,25 +1586,26 @@ fn reload_options(harness: &mut TestHarness, options: &str) {
 }
 
 /// A config reload that changes the gaps fits a maximized window to the
-/// usable area again.
+/// padded viewport.
 #[test]
 fn a_padding_reload_refits_a_maximized_window() {
     let mut harness = three_windows_one_focused();
     double_click_title_bar(&mut harness, 1);
     let area = usable_area(&mut harness);
+    let padded = IRect::from_corners(area.min + IVec2::splat(8), area.max - IVec2::splat(8));
 
     reload_with_gaps(&mut harness, &[0, 1, 2]);
-    assert_eq!(os_frame(&harness, 1), area);
+    assert_eq!(os_frame(&harness, 1), padded);
 
     focus(&mut harness, Direction::East);
     assert_nothing_covers(&mut harness, 1, &[0, 2]);
     focus(&mut harness, Direction::West);
-    assert_eq!(os_frame(&harness, 1), area);
+    assert_eq!(os_frame(&harness, 1), padded);
     assert_nothing_covers(&mut harness, 1, &[0, 2]);
 }
 
 /// A config reload that changes the gaps also fits a maximized window on a
-/// display without the focus to that display's usable area.
+/// display without the focus to that display's padded viewport.
 #[test]
 fn a_padding_reload_refits_a_maximized_window_on_another_display() {
     let mut harness = maximized_beside(EAST_EXT_BOUNDS);
@@ -1607,13 +1616,14 @@ fn a_padding_reload_refits_a_maximized_window_on_another_display() {
         EXT_WORKSPACE_ID,
     );
     let ext = usable_area_of(&mut harness, EXT_DISPLAY_ID);
+    let ext_padded = IRect::from_corners(ext.min + IVec2::splat(8), ext.max - IVec2::splat(8));
     assert_eq!(os_frame(&harness, 1), ext);
     harness.mock_state.focus_window(0);
     harness.advance(SETTLE);
     assert_focused!(harness.world(), 0);
 
     reload_with_gaps(&mut harness, &[0, 1, 2, 100]);
-    assert_eq!(os_frame(&harness, 1), ext);
+    assert_eq!(os_frame(&harness, 1), ext_padded);
 }
 
 /// Windows 1 and 2 maximized on the built-in display, window 2 in view.
@@ -1627,17 +1637,18 @@ fn two_maximized(mut harness: TestHarness) -> TestHarness {
 }
 
 /// A padding reload that changes only the right padding narrows the first
-/// of two maximized columns, which moves the second. The second still fills
-/// the usable area.
+/// of two maximized columns, which moves the second. The second still fits
+/// the padded viewport.
 #[test]
 fn a_padding_reload_refits_a_maximized_window_after_another() {
     let mut harness = three_windows_one_focused();
     double_click_title_bar(&mut harness, 1);
     let mut harness = two_maximized(harness);
     let area = usable_area(&mut harness);
+    let padded = IRect::from_corners(area.min, area.max - IVec2::new(16, 0));
 
     reload_options(&mut harness, "padding_right = 16\n");
-    assert_eq!(os_frame(&harness, 2), area);
+    assert_eq!(os_frame(&harness, 2), padded);
 }
 
 /// The same holds on a display without the focus, where the strip is
@@ -1646,13 +1657,14 @@ fn a_padding_reload_refits_a_maximized_window_after_another() {
 fn a_padding_reload_refits_a_maximized_window_after_another_on_another_display() {
     let mut harness = two_maximized(maximized_beside(EAST_EXT_BOUNDS));
     let area = usable_area_of(&mut harness, TEST_DISPLAY_ID);
+    let padded = IRect::from_corners(area.min + IVec2::new(4, 0), area.max - IVec2::new(16, 0));
     harness.mock_state.focus_window(100);
     harness.advance(SETTLE);
     assert_focused!(harness.world(), 100);
     assert_eq!(os_frame(&harness, 2), area);
 
     reload_options(&mut harness, "padding_left = 4\npadding_right = 16\n");
-    assert_eq!(os_frame(&harness, 2), area);
+    assert_eq!(os_frame(&harness, 2), padded);
 }
 
 /// Repeated toggles with scrolling in between end where they started.
@@ -1670,9 +1682,8 @@ fn repeated_toggles_with_scrolling_do_not_drift() {
     assert_eq!(sizes(&frames(&harness, &[0, 1, 2])), sizes(&before));
 }
 
-/// A window already as wide as the viewport keeps the same column frame when
-/// maximized, yet still fills the usable area: only its gaps change. Its app
-/// gets the writes through the engine's per-app writers, as with `WindowOS`.
+/// A window already as wide as the viewport keeps the same padded frame when
+/// maximized and restored.
 #[test]
 fn a_full_width_window_fills_the_usable_area_when_maximized() {
     let options = MainOptions {
@@ -1691,12 +1702,13 @@ fn a_full_width_window_fills_the_usable_area_when_maximized() {
     harness.run(vec![command(Operation::SetWidth(1.0))]);
     harness.advance(SETTLE);
     let area = usable_area(&mut harness);
-    assert_eq!(os_frame(&harness, 1).width(), area.width() - 8);
+    let padded = IRect::from_corners(area.min + IVec2::splat(4), area.max - IVec2::splat(4));
+    assert_eq!(os_frame(&harness, 1), padded);
 
     double_click_title_bar(&mut harness, 1);
-    assert_eq!(os_frame(&harness, 1), area);
+    assert_eq!(os_frame(&harness, 1), padded);
     double_click_title_bar(&mut harness, 1);
-    assert_eq!(os_frame(&harness, 1).width(), area.width() - 8);
+    assert_eq!(os_frame(&harness, 1), padded);
 }
 
 /// With `auto_center`, a padding reload keeps a strip with no maximized
