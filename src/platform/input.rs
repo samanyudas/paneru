@@ -281,7 +281,15 @@ fn subset_commits(
         return false;
     }
     let sign = mean_primary.signum();
-    if indices.iter().any(|&i| frame_primary[i] * sign <= 0.0) {
+    let max_frame = indices
+        .iter()
+        .map(|&i| frame_primary[i].abs())
+        .fold(0.0_f64, f64::max);
+    if max_frame <= 0.0
+        || indices.iter().any(|&i| {
+            frame_primary[i] * sign <= 0.0 || frame_primary[i].abs() < COHERENCE_RATIO * max_frame
+        })
+    {
         return false;
     }
     for (idx, (&p, &c)) in primary_mm.iter().zip(cross_mm).enumerate() {
@@ -430,6 +438,10 @@ impl<I: Clone> SwipeAccumulator<I> {
     #[cfg(test)]
     fn reset(&mut self) {
         self.state = SwipeState::Idle;
+        self.last_active_ended = None;
+    }
+
+    fn clear_retouch(&mut self) {
         self.last_active_ended = None;
     }
 
@@ -651,7 +663,10 @@ impl<I: Clone> SwipeAccumulator<I> {
         };
 
         if extra_contact_participated(resting_anchors, &touches, anchors, &same_identity) {
-            self.end(now);
+            self.last_active_ended = None;
+            self.state = SwipeState::Rejected {
+                identities: touches.into_iter().map(|t| t.identity).collect(),
+            };
             return SwipeSampleOutcome::Ended;
         }
 
@@ -1161,8 +1176,9 @@ impl InputHandler {
     fn cancel_disabled_swipe(&mut self, now: Instant) {
         if self.swipe_accumulator.end(now) {
             self.send_touchpad_up();
-            self.last_swipe_time = None;
         }
+        self.swipe_accumulator.clear_retouch();
+        self.last_swipe_time = None;
     }
 
     /// Use the configured modifier to scroll the strip or select an adjacent window.
@@ -1529,7 +1545,6 @@ fn should_suppress_scroll_wheel(
     if elapsed < POST_SWIPE_SCROLL_GRACE {
         return true;
     }
-    *last_swipe_time = None;
     false
 }
 
@@ -2071,9 +2086,11 @@ mod tests {
             SwipeSampleOutcome::Pending
         );
 
-        // Frame 2: thumb stops at 1.0 mm while two scrolling fingers reach 3.0 mm
-        // (mean 2.33 mm >= 2.2 mm, min 1.0 mm >= 0.8 mm and >= 25% of 3.0 mm).
+        // Frame 2: thumb barely drifts 0.01 mm while two scrolling fingers reach 3.0 mm
+        // (mean 2.34 mm >= 2.2 mm, min 1.01 mm >= 0.8 mm and >= 25% of 3.0 mm, but
+        // frame drift 0.01 mm < 25% of the scrolling fingers' 1.5 mm frame step).
         let mut step2 = step1;
+        step2[0].x += 0.01 / 127.0;
         step2[1].x = start[1].x + 3.0 / 127.0;
         step2[2].x = start[2].x + 3.0 / 127.0;
         assert_eq!(
@@ -2138,8 +2155,18 @@ mod tests {
         // Now the 4th contact starts moving >= ARM_DISTANCE_MM.
         moved[3].x += 3.0 / 127.0;
         assert_eq!(
-            swipe.sample(moved, 3, false, now, |a, b| a == b),
+            swipe.sample(moved.clone(), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Ended
+        );
+        assert!(!swipe.is_active());
+
+        // Same four contacts stay rejected even if the 4th pauses while the other 3 keep moving.
+        for f in &mut moved[0..3] {
+            f.x += 4.0 / 127.0;
+        }
+        assert_eq!(
+            swipe.sample(moved, 3, false, now, |a, b| a == b),
+            SwipeSampleOutcome::Rejected
         );
         assert!(!swipe.is_active());
     }
@@ -2179,7 +2206,7 @@ mod tests {
             &mut last,
             true,
             0,
-            t0 + Duration::from_millis(200)
+            t0 + Duration::from_millis(20)
         ));
 
         // Within 120 ms grace after lift, non-momentum scroll (e.g. Began) is suppressed.
@@ -2191,22 +2218,32 @@ mod tests {
             t0 + Duration::from_millis(50)
         ));
 
-        // Momentum scroll stays suppressed up to 1200 ms.
-        assert!(should_suppress_scroll_wheel(
-            false,
-            &mut last,
-            true,
-            2,
-            t0 + Duration::from_millis(500)
-        ));
-
-        // Subsequent non-momentum Changed after grace clears suppression and passes through.
+        // Non-momentum Changed at 150 ms (after grace) passes without clearing momentum guard.
         assert!(!should_suppress_scroll_wheel(
             false,
             &mut last,
             true,
             0,
+            t0 + Duration::from_millis(150)
+        ));
+        assert!(last.is_some());
+
+        // Momentum tail at 200 ms is still suppressed inside the 1200 ms window.
+        assert!(should_suppress_scroll_wheel(
+            false,
+            &mut last,
+            true,
+            2,
             t0 + Duration::from_millis(200)
+        ));
+
+        // After 1200 ms expiry, momentum clears the timestamp and passes.
+        assert!(!should_suppress_scroll_wheel(
+            false,
+            &mut last,
+            true,
+            2,
+            t0 + Duration::from_millis(1250)
         ));
         assert!(last.is_none());
     }
