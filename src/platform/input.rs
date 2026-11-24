@@ -171,6 +171,8 @@ enum SwipeSampleOutcome {
     /// Gesture was disqualified (vertical scroll when vertical is disabled, or
     /// non-coherent motion such as two scrolling fingers plus a resting thumb).
     Rejected,
+    /// An active swipe ended because one of its committed fingers lifted.
+    Ended,
     /// Committed on this sample or continuing an already-committed swipe.
     Movement {
         movement: SwipeMovement,
@@ -226,40 +228,59 @@ fn len_as_f64(len: usize) -> f64 {
     f64::from(u32::try_from(len).unwrap_or(u32::MAX))
 }
 
-/// Evaluates whether a set of per-finger physical displacements (in mm) along
-/// primary and cross axes qualifies to commit a swipe.
-fn axis_commits(primary_mm: &[f64], cross_mm: &[f64]) -> bool {
-    if primary_mm.is_empty() {
+/// Selects the indices of touches moving coherently together along `primary_mm`.
+///
+/// A touch belongs to the moving group when it has moved at least
+/// `MIN_FINGER_ARM_MM` in the dominant direction and at least
+/// `COHERENCE_RATIO` of the farthest-moving touch. Stationary or passively
+/// drifting palms/thumbs stay out of this group.
+fn coherent_moving_indices(primary_mm: &[f64]) -> Vec<usize> {
+    let Some((max_idx, &max_val)) = primary_mm.iter().enumerate().max_by(|(_, a), (_, b)| {
+        a.abs()
+            .partial_cmp(&b.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) else {
+        return Vec::new();
+    };
+    let max_abs = max_val.abs();
+    if max_abs < MIN_FINGER_ARM_MM {
+        return Vec::new();
+    }
+    let sign = primary_mm[max_idx].signum();
+    let floor = MIN_FINGER_ARM_MM.max(COHERENCE_RATIO * max_abs);
+    primary_mm
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &d)| (d * sign > 0.0 && d.abs() >= floor).then_some(idx))
+        .collect()
+}
+
+/// Evaluates whether the selected `indices` of per-finger physical
+/// displacements (in mm) qualify to commit a swipe for `configured_fingers`.
+fn subset_commits(
+    indices: &[usize],
+    configured_fingers: usize,
+    primary_mm: &[f64],
+    cross_mm: &[f64],
+) -> bool {
+    if indices.len() != configured_fingers || indices.is_empty() {
         return false;
     }
-    let count = len_as_f64(primary_mm.len());
-    let mean_primary = primary_mm.iter().sum::<f64>() / count;
-    let mean_cross = cross_mm.iter().sum::<f64>() / count;
+    let count = len_as_f64(indices.len());
+    let mean_primary = indices.iter().map(|&i| primary_mm[i]).sum::<f64>() / count;
+    let mean_cross = indices.iter().map(|&i| cross_mm[i]).sum::<f64>() / count;
     if mean_primary.abs() < ARM_DISTANCE_MM {
         return false;
     }
-    if mean_primary.abs() < AXIS_DOMINANCE * mean_cross.abs() {
-        return false;
-    }
-    let sign = mean_primary.signum();
-    let mut min_abs = f64::INFINITY;
-    let mut max_abs = 0.0_f64;
-    for &d in primary_mm {
-        if d * sign <= 0.0 || d.abs() < MIN_FINGER_ARM_MM {
-            return false;
-        }
-        min_abs = min_abs.min(d.abs());
-        max_abs = max_abs.max(d.abs());
-    }
-    min_abs >= COHERENCE_RATIO * max_abs
+    mean_primary.abs() >= AXIS_DOMINANCE * mean_cross.abs()
 }
 
 struct ArmingMetrics {
     horiz_mm: Vec<f64>,
     vert_mm: Vec<f64>,
     horiz_norm: Vec<(f64, f64)>,
-    frame_horiz: f64,
-    frame_vert: f64,
+    frame_horiz: Vec<f64>,
+    frame_vert: Vec<f64>,
 }
 
 impl ArmingMetrics {
@@ -272,8 +293,8 @@ impl ArmingMetrics {
         let mut horiz_mm = Vec::with_capacity(touches.len());
         let mut vert_mm = Vec::with_capacity(touches.len());
         let mut horiz_norm = Vec::with_capacity(touches.len());
-        let mut frame_horiz = 0.0;
-        let mut frame_vert = 0.0;
+        let mut frame_horiz = Vec::with_capacity(touches.len());
+        let mut frame_vert = Vec::with_capacity(touches.len());
 
         for current in touches {
             let start = start_anchors
@@ -297,8 +318,8 @@ impl ArmingMetrics {
                 current.device_height_points,
                 FALLBACK_MM_PER_NORM_Y,
             ));
-            frame_horiz += prev.x - current.x;
-            frame_vert += prev.y - current.y;
+            frame_horiz.push(prev.x - current.x);
+            frame_vert.push(prev.y - current.y);
         }
 
         Some(Self {
@@ -311,11 +332,23 @@ impl ArmingMetrics {
     }
 }
 
-fn axis_extrema(values: &[f64]) -> (f64, f64, f64) {
-    let mean = values.iter().sum::<f64>() / len_as_f64(values.len());
-    let max_abs = values.iter().map(|d| d.abs()).fold(0.0_f64, f64::max);
-    let min_abs = values.iter().map(|d| d.abs()).fold(f64::INFINITY, f64::min);
-    (mean, max_abs, min_abs)
+fn select_touches<I>(touches: Vec<SwipeSample<I>>, indices: &[usize]) -> Vec<SwipeSample<I>> {
+    touches
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, touch)| indices.contains(&idx).then_some(touch))
+        .collect()
+}
+
+fn max_abs(values: &[f64]) -> f64 {
+    values.iter().map(|d| d.abs()).fold(0.0_f64, f64::max)
+}
+
+fn mean_selected(values: &[f64], indices: &[usize]) -> f64 {
+    if indices.is_empty() {
+        return 0.0;
+    }
+    indices.iter().map(|&i| values[i]).sum::<f64>() / len_as_f64(indices.len())
 }
 
 impl<I> SwipeAccumulator<I> {
@@ -345,10 +378,17 @@ impl<I> SwipeAccumulator<I> {
     }
 
     /// Starts a fresh touch set. If an `Active` swipe ended within
-    /// `SWIPE_RETOUCH_WINDOW`, resumes `Active` immediately and returns `true`
-    /// so the caller can emit `TouchpadDown` for `scroll::continues_swipe`.
-    fn begin_or_retouch(&mut self, touches: Vec<SwipeSample<I>>, now: Instant) -> bool {
-        if let Some((ended_at, axis)) = self.last_active_ended
+    /// `SWIPE_RETOUCH_WINDOW` and the touch count matches `configured_fingers`,
+    /// resumes `Active` immediately and returns `true` so the caller can emit
+    /// `TouchpadDown` for `scroll::continues_swipe`.
+    fn begin_or_retouch(
+        &mut self,
+        touches: Vec<SwipeSample<I>>,
+        configured_fingers: usize,
+        now: Instant,
+    ) -> bool {
+        if touches.len() == configured_fingers
+            && let Some((ended_at, axis)) = self.last_active_ended
             && now.saturating_duration_since(ended_at) <= SWIPE_RETOUCH_WINDOW
         {
             self.last_active_ended = None;
@@ -358,10 +398,9 @@ impl<I> SwipeAccumulator<I> {
             };
             return true;
         }
-        let prev_frame = Vec::new();
         self.state = SwipeState::Arming {
             start_anchors: touches,
-            prev_frame,
+            prev_frame: Vec::new(),
         };
         false
     }
@@ -369,18 +408,23 @@ impl<I> SwipeAccumulator<I> {
     fn sample(
         &mut self,
         touches: Vec<SwipeSample<I>>,
+        configured_fingers: usize,
         vertical_enabled: bool,
         now: Instant,
         same_identity: impl Fn(&I, &I) -> bool,
     ) -> SwipeSampleOutcome {
         if touches.is_empty() {
-            self.state = SwipeState::Idle;
-            return SwipeSampleOutcome::Pending;
+            let was_active = self.end(now);
+            return if was_active {
+                SwipeSampleOutcome::Ended
+            } else {
+                SwipeSampleOutcome::Pending
+            };
         }
 
         match &mut self.state {
             SwipeState::Idle => {
-                let _ = self.begin_or_retouch(touches, now);
+                let _ = self.begin_or_retouch(touches, configured_fingers, now);
                 SwipeSampleOutcome::Pending
             }
             SwipeState::Rejected { identities } => {
@@ -401,15 +445,16 @@ impl<I> SwipeAccumulator<I> {
                 }
             }
             SwipeState::Arming { .. } => {
-                self.sample_arming(touches, vertical_enabled, same_identity)
+                self.sample_arming(touches, configured_fingers, vertical_enabled, same_identity)
             }
-            SwipeState::Active { .. } => self.sample_active(touches, same_identity),
+            SwipeState::Active { .. } => self.sample_active(touches, now, same_identity),
         }
     }
 
     fn sample_arming(
         &mut self,
         touches: Vec<SwipeSample<I>>,
+        configured_fingers: usize,
         vertical_enabled: bool,
         same_identity: impl Fn(&I, &I) -> bool,
     ) -> SwipeSampleOutcome {
@@ -444,47 +489,61 @@ impl<I> SwipeAccumulator<I> {
             return SwipeSampleOutcome::Pending;
         };
 
-        if axis_commits(&metrics.horiz_mm, &metrics.vert_mm) {
-            let distance_cm = physical_swipe_distance_cm(metrics.horiz_norm);
+        let horiz_moving = coherent_moving_indices(&metrics.horiz_mm);
+        if subset_commits(
+            &horiz_moving,
+            configured_fingers,
+            &metrics.horiz_mm,
+            &metrics.vert_mm,
+        ) {
+            let delta = horiz_moving.iter().map(|&i| metrics.frame_horiz[i]).sum();
+            let distance_cm =
+                physical_swipe_distance_cm(horiz_moving.iter().map(|&i| metrics.horiz_norm[i]));
             self.state = SwipeState::Active {
                 axis: SwipeAxis::Horizontal,
-                anchors: touches,
+                anchors: select_touches(touches, &horiz_moving),
             };
             return SwipeSampleOutcome::Movement {
-                movement: SwipeMovement::Horizontal {
-                    delta: metrics.frame_horiz,
-                    distance_cm,
-                },
+                movement: SwipeMovement::Horizontal { delta, distance_cm },
                 just_committed: true,
             };
         }
 
-        let (mean_horiz, max_horiz, min_horiz) = axis_extrema(&metrics.horiz_mm);
-        let (mean_vert, max_vert, min_vert) = axis_extrema(&metrics.vert_mm);
-
-        if mean_vert.abs() >= ARM_DISTANCE_MM && mean_vert.abs() > mean_horiz.abs() {
-            if vertical_enabled && axis_commits(&metrics.vert_mm, &metrics.horiz_mm) {
-                self.state = SwipeState::Active {
-                    axis: SwipeAxis::Vertical,
-                    anchors: touches,
-                };
-                return SwipeSampleOutcome::Movement {
-                    movement: SwipeMovement::Vertical(metrics.frame_vert),
-                    just_committed: true,
-                };
-            }
-            if !vertical_enabled || (max_vert >= REJECT_DISAGREE_MM && min_vert < MIN_FINGER_ARM_MM)
-            {
-                self.state = SwipeState::Rejected {
-                    identities: touches.into_iter().map(|t| t.identity).collect(),
-                };
-                return SwipeSampleOutcome::Rejected;
+        let vert_moving = coherent_moving_indices(&metrics.vert_mm);
+        if vert_moving.len() >= 2 {
+            let mean_vert = mean_selected(&metrics.vert_mm, &vert_moving).abs();
+            let mean_horiz = mean_selected(&metrics.horiz_mm, &vert_moving).abs();
+            if mean_vert >= ARM_DISTANCE_MM && mean_vert > mean_horiz {
+                if vertical_enabled
+                    && subset_commits(
+                        &vert_moving,
+                        configured_fingers,
+                        &metrics.vert_mm,
+                        &metrics.horiz_mm,
+                    )
+                {
+                    let delta = vert_moving.iter().map(|&i| metrics.frame_vert[i]).sum();
+                    self.state = SwipeState::Active {
+                        axis: SwipeAxis::Vertical,
+                        anchors: select_touches(touches, &vert_moving),
+                    };
+                    return SwipeSampleOutcome::Movement {
+                        movement: SwipeMovement::Vertical(delta),
+                        just_committed: true,
+                    };
+                }
+                if !vertical_enabled || max_abs(&metrics.vert_mm) >= REJECT_DISAGREE_MM {
+                    self.state = SwipeState::Rejected {
+                        identities: touches.into_iter().map(|t| t.identity).collect(),
+                    };
+                    return SwipeSampleOutcome::Rejected;
+                }
             }
         }
 
-        let horiz_sign = mean_horiz.signum();
-        let all_same_horiz = metrics.horiz_mm.iter().all(|&d| d * horiz_sign > 0.0);
-        if max_horiz >= REJECT_DISAGREE_MM && (min_horiz < MIN_FINGER_ARM_MM || !all_same_horiz) {
+        if max_abs(&metrics.horiz_mm) >= REJECT_DISAGREE_MM
+            && horiz_moving.len() != configured_fingers
+        {
             self.state = SwipeState::Rejected {
                 identities: touches.into_iter().map(|t| t.identity).collect(),
             };
@@ -498,42 +557,31 @@ impl<I> SwipeAccumulator<I> {
     fn sample_active(
         &mut self,
         touches: Vec<SwipeSample<I>>,
+        now: Instant,
         same_identity: impl Fn(&I, &I) -> bool,
     ) -> SwipeSampleOutcome {
         let SwipeState::Active { axis, anchors } = &mut self.state else {
             return SwipeSampleOutcome::Pending;
         };
 
-        if anchors.len() != touches.len() {
-            self.state = SwipeState::Arming {
-                start_anchors: touches,
-                prev_frame: Vec::new(),
+        // Track only the committed swipe identities so a resting palm landing
+        // or lifting beside them does not interrupt the swipe.
+        let mut matched_touches = Vec::with_capacity(anchors.len());
+        let mut deltas = Vec::with_capacity(anchors.len());
+        for previous in anchors.iter() {
+            let Some(current) = touches
+                .iter()
+                .find(|t| same_identity(&previous.identity, &t.identity))
+            else {
+                self.end(now);
+                return SwipeSampleOutcome::Ended;
             };
-            return SwipeSampleOutcome::Pending;
+            deltas.push((
+                previous.x - current.x,
+                previous.y - current.y,
+                current.device_width_points,
+            ));
         }
-
-        let deltas = touches
-            .iter()
-            .map(|current| {
-                anchors
-                    .iter()
-                    .find(|previous| same_identity(&previous.identity, &current.identity))
-                    .map(|previous| {
-                        (
-                            previous.x - current.x,
-                            previous.y - current.y,
-                            current.device_width_points,
-                        )
-                    })
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(deltas) = deltas else {
-            self.state = SwipeState::Arming {
-                start_anchors: touches,
-                prev_frame: Vec::new(),
-            };
-            return SwipeSampleOutcome::Pending;
-        };
 
         // Once committed, stay locked to the winning axis and allow any finger
         // to continue driving the strip (so a lagging finger mid-swipe stays smooth).
@@ -561,7 +609,15 @@ impl<I> SwipeAccumulator<I> {
             }
         };
         if let Some(movement) = movement {
-            *anchors = touches;
+            for touch in touches {
+                if anchors
+                    .iter()
+                    .any(|prev| same_identity(&prev.identity, &touch.identity))
+                {
+                    matched_touches.push(touch);
+                }
+            }
+            *anchors = matched_touches;
             SwipeSampleOutcome::Movement {
                 movement,
                 just_committed: false,
@@ -1153,25 +1209,16 @@ impl InputHandler {
                 return false;
             }
 
-            // The gesture phase can end while the fingers stay down, or never
-            // end, so a finger leaving the trackpad is what ends a swipe.
-            if touch_batch.any_lifted {
+            if touch_batch.active.len() < configured_fingers {
                 let was_active = self.swipe_accumulator.end(now);
                 if was_active {
                     self.send_touchpad_up();
                 }
-                return was_active;
-            }
-
-            if !gesture_should_intercept(Some(configured_fingers), touch_batch.active.len()) {
-                let was_active = self.swipe_accumulator.end(now);
-                if was_active {
-                    self.send_touchpad_up();
-                }
-                return false;
+                return was_active && touch_batch.any_lifted;
             }
 
             let any_began = touch_batch.active.iter().any(|finger| finger.began);
+            let any_lifted = touch_batch.any_lifted;
             let samples = touch_batch
                 .active
                 .into_iter()
@@ -1184,9 +1231,11 @@ impl InputHandler {
                 })
                 .collect();
 
-            if any_began {
+            if !self.swipe_accumulator.is_active() && any_began {
                 self.invalid_device_size_warned = false;
-                let resumed = self.swipe_accumulator.begin_or_retouch(samples, now);
+                let resumed =
+                    self.swipe_accumulator
+                        .begin_or_retouch(samples, configured_fingers, now);
                 if resumed {
                     self.send_touchpad_down();
                     return true;
@@ -1197,6 +1246,7 @@ impl InputHandler {
             let vertical_enabled = self.config.swipe_vertical();
             let outcome = self.swipe_accumulator.sample(
                 samples,
+                configured_fingers,
                 vertical_enabled,
                 now,
                 |previous, current| {
@@ -1204,7 +1254,13 @@ impl InputHandler {
                     unsafe { msg_send![&**previous, isEqual: &**current] }
                 },
             );
-            self.dispatch_swipe_outcome(outcome, configured_fingers, vertical_enabled, now)
+            self.dispatch_swipe_outcome(
+                outcome,
+                configured_fingers,
+                vertical_enabled,
+                any_lifted,
+                now,
+            )
         })
     }
 
@@ -1213,6 +1269,7 @@ impl InputHandler {
         outcome: SwipeSampleOutcome,
         configured_fingers: usize,
         vertical_enabled: bool,
+        any_lifted: bool,
         now: Instant,
     ) -> bool {
         match outcome {
@@ -1252,6 +1309,10 @@ impl InputHandler {
                     self.last_swipe_time = Some(now);
                 }
                 true
+            }
+            SwipeSampleOutcome::Ended => {
+                self.send_touchpad_up();
+                any_lifted
             }
             SwipeSampleOutcome::Movement {
                 movement: SwipeMovement::Vertical(_),
@@ -1316,6 +1377,7 @@ impl InputHandler {
     }
 }
 
+#[cfg(test)]
 fn gesture_should_intercept(configured_fingers: Option<usize>, actual_fingers: usize) -> bool {
     configured_fingers.is_some_and(|configured| {
         configured >= GESTURE_MINIMAL_FINGERS && configured == actual_fingers
@@ -1503,11 +1565,11 @@ mod tests {
     /// subsequent assertions can test active-state continuation behavior.
     fn commit_horizontal(swipe: &mut SwipeAccumulator<usize>, now: Instant) -> f64 {
         assert_eq!(
-            swipe.sample(three_fingers_144(0.0), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(0.0), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
         // 0.05 * 50.8 mm = 2.54 mm >= ARM_DISTANCE_MM (2.2 mm)
-        let outcome = swipe.sample(three_fingers_144(0.05), false, now, |a, b| a == b);
+        let outcome = swipe.sample(three_fingers_144(0.05), 3, false, now, |a, b| a == b);
         assert!(matches!(
             outcome,
             SwipeSampleOutcome::Movement {
@@ -1523,16 +1585,16 @@ mod tests {
         let now = Instant::now();
         let mut swipe = SwipeAccumulator::default();
         assert_eq!(
-            swipe.sample(three_fingers_144(0.0), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(0.0), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
         // 0.04 * 50.8 mm = 2.032 mm (still arming)
         assert_eq!(
-            swipe.sample(three_fingers_144(0.04), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(0.04), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
         // 0.05 * 50.8 mm = 2.54 mm (commits on this 0.01 step)
-        let outcome = swipe.sample(three_fingers_144(0.05), false, now, |a, b| a == b);
+        let outcome = swipe.sample(three_fingers_144(0.05), 3, false, now, |a, b| a == b);
         let SwipeSampleOutcome::Movement {
             movement: SwipeMovement::Horizontal { delta, distance_cm },
             just_committed,
@@ -1554,23 +1616,30 @@ mod tests {
         let mut swipe = SwipeAccumulator::default();
         let base = commit_horizontal(&mut swipe, now);
         assert_eq!(
-            swipe.sample(three_fingers_144(base + 0.0002), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(base + 0.0002), 3, false, now, |a, b| a
+                == b),
             SwipeSampleOutcome::Pending
         );
         assert_eq!(
-            swipe.sample(three_fingers_144(base + 0.0004), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(base + 0.0004), 3, false, now, |a, b| a
+                == b),
             SwipeSampleOutcome::Pending
         );
         assert_horizontal(
-            swipe.sample(three_fingers_144(base + 0.0006), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(base + 0.0006), 3, false, now, |a, b| {
+                a == b
+            }),
             -0.0018,
         );
         assert_eq!(
-            swipe.sample(three_fingers_144(base + 0.0008), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(base + 0.0008), 3, false, now, |a, b| a
+                == b),
             SwipeSampleOutcome::Pending
         );
         assert_horizontal(
-            swipe.sample(three_fingers_144(base + 0.0012), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(base + 0.0012), 3, false, now, |a, b| {
+                a == b
+            }),
             -0.0018,
         );
     }
@@ -1579,17 +1648,17 @@ mod tests {
     fn subthreshold_reversal_cancels_without_emitting_a_swipe() {
         let now = Instant::now();
         let mut swipe = SwipeAccumulator::default();
-        swipe.sample(three_fingers(0.0), false, now, |a, b| a == b);
+        swipe.sample(three_fingers(0.0), 3, false, now, |a, b| a == b);
         assert_eq!(
-            swipe.sample(three_fingers(0.005), false, now, |a, b| a == b),
+            swipe.sample(three_fingers(0.005), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
         assert_eq!(
-            swipe.sample(three_fingers(0.001), false, now, |a, b| a == b),
+            swipe.sample(three_fingers(0.001), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
         assert_eq!(
-            swipe.sample(three_fingers(0.0), false, now, |a, b| a == b),
+            swipe.sample(three_fingers(0.0), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
     }
@@ -1598,44 +1667,34 @@ mod tests {
     fn new_gesture_discards_unconsumed_motion() {
         let now = Instant::now();
         let mut swipe = SwipeAccumulator::default();
-        swipe.sample(three_fingers_144(0.0), false, now, |a, b| a == b);
+        swipe.sample(three_fingers_144(0.0), 3, false, now, |a, b| a == b);
         assert_eq!(
-            swipe.sample(three_fingers_144(0.04), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(0.04), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
         swipe.reset();
         assert_eq!(
-            swipe.sample(three_fingers_144(0.04), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(0.04), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
         assert_eq!(
-            swipe.sample(three_fingers_144(0.05), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(0.05), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
     }
 
     #[test]
-    fn finger_replacement_resets_to_arming() {
+    fn finger_replacement_ends_active_swipe() {
         let now = Instant::now();
         let mut swipe = SwipeAccumulator::default();
         let base = commit_horizontal(&mut swipe, now);
         let mut replacement = three_fingers_144(base + 0.002);
         replacement[2].identity = 3;
         assert_eq!(
-            swipe.sample(replacement, false, now, |a, b| a == b),
-            SwipeSampleOutcome::Pending
+            swipe.sample(replacement, 3, false, now, |a, b| a == b),
+            SwipeSampleOutcome::Ended
         );
         assert!(!swipe.is_active());
-        let mut next = three_fingers_144(base + 0.052);
-        next[2].identity = 3;
-        let outcome = swipe.sample(next, false, now, |a, b| a == b);
-        assert!(matches!(
-            outcome,
-            SwipeSampleOutcome::Movement {
-                just_committed: true,
-                ..
-            }
-        ));
     }
 
     #[test]
@@ -1646,11 +1705,13 @@ mod tests {
         let mut first = three_fingers_144(base + 0.0003);
         first.reverse();
         assert_eq!(
-            swipe.sample(first, false, now, |a, b| a == b),
+            swipe.sample(first, 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
         assert_horizontal(
-            swipe.sample(three_fingers_144(base + 0.0006), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(base + 0.0006), 3, false, now, |a, b| {
+                a == b
+            }),
             -0.0018,
         );
     }
@@ -1663,11 +1724,11 @@ mod tests {
 
         let mut next = three_fingers_144(base + 0.002);
         next[2].x = base;
-        assert_horizontal(swipe.sample(next, false, now, |a, b| a == b), -0.004);
+        assert_horizontal(swipe.sample(next, 3, false, now, |a, b| a == b), -0.004);
 
         let mut next = three_fingers_144(base + 0.004);
         next[2].x = base;
-        assert_horizontal(swipe.sample(next, false, now, |a, b| a == b), -0.004);
+        assert_horizontal(swipe.sample(next, 3, false, now, |a, b| a == b), -0.004);
     }
 
     #[test]
@@ -1679,7 +1740,7 @@ mod tests {
         start[0].x = 0.05;
         start[0].y = 0.92;
         assert_eq!(
-            swipe.sample(start.clone(), false, now, |a, b| a == b),
+            swipe.sample(start.clone(), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
 
@@ -1688,7 +1749,7 @@ mod tests {
         step1[1].x += 0.032; // ~4.1 mm on 127 mm pad
         step1[2].x += 0.032;
         assert_eq!(
-            swipe.sample(step1, false, now, |a, b| a == b),
+            swipe.sample(step1, 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
         assert!(!swipe.is_active());
@@ -1698,7 +1759,7 @@ mod tests {
         step2[1].x += 0.08; // ~10.2 mm
         step2[2].x += 0.08;
         assert_eq!(
-            swipe.sample(step2, false, now, |a, b| a == b),
+            swipe.sample(step2, 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Rejected
         );
         assert!(!swipe.is_active());
@@ -1709,7 +1770,7 @@ mod tests {
         let now = Instant::now();
         let mut swipe = SwipeAccumulator::default();
         let start = three_fingers(0.5);
-        swipe.sample(start.clone(), false, now, |a, b| a == b);
+        swipe.sample(start.clone(), 3, false, now, |a, b| a == b);
 
         // Two fingers move 6 mm horizontally while thumb passively rolls 1 mm (< 25% of 6 mm).
         let mut next = start;
@@ -1717,7 +1778,7 @@ mod tests {
         next[1].x += 6.0 / 127.0;
         next[2].x += 6.0 / 127.0;
         assert_eq!(
-            swipe.sample(next, false, now, |a, b| a == b),
+            swipe.sample(next, 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
         assert!(!swipe.is_active());
@@ -1728,14 +1789,14 @@ mod tests {
         let now = Instant::now();
         let mut swipe = SwipeAccumulator::default();
         let start = three_fingers(0.5);
-        swipe.sample(start.clone(), false, now, |a, b| a == b);
+        swipe.sample(start.clone(), 3, false, now, |a, b| a == b);
 
-        // Vertical scroll: two fingers move 5 mm vertically (mean ~3.3 mm > 2.2 mm) with vertical disabled.
+        // Vertical scroll: two fingers move 5 mm vertically with vertical disabled.
         let mut vertical = start.clone();
         vertical[1].y += 5.0 / 84.7;
         vertical[2].y += 5.0 / 84.7;
         assert_eq!(
-            swipe.sample(vertical.clone(), false, now, |a, b| a == b),
+            swipe.sample(vertical.clone(), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Rejected
         );
 
@@ -1745,7 +1806,82 @@ mod tests {
             f.x += 5.0 / 127.0;
         }
         assert_eq!(
-            swipe.sample(wobble, false, now, |a, b| a == b),
+            swipe.sample(wobble, 3, false, now, |a, b| a == b),
+            SwipeSampleOutcome::Rejected
+        );
+        assert!(!swipe.is_active());
+    }
+
+    #[test]
+    fn resting_palm_plus_three_moving_fingers_commits_and_ignores_palm() {
+        let now = Instant::now();
+        let mut swipe = SwipeAccumulator::default();
+        // Palm is identity 99 at bottom-left, stationary; fingers 0, 1, 2 swipe.
+        let mut start = three_fingers(0.5);
+        start.push(SwipeSample {
+            identity: 99,
+            x: 0.05,
+            y: 0.05,
+            device_width_points: 360.0,
+            device_height_points: 240.0,
+        });
+        assert_eq!(
+            swipe.sample(start.clone(), 3, false, now, |a, b| a == b),
+            SwipeSampleOutcome::Pending
+        );
+
+        // Three fingers move 3 mm horizontally; palm stays still.
+        let mut moved = start.clone();
+        for f in &mut moved[0..3] {
+            f.x += 3.0 / 127.0;
+        }
+        let outcome = swipe.sample(moved.clone(), 3, false, now, |a, b| a == b);
+        assert!(matches!(
+            outcome,
+            SwipeSampleOutcome::Movement {
+                movement: SwipeMovement::Horizontal { .. },
+                just_committed: true
+            }
+        ));
+        assert!(swipe.is_active());
+
+        // Palm lifts mid-swipe while the 3 committed fingers keep moving: swipe continues.
+        let mut palm_lifted = moved[0..3].to_vec();
+        for f in &mut palm_lifted {
+            f.x += 2.0 / 127.0;
+        }
+        assert!(matches!(
+            swipe.sample(palm_lifted, 3, false, now, |a, b| a == b),
+            SwipeSampleOutcome::Movement {
+                movement: SwipeMovement::Horizontal { .. },
+                just_committed: false
+            }
+        ));
+    }
+
+    #[test]
+    fn four_coherent_moving_fingers_do_not_trigger_three_finger_swipe() {
+        let now = Instant::now();
+        let mut swipe = SwipeAccumulator::default();
+        let four = |x| {
+            (0..4)
+                .map(|identity| SwipeSample {
+                    identity,
+                    x,
+                    y: 0.5,
+                    device_width_points: 360.0,
+                    device_height_points: 240.0,
+                })
+                .collect::<Vec<_>>()
+        };
+        swipe.sample(four(0.5), 3, false, now, |a, b| a == b);
+        assert_eq!(
+            swipe.sample(four(0.5 + 4.0 / 127.0), 3, false, now, |a, b| a == b),
+            SwipeSampleOutcome::Pending
+        );
+        assert!(!swipe.is_active());
+        assert_eq!(
+            swipe.sample(four(0.5 + 10.0 / 127.0), 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Rejected
         );
         assert!(!swipe.is_active());
@@ -1760,10 +1896,10 @@ mod tests {
 
         // Fingers return 20 ms later (within 40 ms SWIPE_RETOUCH_WINDOW).
         let t_retouch = t0 + Duration::from_millis(30);
-        assert!(swipe.begin_or_retouch(three_fingers_144(0.2), t_retouch));
+        assert!(swipe.begin_or_retouch(three_fingers_144(0.2), 3, t_retouch));
         assert!(swipe.is_active());
         assert_horizontal(
-            swipe.sample(three_fingers_144(0.201), false, t_retouch, |a, b| a == b),
+            swipe.sample(three_fingers_144(0.201), 3, false, t_retouch, |a, b| a == b),
             -0.003,
         );
     }
@@ -1777,7 +1913,7 @@ mod tests {
 
         // Fingers return 100 ms later (past 40 ms SWIPE_RETOUCH_WINDOW).
         let t_later = t0 + Duration::from_millis(100);
-        assert!(!swipe.begin_or_retouch(three_fingers_144(0.2), t_later));
+        assert!(!swipe.begin_or_retouch(three_fingers_144(0.2), 3, t_later));
         assert!(!swipe.is_active());
     }
 
@@ -1796,8 +1932,8 @@ mod tests {
                 })
                 .collect()
         };
-        swipe.sample(vertical(0.0), true, now, |a, b| a == b);
-        let outcome = swipe.sample(vertical(0.05), true, now, |a, b| a == b);
+        swipe.sample(vertical(0.0), 3, true, now, |a, b| a == b);
+        let outcome = swipe.sample(vertical(0.05), 3, true, now, |a, b| a == b);
         let SwipeSampleOutcome::Movement {
             movement: SwipeMovement::Vertical(delta),
             just_committed,
@@ -2320,11 +2456,15 @@ mod tests {
         let base = commit_horizontal(&mut swipe, now);
         // Skipping an empty intermediate raw event leaves the active accumulator intact.
         assert_horizontal(
-            swipe.sample(three_fingers_144(base + 0.0006), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(base + 0.0006), 3, false, now, |a, b| {
+                a == b
+            }),
             -0.0018,
         );
         assert_horizontal(
-            swipe.sample(three_fingers_144(base + 0.0012), false, now, |a, b| a == b),
+            swipe.sample(three_fingers_144(base + 0.0012), 3, false, now, |a, b| {
+                a == b
+            }),
             -0.0018,
         );
     }
