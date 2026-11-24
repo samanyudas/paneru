@@ -55,6 +55,10 @@ const POST_SWIPE_SCROLL_GRACE: Duration = Duration::from_millis(120);
 /// without re-arming (matches `RETOUCH_WINDOW` in `ecs::scroll` for miri#494).
 const SWIPE_RETOUCH_WINDOW: Duration = Duration::from_millis(40);
 
+/// `kCGScrollPhaseBegan` and `kCGScrollPhaseMayBegin` from `CGEventTypes.h`.
+const CG_SCROLL_PHASE_BEGAN: i64 = 1;
+const CG_SCROLL_PHASE_MAY_BEGIN: i64 = 128;
+
 /// Limit repeated wheel inputs while the next window moves into view.
 const WINDOW_SCROLL_INTERVAL: Duration = Duration::from_millis(180);
 
@@ -65,6 +69,7 @@ const WINDOW_SCROLL_INTERVAL: Duration = Duration::from_millis(180);
 /// triggering a three-finger strip swipe.
 const ARM_DISTANCE_MM: f64 = 2.2;
 const MIN_FINGER_ARM_MM: f64 = 0.8;
+const MIN_COMMIT_FRAME_MM: f64 = 0.15;
 const COHERENCE_RATIO: f64 = 0.25;
 const AXIS_DOMINANCE: f64 = 1.5;
 const REJECT_DISAGREE_MM: f64 = 8.0;
@@ -260,14 +265,15 @@ fn coherent_moving_indices(primary_mm: &[f64]) -> Vec<usize> {
 /// displacements (in mm) qualify to commit a swipe for `configured_fingers`:
 /// - exactly `configured_fingers` selected
 /// - mean travel >= `ARM_DISTANCE_MM` with `AXIS_DOMINANCE` over `cross_mm`
-/// - every selected finger also moved in the swipe direction on the commit frame
+/// - every selected finger moved meaningfully (>= `MIN_COMMIT_FRAME_MM` and
+///   `>= COHERENCE_RATIO` of the fastest recent step) in the swipe direction
 /// - every excluded contact remained stationary on both axes
 fn subset_commits(
     indices: &[usize],
     configured_fingers: usize,
     primary_mm: &[f64],
     cross_mm: &[f64],
-    frame_primary: &[f64],
+    frame_primary_mm: &[f64],
 ) -> bool {
     if indices.len() != configured_fingers || indices.is_empty() {
         return false;
@@ -283,12 +289,12 @@ fn subset_commits(
     let sign = mean_primary.signum();
     let max_frame = indices
         .iter()
-        .map(|&i| frame_primary[i].abs())
+        .map(|&i| frame_primary_mm[i].abs())
         .fold(0.0_f64, f64::max);
-    if max_frame <= 0.0
-        || indices.iter().any(|&i| {
-            frame_primary[i] * sign <= 0.0 || frame_primary[i].abs() < COHERENCE_RATIO * max_frame
-        })
+    let frame_floor = MIN_COMMIT_FRAME_MM.max(COHERENCE_RATIO * max_frame);
+    if indices
+        .iter()
+        .any(|&i| frame_primary_mm[i] * sign <= 0.0 || frame_primary_mm[i].abs() < frame_floor)
     {
         return false;
     }
@@ -307,6 +313,8 @@ struct ArmingMetrics {
     horiz_norm: Vec<(f64, f64)>,
     frame_horiz: Vec<f64>,
     frame_vert: Vec<f64>,
+    frame_horiz_mm: Vec<f64>,
+    frame_vert_mm: Vec<f64>,
 }
 
 impl ArmingMetrics {
@@ -321,6 +329,8 @@ impl ArmingMetrics {
         let mut horiz_norm = Vec::with_capacity(touches.len());
         let mut frame_horiz = Vec::with_capacity(touches.len());
         let mut frame_vert = Vec::with_capacity(touches.len());
+        let mut frame_horiz_mm = Vec::with_capacity(touches.len());
+        let mut frame_vert_mm = Vec::with_capacity(touches.len());
 
         for current in touches {
             let start = start_anchors
@@ -333,6 +343,8 @@ impl ArmingMetrics {
 
             let horiz = start.x - current.x;
             let vert = start.y - current.y;
+            let step_horiz = prev.x - current.x;
+            let step_vert = prev.y - current.y;
             horiz_norm.push((horiz, current.device_width_points));
             horiz_mm.push(normalized_to_mm(
                 horiz,
@@ -344,8 +356,18 @@ impl ArmingMetrics {
                 current.device_height_points,
                 FALLBACK_MM_PER_NORM_Y,
             ));
-            frame_horiz.push(prev.x - current.x);
-            frame_vert.push(prev.y - current.y);
+            frame_horiz.push(step_horiz);
+            frame_vert.push(step_vert);
+            frame_horiz_mm.push(normalized_to_mm(
+                step_horiz,
+                current.device_width_points,
+                FALLBACK_MM_PER_NORM_X,
+            ));
+            frame_vert_mm.push(normalized_to_mm(
+                step_vert,
+                current.device_height_points,
+                FALLBACK_MM_PER_NORM_Y,
+            ));
         }
 
         Some(Self {
@@ -354,6 +376,8 @@ impl ArmingMetrics {
             horiz_norm,
             frame_horiz,
             frame_vert,
+            frame_horiz_mm,
+            frame_vert_mm,
         })
     }
 }
@@ -538,6 +562,13 @@ impl<I: Clone> SwipeAccumulator<I> {
         }
     }
 
+    fn reject_touches(&mut self, touches: Vec<SwipeSample<I>>) -> SwipeSampleOutcome {
+        self.state = SwipeState::Rejected {
+            identities: touches.into_iter().map(|t| t.identity).collect(),
+        };
+        SwipeSampleOutcome::Rejected
+    }
+
     fn sample_arming(
         &mut self,
         touches: Vec<SwipeSample<I>>,
@@ -582,7 +613,7 @@ impl<I: Clone> SwipeAccumulator<I> {
             configured_fingers,
             &metrics.horiz_mm,
             &metrics.vert_mm,
-            &metrics.frame_horiz,
+            &metrics.frame_horiz_mm,
         ) {
             let delta = horiz_moving.iter().map(|&i| metrics.frame_horiz[i]).sum();
             let distance_cm =
@@ -610,7 +641,7 @@ impl<I: Clone> SwipeAccumulator<I> {
                         configured_fingers,
                         &metrics.vert_mm,
                         &metrics.horiz_mm,
-                        &metrics.frame_vert,
+                        &metrics.frame_vert_mm,
                     )
                 {
                     let delta = vert_moving.iter().map(|&i| metrics.frame_vert[i]).sum();
@@ -625,11 +656,11 @@ impl<I: Clone> SwipeAccumulator<I> {
                         just_committed: true,
                     };
                 }
-                if !vertical_enabled || max_abs(&metrics.vert_mm) >= REJECT_DISAGREE_MM {
-                    self.state = SwipeState::Rejected {
-                        identities: touches.into_iter().map(|t| t.identity).collect(),
-                    };
-                    return SwipeSampleOutcome::Rejected;
+                if !vertical_enabled
+                    || (max_abs(&metrics.vert_mm) >= REJECT_DISAGREE_MM
+                        && vert_moving.len() != configured_fingers)
+                {
+                    return self.reject_touches(touches);
                 }
             }
         }
@@ -637,13 +668,14 @@ impl<I: Clone> SwipeAccumulator<I> {
         if max_abs(&metrics.horiz_mm) >= REJECT_DISAGREE_MM
             && horiz_moving.len() != configured_fingers
         {
-            self.state = SwipeState::Rejected {
-                identities: touches.into_iter().map(|t| t.identity).collect(),
-            };
-            return SwipeSampleOutcome::Rejected;
+            return self.reject_touches(touches);
         }
 
-        *prev_frame = touches;
+        if max_abs(&metrics.frame_horiz_mm) >= MIN_COMMIT_FRAME_MM
+            || max_abs(&metrics.frame_vert_mm) >= MIN_COMMIT_FRAME_MM
+        {
+            *prev_frame = touches;
+        }
         SwipeSampleOutcome::Pending
     }
 
@@ -1191,6 +1223,8 @@ impl InputHandler {
         let is_continuous =
             CGEvent::integer_value_field(Some(event), CGEventField::ScrollWheelEventIsContinuous)
                 != 0;
+        let scroll_phase =
+            CGEvent::integer_value_field(Some(event), CGEventField::ScrollWheelEventScrollPhase);
         let momentum_phase =
             CGEvent::integer_value_field(Some(event), CGEventField::ScrollWheelEventMomentumPhase);
 
@@ -1198,6 +1232,7 @@ impl InputHandler {
             self.swipe_accumulator.is_active(),
             &mut self.last_swipe_time,
             is_continuous,
+            scroll_phase,
             momentum_phase,
             now,
         ) {
@@ -1515,13 +1550,15 @@ impl InputHandler {
 
 /// Decides whether to suppress a `ScrollWheel` event while or after a strip
 /// swipe is active. Discrete mouse wheels always pass through; trackpad
-/// momentum tails are suppressed for `VERTICAL_GESTURE_SCROLL_SUPPRESS`; and
-/// non-momentum trackpad scrolling is suppressed only during
-/// `POST_SWIPE_SCROLL_GRACE` after the swipe ends.
+/// momentum tails are suppressed for `VERTICAL_GESTURE_SCROLL_SUPPRESS` unless
+/// a fresh non-momentum scroll sequence (`Began` / `MayBegin`) starts after
+/// `POST_SWIPE_SCROLL_GRACE`; and non-momentum `Changed` events pass after
+/// grace while preserving momentum suppression for the prior swipe.
 fn should_suppress_scroll_wheel(
     swipe_active: bool,
     last_swipe_time: &mut Option<Instant>,
     is_continuous: bool,
+    scroll_phase: i64,
     momentum_phase: i64,
     now: Instant,
 ) -> bool {
@@ -1544,6 +1581,9 @@ fn should_suppress_scroll_wheel(
     }
     if elapsed < POST_SWIPE_SCROLL_GRACE {
         return true;
+    }
+    if scroll_phase == CG_SCROLL_PHASE_BEGAN || scroll_phase == CG_SCROLL_PHASE_MAY_BEGIN {
+        *last_swipe_time = None;
     }
     false
 }
@@ -2094,7 +2134,19 @@ mod tests {
         step2[1].x = start[1].x + 3.0 / 127.0;
         step2[2].x = start[2].x + 3.0 / 127.0;
         assert_eq!(
-            swipe.sample(step2, 3, false, now, |a, b| a == b),
+            swipe.sample(step2.clone(), 3, false, now, |a, b| a == b),
+            SwipeSampleOutcome::Pending
+        );
+        assert!(!swipe.is_active());
+
+        // Frame 3: as the 2-finger scroll slows, all three contacts drift 0.01 mm together.
+        // Travel is below MIN_COMMIT_FRAME_MM (0.15 mm), so it still must not commit.
+        let mut step3 = step2;
+        for f in &mut step3 {
+            f.x += 0.01 / 127.0;
+        }
+        assert_eq!(
+            swipe.sample(step3, 3, false, now, |a, b| a == b),
             SwipeSampleOutcome::Pending
         );
         assert!(!swipe.is_active());
@@ -2187,6 +2239,55 @@ mod tests {
     }
 
     #[test]
+    fn uneven_vertical_frame_stays_pending_and_commits_on_next_coherent_frame() {
+        let now = Instant::now();
+        let mut swipe = SwipeAccumulator::default();
+        let mut start = three_fingers(0.5);
+        start.push(SwipeSample {
+            identity: 99,
+            x: 0.05,
+            y: 0.05,
+            device_width_points: 360.0,
+            device_height_points: 240.0,
+        });
+        swipe.sample(start.clone(), 3, true, now, |a, b| a == b);
+
+        // Frame 1: all 3 fingers move 2.0 mm vertically (still < 2.2 mm).
+        let mut step1 = start.clone();
+        for f in &mut step1[0..3] {
+            f.y += 2.0 / 84.7;
+        }
+        assert_eq!(
+            swipe.sample(step1, 3, true, now, |a, b| a == b),
+            SwipeSampleOutcome::Pending
+        );
+
+        // Frame 2: uneven jump to [8.1, 8.1, 2.8] mm; fails frame ratio (0.8 < 0.25 * 6.1)
+        // but must stay Pending (not Rejected) since all 3 fingers are moving vertically.
+        let mut step2 = start;
+        step2[0].y += 8.1 / 84.7;
+        step2[1].y += 8.1 / 84.7;
+        step2[2].y += 2.8 / 84.7;
+        assert_eq!(
+            swipe.sample(step2.clone(), 3, true, now, |a, b| a == b),
+            SwipeSampleOutcome::Pending
+        );
+
+        // Frame 3: all 3 fingers move 1.0 mm together -> commits cleanly.
+        let mut step3 = step2;
+        for f in &mut step3[0..3] {
+            f.y += 1.0 / 84.7;
+        }
+        assert!(matches!(
+            swipe.sample(step3, 3, true, now, |a, b| a == b),
+            SwipeSampleOutcome::Movement {
+                movement: SwipeMovement::Vertical(_),
+                just_committed: true
+            }
+        ));
+    }
+
+    #[test]
     fn scroll_suppression_scopes_to_active_swipe_grace_and_momentum() {
         let t0 = Instant::now();
         let mut last = Some(t0);
@@ -2197,6 +2298,7 @@ mod tests {
             &mut last,
             false,
             0,
+            0,
             t0 + Duration::from_millis(10)
         ));
 
@@ -2205,6 +2307,7 @@ mod tests {
             true,
             &mut last,
             true,
+            CG_SCROLL_PHASE_BEGAN,
             0,
             t0 + Duration::from_millis(20)
         ));
@@ -2214,6 +2317,7 @@ mod tests {
             false,
             &mut last,
             true,
+            CG_SCROLL_PHASE_BEGAN,
             0,
             t0 + Duration::from_millis(50)
         ));
@@ -2223,29 +2327,53 @@ mod tests {
             false,
             &mut last,
             true,
+            2,
             0,
             t0 + Duration::from_millis(150)
         ));
         assert!(last.is_some());
 
-        // Momentum tail at 200 ms is still suppressed inside the 1200 ms window.
+        // Momentum tail from prior swipe at 200 ms is still suppressed inside the 1200 ms window.
         assert!(should_suppress_scroll_wheel(
             false,
             &mut last,
             true,
+            0,
             2,
             t0 + Duration::from_millis(200)
         ));
 
-        // After 1200 ms expiry, momentum clears the timestamp and passes.
+        // A fresh non-momentum Began at 250 ms (after grace) clears the guard so its own
+        // momentum at 400 ms passes through.
         assert!(!should_suppress_scroll_wheel(
             false,
             &mut last,
             true,
+            CG_SCROLL_PHASE_BEGAN,
+            0,
+            t0 + Duration::from_millis(250)
+        ));
+        assert!(last.is_none());
+        assert!(!should_suppress_scroll_wheel(
+            false,
+            &mut last,
+            true,
+            0,
+            2,
+            t0 + Duration::from_millis(400)
+        ));
+
+        // Without a fresh Began, momentum stays suppressed until 1200 ms expiry.
+        let mut last2 = Some(t0);
+        assert!(!should_suppress_scroll_wheel(
+            false,
+            &mut last2,
+            true,
+            0,
             2,
             t0 + Duration::from_millis(1250)
         ));
-        assert!(last.is_none());
+        assert!(last2.is_none());
     }
 
     fn horizontal_key(verb: &str, side: crate::commands::Side, repeat: bool) -> Event {
