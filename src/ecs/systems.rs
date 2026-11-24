@@ -17,12 +17,13 @@ use objc2_foundation::NSPoint;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     AccessibilityProbe, ActiveDisplayMarker, AwaitingAccessibility, BProcess, ExistingMarker,
-    FreshMarker, PlacedUnderCover, RepositionMarker, ResizeMarker, ResizeMotion, RetryFrontSwitch,
+    FreshMarker, PlacedUnderCover, RepositionMarker, ResizeMarker, ResizeMotion,
     SpawnWindowTrigger, Timeout, VerifyWindowPosition, VerifyWindowSize,
 };
 
@@ -42,8 +43,8 @@ use crate::ecs::triggers::{adopt_refused_size, widen_column_siblings};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
     LowPowerMode, MaximumHeight, MinimumHeight, MissionControlActive, Position, PreLaunchFrame,
-    PresentedOrigin, ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger,
-    SpawnCommandsExt, SystemTheme, Unmanaged, WidthLimits, WidthRatio, WindowProperties,
+    PresentedOrigin, ReadDisplayProperties, RestoreWindowState, Scrolling, SpawnCommandsExt,
+    SystemTheme, Unmanaged, WidthLimits, WidthRatio, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -657,42 +658,6 @@ pub(super) fn timeout_ticker(
     }
 }
 
-/// Retries querying the focused window for applications that had a transient AX error
-/// during `ApplicationFrontSwitched`. Runs each frame until success or timeout.
-pub(super) fn retry_front_switch(
-    retries: Populated<(Entity, &RetryFrontSwitch)>,
-    applications: Query<&Application>,
-    mut commands: Commands,
-) {
-    for (entity, retry) in retries.iter() {
-        let Ok(app) = applications.get(retry.0) else {
-            // Application entity no longer exists, clean up.
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_despawn();
-            }
-            continue;
-        };
-        if !app.is_frontmost() {
-            // App is no longer frontmost — this retry is stale.
-            debug!("Discarding stale front switch retry (app no longer frontmost).");
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_despawn();
-            }
-            continue;
-        }
-        if let Ok(focused_id) = app.focused_window_id() {
-            debug!("Front switch retry succeeded for window {focused_id}.");
-            commands.trigger(SendMessageTrigger(Event::WindowFocused {
-                window_id: focused_id,
-            }));
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_despawn();
-            }
-        }
-        // Otherwise, let timeout_ticker handle expiry.
-    }
-}
-
 /// Upper bound on a pass's animation time while motion is already running:
 /// a 30fps tick, matching the scroll integrator's `MAX_STEP_SECS`, so a
 /// stalled pass steps on instead of jumping.
@@ -1022,15 +987,18 @@ pub(crate) fn pump_events(
     }
 }
 
-/// A move or resize notification that arrived while the engine's own write
-/// to the window was still on its way. Reading the frame then would wait on
-/// the app and see the frame the window is leaving, so it is read once the
-/// write has landed. The app may have changed the window since, and dropping
-/// the notification would lose that change.
+/// A move or resize notification whose frame is not read yet. It arrived
+/// while the engine's own write to the window was still on its way, and
+/// reading the frame then would see the frame the window is leaving, so it
+/// is read once the write has landed. Or its read is asked of the app's
+/// writer, and waits for the app's answer. The app may have changed the
+/// window since, and dropping the notification would lose that change.
 #[derive(Clone, Copy, Component, Debug, Default)]
 pub(crate) struct DeferredFrameRead {
     moved: bool,
     resized: bool,
+    /// The read is asked, so the engine runs frames until the app answers.
+    pub(crate) asked: bool,
 }
 
 /// Windows whose frame is read again without a fresh notification: a native
@@ -1124,6 +1092,9 @@ pub(crate) fn window_frame_update(
     } else {
         notified_windows(&mut messages, &windows)
     };
+    // Windows whose app reported a change this frame: a read asked before
+    // then may have been answered before the change.
+    let fresh: Vec<Entity> = notified.iter().map(|(entity, ..)| *entity).collect();
     for (entity, moved, _) in &notified {
         if *moved {
             native.moved(*entity);
@@ -1147,16 +1118,28 @@ pub(crate) fn window_frame_update(
         let Ok((_, mut window, position, bounds, unmanaged, resize, verifying, repositioning, _)) =
             windows.get_mut(entity)
         else {
+            if rechecks
+                .get(entity)
+                .is_ok_and(|(_, _, deferred)| deferred.is_some())
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_remove::<DeferredFrameRead>();
+            }
             continue;
         };
         let strip = workspaces.iter().find(|(strip, _)| strip.contains(entity));
         let strip_space = strip.map(|(strip, _)| strip.id());
         let tiled = unmanaged.is_none() && strip.is_some_and(|(strip, _)| tiled_in(strip, entity));
-        let (native_resize, deferred) = rechecks
-            .get(entity)
-            .map_or((false, false), |(_, native, deferred)| {
-                (native, deferred.is_some())
-            });
+        let (native_resize, deferred, asked) =
+            rechecks
+                .get(entity)
+                .map_or((false, false, false), |(_, native, deferred)| {
+                    (
+                        native,
+                        deferred.is_some(),
+                        deferred.is_some_and(|read| read.asked),
+                    )
+                });
         if !tiled
             && native_resize
             && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -1173,7 +1156,10 @@ pub(crate) fn window_frame_update(
         }
         if swiping
             || hidden
-            || !(moved || resized || (tiled && tiling.due(entity, strip.map(|(strip, _)| strip))))
+            || !(moved
+                || resized
+                || asked
+                || (tiled && tiling.due(entity, strip.map(|(strip, _)| strip))))
         {
             continue;
         }
@@ -1184,18 +1170,40 @@ pub(crate) fn window_frame_update(
             if (moved || resized)
                 && let Ok(mut entity_commands) = commands.get_entity(entity)
             {
-                entity_commands.try_insert(DeferredFrameRead { moved, resized });
+                entity_commands.try_insert(DeferredFrameRead {
+                    moved,
+                    resized,
+                    asked: false,
+                });
             }
             continue;
         }
-        if deferred && let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_remove::<DeferredFrameRead>();
-        }
-        let Ok(new_frame) = window.update_frame() else {
-            if tiled {
-                tiling.retry(entity, &mut commands);
+        // A busy app can leave the read unanswered for the whole
+        // Accessibility timeout, so the app's writer asks it, and the frame
+        // after it answers reads the answer.
+        let new_frame = match window.poll_frame(fresh.contains(&entity)) {
+            Poll::Pending => {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(DeferredFrameRead {
+                        moved,
+                        resized,
+                        asked: true,
+                    });
+                }
+                continue;
             }
-            continue;
+            Poll::Ready(read) => {
+                if deferred && let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<DeferredFrameRead>();
+                }
+                let Ok(new_frame) = read else {
+                    if tiled {
+                        tiling.retry(entity, &mut commands);
+                    }
+                    continue;
+                };
+                new_frame
+            }
         };
         let engine = resize.is_some() || verifying;
         let outcome = if tiled {

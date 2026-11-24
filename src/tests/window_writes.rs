@@ -675,3 +675,330 @@ fn a_configured_width_survives_a_busy_app() {
         TEST_DISPLAY_WIDTH / 2
     );
 }
+
+// --- Questions for a busy app go to its writer ---
+
+/// Holds the slow app, whose frame and focus reads then wait as its writes
+/// do, like an app busy on its main thread. A read on the engine's thread
+/// fails the test.
+fn hold_slow_app_reads(harness: &mut TestHarness) {
+    harness.mock_state.hold_reads_with_writes(SLOW_APP);
+    harness.mock_state.hold_writes(SLOW_APP);
+}
+
+/// `window_frame_update`: a busy app moves its own window while no write of
+/// the engine's is on its way. The engine reads the frame on the app's
+/// writer, so no frame waits for the app, as one did for each 250 ms read
+/// that Helium left unanswered while the strip slid to its stack. Once the
+/// app answers, the engine puts the window back in its slot.
+#[test]
+fn a_move_notification_from_a_busy_app_holds_up_no_frame() {
+    let mut harness = harness();
+    let slot = engine_frame(harness.world(), 0);
+    let moved = IRect::from_corners(slot.min + IVec2::new(60, 0), slot.max + IVec2::new(60, 0));
+    hold_slow_app_reads(&mut harness);
+    harness
+        .mock_state
+        .update_window(0, |window| window.frame = moved);
+    harness
+        .world()
+        .write_message(Event::WindowMoved { window_id: 0 });
+
+    run_frames(&mut harness, 5);
+    assert!(
+        has::<crate::ecs::systems::DeferredFrameRead>(harness.world(), 0),
+        "the read waits for the app's answer"
+    );
+    release_slow_app(&mut harness);
+    harness.advance(Duration::from_secs(1));
+    assert!(harness.mock_state.flush_writes(FLUSH));
+
+    assert!(!has::<crate::ecs::systems::DeferredFrameRead>(
+        harness.world(),
+        0
+    ));
+    assert_eq!(harness.mock_state.ax_frame(0), slot, "back in its slot");
+}
+
+/// `front_switched_trigger`: a busy app comes to the front. The engine asks
+/// it for its focused window on its writer, so no frame waits for the app,
+/// and once it answers the engine focuses that window.
+#[test]
+fn a_front_switch_to_a_busy_app_holds_up_no_frame() {
+    let mut harness = harness();
+    harness.mock_state.focus_window_unreported(2);
+    hold_slow_app_reads(&mut harness);
+    harness.mock_state.activate_app(SLOW_APP);
+
+    run_frames(&mut harness, 5);
+    let waiting = {
+        let world = harness.world();
+        world
+            .query::<&crate::ecs::FrontSwitchQuestion>()
+            .iter(world)
+            .count()
+    };
+    assert_eq!(waiting, 1, "the question waits for the app's answer");
+    release_slow_app(&mut harness);
+    harness.advance(Duration::from_secs(1));
+
+    assert!(has::<crate::ecs::FocusedMarker>(harness.world(), 2));
+}
+
+/// `detect_focus_rejection`: the engine checks that a busy app focused the
+/// window it asked for. The check asks the app on its writer, so no frame
+/// waits for the app, and the check ends once the app answers.
+#[test]
+fn a_focus_check_of_a_busy_app_holds_up_no_frame() {
+    let mut harness = harness();
+    harness.world().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+    run_frames(&mut harness, 1);
+    assert!(has::<crate::ecs::VerifyFocus>(harness.world(), 2));
+    hold_slow_app_reads(&mut harness);
+
+    // Past the time the check waits before it asks.
+    run_frames(&mut harness, 25);
+    assert!(
+        has::<crate::ecs::VerifyFocus>(harness.world(), 2),
+        "the check waits for the app's answer"
+    );
+    release_slow_app(&mut harness);
+    harness.advance(Duration::from_secs(1));
+
+    assert!(!has::<crate::ecs::VerifyFocus>(harness.world(), 2));
+    assert!(has::<crate::ecs::FocusedMarker>(harness.world(), 2));
+}
+
+/// `window_focused_trigger`: a focus notification from a busy app waits on the
+/// app's writer for its real focused window instead of skipping stale-focus
+/// and native-tab redirection, without blocking any engine frame.
+#[test]
+fn a_focus_notification_from_a_busy_app_waits_for_its_answer_and_follows_redirect() {
+    let mut harness = harness();
+    assert!(has::<crate::ecs::FocusedMarker>(harness.world(), 0));
+
+    // SLOW_APP is frontmost and actually focuses window 2, while a focus
+    // notification names window 0 (like a native tab group or stale event).
+    harness.mock_state.focus_window_unreported(2);
+    hold_slow_app_reads(&mut harness);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 0 });
+
+    run_frames(&mut harness, 5);
+    let waiting = {
+        let world = harness.world();
+        world
+            .query::<&crate::ecs::WindowFocusQuestion>()
+            .iter(world)
+            .count()
+    };
+    assert_eq!(waiting, 1, "the focus check waits for the app's answer");
+    assert!(
+        has::<crate::ecs::FocusedMarker>(harness.world(), 0),
+        "focus waits for the app's answer instead of dropping the check"
+    );
+
+    release_slow_app(&mut harness);
+    harness.advance(Duration::from_secs(1));
+
+    let remaining = {
+        let world = harness.world();
+        world
+            .query::<&crate::ecs::WindowFocusQuestion>()
+            .iter(world)
+            .count()
+    };
+    assert_eq!(remaining, 0);
+    assert!(
+        has::<crate::ecs::FocusedMarker>(harness.world(), 2),
+        "focus must follow the window the app actually reported"
+    );
+}
+
+/// Two `ApplicationFrontSwitched` events in one frame leave only one
+/// `FrontSwitchQuestion` for the newest app.
+#[test]
+fn two_front_switches_in_one_frame_leave_one_question() {
+    let mut harness = harness();
+    harness.mock_state.focus_window_unreported(2);
+    harness.mock_state.hold_reads_with_writes(OTHER_APP);
+    harness.mock_state.hold_writes(OTHER_APP);
+    hold_slow_app_reads(&mut harness);
+    harness.mock_state.activate_app(OTHER_APP);
+    harness.mock_state.activate_app(SLOW_APP);
+
+    run_frames(&mut harness, 2);
+    let waiting = {
+        let world = harness.world();
+        world
+            .query::<&crate::ecs::FrontSwitchQuestion>()
+            .iter(world)
+            .count()
+    };
+    harness.mock_state.release_writes(OTHER_APP);
+    release_slow_app(&mut harness);
+    assert_eq!(waiting, 1, "only the newest front switch keeps a question");
+}
+
+/// A newer `WindowFocused` notification in the same frame supersedes even a
+/// ready deferred `WindowFocusQuestion`, so the older answer never mutates
+/// focus history or active focus while the newer notification is pending.
+#[test]
+fn a_newer_focus_notification_supersedes_a_ready_deferred_focus_answer() {
+    let mut harness = harness();
+    let app_entity = {
+        let world = harness.world();
+        world
+            .query::<(Entity, &crate::manager::Application)>()
+            .iter(world)
+            .find(|(_, app)| app.pid() == SLOW_APP)
+            .expect("slow app")
+            .0
+    };
+    let timeout = crate::ecs::Timeout::new(
+        Duration::from_secs(2),
+        None,
+        &mut harness.world().commands(),
+    );
+    harness.world().spawn((
+        timeout,
+        crate::ecs::WindowFocusQuestion {
+            window_id: 2,
+            app: app_entity,
+            answer: crate::manager::Answer::ready(Ok(2)),
+        },
+    ));
+    harness.world().flush();
+
+    // A newer notification for window 0 arrives while SLOW_APP is held, so
+    // window 0's confirmation is pending and the ready question for window 2
+    // must be dropped without moving focus to 2.
+    harness.mock_state.focus_window_unreported(0);
+    hold_slow_app_reads(&mut harness);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 0 });
+
+    run_frames(&mut harness, 2);
+    assert!(
+        has::<crate::ecs::FocusedMarker>(harness.world(), 0),
+        "ready deferred answer for window 2 must not override the newer notification"
+    );
+    assert!(
+        !has::<crate::ecs::FocusedMarker>(harness.world(), 2),
+        "stale ready answer must be discarded"
+    );
+    release_slow_app(&mut harness);
+    harness.advance(Duration::from_secs(1));
+    assert!(has::<crate::ecs::FocusedMarker>(harness.world(), 0));
+}
+
+/// A keyboard focus command cancels any pending `WindowFocusQuestion`, so an
+/// older deferred answer cannot pull `FocusedMarker` back before macOS reports
+/// the new focus.
+#[test]
+fn a_focus_command_cancels_a_pending_window_focus_question() {
+    let mut harness = harness();
+    harness.mock_state.focus_window_unreported(0);
+    hold_slow_app_reads(&mut harness);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 0 });
+    run_frames(&mut harness, 2);
+    assert_eq!(
+        harness
+            .world()
+            .query::<&crate::ecs::WindowFocusQuestion>()
+            .iter(harness.world())
+            .count(),
+        1
+    );
+
+    // Focus window 2 via keyboard command while window 0's question is pending.
+    harness.world().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+    run_frames(&mut harness, 1);
+
+    assert_eq!(
+        harness
+            .world()
+            .query::<&crate::ecs::WindowFocusQuestion>()
+            .iter(harness.world())
+            .count(),
+        0,
+        "a newer focus command must cancel pending WindowFocusQuestion"
+    );
+    assert!(has::<crate::ecs::FocusedMarker>(harness.world(), 2));
+    release_slow_app(&mut harness);
+    harness.advance(Duration::from_secs(1));
+    assert!(has::<crate::ecs::FocusedMarker>(harness.world(), 2));
+}
+
+/// An untracked `WindowFocused` notification (e.g. a newly opened dialog)
+/// invalidates an older pending `WindowFocusQuestion` while keeping the stray
+/// retry.
+#[test]
+fn an_untracked_focus_notification_invalidates_a_pending_focus_question() {
+    let mut harness = harness();
+    let app_entity = {
+        let world = harness.world();
+        world
+            .query::<(Entity, &crate::manager::Application)>()
+            .iter(world)
+            .find(|(_, app)| app.pid() == SLOW_APP)
+            .expect("slow app")
+            .0
+    };
+    let timeout = crate::ecs::Timeout::new(
+        Duration::from_secs(2),
+        None,
+        &mut harness.world().commands(),
+    );
+    harness.world().spawn((
+        timeout,
+        crate::ecs::WindowFocusQuestion {
+            window_id: 2,
+            app: app_entity,
+            answer: crate::manager::Answer::ready(Ok(2)),
+        },
+    ));
+    harness.world().flush();
+
+    // Window 999 is untracked and arrives after window 2 in the same frame;
+    // neither the older ready question nor the earlier same-frame tracked
+    // notification for window 2 may apply, and StrayFocusEvent(999) stays.
+    harness.mock_state.focus_window_unreported(2);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 2 });
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 999 });
+    run_frames(&mut harness, 1);
+
+    assert!(
+        has::<crate::ecs::FocusedMarker>(harness.world(), 0),
+        "ready deferred answer for window 2 must not apply after an untracked focus event"
+    );
+    assert_eq!(
+        harness
+            .world()
+            .query::<&crate::ecs::WindowFocusQuestion>()
+            .iter(harness.world())
+            .count(),
+        0
+    );
+    assert_eq!(
+        harness
+            .world()
+            .query::<&crate::ecs::StrayFocusEvent>()
+            .iter(harness.world())
+            .filter(|stray| stray.0 == 999)
+            .count(),
+        1
+    );
+}

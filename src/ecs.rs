@@ -37,7 +37,8 @@ use crate::events::{Event, EventSender, InputEvent};
 #[cfg(feature = "lua")]
 use crate::lua;
 use crate::manager::{
-    Application, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi, WindowManagerOS,
+    Answer, Application, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi,
+    WindowManagerOS,
 };
 use crate::overlay::{DragOverlay, FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
@@ -275,7 +276,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(not(resource_exists::<Initializing>))
                 .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
             systems::auto_discover_unmanaged_focused_windows,
-            systems::retry_front_switch,
+            triggers::answer_front_switch,
         )
             .in_set(UpdateSet::Events),
     );
@@ -817,10 +818,29 @@ impl Timeout {
 #[derive(Component)]
 pub struct StrayFocusEvent(pub WinID);
 
-/// Component used as a retry mechanism when `focused_window_id()` fails during
-/// an `ApplicationFrontSwitched` event (e.g. transient `kAXErrorCannotComplete`).
+/// Asks the application `app` which window it focused, after it came to the
+/// front, and waits for its answer. The answer focuses that window. A failed
+/// answer (e.g. transient `kAXErrorCannotComplete` while the app switches)
+/// is asked again until the entity's [`Timeout`] ends, if `retry`, and
+/// otherwise starts such a retry.
 #[derive(Component)]
-pub struct RetryFrontSwitch(pub Entity);
+pub struct FrontSwitchQuestion {
+    pub app: Entity,
+    pub answer: Option<Answer<Result<WinID>>>,
+    pub retry: bool,
+}
+
+/// Asks `app` which window it currently considers focused, after a
+/// `WindowFocused` notification for `window_id` arrived from an app that did
+/// not answer within the brief same-frame wait. Once the answer arrives,
+/// `window_focused_trigger` applies the focus (including native-tab and
+/// floating-dialog redirection, or dropping stale events).
+#[derive(Component)]
+pub struct WindowFocusQuestion {
+    pub window_id: WinID,
+    pub app: Entity,
+    pub answer: Answer<Result<WinID>>,
+}
 
 /// Attached to a window after a keyboard focus request to verify whether the
 /// application accepted or rejected focus once the settle [`Timeout`] completes.
@@ -829,6 +849,12 @@ pub struct RetryFrontSwitch(pub Entity);
 #[derive(Component, Default)]
 pub struct VerifyFocus {
     pub asked_again: bool,
+    /// The app's answer to which window it focused, asked once the settle
+    /// [`Timeout`] completed. A busy app can take the whole Accessibility
+    /// timeout to answer, so the engine does not wait for it.
+    pub answer: Option<Answer<Result<WinID>>>,
+    /// How many times the settle [`Timeout`] was extended for the answer.
+    pub answer_waits: u8,
 }
 
 /// Waits for a replacement AX handle without discarding the window entity.

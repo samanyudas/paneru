@@ -54,6 +54,7 @@ use skylight::{
     SLSWindowIteratorGetParentID, SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID,
     SLSWindowQueryResultCopyWindows, SLSWindowQueryWindows,
 };
+pub use window_writer::Answer;
 pub(crate) use windows::forget_enhanced_ui_state;
 pub use windows::{
     Margins, Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id,

@@ -19,9 +19,9 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     AboveOrdinaryCheck, ActiveDisplayMarker, AwaitingHandle, AwaitsTitleMatch, BProcess,
-    DepartureConfirmed, FloatsWhenRestored, FocusedMarker, MissionControlActive, OpenedHidden,
-    PreviousManagedStrip, Rejoin, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent,
-    SystemTheme, Timeout, Unmanaged,
+    DepartureConfirmed, FloatsWhenRestored, FocusedMarker, FrontSwitchQuestion,
+    MissionControlActive, OpenedHidden, PreviousManagedStrip, Rejoin, SpawnWindowTrigger,
+    StrayFocusEvent, SystemTheme, Timeout, Unmanaged, WindowFocusQuestion,
 };
 use crate::config::Config;
 use crate::ecs::display::size_for_arrival;
@@ -126,25 +126,21 @@ pub(crate) fn apply_config_side_effects(
     }
 }
 
-/// Handles the event when an application switches to the front. It updates the focused window and PSN.
-///
-/// # Arguments
-///
-/// * `trigger` - The Bevy event trigger containing the application front switched event.
-/// * `processes` - A query for all processes with their children.
-/// * `applications` - A query for all applications.
-/// * `focused_window` - A query for the focused window.
-/// * `focus_follows_mouse_id` - The resource to track focus follows mouse window ID.
-/// * `commands` - Bevy commands to trigger events and manage components.
+/// Handles the event when an application switches to the front: asks the
+/// application which window it focused, without waiting on it. A busy app
+/// can take the whole Accessibility timeout to answer, and a frame that
+/// waited on it stopped every window. [`answer_front_switch`] reads the
+/// answer.
 pub(super) fn front_switched_trigger(
     mut messages: MessageReader<Event>,
     processes: Query<(&BProcess, &Children)>,
     applications: Query<&Application>,
+    questions: Query<Entity, With<FrontSwitchQuestion>>,
     window_manager: Res<WindowManager>,
     mut config: GlobalState,
     mut commands: Commands,
 ) {
-    const FRONT_SWITCH_RETRY_SEC: u64 = 2;
+    let mut latest = None;
     for event in messages.read() {
         let Event::ApplicationFrontSwitched { psn } = event else {
             continue;
@@ -164,41 +160,146 @@ pub(super) fn front_switched_trigger(
             error!("No application for process '{}'.", process.name());
             continue;
         };
-        let Some(app) = applications.get(app_entity).ok() else {
+        let Ok(app) = applications.get(app_entity) else {
             error!("No application for process '{}'.", process.name());
             continue;
         };
 
         debug!("front switching process: {}", process.name());
+        latest = Some((process.name().to_string(), app_entity, app));
+    }
 
-        if let Ok(focused_id) = app.focused_window_id().inspect_err(|err| {
-            warn!("can not get current focus: {err}");
-        }) {
-            if let Some(point) = window_manager.cursor_position()
-                && window_manager
-                    .find_window_at_point(&point)
-                    .is_ok_and(|window_id| window_id != focused_id)
-            {
-                // Window got focus without mouse movement - probably with a Cmd-Tab.
-                // If so, bring it into view.
-                config.set_skip_reshuffle(false);
-                config.set_ffm_flag(None);
-            }
-            commands.trigger(SendMessageTrigger(Event::WindowFocused {
-                window_id: focused_id,
-            }));
-        } else {
-            // Transient AX error (e.g. kAXErrorCannotComplete during app transitions).
-            // Schedule a retry to query the focused window once the app is ready.
-            let timeout = Timeout::new(
-                Duration::from_secs(FRONT_SWITCH_RETRY_SEC),
-                Some(format!(
-                    "Front switch retry for '{}' timed out.",
-                    process.name()
-                )),
+    let Some((process_name, app_entity, app)) = latest else {
+        return;
+    };
+
+    // The newest app in front is the one whose focus counts.
+    for question in &questions {
+        if let Ok(mut entity_commands) = commands.get_entity(question) {
+            entity_commands.try_despawn();
+        }
+    }
+    let answer = app.ask_focused_window_id();
+    // An app that answers at once is followed in this frame.
+    let retry = match answer.take() {
+        Some(Ok(focused_id)) => {
+            focus_front_window(
+                focused_id,
+                false,
+                &window_manager,
+                &mut config,
                 &mut commands,
             );
-            commands.spawn((timeout, RetryFrontSwitch(app_entity)));
+            return;
+        }
+        Some(Err(err)) => {
+            // Transient AX error (e.g. kAXErrorCannotComplete during app
+            // transitions): ask again once the app is ready.
+            warn!("can not get current focus: {err}");
+            true
+        }
+        None => false,
+    };
+    let timeout = Timeout::new(
+        Duration::from_secs(FRONT_SWITCH_ANSWER_SEC),
+        Some(format!(
+            "Front switch answer for '{process_name}' timed out."
+        )),
+        &mut commands,
+    );
+    commands.spawn((
+        timeout,
+        FrontSwitchQuestion {
+            app: app_entity,
+            answer: (!retry).then_some(answer),
+            retry,
+        },
+    ));
+}
+
+/// Focuses `focused_id`, the window an app named after it came to the front.
+/// A first answer that names another window than the one under the pointer
+/// came from a Cmd-Tab, not the pointer, so it brings the window into view.
+fn focus_front_window(
+    focused_id: WinID,
+    retry: bool,
+    window_manager: &WindowManager,
+    config: &mut GlobalState,
+    commands: &mut Commands,
+) {
+    if retry {
+        debug!("Front switch retry succeeded for window {focused_id}.");
+    } else if let Some(point) = window_manager.cursor_position()
+        && window_manager
+            .find_window_at_point(&point)
+            .is_ok_and(|window_id| window_id != focused_id)
+    {
+        // Window got focus without mouse movement - probably with a Cmd-Tab.
+        // If so, bring it into view.
+        config.set_skip_reshuffle(false);
+        config.set_ffm_flag(None);
+    }
+    commands.trigger(SendMessageTrigger(Event::WindowFocused {
+        window_id: focused_id,
+    }));
+}
+
+/// How long an app in front has to name its focused window.
+const FRONT_SWITCH_ANSWER_SEC: u64 = 2;
+
+/// Reads the answers to [`FrontSwitchQuestion`]s, and focuses the window each
+/// app named. An app that failed to answer is asked again each frame, until
+/// the question's [`Timeout`] ends.
+pub(super) fn answer_front_switch(
+    mut questions: Populated<(Entity, &mut FrontSwitchQuestion)>,
+    applications: Query<&Application>,
+    window_manager: Res<WindowManager>,
+    mut config: GlobalState,
+    mut commands: Commands,
+) {
+    for (entity, mut question) in &mut questions {
+        let Ok(app) = applications.get(question.app) else {
+            // Application entity no longer exists, clean up.
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_despawn();
+            }
+            continue;
+        };
+        if !app.is_frontmost() {
+            debug!("Discarding stale front switch question (app no longer frontmost).");
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_despawn();
+            }
+            continue;
+        }
+        let answer = question
+            .answer
+            .get_or_insert_with(|| app.ask_focused_window_id());
+        let Some(answer) = answer.take() else {
+            continue;
+        };
+        question.answer = None;
+        let focused_id = match answer {
+            Ok(focused_id) => focused_id,
+            Err(err) => {
+                // Transient AX error (e.g. kAXErrorCannotComplete during app
+                // transitions): ask again once the app is ready.
+                if !question.retry {
+                    warn!("can not get current focus: {err}");
+                    question.retry = true;
+                }
+                continue;
+            }
+        };
+        focus_front_window(
+            focused_id,
+            question.retry,
+            &window_manager,
+            &mut config,
+            &mut commands,
+        );
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_despawn();
         }
     }
 }
@@ -244,6 +345,169 @@ pub(super) fn theme_change_trigger(
     }
 }
 
+/// How long a frontmost app has to confirm its focused window after a
+/// `WindowFocused` notification.
+const WINDOW_FOCUS_ANSWER_SEC: u64 = 2;
+
+/// Applies one `WindowFocused` notification once the app's `focused_window_id`
+/// answer has arrived (or failed).
+#[allow(clippy::too_many_arguments)]
+fn apply_window_focus(
+    window_id: WinID,
+    parent: Entity,
+    app: &Application,
+    answer: crate::errors::Result<WinID>,
+    workspaces: &mut Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    restore_guards: &Query<(Entity, &RestoreFocusMarker)>,
+    focus_history: &mut FocusHistory,
+    global_state: &GlobalState,
+    ctx: &mut WindowCtx,
+    current_focused: &mut Option<(Entity, WinID)>,
+) {
+    let Some((window, entity, actual_parent)) = ctx.windows.find_parent(window_id) else {
+        return;
+    };
+    if actual_parent != parent {
+        return;
+    }
+
+    // Within the app, the window it says is focused wins over the id the
+    // event carries, which may be a moment out of date. An app with native
+    // tabs in particular answers with whichever member of the tab group it
+    // decided to show. Follow it to that window rather than dropping the
+    // event: dropping it leaves the strip parked where it was, so Cmd-Tab
+    // into a tabbed terminal looks like nothing happened.
+    let (window, entity, window_id) = match answer {
+        Ok(current) if current != window_id => match ctx.windows.find_parent(current) {
+            Some((current_window, current_entity, current_parent)) if current_parent == parent => {
+                debug!(
+                    "app {} reports window {current} focused, not {window_id}; following it",
+                    app.name()
+                );
+                // An app can put a floating window of its own, such as
+                // a dialog that opens with a document, in front of the
+                // tiled window the event is for. That window keeps the
+                // focus, but the tiled one still comes into view under
+                // it and counts as the strip's last focus, so the
+                // dialog does not leave it parked off screen.
+                let floating = ctx
+                    .windows
+                    .get_managed(current_entity)
+                    .is_some_and(|(_, _, managed)| matches!(managed, Some(Unmanaged::Floating)));
+                if floating
+                    && let Some((_, strip, _)) = workspaces
+                        .iter()
+                        .find(|(_, strip, _)| strip.contains(entity))
+                {
+                    focus_history.record(strip.id(), entity, None);
+                    ctx.commands.ensure_visible(entity);
+                }
+                (current_window, current_entity, current)
+            }
+            // Nothing we track answers to that id, so the event really
+            // is stale.
+            _ => return,
+        },
+        _ => (window, entity, window_id),
+    };
+
+    // Always keep passthrough in sync. An internal focus_entity call races
+    // with the OS WindowFocused event; without this the passthrough keys
+    // remain stale from a previously focused window.
+    update_passthrough(window, app, &ctx.config);
+
+    let already_focused = current_focused.is_some_and(|(_, id)| id == window_id);
+
+    let managed = ctx
+        .windows
+        .get_managed(entity)
+        .and_then(|(_, _, managed)| managed);
+    if matches!(managed, Some(Unmanaged::Hidden)) {
+        if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
+            entity_commands.try_remove::<Unmanaged>();
+        }
+        ctx.commands
+            .trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
+        return;
+    }
+
+    // Handle tab switching: if the focused window is a tab, make it the leader.
+    // Also reactivate the owning virtual strip before treating duplicate
+    // focus as a no-op; the focus marker can be stale on a hidden strip.
+    // Track the active workspace as a fallback so focus_history can record
+    // a workspace id even when the entity hasn't been routed into a strip.
+    let mut owner = None;
+    let mut owning_workspace_id = None;
+    let mut active_workspace_id = None;
+    for (strip_entity, mut strip, active) in workspaces.iter_mut() {
+        if active {
+            active_workspace_id = Some(strip.id());
+        }
+        if owner.is_none() && strip.contains(entity) {
+            // Only a real reorder counts as a layout change. A repeat
+            // focus notification must not order the stack again.
+            if let Ok(index) = strip.index_of(entity)
+                && let Some(column) = strip.bypass_change_detection().get_column_mut(index)
+                && column.move_to_front(entity)
+            {
+                strip.set_changed();
+            }
+            owning_workspace_id = Some(strip.id());
+            owner = Some((strip_entity, active));
+        }
+    }
+
+    if owner.is_none() && managed.is_none() {
+        // The window just spawned and has not yet been inserted into the strip.
+        return;
+    }
+
+    if let Some((strip_entity, active)) = owner
+        && !active
+        && let Ok(mut entity_commands) = ctx.commands.get_entity(strip_entity)
+    {
+        entity_commands.try_insert(ActiveWorkspaceMarker);
+    }
+
+    // Record before the already-focused short-circuit below: focus_entity
+    // sets FocusedMarker synchronously, so OS-confirmed events for the
+    // same entity would otherwise skip the write.
+    if let Some(workspace_id) = owning_workspace_id.or(active_workspace_id) {
+        let unmanaged = ctx.windows.get_managed(entity).and_then(|(_, _, u)| u);
+        focus_history.record(workspace_id, entity, unmanaged);
+    }
+
+    // The restore guard absorbs the OS focus acknowledgment from a restore;
+    // reshuffling on it would slide the strip away from where the restore
+    // placed it. It may fire twice (front_switched_trigger synthesizes a
+    // duplicate), so a match keeps the guard; focus moving elsewhere despawns it.
+    let mut restored_focus = false;
+    for (guard_entity, guard) in restore_guards {
+        if guard.entity == entity {
+            restored_focus = true;
+        } else if let Ok(mut entity_commands) = ctx.commands.get_entity(guard_entity) {
+            entity_commands.try_despawn();
+        }
+    }
+
+    if already_focused {
+        if restored_focus {
+            return;
+        }
+        // A repeat focus event for the window that already holds focus (a
+        // new browser tab, an app re-activating) is not new layout
+        // information, so it must not re-derive the strip offset — that
+        // threw away a manual centering. Expose the window if it has been
+        // scrolled off an edge, and otherwise leave the strip alone.
+        if !global_state.skip_reshuffle() && !global_state.initializing() {
+            ctx.commands.ensure_visible(entity);
+        }
+        return;
+    }
+
+    *current_focused = Some((entity, window_id));
+}
+
 /// Handles the event when a window gains focus. It updates the focused window, PSN, and reshuffles windows.
 /// It also centers the mouse on the focused window if focus-follows-mouse is enabled.
 ///
@@ -251,16 +515,18 @@ pub(super) fn theme_change_trigger(
 ///
 /// * `messages` - The event stream carrying the window focused event.
 /// * `applications` - A query for all applications.
+/// * `questions` - Deferred focused-window questions from busy apps.
 /// * `workspaces` - A query for the layout strips, to reorder the focused column.
 /// * `restore_guards` - Guards absorbing the OS acknowledgment of a restored focus.
 /// * `focus_history` - Per-workspace record of what was focused last.
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `ctx` - Window queries, configuration and the command buffer.
 #[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn window_focused_trigger(
     mut messages: MessageReader<Event>,
     applications: Query<&Application>,
+    questions: Query<(Entity, &WindowFocusQuestion)>,
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     restore_guards: Query<(Entity, &RestoreFocusMarker)>,
     mut focus_history: ResMut<FocusHistory>,
@@ -275,18 +541,24 @@ pub(super) fn window_focused_trigger(
         .map(|(window, entity)| (entity, window.id()));
     let mut current_focused = initial_focused;
 
+    // Collect newer eligible focus notifications before applying any deferred
+    // answers so a newer notification supersedes even a ready deferred answer.
+    let mut eligible = Vec::new();
+    let mut saw_untracked = false;
     for event in messages.read() {
         let Event::WindowFocused { window_id } = *event else {
             continue;
         };
 
-        let Some((window, entity, parent)) = ctx.windows.find_parent(window_id) else {
+        let Some((window, _, parent)) = ctx.windows.find_parent(window_id) else {
             let timeout = Timeout::new(
                 Duration::from_secs(STRAY_FOCUS_RETRY_SEC),
                 None,
                 &mut ctx.commands,
             );
             ctx.commands.spawn((timeout, StrayFocusEvent(window_id)));
+            eligible.clear();
+            saw_untracked = true;
             continue;
         };
 
@@ -296,150 +568,103 @@ pub(super) fn window_focused_trigger(
         };
 
         // Guard against stale focus events: a delayed one (from
-        // RetryFrontSwitch or a dont_focus re-assertion) must not pull
+        // FrontSwitchQuestion or a dont_focus re-assertion) must not pull
         // FocusedMarker back after focus has moved to another app.
         if !app.is_frontmost() {
             continue;
         }
 
-        // Within the app, the window it says is focused wins over the id the
-        // event carries, which may be a moment out of date. An app with native
-        // tabs in particular answers with whichever member of the tab group it
-        // decided to show. Follow it to that window rather than dropping the
-        // event: dropping it leaves the strip parked where it was, so Cmd-Tab
-        // into a tabbed terminal looks like nothing happened.
-        let (window, entity, window_id) = match app.focused_window_id() {
-            Ok(current) if current != window_id => {
-                match ctx.windows.find_parent(current) {
-                    Some((current_window, current_entity, current_parent))
-                        if current_parent == parent =>
-                    {
-                        debug!(
-                            "app {} reports window {current} focused, not {window_id}; following it",
-                            app.name()
-                        );
-                        // An app can put a floating window of its own, such as
-                        // a dialog that opens with a document, in front of the
-                        // tiled window the event is for. That window keeps the
-                        // focus, but the tiled one still comes into view under
-                        // it and counts as the strip's last focus, so the
-                        // dialog does not leave it parked off screen.
-                        let floating = ctx.windows.get_managed(current_entity).is_some_and(
-                            |(_, _, managed)| matches!(managed, Some(Unmanaged::Floating)),
-                        );
-                        if floating
-                            && let Some((_, strip, _)) = workspaces
-                                .iter()
-                                .find(|(_, strip, _)| strip.contains(entity))
-                        {
-                            focus_history.record(strip.id(), entity, None);
-                            ctx.commands.ensure_visible(entity);
-                        }
-                        (current_window, current_entity, current)
-                    }
-                    // Nothing we track answers to that id, so the event really
-                    // is stale.
-                    _ => continue,
-                }
-            }
-            _ => (window, entity, window_id),
-        };
+        eligible.push((window_id, parent));
+    }
 
-        // Always keep passthrough in sync. An internal focus_entity call races
-        // with the OS WindowFocused event; without this the passthrough keys
-        // remain stale from a previously focused window.
-        update_passthrough(window, app, &ctx.config);
-
-        let already_focused = current_focused.is_some_and(|(_, id)| id == window_id);
-
-        let managed = ctx
-            .windows
-            .get_managed(entity)
-            .and_then(|(_, _, managed)| managed);
-        if matches!(managed, Some(Unmanaged::Hidden)) {
-            if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-                entity_commands.try_remove::<Unmanaged>();
-            }
-            ctx.commands
-                .trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
-            continue;
-        }
-
-        // Handle tab switching: if the focused window is a tab, make it the leader.
-        // Also reactivate the owning virtual strip before treating duplicate
-        // focus as a no-op; the focus marker can be stale on a hidden strip.
-        // Track the active workspace as a fallback so focus_history can record
-        // a workspace id even when the entity hasn't been routed into a strip.
-        let mut owner = None;
-        let mut owning_workspace_id = None;
-        let mut active_workspace_id = None;
-        for (strip_entity, mut strip, active) in &mut workspaces {
-            if active {
-                active_workspace_id = Some(strip.id());
-            }
-            if owner.is_none() && strip.contains(entity) {
-                // Only a real reorder counts as a layout change. A repeat
-                // focus notification must not order the stack again.
-                if let Ok(index) = strip.index_of(entity)
-                    && let Some(column) = strip.bypass_change_detection().get_column_mut(index)
-                    && column.move_to_front(entity)
-                {
-                    strip.set_changed();
-                }
-                owning_workspace_id = Some(strip.id());
-                owner = Some((strip_entity, active));
-            }
-        }
-
-        if owner.is_none() && managed.is_none() {
-            // The window just spawned and has not yet been inserted into the strip.
-            continue;
-        }
-
-        if let Some((strip_entity, active)) = owner
-            && !active
-            && let Ok(mut entity_commands) = ctx.commands.get_entity(strip_entity)
-        {
-            entity_commands.try_insert(ActiveWorkspaceMarker);
-        }
-
-        // Record before the already-focused short-circuit below: focus_entity
-        // sets FocusedMarker synchronously, so OS-confirmed events for the
-        // same entity would otherwise skip the write.
-        if let Some(workspace_id) = owning_workspace_id.or(active_workspace_id) {
-            let unmanaged = ctx.windows.get_managed(entity).and_then(|(_, _, u)| u);
-            focus_history.record(workspace_id, entity, unmanaged);
-        }
-
-        // The restore guard absorbs the OS focus acknowledgment from a restore;
-        // reshuffling on it would slide the strip away from where the restore
-        // placed it. It may fire twice (front_switched_trigger synthesizes a
-        // duplicate), so a match keeps the guard; focus moving elsewhere despawns it.
-        let mut restored_focus = false;
-        for (guard_entity, guard) in &restore_guards {
-            if guard.entity == entity {
-                restored_focus = true;
-            } else if let Ok(mut entity_commands) = ctx.commands.get_entity(guard_entity) {
+    for (q_entity, question) in &questions {
+        let Ok(app) = applications.get(question.app) else {
+            if let Ok(mut entity_commands) = ctx.commands.get_entity(q_entity) {
                 entity_commands.try_despawn();
             }
-        }
-
-        if already_focused {
-            if restored_focus {
-                continue;
-            }
-            // A repeat focus event for the window that already holds focus (a
-            // new browser tab, an app re-activating) is not new layout
-            // information, so it must not re-derive the strip offset — that
-            // threw away a manual centering. Expose the window if it has been
-            // scrolled off an edge, and otherwise leave the strip alone.
-            if !global_state.skip_reshuffle() && !global_state.initializing() {
-                ctx.commands.ensure_visible(entity);
+            continue;
+        };
+        if !app.is_frontmost() {
+            if let Ok(mut entity_commands) = ctx.commands.get_entity(q_entity) {
+                entity_commands.try_despawn();
             }
             continue;
         }
+        if eligible.is_empty() && !saw_untracked {
+            let Some(answer) = question.answer.take() else {
+                continue;
+            };
+            if let Ok(mut entity_commands) = ctx.commands.get_entity(q_entity) {
+                entity_commands.try_despawn();
+            }
+            apply_window_focus(
+                question.window_id,
+                question.app,
+                app,
+                answer,
+                &mut workspaces,
+                &restore_guards,
+                &mut focus_history,
+                &global_state,
+                &mut ctx,
+                &mut current_focused,
+            );
+        } else if let Ok(mut entity_commands) = ctx.commands.get_entity(q_entity) {
+            // Any newer eligible or untracked focus notification supersedes the
+            // older question even when the window ID matches, because an
+            // in-flight read may have sampled an earlier tab or pre-dialog window.
+            entity_commands.try_despawn();
+        }
+    }
 
-        current_focused = Some((entity, window_id));
+    let mut spawned: Option<Entity> = None;
+    for (window_id, parent) in eligible {
+        let Ok(app) = applications.get(parent) else {
+            continue;
+        };
+        if let Some(q_entity) = spawned.take()
+            && let Ok(mut entity_commands) = ctx.commands.get_entity(q_entity)
+        {
+            entity_commands.try_despawn();
+        }
+
+        let answer = app.ask_focused_window_id();
+        if let Some(result) = answer.take() {
+            apply_window_focus(
+                window_id,
+                parent,
+                app,
+                result,
+                &mut workspaces,
+                &restore_guards,
+                &mut focus_history,
+                &global_state,
+                &mut ctx,
+                &mut current_focused,
+            );
+        } else {
+            // A busy app can take longer than the brief same-frame wait (for
+            // instance 10-50 ms for Chromium, or up to the 250 ms timeout).
+            // Wait for its real answer on a later frame instead of skipping
+            // stale-focus and native-tab redirection.
+            let timeout = Timeout::new(
+                Duration::from_secs(WINDOW_FOCUS_ANSWER_SEC),
+                None,
+                &mut ctx.commands,
+            );
+            let q_entity = ctx
+                .commands
+                .spawn((
+                    timeout,
+                    WindowFocusQuestion {
+                        window_id,
+                        app: parent,
+                        answer,
+                    },
+                ))
+                .id();
+            spawned = Some(q_entity);
+        }
     }
 
     // Apply `FocusedMarker` at most once for the final target in this frame's
