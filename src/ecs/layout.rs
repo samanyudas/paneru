@@ -293,7 +293,6 @@ impl Plugin for LayoutEventsPlugin {
                     relayout_on_edge_padding_change,
                     relayout_on_viewport_move,
                     layout_strip_changed,
-                    fit_maximized_windows,
                     reshuffle_layout_strip,
                     expose_focused_survivor_after_removal,
                     ensure_visible_in_strip,
@@ -853,9 +852,6 @@ pub struct LayoutStrip {
     /// Windows whose column splits its height evenly at the next layout,
     /// because a stack item joined or left that column.
     even_splits: EntityHashSet,
-    /// Windows that left a maximized column since the last layout, so the
-    /// layout gives them back their own margins.
-    released: EntityHashSet,
 }
 
 impl LayoutStrip {
@@ -866,7 +862,6 @@ impl LayoutStrip {
             columns: VecDeque::new(),
             tabbed_stacks: EntityHashSet::default(),
             even_splits: EntityHashSet::default(),
-            released: EntityHashSet::default(),
         }
     }
 
@@ -879,7 +874,6 @@ impl LayoutStrip {
             columns,
             tabbed_stacks: EntityHashSet::default(),
             even_splits: EntityHashSet::default(),
-            released: EntityHashSet::default(),
         }
     }
 
@@ -941,7 +935,6 @@ impl LayoutStrip {
     pub(crate) fn append_strip(&mut self, other: &mut Self) {
         self.columns.append(&mut other.columns);
         self.tabbed_stacks.extend(other.tabbed_stacks.drain());
-        self.released.extend(other.released.drain());
     }
 
     /// Extracts all windows in `moved` from `self` and appends them to `target`,
@@ -1133,7 +1126,6 @@ impl LayoutStrip {
                     }
                 }
                 Column::Maximized(MaximizedColumn { item, before }) => {
-                    self.released.insert(entity);
                     let item = match item {
                         StackItem::Single(_) => None,
                         StackItem::Tabs(mut tabs) => {
@@ -1535,10 +1527,7 @@ impl LayoutStrip {
         let item = match self.columns.remove(index)? {
             Column::Single(id) | Column::Fullscren(id) => StackItem::Single(id),
             Column::Tabs(tabs) => StackItem::Tabs(tabs),
-            Column::Maximized(MaximizedColumn { item, .. }) => {
-                self.released.extend(item.window_iter());
-                item
-            }
+            Column::Maximized(MaximizedColumn { item, .. }) => item,
             Column::Stack(mut items) => {
                 let item = items.remove(position);
                 // The item no longer shares a column with its former
@@ -1927,19 +1916,6 @@ impl LayoutStrip {
         self.even_splits.clear();
     }
 
-    /// The windows of every maximized column.
-    pub(crate) fn maximized_windows(&self) -> impl Iterator<Item = Entity> + '_ {
-        self.columns
-            .iter()
-            .filter(|column| matches!(column, Column::Maximized(_)))
-            .flat_map(Column::window_iter)
-    }
-
-    /// The windows that left a maximized column since the last call.
-    pub(crate) fn take_released(&mut self) -> EntityHashSet {
-        std::mem::take(&mut self.released)
-    }
-
     /// What maximized window `entity` returns to, or `None` when it is not
     /// maximized.
     pub fn maximized(&self, entity: Entity) -> Option<&Before> {
@@ -2028,7 +2004,6 @@ impl LayoutStrip {
         };
         let MaximizedColumn { item, before } = maximized.clone();
         self.columns.remove(index);
-        self.released.extend(item.window_iter());
         let home = match (to, before.home.as_ref()) {
             (RestoreTo::Home { limit }, Some(home)) => home.mates.iter().find_map(|mate| {
                 let column = self.index_of(*mate).ok()?;
@@ -2746,40 +2721,6 @@ fn origin_filling_viewport(
         .column_positions(&frame, viewport.width())
         .find(|(column, _)| column.position_of(anchor).is_some())?;
     matches!(column, Column::Maximized(_)).then(|| Origin::new(viewport.min.x - x, viewport.min.y))
-}
-
-/// Has every window of a maximized column fill the display's edge padding,
-/// and gives every other window of a changed strip, and every window that
-/// left a maximized column, its own margins back. A window whose margins
-/// change is written again.
-fn fit_maximized_windows(
-    mut strips: Query<&mut LayoutStrip>,
-    mut windows: Query<(&mut Window, &mut Bounds)>,
-    config: Res<Config>,
-) {
-    let (top, right, bottom, left) = config.edge_padding();
-    let edges = Margins {
-        min: IVec2::new(left, top),
-        max: IVec2::new(right, bottom),
-    };
-    let mut filled = EntityHashSet::default();
-    let mut refit = Vec::new();
-    for mut strip in &mut strips {
-        filled.extend(strip.maximized_windows());
-        if strip.is_changed() {
-            refit.extend(strip.all_windows());
-        }
-        refit.extend(strip.bypass_change_detection().take_released());
-    }
-    for entity in refit {
-        let fill = filled.contains(&entity).then_some(edges);
-        if let Ok((mut window, mut bounds)) = windows.get_mut(entity)
-            && window.fill() != fill
-        {
-            window.set_fill(fill);
-            bounds.set_changed();
-        }
-    }
 }
 
 pub(crate) fn strip_content_range(
@@ -4174,20 +4115,6 @@ mod tests {
         strip.insert_as_column(e[1], 0).unwrap();
         assert_eq!(render(&strip, &e), "^B | A | C");
         assert_eq!(strip.maximized(e[1]), Some(&half()));
-    }
-
-    #[test]
-    fn a_window_leaving_a_maximized_column_is_released() {
-        let (_world, mut strip, e) = strip_of(3);
-        strip.maximize(e[0], Side::East, half()).unwrap();
-        strip.maximize(e[1], Side::East, half()).unwrap();
-        strip.maximize(e[2], Side::East, half()).unwrap();
-        strip.unmaximize(e[0], home(3));
-        strip.remove(e[1]);
-        strip.stack(e[2], Side::West).unwrap();
-        assert_eq!(render(&strip, &e), "[A, C]");
-        assert_eq!(strip.take_released(), e.iter().copied().collect());
-        assert!(strip.take_released().is_empty());
     }
 
     #[test]

@@ -3266,9 +3266,10 @@ fn a_maximize_and_restore_morph_under_the_cover() {
     let (from_1, to_1) = morph_of(&log, 0, 1);
     assert_eq!(from_1, rest_1);
     assert!(to_1.width() > from_1.width(), "window 1 widens");
-    assert!(
-        to_1.height() > from_1.height(),
-        "window 1 fills edge padding"
+    assert_eq!(
+        to_1.height(),
+        from_1.height(),
+        "window 1 keeps edge padding"
     );
     let asks = window_asks_since(&log, since);
     assert_eq!(asks.len(), 1, "fresh picture asked for maximized window");
@@ -4048,7 +4049,7 @@ fn a_title_bar_double_click_morphs_under_the_cover() {
     let (from_1, to_1) = morph_of(&log, 0, 1);
     assert_eq!(from_1, rest_1);
     assert!(to_1.width() > from_1.width());
-    assert!(to_1.height() > from_1.height());
+    assert_eq!(to_1.height(), from_1.height());
     // Release click 2 mid-morph: must not abort or start a spurious second morph.
     harness.advance(ONE_FRAME * 2);
     send(
