@@ -2181,3 +2181,144 @@ fn restart_keeps_where_a_row_was_scrolled(returned_width: i32) {
         "the last column must be where it was before the restart"
     );
 }
+
+/// Builds a 5-window stack at `saved_width` on a 1332-pt tall display (like
+/// the built-in display in Miri #517), saves its session on exit, and restores
+/// it with `configure_after` applied to the restored mock windows.
+fn save_and_restore_five_window_stack(
+    name: &str,
+    saved_width: i32,
+    configure_after: impl Fn(&MockState),
+) -> TestHarness {
+    let display_bounds = IRect::new(0, 0, 2048, 1332);
+    let mut before = TestHarness::new();
+    before
+        .mock_state
+        .add_display(EXT_DISPLAY_ID, display_bounds, vec![EXT_WORKSPACE_ID]);
+    before.mock_state.activate_display(EXT_DISPLAY_ID);
+    let initial_size = Size::new(saved_width, 308);
+    for id in 0..5 {
+        before.mock_state.spawn_window(
+            TEST_PROCESS_ID,
+            EXT_WORKSPACE_ID,
+            id,
+            IRect::from_corners(display_bounds.min, display_bounds.min + initial_size),
+        );
+    }
+    before.mock_state.focus_window_unreported(0);
+    before.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(crate::commands::Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(crate::types::commands::Side::West)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(crate::commands::Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(crate::types::commands::Side::West)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(crate::commands::Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(crate::types::commands::Side::West)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(crate::commands::Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(crate::types::commands::Side::West)),
+        },
+    ]);
+    before.advance(Duration::from_secs(2));
+    {
+        let world = before.world();
+        let stack_len = world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .find(|strip| strip.id() == EXT_WORKSPACE_ID)
+            .and_then(|strip| strip.columns().next())
+            .map_or(0, |col| col.window_iter().count());
+        assert_eq!(stack_len, 5, "all 5 windows must be stacked before exit");
+    }
+    let saved = session_after_exit(&mut before, name, "", |world| {
+        world.write_message(AppExit::Success);
+    });
+
+    let mut after = TestHarness::new()
+        .with_state(serde_json::from_str(&saved).expect("the saved session parses"));
+    after
+        .mock_state
+        .add_display(EXT_DISPLAY_ID, display_bounds, vec![EXT_WORKSPACE_ID]);
+    after.mock_state.activate_display(EXT_DISPLAY_ID);
+    // Simulate exit cleanup returning windows to a wider pre-Miri frame.
+    let pre_miri_size = Size::new(display_bounds.width(), display_bounds.height() - 46);
+    for id in 0..5 {
+        after.mock_state.spawn_window(
+            TEST_PROCESS_ID,
+            EXT_WORKSPACE_ID,
+            id,
+            IRect::from_corners(display_bounds.min, display_bounds.min + pre_miri_size),
+        );
+    }
+    configure_after(&after.mock_state);
+    after.mock_state.focus_window_unreported(0);
+    after.run(vec![Event::MenuOpened { window_id: 0 }]);
+    after.advance(Duration::from_secs(5));
+    after
+}
+
+/// Saving and restoring a 5-window stack keeps the column's width within 2 pt
+/// even when a window adds 19 pt to its width while refusing a too-short
+/// height (Miri #517).
+#[test]
+fn a_restart_keeps_a_five_window_stack_width_when_height_refusal_widens() {
+    let saved_width = 500;
+    let after = save_and_restore_five_window_stack("stack-517-widen", saved_width, |state| {
+        for id in 0..5 {
+            state.update_window(id, |window| {
+                window.minimum_size = Some(Size::new(0, 308));
+            });
+        }
+        state.update_window(0, |window| {
+            window.widen_on_short_height = 19;
+        });
+    });
+
+    for id in 0..5 {
+        let width = after.mock_state.ax_frame(id).width();
+        assert!(
+            (width - saved_width).abs() <= 2,
+            "window {id} came back {width} pt wide, expected within 2 pt of {saved_width} pt"
+        );
+    }
+}
+
+/// A stacked window that genuinely refuses both the column's width and its
+/// height still records its minimum width and widens its stack siblings.
+#[test]
+fn a_window_that_refuses_both_width_and_height_still_widens_its_stack() {
+    let saved_width = 500;
+    let min_width = saved_width + 40;
+    let after = save_and_restore_five_window_stack("stack-517-min-width", saved_width, |state| {
+        for id in 0..5 {
+            state.update_window(id, |window| {
+                window.minimum_size = Some(Size::new(0, 308));
+            });
+        }
+        state.update_window(0, |window| {
+            window.minimum_size = Some(Size::new(min_width, 308));
+        });
+    });
+
+    for id in 0..5 {
+        let width = after.mock_state.ax_frame(id).width();
+        assert_eq!(
+            width, min_width,
+            "window {id} must widen to its sibling's true minimum width {min_width}"
+        );
+    }
+}

@@ -2538,6 +2538,16 @@ pub(super) fn window_resize_verifier(
             request.release = Release::Lowering(None);
             continue;
         }
+        if let Ok(frame) = frame
+            && verification.retry_width_at_accepted_height(
+                entity,
+                &mut request,
+                frame.size(),
+                &mut commands,
+            )
+        {
+            continue;
+        }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<VerifyWindowSize>();
         }
@@ -2592,6 +2602,41 @@ impl SizeVerification<'_, '_> {
             .get(entity)
             .ok()
             .map(|(_, position, bounds)| IRect::from_corners(position.0, position.0 + bounds.0))
+    }
+
+    /// A resizable window that refused a shorter height can also answer wider
+    /// than asked (e.g. Helium adding 19 pt when clamped to its minimum
+    /// height). Adopt the accepted height, keep the asked width, and ask once
+    /// more before treating the width as refused.
+    fn retry_width_at_accepted_height(
+        &mut self,
+        entity: Entity,
+        request: &mut VerifyWindowSize,
+        actual_size: Size,
+        commands: &mut Commands,
+    ) -> bool {
+        if request.retried_width {
+            return false;
+        }
+        let Ok((window, _, mut bounds)) = self.windows.get_mut(entity) else {
+            return false;
+        };
+        if !window.is_resizable()
+            || fuzzy_equal(actual_size.y, bounds.0.y) != Ordering::Less
+            || fuzzy_equal(actual_size.x, bounds.0.x) != Ordering::Less
+        {
+            return false;
+        }
+        let asked_height = bounds.0.y;
+        bounds.0.y = actual_size.y;
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(MinimumHeight(actual_size.y));
+        }
+        request.retried_width = true;
+        request.mismatched_since = None;
+        request.release = Release::Done;
+        self.return_refused_step(entity, actual_size.y - asked_height, commands);
+        true
     }
 
     fn reconcile(&mut self, entity: Entity, actual_size: Size, commands: &mut Commands) {
