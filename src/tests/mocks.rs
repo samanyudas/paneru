@@ -63,6 +63,10 @@ pub(crate) struct MockWindowData {
     pub(crate) maximum_size: Option<Size>,
     /// The smallest size the app accepts, like an app with a minimum height.
     pub(crate) minimum_size: Option<Size>,
+    /// Extra width the app adds when a resize asks for a height below
+    /// `minimum_size.y`, as Helium does when a stacked window refuses a
+    /// too-short height.
+    pub(crate) widen_on_short_height: i32,
     pub(crate) resize_bottom_limit: Option<i32>,
     /// The screen's bottom edge, which holds on to the window's bottom edge
     /// as macOS does: a shrink that leaves the bottom within
@@ -151,8 +155,12 @@ const STICKY_ZONE: i32 = 32;
 impl MockWindowData {
     /// The size the app applies when asked for `size`, within its limits.
     fn accepted_size(&self, size: Size) -> Size {
+        let short_height = self.minimum_size.is_some_and(|minimum| size.y < minimum.y);
         let mut size = self.maximum_size.map_or(size, |maximum| size.min(maximum));
         size = self.minimum_size.map_or(size, |minimum| size.max(minimum));
+        if short_height && self.widen_on_short_height != 0 {
+            size.x += self.widen_on_short_height;
+        }
         if let Some(bottom) = self.resize_bottom_limit
             && size.y > 0
         {
@@ -177,6 +185,7 @@ impl Default for MockWindowData {
             frame: IRect::default(),
             maximum_size: None,
             minimum_size: None,
+            widen_on_short_height: 0,
             resize_bottom_limit: None,
             sticky_bottom: None,
             dropped_resizes: 0,

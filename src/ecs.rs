@@ -1038,6 +1038,9 @@ pub struct VerifyWindowSize {
     /// How far the check has got in releasing a window that kept a taller
     /// height, before that height counts as its minimum.
     release: Release,
+    /// Whether the asked width was already retried once at the window's
+    /// accepted height after a combined height-and-width refusal.
+    retried_width: bool,
 }
 
 /// macOS ignores a small shrink that leaves a window's bottom edge near the
@@ -1064,6 +1067,7 @@ impl Default for VerifyWindowSize {
             remaining: 3,
             mismatched_since: None,
             release: Release::Untried,
+            retried_width: false,
         }
     }
 }
