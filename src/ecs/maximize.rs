@@ -110,10 +110,20 @@ impl FrameHold {
 /// A tiled window whose app refused the width of a maximized column on a
 /// display whose usable area was `viewport` points. It would sit at the
 /// column's left edge with the desktop showing beside it, so its maximize
-/// was undone, and it is not maximized again while the area is that size.
+/// was undone, and it is not maximized again while the area is that size
+/// unless the window later accepts a wider width than `accepted_width`.
 #[derive(Component, Clone, Copy, Debug)]
 pub(crate) struct MaximizeRefused {
     viewport: IVec2,
+    accepted_width: i32,
+}
+
+impl MaximizeRefused {
+    /// Whether `width` exceeds the width this window accepted when it refused
+    /// maximize, showing it is no longer capped there.
+    pub(crate) fn cleared_by(self, width: i32) -> bool {
+        width > self.accepted_width + REFUSED_SLACK
+    }
 }
 
 /// A tiled window whose app last answered a finished write of its maximized
@@ -125,6 +135,20 @@ pub(crate) struct RefusingWidth;
 /// How many times in a row a maximized tiled window answers a finished
 /// write with a narrower frame before its app counts as refusing the width.
 const REFUSALS: u8 = 2;
+
+/// How long a maximized tiled window must keep answering with a narrower
+/// frame before its app counts as refusing the width. Slow or asynchronous
+/// apps (such as Chromium browsers) can take 100 to 300 ms to commit a
+/// wider size, while a fixed-width window still refuses well within
+/// `REFUSED_WAIT` (800 ms) and `FRAME_HOLD` (1 s).
+const REFUSED_GRACE: Duration = Duration::from_millis(350);
+
+/// Consecutive narrower frames seen during one maximize hold.
+#[derive(Clone, Copy, Debug)]
+struct WidthRefusal {
+    count: u8,
+    since: Duration,
+}
 
 /// How much narrower than asked a frame is before it counts as a refusal,
 /// in points.
@@ -308,7 +332,12 @@ fn double_click_toggle(
         }
         if unmanaged.is_none()
             && let Some(refused) = refused
-            && strips
+        {
+            if !window.write_pending() && refused.cleared_by(window.frame().width()) {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<MaximizeRefused>();
+                }
+            } else if strips
                 .iter()
                 .find(|(strip, _)| strip.contains(entity))
                 .filter(|(strip, _)| strip.maximized(entity).is_none())
@@ -316,12 +345,13 @@ fn double_click_toggle(
                 .is_some_and(|(display, dock)| {
                     display.actual_display_bounds(dock, &config).size() == refused.viewport
                 })
-        {
-            debug!(
-                "double-click on window {window_id} left to the app: it refuses the maximized width"
-            );
-            double_click_tap::replay(*hold);
-            continue;
+            {
+                debug!(
+                    "double-click on window {window_id} left to the app: it refuses the maximized width"
+                );
+                double_click_tap::replay(*hold);
+                continue;
+            }
         }
         if !double_click_tap::consume(*hold) {
             // The tap gave the press up, at its time limit or for a newer
@@ -395,13 +425,19 @@ fn toggle_maximize(
         };
         let viewport = display.actual_display_bounds(dock, &config);
         if strip.maximized(entity).is_none()
-            && refused.is_some_and(|refused| refused.viewport == viewport.size())
+            && let Some(refused) = refused
         {
-            debug!("no maximize: the window's app refused this width before");
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<(FrameHold, RefusingWidth)>();
+            if !window.write_pending() && refused.cleared_by(window.frame().width()) {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<MaximizeRefused>();
+                }
+            } else if refused.viewport == viewport.size() {
+                debug!("no maximize: the window's app refused this width before");
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<(FrameHold, RefusingWidth)>();
+                }
+                return;
             }
-            return;
         }
         let frame = IRect::from_corners(position.0, position.0 + bounds.0);
         toggle_tiled(
@@ -674,6 +710,7 @@ type Held<'w, 's> = Query<
         &'static Position,
         &'static Bounds,
         Option<&'static FloatingMaximized>,
+        Option<&'static MaximizeRefused>,
         Ref<'static, FrameHold>,
     ),
 >;
@@ -694,12 +731,12 @@ fn hold_frames(
     gesture: Res<PointerResize>,
     config: Res<Config>,
     time: Res<Time>,
-    mut refusals: Local<EntityHashMap<u8>>,
+    mut refusals: Local<EntityHashMap<WidthRefusal>>,
     mut commands: Commands,
 ) {
     let now = time.elapsed();
     refusals.retain(|entity, _| windows.contains(*entity));
-    for (entity, mut window, position, bounds, maximized, hold) in &mut windows {
+    for (entity, mut window, position, bounds, maximized, maximize_refused, hold) in &mut windows {
         // Wait until the toggle frame's layout and animate passes have committed
         // the new target frame; otherwise `UpdateSet::Events` sees the old
         // `Position` paired with a newly restored `Bounds` and writes a bogus
@@ -725,6 +762,11 @@ fn hold_frames(
         let Ok(frame) = window.update_frame() else {
             continue;
         };
+        if maximize_refused.is_some_and(|refused| refused.cleared_by(frame.width()))
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<MaximizeRefused>();
+        }
         if frame == target {
             if refusals.remove(&entity).is_some()
                 && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -747,12 +789,16 @@ fn hold_frames(
                     .iter()
                     .any(|(_, strip, _)| strip.maximized(entity).is_some());
             if !ends && tiled_maximized && frame.width() + REFUSED_SLACK < target.width() {
-                let refused = refusals.entry(entity).or_default();
-                *refused += 1;
+                let refusal = refusals.entry(entity).or_insert(WidthRefusal {
+                    count: 0,
+                    since: now,
+                });
+                refusal.count = refusal.count.saturating_add(1);
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_insert(RefusingWidth);
                 }
-                if *refused >= REFUSALS
+                if refusal.count >= REFUSALS
+                    && now.saturating_sub(refusal.since) >= REFUSED_GRACE
                     && undo_refused_maximize(
                         entity,
                         (frame.width(), target.width()),
@@ -782,7 +828,7 @@ fn hold_frames(
 
 /// Ends the frame hold of `entity`, and any count of the width its app
 /// refused: a later write is no answer to the maximize.
-fn end_hold(entity: Entity, refusals: &mut EntityHashMap<u8>, commands: &mut Commands) {
+fn end_hold(entity: Entity, refusals: &mut EntityHashMap<WidthRefusal>, commands: &mut Commands) {
     refusals.remove(&entity);
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         entity_commands.try_remove::<(FrameHold, RefusingWidth)>();
@@ -833,6 +879,7 @@ fn undo_refused_maximize(
                 },
                 MaximizeRefused {
                     viewport: viewport.size(),
+                    accepted_width: widths.0,
                 },
                 // The frame it returns to is held as a restore's is: macOS
                 // can ignore the small shrink back from the maximized height,
