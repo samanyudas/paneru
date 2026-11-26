@@ -1289,10 +1289,17 @@ impl InnerConfig {
     ) -> Result<InnerConfig> {
         let mut config: InnerConfig = toml::from_str(input)?;
 
-        for (command, bindings) in &mut config.bindings {
+        config.bindings.retain(|command, bindings| {
             let argv = command.split('_').collect::<Vec<_>>();
+            if bindings.all().is_empty() {
+                return false;
+            }
+            let Ok(parsed_command) = parse_command(&argv) else {
+                warn!("{}: ignoring unknown command '{command}'", function_name!());
+                return false;
+            };
             for binding in bindings.all_mut() {
-                binding.command = parse_command(&argv)?;
+                binding.command = parsed_command.clone();
             }
             // A binding keeps the deserialized code 0 until its key resolves, and
             // 0 is the A key, so a binding whose key name is unknown must go.
@@ -1306,7 +1313,8 @@ impl InnerConfig {
                     false
                 }
             });
-        }
+            true
+        });
 
         // Resolve passthrough keybinding strings into (keycode, modifiers) pairs.
         if let Some(windows) = &mut config.windows {
@@ -2563,6 +2571,45 @@ window_focus_east = "ctrl+alt-rigtharrow"
         ))),
         "the binding's valid chords must still work"
     );
+}
+
+#[test]
+fn test_config_parsing_drops_binding_with_unknown_command() {
+    let input = r#"
+[bindings]
+window_nonexistent_command = "ctrl+alt-p"
+window_focus_west = "ctrl+alt-h"
+"#;
+    let virtual_keys = test_virtual_keymap();
+    let config = Config {
+        inner: Arc::new(ArcSwap::from_pointee(
+            InnerConfig::parse_config_with_virtual_keys(input, &virtual_keys)
+                .expect("an unknown command must not reject the whole file"),
+        )),
+    };
+    let keycode = |name: &str| keycode_for_key_name(name, &virtual_keys).unwrap();
+    let chord = Modifiers::LCTRL | Modifiers::LALT;
+
+    assert_eq!(
+        config.find_keybind(keycode("p"), chord),
+        None,
+        "an unknown command binding must be skipped"
+    );
+    assert_eq!(
+        config.find_keybind(keycode("h"), chord),
+        Some(Command::Window(Operation::Focus(
+            crate::commands::Direction::West
+        ))),
+        "valid bindings in the same table must still load"
+    );
+
+    for invalid_chord in ["hyper-p", "ctrl+alt-h-extra"] {
+        let invalid = format!("[bindings]\nwindow_nonexistent_command = \"{invalid_chord}\"\n");
+        assert!(
+            InnerConfig::parse_config_with_virtual_keys(&invalid, &virtual_keys).is_err(),
+            "invalid chord syntax '{invalid_chord}' must still reject the file even on an unknown command"
+        );
+    }
 }
 
 #[test]
