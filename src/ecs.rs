@@ -1536,6 +1536,7 @@ pub(crate) struct WindowProperties {
     params: Vec<WindowParams>,
     resizable: bool,
     above_ordinary: bool,
+    mounted_disk_image: bool,
 }
 
 impl WindowProperties {
@@ -1549,21 +1550,26 @@ impl WindowProperties {
         let subrole = window.subrole().ok();
         let params =
             config.find_window_properties(&title, &bundle_id, role.as_deref(), subrole.as_deref());
+        let has_floating_rule = params.iter().any(|props| props.floating.is_some());
+        let mounted_disk_image =
+            !has_floating_rule && bundle_id == "com.apple.finder" && window.is_mounted_disk_image();
         Self {
             params,
             resizable: window.is_resizable(),
             above_ordinary: window.is_above_ordinary_windows(),
+            mounted_disk_image,
         }
     }
 
     /// Whether the window floats automatically: a rule decides, and without
-    /// one a window that cannot be resized or that its app keeps above
-    /// ordinary windows floats.
+    /// one a window that cannot be resized, that its app keeps above ordinary
+    /// windows, or that displays a mounted disk image in Finder without a
+    /// toolbar floats.
     pub fn floating(&self) -> bool {
         self.params
             .iter()
             .find_map(|props| props.floating)
-            .unwrap_or(!self.resizable || self.above_ordinary)
+            .unwrap_or(!self.resizable || self.above_ordinary || self.mounted_disk_image)
     }
 
     /// Whether the app keeps the window above ordinary windows, as for a

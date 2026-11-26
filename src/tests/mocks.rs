@@ -107,6 +107,8 @@ pub(crate) struct MockWindowData {
     pub(crate) fixed_size: bool,
     /// The app keeps the window above ordinary windows.
     pub(crate) above_ordinary: bool,
+    /// Finder is showing a mounted disk image without a toolbar.
+    pub(crate) mounted_disk_image: bool,
     pub(crate) border_radius: Option<f64>,
     /// What Accessibility reports as the window's top bar height. `None`
     /// models a window whose top bar cannot be measured.
@@ -209,6 +211,7 @@ impl Default for MockWindowData {
             no_full_screen_button: false,
             fixed_size: false,
             above_ordinary: false,
+            mounted_disk_image: false,
             border_radius: None,
             top_bar_height: None,
             top_bar_unreadable: false,
@@ -1915,6 +1918,15 @@ impl MockState {
                 *cached_above.lock().unwrap() = Some(above);
                 above
             });
+
+        let s = self.clone();
+        mw.expect_is_mounted_disk_image().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .is_some_and(|w| w.mounted_disk_image)
+        });
 
         let s = self.clone();
         mw.expect_border_radius().returning(move || {

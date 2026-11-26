@@ -515,6 +515,17 @@ pub trait WindowApi: Send + Sync {
     /// does not, such as a fixed-size panel, floats unless a rule says
     /// otherwise. A failed read counts as resizable.
     fn is_resizable(&self) -> bool;
+    /// Whether the window is a Finder window displaying a mounted disk image
+    /// without a toolbar, such as a branded DMG installer. Such a window floats
+    /// unless a rule says otherwise.
+    ///
+    /// Finder does not expose a folder URL via Accessibility (`AXDocument` and
+    /// `AXProxy` have no URL on macOS 27), so detection matches the window title
+    /// against mounted disk images in `/Volumes/` when `AXToolbar` is absent.
+    /// A toolbar-less Finder window on a local folder whose name matches a
+    /// currently mounted disk image also matches this heuristic and can be
+    /// tiled with the float toggle or a window rule.
+    fn is_mounted_disk_image(&self) -> bool;
     /// Whether its app keeps the window above ordinary windows, as for a
     /// Picture-in-Picture video. Such a window floats unless a rule says
     /// otherwise. A failed read counts as an ordinary window.
@@ -694,6 +705,92 @@ fn window_layer(id: WinID) -> Option<i32> {
         .downcast::<CFNumber>()
         .ok()?
         .as_i32()
+}
+
+#[link(name = "DiskArbitration", kind = "framework")]
+unsafe extern "C" {
+    fn DASessionCreate(allocator: *const std::ffi::c_void) -> *const CFType;
+    fn DADiskCreateFromBSDName(
+        allocator: *const std::ffi::c_void,
+        session: *const CFType,
+        name: *const libc::c_char,
+    ) -> *const CFType;
+    fn DADiskCopyDescription(disk: *const CFType) -> *const CFDictionary;
+}
+
+fn disk_image_mount_path(volume_name: &str) -> Option<String> {
+    if volume_name.is_empty()
+        || volume_name == "."
+        || volume_name == ".."
+        || volume_name.contains('/')
+        || volume_name.contains('\0')
+    {
+        return None;
+    }
+    Some(format!("/Volumes/{volume_name}"))
+}
+
+fn is_disk_image_description(model: Option<&str>, protocol: Option<&str>) -> bool {
+    model == Some("Disk Image") && protocol == Some("Virtual Interface")
+}
+
+fn is_mounted_disk_image_volume(volume_name: &str) -> bool {
+    let Some(mount_path) = disk_image_mount_path(volume_name) else {
+        return false;
+    };
+    let Ok(c_path) = std::ffi::CString::new(mount_path.as_str()) else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let stat = unsafe { stat.assume_init() };
+    let mounted_on = unsafe { std::ffi::CStr::from_ptr(stat.f_mntonname.as_ptr()) };
+    if mounted_on.to_str().ok() != Some(mount_path.as_str()) {
+        return false;
+    }
+    let bsd_name = unsafe { std::ffi::CStr::from_ptr(stat.f_mntfromname.as_ptr()) };
+
+    let Some(session) = NonNull::new(unsafe { DASessionCreate(std::ptr::null()) }.cast_mut())
+        .map(|ptr| unsafe { CFRetained::from_raw(ptr) })
+    else {
+        return false;
+    };
+    let Some(disk) = NonNull::new(
+        unsafe {
+            DADiskCreateFromBSDName(std::ptr::null(), &raw const *session, bsd_name.as_ptr())
+        }
+        .cast_mut(),
+    )
+    .map(|ptr| unsafe { CFRetained::from_raw(ptr) }) else {
+        return false;
+    };
+    let Some(description) =
+        NonNull::new(unsafe { DADiskCopyDescription(&raw const *disk) }.cast_mut())
+            .map(|ptr| unsafe { CFRetained::from_raw(ptr) })
+    else {
+        return false;
+    };
+    let dict = unsafe { description.cast_unchecked::<CFString, CFType>() };
+    let model = dict
+        .get(&CFString::from_static_str("DADeviceModel"))
+        .and_then(|value| value.downcast::<CFString>().ok())
+        .map(|value| value.to_string());
+    let protocol = dict
+        .get(&CFString::from_static_str("DADeviceProtocol"))
+        .and_then(|value| value.downcast::<CFString>().ok())
+        .map(|value| value.to_string());
+    is_disk_image_description(model.as_deref(), protocol.as_deref())
+}
+
+fn window_has_toolbar(element: &CFRetained<AXUIWrapper>) -> bool {
+    let Ok(children) = AxTopBarTree.children(element) else {
+        return true;
+    };
+    children
+        .iter()
+        .any(|child| AxTopBarTree.role(child).ok().flatten().as_deref() == Some(kAXToolbarRole))
 }
 
 /// Reads an element's frame through Accessibility.
@@ -1344,6 +1441,16 @@ impl WindowApi for WindowOS {
         let resizable = settable != 0;
         let _ = self.resizable.set(resizable);
         resizable
+    }
+
+    fn is_mounted_disk_image(&self) -> bool {
+        let Ok(title) = self.title() else {
+            return false;
+        };
+        if !is_mounted_disk_image_volume(&title) {
+            return false;
+        }
+        !window_has_toolbar(&self.ax_element)
     }
 
     fn is_above_ordinary_windows(&self) -> bool {
@@ -2289,5 +2396,32 @@ mod tests {
     fn a_window_without_buttons_or_toolbars_has_no_measured_top_bar() {
         assert_eq!(top_bar_extent(None, vec![]), None);
         assert_eq!(top_bar_extent(None, vec![60..90, 120..150]), None);
+    }
+
+    #[test]
+    fn disk_image_mount_path_accepts_plain_volume_names_and_rejects_traversal() {
+        assert_eq!(
+            disk_image_mount_path("Miri Developer").as_deref(),
+            Some("/Volumes/Miri Developer")
+        );
+        assert_eq!(disk_image_mount_path(""), None);
+        assert_eq!(disk_image_mount_path("."), None);
+        assert_eq!(disk_image_mount_path(".."), None);
+        assert_eq!(disk_image_mount_path("../etc"), None);
+        assert_eq!(disk_image_mount_path("a/b"), None);
+    }
+
+    #[test]
+    fn disk_image_description_matches_only_virtual_disk_images() {
+        assert!(is_disk_image_description(
+            Some("Disk Image"),
+            Some("Virtual Interface")
+        ));
+        assert!(!is_disk_image_description(
+            Some("APPLE SSD AP0512Z"),
+            Some("Apple Fabric")
+        ));
+        assert!(!is_disk_image_description(Some("Disk Image"), Some("USB")));
+        assert!(!is_disk_image_description(None, Some("Virtual Interface")));
     }
 }
