@@ -2827,3 +2827,113 @@ fn a_minimum_height_taller_than_the_slot_is_kept_after_a_tile() {
         "no size writes after settling"
     );
 }
+
+const FINDER_PID: crate::platform::Pid = TEST_PROCESS_ID + 50;
+
+fn spawned_finder_window(config: Config, mounted_disk_image: bool, frame: IRect) -> TestHarness {
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .with_focused_window(0)
+        .with_app(FINDER_PID, "com.apple.finder", "Finder", |_| {});
+    harness.advance(Duration::from_millis(500));
+    let window = harness
+        .mock_state
+        .spawn_window(FINDER_PID, TEST_WORKSPACE_ID, 2, frame);
+    harness.mock_state.update_window(2, |window| {
+        window.title = "MiriDMGBranded".to_string();
+        window.mounted_disk_image = mounted_disk_image;
+    });
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_millis(500));
+    harness
+}
+
+#[test]
+fn a_mounted_disk_image_finder_window_floats_and_keeps_its_frame() {
+    let branded = IRect::new(200, 200, 740, 580);
+    let mut harness = spawned_finder_window(Config::default(), true, branded);
+
+    let world = harness.world();
+    let entity = find_window_entity(2, world);
+    assert!(matches!(
+        world.entity(entity).get::<crate::ecs::Unmanaged>(),
+        Some(crate::ecs::Unmanaged::Floating)
+    ));
+    let mut query = world.query::<&LayoutStrip>();
+    assert!(
+        !query.iter(world).any(|strip| strip.contains(entity)),
+        "a mounted DMG installer window must not join a tiled column"
+    );
+    crate::assert_focused!(world, 2);
+    let mut actual_frame = IRect::default();
+    harness
+        .mock_state
+        .update_window(2, |window| actual_frame = window.frame);
+    assert_eq!(actual_frame, branded);
+}
+
+#[test]
+fn a_regular_finder_window_stays_tiled() {
+    let frame = IRect::new(200, 200, 740, 580);
+    let mut harness = spawned_finder_window(Config::default(), false, frame);
+
+    let world = harness.world();
+    let entity = find_window_entity(2, world);
+    assert!(
+        world
+            .entity(entity)
+            .get::<crate::ecs::Unmanaged>()
+            .is_none()
+    );
+    let mut query = world.query::<&LayoutStrip>();
+    assert!(query.iter(world).any(|strip| strip.contains(entity)));
+}
+
+#[test]
+fn a_non_finder_window_is_not_treated_as_mounted_disk_image() {
+    let mut harness = TestHarness::new().with_windows(2).with_focused_window(0);
+    harness.advance(Duration::from_millis(500));
+    let frame = IRect::new(200, 200, 740, 580);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 2, frame);
+    harness
+        .mock_state
+        .update_window(2, |window| window.mounted_disk_image = true);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_millis(500));
+
+    let world = harness.world();
+    let entity = find_window_entity(2, world);
+    assert!(
+        world
+            .entity(entity)
+            .get::<crate::ecs::Unmanaged>()
+            .is_none()
+    );
+    let mut query = world.query::<&LayoutStrip>();
+    assert!(query.iter(world).any(|strip| strip.contains(entity)));
+}
+
+#[test]
+fn toggling_float_on_a_mounted_disk_image_window_tiles_it() {
+    let branded = IRect::new(200, 200, 740, 580);
+    let mut harness = spawned_finder_window(Config::default(), true, branded);
+    harness.mock_state.focus_window(2);
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::Manage),
+    }]);
+    harness.advance(Duration::from_millis(500));
+
+    let world = harness.world();
+    let entity = find_window_entity(2, world);
+    assert!(
+        world
+            .entity(entity)
+            .get::<crate::ecs::Unmanaged>()
+            .is_none()
+    );
+    let mut query = world.query::<&LayoutStrip>();
+    assert!(query.iter(world).any(|strip| strip.contains(entity)));
+}
