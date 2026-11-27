@@ -672,6 +672,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         new_window_width: _,
         stack_limit: _,
         maximized_window_side: _,
+        focus_on_close: _,
         reap_empty_workspaces: _,
         disable_native_tabs: _,
         virtual_workspace_animations: _,
@@ -713,6 +714,11 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         MaximizedWindowSide::Right => "right",
     };
     options.set("maximized_window_side", maximized_window_side)?;
+    let focus_on_close = match config.focus_on_close() {
+        crate::config::FocusOnClose::Left => "left",
+        crate::config::FocusOnClose::Right => "right",
+    };
+    options.set("focus_on_close", focus_on_close)?;
     options.set("reap_empty_workspaces", config.reap_empty_workspaces())?;
     options.set("disable_native_tabs", !config.native_tabs_enabled())?;
     options.set(
@@ -1011,5 +1017,26 @@ mod tests {
             "right"
         );
         assert!(side(r#"return { options = { maximized_window_side = "up" } }"#).is_err());
+    }
+
+    #[test]
+    fn setup_table_sets_focus_on_close() {
+        let lua = Lua::new();
+        let side = |source: &str| -> mlua::Result<String> {
+            let value = lua.load(source).eval()?;
+            let config = config_from_lua(&lua, value)?;
+            let options: Table = config_to_lua_table(&lua, &config)?.get("options")?;
+            options.get("focus_on_close")
+        };
+        assert_eq!(side("return {}").unwrap(), "left");
+        assert_eq!(
+            side(r#"return { options = { focus_on_close = "left" } }"#).unwrap(),
+            "left"
+        );
+        assert_eq!(
+            side(r#"return { options = { focus_on_close = "right" } }"#).unwrap(),
+            "right"
+        );
+        assert!(side(r#"return { options = { focus_on_close = "up" } }"#).is_err());
     }
 }
