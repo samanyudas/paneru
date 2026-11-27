@@ -406,13 +406,30 @@ fn mouse_to_next_display_keeps_first_window_on_tie_and_warps_empty_strip_to_cent
         "equal-width stack should focus its first window"
     );
 
-    // Move to an empty third display: cursor warps to center without changing focus.
+    // Move to a third display whose only window sits wholly off-screen: cursor
+    // warps to the display center without focusing the off-screen window.
     let display_3_bounds = rect(2024, 0, 3024, 700);
     harness
         .mock_state
         .add_display(3, display_3_bounds, vec![30]);
+    let offscreen =
+        harness
+            .mock_state
+            .spawn_window(TEST_PROCESS_ID, 30, 30, IRect::new(5000, 40, 5500, 540));
     harness.run(vec![Event::DisplayAdded { display_id: 3 }]);
+    harness
+        .world()
+        .trigger(crate::ecs::SpawnWindowTrigger(vec![offscreen]));
     harness.advance(SETTLE);
+    // Move window 30 off-screen in mock_state and sync its cached ECS frame so
+    // `other.bounds().intersect(frame)` is empty.
+    harness.mock_state.update_window(30, |window| {
+        window.frame = IRect::new(5000, 40, 5500, 540);
+    });
+    let e30 = find_window_entity(30, harness.world());
+    if let Some(mut window) = harness.world().get_mut::<crate::manager::Window>(e30) {
+        let _ = window.update_frame();
+    }
     harness.run(vec![Event::Command {
         command: Command::Mouse(MouseMove::ToNextDisplay),
     }]);
@@ -420,11 +437,11 @@ fn mouse_to_next_display_keeps_first_window_on_tie_and_warps_empty_strip_to_cent
     let cursor = harness.mock_state.cursor_position();
     assert!(
         display_3_bounds.contains(cursor),
-        "cursor {cursor:?} should warp inside empty display {display_3_bounds:?}"
+        "cursor {cursor:?} should warp inside display {display_3_bounds:?}"
     );
     assert_eq!(
         harness.mock_state.focused_window_id(TEST_PROCESS_ID),
         Some(10),
-        "empty display should not change focus"
+        "off-screen strip should not change focus"
     );
 }

@@ -4902,6 +4902,7 @@ fn a_sliver_jumping_to_the_opposite_edge_stays_in_hid() {
 #[test]
 fn cover_slide_is_refused_during_mission_control() {
     let (mut harness, log) = harness_of(config(true, Some(14.0)), &[600, 600, 600]);
+    take_pictures(&mut harness, &log);
     harness
         .world()
         .resource_mut::<crate::ecs::MissionControlActive>()

@@ -3346,6 +3346,7 @@ fn test_move_to_display_keeps_a_window_that_refused_its_width_visible() {
 #[test]
 fn test_move_to_display_appends_when_join_column_fails() {
     use crate::ecs::display::{DisplayMoves, Placement};
+    use crate::ecs::layout::Column;
 
     let mut harness = TestHarness::new()
         .with_windows(1)
@@ -3353,16 +3354,29 @@ fn test_move_to_display_appends_when_join_column_fails() {
         .with_workspace_window(10, 20, |window| {
             window.frame = IRect::new(1024, 40, 1524, 540);
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
-    harness.settle();
-
-    // Maximize column 0 on display 2 so `Placement::Into(0, 0)` passes the
-    // fullscreen pre-check but fails `join_column`.
     harness.run(vec![
-        Event::WindowFocused { window_id: 10 },
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::FocusDisplay(Direction::East)),
         window_command(Operation::Maximize),
     ]);
     harness.settle();
+
+    // Verify column 0 on display 2 is actually maximized so `Placement::Into(0, 0)`
+    // passes the fullscreen pre-check and fails `join_column`.
+    {
+        let world = harness.world();
+        let mut strips = world.query::<&LayoutStrip>();
+        let strip = strips
+            .iter(world)
+            .find(|strip| strip.id() == 20)
+            .expect("strip 20");
+        assert_eq!(strip.len(), 1);
+        assert!(
+            matches!(strip.get(0), Ok(Column::Maximized(_))),
+            "column 0 on display 2 must be maximized before move, got {:?}",
+            strip.get(0)
+        );
+    }
 
     let entity = find_window_entity(0, harness.world());
     let mut system = bevy::ecs::system::IntoSystem::into_system(
@@ -3383,4 +3397,16 @@ fn test_move_to_display_appends_when_join_column_fails() {
     system.apply_deferred(harness.world());
 
     assert_on_workspace!(harness.world(), 0, 20);
+    let world = harness.world();
+    let mut strips = world.query::<&LayoutStrip>();
+    let strip = strips
+        .iter(world)
+        .find(|strip| strip.id() == 20)
+        .expect("strip 20");
+    assert_eq!(
+        strip.len(),
+        2,
+        "window 0 should be appended as its own new column after join_column fails"
+    );
+    assert_eq!(strip.get(1).ok(), Some(Column::Single(entity)));
 }
