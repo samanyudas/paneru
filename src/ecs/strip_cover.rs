@@ -172,11 +172,8 @@ pub(crate) trait CoverScreen {
     /// Moves the strip on the cover of `display` along `path`, one strip x
     /// in global points every `step` seconds from now. It rests at the last.
     fn slide(&mut self, display: CGDirectDisplayID, path: &[f64], step: f64);
-    /// Tells the event tap that the strip on the cover of `display` shows
-    /// at strip x `x`, so a press on a picture reaches its window.
-    fn track(&mut self, display: CGDirectDisplayID, x: f64);
     /// Shows the strip on the cover of `display` at strip x `x` at once, as
-    /// a swipe moves it, and tells the event tap.
+    /// a swipe moves it.
     fn place(&mut self, display: CGDirectDisplayID, x: f64);
     /// Moves each window's frame on the cover of `display` from one frame
     /// to another, in global points, along `shares`: the share of the way
@@ -579,6 +576,12 @@ impl CoverSlide {
         &self.hid
     }
 
+    /// Where the slide currently shows along x, as a test reads it.
+    #[cfg(test)]
+    pub(crate) fn shown_x(&self) -> f64 {
+        self.x_at(self.elapsed)
+    }
+
     /// Where the strip shows `at` seconds into the slide.
     fn x_at(&self, at: f64) -> f64 {
         let to = f64::from(self.target.x);
@@ -592,8 +595,8 @@ impl CoverSlide {
     /// How fast the strip moves `at` seconds into the slide, in points per
     /// second.
     fn speed_at(&self, at: f64) -> f64 {
-        let dt = 1e-3;
-        (self.x_at(at) - self.x_at(at - dt)) / dt
+        let to = f64::from(self.target.x);
+        (to - self.from) * ease::Curve::Spring.share_rate(self.entry, at, self.duration)
     }
 
     /// How long the slide lasts.
@@ -702,7 +705,6 @@ pub(crate) fn register(app: &mut App) {
                 resize::apply_morph_replies,
                 cover_strip_moves,
                 cover_swipes,
-                mark_moved,
                 remember_layouts,
             )
                 .chain()
@@ -731,7 +733,7 @@ pub(crate) fn register(app: &mut App) {
 fn cover_enabled(config: &Config) -> bool {
     let duration = ease::duration(config);
     config.slide_window_pictures()
-        && config.options().animation_speed.is_some()
+        && config.has_animation_speed()
         && duration.is_finite()
         && duration <= LONGEST_SLIDE
         && ease::animates(duration)
@@ -1304,9 +1306,7 @@ fn cover_strip_moves(
             // Where the pictures show, as Core Animation draws them, which
             // runs on while the engine stalls.
             let showing = if slide.landing.is_none() {
-                let showing = sample(&mut slide, screen.0.as_ref(), step.secs(), time.elapsed());
-                screen.0.track(slide.display, showing);
-                showing
+                sample(&mut slide, screen.0.as_ref(), step.secs(), time.elapsed())
             } else {
                 // Landed, the pictures rest at the slide's target, where a
                 // swipe that starts with this frame may have moved `Position`.
@@ -1490,7 +1490,6 @@ fn cover_strip_moves(
                 slide.rest = slide.target.x;
                 end_guard(slide.guard.take(), &mut commands);
                 slide.guard = Some(spawn_snap_strip_guard(entity, &mut commands));
-                screen.0.track(slide.display, f64::from(slide.target.x));
                 slide.landing = Some((time.elapsed() + LANDING_TIMEOUT, 0));
                 debug!("cover over strip {entity} landed at {}", slide.target.x);
             }
@@ -1517,6 +1516,8 @@ fn cover_strip_moves(
             Some("fullscreen")
         } else if dragging {
             Some("drag")
+        } else if mission_control.0 {
+            Some("mission control")
         } else if target.y != position.0.y {
             Some("vertical move")
         } else if layouts.0.get(&entity) != Some(&layout_print(&strip, &windows)) {
@@ -1566,7 +1567,6 @@ fn cover_strip_moves(
             config.sliver_width(),
         );
         screen.0.slide(display.id(), &slide.path(), PATH_STEP);
-        screen.0.track(display.id(), f64::from(from));
         debug!(
             "cover over strip {entity}: {pictures} pictures, {from} to {}",
             target.x
@@ -1709,36 +1709,30 @@ fn lift_covers(
         return;
     };
     let sliver = config.sliver_width();
+    let now = time.elapsed();
     for (entity, strip, mut slide) in &mut strips {
         let Some((deadline, settled)) = slide.landing else {
             continue;
         };
-        let row = strip_windows(strip, &windows);
-        let in_place = row.iter().all(|window| window.at_rest)
-            && shown_frames.as_ref().is_none_or(|shown| {
-                resize::shows_committed(&row, &frames, slide.area, &slide.hid, shown, sliver)
-            });
-        let settled = if in_place { settled + 1 } else { 0 };
-        if settled >= LANDED_FRAMES || time.elapsed() >= deadline {
-            let late = if settled >= LANDED_FRAMES {
-                ""
-            } else {
-                if let Some(shown) = shown_frames.as_ref() {
-                    let mismatches = resize::uncommitted_frames(
-                        &row, &frames, slide.area, &slide.hid, shown, sliver,
-                    );
-                    if !mismatches.is_empty() {
-                        debug!("cover over strip {entity} landing mismatch: {mismatches:?}");
-                    }
-                }
-                " at its time limit"
-            };
-            debug!("cover over strip {entity} lifted{late}");
+        if let Some(settled) = resize::check_landing(
+            "cover over strip",
+            entity,
+            strip,
+            slide.area,
+            &slide.hid,
+            deadline,
+            settled,
+            now,
+            sliver,
+            &windows,
+            &frames,
+            shown_frames.as_deref(),
+        ) {
+            slide.landing = Some((deadline, settled));
+        } else {
             screen.0.hide(slide.display);
             end_guard(slide.guard, &mut commands);
             commands.entity(entity).remove::<CoverSlide>();
-        } else {
-            slide.landing = Some((deadline, settled));
         }
     }
 }
@@ -1748,7 +1742,7 @@ fn lift_covers(
 /// the cover's display ends there too.
 fn drop_orphan_covers(
     slides: Query<(Entity, &CoverSlide, Option<&ChildOf>)>,
-    swipes: Query<(Entity, &CoverSwipe, Option<&ChildOf>)>,
+    mut swipes: Query<(Entity, &CoverSwipe, Option<&ChildOf>, &mut Position)>,
     morphs: Query<(Entity, &CoverMorph, Option<&ChildOf>)>,
     displays: Query<&Display>,
     screen: Option<NonSendMut<CoverScreenHandle>>,
@@ -1771,11 +1765,12 @@ fn drop_orphan_covers(
             commands.entity(entity).remove::<CoverSlide>();
         }
     }
-    for (entity, swipe, child) in &swipes {
+    for (entity, swipe, child, mut position) in &mut swipes {
         if on(child, swipe.display) {
             held.push(swipe.display);
         } else {
-            commands.entity(entity).remove::<CoverSwipe>().insert(Moved);
+            position.set_changed();
+            commands.entity(entity).remove::<CoverSwipe>();
         }
     }
     for (entity, morph, child) in &morphs {
@@ -1945,7 +1940,6 @@ fn cover_swipes(
                 slide.rest = swipe.rest;
                 position.0.x = swipe.rest;
                 screen.0.slide(swipe.display, &slide.path(), PATH_STEP);
-                screen.0.track(swipe.display, from);
                 debug!(
                     "cover over swiped strip {entity} slides on from {from} to {}",
                     marker.0.x
@@ -1961,8 +1955,9 @@ fn cover_swipes(
                 // The swipe has landed, or the cover cannot stay: the real
                 // windows take their places in one step.
                 let guard = spawn_snap_strip_guard(entity, &mut commands);
+                position.set_changed();
                 let mut entity_commands = commands.entity(entity);
-                entity_commands.remove::<CoverSwipe>().insert(Moved);
+                entity_commands.remove::<CoverSwipe>();
                 if stopped {
                     entity_commands.remove::<Scrolling>();
                 }
@@ -2047,7 +2042,6 @@ fn cover_swipes(
         let (pictures, area) = (scene.pictures.len(), scene.viewport);
         screen.0.show(&scene);
         started.0.push(display.id());
-        screen.0.track(display.id(), f64::from(position.0.x));
         debug!("cover over swiped strip {entity}: {pictures} pictures");
         let mut hid = Vec::new();
         note_hidden(
@@ -2071,20 +2065,6 @@ fn cover_swipes(
                 .map_or(position.0.x, |scrolling| round_px(scrolling.origin)),
             layout: layout_print(&strip, &windows),
         });
-    }
-}
-
-/// Marks a strip whose windows must take their places again, once a swipe
-/// under the cover lands. [`mark_moved`] turns it into a change of the
-/// strip's position, which repositions its windows.
-#[derive(bevy::ecs::component::Component)]
-struct Moved;
-
-/// Repositions the windows of each strip marked [`Moved`].
-fn mark_moved(mut strips: Query<(Entity, &mut Position), With<Moved>>, mut commands: Commands) {
-    for (entity, mut position) in &mut strips {
-        position.set_changed();
-        commands.entity(entity).remove::<Moved>();
     }
 }
 

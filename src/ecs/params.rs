@@ -213,6 +213,7 @@ pub struct FrameActivity<'w, 's> {
     focus_checks: Query<'w, 's, &'static crate::ecs::VerifyFocus>,
     front_switches: Query<'w, 's, &'static crate::ecs::FrontSwitchQuestion>,
     window_focus_questions: Query<'w, 's, (), With<crate::ecs::WindowFocusQuestion>>,
+    shown_space: Option<Res<'w, crate::ecs::shown_space::ShownSpaceCheck>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -232,6 +233,10 @@ impl FrameActivity<'_, '_> {
             || !self.covers.is_empty()
             || !self.swipe_covers.is_empty()
             || !self.resize_covers.is_empty()
+            || self
+                .shown_space
+                .as_ref()
+                .is_some_and(|check| check.is_pending())
             || self
                 .native_resizes
                 .iter()
@@ -358,6 +363,13 @@ impl Windows<'_, '_> {
             .filter_map(|(window, entity, childof, unmanaged)| {
                 unmanaged.is_none().then_some((window, entity, childof))
             })
+    }
+
+    pub fn parent_of(&self, entity: Entity) -> Option<Entity> {
+        self.all
+            .get(entity)
+            .ok()
+            .map(|(_, _, childof, _)| childof.parent())
     }
 
     pub fn psn(&self, window_id: WinID, apps: &Query<&Application>) -> Option<ProcessSerialNumber> {

@@ -54,6 +54,10 @@ struct Switch {
 }
 
 impl ShownSpaceCheck {
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub(crate) fn arm(&mut self, displays: Vec<CGDirectDisplayID>, focused: Option<Entity>) {
         self.pending = (!displays.is_empty()).then(|| Check {
             displays,

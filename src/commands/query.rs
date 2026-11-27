@@ -7,7 +7,6 @@ use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Query, Res, ResMut};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
 
 use super::{Command, Operation};
@@ -21,20 +20,9 @@ use crate::events::Event;
 use crate::platform::WinID;
 use crate::types::wire::{self, Response};
 
-/// One connected `paneru subscribe` client.
-///
-/// The channel is only ever touched from a task on the IO pool, since writing
-/// to a peer that may not be reading can block. `alive` lets the main thread
-/// learn a subscriber is gone via a plain atomic flag instead of a lock shared
-/// with that task.
-struct Subscriber {
-    channel: Arc<wire::Subscriber>,
-    alive: Arc<AtomicBool>,
-}
-
 #[derive(Default, Resource)]
 struct StateSubscribers {
-    streams: Vec<Subscriber>,
+    streams: Vec<Arc<wire::Subscriber>>,
 }
 
 #[derive(Default, Resource)]
@@ -212,29 +200,16 @@ pub(super) fn register_query_commands(app: &mut App) {
 /// world access. The window set is a separate variant rather than folded into
 /// [`StateQueryKind`] since it projects a different value (the layout tree).
 fn state_query_handler(mut messages: MessageReader<Event>, state: QueryStateParams) {
-    /// Sends an answer without ever waiting for it to be taken. The reply
-    /// channel holds one message and exactly one is sent, so this cannot fill;
-    /// a client that hung up in the meantime is simply gone.
-    fn reply(respond_to: &crate::events::Reply, answer: Result<Response, String>) {
-        _ = respond_to.try_send(answer.unwrap_or_else(Response::Error));
-    }
-
+    // Each reply channel holds one message and gets exactly one, so try_send
+    // cannot fill; a client that hung up in the meantime is simply gone.
     for event in messages.read() {
         match event {
-            Event::StateQuery { kind, respond_to } => reply(
-                respond_to,
-                state
-                    .extract()
-                    .map_err(|err| err.to_string())
-                    .map(|state| Response::Query(state.to_query_payload(*kind))),
-            ),
-            Event::WindowSetQuery { respond_to } => reply(
-                respond_to,
-                state
-                    .extract_window_set()
-                    .map_err(|err| err.to_string())
-                    .map(|set| Response::WindowSet(Box::new(set))),
-            ),
+            Event::StateQuery { kind, respond_to } => {
+                _ = respond_to.try_send(Response::Query(state.extract().to_query_payload(*kind)));
+            }
+            Event::WindowSetQuery { respond_to } => {
+                _ = respond_to.try_send(Response::WindowSet(Box::new(state.extract_window_set())));
+            }
             _ => {}
         }
     }
@@ -248,10 +223,7 @@ fn state_subscribe_handler(
         let Event::StateSubscribe { subscriber } = event else {
             continue;
         };
-        subscribers.streams.push(Subscriber {
-            channel: subscriber.clone(),
-            alive: Arc::new(AtomicBool::new(true)),
-        });
+        subscribers.streams.push(subscriber.clone());
     }
 }
 
@@ -404,17 +376,7 @@ fn state_event_broadcast_handler(
         return;
     }
 
-    let document = if intent.requires_state() {
-        match state.extract() {
-            Ok(document) => Some(document),
-            Err(err) => {
-                warn!("extracting query state for broadcast: {err}");
-                return;
-            }
-        }
-    } else {
-        None
-    };
+    let document = intent.requires_state().then(|| state.extract());
     let outgoing = collect_state_broadcast_events_for_intent(
         &intent,
         document.as_ref(),
@@ -431,31 +393,21 @@ fn state_event_broadcast_handler(
         return;
     }
 
-    // Each send is non-blocking and bounded, so a stalled reader just drops the
-    // event instead of blocking the main thread; an exited subscriber is
-    // marked below and reaped here on the next broadcast.
-    subscribers
-        .streams
-        .retain(|subscriber| subscriber.alive.load(Ordering::Relaxed));
-
-    let events = Arc::new(outgoing);
-    for subscriber in &subscribers.streams {
-        for event in events.iter() {
-            match subscriber.channel.try_send(event) {
+    // Each send is non-blocking and bounded, so a stalled reader drops the
+    // event instead of blocking the main thread.
+    subscribers.streams.retain(|channel| {
+        for event in &outgoing {
+            match channel.try_send(event) {
                 Ok(()) => {}
-                // The subscriber's process is gone; reaped on the next
-                // broadcast. This is a real signal from the kernel rather than
-                // a write error a merely slow reader would also produce.
-                Err(wire::Error::PeerGone) => {
-                    subscriber.alive.store(false, Ordering::Relaxed);
-                    break;
-                }
-                // Alive but not keeping up. The event is lost; the subscriber
-                // is kept.
+                // The subscriber's process is gone (a real kernel signal rather
+                // than a write error a merely slow reader would produce).
+                Err(wire::Error::PeerGone) => return false,
+                // Alive but not keeping up: drop this event and keep the subscriber.
                 Err(err) => warn!("pushing broadcast event: {err}"),
             }
         }
-    }
+        true
+    });
 }
 
 #[cfg(test)]

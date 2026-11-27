@@ -2,24 +2,19 @@
 //! and the `ScreenCaptureKit` pictures they show (miri#509).
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
 
 use bevy::math::{IRect, IVec2};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly as _};
-use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSPanel, NSScreen, NSView,
-    NSViewLayerContentsRedrawPolicy, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
-};
+use objc2::{AnyThread as _, MainThreadMarker};
+use objc2_app_kit::{NSColor, NSPanel};
 use objc2_core_foundation::{CFRetained, CFType, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGColor, CGColorSpace, CGColorSpaceModel, CGDirectDisplayID, CGImage,
     CGPreflightScreenCaptureAccess,
 };
-use objc2_foundation::{NSArray, NSError, NSNumber, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSArray, NSError, NSNumber, NSString};
 use objc2_quartz_core::{
     CAKeyframeAnimation, CALayer, CAMediaTiming as _, CATransaction, kCAAnimationDiscrete,
 };
@@ -29,10 +24,10 @@ use tracing::debug;
 use crate::ecs::slice_photos::{Photo, PhotoError};
 use crate::ecs::strip_cover::{CoverScene, CoverScreen, CoverSubject};
 use crate::events::{Event, EventSender};
-use crate::overlay::{cg_abs_to_cocoa, primary_screen_height};
 use crate::platform::WinID;
-use crate::platform::slice_tap::{SlicePanel, set_cover_panels};
-use crate::slice_screen::{Filter, capture};
+use crate::platform::cocoa_ui::{OverlayLevel, cocoa_frame, make_layer_panel, scale_at};
+use crate::platform::slice_tap::{SlicePanel, set_cover_panel_ids};
+use crate::slice_screen::{CaptureOptions, WindowFilterCache, capture};
 use crate::types::commands::Side;
 
 /// The key of the slide animation on a cover's strip layer. A new slide
@@ -113,8 +108,7 @@ pub struct CoverScreenOS {
     mtm: MainThreadMarker,
     events: EventSender,
     covers: HashMap<CGDirectDisplayID, Cover>,
-    /// The filter of each window's last lookup, once it arrives.
-    filters: HashMap<WinID, Arc<OnceLock<Filter>>>,
+    filters: WindowFilterCache,
 }
 
 /// One window on a cover: a frame that a resize moves and sizes, which
@@ -563,16 +557,12 @@ struct Cover {
     window: Retained<NSPanel>,
     strip: Retained<CALayer>,
     viewport: IRect,
-    /// Each window's picture and the frame it shows from the strip origin.
-    pictures: Vec<(WinID, IRect)>,
     /// Each window's frame and picture, which a resize moves on its own.
     layers: Vec<Framed>,
     /// The strip origin the cover was laid out at, which a resize keeps.
     laid: IVec2,
     /// The track of a morph that moves furthest, to tell how far it shows.
     lead: Option<Lead>,
-    /// Where the strip origin shows now, as far as the engine has told.
-    at: IVec2,
     /// Whether the cover is up.
     shown: bool,
     /// The windows whose frames the next morph opens onto the windows
@@ -589,35 +579,8 @@ impl CoverScreenOS {
             mtm,
             events,
             covers: HashMap::new(),
-            filters: HashMap::new(),
+            filters: WindowFilterCache::default(),
         }
-    }
-
-    fn cocoa_frame(&self, on_screen: IRect) -> NSRect {
-        cg_abs_to_cocoa(
-            NSRect::new(
-                NSPoint::new(f64::from(on_screen.min.x), f64::from(on_screen.min.y)),
-                NSSize::new(f64::from(on_screen.width()), f64::from(on_screen.height())),
-            ),
-            primary_screen_height(self.mtm),
-        )
-    }
-
-    /// The backing scale of the screen that shows `on_screen`.
-    fn scale_at(&self, on_screen: IRect) -> f64 {
-        let frame = self.cocoa_frame(on_screen);
-        let (x, y) = (
-            frame.origin.x + frame.size.width / 2.0,
-            frame.origin.y + frame.size.height / 2.0,
-        );
-        NSScreen::screens(self.mtm)
-            .iter()
-            .find(|screen| {
-                let bounds = screen.frame();
-                (bounds.origin.x..bounds.origin.x + bounds.size.width).contains(&x)
-                    && (bounds.origin.y..bounds.origin.y + bounds.size.height).contains(&y)
-            })
-            .map_or(1.0, |screen| screen.backingScaleFactor())
     }
 
     /// The bounds of `display` in global points, if it is connected.
@@ -631,42 +594,6 @@ impl CoverScreenOS {
             point(bounds.origin.x + bounds.size.width),
             point(bounds.origin.y + bounds.size.height),
         )
-    }
-
-    /// An opaque borderless panel at the level of the edge slice panels,
-    /// below floating windows and the menu bar. It never animates its own
-    /// appearance, and takes clicks without activating the engine.
-    fn make_panel(&self, frame: NSRect) -> Retained<NSPanel> {
-        let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
-            NSPanel::alloc(self.mtm),
-            frame,
-            NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
-            NSBackingStoreType::Buffered,
-            false,
-        );
-        panel.setOpaque(true);
-        panel.setBackgroundColor(Some(&NSColor::blackColor()));
-        panel.setHasShadow(false);
-        panel.setHidesOnDeactivate(false);
-        // A press on a picture never reaches the panel: the event tap holds
-        // it for the window. One between pictures stops here.
-        panel.setIgnoresMouseEvents(false);
-        panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
-        panel.setLevel(NSFloatingWindowLevel - 1);
-        panel.setCollectionBehavior(
-            NSWindowCollectionBehavior::Transient
-                | NSWindowCollectionBehavior::IgnoresCycle
-                | NSWindowCollectionBehavior::CanJoinAllSpaces
-                | NSWindowCollectionBehavior::FullScreenNone,
-        );
-        let view = NSView::initWithFrame(
-            NSView::alloc(self.mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), frame.size),
-        );
-        view.setWantsLayer(true);
-        view.setLayerContentsRedrawPolicy(NSViewLayerContentsRedrawPolicy::Never);
-        panel.setContentView(Some(&view));
-        panel
     }
 
     /// `rect` in global points, in the layer space of a cover over
@@ -797,18 +724,21 @@ impl CoverScreenOS {
         }
     }
 
-    /// Tells the event tap where every shown cover's pictures are: the
-    /// live layers for presses and scrolls, and the last known places for
-    /// the window lookups off the main thread.
+    /// Tells the event tap where every shown cover's live layers are on the
+    /// main thread, and publishes the shown cover panel ids for cross-thread
+    /// window lookups.
     fn publish_panels(&self) {
+        let mut panel_ids = Vec::new();
         LIVE_COVERS.with(|live| {
             *live.borrow_mut() = self
                 .covers
                 .values()
                 .filter(|cover| cover.shown)
                 .filter_map(|cover| {
+                    let panel = WinID::try_from(cover.window.windowNumber()).ok()?;
+                    panel_ids.push(panel);
                     Some(LiveCover {
-                        panel: WinID::try_from(cover.window.windowNumber()).ok()?,
+                        panel,
                         viewport: cover.viewport,
                         strip: cover.strip.clone(),
                         layers: cover
@@ -820,24 +750,7 @@ impl CoverScreenOS {
                 })
                 .collect();
         });
-        set_cover_panels(
-            self.covers
-                .values()
-                .filter(|cover| cover.shown)
-                .filter_map(|cover| {
-                    let panel = WinID::try_from(cover.window.windowNumber()).ok()?;
-                    Some(cover_panels(
-                        panel,
-                        cover.viewport,
-                        cover.at,
-                        &cover.pictures,
-                    ))
-                })
-                // Pictures paint back to front, and the front one takes a
-                // press where pictures overlap.
-                .flat_map(|panels| panels.into_iter().rev())
-                .collect(),
-        );
+        set_cover_panel_ids(panel_ids);
     }
 
     fn reply(&self, subject: CoverSubject, generation: u32) -> Reply {
@@ -862,48 +775,19 @@ impl CoverScreen for CoverScreenOS {
         generation: u32,
     ) {
         let reply = self.reply(CoverSubject::Window(window), generation);
-        let scale = self.scale_at(Self::display_bounds(display));
-        if let Some(filter) = self.filters.get(&window).and_then(|found| found.get()) {
-            capture(&filter.0, size, scale, false, move |result| {
-                reply.send(result);
-            });
-            return;
-        }
-        let filter = Arc::new(OnceLock::new());
-        self.filters.insert(window, filter.clone());
-        let found = RcBlock::new(
-            move |content: *mut SCShareableContent, error: *mut NSError| {
-                // SAFETY: ScreenCaptureKit passes a valid content object or null.
-                let Some(content) = (unsafe { content.as_ref() }) else {
-                    reply.send(Err(crate::slice_screen::photo_error(error)));
-                    return;
-                };
-                let target = unsafe { content.windows() }
-                    .iter()
-                    .find(|candidate| unsafe { candidate.windowID() } == window.cast_unsigned());
-                let Some(target) = target else {
-                    reply.send(Err(PhotoError::WindowGone));
-                    return;
-                };
-                let filter = filter.get_or_init(|| {
-                    Filter(unsafe {
-                        SCContentFilter::initWithDesktopIndependentWindow(
-                            SCContentFilter::alloc(),
-                            &target,
-                        )
-                    })
-                });
-                let reply = reply.clone();
-                capture(&filter.0, size, scale, false, move |result| {
-                    reply.send(result);
-                });
+        let scale = scale_at(self.mtm, Self::display_bounds(display));
+        self.filters.capture_window(
+            window,
+            size,
+            scale,
+            true,
+            CaptureOptions {
+                digest: false,
+                sample_edge_color: true,
             },
+            || false,
+            move |result| reply.send(result),
         );
-        unsafe {
-            SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-                true, false, &found,
-            );
-        }
     }
 
     fn photograph_desktop(
@@ -914,7 +798,7 @@ impl CoverScreen for CoverScreenOS {
     ) {
         let reply = self.reply(CoverSubject::Desktop(display), generation);
         let bounds = Self::display_bounds(display);
-        let scale = self.scale_at(bounds);
+        let scale = scale_at(self.mtm, bounds);
         let excluding = excluding.to_vec();
         let own = std::process::id();
         let found = RcBlock::new(
@@ -958,9 +842,18 @@ impl CoverScreen for CoverScreenOS {
                     )
                 };
                 let reply = reply.clone();
-                capture(&filter, bounds.size(), scale, false, move |result| {
-                    reply.send_excluded(result, Some(matched.clone()));
-                });
+                capture(
+                    &filter,
+                    bounds.size(),
+                    scale,
+                    CaptureOptions {
+                        digest: false,
+                        sample_edge_color: false,
+                    },
+                    move |result| {
+                        reply.send_excluded(result, Some(matched.clone()));
+                    },
+                );
             },
         );
         unsafe {
@@ -971,11 +864,18 @@ impl CoverScreen for CoverScreenOS {
     }
 
     fn show(&mut self, scene: &CoverScene) {
-        let frame = self.cocoa_frame(scene.viewport);
-        let scale = self.scale_at(scene.viewport);
+        let frame = cocoa_frame(self.mtm, scene.viewport);
+        let scale = scale_at(self.mtm, scene.viewport);
         let viewport = scene.viewport;
         if !self.covers.contains_key(&scene.display) {
-            let window = self.make_panel(frame);
+            let window = make_layer_panel(
+                self.mtm,
+                frame,
+                OverlayLevel::StripCover,
+                true,
+                &NSColor::blackColor(),
+                true,
+            );
             let strip = CALayer::new();
             self.covers.insert(
                 scene.display,
@@ -983,11 +883,9 @@ impl CoverScreen for CoverScreenOS {
                     window,
                     strip,
                     viewport,
-                    pictures: Vec::new(),
                     layers: Vec::new(),
                     laid: scene.strip,
                     lead: None,
-                    at: scene.strip,
                     shown: false,
                     open: Vec::new(),
                     headings: Vec::new(),
@@ -1043,12 +941,6 @@ impl CoverScreen for CoverScreenOS {
         cover.layers = layers;
         cover.laid = scene.strip;
         cover.lead = None;
-        cover.pictures = scene
-            .pictures
-            .iter()
-            .map(|(id, rel, _)| (*id, *rel))
-            .collect();
-        cover.at = scene.strip;
         cover.shown = true;
         cover.window.orderFrontRegardless();
         CATransaction::flush();
@@ -1100,7 +992,7 @@ impl CoverScreen for CoverScreenOS {
             .get(&display)
             .is_some_and(|cover| !cover.headings.is_empty())
         {
-            self.scale_at(Self::display_bounds(display))
+            scale_at(self.mtm, Self::display_bounds(display))
         } else {
             1.0
         };
@@ -1189,18 +1081,6 @@ impl CoverScreen for CoverScreenOS {
         CATransaction::commit();
         CATransaction::flush();
         cover.lead = lead;
-        // A press goes to the window where its picture rests.
-        // In paint order, so a press where pictures overlap goes to the front.
-        cover.pictures = cover
-            .layers
-            .iter()
-            .filter_map(|framed| {
-                let (_, _, to) = frames.iter().find(|(frame, ..)| *frame == framed.id)?;
-                Some((framed.id, IRect::from_corners(to.min - laid, to.max - laid)))
-            })
-            .collect();
-        cover.at = laid;
-        self.publish_panels();
     }
 
     fn replace_picture(
@@ -1286,18 +1166,6 @@ impl CoverScreen for CoverScreenOS {
         })
     }
 
-    fn track(&mut self, display: CGDirectDisplayID, x: f64) {
-        let Some(cover) = self.covers.get_mut(&display) else {
-            return;
-        };
-        #[allow(clippy::cast_possible_truncation)]
-        let x = x.round() as i32;
-        if cover.at.x != x {
-            cover.at.x = x;
-            self.publish_panels();
-        }
-    }
-
     fn place(&mut self, display: CGDirectDisplayID, x: f64) {
         let Some(cover) = self.covers.get(&display) else {
             return;
@@ -1312,16 +1180,10 @@ impl CoverScreen for CoverScreenOS {
             .setPosition(CGPoint::new(x - origin, position.y));
         CATransaction::commit();
         CATransaction::flush();
-        self.track(display, x);
     }
 
     fn forget(&mut self, window: Option<WinID>) {
-        match window {
-            Some(window) => {
-                self.filters.remove(&window);
-            }
-            None => self.filters.clear(),
-        }
+        self.filters.forget(window);
     }
 
     fn showing(&self, display: CGDirectDisplayID) -> Option<f64> {
@@ -1344,7 +1206,6 @@ impl CoverScreen for CoverScreenOS {
             return;
         };
         cover.shown = false;
-        cover.pictures.clear();
         cover.layers.clear();
         cover.lead = None;
         // The pictures go with the layer that held them.
@@ -1483,36 +1344,14 @@ pub(crate) fn live_panels(
         .collect()
 }
 
-/// The pictures of a cover over `viewport`, with the strip origin at
-/// `strip`, as panels of the cover window `panel`: each picture's part in
-/// the viewport, and the part of its window that shows there, from the top
-/// left of the window's shown frame.
-pub(crate) fn cover_panels(
-    panel: WinID,
-    viewport: IRect,
-    strip: IVec2,
-    pictures: &[(WinID, IRect)],
-) -> Vec<SlicePanel> {
-    let frames = pictures
-        .iter()
-        .map(|&(window, rel)| {
-            (
-                window,
-                IRect::from_corners(rel.min + strip, rel.max + strip),
-            )
-        })
-        .collect::<Vec<_>>();
-    live_panels(panel, viewport, &frames)
-}
-
 #[cfg(test)]
 mod tests {
     use bevy::math::{IRect, IVec2};
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
     use super::{
-        CoverScreenOS, Heading, cover_panels, fill_opacity_steps, fill_start, global_rect,
-        live_panels, mask_bands, mask_steps,
+        CoverScreenOS, Heading, fill_opacity_steps, fill_start, global_rect, live_panels,
+        mask_bands, mask_steps,
     };
 
     /// A press on a picture lands on its window at the same point in the
@@ -1521,11 +1360,18 @@ mod tests {
     #[test]
     fn each_picture_maps_its_shown_part_to_its_window() {
         let viewport = IRect::new(0, 25, 1000, 800);
-        let pictures = [
-            (7, IRect::new(0, 0, 600, 700)),
-            (8, IRect::new(600, 0, 1200, 700)),
+        let strip = IVec2::new(-300, 30);
+        let frames = [
+            (
+                7,
+                IRect::new(strip.x, strip.y, 600 + strip.x, 700 + strip.y),
+            ),
+            (
+                8,
+                IRect::new(600 + strip.x, strip.y, 1200 + strip.x, 700 + strip.y),
+            ),
         ];
-        let panels = cover_panels(99, viewport, IVec2::new(-300, 30), &pictures);
+        let panels = live_panels(99, viewport, &frames);
         assert_eq!(panels.len(), 2);
         assert_eq!(panels[0].window, 7);
         assert_eq!(panels[0].on_screen, IRect::new(0, 30, 300, 730));
@@ -1538,11 +1384,8 @@ mod tests {
     #[test]
     fn a_picture_out_of_the_viewport_gets_no_panel() {
         let viewport = IRect::new(0, 0, 1000, 800);
-        let pictures = [(7, IRect::new(0, 0, 600, 700))];
-        assert_eq!(
-            cover_panels(99, viewport, IVec2::new(-700, 0), &pictures),
-            []
-        );
+        let frames = [(7, IRect::new(-700, 0, -100, 700))];
+        assert_eq!(live_panels(99, viewport, &frames), []);
     }
 
     /// `global_rect` is the inverse of `CoverScreenOS::turned` plus strip

@@ -20,8 +20,8 @@ use objc2_foundation::NSPoint;
 use tracing::{debug, warn};
 
 use crate::events::MouseButton;
-use crate::overlay::primary_screen_height;
 use crate::platform::WinID;
+use crate::platform::cocoa_ui::primary_screen_height;
 use crate::types::commands::Side;
 
 /// Marks the user data of the events the engine posts, with the press id in
@@ -68,9 +68,9 @@ pub(crate) fn set_slice_panels(panels: Vec<SlicePanel>) {
     SLICE_PANELS.store(Arc::new(panels));
 }
 
-/// The pictures on the strip covers, each as a panel of the window it shows,
-/// so a press on a picture reaches its window once the window is in place.
-static COVER_PANELS: LazyLock<ArcSwap<Vec<SlicePanel>>> =
+/// Window numbers of currently shown strip cover panels, so window lookups can
+/// recognize cover panels from any thread without mirroring their layer rects.
+static COVER_PANEL_IDS: LazyLock<ArcSwap<Vec<WinID>>> =
     LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
 
 /// Held press ids and cancellation times that the engine cancelled because
@@ -103,17 +103,17 @@ pub(crate) fn apply_cancellations(tap: &mut SliceTap) {
     }
 }
 
-/// Replaces the cover pictures the tap and the window lookups know of.
-pub(crate) fn set_cover_panels(panels: Vec<SlicePanel>) {
-    COVER_PANELS.store(Arc::new(panels));
+/// Replaces the window numbers of shown strip cover panels.
+pub(crate) fn set_cover_panel_ids(ids: Vec<WinID>) {
+    COVER_PANEL_IDS.store(Arc::new(ids));
 }
 
 pub(crate) fn is_slice_panel(window: WinID) -> bool {
     SLICE_PANELS
         .load()
         .iter()
-        .chain(COVER_PANELS.load().iter())
         .any(|panel| panel.panel == window)
+        || COVER_PANEL_IDS.load().contains(&window)
 }
 
 /// The panel that a press at `point` would reach, as the window server

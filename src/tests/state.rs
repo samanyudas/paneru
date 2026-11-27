@@ -8,7 +8,7 @@ use crate::ecs::state::{
     PaneruQueryState, PaneruState, SavedColumn, SavedDisplay, SavedMaximize, SavedRect,
     SavedStackHome, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
 };
-use crate::ecs::state::{QueryState, SessionStrips};
+use crate::ecs::state::{QueryStateParams, SessionStrips};
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, SelectedVirtualMarker};
 use crate::events::Event;
 use crate::manager::{Application, Display, WindowManager};
@@ -17,7 +17,6 @@ use crate::tests::{
     TEST_DISPLAY_HEIGHT, TEST_DISPLAY_ID, TEST_DISPLAY_WIDTH, TEST_MENUBAR_HEIGHT,
     TEST_WORKSPACE_ID,
 };
-use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::query::Has;
 use bevy::ecs::system::SystemState;
 
@@ -30,35 +29,10 @@ type StateExtractionState<'w, 's> = SystemState<(
     Query<'w, 's, &'static Application>,
 )>;
 
-type QueryStateExtractionState<'w, 's> = SystemState<(
-    Query<
-        'w,
-        's,
-        (
-            &'static ChildOf,
-            &'static LayoutStrip,
-            Has<ActiveWorkspaceMarker>,
-            Has<SelectedVirtualMarker>,
-        ),
-    >,
-    Query<'w, 's, (&'static Display, Entity, Has<ActiveDisplayMarker>)>,
-    Windows<'w, 's>,
-    Query<'w, 's, &'static Application>,
-    Res<'w, WindowManager>,
-    Res<'w, Config>,
-)>;
-
 fn extract_query_state(world: &mut World) -> crate::errors::Result<PaneruQueryState> {
-    let mut system_state: QueryStateExtractionState<'_, '_> = SystemState::new(world);
-    let (workspaces, displays, windows, apps, window_manager, config) = system_state.get(world)?;
-    PaneruQueryState::extract(
-        &workspaces,
-        &displays,
-        &windows,
-        &apps,
-        &window_manager,
-        &config,
-    )
+    let mut system_state: SystemState<QueryStateParams> = SystemState::new(world);
+    let params = system_state.get(world)?;
+    Ok(params.extract())
 }
 
 #[test]
@@ -924,7 +898,7 @@ fn extract_window_set(
 
     let mut system_state: SystemState<QueryStateParams> = SystemState::new(world);
     let params = system_state.get(world)?;
-    params.extract_window_set()
+    Ok(params.extract_window_set())
 }
 
 #[cfg(feature = "lua")]

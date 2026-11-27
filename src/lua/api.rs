@@ -878,26 +878,7 @@ mod tests {
         swipe::{GestureOptions, ScrollOptions, SwipeOptions},
     };
 
-    /// Legacy top-level keys on `MainOptions` that have moved to dedicated
-    /// `[padding]`, `[decorations]`, and `[swipe]` sub-tables.
-    const LEGACY_MAIN_OPTION_KEYS: &[&str] = &[
-        "padding_top",
-        "padding_bottom",
-        "padding_left",
-        "padding_right",
-        "dim_inactive_windows",
-        "dim_inactive_color",
-        "border_active_window",
-        "border_color",
-        "border_opacity",
-        "border_width",
-        "border_radius",
-        "swipe_gesture_fingers",
-        "swipe_gesture_direction",
-        "continuous_swipe",
-        "swipe_sensitivity",
-        "swipe_deceleration",
-    ];
+    const LEGACY_MAIN_OPTION_KEYS: &[&str] = &crate::config::DEPRECATED_OPTION_KEYS;
 
     fn struct_field_names<T: serde::Serialize + Default>() -> Vec<String> {
         let serde_json::Value::Object(map) =

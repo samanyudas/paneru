@@ -212,7 +212,7 @@ pub(crate) fn tiled_in(strip: &LayoutStrip, entity: Entity) -> bool {
         .index_of(entity)
         .ok()
         .and_then(|index| strip.get(index).ok())
-        .is_some_and(|column| !matches!(column, Column::Fullscren(_)))
+        .is_some_and(|column| !matches!(column, Column::Fullscreen(_)))
 }
 
 #[derive(Component, Clone, Copy)]

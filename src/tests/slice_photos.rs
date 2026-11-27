@@ -16,7 +16,7 @@ use objc2_core_graphics::{
 };
 
 use super::*;
-use crate::commands::{Command, Direction, Operation, Side};
+use crate::commands::{Direction, Operation, Side};
 use crate::config::{Config, MainOptions};
 use crate::ecs::shared_edge::{EdgeSlice, showing_edge_slices};
 use crate::ecs::slice_photos::{
@@ -107,11 +107,7 @@ impl SliceScreen for RecordingScreen {
     }
 }
 
-fn command(operation: Operation) -> Event {
-    Event::Command {
-        command: Command::Window(operation),
-    }
-}
+use super::window_command as command;
 
 /// Slices on, with windows moving as fast as Sam has them.
 pub(super) fn animated() -> Config {

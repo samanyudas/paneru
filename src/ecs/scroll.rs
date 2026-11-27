@@ -14,8 +14,8 @@ use std::time::Duration;
 use tracing::{Level, instrument};
 
 use crate::commands::{Direction, FocusSource, focus_with_verification};
-use crate::config::Config;
 use crate::config::swipe::{SwipeGestureDirection, SwipeTarget, focus_direction};
+use crate::config::{Config, SwipePagingConfig};
 use crate::ecs::display::shown_strip;
 use crate::ecs::ease;
 use crate::ecs::focus::{FocusHistory, PageHapticRequest};
@@ -62,7 +62,7 @@ pub(crate) struct PageGestureState {
     pub(crate) in_flight: Option<PageInFlight>,
     last_event: Option<Duration>,
     active: bool,
-    config: Option<(bool, Option<usize>, SwipeGestureDirection, f64, bool)>,
+    config: Option<SwipePagingConfig>,
     pub(crate) generation: u64,
 }
 
@@ -121,12 +121,14 @@ impl PageGestureState {
 }
 
 fn paging_enabled(config: Res<Config>, state: Res<PageGestureState>) -> bool {
-    config.swipe_gesture_paging() || state.has_work() || state.config.as_ref().is_some_and(|c| c.0)
+    config.swipe_gesture_paging()
+        || state.has_work()
+        || state.config.as_ref().is_some_and(|c| c.enabled)
 }
 
 fn paging_active(config: Res<Config>, state: Res<PageGestureState>) -> bool {
     state.has_work()
-        || (!config.swipe_gesture_paging() && state.config.as_ref().is_some_and(|c| c.0))
+        || (!config.swipe_gesture_paging() && state.config.as_ref().is_some_and(|c| c.enabled))
 }
 
 /// Upper bound on the timestep used to *advance* the strip.
@@ -290,7 +292,7 @@ fn paging_gesture(
         state.reset();
         state.config = Some(current_config.clone());
     }
-    if !current_config.0 {
+    if !current_config.enabled {
         return;
     }
 
@@ -318,7 +320,7 @@ fn paging_gesture(
                 distance_cm,
                 fingers,
                 ..
-            } if Some(*fingers) == current_config.1 => {
+            } if Some(*fingers) == current_config.fingers => {
                 state.last_event = Some(time.elapsed());
                 state.active = true;
                 if !distance_cm.is_finite() {
@@ -330,7 +332,10 @@ fn paging_gesture(
                     continue;
                 }
                 commands.entity(*active_workspace).try_remove::<Scrolling>();
-                state.earn_steps(current_config.3, current_config.2.clone());
+                state.earn_steps(
+                    current_config.page_distance_cm,
+                    current_config.direction.clone(),
+                );
             }
             Event::Swipe { .. } => state.reset(),
             _ => {}
@@ -865,15 +870,8 @@ fn resting_offset(
     if let Some(fitted) = fitted_offsets(strip, windows, viewport) {
         return Some(round_px(scroll.anchor.clamp(fitted.0, fitted.1)));
     }
-    let get_window_frame = |entity| windows.moving_frame(entity);
-    let resting = clamp_viewport_offset(
-        round_px(scroll.position),
-        strip,
-        windows,
-        &get_window_frame,
-        &viewport,
-        config,
-    )?;
+    let resting =
+        clamp_viewport_offset(round_px(scroll.position), strip, windows, &viewport, config)?;
     Some(landing(resting, None, strip, windows, viewport).map_or(resting, |(_, offset)| offset))
 }
 
@@ -1208,16 +1206,10 @@ fn settle_strip(
                     None,
                 )
             };
-            let get_window_frame = |entity| windows.moving_frame(entity);
-            let Some((column, target)) = clamp_viewport_offset(
-                round_px(natural),
-                strip,
-                &windows,
-                &get_window_frame,
-                &viewport,
-                &config,
-            )
-            .and_then(|resting| landing(resting, step, strip, &windows, viewport)) else {
+            let Some((column, target)) =
+                clamp_viewport_offset(round_px(natural), strip, &windows, &viewport, &config)
+                    .and_then(|resting| landing(resting, step, strip, &windows, viewport))
+            else {
                 finish(&mut commands);
                 continue;
             };
@@ -1247,7 +1239,7 @@ fn settle_strip(
 
         // An unset animation speed means instant movement, which is how Miri
         // applies Reduce Motion and its disable-animation setting.
-        if config.options().animation_speed.is_none() {
+        if !config.has_animation_speed() {
             position.x = round_px(target);
             if let Some(window) = scroll.landing_focus.take() {
                 focus(window, strip, &scroll, &windows, &mut commands);
@@ -1560,15 +1552,9 @@ fn constrain(
         }
     }
 
-    let get_window_frame = |entity| windows.moving_frame(entity);
-    if let Some(clamped_offset) = clamp_viewport_offset(
-        round_px(scroll.position),
-        strip,
-        windows,
-        &get_window_frame,
-        &viewport,
-        config,
-    ) {
+    if let Some(clamped_offset) =
+        clamp_viewport_offset(round_px(scroll.position), strip, windows, &viewport, config)
+    {
         position.x = clamped_offset;
         // A strip the clamp holds at an end does not move with the fingers,
         // nor one at the end that they push on past it.
@@ -1577,7 +1563,7 @@ fn constrain(
         #[allow(clippy::cast_possible_truncation)]
         let pushed = rounded + outward.signum() as i32;
         let held = outward != 0.0
-            && clamp_viewport_offset(pushed, strip, windows, &get_window_frame, &viewport, config)
+            && clamp_viewport_offset(pushed, strip, windows, &viewport, config)
                 == Some(clamped_offset);
         scroll.slope = if clamped_offset != rounded || held {
             0.0
@@ -1596,17 +1582,13 @@ fn constrain(
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
-fn clamp_viewport_offset<W>(
+fn clamp_viewport_offset(
     current_offset: i32,
     layout_strip: &LayoutStrip,
     windows: &Windows,
-    get_window_frame: &W,
     viewport: &IRect,
     config: &Config,
-) -> Option<i32>
-where
-    W: Fn(Entity) -> Option<IRect>,
-{
+) -> Option<i32> {
     let total_strip_width = layout_strip
         .last()
         .ok()
@@ -1614,7 +1596,7 @@ where
         .and_then(|entity| {
             windows
                 .layout_position(entity)
-                .zip(get_window_frame(entity))
+                .zip(windows.moving_frame(entity))
         })
         .map(|(position, frame)| position.x + frame.width())?;
 

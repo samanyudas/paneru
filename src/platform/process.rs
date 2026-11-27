@@ -10,9 +10,19 @@ use tracing::{debug, error, info};
 use super::workspace::WorkspaceObserver;
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
-use crate::platform::OSStatus;
+use crate::platform::{OSStatus, Pid};
 use crate::util::MacResult;
+use objc2_app_kit::NSRunningApplication;
+use objc2_foundation::NSString;
 use serde::{Deserialize, Serialize};
+
+/// Returns the PID of the first running application matching `bundle_id`.
+pub(crate) fn pid_for_bundle_id(bundle_id: &NSString) -> Option<Pid> {
+    NSRunningApplication::runningApplicationsWithBundleIdentifier(bundle_id)
+        .iter()
+        .next()
+        .map(|app| app.processIdentifier())
+}
 
 /// Represents a process serial number (PSN), a unique identifier for a running process on macOS.
 /// It is used by the Carbon APIs to identify applications.
@@ -230,56 +240,10 @@ pub(super) struct ProcessHandler {
 pub type PinnedProcessHandler =
     ScopeGuard<Pin<Box<ProcessHandler>>, Box<dyn FnOnce(Pin<Box<ProcessHandler>>)>>;
 
-/// An enum representing different types of Carbon application-related events.
-/// These correspond to specific event kinds within the `kEventClassApplication` event class.
-#[repr(C)]
-#[allow(dead_code)]
-enum ProcessEventApp {
-    /// Application activated event.
-    Activated = 1,
-    /// Application deactivated event.
-    Deactivated = 2,
-    /// Application quit event.
-    Quit = 3,
-    /// Application launch notification.
-    LaunchNotification = 4,
-    /// Application launched event.
-    Launched = 5,
-    /// Application terminated event.
-    Terminated = 6,
-    /// Frontmost application switched event.
-    FrontSwitched = 7,
-
-    /// Focus menu bar event.
-    FocusMenuBar = 8,
-    /// Focus next document window event.
-    FocusNextDocumentWindow = 9,
-    /// Focus next floating window event.
-    FocusNextFloatingWindow = 10,
-    /// Focus toolbar event.
-    FocusToolbar = 11,
-    /// Focus drawer event.
-    FocusDrawer = 12,
-
-    /// Get Dock tile menu event.
-    GetDockTileMenu = 20,
-    /// Update Dock tile event.
-    UpdateDockTile = 21,
-
-    /// Is event in Instant Mouser event.
-    IsEventInInstantMouser = 104,
-
-    /// Application hidden event.
-    Hidden = 107,
-    /// Application shown event.
-    Shown = 108,
-    /// System UI mode changed event.
-    SystemUIModeChanged = 109,
-    /// Available window bounds changed event.
-    AvailableWindowBoundsChanged = 110,
-    /// Active window changed event.
-    ActiveWindowChanged = 111,
-}
+/// Carbon `kEventClassApplication` event kinds registered by [`ProcessHandler`].
+const EVENT_APP_LAUNCHED: u32 = 5;
+const EVENT_APP_TERMINATED: u32 = 6;
+const EVENT_APP_FRONT_SWITCHED: u32 = 7;
 
 impl ProcessHandler {
     /// Creates a new `ProcessHandler` instance.
@@ -307,11 +271,8 @@ impl ProcessHandler {
     ///
     /// - Registers a Carbon event handler, which will be unregistered when `cleanup` is dropped.
     /// - Iterates through existing processes and dispatches `ApplicationLaunched` events for them.
-    pub(super) fn start(mut self) -> Result<PinnedProcessHandler> {
+    pub(super) fn start(self) -> Result<PinnedProcessHandler> {
         const APPL_CLASS: &str = "appl";
-        const PROCESS_EVENT_LAUNCHED: u32 = 5;
-        const PROCESS_EVENT_TERMINATED: u32 = 6;
-        const PROCESS_EVENT_FRONTSWITCHED: u32 = 7;
 
         info!("Registering process_handler");
 
@@ -321,7 +282,7 @@ impl ProcessHandler {
             .to_result(function_name!())
             .is_ok()
         {
-            self.process_handler(psn, ProcessEventApp::Launched);
+            self.process_handler(psn, EVENT_APP_LAUNCHED);
         }
 
         let target = unsafe { GetApplicationEventTarget() };
@@ -329,15 +290,15 @@ impl ProcessHandler {
         let events = [
             EventTypeSpec {
                 event_class,
-                event_kind: PROCESS_EVENT_LAUNCHED,
+                event_kind: EVENT_APP_LAUNCHED,
             },
             EventTypeSpec {
                 event_class,
-                event_kind: PROCESS_EVENT_TERMINATED,
+                event_kind: EVENT_APP_TERMINATED,
             },
             EventTypeSpec {
                 event_class,
-                event_kind: PROCESS_EVENT_FRONTSWITCHED,
+                event_kind: EVENT_APP_FRONT_SWITCHED,
             },
         ];
 
@@ -371,25 +332,13 @@ impl ProcessHandler {
         ))
     }
 
-    /// The C-callback function invoked by the private process handling API. It dispatches to the `process_handler` method.
-    /// This function is declared as `extern "C-unwind"`.
-    ///
-    /// # Arguments
-    ///
-    /// * `_` - Unused callback info parameter.
-    /// * `event` - A raw pointer to the `ProcessEvent`.
-    /// * `this` - A raw pointer to the `ProcessHandler` instance.
-    ///
-    /// # Returns
-    ///
-    /// An `OSStatus`.
     extern "C-unwind" fn callback(
         _: *mut c_void,
         event: *const ProcessEvent,
         this: *const c_void,
     ) -> OSStatus {
         if let Some(this) = NonNull::new(this.cast_mut())
-            .map(|this| unsafe { this.cast::<ProcessHandler>().as_mut() })
+            .map(|this| unsafe { this.cast::<ProcessHandler>().as_ref() })
         {
             const PARAM: &str = "psn "; // kEventParamProcessID and typeProcessSerialNumber
             let param_name = u32::from_be_bytes(PARAM.as_bytes().try_into().unwrap());
@@ -411,8 +360,8 @@ impl ProcessHandler {
                 )
             };
             if res == 0 {
-                let decoded: ProcessEventApp = unsafe { std::mem::transmute(GetEventKind(event)) };
-                this.process_handler(psn, decoded);
+                let kind = unsafe { GetEventKind(event) };
+                this.process_handler(psn, kind);
             }
         } else {
             error!("Zero passed to Process Handler.");
@@ -420,27 +369,75 @@ impl ProcessHandler {
         0
     }
 
-    /// Handles various process events received from the C callback. It sends corresponding `Event`s via `events`.
-    ///
-    /// # Arguments
-    ///
-    /// * `psn` - The `ProcessSerialNumber` of the process involved in the event.
-    /// * `event` - The `ProcessEventApp` indicating the type of event (e.g., `Launched`, `Terminated`).
-    fn process_handler(&mut self, psn: ProcessSerialNumber, event: ProcessEventApp) {
-        let _ = match event {
-            ProcessEventApp::Launched => self.events.send(Event::ApplicationLaunched {
+    fn process_handler(&self, psn: ProcessSerialNumber, event_kind: u32) {
+        let _ = match event_kind {
+            EVENT_APP_LAUNCHED => self.events.send(Event::ApplicationLaunched {
                 psn,
                 observer: self.observer.clone(),
             }),
-            ProcessEventApp::Terminated => self.events.send(Event::ApplicationTerminated { psn }),
-            ProcessEventApp::FrontSwitched => {
-                self.events.send(Event::ApplicationFrontSwitched { psn })
-            }
-            _ => {
-                error!("Unknown process event: {}", event as u32);
+            EVENT_APP_TERMINATED => self.events.send(Event::ApplicationTerminated { psn }),
+            EVENT_APP_FRONT_SWITCHED => self.events.send(Event::ApplicationFrontSwitched { psn }),
+            other => {
+                error!("Unknown process event: {other}");
                 Ok(())
             }
         }
         .inspect_err(|err| error!("error sending event: {err}"));
+    }
+}
+
+/// The start of the kernel's `kinfo_proc` record: `kp_proc.p_un` begins with
+/// the process start time. The rest of the record is not read.
+#[repr(C)]
+struct KinfoProc {
+    started: libc::timeval,
+    rest: [u8; 632],
+}
+
+/// Returns when the process `pid` started, in microseconds since the epoch,
+/// or `None` when no such process runs.
+pub(crate) fn process_started(pid: Pid) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<KinfoProc>::zeroed();
+    let mut size = std::mem::size_of::<KinfoProc>();
+    let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let result = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            4,
+            info.as_mut_ptr().cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || size != std::mem::size_of::<KinfoProc>() {
+        return None;
+    }
+    let started = unsafe { info.assume_init() }.started;
+    let seconds = u64::try_from(started.tv_sec).ok()?;
+    let micros = u64::try_from(started.tv_usec).ok()?;
+    Some(seconds * 1_000_000 + micros)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_started;
+
+    #[test]
+    fn a_running_process_has_a_stable_start_time() {
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let started = process_started(pid);
+        assert!(started.is_some());
+        assert_eq!(process_started(pid), started);
+    }
+
+    #[test]
+    fn a_process_of_another_user_has_a_start_time() {
+        assert!(process_started(1).is_some());
+    }
+
+    #[test]
+    fn a_missing_process_has_no_start_time() {
+        assert_eq!(process_started(i32::MAX), None);
     }
 }

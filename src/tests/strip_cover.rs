@@ -41,8 +41,6 @@ struct Screen {
     slides: Vec<(f64, f64)>,
     /// Every strip x of each slide's path, one each [`PATH_STEP`].
     paths: Vec<Vec<f64>>,
-    /// Each strip x the engine told the tap about.
-    tracked: Vec<f64>,
     /// Each strip x a swipe put the cover's strip at.
     placed: Vec<f64>,
     /// Where Core Animation shows the cover's strip, if the test says.
@@ -167,10 +165,6 @@ impl CoverScreen for RecordingScreen {
         self.0.borrow().morph_share
     }
 
-    fn track(&mut self, _display: CGDirectDisplayID, x: f64) {
-        self.0.borrow_mut().tracked.push(x);
-    }
-
     fn place(&mut self, _display: CGDirectDisplayID, x: f64) {
         self.0.borrow_mut().placed.push(x);
     }
@@ -268,17 +262,6 @@ fn send(harness: &mut TestHarness, event: Event) {
     harness.world().write_message::<Event>(event);
 }
 
-fn window_x(world: &mut World, id: WinID) -> i32 {
-    let mut query = world.query::<&Window>();
-    query
-        .iter(world)
-        .find(|window| window.id() == id)
-        .expect("window not found")
-        .frame()
-        .min
-        .x
-}
-
 fn covered(world: &mut World) -> bool {
     world.query::<&CoverSlide>().iter(world).next().is_some()
 }
@@ -365,14 +348,16 @@ fn a_keyboard_move_slides_pictures_and_moves_each_window_once() {
     assert_eq!(path, vec![700, 700 - STEP], "the window moves once");
     assert_eq!(log.borrow().hidden, 1, "the cover comes down");
 
-    // The tap learns where the pictures are as they slide, so a press on
-    // one reaches its window.
-    let tracked = log.borrow().tracked.clone();
-    assert_eq!(tracked.first(), Some(&0.0), "from where the strip was");
-    assert_eq!(tracked.last(), Some(&f64::from(-STEP)), "to where it lands");
+    let slide_path = log.borrow().paths[0].clone();
+    assert_eq!(slide_path.first(), Some(&0.0), "from where the strip was");
+    assert_eq!(
+        slide_path.last(),
+        Some(&f64::from(-STEP)),
+        "to where it lands"
+    );
     assert!(
-        tracked.windows(2).all(|pair| pair[1] <= pair[0]) && tracked.len() > 3,
-        "along the slide, got {tracked:?}"
+        slide_path.windows(2).all(|pair| pair[1] <= pair[0]) && slide_path.len() > 3,
+        "along the slide, got {slide_path:?}"
     );
     assert_eq!(log.borrow().shown.len(), 1);
 }
@@ -1266,11 +1251,20 @@ fn a_swipe_that_catches_a_slide_starts_from_this_frames_place() {
             send(&mut harness, swipe(0.000_01));
         }
         harness.advance(ONE_FRAME);
-        let screen = log.borrow();
         if swiped {
-            screen.placed.last().copied().expect("the swipe places it")
+            log.borrow()
+                .placed
+                .last()
+                .copied()
+                .expect("the swipe places it")
         } else {
-            screen.tracked.last().copied().expect("the slide shows")
+            harness
+                .world()
+                .query::<&CoverSlide>()
+                .iter(harness.world())
+                .next()
+                .expect("the slide shows")
+                .shown_x()
         }
     };
     let (slid, caught) = (start(false), start(true));
@@ -2120,15 +2114,6 @@ fn resize(direction: crate::types::commands::ResizeDirection) -> Event {
     Event::Command {
         command: Command::Window(Operation::Resize(direction)),
     }
-}
-
-fn window_frame(world: &mut World, id: WinID) -> IRect {
-    let mut query = world.query::<&Window>();
-    query
-        .iter(world)
-        .find(|window| window.id() == id)
-        .expect("window not found")
-        .frame()
 }
 
 fn morphed(world: &mut World) -> bool {
@@ -4912,4 +4897,109 @@ fn a_sliver_jumping_to_the_opposite_edge_stays_in_hid() {
         !covered(harness.world()),
         "cover lifts once window 2 leaves the old right sliver"
     );
+}
+
+#[test]
+fn cover_slide_is_refused_during_mission_control() {
+    let (mut harness, log) = harness_of(config(true, Some(14.0)), &[600, 600, 600]);
+    take_pictures(&mut harness, &log);
+    harness
+        .world()
+        .resource_mut::<crate::ecs::MissionControlActive>()
+        .0 = true;
+
+    send(&mut harness, focus(Direction::Last));
+    harness.advance(ONE_FRAME * 4);
+
+    assert!(
+        !covered(harness.world()),
+        "cover slide must not start while Mission Control is active"
+    );
+    assert!(
+        log.borrow().shown.is_empty(),
+        "no cover should be shown during Mission Control"
+    );
+}
+
+#[test]
+fn edge_slice_press_waits_until_picture_cover_lifts() {
+    use crate::events::MouseButton;
+    use crate::platform::slice_tap::SlicePress;
+    use crate::types::commands::Side;
+    use objc2_core_foundation::CGPoint;
+    use objc2_core_graphics::CGEventFlags;
+
+    const SLOW_APP: crate::platform::Pid = 2;
+
+    let log = ScreenLog::default();
+    let mut harness = TestHarness::new()
+        .with_config(config(true, Some(14.0)))
+        .with_app(SLOW_APP, "slow", "SlowApp", |_| {});
+    harness.mock_state.queue_writes(SLOW_APP);
+    for (id, width) in (0..).zip([500, 524, 500, 600, 600]) {
+        let pid = if id == 2 { SLOW_APP } else { TEST_PROCESS_ID };
+        let frame = IRect::new(0, 0, width, TEST_WINDOW_HEIGHT);
+        let window = harness
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
+        harness.existed_at_launch([id]);
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness
+        .world()
+        .insert_non_send(CoverScreenHandle(Box::new(RecordingScreen(log.clone()))));
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        focus(Direction::First),
+    ]);
+    for _ in 0..100 {
+        harness.advance(ONE_FRAME);
+        assert!(harness.mock_state.flush_writes(Duration::from_secs(1)));
+    }
+    take_pictures(&mut harness, &log);
+
+    harness.mock_state.hold_writes(SLOW_APP);
+    send(&mut harness, focus(Direction::Last));
+    harness.advance(ONE_FRAME * 16);
+    assert!(
+        covered(harness.world()),
+        "cover must be active before press"
+    );
+
+    let press = SlicePress {
+        id: 42,
+        window_id: 4,
+        at: CGPoint::new(50.0, 50.0),
+        side: Side::East,
+        exact: true,
+        button: MouseButton::Left,
+        flags: CGEventFlags::empty(),
+    };
+    send(&mut harness, Event::SlicePress { press });
+    harness.advance(ONE_FRAME * 2);
+
+    assert!(
+        harness.mock_state.take_posted_presses().is_empty(),
+        "press must wait while strip is under a picture cover"
+    );
+
+    harness.mock_state.release_writes(SLOW_APP);
+    assert!(harness.mock_state.flush_writes(Duration::from_secs(1)));
+    for _ in 0..10 {
+        harness.advance(ONE_FRAME);
+        if !covered(harness.world()) {
+            break;
+        }
+    }
+    harness.advance(ONE_FRAME * 2);
+
+    let posted = harness.mock_state.take_posted_presses();
+    assert_eq!(
+        posted.len(),
+        1,
+        "held press should be delivered once the picture cover lifts"
+    );
+    assert_eq!(posted[0].0.id, 42);
 }

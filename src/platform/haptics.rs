@@ -27,6 +27,7 @@ struct Actuators {
 unsafe extern "C" {
     fn CFArrayGetCount(array: CFTypeRef) -> isize;
     fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
+    fn CFRelease(cf: CFTypeRef);
 }
 
 impl Actuators {
@@ -68,9 +69,20 @@ impl Actuators {
                     (device_id(CFArrayGetValueAtIndex(trackpads, index), &raw mut id) == 0)
                         .then_some(id)
                 })
-                .map(|id| create(id))
-                .filter(|actuator| !actuator.is_null() && open(*actuator) == 0)
+                .filter_map(|id| {
+                    let actuator = create(id);
+                    if actuator.is_null() {
+                        return None;
+                    }
+                    if open(actuator) == 0 {
+                        Some(actuator)
+                    } else {
+                        CFRelease(actuator);
+                        None
+                    }
+                })
                 .collect();
+            CFRelease(trackpads);
             (!devices.is_empty()).then_some(Self { actuate, devices })
         }
     }

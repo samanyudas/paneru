@@ -66,32 +66,10 @@ impl PartialEq for AXUIWrapper {
 }
 
 impl AXUIWrapper {
-    /// Converts `self` into a raw mutable pointer of type `T`.
-    ///
-    /// # Type Parameters
-    ///
-    /// * `T` - The target type for the raw pointer.
-    ///
-    /// # Returns
-    ///
-    /// A raw mutable pointer to `T`.
     pub fn as_ptr<T>(&self) -> *mut T {
         NonNull::from(self).cast::<T>().as_ptr()
     }
 
-    /// Converts a raw mutable pointer of type `T` into a `NonNull<Self>`.
-    ///
-    /// # Type Parameters
-    ///
-    /// * `T` - The type of the input raw pointer.
-    ///
-    /// # Arguments
-    ///
-    /// * `ptr` - The raw mutable pointer.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(NonNull<Self>)` if the pointer is not null, otherwise `Err(Error)`.
     pub fn from_ptr<T>(ptr: *mut T) -> Result<NonNull<Self>> {
         NonNull::new(ptr)
             .map(std::ptr::NonNull::cast)
@@ -101,67 +79,28 @@ impl AXUIWrapper {
             )))
     }
 
-    /// Wraps an already retained raw pointer of type `T` into a `CFRetained<Self>`.
-    /// This function assumes the caller has already handled the retention count.
-    ///
-    /// # Type Parameters
-    ///
-    /// * `T` - The type of the input raw pointer.
-    ///
-    /// # Arguments
-    ///
-    /// * `ptr` - The already retained raw mutable pointer.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(CFRetained<Self>)` if the pointer is valid, otherwise `Err(Error)`.
+    /// Takes ownership of an already-retained CoreFoundation pointer.
     pub fn from_retained<T>(ptr: *mut T) -> Result<CFRetained<Self>> {
         let ptr = Self::from_ptr(ptr)?;
         Ok(unsafe { CFRetained::from_raw(ptr) })
     }
 
-    /// Retains a raw pointer of type `T` and wraps it into a `CFRetained<Self>`.
-    /// This function increments the retention count.
-    ///
-    /// # Type Parameters
-    ///
-    /// * `T` - The type of the input raw pointer.
-    ///
-    /// # Arguments
-    ///
-    /// * `ptr` - The raw mutable pointer to retain.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(CFRetained<Self>)` if the pointer is valid, otherwise `Err(Error)`.
+    /// Increments the retain count of a borrowed CoreFoundation pointer.
     pub fn retain<T>(ptr: *mut T) -> Result<CFRetained<Self>> {
         let ptr = Self::from_ptr(ptr)?;
         Ok(unsafe { ptr.as_ref() }.retain())
     }
 }
 
-impl<T> std::convert::AsRef<T> for AXUIWrapper {
-    /// Provides a shared reference to the inner data as type `T`.
-    ///
-    /// # Returns
-    ///
-    /// A shared reference to `T`.
-    fn as_ref(&self) -> &T {
+impl std::convert::AsRef<CFType> for AXUIWrapper {
+    fn as_ref(&self) -> &CFType {
         let ptr = NonNull::from(self).cast();
+        // SAFETY: AXUIWrapper is a CFType-compatible opaque CoreFoundation object.
         unsafe { ptr.as_ref() }
     }
 }
 
 impl std::fmt::Display for AXUIWrapper {
-    /// Formats the `AXUIWrapper` for display, showing the raw pointer value.
-    ///
-    /// # Arguments
-    ///
-    /// * `f` - The formatter.
-    ///
-    /// # Returns
-    ///
-    /// A `std::fmt::Result`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.as_ptr::<AXUIElementRef>())
     }
@@ -241,20 +180,6 @@ impl AXUIAttributes for CFRetained<AXUIWrapper> {
     }
 }
 
-/// Creates a new `CFArray` from a slice of values and a specified `CFNumberType`.
-///
-/// # Type Parameters
-///
-/// * `T` - The type of the values in the input slice.
-///
-/// # Arguments
-///
-/// * `values` - A slice containing the values to be added to the array.
-/// * `cftype` - The `CFNumberType` representing the type of numbers in the array.
-///
-/// # Returns
-///
-/// `Ok(CFRetained<CFArray>)` with the created array if successful, otherwise `Err(Error)`.
 pub fn create_array<T>(values: &[T], cftype: CFNumberType) -> Result<CFRetained<CFArray>> {
     let numbers = values
         .iter()
@@ -282,30 +207,11 @@ pub fn create_array<T>(values: &[T], cftype: CFNumberType) -> Result<CFRetained<
     )))
 }
 
-/// Retrieves the `CFRunLoopSource` associated with an `AXObserver`.
-///
-/// # Arguments
-///
-/// * `observer` - A reference to the `AXUIWrapper` wrapping the `AXObserverRef`.
-///
-/// # Returns
-///
-/// `Some(&CFRunLoopSource)` if a run loop source is found, otherwise `None`.
 fn run_loop_source(observer: &AXUIWrapper) -> Option<&CFRunLoopSource> {
     let ptr = NonNull::new(unsafe { AXObserverGetRunLoopSource(observer.as_ptr()) })?;
     Some(unsafe { ptr.cast::<CFRunLoopSource>().as_ref() })
 }
 
-/// Adds the `CFRunLoopSource` of an `AXObserver` to the main run loop.
-///
-/// # Arguments
-///
-/// * `observer` - A reference to the `AXUIWrapper` wrapping the `AXObserverRef`.
-/// * `mode` - An optional `CFRunLoopMode` for adding the source.
-///
-/// # Returns
-///
-/// `Ok(())` if the run loop source is added successfully, otherwise `Err(Error)`.
 pub fn add_run_loop(observer: &AXUIWrapper, mode: Option<&CFRunLoopMode>) -> Result<()> {
     let run_loop = run_loop_source(observer);
 
@@ -325,11 +231,6 @@ pub fn add_run_loop(observer: &AXUIWrapper, mode: Option<&CFRunLoopMode>) -> Res
     }
 }
 
-/// Invalidates and removes the `CFRunLoopSource` of an `AXObserver` from the main run loop.
-///
-/// # Arguments
-///
-/// * `observer` - A reference to the `AXUIWrapper` wrapping the `AXObserverRef`.
 pub fn remove_run_loop(observer: &AXUIWrapper) {
     if let Some(run_loop_source) = run_loop_source(observer) {
         debug!(
@@ -409,4 +310,30 @@ where
         id.is_some_and(|id| id.as_u32() == display_id)
             .then(|| getter(screen))
     })
+}
+
+/// Returns the XDG state file path for `file_name` under the `paneru` prefix.
+#[must_use]
+pub(crate) fn xdg_state_file(file_name: &str) -> PathBuf {
+    xdg::BaseDirectories::with_prefix("paneru")
+        .get_state_file(file_name)
+        .expect("XDG state directory should be available")
+}
+
+/// Serializes `value` as pretty JSON and replaces `path` atomically via a
+/// sibling `.json.tmp` file.
+pub(crate) fn write_json_atomic<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(tmp_path, path)
 }

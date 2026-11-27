@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 
-use crate::commands::{Command, Direction, MoveFocus, Operation};
+use crate::commands::{Direction, MoveFocus, Operation};
 use crate::ecs::layout::LayoutStrip;
 use crate::events::Event;
 use crate::platform::{WinID, WorkspaceId};
@@ -56,11 +56,7 @@ fn resident(display: u32) -> WinID {
     100 + WinID::try_from(display).expect("a small display id")
 }
 
-fn command(operation: Operation) -> Event {
-    Event::Command {
-        command: Command::Window(operation),
-    }
-}
+use super::window_command as command;
 
 /// Every order of the display ids `1..=count`.
 fn orders(count: u32) -> Vec<Vec<u32>> {
@@ -325,4 +321,135 @@ fn two_displays_take_turns() {
             );
         }
     }
+}
+
+/// `mouse_to_next_display` recognizes a cursor on the menu bar via
+/// `physical_bounds()` and steps through 3+ displays in screen order.
+#[test]
+fn mouse_to_next_display_follows_screen_order_and_handles_menubar_cursor() {
+    use crate::commands::{Command, MouseMove};
+
+    let ids = [3, 1, 2];
+    let mut harness = arranged(&THREE, &ids);
+    {
+        let world = harness.world();
+        let mut displays = world.query::<&mut crate::manager::Display>();
+        for mut display in displays.iter_mut(world) {
+            display.set_menubar_height_override(Some(30));
+        }
+    }
+
+    // Place the cursor inside slot 0's menu bar (outside `bounds()`, inside `physical_bounds()`).
+    harness
+        .mock_state
+        .set_cursor_position(THREE[0].min + IVec2::new(50, 5));
+
+    let mut visited = Vec::new();
+    for _ in 0..3 {
+        harness.run(vec![Event::Command {
+            command: Command::Mouse(MouseMove::ToNextDisplay),
+        }]);
+        harness.advance(SETTLE);
+        let cursor = harness.mock_state.cursor_position();
+        let slot = THREE
+            .iter()
+            .position(|bounds| bounds.contains(cursor))
+            .unwrap_or_else(|| panic!("cursor {cursor:?} not inside any display"));
+        visited.push(slot);
+    }
+    assert_eq!(visited, vec![1, 2, 0]);
+}
+
+/// Equal-width ties (such as a two-window stack) keep focusing the first
+/// window on the target display, and an empty/off-screen strip warps the
+/// cursor to the display center without focusing.
+#[test]
+fn mouse_to_next_display_keeps_first_window_on_tie_and_warps_empty_strip_to_center() {
+    use crate::commands::{Command, MouseMove};
+
+    let display_2_bounds = rect(1024, 0, 2024, 700);
+    let display_3_bounds = rect(2024, 0, 3024, 700);
+    let mut harness = TestHarness::new()
+        .with_windows(1)
+        .with_display(2, display_2_bounds, vec![20])
+        .with_workspace_window(10, 20, |window| {
+            window.frame = IRect::new(1024, 40, 1524, 340);
+        })
+        .with_workspace_window(11, 20, |window| {
+            window.frame = IRect::new(1024, 340, 1524, 640);
+        })
+        .with_display(3, display_3_bounds, vec![30])
+        .with_workspace_window(30, 30, |window| {
+            window.frame = IRect::new(2024, 40, 2524, 540);
+        });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(SETTLE);
+
+    // Stack window 11 into window 10's column on display 2 so the stack is [10, 11] with equal widths.
+    let e11 = find_window_entity(11, harness.world());
+    {
+        let world = harness.world();
+        let mut strips = world.query::<&mut LayoutStrip>();
+        for mut strip in strips.iter_mut(world) {
+            if strip.id() == 20 {
+                strip
+                    .stack(e11, crate::types::commands::Side::West)
+                    .expect("stack e11 onto e10");
+            }
+        }
+    }
+    harness.advance(SETTLE);
+
+    harness.mock_state.set_cursor_position(IVec2::new(100, 100));
+    harness.run(vec![Event::Command {
+        command: Command::Mouse(MouseMove::ToNextDisplay),
+    }]);
+    harness.advance(SETTLE);
+    assert_eq!(
+        harness.mock_state.focused_window_id(TEST_PROCESS_ID),
+        Some(10),
+        "equal-width stack should focus its first window"
+    );
+
+    // Move window 30 on display 3 wholly off-screen in ECS `Position` (which
+    // `Windows::frame()` reads) so `other.bounds().intersect(frame)` is empty,
+    // and assert both preconditions before calling `ToNextDisplay`.
+    let e30 = find_window_entity(30, harness.world());
+    {
+        let world = harness.world();
+        world
+            .get_mut::<crate::ecs::Position>(e30)
+            .expect("window 30 Position")
+            .0 = IVec2::new(5000, 40);
+        let pos = world.get::<crate::ecs::Position>(e30).unwrap().0;
+        let size = world.get::<crate::ecs::Bounds>(e30).unwrap().0;
+        let frame = IRect::from_corners(pos, pos + size);
+        assert!(
+            display_3_bounds.intersect(frame).is_empty(),
+            "window 30 frame {frame:?} must lie outside display 3 {display_3_bounds:?}"
+        );
+        let mut strips = world.query::<&LayoutStrip>();
+        let strip_30 = strips
+            .iter(world)
+            .find(|strip| strip.id() == 30)
+            .expect("strip 30");
+        assert!(
+            strip_30.contains(e30),
+            "strip 30 must contain off-screen window 30 before command"
+        );
+    }
+    harness.run(vec![Event::Command {
+        command: Command::Mouse(MouseMove::ToNextDisplay),
+    }]);
+    harness.advance(SETTLE);
+    let cursor = harness.mock_state.cursor_position();
+    assert!(
+        display_3_bounds.contains(cursor),
+        "cursor {cursor:?} should warp inside display {display_3_bounds:?}"
+    );
+    assert_eq!(
+        harness.mock_state.focused_window_id(TEST_PROCESS_ID),
+        Some(10),
+        "off-screen strip should not change focus"
+    );
 }

@@ -1042,9 +1042,14 @@ impl InputHandler {
         Ok(())
     }
 
-    fn uninstall_tap(&mut self) {
+    fn reset_tap_state(&mut self) {
         self.slice_tap.reset();
+        double_click_tap::reset();
         self.clear_swipe_on_tap_reset();
+    }
+
+    fn uninstall_tap(&mut self) {
+        self.reset_tap_state();
         self.taps = None;
     }
 
@@ -1068,14 +1073,13 @@ impl InputHandler {
             return TapHealth::Healthy;
         }
 
-        self.slice_tap.reset();
         for tap in taps {
             if !CGEvent::tap_is_enabled(&tap.port) {
                 CGEvent::tap_enable(&tap.port, true);
             }
         }
         let reenabled = taps.iter().all(|tap| CGEvent::tap_is_enabled(&tap.port));
-        self.clear_swipe_on_tap_reset();
+        self.reset_tap_state();
         if reenabled {
             warn!("event tap was disabled, re-enabled it");
             TapHealth::Reenabled
@@ -1098,19 +1102,6 @@ impl InputHandler {
         }
     }
 
-    /// The C-callback function for the `CGEventTap`. It dispatches to the `input_handler` method.
-    /// This function is declared as `extern "C-unwind"`.
-    ///
-    /// # Arguments
-    ///
-    /// * `_` - The `CGEventTapProxy` (unused).
-    /// * `event_type` - The `CGEventType` of the event.
-    /// * `event_ref` - A mutable `NonNull` pointer to the `CGEvent`.
-    /// * `this` - A raw pointer to the `InputHandler` instance.
-    ///
-    /// # Returns
-    ///
-    /// A raw mutable pointer to `CGEvent`. Returns `null_mut()` if the event is intercepted.
     extern "C-unwind" fn callback(
         _: CGEventTapProxy,
         event_type: CGEventType,
@@ -1132,9 +1123,7 @@ impl InputHandler {
 
     fn rearm_taps(&mut self) {
         warn!("Tap Disabled, re-enabling");
-        self.slice_tap.reset();
-        self.clear_swipe_on_tap_reset();
-        double_click_tap::reset();
+        self.reset_tap_state();
         for tap in self.taps.iter().flatten() {
             if tap.port.is_valid() {
                 CGEvent::tap_enable(&tap.port, true);

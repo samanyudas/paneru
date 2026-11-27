@@ -30,6 +30,9 @@ mod tiling;
 mod virtual_workspaces;
 mod window_writes;
 
+pub(crate) use crate::events::Event;
+pub(crate) use crate::manager::Window;
+pub(crate) use crate::platform::WorkspaceId;
 pub(crate) use harness::*;
 pub(crate) use mocks::*;
 
@@ -47,13 +50,6 @@ pub(crate) const EXT_DISPLAY_HEIGHT: i32 = 1200;
 pub(crate) const TEST_MENUBAR_HEIGHT: i32 = 20;
 pub(crate) const TEST_WINDOW_WIDTH: i32 = 400;
 pub(crate) const TEST_WINDOW_HEIGHT: i32 = 1000;
-
-#[allow(unused_imports)]
-use crate::events::Event;
-#[allow(unused_imports)]
-use crate::manager::Window;
-#[allow(unused_imports)]
-use crate::platform::WorkspaceId;
 
 #[test]
 fn showmenu_is_a_direct_subcommand() {

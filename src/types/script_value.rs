@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// separate rather than one `f64`. Lua distinguishes them, JSON round trips them
 /// differently, and a window ID past 2^53 silently loses precision if everything
 /// is a float — which is exactly the kind of value a script keeps in here.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ScriptValue {
     Null,
     Bool(bool),
@@ -29,9 +29,24 @@ pub enum ScriptValue {
     Map(BTreeMap<String, ScriptValue>),
 }
 
-/// `Eq` by hand because `f64` is not `Eq`. Two `Float`s are equal when their
-/// bits are, so `NaN == NaN` here — unlike IEEE equality, but what
-/// compare-and-set needs.
+/// Treats all `NaN` values as equal and keeps `-0.0 == 0.0`, so `Eq` holds for
+/// compare-and-set without diverging from Lua/JSON numeric equality.
+impl PartialEq for ScriptValue {
+    #[allow(clippy::float_cmp)]
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => (a.is_nan() && b.is_nan()) || a == b,
+            (Self::Str(a), Self::Str(b)) => a == b,
+            (Self::List(a), Self::List(b)) => a == b,
+            (Self::Map(a), Self::Map(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 impl Eq for ScriptValue {}
 
 impl ScriptValue {
@@ -160,5 +175,12 @@ mod tests {
             serde_json::Value::from(ScriptValue::Float(f64::INFINITY)),
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn nan_floats_satisfy_eq_reflexivity() {
+        assert_eq!(ScriptValue::Float(f64::NAN), ScriptValue::Float(f64::NAN));
+        assert_eq!(ScriptValue::Float(f64::NAN), ScriptValue::Float(-f64::NAN));
+        assert_eq!(ScriptValue::Float(-0.0), ScriptValue::Float(0.0));
     }
 }

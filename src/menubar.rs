@@ -68,13 +68,7 @@ impl MenuBarVisibility {
     }
 
     fn save(&self, path: &Path) -> crate::errors::Result<()> {
-        let data = serde_json::to_string_pretty(self)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, data)?;
-        std::fs::rename(temporary, path)?;
+        crate::util::write_json_atomic(path, self)?;
         Ok(())
     }
 }
@@ -853,7 +847,8 @@ pub fn update_menu_bar(
 
     let focused_window = focused.iter().next();
     let focused_width_ratio = focused_window.and_then(|(bounds, unmanaged)| {
-        (!unmanaged).then(|| f64::from(bounds.0.x) / f64::from(viewport.width()))
+        (!unmanaged && viewport.width() > 0)
+            .then(|| f64::from(bounds.0.x) / f64::from(viewport.width()))
     });
 
     menu_bar.update(

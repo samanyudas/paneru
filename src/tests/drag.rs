@@ -1247,14 +1247,7 @@ fn mouse_up(point: Origin) -> Event {
     }
 }
 
-fn frame(world: &mut World, id: WinID) -> IRect {
-    world
-        .query::<&Window>()
-        .iter(world)
-        .find(|window| window.id() == id)
-        .expect("window exists")
-        .frame()
-}
+use super::window_frame as frame;
 
 /// The window IDs of each column of the active strip, left to right, each
 /// column top to bottom.
@@ -1354,7 +1347,7 @@ fn harness_with(config: &str, display_height: i32, windows: i32) -> TestHarness 
         IRect::new(0, 0, TEST_DISPLAY_WIDTH, display_height),
     );
     let mut harness = harness.with_windows(windows);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     harness
 }
@@ -1394,11 +1387,7 @@ fn a_title_bar_press_uses_its_cached_height() {
     }
 }
 
-fn command(operation: Operation) -> Event {
-    Event::Command {
-        command: Command::Window(operation),
-    }
-}
+use super::window_command as command;
 
 /// Each window's frame top to bottom, checking they stay in one column and
 /// neither overlap nor leave a gap.
@@ -2482,7 +2471,7 @@ fn activate_a_parked_app_while_held() -> (TestHarness, Origin) {
     harness.existed_at_launch(0..5);
     harness.world().trigger(SpawnWindowTrigger(windows));
     state.activate_app(TEST_PROCESS_ID);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     crate::assert_focused!(harness.world(), 0);
     assert!(

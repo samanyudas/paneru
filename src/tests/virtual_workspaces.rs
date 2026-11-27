@@ -84,7 +84,7 @@ fn virtual_workspace_commands_change_nothing() {
 #[test]
 fn a_second_strip_for_a_space_joins_the_first() {
     let mut harness = TestHarness::new().with_windows(3);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(Duration::from_secs(1));
 
     let world = harness.world();
@@ -130,7 +130,7 @@ fn a_second_strip_for_a_space_joins_the_first() {
 fn parked_windows_merged_into_an_existing_empty_strip_come_back_on_screen() {
     const ELSEWHERE: WorkspaceId = 999;
     let mut harness = TestHarness::new().with_windows(1);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(Duration::from_secs(1));
 
     let parked = Origin::new(

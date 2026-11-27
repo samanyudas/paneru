@@ -1737,7 +1737,7 @@ fn snapshot_of(
                     .filter_map(|(index, column)| {
                         let (items, kind) = match column {
                             Column::Single(entity) => (vec![vec![*entity]], ColumnKind::Tiled),
-                            Column::Fullscren(entity) => {
+                            Column::Fullscreen(entity) => {
                                 (vec![vec![*entity]], ColumnKind::Fullscreen)
                             }
                             // A drop into a maximized column restores it first.
@@ -2019,7 +2019,7 @@ fn apply_drop(
         DropTarget::IntoColumn { column, slot, .. } => {
             let destination_can_join = strip
                 .get(column)
-                .is_ok_and(|column| !matches!(column, Column::Fullscren(_)));
+                .is_ok_and(|column| !matches!(column, Column::Fullscreen(_)));
             if strip.index_of(window).ok() != Some(column) {
                 // The window takes the width of the column it joins, even
                 // as its new top window.

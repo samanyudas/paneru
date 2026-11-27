@@ -212,15 +212,11 @@ pub fn serve_lua_store(
 }
 
 /// Reads the world once per pass, however many waiters ask for it.
-///
-/// `slot` holds what the first asker got — including a failure, which is
-/// shared rather than retried per waiter.
 fn extract_once<T>(
     slot: &mut Option<worker::Shared<T>>,
-    extract: impl FnOnce() -> crate::errors::Result<T>,
+    extract: impl FnOnce() -> T,
 ) -> worker::Shared<T> {
-    slot.get_or_insert_with(|| extract().map(Arc::new).map_err(|err| err.to_string()))
-        .clone()
+    slot.get_or_insert_with(|| Ok(Arc::new(extract()))).clone()
 }
 
 /// Puts what the callbacks queued onto the command bus.
@@ -337,7 +333,7 @@ mod tests {
                 dispatch_lua_events.in_set(crate::ecs::UpdateSet::Housekeeping),
             )
             .add_systems(PostUpdate, (serve_lua_queries, serve_lua_store));
-        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.settle();
         harness.advance(Duration::from_millis(2000));
 
         harness.mock_state.os_vanish_window(1);
@@ -445,7 +441,7 @@ mod tests {
             .map(|_| {
                 extract_once(&mut slot, || {
                     reads.set(reads.get() + 1);
-                    Ok(7_u32)
+                    7_u32
                 })
             })
             .collect();
@@ -461,23 +457,5 @@ mod tests {
                 .all(|other| Arc::ptr_eq(first, other.as_ref().expect("a successful read"))),
             "every waiter should hold the same extraction"
         );
-    }
-
-    // A failed read is shared rather than retried per waiter.
-    #[test]
-    fn a_failed_extraction_is_shared_not_retried() {
-        let reads = Cell::new(0);
-        let mut slot = None;
-        let answers: Vec<_> = (0..3)
-            .map(|_| {
-                extract_once(&mut slot, || -> crate::errors::Result<u32> {
-                    reads.set(reads.get() + 1);
-                    Err(crate::errors::Error::InvalidInput("no world".to_string()))
-                })
-            })
-            .collect();
-
-        assert_eq!(reads.get(), 1, "a failure should not be retried per waiter");
-        assert!(answers.iter().all(std::result::Result::is_err));
     }
 }

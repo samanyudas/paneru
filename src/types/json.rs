@@ -19,11 +19,13 @@ pub fn flatten_tag(value: serde_json::Value, tag: &str) -> serde_json::Value {
         return value;
     };
 
-    let mut entries = outer.into_iter();
-    let (Some((name, payload)), None) = (entries.next(), entries.next()) else {
-        // More than one key means this was not an externally tagged enum after
-        // all; pass it through rather than mangling it.
-        return serde_json::Value::Object(entries.collect());
+    if outer.len() != 1 {
+        // More than one key (or empty) means this was not an externally tagged
+        // enum after all; pass it through rather than mangling it.
+        return serde_json::Value::Object(outer);
+    }
+    let Some((name, payload)) = outer.into_iter().next() else {
+        unreachable!("checked len == 1 above");
     };
 
     let mut flat = serde_json::Map::new();
@@ -66,5 +68,12 @@ mod tests {
             flatten_tag(json!({"conflict": 7}), "outcome"),
             json!({"outcome": "conflict", "value": 7})
         );
+    }
+
+    #[test]
+    fn a_multi_key_object_passes_through_unchanged() {
+        let object = json!({"a": 1, "b": 2, "c": 3});
+        assert_eq!(flatten_tag(object.clone(), "outcome"), object);
+        assert_eq!(flatten_tag(json!({}), "outcome"), json!({}));
     }
 }

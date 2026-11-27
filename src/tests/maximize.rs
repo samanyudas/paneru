@@ -6,7 +6,7 @@ use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
 
 use crate::assert_focused;
-use crate::commands::{Command, Direction, Operation, Side};
+use crate::commands::{Direction, Operation, Side};
 use crate::config::{Config, MainOptions};
 use crate::ecs::drag::{DragFeedback, DragState, OverlayShape};
 use crate::ecs::layout::LayoutStrip;
@@ -17,18 +17,12 @@ use crate::events::{Event, MouseButton};
 use crate::manager::{Display, DockFrame, Origin, Size, Window};
 use crate::platform::{Modifiers, WinID, WorkspaceId};
 
-use super::*;
+use super::{window_command as command, *};
 
 mod restore_first;
 mod session;
 
 const SETTLE: Duration = Duration::from_secs(2);
-
-fn command(operation: Operation) -> Event {
-    Event::Command {
-        command: Command::Window(operation),
-    }
-}
 
 /// The window's frame as the OS has it.
 fn os_frame(harness: &TestHarness, id: WinID) -> IRect {
@@ -75,7 +69,7 @@ fn double_click_title_bar_now(harness: &mut TestHarness, id: WinID) {
 /// already moved to show it.
 fn three_windows() -> TestHarness {
     let mut harness = TestHarness::new().with_windows(3);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     let point = title_bar(&harness, 1);
     harness.mock_state.simulate_click(point);
     harness.advance(SETTLE);
@@ -380,7 +374,7 @@ fn the_command_restores_a_floating_window_on_the_display_it_was_moved_to() {
         EXT_BOUNDS,
         vec![EXT_WORKSPACE_ID],
     );
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.mock_state.focus_window(1);
     harness.advance(SETTLE);
     harness.run(vec![command(Operation::Manage)]);
@@ -633,7 +627,7 @@ fn a_window_returns_to_a_slot_that_ends_near_the_screen_edge() {
     let mut harness = TestHarness::new()
         .with_config((options, vec![]).into())
         .with_windows(3);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     let point = title_bar(&harness, 1);
     harness.mock_state.simulate_click(point);
     harness.advance(SETTLE);
@@ -673,7 +667,7 @@ fn a_dragged_maximized_window_restores_from_where_it_is() {
     let harness = TestHarness::new();
     harness.mock_state.queue_writes(TEST_PROCESS_ID);
     let mut harness = harness.with_windows(3);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     let point = title_bar(&harness, 1);
     harness.mock_state.simulate_click(point);
     harness.advance(SETTLE);
@@ -1373,7 +1367,7 @@ fn a_swipe_scrolls_past_a_maximized_window() {
     )
         .into();
     let mut harness = TestHarness::new().with_config(config).with_windows(3);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.mock_state.focus_window(1);
     harness.advance(SETTLE);
     double_click_title_bar(&mut harness, 1);
@@ -1425,7 +1419,7 @@ fn no_neighbor_covers_a_maximized_window_with_gaps() {
             window.vertical_padding = 4;
         });
     }
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.mock_state.focus_window(1);
     harness.advance(SETTLE);
 
@@ -1696,7 +1690,7 @@ fn a_full_width_window_fills_the_usable_area_when_maximized() {
     let harness = TestHarness::new().with_config((options, vec![]).into());
     harness.mock_state.queue_writes(TEST_PROCESS_ID);
     let mut harness = harness.with_windows(3);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.mock_state.focus_window(1);
     harness.advance(SETTLE);
     harness.run(vec![command(Operation::SetWidth(1.0))]);
@@ -1726,7 +1720,7 @@ fn a_padding_reload_keeps_a_swiped_strip_where_it_was() {
     )
         .into();
     let mut harness = TestHarness::new().with_config(config).with_windows(3);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.mock_state.focus_window(1);
     harness.advance(SETTLE);
     let centered = os_frame(&harness, 1);
@@ -1774,7 +1768,7 @@ fn a_hidden_maximized_window_stays_off_a_taller_display_beside() {
         .with_config((options, vec![]).into())
         .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
         .with_windows(3);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.mock_state.focus_window(2);
     harness.advance(SETTLE);
     double_click_title_bar(&mut harness, 2);

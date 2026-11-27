@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use bevy::app::{App, PostUpdate};
+use bevy::ecs::change_detection::{DetectChanges as _, Ref};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
@@ -8,13 +9,17 @@ use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Added, Changed, Has, With};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{In, IntoSystem as _, Local, Query, Res};
+use bevy::ecs::system::{In, IntoSystem as _, Local, Populated, Query, Res};
 use bevy::math::{IRect, IVec2};
+use bevy::time::Time;
 use tracing::debug;
 
+use crate::config::Config;
+use crate::ecs::ease::{self, Ease, SlideEase};
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
-use crate::ecs::{PostUpdateSet, SelectedVirtualMarker};
+use crate::ecs::systems::AnimationStep;
+use crate::ecs::{PostUpdateSet, PresentedOrigin, SelectedVirtualMarker};
 use crate::events::Event;
 use crate::manager::{Display, Margins, Window, WindowManager};
 use crate::platform::WinID;
@@ -424,4 +429,47 @@ pub(crate) fn log_showing_edge_slices(
         .collect::<Vec<_>>();
     debug!("showing edge slices: [{}]", described.join(", "));
     *logged = showing;
+}
+
+/// Where a slide shows now, and where it heads. `None` while it lands, at
+/// rest under its photo.
+pub(crate) fn slide_heading(slide: &Slide, presented: IVec2) -> Option<(IVec2, IVec2)> {
+    match *slide {
+        Slide::Moving { at, .. } => Some((at, presented)),
+        Slide::Leaving { at, to, .. } | Slide::Tucking { at, to, .. } => Some((at, to)),
+        Slide::Landing { .. } => None,
+    }
+}
+
+/// Steps the ease of each slide, before pacing reads how far each photo
+/// steps this frame and the photos step by it. A photo that waits for its
+/// window to tuck under it holds its place on the curve, as it does not
+/// move. A slide that lands forgets its motion, so the next one starts from
+/// rest.
+pub(crate) fn step_slides(
+    slides: Populated<(&Window, Ref<Slide>, &PresentedOrigin, &mut SlideEase)>,
+    step: Res<AnimationStep>,
+    time: Res<Time>,
+    config: Res<Config>,
+) {
+    let duration = ease::duration(&config);
+    for (window, slide, presented, mut ease) in slides {
+        let waits = matches!(*slide, Slide::Tucking { until, .. }
+            if window.write_pending() && time.elapsed() < until);
+        match slide_heading(&slide, presented.0) {
+            Some((at, to)) => {
+                if slide.is_added() {
+                    ease.0.restart();
+                }
+                if waits {
+                    ease.0.hold();
+                } else {
+                    let now = time.elapsed_secs_f64();
+                    ease.0
+                        .step(at, to, slide.is_added(), (now, step.secs()), duration);
+                }
+            }
+            None => ease.0 = Ease::default(),
+        }
+    }
 }

@@ -117,9 +117,8 @@ pub(crate) fn apply_config_side_effects(
     }
 
     // Recompute passthrough keys for the currently focused window.
-    if let Some((window, _, parent)) = windows
-        .focused()
-        .and_then(|(w, e)| windows.find_parent(w.id()).map(|(w, _, p)| (w, e, p)))
+    if let Some((window, entity)) = windows.focused()
+        && let Some(parent) = windows.parent_of(entity)
         && let Ok(app) = applications.get(parent)
     {
         update_passthrough(window, app, config);
@@ -998,8 +997,8 @@ pub(super) fn window_unmanaged_trigger(
     };
     let Some((_, app)) = ctx
         .windows
-        .find_parent(window.id())
-        .and_then(|(_, _, parent)| apps.get(parent).ok())
+        .parent_of(entity)
+        .and_then(|parent| apps.get(parent).ok())
     else {
         return;
     };
@@ -1163,8 +1162,8 @@ pub(super) fn window_managed_trigger(
     if let Some(window) = ctx.windows.get(entity)
         && let Some((_, app)) = ctx
             .windows
-            .find_parent(window.id())
-            .and_then(|(_, _, parent)| apps.get(parent).ok())
+            .parent_of(entity)
+            .and_then(|parent| apps.get(parent).ok())
     {
         let properties = WindowProperties::new(app, window, &ctx.config);
 
@@ -1874,8 +1873,8 @@ pub(super) fn recheck_window_level(
         };
         entity_commands.try_remove::<AboveOrdinaryCheck>();
         let app = windows
-            .find_parent(window.id())
-            .and_then(|(_, _, parent)| apps.get(parent).ok());
+            .parent_of(entity)
+            .and_then(|parent| apps.get(parent).ok());
         let properties = app.map(|app| WindowProperties::new(app, window, &config));
         let Some(properties) = properties.filter(|properties| raised && properties.floating())
         else {
@@ -1929,8 +1928,6 @@ pub(super) fn recheck_window_level(
     }
 }
 
-/// The active display with the Dock's edge, read without skipping the system
-/// when no display is active.
 /// Gives each window that waited for a match by its title the new-window
 /// width, once the startup restore's grace period ends without a match, as
 /// it would have had when it joined its strip. A window that floats or is
@@ -1961,8 +1958,8 @@ pub(super) fn size_windows_restore_did_not_match(
             continue;
         }
         let Some(app) = windows
-            .find_parent(window.id())
-            .and_then(|(_, _, parent)| apps.get(parent).ok())
+            .parent_of(entity)
+            .and_then(|parent| apps.get(parent).ok())
         else {
             continue;
         };
@@ -2106,11 +2103,11 @@ pub(super) fn apply_window_positions(
         }
 
         // A window of a hidden app joins a strip when the app shows again.
-        let Some((window, _, parent)) = ctx
+        let Some((window, parent)) = ctx
             .windows
             .get_managed(entity)
             .filter(|(_, _, unmanaged)| !matches!(unmanaged, Some(Unmanaged::Hidden)))
-            .and_then(|(window, _, _)| ctx.windows.find_parent(window.id()))
+            .and_then(|(window, _, _)| Some((window, ctx.windows.parent_of(entity)?)))
         else {
             continue;
         };
@@ -2966,7 +2963,7 @@ mod tests {
     #[test]
     fn test_persistent_frame_refresh_failure_keeps_the_live_window() {
         let mut harness = TestHarness::new().with_windows(1);
-        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.settle();
         harness.advance(Duration::from_millis(2000));
         let entity = find_window_entity(0, harness.world());
         harness.mock_state.update_window(0, |window| {
@@ -2997,7 +2994,7 @@ mod tests {
     #[test]
     fn test_handle_recovery_retries_a_transient_frame_refresh_failure() {
         let mut harness = TestHarness::new().with_windows(1);
-        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.settle();
         harness.advance(Duration::from_millis(2000));
         harness.advance(Duration::from_millis(20));
         let entity = find_window_entity(0, harness.world());
@@ -3176,7 +3173,7 @@ mod tests {
     #[test]
     fn test_size_verification_retries_a_transient_read_failure() {
         let mut harness = TestHarness::new().with_windows(1);
-        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.settle();
         harness.advance(Duration::from_millis(2000));
         let entity = find_window_entity(0, harness.world());
         let mut size = harness.world().get::<crate::ecs::Bounds>(entity).unwrap().0;
@@ -3231,7 +3228,7 @@ mod tests {
     #[test]
     fn test_size_verification_stops_after_persistent_read_failures() {
         let mut harness = TestHarness::new().with_windows(1);
-        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.settle();
         harness.advance(Duration::from_millis(2000));
         let entity = find_window_entity(0, harness.world());
         harness.mock_state.update_window(0, |window| {

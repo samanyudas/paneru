@@ -858,7 +858,7 @@ fn focusing_another_display_without_switching_its_workspace_does_not_flash() {
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
             window.workspace_id = EXT_WORKSPACE_ID;
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
 
     // The focus event can arrive before the active-display notification.
     harness.mock_state.focus_window(100);
@@ -948,7 +948,7 @@ fn popup_waits_until_the_destination_display_is_active() {
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
             window.workspace_id = EXT_WORKSPACE_ID;
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
 
     let target = {
         let world = harness.world();
@@ -1041,12 +1041,6 @@ fn test_empty_baseline_row_survives_display_removal() {
             );
         })
         .run(commands);
-}
-
-fn window_command(operation: Operation) -> Event {
-    Event::Command {
-        command: Command::Window(operation),
-    }
 }
 
 fn window_entity(world: &mut World, id: WinID) -> Option<Entity> {
@@ -2906,7 +2900,7 @@ fn test_topology_read_appends_window_moved_to_inactive_space_into_its_strip() {
         )
         .with_windows(2)
         .with_workspace_window(100, inactive_space, |_| {});
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
 
     harness
         .mock_state
@@ -3344,4 +3338,75 @@ fn test_move_to_display_keeps_a_window_that_refused_its_width_visible() {
         );
         assert_focused!(harness.world(), 0);
     }
+}
+
+/// If `join_column` fails after a display move (for example because the target
+/// column is maximized and cannot accept a stack item), the moved window is
+/// appended to the destination strip instead of being lost outside every strip.
+#[test]
+fn test_move_to_display_appends_when_join_column_fails() {
+    use crate::ecs::display::{DisplayMoves, Placement};
+    use crate::ecs::layout::Column;
+
+    let mut harness = TestHarness::new()
+        .with_windows(1)
+        .with_display(2, IRect::new(1024, 0, 2048, 768), vec![20])
+        .with_workspace_window(10, 20, |window| {
+            window.frame = IRect::new(1024, 40, 1524, 540);
+        });
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        window_command(Operation::FocusDisplay(Direction::East)),
+        window_command(Operation::Maximize),
+    ]);
+    harness.settle();
+
+    // Verify column 0 on display 2 is actually maximized so `Placement::Into(0, 0)`
+    // passes the fullscreen pre-check and fails `join_column`.
+    {
+        let world = harness.world();
+        let mut strips = world.query::<&LayoutStrip>();
+        let strip = strips
+            .iter(world)
+            .find(|strip| strip.id() == 20)
+            .expect("strip 20");
+        assert_eq!(strip.len(), 1);
+        assert!(
+            matches!(strip.get(0), Ok(Column::Maximized(_))),
+            "column 0 on display 2 must be maximized before move, got {:?}",
+            strip.get(0)
+        );
+    }
+
+    let entity = find_window_entity(0, harness.world());
+    let mut system = bevy::ecs::system::IntoSystem::into_system(
+        move |mut strips: DisplayMoves, mut commands: Commands| {
+            let moved = strips.move_to_display(
+                entity,
+                2,
+                Placement::Into(0, 0),
+                Size::new(500, 500),
+                |_| Some(IRect::new(0, 20, 500, 520)),
+                &mut commands,
+            );
+            assert!(moved.is_some(), "move_to_display should complete");
+        },
+    );
+    system.initialize(harness.world());
+    system.run((), harness.world()).expect("run DisplayMoves");
+    system.apply_deferred(harness.world());
+
+    assert_on_workspace!(harness.world(), 0, 20);
+    let world = harness.world();
+    let mut strips = world.query::<&LayoutStrip>();
+    let strip = strips
+        .iter(world)
+        .find(|strip| strip.id() == 20)
+        .expect("strip 20");
+    assert_eq!(
+        strip.len(),
+        2,
+        "window 0 should be appended as its own new column after join_column fails"
+    );
+    assert_eq!(strip.get(1).ok(), Some(Column::Single(entity)));
 }

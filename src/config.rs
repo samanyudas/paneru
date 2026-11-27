@@ -36,6 +36,15 @@ use crate::{
 };
 use crate::{platform::CFStringRef, util::AXUIWrapper};
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SwipePagingConfig {
+    pub enabled: bool,
+    pub fingers: Option<usize>,
+    pub direction: SwipeGestureDirection,
+    pub page_distance_cm: f64,
+    pub haptics: bool,
+}
+
 pub mod decorations;
 pub mod padding;
 pub mod snippet;
@@ -86,7 +95,7 @@ pub static CONFIGURATION_FILE: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 
 const DEFAULT_CONFIGURATION: &str = "# Paneru configuration\n\n[options]\n\n[bindings]\n";
 
-fn default_configuration_file() -> std::io::Result<PathBuf> {
+fn default_config_path(filename: &str) -> std::io::Result<PathBuf> {
     let config_home = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
@@ -97,7 +106,30 @@ fn default_configuration_file() -> std::io::Result<PathBuf> {
             )
         })?;
 
-    Ok(config_home.join("paneru").join("paneru.toml"))
+    Ok(config_home.join("paneru").join(filename))
+}
+
+fn create_default_file_at(path: &Path, content: &str, kind: &str) -> std::io::Result<bool> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("{kind} path has no parent"),
+        )
+    })?;
+    create_dir_all(parent)?;
+
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            file.write_all(content.as_bytes())?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn default_configuration_file() -> std::io::Result<PathBuf> {
+    default_config_path("paneru.toml")
 }
 
 fn create_default_configuration_file() -> std::io::Result<PathBuf> {
@@ -109,19 +141,7 @@ fn create_default_configuration_file() -> std::io::Result<PathBuf> {
 }
 
 fn create_configuration_file_at(path: &Path) -> std::io::Result<bool> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(ErrorKind::InvalidInput, "configuration path has no parent")
-    })?;
-    create_dir_all(parent)?;
-
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            file.write_all(DEFAULT_CONFIGURATION.as_bytes())?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error),
-    }
+    create_default_file_at(path, DEFAULT_CONFIGURATION, "configuration")
 }
 
 /// The path in `PANERU_CONFIG`, when it is set and not empty.
@@ -189,20 +209,9 @@ const DEFAULT_LUA_SCRIPT: &str = "\
 --   end)
 ";
 
-/// Returns the default location for the Lua init script (`<config>/paneru/init.lua`).
 #[cfg(feature = "lua")]
 fn default_lua_file() -> std::io::Result<PathBuf> {
-    let config_home = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                ErrorKind::NotFound,
-                "neither XDG_CONFIG_HOME nor HOME is set",
-            )
-        })?;
-
-    Ok(config_home.join("paneru").join("init.lua"))
+    default_config_path("init.lua")
 }
 
 /// Finds the first existing Lua init script from supported locations, mirroring
@@ -263,48 +272,38 @@ pub fn ensure_lua_file() -> std::io::Result<Option<PathBuf>> {
 
 #[cfg(feature = "lua")]
 fn create_lua_file_at(path: &Path) -> std::io::Result<bool> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(ErrorKind::InvalidInput, "Lua script path has no parent")
-    })?;
-    create_dir_all(parent)?;
-
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            file.write_all(DEFAULT_LUA_SCRIPT.as_bytes())?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error),
-    }
+    create_default_file_at(path, DEFAULT_LUA_SCRIPT, "Lua script")
 }
+
+/// Legacy top-level `[options]` keys that have moved to dedicated `[padding]`,
+/// `[decorations]`, and `[swipe]` sub-tables.
+pub(crate) const DEPRECATED_OPTION_KEYS: [&str; 16] = [
+    "padding_top",
+    "padding_bottom",
+    "padding_left",
+    "padding_right",
+    "dim_inactive_windows",
+    "dim_inactive_color",
+    "border_active_window",
+    "border_color",
+    "border_opacity",
+    "border_width",
+    "border_radius",
+    "swipe_gesture_fingers",
+    "swipe_gesture_direction",
+    "continuous_swipe",
+    "swipe_sensitivity",
+    "swipe_deceleration",
+];
 
 /// Returns the list of deprecated top-level `[options]` keys present in a TOML config.
 pub fn deprecated_options_in_input(input: &str) -> Result<Vec<String>> {
-    const DEPRECATED_KEYS: [&str; 16] = [
-        "padding_top",
-        "padding_bottom",
-        "padding_left",
-        "padding_right",
-        "dim_inactive_windows",
-        "dim_inactive_color",
-        "border_active_window",
-        "border_color",
-        "border_opacity",
-        "border_width",
-        "border_radius",
-        "swipe_gesture_fingers",
-        "swipe_gesture_direction",
-        "continuous_swipe",
-        "swipe_sensitivity",
-        "swipe_deceleration",
-    ];
-
     let value: toml::Value = toml::from_str(input)?;
     let Some(options) = value.get("options").and_then(toml::Value::as_table) else {
         return Ok(Vec::new());
     };
 
-    Ok(DEPRECATED_KEYS
+    Ok(DEPRECATED_OPTION_KEYS
         .into_iter()
         .filter(|key| options.contains_key(*key))
         .map(str::to_string)
@@ -401,13 +400,13 @@ impl Config {
         self.inner.load()
     }
 
-    /// Returns a clone of the `MainOptions` from the current configuration.
-    ///
-    /// # Returns
-    ///
-    /// A `MainOptions` struct containing the main configuration options.
+    #[cfg(any(test, feature = "lua"))]
     pub fn options(&self) -> MainOptions {
         self.inner().options.clone()
+    }
+
+    pub fn has_animation_speed(&self) -> bool {
+        self.inner().options.animation_speed.is_some()
     }
 
     // Scales window motion duration (higher is shorter, not pixels per
@@ -416,7 +415,8 @@ impl Config {
     // speed), while `ResizeMotion` uses a shorter quartic ease-out
     // (`120 ms * 14 / speed`).
     pub fn animation_speed(&self) -> f64 {
-        self.options()
+        self.inner()
+            .options
             .animation_speed
             // If unset, set it to something high, so the move happens immediately,
             // effectively disabling animation.
@@ -514,11 +514,15 @@ impl Config {
     }
 
     pub fn sliver_height(&self) -> f64 {
-        self.options().sliver_height.unwrap_or(1.0).clamp(0.1, 1.0)
+        self.inner()
+            .options
+            .sliver_height
+            .unwrap_or(1.0)
+            .clamp(0.1, 1.0)
     }
 
     pub fn sliver_width(&self) -> i32 {
-        i32::from(self.options().sliver_width.unwrap_or(5)).max(1)
+        i32::from(self.inner().options.sliver_width.unwrap_or(5)).max(1)
     }
 
     pub fn edge_padding(&self) -> (i32, i32, i32, i32) {
@@ -534,11 +538,11 @@ impl Config {
     }
 
     pub fn preset_column_widths(&self) -> Vec<f64> {
-        self.options().preset_column_widths
+        self.inner().options.preset_column_widths.clone()
     }
 
     pub fn preset_stack_heights(&self) -> Vec<f64> {
-        self.options().preset_stack_heights
+        self.inner().options.preset_stack_heights.clone()
     }
 
     pub fn swipe_gesture_direction(&self) -> SwipeGestureDirection {
@@ -548,8 +552,7 @@ impl Config {
             .as_ref()
             .and_then(|swipe| swipe.gesture.as_ref())
             .and_then(|gesture| gesture.direction.clone())
-            .clone()
-            .or(config.options.swipe_gesture_direction.clone())
+            .or_else(|| config.options.swipe_gesture_direction.clone())
             .unwrap_or(SwipeGestureDirection::Natural)
     }
 
@@ -608,16 +611,14 @@ impl Config {
             .unwrap_or(true)
     }
 
-    pub(crate) fn swipe_paging_config(
-        &self,
-    ) -> (bool, Option<usize>, SwipeGestureDirection, f64, bool) {
-        (
-            self.swipe_gesture_paging(),
-            self.swipe_gesture_fingers(),
-            self.swipe_gesture_direction(),
-            self.swipe_gesture_page_distance_cm(),
-            self.swipe_gesture_haptics(),
-        )
+    pub(crate) fn swipe_paging_config(&self) -> SwipePagingConfig {
+        SwipePagingConfig {
+            enabled: self.swipe_gesture_paging(),
+            fingers: self.swipe_gesture_fingers(),
+            direction: self.swipe_gesture_direction(),
+            page_distance_cm: self.swipe_gesture_page_distance_cm(),
+            haptics: self.swipe_gesture_haptics(),
+        }
     }
 
     pub fn swipe_vertical(&self) -> bool {
@@ -742,14 +743,14 @@ impl Config {
             .or(config.options.border_radius.clone())
             .unwrap_or(BorderRadiusOption::Auto)
         {
-            BorderRadiusOption::Auto if macos_major_version() == 26 => BorderRadiusOption::Auto,
+            BorderRadiusOption::Auto if macos_major_version() >= 26 => BorderRadiusOption::Auto,
             BorderRadiusOption::Value(value) => BorderRadiusOption::Value(value.max(0.0)),
             BorderRadiusOption::Auto => BorderRadiusOption::Value(10.0),
         }
     }
 
     pub fn menubar_height(&self) -> Option<i32> {
-        self.options().menubar_height.map(i32::from)
+        self.inner().options.menubar_height.map(i32::from)
     }
 
     pub fn swipe_sensitivity(&self) -> f64 {
@@ -786,7 +787,7 @@ impl Config {
     }
 
     pub fn mouse_resize_modifier(&self) -> Option<Modifiers> {
-        self.options().mouse_resize_modifier
+        self.inner().options.mouse_resize_modifier
     }
 
     pub fn restore_enabled(&self) -> bool {
@@ -878,20 +879,22 @@ impl Config {
     /// forces it into view. 0.0 = always bring into view (eager),
     /// 1.0 = never move unless fully invisible (lazy). Default: 0.0.
     pub fn window_hidden_ratio(&self) -> f64 {
-        self.options()
+        self.inner()
+            .options
             .window_hidden_ratio
             .unwrap_or(0.0)
             .clamp(0.0, 1.0)
     }
 
     pub fn window_resize_cycle(&self) -> bool {
-        self.options().window_resize_cycle.unwrap_or(true)
+        self.inner().options.window_resize_cycle.unwrap_or(true)
     }
 
     /// The share of the display that one step resize adds or removes, five
     /// percentage points unless the option holds a ratio above 0 and up to 1.
     pub fn window_resize_step(&self) -> f64 {
-        self.options()
+        self.inner()
+            .options
             .window_resize_step
             .filter(|step| step.is_finite() && *step > 0.0 && *step <= 1.0)
             .unwrap_or(0.05)
@@ -901,7 +904,8 @@ impl Config {
     /// engine runs starts at, when the option holds a ratio above 0 and up to 1.
     /// Without it, such a window keeps the width it opened with.
     pub fn new_window_width(&self) -> Option<f64> {
-        self.options()
+        self.inner()
+            .options
             .new_window_width
             .filter(|ratio| ratio.is_finite() && *ratio > 0.0 && *ratio <= 1.0)
     }
@@ -909,57 +913,64 @@ impl Config {
     /// How many windows one stack holds, before capping at what fits on a
     /// display (see `effective_stack_limit`).
     pub fn stack_limit(&self) -> StackLimit {
-        self.options().stack_limit.unwrap_or_default()
+        self.inner().options.stack_limit.unwrap_or_default()
     }
 
     /// Which side of its stack a stacked window opens on when it is maximized.
     pub fn maximized_window_side(&self) -> MaximizedWindowSide {
-        self.options().maximized_window_side.unwrap_or_default()
+        self.inner()
+            .options
+            .maximized_window_side
+            .unwrap_or_default()
     }
 
     pub fn auto_center(&self) -> bool {
-        self.options().auto_center.is_some_and(|center| center)
+        self.inner()
+            .options
+            .auto_center
+            .is_some_and(|center| center)
     }
 
     pub fn horizontal_mouse_warp(&self) -> Option<i16> {
-        self.options().horizontal_mouse_warp
+        self.inner().options.horizontal_mouse_warp
     }
 
-    /// Returns `true` if focus should follow the mouse based on the current configuration.
     /// Miri keeps pointer movement from changing focus, so it defaults to `false`.
     pub fn focus_follows_mouse(&self) -> bool {
-        self.options().focus_follows_mouse.unwrap_or(false)
+        self.inner().options.focus_follows_mouse.unwrap_or(false)
     }
 
-    /// Returns `true` if the mouse cursor should follow the focused window based on the current configuration.
     /// Miri keeps keyboard commands from moving the pointer, so it defaults to `false`.
     pub fn mouse_follows_focus(&self) -> bool {
-        self.options().mouse_follows_focus.unwrap_or(false)
+        self.inner().options.mouse_follows_focus.unwrap_or(false)
     }
 
     pub fn horizontal_mouse_warp_offset(&self) -> i32 {
-        self.options().horizontal_mouse_warp_offset.unwrap_or(0)
+        self.inner()
+            .options
+            .horizontal_mouse_warp_offset
+            .unwrap_or(0)
     }
 
     pub fn reap_empty_workspaces(&self) -> bool {
-        // Default is disabled..
-        self.options()
+        self.inner()
+            .options
             .reap_empty_workspaces
             .is_some_and(|reap| reap)
     }
 
     pub fn shared_edge_slices(&self) -> bool {
-        self.options().shared_edge_slices.unwrap_or(false)
+        self.inner().options.shared_edge_slices.unwrap_or(false)
     }
 
     pub fn slide_window_pictures(&self) -> bool {
-        self.options().slide_window_pictures.unwrap_or(false)
+        self.inner().options.slide_window_pictures.unwrap_or(false)
     }
 
     pub fn native_tabs_enabled(&self) -> bool {
-        // Default is enabled.
         !self
-            .options()
+            .inner()
+            .options
             .disable_native_tabs
             .is_some_and(|disabled| disabled)
     }
@@ -983,8 +994,8 @@ impl Config {
     }
 
     pub fn virtual_workspace_animations(&self) -> bool {
-        // Default is disabled
-        self.options()
+        self.inner()
+            .options
             .virtual_workspace_animations
             .is_some_and(|enabled| enabled)
     }
@@ -1000,14 +1011,16 @@ impl Config {
     pub fn insert_windows_mid_strip(&self) -> bool {
         // Default is disabled: appending to the end of the strip is the
         // expected behaviour, especially when moving several windows.
-        self.options()
+        self.inner()
+            .options
             .insert_windows_mid_strip
             .is_some_and(|enabled| enabled)
     }
 
     #[cfg_attr(not(feature = "lua"), allow(dead_code))]
     pub fn create_workspace_automatically(&self) -> bool {
-        self.options()
+        self.inner()
+            .options
             .create_virtual_workspace_automatically
             .is_some_and(|enabled| enabled)
     }
@@ -1045,15 +1058,13 @@ impl Config {
             .and_then(|menubar| menubar.colors.as_ref())
             .into_iter()
             .flatten()
-            .map(|hex_string| resolve_menubar_color(hex_string))
+            .filter_map(|hex_string| resolve_menubar_color(hex_string))
             .collect()
     }
     /// True when at least one menubar colour is an explicit hex stop rather than
     /// the empty-string system-appearance sentinel.
     pub fn menubar_has_external_gradient(&self) -> bool {
-        self.menubar_gradient()
-            .iter()
-            .any(|(red, _, _)| !red.is_nan())
+        !self.menubar_gradient().is_empty()
     }
     pub fn menubar_gradient_angle(&self) -> f64 {
         self.inner()
@@ -1142,17 +1153,13 @@ impl Config {
     }
 }
 
-fn resolve_menubar_color(hex: &str) -> (f64, f64, f64) {
-    let check_string = hex.is_empty();
-    if !check_string {
-        return parse_hex_color(hex);
-    }
-    (f64::NAN, f64::NAN, f64::NAN)
+fn resolve_menubar_color(hex: &str) -> Option<(f64, f64, f64)> {
+    (!hex.is_empty()).then(|| parse_hex_color(hex))
 }
 
 fn parse_hex_color(hex: &str) -> (f64, f64, f64) {
     let hex = hex.strip_prefix('#').unwrap_or(hex);
-    if hex.len() != 6 {
+    if hex.len() != 6 || !hex.is_ascii() {
         return (1.0, 1.0, 1.0);
     }
     let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(255);
@@ -2953,9 +2960,9 @@ fn test_config_defaults() {
     assert_eq!(config.border_color(true), (1.0, 1.0, 1.0));
     assert_eq!(config.border_opacity(), 1.0);
     assert_eq!(config.border_width(), 2.0);
-    // Automatic radius detection is only enabled on macOS 26; other
+    // Automatic radius detection is enabled on macOS 26 and newer; earlier
     // releases use the fixed-radius fallback.
-    let expected_radius = if macos_major_version() == 26 {
+    let expected_radius = if macos_major_version() >= 26 {
         BorderRadiusOption::Auto
     } else {
         BorderRadiusOption::Value(10.0)

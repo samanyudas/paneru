@@ -154,21 +154,12 @@ impl ScriptStateStore {
             version: SUPPORTED_SCRIPT_STATE_VERSION,
             state: self.state.clone(),
         };
-        let json = serde_json::to_string_pretty(&saved).map_err(std::io::Error::other)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let tmp_path = path.with_extension("json.tmp");
-        fs::write(&tmp_path, json)?;
-        fs::rename(tmp_path, path)?;
-        Ok(())
+        crate::util::write_json_atomic(path, &saved)
     }
 
     #[must_use]
     pub fn default_file_path() -> PathBuf {
-        xdg::BaseDirectories::with_prefix("paneru")
-            .get_state_file(SCRIPT_STATE_FILE_NAME)
-            .expect("XDG state directory should be available")
+        crate::util::xdg_state_file(SCRIPT_STATE_FILE_NAME)
     }
 }
 

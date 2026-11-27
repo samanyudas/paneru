@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use bevy::math::IRect;
 use objc2::rc::Retained;
@@ -6,18 +6,21 @@ use objc2::runtime::AnyObject;
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSAnimatablePropertyContainer, NSAnimationContext, NSBackingStoreType, NSBezierPath, NSColor,
-    NSCompositingOperation, NSFloatingWindowLevel, NSFont, NSFontWeightSemibold, NSGraphicsContext,
-    NSImage, NSImageSymbolConfiguration, NSParagraphStyle, NSScreen, NSView, NSWindow,
+    NSCompositingOperation, NSFont, NSFontWeightSemibold, NSGraphicsContext, NSImage,
+    NSImageSymbolConfiguration, NSParagraphStyle, NSScreen, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGFloat;
-
-use crate::ecs::drag::DragOverlayApi;
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableCopying, NSPoint, NSRect, NSSize, NSString,
 };
 
-#[derive(Clone, PartialEq)]
+use crate::ecs::drag::DragOverlayApi;
+use crate::platform::cocoa_ui::{
+    OverlayLevel, cg_abs_to_cocoa, cocoa_frame, cocoa_to_local_flipped, primary_screen_height,
+};
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct BorderParams {
     pub color: (f64, f64, f64),
     pub opacity: f64,
@@ -26,11 +29,11 @@ pub struct BorderParams {
 }
 
 /// Parameters for the fullscreen dim + cutout overlay.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DimParams {
     pub opacity: f32,
     pub color: (f64, f64, f64),
-    /// The focused window rect to cut out (in Cocoa screen coordinates).
+    /// The focused window rect to cut out (in the view's local flipped coordinates).
     /// `None` means dim everything (no focused window).
     pub cutout: Option<NSRect>,
     pub border: Option<BorderParams>,
@@ -38,26 +41,9 @@ pub struct DimParams {
 
 // ── DimView: fullscreen dark overlay with a transparent cutout + border ──
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct DimViewIvars {
-    opacity: f32,
-    dim_r: f64,
-    dim_g: f64,
-    dim_b: f64,
-    // Cutout rect in the view's local coordinates.
-    cutout_x: f64,
-    cutout_y: f64,
-    cutout_w: f64,
-    cutout_h: f64,
-    has_cutout: bool,
-    // Border params (only drawn if has_border is true).
-    has_border: bool,
-    border_r: f64,
-    border_g: f64,
-    border_b: f64,
-    border_opacity: f64,
-    border_width: f64,
-    border_radius: f64,
+    params: RefCell<DimParams>,
 }
 
 define_class!(
@@ -71,33 +57,35 @@ define_class!(
     impl DimView {
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty_rect: NSRect) {
-            let ivars = self.ivars();
+            let params = self.ivars().params.borrow();
             let bounds = self.bounds();
 
-            // Fill the entire view with the dim color.
             let dim_color = NSColor::colorWithSRGBRed_green_blue_alpha(
-                ivars.dim_r as CGFloat,
-                ivars.dim_g as CGFloat,
-                ivars.dim_b as CGFloat,
-                CGFloat::from(ivars.opacity),
+                params.color.0 as CGFloat,
+                params.color.1 as CGFloat,
+                params.color.2 as CGFloat,
+                CGFloat::from(params.opacity),
             );
             dim_color.setFill();
             NSBezierPath::fillRect(bounds);
 
-            if ivars.has_cutout {
-                let half = if ivars.has_border { ivars.border_width / 2.0 } else { 0.0 };
-                let radius = ivars.border_radius as CGFloat;
+            if let Some(cutout_rect) = params.cutout {
+                let border_width = params.border.as_ref().map_or(0.0, |b| b.width);
+                let half = border_width / 2.0;
+                let radius = params.border.as_ref().map_or(0.0, |b| b.radius) as CGFloat;
 
                 // Expand the cutout by half the border width so the clear hole
                 // extends just past the window edge. The border straddles the
                 // window edge: outer half visible in the cutout, inner half
                 // hidden behind the window.
                 let cutout = NSRect::new(
-                    NSPoint::new(ivars.cutout_x - half, ivars.cutout_y - half),
-                    NSSize::new(ivars.cutout_w + ivars.border_width, ivars.cutout_h + ivars.border_width),
+                    NSPoint::new(cutout_rect.origin.x - half, cutout_rect.origin.y - half),
+                    NSSize::new(
+                        cutout_rect.size.width + border_width,
+                        cutout_rect.size.height + border_width,
+                    ),
                 );
 
-                // Punch a rounded transparent hole using Clear compositing.
                 if let Some(ctx) = NSGraphicsContext::currentContext() {
                     ctx.setCompositingOperation(NSCompositingOperation::Clear);
                     let hole = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
@@ -107,23 +95,18 @@ define_class!(
                     ctx.setCompositingOperation(NSCompositingOperation::SourceOver);
                 }
 
-                // Draw border centered on the window edge — half grows
-                // outward (visible in the cutout), half grows inward (behind
-                // the window).
-                if ivars.has_border {
-                    let border_rect = NSRect::new(
-                        NSPoint::new(ivars.cutout_x, ivars.cutout_y),
-                        NSSize::new(ivars.cutout_w, ivars.cutout_h),
-                    );
+                if let Some(border) = &params.border {
                     let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                        border_rect, radius, radius,
+                        cutout_rect,
+                        radius,
+                        radius,
                     );
-                    path.setLineWidth(ivars.border_width as CGFloat);
+                    path.setLineWidth(border.width as CGFloat);
                     let border_color = NSColor::colorWithSRGBRed_green_blue_alpha(
-                        ivars.border_r as CGFloat,
-                        ivars.border_g as CGFloat,
-                        ivars.border_b as CGFloat,
-                        ivars.border_opacity as CGFloat,
+                        border.color.0 as CGFloat,
+                        border.color.1 as CGFloat,
+                        border.color.2 as CGFloat,
+                        border.opacity as CGFloat,
                     );
                     border_color.setStroke();
                     path.stroke();
@@ -139,70 +122,21 @@ define_class!(
 );
 
 impl DimView {
-    fn new(mtm: MainThreadMarker, frame: NSRect, params: &DimParams) -> Retained<Self> {
-        let (has_cutout, cx, cy, cw, ch) = params.cutout.map_or((false, 0.0, 0.0, 0.0, 0.0), |r| {
-            (true, r.origin.x, r.origin.y, r.size.width, r.size.height)
-        });
-        let (has_border, br, bg, bb, bo, bw, brad) =
-            params
-                .border
-                .as_ref()
-                .map_or((false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), |b| {
-                    (
-                        true, b.color.0, b.color.1, b.color.2, b.opacity, b.width, b.radius,
-                    )
-                });
+    fn new(mtm: MainThreadMarker, frame: NSRect, params: DimParams) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(DimViewIvars {
-            opacity: params.opacity,
-            dim_r: params.color.0,
-            dim_g: params.color.1,
-            dim_b: params.color.2,
-            cutout_x: cx,
-            cutout_y: cy,
-            cutout_w: cw,
-            cutout_h: ch,
-            has_cutout,
-            has_border,
-            border_r: br,
-            border_g: bg,
-            border_b: bb,
-            border_opacity: bo,
-            border_width: bw,
-            border_radius: brad,
+            params: RefCell::new(params),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
-}
 
-// ── Coordinate helpers ──────────────────────────────────────────────────
-
-/// Convert an absolute CG screen frame (origin top-left, y-down) to Cocoa
-/// screen coordinates (origin bottom-left of primary screen, y-up).
-pub(crate) fn cg_abs_to_cocoa(frame: NSRect, primary_screen_height: f64) -> NSRect {
-    let cocoa_y = primary_screen_height - frame.origin.y - frame.size.height;
-    NSRect::new(NSPoint::new(frame.origin.x, cocoa_y), frame.size)
-}
-
-/// Height of the display at the global origin (the main display, whose Cocoa
-/// frame origin is `(0, 0)`). The CG↔Cocoa Y-flip is anchored to this display,
-/// so it must be *that* screen — `NSScreen::screens()[0]` is NOT reliably the
-/// main display, and using the wrong one offsets the overlay (and, when
-/// displays are stacked, lands it on the wrong monitor).
-pub(crate) fn primary_screen_height(mtm: MainThreadMarker) -> f64 {
-    let screens = NSScreen::screens(mtm);
-    let mut fallback = 0.0;
-    let mut first = true;
-    for screen in &screens {
-        let frame = screen.frame();
-        if first {
-            fallback = frame.size.height;
-            first = false;
+    fn update_params(&self, params: DimParams) -> bool {
+        let mut stored = self.ivars().params.borrow_mut();
+        if *stored == params {
+            return false;
         }
-        if frame.origin.x == 0.0 && frame.origin.y == 0.0 {
-            return frame.size.height;
-        }
+        *stored = params;
+        true
     }
-    fallback
 }
 
 /// Do two Cocoa rects overlap? Used to decide which displays a focused window
@@ -216,7 +150,11 @@ fn rects_intersect(a: NSRect, b: NSRect) -> bool {
 
 // ── Overlay window factory ──────────────────────────────────────────────
 
-fn make_overlay_window(mtm: MainThreadMarker, cocoa_frame: NSRect) -> Retained<NSWindow> {
+fn make_overlay_window(
+    mtm: MainThreadMarker,
+    cocoa_frame: NSRect,
+    level: OverlayLevel,
+) -> Retained<NSWindow> {
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
@@ -230,7 +168,7 @@ fn make_overlay_window(mtm: MainThreadMarker, cocoa_frame: NSRect) -> Retained<N
     window.setBackgroundColor(Some(&NSColor::clearColor()));
     window.setIgnoresMouseEvents(true);
     window.setHasShadow(false);
-    window.setLevel(NSFloatingWindowLevel);
+    window.setLevel(level.window_level());
     window.setCollectionBehavior(
         NSWindowCollectionBehavior::Transient
             | NSWindowCollectionBehavior::IgnoresCycle
@@ -241,6 +179,7 @@ fn make_overlay_window(mtm: MainThreadMarker, cocoa_frame: NSRect) -> Retained<N
 
     window
 }
+
 // ── OverlayManager ──────────────────────────────────────────────────────
 
 pub struct OverlayManager {
@@ -249,7 +188,7 @@ pub struct OverlayManager {
     /// window span multiple displays (with "Displays have separate Spaces" it
     /// renders on only one), so each screen gets its own overlay drawn in that
     /// screen's local coordinates. Indexed in lockstep with `NSScreen::screens`.
-    overlays: Vec<(Retained<NSWindow>, DimParams)>,
+    overlays: Vec<(Retained<NSWindow>, Retained<DimView>)>,
     hidden: bool,
 }
 
@@ -278,7 +217,7 @@ impl OverlayManager {
         // The focused window in Cocoa global coords (shared across all screens).
         let focused_cocoa = focused_abs_cg.map(|cg| cg_abs_to_cocoa(cg, screen_h));
 
-        // A display was added/removed — tear down and rebuild from scratch.
+        // A display was added/removed - tear down and rebuild from scratch.
         if self.overlays.len() != screens.len() {
             for (window, _) in self.overlays.drain(..) {
                 window.orderOut(None::<&AnyObject>);
@@ -293,15 +232,7 @@ impl OverlayManager {
             // window straddling a seam draws on both, clipped to each.
             let cutout_local = focused_cocoa
                 .filter(|wc| rects_intersect(*wc, frame))
-                .map(|wc| {
-                    NSRect::new(
-                        NSPoint::new(
-                            wc.origin.x - frame.origin.x,
-                            (frame.origin.y + frame.size.height) - (wc.origin.y + wc.size.height),
-                        ),
-                        wc.size,
-                    )
-                });
+                .map(|wc| cocoa_to_local_flipped(wc, frame));
 
             let params = DimParams {
                 opacity: dim_opacity,
@@ -310,25 +241,22 @@ impl OverlayManager {
                 border: border.cloned(),
             };
 
-            if let Some((window, stored)) = self.overlays.get_mut(i) {
-                if *stored == params {
-                    // Keep geometry in sync cheaply (no forced redraw).
-                    window.setFrame_display(frame, false);
-                } else {
-                    let view = DimView::new(self.mtm, frame, &params);
-                    window.setContentView(Some(&view));
+            if let Some((window, view)) = self.overlays.get(i) {
+                if view.update_params(params) {
+                    view.setNeedsDisplay(true);
+                }
+                if window.frame() != frame {
                     window.setFrame_display(frame, true);
-                    *stored = params;
                 }
                 if self.hidden {
                     window.orderFront(None::<&AnyObject>);
                 }
             } else {
-                let window = make_overlay_window(self.mtm, frame);
-                let view = DimView::new(self.mtm, frame, &params);
+                let window = make_overlay_window(self.mtm, frame, OverlayLevel::DimOverlay);
+                let view = DimView::new(self.mtm, frame, params);
                 window.setContentView(Some(&view));
                 window.orderFront(None::<&AnyObject>);
-                self.overlays.push((window, params));
+                self.overlays.push((window, view));
             }
         }
         self.hidden = false;
@@ -457,18 +385,12 @@ impl DragOverlay {
                 window.orderOut(None::<&AnyObject>);
             }
         }
-        let cocoa = cg_abs_to_cocoa(
-            NSRect::new(
-                NSPoint::new(f64::from(shape.min.x), f64::from(shape.min.y)),
-                NSSize::new(f64::from(shape.width()), f64::from(shape.height())),
-            ),
-            primary_screen_height(self.mtm),
-        );
+        let cocoa = cocoa_frame(self.mtm, shape);
 
         for (i, screen) in (&screens).into_iter().enumerate() {
             let frame = screen.frame();
             if i == self.overlays.len() {
-                let window = make_overlay_window(self.mtm, frame);
+                let window = make_overlay_window(self.mtm, frame, OverlayLevel::DimOverlay);
                 let view = DragView::new(self.mtm, frame, self.symbol.clone());
                 window.setContentView(Some(&view));
                 self.overlays.push((window, view));
@@ -482,13 +404,7 @@ impl DragOverlay {
                 window.orderOut(None::<&AnyObject>);
                 continue;
             }
-            let local = NSRect::new(
-                NSPoint::new(
-                    cocoa.origin.x - frame.origin.x,
-                    (frame.origin.y + frame.size.height) - (cocoa.origin.y + cocoa.size.height),
-                ),
-                cocoa.size,
-            );
+            let local = cocoa_to_local_flipped(cocoa, frame);
             view.ivars().mark.set(Some(mark(local)));
             view.setNeedsDisplay(true);
             // Stops a fade still running from the last refusal.
@@ -560,11 +476,18 @@ fn refusal_symbol() -> Option<Retained<NSImage>> {
 
 // ── FlashMessage ────────────────────────────────────────────────────────
 
+const FLASH_TEXT_FONT_SIZE: f64 = 30.0;
+
 #[derive(Debug, Clone)]
-struct FlashMessageViewIvars {
+struct FlashState {
     opacity: f32,
     message: Retained<NSString>,
     is_badge: bool,
+}
+
+#[derive(Debug)]
+struct FlashMessageViewIvars {
+    state: RefCell<FlashState>,
 }
 
 define_class!(
@@ -578,14 +501,15 @@ define_class!(
     impl FlashMessageView {
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty_rect: NSRect) {
-            let ivars = self.ivars();
+            let state = self.ivars().state.borrow();
             let bounds = self.bounds();
-            let is_badge = ivars.is_badge;
+            let is_badge = state.is_badge;
 
-            // 1. Draw semi-transparent bezel
             let bezel_color = NSColor::colorWithSRGBRed_green_blue_alpha(
-                0.12, 0.12, 0.12,
-                CGFloat::from(ivars.opacity * 0.88),
+                0.12,
+                0.12,
+                0.12,
+                CGFloat::from(state.opacity * 0.88),
             );
             bezel_color.setFill();
             let radius = if is_badge {
@@ -598,30 +522,32 @@ define_class!(
             );
             path.fill();
 
-            // Draw subtle border for contrast
             let border_color = NSColor::colorWithSRGBRed_green_blue_alpha(
-                1.0, 1.0, 1.0,
-                CGFloat::from(ivars.opacity * 0.15),
+                1.0,
+                1.0,
+                1.0,
+                CGFloat::from(state.opacity * 0.15),
             );
             border_color.setStroke();
             path.setLineWidth(1.0);
             path.stroke();
 
-            // 2. Draw text
             let font = if is_badge {
                 NSFont::boldSystemFontOfSize(bounds.size.height * 0.62)
             } else {
-                NSFont::systemFontOfSize(30.0)
+                NSFont::systemFontOfSize(FLASH_TEXT_FONT_SIZE)
             };
             let color = NSColor::colorWithSRGBRed_green_blue_alpha(
-                1.0, 1.0, 1.0,
-                CGFloat::from(ivars.opacity * 0.95),
+                1.0,
+                1.0,
+                1.0,
+                CGFloat::from(state.opacity * 0.95),
             );
 
             let paragraph_style = unsafe {
                 let style = NSParagraphStyle::defaultParagraphStyle().mutableCopy();
-                let _: () = msg_send![&style, setAlignment: 1isize]; // Center (NSTextAlignmentCenter = 1)
-                let _: () = msg_send![&style, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail = 4
+                let _: () = msg_send![&style, setAlignment: 1isize]; // NSTextAlignmentCenter
+                let _: () = msg_send![&style, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
                 style
             };
 
@@ -639,7 +565,7 @@ define_class!(
 
                 let attributes = NSDictionary::from_slices(&keys, &objects);
                 let alloc = NSAttributedString::alloc();
-                msg_send![alloc, initWithString: &*ivars.message, attributes: &*attributes]
+                msg_send![alloc, initWithString: &*state.message, attributes: &*attributes]
             };
 
             let text_size: NSSize = unsafe { msg_send![&attr_str, size] };
@@ -672,25 +598,22 @@ define_class!(
 );
 
 impl FlashMessageView {
-    fn new(
-        mtm: MainThreadMarker,
-        frame: NSRect,
-        message: &str,
-        opacity: f32,
-        is_badge: bool,
-    ) -> Retained<Self> {
+    fn new(mtm: MainThreadMarker, frame: NSRect, state: FlashState) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(FlashMessageViewIvars {
-            opacity,
-            message: NSString::from_str(message),
-            is_badge,
+            state: RefCell::new(state),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    fn set_state(&self, state: FlashState) {
+        *self.ivars().state.borrow_mut() = state;
+        self.setNeedsDisplay(true);
     }
 }
 
 pub struct FlashMessageManager {
     mtm: MainThreadMarker,
-    window: Option<Retained<NSWindow>>,
+    window: Option<(Retained<NSWindow>, Retained<FlashMessageView>)>,
 }
 
 impl FlashMessageManager {
@@ -702,64 +625,57 @@ impl FlashMessageManager {
     pub fn show(&mut self, message: &str, opacity: f32, top_right_abs_cg: NSPoint) {
         let is_badge = message.chars().count() <= 2;
         let screen_h = primary_screen_height(self.mtm);
+        let msg_ns = NSString::from_str(message);
 
         let size = if is_badge {
             NSSize::new(150.0, 150.0)
         } else {
-            let font = NSFont::systemFontOfSize(30.0);
+            let font = NSFont::systemFontOfSize(FLASH_TEXT_FONT_SIZE);
             let font_key = NSString::from_str("NSFont");
             let keys = [&*font_key];
             let objects = [&*font as &AnyObject];
             let attributes = NSDictionary::from_slices(&keys, &objects);
-            let msg_ns = NSString::from_str(message);
             let attr_str: Retained<NSAttributedString> = unsafe {
                 let alloc = NSAttributedString::alloc();
                 msg_send![alloc, initWithString: &*msg_ns, attributes: &*attributes]
             };
             let text_size: NSSize = unsafe { msg_send![&attr_str, size] };
-            let horizontal_padding = 48.0;
-            let max_width = 780.0;
-            let min_width = 140.0;
-            let width = (text_size.width + horizontal_padding).clamp(min_width, max_width);
+            let width = (text_size.width + 48.0).clamp(140.0, 780.0);
             NSSize::new(width, 64.0)
         };
 
         let padding = 20.0;
+        let frame = NSRect::new(
+            NSPoint::new(
+                top_right_abs_cg.x - size.width - padding,
+                screen_h - (top_right_abs_cg.y + size.height + padding),
+            ),
+            size,
+        );
+        let state = FlashState {
+            opacity,
+            message: msg_ns,
+            is_badge,
+        };
 
-        let cocoa_origin_x = top_right_abs_cg.x - size.width - padding;
-        let cocoa_origin_y = screen_h - (top_right_abs_cg.y + size.height + padding);
-
-        let frame = NSRect::new(NSPoint::new(cocoa_origin_x, cocoa_origin_y), size);
-
-        if let Some(window) = &self.window {
-            let view = FlashMessageView::new(
-                self.mtm,
-                NSRect::new(NSPoint::new(0.0, 0.0), size),
-                message,
-                opacity,
-                is_badge,
-            );
-            window.setContentView(Some(&view));
-            window.setFrame_display(frame, true);
+        if let Some((window, view)) = &self.window {
+            view.set_state(state);
+            if window.frame() != frame {
+                window.setFrame_display(frame, true);
+            }
             window.orderFront(None::<&AnyObject>);
         } else {
-            let window = make_overlay_window(self.mtm, frame);
-            window.setLevel(NSFloatingWindowLevel + 1);
-            let view = FlashMessageView::new(
-                self.mtm,
-                NSRect::new(NSPoint::new(0.0, 0.0), size),
-                message,
-                opacity,
-                is_badge,
-            );
+            let window = make_overlay_window(self.mtm, frame, OverlayLevel::FlashMessage);
+            let view =
+                FlashMessageView::new(self.mtm, NSRect::new(NSPoint::new(0.0, 0.0), size), state);
             window.setContentView(Some(&view));
             window.orderFront(None::<&AnyObject>);
-            self.window = Some(window);
+            self.window = Some((window, view));
         }
     }
 
     pub fn remove(&mut self) {
-        if let Some(window) = self.window.take() {
+        if let Some((window, _)) = self.window.take() {
             window.orderOut(None::<&AnyObject>);
         }
     }

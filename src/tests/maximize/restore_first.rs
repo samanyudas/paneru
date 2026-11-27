@@ -496,7 +496,7 @@ mod scripts {
 
     fn layout_ops(harness: &mut TestHarness, ops: Vec<LayoutOp>) {
         harness.run(vec![Event::Command {
-            command: Command::Layout(ops),
+            command: crate::commands::Command::Layout(ops),
         }]);
         harness.advance(SETTLE);
     }
