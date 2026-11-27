@@ -115,6 +115,11 @@ impl FocusHistory {
             .and_then(|t| t.last_floating)
     }
 
+    /// When `entity` last had managed focus, if ever.
+    pub fn recency(&self, entity: Entity) -> Option<u64> {
+        self.managed_recency.get(&entity).copied()
+    }
+
     /// The window in `column` that had focus most recently, or its top window
     /// when none of them has had focus.
     pub fn last_focused_in(&self, column: &Column) -> Option<Entity> {

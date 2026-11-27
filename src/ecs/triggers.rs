@@ -1,5 +1,5 @@
 use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Mut, Ref};
-use bevy::ecs::entity::Entity;
+use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::message::{MessageReader, MessageWriter};
@@ -23,7 +23,7 @@ use super::{
     MissionControlActive, OpenedHidden, PreviousManagedStrip, Rejoin, SpawnWindowTrigger,
     StrayFocusEvent, SystemTheme, Timeout, Unmanaged, WindowFocusQuestion,
 };
-use crate::config::Config;
+use crate::config::{Config, FocusOnClose};
 use crate::ecs::display::size_for_arrival;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, ExposeFocusedSurvivorAfterRemoval, LayoutStrip, anchored_origin};
@@ -758,7 +758,6 @@ pub(super) fn mission_control_trigger(
 pub(super) fn application_event_trigger(
     mut messages: MessageReader<Event>,
     processes: Query<(&BProcess, Entity, Has<Children>)>,
-    mut overrides: ResMut<TileOverrides>,
     mut commands: Commands,
 ) {
     let find_process = |psn| {
@@ -786,17 +785,6 @@ pub(super) fn application_event_trigger(
                 }
                 let watch = launch_watch(process.name(), &mut commands);
                 commands.spawn((watch, process));
-            }
-
-            Event::ApplicationTerminated { psn } => {
-                if let Some((BProcess(process), entity, _)) = find_process(*psn) {
-                    forget_enhanced_ui_state(process.pid());
-                    // Its windows despawn with it, without a destroy event.
-                    overrides.forget_process(process.pid());
-                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                        entity_commands.try_despawn();
-                    }
-                }
             }
             _ => (),
         }
@@ -1058,13 +1046,15 @@ fn remember_managed_strip(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_minimized_trigger(
     trigger: On<Add, Unmanaged>,
     windows: Windows,
     workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    active_display: Single<&Display, With<ActiveDisplayMarker>>,
-    mut config: GlobalState,
+    focus_history: Res<FocusHistory>,
+    config: Res<Config>,
+    mut global_state: GlobalState,
     mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
@@ -1072,21 +1062,27 @@ pub(super) fn window_minimized_trigger(
         windows.get_managed(entity)
     {
         debug!("Entity {entity} is minimized or hidden.");
-        let display_bounds = active_display.bounds();
         let focused = windows
             .focused()
             .is_some_and(|(_, focused)| focused == entity);
+        let has_focused_survivor = windows
+            .focused()
+            .and_then(|(_, focused)| windows.get_managed(focused))
+            .is_some_and(|(_, focused, unmanaged)| focused != entity && unmanaged.is_none());
+        let departing = EntityHashSet::from_iter([entity]);
 
         for (mut strip, active) in workspaces {
             // A window of a hidden app that opens in no strip and without focus has no focus to
             // give away. (#374)
-            if active && (focused || strip.contains(entity)) {
-                give_away_focus(
+            if active && !has_focused_survivor && (focused || strip.contains(entity)) {
+                give_away_focus_for_departing(
                     entity,
+                    &departing,
                     &windows,
                     &strip,
-                    &display_bounds,
-                    &mut config,
+                    &focus_history,
+                    &config,
+                    &mut global_state,
                     &mut commands,
                 );
             }
@@ -1440,89 +1436,130 @@ fn adopt_fresh_handle(window: &mut Window, app: &mut Application, config: &Confi
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn window_destroyed_trigger(
     mut messages: MessageReader<Event>,
-    active_display: ActiveDisplay,
-    mut apps: Query<&mut Application>,
+    workspaces: Query<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    processes: Query<(&BProcess, Entity)>,
+    mut apps: Query<(&mut Application, Option<&Children>)>,
     mut global_state: GlobalState,
     windows: Windows,
     confirmed: Query<(), With<DepartureConfirmed>>,
     focus_history: Res<FocusHistory>,
+    config: Res<Config>,
     mut overrides: ResMut<TileOverrides>,
     mut commands: Commands,
 ) {
+    let mut destroyed_order = Vec::new();
+    let mut departing_set = EntityHashSet::new();
+
     for event in messages.read() {
-        let Event::WindowDestroyed { window_id, source } = event else {
-            continue;
-        };
-
-        let Some((window, entity, parent)) = windows.find_parent(*window_id) else {
-            debug!("Duplicate event: window {window_id} already destroyed.");
-            continue;
-        };
-
-        // Only the SLS notification is ambiguous: it also fires when a window merely leaves a
-        // space. `confirm_space_departures` confirms it from one AX read and marks a window that
-        // is gone with `DepartureConfirmed`, so only a marked window closes here. A `kAXUIElementDestroyedNotification` means the AX
-        // element itself has been torn down and is taken at face value: confirming it against the
-        // app is not just unnecessary but actively wrong, because both signals below lag the
-        // teardown. `is_alive()` keeps succeeding on the dead element for apps that outlive their
-        // windows, and the app's AX window list is still warm for a moment after the close.
-        // Re-checking them raced the window back to life, leaving the entity in the strip and a
-        // permanent gap where the window had been.
-        let reason = match source {
-            DestroySource::SpaceNotification if !confirmed.contains(entity) => continue,
-            DestroySource::SpaceNotification => "a Space notification with a dead AX element",
-            DestroySource::Accessibility {
-                element: Some(element),
-            } if !window.is_current_element(element) => {
-                debug!("Window {window_id} lost a replaced AX element.");
-                continue;
+        match event {
+            Event::ApplicationTerminated { psn } => {
+                let Some((BProcess(process), entity)) = processes
+                    .iter()
+                    .find(|(BProcess(process), _)| process.psn() == *psn)
+                else {
+                    continue;
+                };
+                let pid = process.pid();
+                forget_enhanced_ui_state(pid);
+                // Its windows despawn with it, without a destroy event.
+                overrides.forget_process(pid);
+                for (app, children) in &apps {
+                    if app.pid() == pid {
+                        departing_set.extend(children.into_iter().flatten().copied());
+                    }
+                }
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_despawn();
+                }
             }
-            DestroySource::Accessibility { element: Some(_) } => "its AX element was destroyed",
-            DestroySource::Accessibility { element: None } => "the engine found it gone",
-        };
-        info!("Closing window {window_id}: {reason}.");
+            Event::WindowDestroyed { window_id, source } => {
+                let Some((window, entity, parent)) = windows.find_parent(*window_id) else {
+                    debug!("Duplicate event: window {window_id} already destroyed.");
+                    continue;
+                };
+                if departing_set.contains(&entity) {
+                    continue;
+                }
 
-        let Ok(mut app) = apps.get_mut(parent) else {
-            error!("Window {} has no parent!", window.id());
-            continue;
-        };
+                // Only the SLS notification is ambiguous: it also fires when a window merely leaves a
+                // space. `confirm_space_departures` confirms it from one AX read and marks a window that
+                // is gone with `DepartureConfirmed`, so only a marked window closes here. A `kAXUIElementDestroyedNotification` means the AX
+                // element itself has been torn down and is taken at face value: confirming it against the
+                // app is not just unnecessary but actively wrong, because both signals below lag the
+                // teardown. `is_alive()` keeps succeeding on the dead element for apps that outlive their
+                // windows, and the app's AX window list is still warm for a moment after the close.
+                // Re-checking them raced the window back to life, leaving the entity in the strip and a
+                // permanent gap where the window had been.
+                let reason = match source {
+                    DestroySource::SpaceNotification if !confirmed.contains(entity) => continue,
+                    DestroySource::SpaceNotification => {
+                        "a Space notification with a dead AX element"
+                    }
+                    DestroySource::Accessibility {
+                        element: Some(element),
+                    } if !window.is_current_element(element) => {
+                        debug!("Window {window_id} lost a replaced AX element.");
+                        continue;
+                    }
+                    DestroySource::Accessibility { element: Some(_) } => {
+                        "its AX element was destroyed"
+                    }
+                    DestroySource::Accessibility { element: None } => "the engine found it gone",
+                };
+                info!("Closing window {window_id}: {reason}.");
 
-        app.unobserve_window(window);
-        overrides.forget(window.id());
+                let Ok((mut app, _)) = apps.get_mut(parent) else {
+                    error!("Window {} has no parent!", window.id());
+                    continue;
+                };
 
-        let has_focused_survivor = windows
-            .focused()
-            .and_then(|(_, focused)| windows.get_managed(focused))
-            .is_some_and(|(_, focused, unmanaged)| focused != entity && unmanaged.is_none());
-        // A closing floating window, such as a dialog, hands the focus back
-        // to the strip window that had it last, which is the one its app
-        // returns to, rather than to whichever column sits mid-display.
-        let strip = active_display.active_strip();
-        let returns_to = windows
-            .get_managed(entity)
-            .is_some_and(|(_, _, managed)| matches!(managed, Some(Unmanaged::Floating)))
-            .then(|| focus_history.last_managed(strip.id()))
+                app.unobserve_window(window);
+                overrides.forget(window.id());
+                departing_set.insert(entity);
+                destroyed_order.push(entity);
+
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_despawn();
+                }
+
+                // The window entity will be removed from the layout strip in the On<Remove> trigger.
+            }
+            _ => (),
+        }
+    }
+
+    if departing_set.is_empty() {
+        return;
+    }
+
+    let focused_departing = windows
+        .focused()
+        .map(|(_, focused)| focused)
+        .filter(|focused| departing_set.contains(focused));
+    let has_focused_survivor = windows
+        .focused()
+        .and_then(|(_, focused)| windows.get_managed(focused))
+        .is_some_and(|(_, focused, unmanaged)| {
+            !departing_set.contains(&focused) && unmanaged.is_none()
+        });
+    let anchor = focused_departing.or_else(|| {
+        (!has_focused_survivor)
+            .then(|| destroyed_order.first().copied())
             .flatten()
-            .filter(|&last| strip.contains(last) && windows.get(last).is_some());
-        if let Some(last) = returns_to.filter(|_| !has_focused_survivor) {
-            global_state.set_ffm_flag(None);
-            commands.focus_entity(last, true);
-        } else if !has_focused_survivor {
-            give_away_focus(
-                entity,
-                &windows,
-                strip,
-                &active_display.bounds(),
-                &mut global_state,
-                &mut commands,
-            );
-        }
-
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_despawn();
-        }
-
-        // The window entity will be removed from the layout strip in the On<Remove> trigger.
+    });
+    if let Some(anchor) = anchor
+        && let Some((strip, _)) = workspaces.iter().find(|(_, active)| *active)
+    {
+        give_away_focus_for_departing(
+            anchor,
+            &departing_set,
+            &windows,
+            strip,
+            &focus_history,
+            &config,
+            &mut global_state,
+            &mut commands,
+        );
     }
 }
 
@@ -1541,61 +1578,112 @@ pub(super) fn invalidate_window_title(mut messages: MessageReader<Event>, window
     }
 }
 
-/// Moves the focus away to a neighbour window.
-fn give_away_focus(
+/// Moves focus to a surviving neighbour when a window closes, hides, minimizes,
+/// or its application terminates.
+#[allow(clippy::too_many_arguments)]
+fn give_away_focus_for_departing(
     entity: Entity,
+    departing: &EntityHashSet,
     windows: &Windows,
     active_strip: &LayoutStrip,
-    viewport: &IRect,
-    config: &mut GlobalState,
+    focus_history: &FocusHistory,
+    config: &Config,
+    global_state: &mut GlobalState,
     commands: &mut Commands,
 ) {
-    if active_strip.is_tabbed_display(entity)
-        && let Some(sibling) = active_strip.tab_display_sibling(entity)
+    // A closing floating window, such as a dialog, hands focus back to the
+    // surviving strip window that had it last.
+    if windows
+        .get_managed(entity)
+        .is_some_and(|(_, _, managed)| matches!(managed, Some(Unmanaged::Floating)))
+        && let Some(last) = focus_history
+            .last_managed(active_strip.id())
+            .filter(|last| {
+                !departing.contains(last)
+                    && active_strip.contains(*last)
+                    && matches!(windows.get_managed(*last), Some((_, _, None)))
+            })
     {
-        // Closing/losing focus on the active tab of a paneru-tabbed-display
-        // stack must focus the next tab, not fall through to the
-        // nearest-column search below — that search returns one
-        // representative entity per column, and this column's own entry
-        // was `entity` itself, so it would otherwise jump to an unrelated
-        // neighbouring column.
-        config.set_ffm_flag(None);
+        global_state.set_ffm_flag(None);
+        commands.focus_entity(last, true);
+        return;
+    }
+
+    if active_strip.is_tabbed_display(entity)
+        && let Some(sibling) = active_strip.tab_display_sibling(entity).filter(|sibling| {
+            !departing.contains(sibling)
+                && matches!(windows.get_managed(*sibling), Some((_, _, None)))
+        })
+    {
+        global_state.set_ffm_flag(None);
         commands.focus_entity(sibling, true);
         return;
     }
 
-    if active_strip.tabbed(entity) {
-        // Do not give away focus for tabbed windows.
-        // Remaining tab gets the focus.
+    if active_strip.tabbed(entity)
+        && active_strip
+            .tab_group(entity)
+            .is_some_and(|group| group.iter().any(|member| !departing.contains(member)))
+    {
+        // Do not give away focus while a surviving native tab remains in this group.
         return;
     }
-    let display_center = viewport.center().x;
-    let closest = active_strip
-        .all_columns()
-        .into_iter()
-        .filter(|&candidate| candidate != entity)
-        .filter_map(|candidate| {
-            let center = windows.moving_frame(candidate)?.center().x;
-            let distance = (center - display_center).abs();
-            Some((candidate, distance))
-        })
-        .min_by_key(|(_, dist)| *dist)
-        .map(|(e, _)| e)
-        .or_else(|| {
-            // Fallback when no candidate has a usable frame: pick any other
-            // column in the strip. Without this, losing focus on the only
-            // geometrically-known window would leave FocusedMarker unset and
-            // silently break keybindings.
-            active_strip
-                .all_columns()
-                .into_iter()
-                .find(|&candidate| candidate != entity)
-        });
 
-    if let Some(neighbour) = closest
-        && windows.get(neighbour).is_some()
-    {
-        config.set_ffm_flag(None);
+    let pick_in_column = |column: &Column| -> Option<Entity> {
+        let mut best: Option<(Entity, Option<u64>)> = None;
+        for candidate in column.window_iter() {
+            if departing.contains(&candidate)
+                || !matches!(windows.get_managed(candidate), Some((_, _, None)))
+            {
+                continue;
+            }
+            let recency = focus_history.recency(candidate);
+            if best.is_none_or(|(_, best_recency)| recency > best_recency) {
+                best = Some((candidate, recency));
+            }
+        }
+        best.map(|(candidate, _)| candidate)
+    };
+
+    let target = if let Ok(index) = active_strip.index_of(entity) {
+        active_strip
+            .get(index)
+            .ok()
+            .and_then(|column| pick_in_column(&column))
+            .or_else(|| {
+                let left = (0..index).rev();
+                let right = (index + 1)..active_strip.len();
+                let mut search_order = Vec::with_capacity(active_strip.len().saturating_sub(1));
+                match config.focus_on_close() {
+                    FocusOnClose::Left => {
+                        search_order.extend(left);
+                        search_order.extend(right);
+                    }
+                    FocusOnClose::Right => {
+                        search_order.extend(right);
+                        search_order.extend(left);
+                    }
+                }
+                search_order.into_iter().find_map(|col_idx| {
+                    active_strip
+                        .get(col_idx)
+                        .ok()
+                        .and_then(|column| pick_in_column(&column))
+                })
+            })
+    } else {
+        focus_history
+            .last_managed(active_strip.id())
+            .filter(|last| {
+                !departing.contains(last)
+                    && active_strip.contains(*last)
+                    && matches!(windows.get_managed(*last), Some((_, _, None)))
+            })
+            .or_else(|| active_strip.columns().find_map(pick_in_column))
+    };
+
+    if let Some(neighbour) = target {
+        global_state.set_ffm_flag(None);
         // Use focus_entity instead of triggering Event::WindowFocused: the
         // OS has usually handed focus to a different app after the current
         // window closed/hid, so window_focused_trigger's frontmost/focused

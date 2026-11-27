@@ -924,6 +924,12 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// Which adjacent column receives focus when the focused window closes or
+    /// its app quits.
+    pub fn focus_on_close(&self) -> FocusOnClose {
+        self.inner().options.focus_on_close.unwrap_or_default()
+    }
+
     pub fn auto_center(&self) -> bool {
         self.inner()
             .options
@@ -1462,6 +1468,11 @@ pub struct MainOptions {
     /// own, when it is maximized: `"left"` or `"right"`. Default: right.
     pub maximized_window_side: Option<MaximizedWindowSide>,
 
+    /// Which adjacent column receives focus when a focused window closes or
+    /// its app quits: `"left"` or `"right"`. Falls back to the opposite side
+    /// at the end of a strip. Default: left.
+    pub focus_on_close: Option<FocusOnClose>,
+
     /// If enabled, an empty virtual workspace will be removed.
     /// Default: true.
     pub reap_empty_workspaces: Option<bool>,
@@ -1564,6 +1575,15 @@ impl<'de> Deserialize<'de> for Keybinding {
 pub enum MaximizedWindowSide {
     Left,
     #[default]
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "snake_case")]
+pub enum FocusOnClose {
+    #[default]
+    Left,
     Right,
 }
 
