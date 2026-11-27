@@ -34,7 +34,7 @@ use crate::ecs::drag::{
 };
 use crate::ecs::ease::{self, PositionEase, SizeEase};
 use crate::ecs::layout::{Column, LayoutStrip, RestoreTo};
-use crate::ecs::maximize::{FloatingMaximized, FrameHold};
+use crate::ecs::maximize::{FloatingMaximized, FrameHold, MaximizeRefused};
 use crate::ecs::native_membership::{NativeMembership, NativeScope, stranded};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, WindowCtx, Windows};
 use crate::ecs::shared_edge::Slide;
@@ -80,6 +80,7 @@ type NativeFrameWindows<'w, 's> = Query<
             Option<&'static MinimumHeight>,
             Option<&'static MaximumHeight>,
             Option<&'static WidthLimits>,
+            Option<&'static MaximizeRefused>,
         ),
     ),
     (
@@ -1447,8 +1448,14 @@ fn adopt_native_size(
     workspaces: &mut Query<(&mut LayoutStrip, &mut Position)>,
     commands: &mut Commands,
 ) {
-    let Ok((_, _, position, mut bounds, .., (minimum_height, maximum_height, width_limits))) =
-        windows.get_mut(entity)
+    let Ok((
+        _,
+        _,
+        position,
+        mut bounds,
+        ..,
+        (minimum_height, maximum_height, width_limits, maximize_refused),
+    )) = windows.get_mut(entity)
     else {
         return;
     };
@@ -1478,6 +1485,11 @@ fn adopt_native_size(
         && let Ok(mut entity_commands) = commands.get_entity(entity)
     {
         entity_commands.try_remove::<WidthLimits>();
+    }
+    if maximize_refused.is_some_and(|refused| refused.cleared_by(new_frame.width()))
+        && let Ok(mut entity_commands) = commands.get_entity(entity)
+    {
+        entity_commands.try_remove::<MaximizeRefused>();
     }
     let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
     if old_frame.size() != new_frame.size() {
@@ -1545,7 +1557,7 @@ fn adopt_refused_frame(
     commands: &mut Commands,
 ) {
     let wider = windows.get_mut(entity).is_ok_and(
-        |(_, window, mut position, mut bounds, .., (_, _, limits))| {
+        |(_, window, mut position, mut bounds, .., (_, _, limits, _))| {
             if position.0 != new_frame.min {
                 position.0 = new_frame.min;
             }

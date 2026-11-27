@@ -2221,3 +2221,131 @@ fn double_click_restores_maximized_window_at_previously_refused_viewport_but_ski
         "double-click restores maximized window even at previously refused viewport"
     );
 }
+
+/// A slow or asynchronous app (such as a Chromium browser) that still reports
+/// its previous width for a brief period after a maximize write stays
+/// maximized instead of bouncing back and locking out future maximizes.
+#[test]
+fn a_slow_resizing_window_stays_maximized_within_the_refusal_grace() {
+    use crate::ecs::maximize::MaximizeRefused;
+
+    let mut harness = three_windows();
+    let before = frames(&harness, &[0, 1, 2]);
+    let entity = entity_of(&mut harness, 0);
+    // Cap the window to its current width for 150 ms after maximize starts.
+    harness.mock_state.update_window(0, |window| {
+        window.maximum_size = Some(Size::new(before[0].width(), 4000));
+    });
+
+    frame(&mut harness, vec![command(Operation::Maximize)]);
+    for _ in 0..8 {
+        harness.advance(Duration::from_millis(20));
+    }
+    assert!(
+        is_maximized(&mut harness, 0),
+        "window stays maximized while slow app has not committed the width yet"
+    );
+
+    // App finishes committing the wider size before the grace window elapses.
+    harness.mock_state.update_window(0, |window| {
+        window.maximum_size = None;
+    });
+    harness.advance(SETTLE);
+    assert!(
+        is_maximized(&mut harness, 0),
+        "window remains maximized once the slow app accepts the width"
+    );
+    assert!(
+        harness.world().get::<MaximizeRefused>(entity).is_none(),
+        "no permanent refusal recorded for a slow resize"
+    );
+}
+
+/// Once a window later accepts a width wider than the width it refused at
+/// maximize, `MaximizeRefused` clears so maximize works again.
+#[test]
+fn maximize_refused_clears_when_the_window_later_accepts_a_wider_width() {
+    use crate::ecs::maximize::MaximizeRefused;
+
+    let mut harness = three_windows();
+    let before = frames(&harness, &[0, 1, 2]);
+    let entity = entity_of(&mut harness, 0);
+    let cap = before[0].width() + 40;
+    harness.mock_state.update_window(0, |window| {
+        window.maximum_size = Some(Size::new(cap, 4000));
+    });
+
+    double_click_title_bar(&mut harness, 0);
+    assert!(!is_maximized(&mut harness, 0));
+    assert!(
+        harness.world().get::<MaximizeRefused>(entity).is_some(),
+        "refused width recorded"
+    );
+
+    // Window is no longer capped and widens past the previously refused width.
+    harness.mock_state.update_window(0, |window| {
+        window.maximum_size = None;
+    });
+    run_window_verb(&mut harness, "resize");
+    assert!(
+        frames(&harness, &[0])[0].width() > cap,
+        "window accepted a width wider than the old cap"
+    );
+
+    double_click_title_bar(&mut harness, 0);
+    assert!(
+        is_maximized(&mut harness, 0),
+        "double-click maximizes again after the window accepted a wider width"
+    );
+    assert!(
+        harness.world().get::<MaximizeRefused>(entity).is_none(),
+        "MaximizeRefused was cleared"
+    );
+}
+
+/// If a slow app commits the wider frame after the refusal grace elapsed
+/// (while the window is under its restore `FrameHold`), `hold_frames` clears
+/// `MaximizeRefused` so future maximizes are not locked out.
+#[test]
+fn maximize_refused_clears_when_late_width_arrives_during_restore_hold() {
+    use crate::ecs::maximize::MaximizeRefused;
+
+    let mut harness = three_windows();
+    let area = usable_area(&mut harness);
+    let before = frames(&harness, &[0, 1, 2]);
+    let entity = entity_of(&mut harness, 0);
+    harness.mock_state.update_window(0, |window| {
+        window.maximum_size = Some(Size::new(before[0].width(), 4000));
+    });
+
+    // Maximize and let the refusal grace elapse so undo_refused_maximize runs
+    // and starts the restore FrameHold.
+    frame(&mut harness, vec![command(Operation::Maximize)]);
+    for _ in 0..30 {
+        if harness.world().get::<MaximizeRefused>(entity).is_some() {
+            break;
+        }
+        harness.advance(Duration::from_millis(20));
+    }
+    assert!(
+        harness.world().get::<MaximizeRefused>(entity).is_some(),
+        "MaximizeRefused recorded after grace elapsed"
+    );
+
+    // The slow app finally commits the wider frame while restore FrameHold is active.
+    harness.mock_state.update_window(0, |window| {
+        window.maximum_size = None;
+        window.frame = IRect::from_corners(window.frame.min, window.frame.min + area.size());
+    });
+    harness.advance(SETTLE);
+
+    assert!(
+        harness.world().get::<MaximizeRefused>(entity).is_none(),
+        "late wider frame during restore FrameHold clears MaximizeRefused"
+    );
+    double_click_title_bar(&mut harness, 0);
+    assert!(
+        is_maximized(&mut harness, 0),
+        "double-click maximizes after late frame cleared MaximizeRefused"
+    );
+}
