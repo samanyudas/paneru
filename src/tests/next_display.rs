@@ -368,6 +368,7 @@ fn mouse_to_next_display_keeps_first_window_on_tie_and_warps_empty_strip_to_cent
     use crate::commands::{Command, MouseMove};
 
     let display_2_bounds = rect(1024, 0, 2024, 700);
+    let display_3_bounds = rect(2024, 0, 3024, 700);
     let mut harness = TestHarness::new()
         .with_windows(1)
         .with_display(2, display_2_bounds, vec![20])
@@ -376,6 +377,10 @@ fn mouse_to_next_display_keeps_first_window_on_tie_and_warps_empty_strip_to_cent
         })
         .with_workspace_window(11, 20, |window| {
             window.frame = IRect::new(1024, 340, 1524, 640);
+        })
+        .with_display(3, display_3_bounds, vec![30])
+        .with_workspace_window(30, 30, |window| {
+            window.frame = IRect::new(2024, 40, 2524, 540);
         });
     harness.run(vec![Event::MenuOpened { window_id: 0 }]);
     harness.advance(SETTLE);
@@ -406,29 +411,32 @@ fn mouse_to_next_display_keeps_first_window_on_tie_and_warps_empty_strip_to_cent
         "equal-width stack should focus its first window"
     );
 
-    // Move to a third display whose only window sits wholly off-screen: cursor
-    // warps to the display center without focusing the off-screen window.
-    let display_3_bounds = rect(2024, 0, 3024, 700);
-    harness
-        .mock_state
-        .add_display(3, display_3_bounds, vec![30]);
-    let offscreen =
-        harness
-            .mock_state
-            .spawn_window(TEST_PROCESS_ID, 30, 30, IRect::new(5000, 40, 5500, 540));
-    harness.run(vec![Event::DisplayAdded { display_id: 3 }]);
-    harness
-        .world()
-        .trigger(crate::ecs::SpawnWindowTrigger(vec![offscreen]));
-    harness.advance(SETTLE);
-    // Move window 30 off-screen in mock_state and sync its cached ECS frame so
-    // `other.bounds().intersect(frame)` is empty.
-    harness.mock_state.update_window(30, |window| {
-        window.frame = IRect::new(5000, 40, 5500, 540);
-    });
+    // Move window 30 on display 3 wholly off-screen in ECS `Position` (which
+    // `Windows::frame()` reads) so `other.bounds().intersect(frame)` is empty,
+    // and assert both preconditions before calling `ToNextDisplay`.
     let e30 = find_window_entity(30, harness.world());
-    if let Some(mut window) = harness.world().get_mut::<crate::manager::Window>(e30) {
-        let _ = window.update_frame();
+    {
+        let world = harness.world();
+        world
+            .get_mut::<crate::ecs::Position>(e30)
+            .expect("window 30 Position")
+            .0 = IVec2::new(5000, 40);
+        let pos = world.get::<crate::ecs::Position>(e30).unwrap().0;
+        let size = world.get::<crate::ecs::Bounds>(e30).unwrap().0;
+        let frame = IRect::from_corners(pos, pos + size);
+        assert!(
+            display_3_bounds.intersect(frame).is_empty(),
+            "window 30 frame {frame:?} must lie outside display 3 {display_3_bounds:?}"
+        );
+        let mut strips = world.query::<&LayoutStrip>();
+        let strip_30 = strips
+            .iter(world)
+            .find(|strip| strip.id() == 30)
+            .expect("strip 30");
+        assert!(
+            strip_30.contains(e30),
+            "strip 30 must contain off-screen window 30 before command"
+        );
     }
     harness.run(vec![Event::Command {
         command: Command::Mouse(MouseMove::ToNextDisplay),
