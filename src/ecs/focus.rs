@@ -395,13 +395,9 @@ fn shares_a_tab_group(
         return true;
     }
 
-    let parent_of = |entity: Entity| {
-        windows
-            .get(entity)
-            .and_then(|window| windows.find_parent(window.id()))
-            .map(|(_, _, parent)| parent)
-    };
-    let (Some(target_app), Some(actual_app)) = (parent_of(target), parent_of(actual)) else {
+    let (Some(target_app), Some(actual_app)) =
+        (windows.parent_of(target), windows.parent_of(actual))
+    else {
         return false;
     };
     if target_app != actual_app {
@@ -683,23 +679,15 @@ fn autocenter_window_on_focus(
         && ctx.config.continuous_swipe()
         && let Some(target) = moving
     {
-        let hidden_ratio = ctx.config.window_hidden_ratio();
-        if hidden_ratio > 0.0
-            && let Some(slot) = ctx.windows.layout_position(entity)
+        if let Some(slot) = ctx.windows.layout_position(entity)
             && let Some(frame) = ctx.windows.moving_frame(entity)
         {
             let projected = slot.0 + target.0;
             let frame = IRect::from_corners(projected, projected + frame.size());
             let viewport = active_display.actual_bounds(&ctx.config);
-            let visible_width = viewport.intersect(frame).width();
-            let meaningful = (visible_width - ctx.config.sliver_width()).max(0);
-            let visible_fraction = f64::from(meaningful) / f64::from(frame.width().max(1));
             let strip_movement =
                 (clamp_origin_to_viewport(projected, frame.size(), viewport).x - projected.x).abs();
-            if visible_width > 0
-                && 1.0 - visible_fraction <= hidden_ratio
-                && frame.width() - visible_width >= strip_movement
-            {
+            if crate::ecs::layout::is_mostly_visible(frame, viewport, strip_movement, &ctx.config) {
                 return;
             }
         }

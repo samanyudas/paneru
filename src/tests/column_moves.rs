@@ -34,11 +34,8 @@ fn external_bounds(direction: &Direction) -> IRect {
     IRect::from_corners(min, min + size)
 }
 
-fn command(operation: Operation) -> Event {
-    Event::Command {
-        command: Command::Window(operation),
-    }
-}
+use super::window_command as command;
+use super::window_frame as frame;
 
 /// Windows 0 to 3 on the built-in display, stacked as `[0, 1, 2], [3]` with
 /// window 1 focused, and an external display at `ext` holding one column for
@@ -96,15 +93,6 @@ fn columns(world: &mut World, workspace: WorkspaceId) -> Vec<Vec<WinID>> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn frame(world: &mut World, id: WinID) -> IRect {
-    world
-        .query::<&Window>()
-        .iter(world)
-        .find(|window| window.id() == id)
-        .expect("window exists")
-        .frame()
 }
 
 /// Lets windows `ids`, which moved to the external display, settle there, as

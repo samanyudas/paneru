@@ -35,14 +35,7 @@ fn layout_on(world: &mut World, workspace: WorkspaceId) -> Vec<Vec<WinID>> {
         .unwrap_or_default()
 }
 
-fn frame(world: &mut World, id: WinID) -> IRect {
-    world
-        .query::<&Window>()
-        .iter(world)
-        .find(|window| window.id() == id)
-        .expect("window exists")
-        .frame()
-}
+use super::window_frame as frame;
 
 fn area(rect: IRect) -> i64 {
     if rect.is_empty() {
@@ -261,7 +254,7 @@ fn a_column_centered_past_a_shared_edge_tucks() {
         .with_window(1, |window| {
             window.frame = IRect::new(0, 0, 630, TEST_WINDOW_HEIGHT);
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     assert_eq!(
         frame(harness.world(), 0).min.x,

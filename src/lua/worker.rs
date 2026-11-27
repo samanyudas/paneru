@@ -139,8 +139,8 @@ pub struct LuaWorker {
     outbox: Receiver<FromLua>,
     /// Reads of the ECS world, and store traffic, on separate channels so
     /// separate systems can serve them. See [`WorldRequest`].
-    world_queries: Receiver<WorldRequest>,
-    store_queries: Receiver<StoreRequest>,
+    world_queries: Option<Receiver<WorldRequest>>,
+    store_queries: Option<Receiver<StoreRequest>>,
     /// Mirrors the runtime's `subscribed_event_mask`, republished after every
     /// load, reload, and callback completion, so the main thread's fast path
     /// filters unsubscribed events without waking the worker.
@@ -200,8 +200,8 @@ impl LuaWorker {
         Self {
             to_lua,
             outbox,
-            world_queries,
-            store_queries,
+            world_queries: Some(world_queries),
+            store_queries: Some(store_queries),
             subscribed_events,
             built_config,
             thread: Some(thread),
@@ -255,24 +255,25 @@ impl LuaWorker {
 
     /// The `paneru.query*` and window-set calls currently waiting on the world.
     pub(super) fn pending_world_queries(&self) -> impl Iterator<Item = WorldRequest> + '_ {
-        std::iter::from_fn(|| self.world_queries.try_recv().ok())
+        std::iter::from_fn(|| self.world_queries.as_ref()?.try_recv().ok())
     }
 
     /// The `paneru.state` calls currently waiting on the store.
     pub(super) fn pending_store_queries(&self) -> impl Iterator<Item = StoreRequest> + '_ {
-        std::iter::from_fn(|| self.store_queries.try_recv().ok())
+        std::iter::from_fn(|| self.store_queries.as_ref()?.try_recv().ok())
     }
 }
 
 impl Drop for LuaWorker {
     fn drop(&mut self) {
         let _ = self.to_lua.try_send(ToLua::Shutdown);
+        // Drop the query receivers before waiting so a handler blocked on a
+        // world or store reply sees the channel disconnect immediately.
+        self.world_queries.take();
+        self.store_queries.take();
         let Some(thread) = self.thread.take() else {
             return;
         };
-        // Dropping the query receiver unblocks a handler waiting on a reply:
-        // its sender dies with the queue, so `recv` errors instead of
-        // waiting forever.
         let mut waited = Duration::ZERO;
         while !thread.is_finished() && waited < SHUTDOWN_GRACE {
             std::thread::sleep(SHUTDOWN_POLL);
@@ -531,7 +532,7 @@ mod tests {
     /// Answers everything currently waiting on the store, so a test about
     /// window sets does not have to care that the script also keeps state.
     fn serve_store(worker: &LuaWorker) {
-        while let Ok(request) = worker.store_queries.try_recv() {
+        for request in worker.pending_store_queries() {
             STORE.with_borrow_mut(|store| store.answer(request));
         }
     }
@@ -542,7 +543,7 @@ mod tests {
         let deadline = std::time::Instant::now() + TIMEOUT;
         loop {
             serve_store(worker);
-            if let Ok(request) = worker.world_queries.try_recv() {
+            if let Some(request) = worker.pending_world_queries().next() {
                 return request;
             }
             assert!(
@@ -590,7 +591,7 @@ mod tests {
         let deadline = std::time::Instant::now() + TIMEOUT;
         loop {
             serve_store(worker);
-            if let Ok(request) = worker.world_queries.try_recv() {
+            if let Some(request) = worker.pending_world_queries().next() {
                 // Every dispatch is handed a window set now, whether or not the
                 // handler touches it, so answering that is part of standing in
                 // for the main thread rather than something a test opts into.
@@ -724,7 +725,7 @@ mod tests {
         next_world_request(&worker, "the first query").answer(Ok(Arc::new(test_state())));
         assert_eq!(next_flash(&worker, "the handler to finish"), "done");
         assert!(
-            worker.world_queries.try_recv().is_err(),
+            worker.pending_world_queries().next().is_none(),
             "the second query should have been served from the cached extraction"
         );
     }
@@ -1116,7 +1117,7 @@ mod tests {
             FromLua::Command(Command::Window(crate::commands::Operation::Balance))
         ));
         assert!(
-            worker.world_queries.try_recv().is_err(),
+            worker.pending_world_queries().next().is_none(),
             "a handler that never touches the window set should not ask for one"
         );
     }
@@ -1135,7 +1136,7 @@ mod tests {
         assert_eq!(next_flash(&worker, "the first handler"), "7");
         assert_eq!(next_flash(&worker, "the second handler"), "7");
         assert!(
-            worker.world_queries.try_recv().is_err(),
+            worker.pending_world_queries().next().is_none(),
             "the second handler should have reused the first fetch"
         );
     }
@@ -1203,7 +1204,7 @@ mod tests {
         worker.send_binds(vec![2]);
         assert_eq!(next_flash(&worker, "the captured set"), "7");
         assert!(
-            worker.world_queries.try_recv().is_err(),
+            worker.pending_world_queries().next().is_none(),
             "reading a captured set should not go back to the world"
         );
     }

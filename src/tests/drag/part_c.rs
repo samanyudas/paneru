@@ -226,7 +226,7 @@ fn two_displays(config: &str, ext_height: i32) -> TestHarness {
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
             window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     harness
 }
@@ -571,7 +571,7 @@ fn a_carried_window_moved_away_without_a_notification_stays_in_its_strip() {
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
             window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     let settle = |harness: &mut TestHarness, duration: Duration| {
         let mut left = duration;
         while left > Duration::ZERO {
@@ -876,7 +876,7 @@ fn strip_x(world: &mut World, workspace: crate::platform::WorkspaceId) -> i32 {
 #[test]
 fn an_outer_edge_scrolls_after_half_a_second_and_repeats_every_350ms() {
     let mut harness = TestHarness::new().with_windows(6);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     harness.run(vec![command(Operation::Focus(Direction::Last))]);
     harness.advance(SETTLE);
@@ -911,7 +911,7 @@ fn an_outer_edge_scrolls_after_half_a_second_and_repeats_every_350ms() {
 #[test]
 fn leaving_an_edge_cancels_the_hold_and_reentering_waits_again() {
     let mut harness = TestHarness::new().with_windows(6);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     harness.run(vec![command(Operation::Focus(Direction::Last))]);
     harness.advance(SETTLE);
@@ -944,7 +944,7 @@ fn an_edge_with_a_neighboring_display_does_not_scroll() {
 #[test]
 fn an_edge_scroll_retargets_the_feedback_and_the_drop() {
     let mut harness = TestHarness::new().with_windows(6);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     harness.run(vec![command(Operation::Focus(Direction::Last))]);
     harness.advance(SETTLE);
@@ -2712,7 +2712,7 @@ fn append_to_a_display_without_a_strip_finishes_its_pending_placement() {
                 vec![EXT_WORKSPACE_ID],
             )
             .with_windows(3);
-        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.settle();
         harness.advance(SETTLE);
         if native_tabs {
             add_native_tab(&mut harness, 0, 3);
@@ -3003,7 +3003,7 @@ fn a_stale_report_for_the_display_beside_a_parked_column_changes_nothing() {
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
             window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     let parked = frame(harness.world(), 3);
     assert!(
@@ -3034,7 +3034,7 @@ fn a_window_that_refuses_its_size_stays_on_its_display() {
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
             window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
     let placed = frame(harness.world(), 1);
@@ -3072,7 +3072,7 @@ fn a_returned_window_parked_past_the_outer_edge_ignores_a_stale_report() {
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
             window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
     assert_eq!(source.len(), 5);
@@ -3140,7 +3140,7 @@ fn a_stale_report_while_a_tucked_column_scrolls_home_changes_nothing() {
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
             window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     let source = layout_on(harness.world(), TEST_WORKSPACE_ID);
     assert!(frame(harness.world(), 3).intersect(ext).is_empty());
@@ -3202,7 +3202,7 @@ fn a_real_native_move_during_an_engine_animation_applies() {
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
             window.frame = IRect::new(ext.min.x + 100, 20, ext.min.x + 900, ext.max.y);
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
 
     harness.world().write_message(Event::Command {
@@ -3264,7 +3264,7 @@ fn stacked_displays(config: &str) -> (TestHarness, IRect) {
     let mut harness = harness
         .with_display(EXT_DISPLAY_ID, lower, vec![EXT_WORKSPACE_ID])
         .with_windows(3);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     (harness, lower)
 }
@@ -4479,7 +4479,7 @@ fn overflowing_right_with_display(ext: IRect) -> TestHarness {
     let mut harness = TestHarness::new()
         .with_display(EXT_DISPLAY_ID, ext, vec![EXT_WORKSPACE_ID])
         .with_windows(6);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(SETTLE);
     harness.run(vec![command(Operation::Focus(Direction::Nth(2)))]);
     harness.advance(SETTLE);
@@ -4712,7 +4712,7 @@ fn drop_slot_harness(cross_display: bool, native_tabs: bool) -> TestHarness {
             window.frame = IRect::new(1024, 20, 1536, 768);
         });
     }
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     if !cross_display {
         harness.run(vec![command(Operation::SetWidth(0.5))]);
     }
@@ -4848,7 +4848,7 @@ fn drop_slot_survives_an_adopting_resize(cross_display: bool) {
                 });
         }
         harness = harness.with_windows(2);
-        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.settle();
         if !cross_display {
             harness.run(vec![command(Operation::SetWidth(0.5))]);
         }

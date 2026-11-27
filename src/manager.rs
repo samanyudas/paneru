@@ -46,13 +46,13 @@ pub use process::{Process, ProcessApi};
 pub use skylight::AXUIElementCopyAttributeValue;
 use skylight::{
     _AXUIElementCreateWithRemoteToken, SLSCopyActiveMenuBarDisplayIdentifier,
-    SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags,
-    SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation,
-    SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSMainConnectionID,
-    SLSManagedDisplayGetCurrentSpace, SLSNewConnection, SLSSpaceGetType, SLSWindowIsOrderedIn,
-    SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes, SLSWindowIteratorGetBounds,
-    SLSWindowIteratorGetParentID, SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID,
-    SLSWindowQueryResultCopyWindows, SLSWindowQueryWindows,
+    SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags, SLSFindWindowAndOwner,
+    SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation, SLSGetDisplayMenubarHeight,
+    SLSGetSpaceManagementMode, SLSMainConnectionID, SLSManagedDisplayGetCurrentSpace,
+    SLSNewConnection, SLSSpaceGetType, SLSWindowIsOrderedIn, SLSWindowIteratorAdvance,
+    SLSWindowIteratorGetAttributes, SLSWindowIteratorGetBounds, SLSWindowIteratorGetParentID,
+    SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
+    SLSWindowQueryWindows,
 };
 pub use window_writer::Answer;
 pub(crate) use windows::forget_enhanced_ui_state;
@@ -104,99 +104,28 @@ mod geometry_tests {
     }
 }
 
-/// Defines the interface for a window manager, abstracting OS-specific operations.
 #[automock]
 pub trait WindowManagerApi: Send + Sync {
-    /// Creates a new `Application` instance from a given `ProcessApi`.
-    ///
-    /// # Arguments
-    ///
-    /// * `process` - A reference to the `ProcessApi` trait object representing the application's process.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Application)` if the application is successfully created, otherwise `Err(Error)`.
     fn new_application(&self, process: &dyn ProcessApi) -> Result<Application>;
     /// Asks the app with `pid` one Accessibility question on a worker thread.
     /// The task resolves to `false` when the app did not answer in time, as
     /// when its main thread is busy. Returns a task so the main loop never
     /// waits on a busy app.
     fn probe_accessibility(&self, pid: Pid) -> Task<bool>;
-    /// Retrieves a list of window IDs associated with a parent window.
-    ///
-    /// # Arguments
-    ///
-    /// * `window_id` - The `WinID` of the parent window.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec<WinID>` containing the IDs of associated child windows.
-    fn get_associated_windows(&self, window_id: WinID) -> Vec<WinID>;
-    /// Retrieves a list of all currently present displays.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec<Display>` containing `Display` objects for all present displays.
     fn present_displays(&self) -> Vec<(Display, Vec<WorkspaceId>)>;
-    /// Retrieves the `CGDirectDisplayID` of the active menu bar display.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(u32)` with the display ID if successful, otherwise `Err(Error)`.
     fn active_display_id(&self) -> Result<u32>;
-    /// Retrieves the ID of the current active space on a given display.
-    ///
-    /// # Arguments
-    ///
-    /// * `display_id` - The `CGDirectDisplayID` of the display.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(u64)` with the space ID if successful, otherwise `Err(Error)`.
     fn active_display_space(&self, display_id: CGDirectDisplayID) -> Result<WorkspaceId>;
-    /// Returns `true` if the current space on the given display is a native fullscreen space.
     fn is_fullscreen_space(&self, display_id: CGDirectDisplayID) -> bool;
-    /// Centers the mouse cursor on a given window within its display bounds if it's not already within the window.
-    ///
-    /// # Arguments
-    ///
-    /// * `window` - A reference to the `Window` to center the mouse on.
-    /// * `display_bounds` - The `CGRect` representing the bounds of the display the window is on.
     fn warp_mouse(&self, origin: Origin);
     /// Focuses the desktop of the display with `bounds`, which makes that
     /// display the active one without moving the pointer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `Error` when no desktop window covers the display's centre,
-    /// as when Finder does not draw the desktop.
     fn focus_desktop(&self, bounds: IRect) -> Result<()>;
-    /// Adds existing windows for a given application, potentially resolving unresolved windows.
-    ///
-    /// # Arguments
-    ///
-    /// * `app` - A mutable reference to the `Application` whose windows are to be added.
-    /// * `spaces` - A slice of space IDs to query for windows.
-    /// * `config` - The current Paneru configuration, used to evaluate window rules.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Vec<Window>)` containing the found and added windows, otherwise `Err(Error)`.
     fn find_existing_application_windows(
         &self,
         app: &mut Application,
         spaces: &[WorkspaceId],
         config: &Config,
     ) -> Result<(Vec<Window>, Vec<WinID>)>;
-    /// Finds the `WinID` of a window at a given screen point.
-    ///
-    /// # Arguments
-    ///
-    /// * `point` - A reference to the `CGPoint` representing the screen coordinate.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(WinID)` with the found window's ID if successful, otherwise `Err(Error)`.
     fn find_window_at_point(&self, point: &CGPoint) -> Result<WinID>;
     /// Posts `press` again at `point`, where a real mouse's presses enter,
     /// which moves the pointer there.
@@ -204,15 +133,6 @@ pub trait WindowManagerApi: Send + Sync {
     /// Cancels held press `press_id` in the event tap when replay becomes
     /// impossible, so later clicks are not swallowed until `GIVE_UP`.
     fn cancel_press(&self, press_id: u32);
-    /// Returns a list of `WinID`s for all windows in a given workspace (space).
-    ///
-    /// # Arguments
-    ///
-    /// * `space_id` - The ID of the space to query.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Vec<WinID>)` containing the list of window IDs, otherwise `Err(Error)`.
     fn windows_in_workspace(&self, space_id: WorkspaceId) -> Result<Vec<WinID>>;
     /// Whether the window server has the window ordered in. A failed query is
     /// an `Err`, never an answer: it is no evidence the window exists or is gone.
@@ -223,47 +143,28 @@ pub trait WindowManagerApi: Send + Sync {
     /// The Dock as the Dock itself shows it, or `None` when it cannot be read,
     /// as while the screen is locked.
     fn dock_frame(&self) -> Option<DockFrame>;
-
-    /// Sends an `Event::Exit` to the event loop, signaling the application to quit.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the exit event is sent successfully, otherwise `Err(Error)`.
     fn quit(&self) -> Result<()>;
-
     fn setup_config_watcher(&self, path: &Path) -> Result<Box<dyn Watcher>>;
-
-    /// Returns the current cursor position in absolute CG coordinates,
-    /// or `None` if the position cannot be determined.
+    /// Returns the current cursor position in absolute CG coordinates.
     fn cursor_position(&self) -> Option<CGPoint>;
-
     /// Whether the left mouse button is down right now, as the window
     /// server sees it, whatever events the tap did or did not deliver.
     fn left_button_down(&self) -> bool;
-
     fn dim_windows(&self, windows: &[WinID], level: f32);
-
     fn windows_on_screen(&self) -> Option<Vec<WinID>>;
-
     /// Every window that exists right now, on any Space, minimized or not.
     fn all_window_ids(&self) -> Vec<WinID>;
-
     /// The process that owns `window_id`, as the window server knows it,
     /// without asking any app. `None` when no such window exists.
     fn window_owner(&self, window_id: WinID) -> Option<Pid>;
-
     /// Waits up to `timeout` for every window move and resize asked for so
     /// far to reach its app. Returns whether all of them did.
     fn flush_window_writes(&self, timeout: Duration) -> bool;
 }
 
-/// `WindowManager` is a Bevy resource that holds a boxed `WindowManagerApi` trait object.
-/// It allows for dynamic dispatch to the OS-specific window management implementation.
 #[derive(Deref, DerefMut, Resource)]
 pub struct WindowManager(pub Box<dyn WindowManagerApi>);
 
-/// `WindowManagerOS` is the macOS-specific implementation of the `WindowManagerApi` trait.
-/// It directly interacts with the macOS `SkyLight` and Accessibility APIs to manage windows.
 pub struct WindowManagerOS {
     main_cid: ConnID,
     event_sender: EventSender,
@@ -271,16 +172,6 @@ pub struct WindowManagerOS {
 }
 
 impl WindowManagerOS {
-    /// Creates a new `WindowManagerOS` instance.
-    /// It initializes the main connection ID to the macOS `SkyLight` API.
-    ///
-    /// # Arguments
-    ///
-    /// * `event_sender` - The `EventSender` to dispatch events from the window manager.
-    ///
-    /// # Returns
-    ///
-    /// A new `WindowManagerOS` instance.
     pub fn new(event_sender: EventSender) -> Self {
         let main_cid = unsafe { SLSMainConnectionID() };
         debug!("My connection id: {main_cid}");
@@ -293,16 +184,6 @@ impl WindowManagerOS {
         }
     }
 
-    /// Retrieves a list of space IDs for a given display UUID.
-    /// It queries the `SkyLight` API for managed display spaces and filters by the provided UUID.
-    ///
-    /// # Arguments
-    ///
-    /// * `uuid` - A reference to the `CFString` representing the display's UUID.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Vec<u64>)` with the list of space IDs if successful, otherwise `Err(Error)` if the spaces cannot be retrieved or the display is not found.
     fn display_space_list(&self, uuid: &CFString) -> Result<Vec<WorkspaceId>> {
         let display_spaces = NonNull::new(unsafe { SLSCopyManagedDisplaySpaces(self.main_cid) })
             .map(|ptr| unsafe { CFRetained::from_raw(ptr) })
@@ -357,12 +238,6 @@ impl WindowManagerOS {
         Ok(spaces)
     }
 
-    /// Retrieves the UUID of the active menu bar display.
-    /// This typically corresponds to the display where the primary menu bar is located.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(CFRetained<CFString>)` with the UUID if successful, otherwise `Err(Error)` if the active display cannot be determined.
     fn active_display_uuid(&self) -> Result<CFRetained<CFString>> {
         unsafe {
             let ptr = SLSCopyActiveMenuBarDisplayIdentifier(self.main_cid);
@@ -374,15 +249,6 @@ impl WindowManagerOS {
         }
     }
 
-    /// Returns the connection ID (`ConnID`) for a given process serial number (`PSN`).
-    ///
-    /// # Arguments
-    ///
-    /// * `psn` - The `ProcessSerialNumber` of the process.
-    ///
-    /// # Returns
-    ///
-    /// `Some(ConnID)` if the connection ID is found, otherwise `None`.
     fn connection_for_process(&self, psn: ProcessSerialNumber) -> Option<ConnID> {
         let mut connection: ConnID = 0;
         unsafe { SLSGetConnectionIDForPSN(self.main_cid, &psn, &mut connection) };
@@ -406,20 +272,6 @@ impl WindowManagerApi for WindowManagerOS {
         AsyncComputeTaskPool::get().spawn(async move { app::answers_accessibility(pid) })
     }
 
-    /// Returns child windows of the main window.
-    #[instrument(level = Level::TRACE, skip(self), ret)]
-    fn get_associated_windows(&self, window_id: WinID) -> Vec<WinID> {
-        trace!("for window {window_id}");
-        let windows =
-            unsafe { CFRetained::from_raw(SLSCopyAssociatedWindows(self.main_cid, window_id)) };
-        windows.into_iter().filter_map(|id| id.as_i32()).collect()
-    }
-
-    /// Retrieves a list of all currently present displays, along with their associated spaces.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec<Self>` containing `Display` objects for all present displays.
     #[instrument(level = Level::DEBUG, skip_all, ret)]
     fn present_displays(&self) -> Vec<(Display, Vec<WorkspaceId>)> {
         let mut count = 0u32;
@@ -453,22 +305,12 @@ impl WindowManagerApi for WindowManagerOS {
             .collect()
     }
 
-    /// Retrieves the `CGDirectDisplayID` of the active menu bar display.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(u32)` with the display ID if successful, otherwise `Err(Error)`.
     #[instrument(level = Level::TRACE, skip_all, ret)]
     fn active_display_id(&self) -> Result<u32> {
         let uuid = self.active_display_uuid()?;
         Display::id_from_uuid(&uuid)
     }
 
-    /// Retrieves the ID of the current active space on this display.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(u64)` with the space ID if successful, otherwise `Err(Error)`.
     fn active_display_space(&self, display_id: CGDirectDisplayID) -> Result<WorkspaceId> {
         Display::uuid_from_id(display_id).map(|uuid| unsafe {
             SLSManagedDisplayGetCurrentSpace(self.main_cid, &raw const *uuid)
@@ -480,7 +322,6 @@ impl WindowManagerApi for WindowManagerOS {
             .is_ok_and(|space_id| unsafe { SLSSpaceGetType(self.main_cid, space_id) } == 4)
     }
 
-    /// Centers the mouse cursor on the window if it's not already within the window's bounds.
     #[instrument(level = Level::DEBUG, skip_all, fields(window))]
     fn warp_mouse(&self, origin: Origin) {
         // Drop the local-event suppression interval to zero so HID mouse
@@ -501,17 +342,6 @@ impl WindowManagerApi for WindowManagerOS {
         windows::focus_desktop_window(process::psn_for_pid(pid)?, window_id)
     }
 
-    /// Adds existing windows for a given application, attempting to resolve any that are not yet found.
-    /// It compares the application's reported window list with the global window list and uses brute-forcing if necessary.
-    ///
-    /// # Arguments
-    ///
-    /// * `app` - A mutable reference to the `Application` whose windows are to be added.
-    /// * `spaces` - A slice of space IDs to query.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Vec<Window>)` containing the found windows, otherwise `Err(Error)`.
     fn find_existing_application_windows(
         &self,
         app: &mut Application,
@@ -543,15 +373,6 @@ impl WindowManagerApi for WindowManagerOS {
         Ok((found_windows, offscreen_windows))
     }
 
-    /// Finds a window at a given screen point using `SkyLight` API.
-    ///
-    /// # Arguments
-    ///
-    /// * `point` - A reference to the `CGPoint` representing the screen coordinate.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(WinID)` with the found window's ID if successful, otherwise `Err(Error)`.
     fn find_window_at_point(&self, point: &CGPoint) -> Result<WinID> {
         let mut window_id: WinID = 0;
         let mut window_conn_id: ConnID = 0;
@@ -636,12 +457,8 @@ impl WindowManagerApi for WindowManagerOS {
         if unsafe { CFPreferencesGetAppBooleanValue(&autohide, &dock, null_mut()) } {
             return Some(DockFrame::AutoHidden);
         }
-        let pid = objc2_app_kit::NSRunningApplication::runningApplicationsWithBundleIdentifier(
-            objc2_foundation::ns_string!("com.apple.dock"),
-        )
-        .iter()
-        .next()?
-        .processIdentifier();
+        let pid =
+            crate::platform::pid_for_bundle_id(objc2_foundation::ns_string!("com.apple.dock"))?;
         let app = AXUIWrapper::from_retained(unsafe { AXUIElementCreateApplication(pid) }).ok()?;
         let children = CFString::from_static_str(kAXChildrenAttribute);
         app.get_attribute::<CFArray<AXUIWrapper>>(&children)
@@ -680,7 +497,7 @@ impl WindowManagerApi for WindowManagerOS {
         let symlink = symlink_target(path);
 
         let mut watcher = if let Some(symlink) = symlink {
-            setup.with_follow_symlinks(true);
+            let setup = setup.with_follow_symlinks(true);
             let mut watcher = notify::PollWatcher::new(config_handler, setup)?;
             debug!("watching symlink target {} for changes.", symlink.display());
             watcher.watch(&symlink, RecursiveMode::NonRecursive)?;
@@ -751,12 +568,8 @@ impl WindowManagerApi for WindowManagerOS {
 /// one to the front reveals the desktop of the display that has focus, and
 /// focus stays there.
 fn desktop_window_at(point: Origin) -> Option<(WinID, Pid)> {
-    let finder = objc2_app_kit::NSRunningApplication::runningApplicationsWithBundleIdentifier(
-        objc2_foundation::ns_string!("com.apple.finder"),
-    )
-    .iter()
-    .next()?
-    .processIdentifier();
+    let finder =
+        crate::platform::pid_for_bundle_id(objc2_foundation::ns_string!("com.apple.finder"))?;
     let level = CGWindowLevelForKey(CGWindowLevelKey::DesktopIconWindowLevelKey);
     let window_list_info =
         CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, kCGNullWindowID)?;
@@ -827,10 +640,7 @@ pub(crate) fn shown_frames(ids: &[WinID]) -> Vec<(WinID, IRect)> {
     let Ok(count) = isize::try_from(ids.len()) else {
         return Vec::new();
     };
-    let query =
-        unsafe { CFRetained::from_raw(SLSWindowQueryWindows(cid, &raw const *windows, count)) };
-    let iterator =
-        unsafe { CFRetained::from_raw(SLSWindowQueryResultCopyWindows(query.deref().into())) };
+    let iterator = window_iterator_for_array(cid, &windows, count);
     let mut frames = Vec::with_capacity(ids.len());
     while unsafe { SLSWindowIteratorAdvance(&raw const *iterator) } {
         let id = unsafe { SLSWindowIteratorGetWindowID(&raw const *iterator) };
@@ -928,21 +738,19 @@ fn window_iterator_for_connection(
         )));
     }
 
-    let query = unsafe {
-        CFRetained::from_raw(SLSWindowQueryWindows(
-            main_cid,
-            &raw const *window_list_ref,
-            count,
-        ))
-    };
-    Ok(unsafe { CFRetained::from_raw(SLSWindowQueryResultCopyWindows(query.deref().into())) })
+    Ok(window_iterator_for_array(main_cid, &window_list_ref, count))
+}
+
+fn window_iterator_for_array(cid: ConnID, windows: &CFArray, count: isize) -> CFRetained<CFType> {
+    let query =
+        unsafe { CFRetained::from_raw(SLSWindowQueryWindows(cid, &raw const *windows, count)) };
+    unsafe { CFRetained::from_raw(SLSWindowQueryResultCopyWindows(query.deref().into())) }
 }
 
 pub fn window_iterator_for_id(window_id: WinID) -> Option<CFRetained<CFType>> {
     let cid = unsafe { SLSMainConnectionID() };
     let windows = create_array(&[window_id], CFNumberType::SInt32Type).ok()?;
-    let query = unsafe { CFRetained::from_raw(SLSWindowQueryWindows(cid, &raw const *windows, 1)) };
-    Some(unsafe { CFRetained::from_raw(SLSWindowQueryResultCopyWindows(query.deref().into())) })
+    Some(window_iterator_for_array(cid, &windows, 1))
 }
 
 /// Determines if a window is valid based on its parent ID, attributes, and tags.

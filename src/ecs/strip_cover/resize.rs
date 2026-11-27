@@ -313,11 +313,10 @@ impl CoverMorph {
             Stage::Waiting { .. } => (0.0, 0.0),
             Stage::Landing { .. } => (1.0, 0.0),
             Stage::Moving if self.elapsed >= self.length() => (1.0, 0.0),
-            Stage::Moving => {
-                let dt = 1e-3;
-                let share = self.share_at(self.elapsed);
-                (share, (share - self.share_at(self.elapsed - dt)) / dt)
-            }
+            Stage::Moving => (
+                self.share_at(self.elapsed),
+                ease::Curve::Spring.share_rate(self.entry, self.elapsed, self.duration),
+            ),
         }
     }
 
@@ -1204,6 +1203,47 @@ pub(super) fn uncommitted_frames(
         .collect()
 }
 
+/// Checks whether a landed cover's real windows have settled at their committed
+/// frames (or hit `deadline`), returning the updated settled count when it must
+/// keep waiting, or `None` once the cover should lift (after logging any
+/// timeout mismatches).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_landing(
+    label: &str,
+    entity: Entity,
+    strip: &LayoutStrip,
+    area: IRect,
+    hid: &[Entity],
+    deadline: Duration,
+    settled: u8,
+    now: Duration,
+    sliver: i32,
+    windows: &CoverWindows,
+    frames: &Query<(&Window, &Position, &Bounds, Has<EdgeSlice>)>,
+    shown_frames: Option<&ShownFrames>,
+) -> Option<u8> {
+    let row = strip_windows(strip, windows);
+    let in_place = row.iter().all(|window| window.at_rest)
+        && shown_frames.is_none_or(|shown| shows_committed(&row, frames, area, hid, shown, sliver));
+    let settled = if in_place { settled + 1 } else { 0 };
+    if settled < LANDED_FRAMES && now < deadline {
+        return Some(settled);
+    }
+    let late = if settled >= LANDED_FRAMES {
+        ""
+    } else {
+        if let Some(shown) = shown_frames {
+            let mismatches = uncommitted_frames(&row, frames, area, hid, shown, sliver);
+            if !mismatches.is_empty() {
+                debug!("{label} {entity} landing mismatch: {mismatches:?}");
+            }
+        }
+        " at its time limit"
+    };
+    debug!("{label} {entity} lifted{late}");
+    None
+}
+
 /// Takes each resize's cover down at once when its pictures have landed
 /// and its windows rest at their new frames, or when it has waited
 /// [`LANDING_TIMEOUT`]. It never fades: a fade over the real windows shows
@@ -1228,32 +1268,26 @@ pub(super) fn lift_morphs(
         let Stage::Landing { deadline, settled } = morph.stage else {
             continue;
         };
-        let row = strip_windows(strip, &windows);
-        let in_place = row.iter().all(|window| window.at_rest)
-            && shown_frames.as_ref().is_none_or(|shown| {
-                shows_committed(&row, &frames, morph.area, &morph.hid, shown, sliver)
-            });
-        let settled = if in_place { settled + 1 } else { 0 };
-        if settled < LANDED_FRAMES && now < deadline {
+        if let Some(settled) = check_landing(
+            "cover over resized strip",
+            entity,
+            strip,
+            morph.area,
+            &morph.hid,
+            deadline,
+            settled,
+            now,
+            sliver,
+            &windows,
+            &frames,
+            shown_frames.as_deref(),
+        ) {
             morph.stage = Stage::Landing { deadline, settled };
-            continue;
-        }
-        let late = if settled >= LANDED_FRAMES {
-            ""
         } else {
-            if let Some(shown) = shown_frames.as_ref() {
-                let mismatches =
-                    uncommitted_frames(&row, &frames, morph.area, &morph.hid, shown, sliver);
-                if !mismatches.is_empty() {
-                    debug!("cover over resized strip {entity} landing mismatch: {mismatches:?}");
-                }
-            }
-            " at its time limit"
-        };
-        debug!("cover over resized strip {entity} lifted{late}");
-        screen.0.hide(morph.display);
-        end_guard(morph.guard, &mut commands);
-        commands.entity(entity).remove::<CoverMorph>();
+            screen.0.hide(morph.display);
+            end_guard(morph.guard, &mut commands);
+            commands.entity(entity).remove::<CoverMorph>();
+        }
     }
 }
 

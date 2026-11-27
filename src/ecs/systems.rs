@@ -106,7 +106,7 @@ type ChangedWindowFrames<'w, 's> = Populated<
     ),
 >;
 
-const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
+const ANIMATE_SNAP_THRESHOLD: f32 = 5.0;
 pub(super) const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
 // Real events (input, IPC, workspace changes, ...) wake the pump immediately
@@ -160,6 +160,7 @@ pub fn gather_displays(window_manager: Res<WindowManager>, mut commands: Command
         error!("Unable to get active display id!");
         return;
     };
+    let active_space = window_manager.active_display_space(active_display_id).ok();
     for (display, workspaces) in window_manager.present_displays() {
         let origin = Position(display.bounds().min);
         let entity = if display.id() == active_display_id {
@@ -171,12 +172,8 @@ pub fn gather_displays(window_manager: Res<WindowManager>, mut commands: Command
 
         commands.trigger(ReadDisplayProperties(entity));
 
-        let Ok(active_space) = window_manager.active_display_space(active_display_id) else {
-            return;
-        };
-
         for id in workspaces {
-            let active = id == active_space;
+            let active = active_space == Some(id);
             commands.spawn_layout_strip(LayoutStrip::new(id, 0), origin.0, entity, active);
             commands.spawn((FloatingLayer::new(id), ChildOf(entity)));
         }
@@ -199,14 +196,14 @@ pub(crate) fn add_existing_process(
     mut commands: Commands,
 ) {
     for (entity, process) in processes {
-        let Ok(app) = window_manager.new_application(&*process.0) else {
-            error!("creating aplication from process '{}'", process.name());
-            return;
-        };
-        commands.spawn((app, ExistingMarker, ChildOf(entity)));
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<ExistingMarker>();
         }
+        let Ok(app) = window_manager.new_application(&*process.0) else {
+            error!("creating application from process '{}'", process.name());
+            continue;
+        };
+        commands.spawn((app, ExistingMarker, ChildOf(entity)));
     }
 }
 
@@ -474,8 +471,8 @@ pub(super) fn add_launched_process(
         }
 
         let Ok(mut app) = window_manager.new_application(process) else {
-            error!("creating aplication from process '{}'", process.name());
-            return;
+            error!("creating application from process '{}'", process.name());
+            continue;
         };
 
         match app.observe() {
@@ -714,7 +711,7 @@ pub(crate) fn step_animation_clock(
 /// once within a few points of the target, so the move ends promptly.
 pub(crate) fn ease_step(current: Origin, target: Origin, t: f32) -> (Origin, bool) {
     let lerped = current.as_vec2().lerp(target.as_vec2(), t);
-    if (target.as_vec2() - lerped).length() <= ANIAMTE_SNAP_THRESHOLD {
+    if (target.as_vec2() - lerped).length() <= ANIMATE_SNAP_THRESHOLD {
         (target, true)
     } else {
         (lerped.round().as_ivec2(), false)
@@ -2710,15 +2707,13 @@ mod flash_tests {
 mod tests {
     use bevy::prelude::*;
 
-    use crate::events::Event;
-
     #[test]
     fn frame_commit_preserves_position_only_windows_without_an_active_display() {
         use crate::ecs::Position;
         use crate::manager::Origin;
         use bevy::ecs::system::RunSystemOnce;
         let mut harness = crate::tests::TestHarness::new().with_windows(1);
-        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.settle();
         let window = harness.mock_state.create_window(0);
         let mut world = World::new();
         world.spawn((window, Position(Origin::new(80, 90))));
@@ -2734,7 +2729,7 @@ mod tests {
         use crate::ecs::{Bounds, Position, WidthRatio};
         use bevy::ecs::system::RunSystemOnce;
         let mut harness = crate::tests::TestHarness::new().with_windows(1);
-        harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+        harness.settle();
         let entity = crate::tests::find_window_entity(0, harness.world());
         harness.world().entity_mut(entity).remove::<Position>();
         harness.world().get_mut::<Bounds>(entity).unwrap().0.x = 700;

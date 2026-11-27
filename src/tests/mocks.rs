@@ -127,7 +127,6 @@ pub(crate) struct MockWindowData {
     /// The edge padding the engine has the window fill. Unlike the padding,
     /// the mock applies it to its frames, as `WindowOS` does.
     pub(crate) fill: Option<Margins>,
-    pub(crate) child_role: bool,
     /// Bumped when the app replaces the window's AX element. A `Window`
     /// handle created before the bump is stale and its `role()` fails.
     pub(crate) ax_generation: u32,
@@ -221,7 +220,6 @@ impl Default for MockWindowData {
             vertical_padding: 0,
             padding_set: (None, None),
             fill: None,
-            child_role: false,
             ax_generation: 0,
             ax_unlisted: false,
             listed_as_dialog: false,
@@ -1824,15 +1822,6 @@ impl MockState {
         });
 
         let s = self.clone();
-        mw.expect_child_role().returning(move || {
-            Ok(s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .is_some_and(|w| w.child_role))
-        });
-
-        let s = self.clone();
         mw.expect_horizontal_padding().returning(move || {
             s.inner
                 .force_read()
@@ -2339,8 +2328,6 @@ impl MockState {
         let s = self.clone();
         wm.expect_left_button_down()
             .returning(move || s.inner.force_read().left_button_down);
-
-        wm.expect_get_associated_windows().return_const(vec![]);
 
         let s = self.clone();
         wm.expect_flush_window_writes().returning(move |timeout| {

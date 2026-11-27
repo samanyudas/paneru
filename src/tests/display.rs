@@ -858,7 +858,7 @@ fn focusing_another_display_without_switching_its_workspace_does_not_flash() {
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
             window.workspace_id = EXT_WORKSPACE_ID;
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
 
     // The focus event can arrive before the active-display notification.
     harness.mock_state.focus_window(100);
@@ -948,7 +948,7 @@ fn popup_waits_until_the_destination_display_is_active() {
         .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
             window.workspace_id = EXT_WORKSPACE_ID;
         });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
 
     let target = {
         let world = harness.world();
@@ -1041,12 +1041,6 @@ fn test_empty_baseline_row_survives_display_removal() {
             );
         })
         .run(commands);
-}
-
-fn window_command(operation: Operation) -> Event {
-    Event::Command {
-        command: Command::Window(operation),
-    }
 }
 
 fn window_entity(world: &mut World, id: WinID) -> Option<Entity> {
@@ -2906,7 +2900,7 @@ fn test_topology_read_appends_window_moved_to_inactive_space_into_its_strip() {
         )
         .with_windows(2)
         .with_workspace_window(100, inactive_space, |_| {});
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
 
     harness
         .mock_state

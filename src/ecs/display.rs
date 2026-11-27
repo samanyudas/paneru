@@ -180,7 +180,7 @@ impl DisplayMoves<'_, '_> {
             Placement::Into(column, _) => {
                 let target_strip = self.strips.get(strip?).ok()?.1;
                 match target_strip.get(column).ok()? {
-                    Column::Fullscren(_) => return None,
+                    Column::Fullscreen(_) => return None,
                     column => column.width(&frame_of),
                 }
             }
@@ -225,7 +225,12 @@ impl DisplayMoves<'_, '_> {
                 (Placement::Append, group) => target_strip.append_tab_group(group),
                 (Placement::Column(index), group) => target_strip.insert_tab_group_at(index, group),
                 (Placement::Into(column, slot), group) => {
-                    _ = target_strip.join_column(group, column, slot);
+                    if let Err(err) = target_strip.join_column(group, column, slot) {
+                        warn!(
+                            "join_column({column}, {slot}) failed after display move, appending instead: {err}"
+                        );
+                        target_strip.append_tab_group(group);
+                    }
                 }
             }
             if let Some(before) = maximized.take() {

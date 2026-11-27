@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 
-use crate::commands::{Command, Direction, MoveFocus, Operation};
+use crate::commands::{Direction, MoveFocus, Operation};
 use crate::ecs::layout::LayoutStrip;
 use crate::events::Event;
 use crate::platform::{WinID, WorkspaceId};
@@ -56,11 +56,7 @@ fn resident(display: u32) -> WinID {
     100 + WinID::try_from(display).expect("a small display id")
 }
 
-fn command(operation: Operation) -> Event {
-    Event::Command {
-        command: Command::Window(operation),
-    }
-}
+use super::window_command as command;
 
 /// Every order of the display ids `1..=count`.
 fn orders(count: u32) -> Vec<Vec<u32>> {

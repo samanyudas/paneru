@@ -2672,17 +2672,6 @@ fn has_manual_offset(world: &mut World) -> bool {
     world.get::<ManualStripOffset>(entity).is_some()
 }
 
-fn window_x(world: &mut World, id: WinID) -> i32 {
-    let mut query = world.query::<&Window>();
-    query
-        .iter(world)
-        .find(|window| window.id() == id)
-        .expect("window not found")
-        .frame()
-        .min
-        .x
-}
-
 /// A repeated OS focus event for the window that already holds focus — what a
 /// browser emits when a new tab opens — is not new layout information. It used
 /// to run a full reshuffle, which re-derived the strip offset and threw away a
@@ -2911,7 +2900,7 @@ fn test_focus_command_starts_animation_on_first_frame() {
     )
         .into();
     let mut harness = TestHarness::new().with_config(config).with_windows(3);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
 
     let initial_strip_x = {
         let world = harness.world();
@@ -3139,7 +3128,7 @@ fn exit_cleanup_restores_the_frame_a_window_had_before_management() {
     let mut harness = TestHarness::new()
         .with_window(0, move |window| window.frame = before[0])
         .with_window(1, move |window| window.frame = before[1]);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
 
     let world = harness.world();
     assert_ne!(
@@ -3186,7 +3175,7 @@ fn exit_cleanup_skips_a_frame_from_a_disconnected_display() {
     let mut harness = TestHarness::new().with_window(0, |window| {
         window.frame = IRect::new(3000, 100, 3000 + 300, 100 + 400);
     });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     let state = harness.mock_state.clone();
     state.os_move_window(0, Origin::new(-1000, TEST_MENUBAR_HEIGHT));
 
@@ -3212,7 +3201,7 @@ fn exit_cleanup_skips_a_frame_from_a_disconnected_display() {
 fn exit_cleanup_restores_the_macos_frame_under_padding() {
     let before = IRect::new(100, 120, 100 + 300, 120 + 400);
     let mut harness = TestHarness::new().with_window(0, move |window| window.frame = before);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     // The window rules apply their padding once the window is known.
     harness.mock_state.update_window(0, |window| {
         window.horizontal_padding = 4;
@@ -3235,7 +3224,7 @@ fn exit_cleanup_restores_the_macos_frame_under_padding() {
 fn exit_cleanup_sets_the_size_again_after_moving() {
     let before = IRect::new(100, 50, 100 + 300, 50 + 600);
     let mut harness = TestHarness::new().with_window(0, move |window| window.frame = before);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     let state = harness.mock_state.clone();
     state.update_window(0, |window| {
         window.resize_bottom_limit = Some(TEST_DISPLAY_HEIGHT);
@@ -3255,7 +3244,7 @@ fn exit_cleanup_sets_the_size_again_after_moving() {
 fn exit_cleanup_places_again_a_window_that_drops_sizes() {
     let before = IRect::new(100, 50, 100 + 300, 50 + 600);
     let mut harness = TestHarness::new().with_window(0, move |window| window.frame = before);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness
         .mock_state
         .update_window(0, |window| window.dropped_resizes = 3);
@@ -3288,7 +3277,7 @@ fn exit_mid_animation_keeps_the_restored_frames() {
         .with_config(config)
         .with_window(0, move |window| window.frame = before[0])
         .with_window(1, move |window| window.frame = before[1]);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(Duration::from_secs(3));
     harness
         .world()
@@ -3323,7 +3312,7 @@ fn exit_cleanup_does_not_retry_an_unreadable_window() {
     let mut harness = TestHarness::new().with_window(0, |window| {
         window.frame = IRect::new(100, 50, 400, 650);
     });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     let state = harness.mock_state.clone();
     state.update_window(0, |window| window.frame_read_failures = u8::MAX);
 
@@ -3343,7 +3332,7 @@ fn exit_cleanup_places_nothing_after_the_recheck_deadline() {
     let mut harness = TestHarness::new().with_window(0, |window| {
         window.frame = IRect::new(100, 50, 400, 650);
     });
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     let state = harness.mock_state.clone();
     let mut writes_before = 0;
     state.update_window(0, |window| {

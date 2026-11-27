@@ -69,17 +69,6 @@ fn send(harness: &mut TestHarness, event: Event) {
     harness.world().write_message::<Event>(event);
 }
 
-fn window_x(world: &mut World, id: WinID) -> i32 {
-    let mut query = world.query::<&Window>();
-    query
-        .iter(world)
-        .find(|window| window.id() == id)
-        .expect("window not found")
-        .frame()
-        .min
-        .x
-}
-
 fn is_scrolling(world: &mut World) -> bool {
     world.query::<&Scrolling>().iter(world).next().is_some()
 }

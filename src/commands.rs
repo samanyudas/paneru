@@ -172,17 +172,6 @@ pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
     })
 }
 
-/// Retrieves a window `Entity` in a specified direction relative to a `current_window_id` within a `LayoutStrip`.
-///
-/// # Arguments
-///
-/// * `direction` - The direction (e.g., `West`, `East`, `First`, `Last`, `North`, `South`).
-/// * `current_window_id` - The `Entity` of the current window.
-/// * `strip` - A reference to the `LayoutStrip` to search within.
-///
-/// # Returns
-///
-/// `Some(Entity)` with the found window's entity, otherwise `None`.
 #[instrument(level = Level::DEBUG, ret)]
 pub(crate) fn get_window_in_direction(
     direction: &Direction,
@@ -202,7 +191,7 @@ pub(crate) fn get_window_in_direction(
         Direction::Nth(index) => strip.get(*index).ok().and_then(|column| column.top()),
 
         Direction::North => match strip.get(index).ok()? {
-            Column::Single(_) | Column::Tabs(_) | Column::Fullscren(_) | Column::Maximized(_) => {
+            Column::Single(_) | Column::Tabs(_) | Column::Fullscreen(_) | Column::Maximized(_) => {
                 None
             }
             Column::Stack(stack) => stack
@@ -214,7 +203,7 @@ pub(crate) fn get_window_in_direction(
         },
 
         Direction::South => match strip.get(index).ok()? {
-            Column::Single(_) | Column::Tabs(_) | Column::Fullscren(_) | Column::Maximized(_) => {
+            Column::Single(_) | Column::Tabs(_) | Column::Fullscreen(_) | Column::Maximized(_) => {
                 None
             }
             Column::Stack(stack) => stack
@@ -394,18 +383,6 @@ fn nearest_float_in_direction(
     pick_nearest_in_direction(direction, focused_center, candidates)
 }
 
-/// Handles the "focus" command, moving focus to a window in a specified direction.
-///
-/// # Arguments
-///
-/// * `direction` - The `Direction` to move focus (e.g., `Direction::East`).
-/// * `current_window` - The `Entity` of the currently focused `Window`.
-/// * `strip` - A reference to the active `LayoutStrip`.
-/// * `windows` - A query for all `Window` components.
-///
-/// # Returns
-///
-/// `Some(Entity)` with the entity of the newly focused window, otherwise `None`.
 pub(crate) fn focus_with_verification(
     entity: Entity,
     focused_entity: Option<Entity>,
@@ -645,6 +622,24 @@ fn focus_from_fullscreen(
     }
 }
 
+fn preferred_floating_target(
+    workspace_id: WorkspaceId,
+    visible_floats: &[Entity],
+    focus_history: &FocusHistory,
+) -> Option<Entity> {
+    focus_history
+        .last_floating(workspace_id)
+        .filter(|entity| visible_floats.contains(entity))
+        .or_else(|| visible_floats.first().copied())
+}
+
+fn preferred_managed_target(strip: &LayoutStrip, focus_history: &FocusHistory) -> Option<Entity> {
+    focus_history
+        .last_managed(strip.id())
+        .filter(|entity| strip.contains(*entity))
+        .or_else(|| strip.all_columns().into_iter().next())
+}
+
 fn command_focus_unmanaged(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -664,14 +659,8 @@ fn command_focus_unmanaged(
     let workspace_id = active_display.active_strip().id();
     let visible_floats =
         visible_floating_entities(&windows, &window_manager, workspace_id, display_bounds);
-    let is_visible_float = |entity: Entity| -> bool { visible_floats.contains(&entity) };
 
-    let target = focus_history
-        .last_floating(workspace_id)
-        .filter(|entity| is_visible_float(*entity))
-        .or_else(|| visible_floats.into_iter().next());
-
-    if let Some(entity) = target {
+    if let Some(entity) = preferred_floating_target(workspace_id, &visible_floats, &focus_history) {
         commands.focus_entity_for_command(entity, true);
     }
 }
@@ -690,14 +679,8 @@ fn command_focus_managed(
     }
 
     let active_strip = active_display.active_strip();
-    let workspace_id = active_strip.id();
 
-    let target = focus_history
-        .last_managed(workspace_id)
-        .filter(|entity| active_strip.contains(*entity))
-        .or_else(|| active_strip.all_columns().into_iter().next());
-
-    if let Some(entity) = target {
+    if let Some(entity) = preferred_managed_target(active_strip, &focus_history) {
         commands.focus_entity_for_command(entity, true);
         commands.reshuffle_around(entity);
     }
@@ -722,15 +705,11 @@ fn command_raise_floating(
     let workspace_id = active_display.active_strip().id();
     let visible_floats =
         visible_floating_entities(&windows, &window_manager, workspace_id, display_bounds);
-    let is_visible_float = |entity: Entity| -> bool { visible_floats.contains(&entity) };
 
-    let target = focus_history
-        .last_floating(workspace_id)
-        .filter(|entity| is_visible_float(*entity))
-        .or_else(|| visible_floats.first().copied());
+    let target = preferred_floating_target(workspace_id, &visible_floats, &focus_history);
 
-    for (_, entity) in windows.iter() {
-        if is_visible_float(entity) && Some(entity) != target {
+    for &entity in &visible_floats {
+        if Some(entity) != target {
             commands.trigger(RaiseWindow {
                 entity,
                 with_strip: false,
@@ -743,10 +722,8 @@ fn command_raise_floating(
     }
 }
 
-/// Focus-and-raise are deliberately coupled here: macOS AX raise can't lift a
-/// window above another app's frontmost window, so the target's app must be
-/// made frontmost. Other windows in the new top tier are raised within their
-/// own apps' stacks as a best-effort.
+/// Toggles whether floating windows or tiled windows sit in front on the active
+/// workspace by raising the chosen tier without changing focus.
 fn command_toggle_floating_layer(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
@@ -785,35 +762,19 @@ fn command_toggle_floating_layer(
             false
         });
 
-    let visible_floats =
-        visible_floating_entities(&windows, &window_manager, workspace_id, display_bounds);
-    let visible_float = |entity: Entity| -> bool {
-        visible_floats.contains(&entity) && !active_strip.contains(entity)
-    };
-
-    let target = if floating_front {
-        focus_history
-            .last_floating(workspace_id)
-            .filter(|entity| visible_float(*entity))
-            .or_else(|| visible_floats.iter().copied().find(|e| visible_float(*e)))
-    } else {
-        focus_history
-            .last_managed(workspace_id)
-            .filter(|entity| active_strip.contains(*entity))
-            .or_else(|| active_strip.all_columns().into_iter().next())
-    };
-
     if floating_front {
-        windows
-            .iter()
-            .filter_map(|(_, e)| visible_float(e).then_some(e))
-            .for_each(|entity| {
-                commands.trigger(RaiseWindow {
-                    entity,
-                    with_strip: false,
-                });
+        let visible_floats =
+            visible_floating_entities(&windows, &window_manager, workspace_id, display_bounds);
+        for entity in visible_floats
+            .into_iter()
+            .filter(|entity| !active_strip.contains(*entity))
+        {
+            commands.trigger(RaiseWindow {
+                entity,
+                with_strip: false,
             });
-    } else if let Some(entity) = target {
+        }
+    } else if let Some(entity) = preferred_managed_target(active_strip, &focus_history) {
         commands.trigger(RaiseWindow {
             entity,
             with_strip: true,
@@ -1169,16 +1130,46 @@ type WidthWork<'w, 's> = Query<
     ),
 >;
 
+/// Presets are assumed sorted ascending; the `0.05` dead-band keeps float
+/// rounding from re-selecting the preset the window is already at.
+fn next_preset_ratio(
+    presets: &[f64],
+    current_ratio: f64,
+    direction: ResizeDirection,
+    cycle: bool,
+) -> f64 {
+    let fallback = *presets.first().unwrap_or(&0.5);
+    let last = *presets.last().unwrap_or(&fallback);
+    match direction {
+        ResizeDirection::Grow => presets
+            .iter()
+            .copied()
+            .find(|&r| r > current_ratio + 0.05)
+            .unwrap_or(if cycle { fallback } else { last }),
+        ResizeDirection::Shrink => presets
+            .iter()
+            .rev()
+            .copied()
+            .find(|&r| r < current_ratio - 0.05)
+            .unwrap_or(if cycle { last } else { fallback }),
+    }
+}
+
+fn clear_native_resize_start(commands: &mut Commands, entity: Entity) {
+    if let Ok(mut cmds) = commands.get_entity(entity) {
+        cmds.try_remove::<NativeResizeStart>();
+    }
+}
+
+fn resize_and_clear_native(commands: &mut Commands, entity: Entity, size: Size) {
+    if size.x > 0 && size.y > 0 {
+        clear_native_resize_start(commands, entity);
+    }
+    commands.resize_entity(entity, size);
+}
+
 /// Resizes the focused window to the next or previous preset column width, or
 /// by one `window_resize_step` of the display width.
-///
-/// # Arguments
-///
-/// * `active_display` - A mutable reference to the `Display` resource.
-/// * `focused_entity` - The `Entity` of the currently focused window.
-/// * `windows` - A mutable query for all `Window` components.
-/// * `commands` - Bevy commands to trigger events.
-/// * `config` - The `Config` resource.
 #[allow(clippy::too_many_lines)]
 fn resize_window(
     mut messages: MessageReader<Event>,
@@ -1268,33 +1259,14 @@ fn resize_window(
     };
     let current_ratio = f64::from(width) / f64::from(viewport.width());
     let widths = config.preset_column_widths();
-    let fallback = *widths.first().unwrap_or(&0.5);
-    let cycle = config.window_resize_cycle();
     let next_ratio = match operation {
         Operation::SetWidth(ratio) if ratio.is_finite() && *ratio > 0.0 => *ratio,
-        Operation::Resize(ResizeDirection::Grow) => widths
-            .iter()
-            .copied()
-            .find(|&r| r > current_ratio + 0.05)
-            .unwrap_or_else(|| {
-                if cycle {
-                    fallback
-                } else {
-                    *widths.last().unwrap_or(&fallback)
-                }
-            }),
-        Operation::Resize(ResizeDirection::Shrink) => widths
-            .iter()
-            .rev()
-            .copied()
-            .find(|&r| r < current_ratio - 0.05)
-            .unwrap_or_else(|| {
-                if cycle {
-                    *widths.last().unwrap_or(&fallback)
-                } else {
-                    fallback
-                }
-            }),
+        Operation::Resize(direction) => next_preset_ratio(
+            &widths,
+            current_ratio,
+            *direction,
+            config.window_resize_cycle(),
+        ),
         Operation::ResizeStep(direction) => {
             step_ratio(current_ratio, *direction, config.window_resize_step(), 1.0)
         }
@@ -1314,9 +1286,7 @@ fn resize_window(
             .and_then(|idx| strip.get(idx).ok())
     {
         for member in column.window_iter() {
-            if let Ok(mut cmds) = commands.get_entity(member) {
-                cmds.try_remove::<NativeResizeStart>();
-            }
+            clear_native_resize_start(&mut commands, member);
         }
     }
     let anchor = width_anchor(
@@ -1458,35 +1428,15 @@ fn resize_window_vertical(
     let viewport = active_display.actual_bounds(&config);
     let current_ratio = f64::from(heights[position]) / f64::from(viewport.height());
     let presets = config.preset_stack_heights();
-    let fallback = *presets.first().unwrap_or(&0.5);
-    let cycle = config.window_resize_cycle();
-    // The presets are assumed sorted ascending, and the `0.05` dead-band keeps
-    // float noise from re-selecting the preset the window is already at.
-    let next_ratio = match direction {
-        _ if stepped => step_ratio(current_ratio, direction, config.window_resize_step(), 1.0),
-        ResizeDirection::Grow => presets
-            .iter()
-            .copied()
-            .find(|&r| r > current_ratio + 0.05)
-            .unwrap_or_else(|| {
-                if cycle {
-                    fallback
-                } else {
-                    *presets.last().unwrap_or(&fallback)
-                }
-            }),
-        ResizeDirection::Shrink => presets
-            .iter()
-            .rev()
-            .copied()
-            .find(|&r| r < current_ratio - 0.05)
-            .unwrap_or_else(|| {
-                if cycle {
-                    *presets.last().unwrap_or(&fallback)
-                } else {
-                    fallback
-                }
-            }),
+    let next_ratio = if stepped {
+        step_ratio(current_ratio, direction, config.window_resize_step(), 1.0)
+    } else {
+        next_preset_ratio(
+            &presets,
+            current_ratio,
+            direction,
+            config.window_resize_cycle(),
+        )
     };
     let new_height = round_px(next_ratio * f64::from(viewport.height()))
         .clamp(floors[position], heights[position] + room);
@@ -1524,13 +1474,7 @@ fn resize_window_vertical(
                 .size(entity)
                 .map(|size| size.with_y(new_heights[index]))
             {
-                if size.x > 0
-                    && size.y > 0
-                    && let Ok(mut cmds) = commands.get_entity(entity)
-                {
-                    cmds.try_remove::<NativeResizeStart>();
-                }
-                commands.resize_entity(entity, size);
+                resize_and_clear_native(&mut commands, entity, size);
             }
         }
     }
@@ -1575,14 +1519,7 @@ fn stepped_heights(heights: &[i32], floors: &[i32], position: usize, height: i32
     stepped
 }
 
-/// Toggles the managed state of the focused window.
-/// If the window is currently unmanaged, it becomes managed. If managed, it becomes unmanaged (floating).
-///
-/// # Arguments
-///
-/// * `focused_entity` - The `Entity` of the currently focused window.
-/// * `windows` - A mutable query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
-/// * `commands` - Bevy commands to modify entities.
+/// Toggles the focused window between managed (tiled) and floating.
 #[allow(clippy::too_many_arguments)]
 fn manage_window(
     mut messages: MessageReader<Event>,
@@ -1611,8 +1548,8 @@ fn manage_window(
     // not managed yet. Toggling then would float a window the user is not
     // looking at, so only the window macOS has focused is toggled.
     let app = windows
-        .find_parent(window.id())
-        .and_then(|(_, _, parent)| apps.get(parent).ok());
+        .parent_of(entity)
+        .and_then(|parent| apps.get(parent).ok());
     let focused_by_macos = app.is_some_and(|app| {
         app.is_frontmost() && app.focused_window_id().is_ok_and(|id| id == window.id())
     });
@@ -1704,8 +1641,7 @@ fn copy_window_rule(
 
     let Some((window, app)) = windows
         .focused()
-        .and_then(|(window, _)| windows.find_parent(window.id()))
-        .and_then(|(window, _, app_entity)| Some((window, apps.get(app_entity).ok()?)))
+        .and_then(|(window, entity)| Some((window, apps.get(windows.parent_of(entity)?).ok()?)))
     else {
         debug!("no focused window to copy a rule for");
         return;
@@ -2169,10 +2105,24 @@ fn mouse_to_next_display(
     let Some(cursor_position) = window_manager.cursor_position().map(origin_from) else {
         return;
     };
-    let Some(other) = displays
-        .into_iter()
-        .find(|display| !display.bounds().contains(cursor_position))
-    else {
+    let other = displays
+        .iter()
+        .find(|display| display.physical_bounds().contains(cursor_position))
+        .and_then(|current| {
+            next_in_screen_order(
+                (current.physical_bounds(), current.id()),
+                displays
+                    .iter()
+                    .filter(|display| display.id() != current.id())
+                    .map(|display| (display, display.physical_bounds(), display.id())),
+            )
+        })
+        .or_else(|| {
+            displays
+                .iter()
+                .find(|display| !display.physical_bounds().contains(cursor_position))
+        });
+    let Some(other) = other else {
         debug!("no other display to move mouse to.");
         return;
     };
@@ -2190,26 +2140,21 @@ fn mouse_to_next_display(
         return;
     };
 
-    let visible_width = |frame: IRect| other.bounds().intersect(frame).width();
-    let Some((frame, entity)) = other_strip
+    let Some((visible_frame, entity)) = other_strip
         .all_windows()
-        .iter()
-        .filter_map(|entity| windows.frame(*entity).zip(Some(*entity)))
-        .max_by(|left, right| {
-            if visible_width(left.0) < visible_width(right.0) {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            }
+        .into_iter()
+        .filter_map(|entity| {
+            let visible = other.bounds().intersect(windows.frame(entity)?);
+            (!visible.is_empty()).then_some((visible, entity))
         })
+        .max_by_key(|(visible, _)| visible.width())
     else {
         debug!("no suitable windows on the other display to move the mouse.");
         window_manager.warp_mouse(other.bounds().center());
         return;
     };
 
-    let visible_frame = other.bounds().intersect(frame);
-    debug!("warping mouse to {visible_frame:?}",);
+    debug!("warping mouse to {visible_frame:?}");
     window_manager.warp_mouse(visible_frame.center());
 
     commands.focus_entity(entity, true);
@@ -2262,13 +2207,7 @@ fn equalize_column(
         for (item, height) in stack.iter().zip(heights) {
             for entity in item.window_iter() {
                 if let Some(size) = windows.size(entity).map(|size| size.with_y(height)) {
-                    if size.x > 0
-                        && size.y > 0
-                        && let Ok(mut cmds) = commands.get_entity(entity)
-                    {
-                        cmds.try_remove::<NativeResizeStart>();
-                    }
-                    commands.resize_entity(entity, size);
+                    resize_and_clear_native(&mut commands, entity, size);
                 }
             }
         }
@@ -2308,19 +2247,13 @@ fn balance_strip(
     };
 
     for column in strip.columns() {
-        if matches!(column, Column::Fullscren(_) | Column::Maximized(_)) {
+        if matches!(column, Column::Fullscreen(_) | Column::Maximized(_)) {
             continue;
         }
 
         for entity in column.window_iter() {
             if let Some(size) = windows.size(entity).map(|size| size.with_x(focused_width)) {
-                if size.x > 0
-                    && size.y > 0
-                    && let Ok(mut cmds) = commands.get_entity(entity)
-                {
-                    cmds.try_remove::<NativeResizeStart>();
-                }
-                commands.resize_entity(entity, size);
+                resize_and_clear_native(&mut commands, entity, size);
             }
         }
     }
@@ -2527,17 +2460,6 @@ pub fn toggle_tabbed_display_handler(
     }
 }
 
-/// Dispatches a command based on the `CommandTrigger` event.
-/// This function is a Bevy system that reacts to `CommandTrigger` events and executes the corresponding window manager command.
-///
-/// # Arguments
-///
-/// * `trigger` - The `On<CommandTrigger>` event trigger containing the command to process.
-/// * `windows` - A query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
-/// * `active_display` - A mutable reference to the `ActiveDisplayMut` resource.
-/// * `window_manager` - The `WindowManager` resource for interacting with the window management logic.
-/// * `commands` - Bevy commands to trigger events and modify entities.
-/// * `config` - The `Config` resource, containing application settings.
 #[instrument(level = Level::DEBUG, skip_all)]
 pub fn command_quit_handler(
     mut messages: MessageReader<Event>,

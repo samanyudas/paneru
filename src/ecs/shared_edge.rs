@@ -1,34 +1,26 @@
 use std::time::Duration;
 
-use bevy::app::{App, PostUpdate};
+use bevy::ecs::change_detection::{DetectChanges as _, Ref};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Added, Changed, Has, With};
-use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{In, IntoSystem as _, Local, Query, Res};
+use bevy::ecs::system::{Populated, Query, Res};
 use bevy::math::{IRect, IVec2};
-use tracing::debug;
+use bevy::time::Time;
 
+use crate::config::Config;
+use crate::ecs::ease::{self, Ease, SlideEase};
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
-use crate::ecs::{PostUpdateSet, SelectedVirtualMarker};
+use crate::ecs::systems::AnimationStep;
+use crate::ecs::{PresentedOrigin, SelectedVirtualMarker};
 use crate::events::Event;
 use crate::manager::{Display, Margins, Window, WindowManager};
 use crate::platform::WinID;
 use crate::types::commands::Side;
-
-pub(crate) fn register(app: &mut App) {
-    app.add_systems(
-        PostUpdate,
-        showing_edge_slices
-            .pipe(log_showing_edge_slices)
-            .in_set(PostUpdateSet::Ui)
-            .run_if(showing_may_change),
-    );
-}
 
 /// Where a window tucked off a display edge shared with another display would
 /// show its sliver, had macOS let it stay there. Layout writes it in the step
@@ -397,31 +389,45 @@ pub(crate) fn showing_may_change(
         || !selected.is_empty()
 }
 
-pub(crate) fn log_showing_edge_slices(
-    In(showing): In<Vec<(WinID, EdgeSlice)>>,
-    mut logged: Local<Vec<(WinID, EdgeSlice)>>,
-) {
-    if *logged == showing {
-        return;
+/// Where a slide shows now, and where it heads. `None` while it lands, at
+/// rest under its photo.
+pub(crate) fn slide_heading(slide: &Slide, presented: IVec2) -> Option<(IVec2, IVec2)> {
+    match *slide {
+        Slide::Moving { at, .. } => Some((at, presented)),
+        Slide::Leaving { at, to, .. } | Slide::Tucking { at, to, .. } => Some((at, to)),
+        Slide::Landing { .. } => None,
     }
-    let described = showing
-        .iter()
-        .map(|(id, slice)| {
-            let (on, crop) = (slice.on_screen, slice.in_window);
-            format!(
-                "{id} {:?} on_screen=({},{})-({},{}) in_window=({},{})-({},{})",
-                slice.side,
-                on.min.x,
-                on.min.y,
-                on.max.x,
-                on.max.y,
-                crop.min.x,
-                crop.min.y,
-                crop.max.x,
-                crop.max.y
-            )
-        })
-        .collect::<Vec<_>>();
-    debug!("showing edge slices: [{}]", described.join(", "));
-    *logged = showing;
+}
+
+/// Steps the ease of each slide, before pacing reads how far each photo
+/// steps this frame and the photos step by it. A photo that waits for its
+/// window to tuck under it holds its place on the curve, as it does not
+/// move. A slide that lands forgets its motion, so the next one starts from
+/// rest.
+pub(crate) fn step_slides(
+    slides: Populated<(&Window, Ref<Slide>, &PresentedOrigin, &mut SlideEase)>,
+    step: Res<AnimationStep>,
+    time: Res<Time>,
+    config: Res<Config>,
+) {
+    let duration = ease::duration(&config);
+    for (window, slide, presented, mut ease) in slides {
+        let waits = matches!(*slide, Slide::Tucking { until, .. }
+            if window.write_pending() && time.elapsed() < until);
+        match slide_heading(&slide, presented.0) {
+            Some((at, to)) => {
+                if slide.is_added() {
+                    ease.0.restart();
+                }
+                if waits {
+                    ease.0.hold();
+                } else {
+                    let now = time.elapsed_secs_f64();
+                    ease.0
+                        .step(at, to, slide.is_added(), (now, step.secs()), duration);
+                }
+            }
+            None => ease.0 = Ease::default(),
+        }
+    }
 }

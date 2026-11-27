@@ -300,6 +300,12 @@ impl TestHarness {
         }
     }
 
+    /// Advances one command window without injecting a synthetic event,
+    /// letting initial layout or prior commands settle.
+    pub(crate) fn settle(&mut self) {
+        self.advance(COMMAND_WINDOW);
+    }
+
     pub(crate) fn run(&mut self, commands: Vec<Event>) {
         if let Some(step) = self
             .verifiers
@@ -373,6 +379,25 @@ fn setup_world() -> App {
     crate::ecs::run_frame_schedules_inline(&mut bevy_app);
 
     bevy_app
+}
+
+pub(crate) fn window_command(operation: crate::commands::Operation) -> Event {
+    Event::Command {
+        command: crate::commands::Command::Window(operation),
+    }
+}
+
+pub(crate) fn window_frame(world: &mut World, id: WinID) -> IRect {
+    world
+        .query::<&Window>()
+        .iter(world)
+        .find(|window| window.id() == id)
+        .unwrap_or_else(|| panic!("window {id} not found"))
+        .frame()
+}
+
+pub(crate) fn window_x(world: &mut World, id: WinID) -> i32 {
+    window_frame(world, id).min.x
 }
 
 pub(crate) fn find_window_entity(window_id: WinID, world: &mut World) -> Entity {

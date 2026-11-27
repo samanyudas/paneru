@@ -4,29 +4,14 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 
-use crate::commands::{Command, Direction, Operation, Side};
+use crate::commands::{Direction, Operation, Side};
 use crate::events::Event;
 use crate::manager::{Size, Window};
 use crate::platform::WinID;
 
-use super::*;
+use super::{window_command as command, window_frame as frame, *};
 
 const SETTLE: Duration = Duration::from_secs(2);
-
-fn command(operation: Operation) -> Event {
-    Event::Command {
-        command: Command::Window(operation),
-    }
-}
-
-fn frame(world: &mut World, id: WinID) -> IRect {
-    world
-        .query::<&Window>()
-        .iter(world)
-        .find(|window| window.id() == id)
-        .expect("window exists")
-        .frame()
-}
 
 /// Stacks windows 1 and 2 under window 0, so one column holds all three.
 fn stack_three(harness: &mut TestHarness) {

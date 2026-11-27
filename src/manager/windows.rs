@@ -1,5 +1,5 @@
 use accessibility_sys::{
-    AXError, AXUIElementCopyElementAtPosition, AXUIElementCreateApplication,
+    AXError, AXUIElementCopyElementAtPosition, AXUIElementCreateApplication, AXUIElementGetPid,
     AXUIElementIsAttributeSettable, AXUIElementRef, AXValueCreate, AXValueGetValue,
     kAXChildrenAttribute, kAXCloseButtonAttribute, kAXErrorAttributeUnsupported,
     kAXErrorCannotComplete, kAXErrorNoValue, kAXErrorNotImplemented, kAXErrorSuccess,
@@ -495,7 +495,6 @@ pub trait WindowApi: Send + Sync {
     /// Called when the app reports the title changed.
     fn invalidate_title(&self);
     fn identifier(&self) -> Result<String>;
-    fn child_role(&self) -> Result<bool>;
     /// Cached after the first successful read. Not a liveness check: use
     /// [`Window::is_alive`] for that.
     fn role(&self) -> Result<String>;
@@ -793,6 +792,23 @@ fn window_has_toolbar(element: &CFRetained<AXUIWrapper>) -> bool {
         .any(|child| AxTopBarTree.role(child).ok().flatten().as_deref() == Some(kAXToolbarRole))
 }
 
+fn ax_rect(position: &AXUIWrapper, size: &AXUIWrapper) -> IRect {
+    let mut frame = CGRect::default();
+    unsafe {
+        AXValueGetValue(
+            position.as_ptr(),
+            kAXValueTypeCGPoint,
+            NonNull::from(&mut frame.origin).as_ptr().cast(),
+        );
+        AXValueGetValue(
+            size.as_ptr(),
+            kAXValueTypeCGSize,
+            NonNull::from(&mut frame.size).as_ptr().cast(),
+        );
+    }
+    irect_from(frame)
+}
+
 /// Reads an element's frame through Accessibility.
 pub(super) fn ax_frame(element: &CFRetained<AXUIWrapper>) -> Result<IRect> {
     let read = |attribute: &'static str| unsafe {
@@ -807,21 +823,7 @@ pub(super) fn ax_frame(element: &CFRetained<AXUIWrapper>) -> Result<IRect> {
     };
     let position = read(kAXPositionAttribute)?;
     let size = read(kAXSizeAttribute)?;
-
-    let mut frame = CGRect::default();
-    unsafe {
-        AXValueGetValue(
-            position.as_ptr(),
-            kAXValueTypeCGPoint,
-            NonNull::from(&mut frame.origin).as_ptr().cast(),
-        );
-        AXValueGetValue(
-            size.as_ptr(),
-            kAXValueTypeCGSize,
-            NonNull::from(&mut frame.size).as_ptr().cast(),
-        );
-    }
-    Ok(irect_from(frame))
+    Ok(ax_rect(&position, &size))
 }
 
 /// How many levels below the window the top bar search looks. Chromium
@@ -931,23 +933,7 @@ impl TopBarTree for AxTopBarTree {
     fn frame(&self, node: &Self::Node) -> Result<Option<IRect>> {
         let position = Self::read::<AXUIWrapper>(node, kAXPositionAttribute)?;
         let size = Self::read::<AXUIWrapper>(node, kAXSizeAttribute)?;
-        let Some((position, size)) = position.zip(size) else {
-            return Ok(None);
-        };
-        let mut frame = CGRect::default();
-        unsafe {
-            AXValueGetValue(
-                position.as_ptr(),
-                kAXValueTypeCGPoint,
-                NonNull::from(&mut frame.origin).as_ptr().cast(),
-            );
-            AXValueGetValue(
-                size.as_ptr(),
-                kAXValueTypeCGSize,
-                NonNull::from(&mut frame.size).as_ptr().cast(),
-            );
-        }
-        Ok(Some(irect_from(frame)))
+        Ok(position.zip(size).map(|(pos, sz)| ax_rect(&pos, &sz)))
     }
 
     fn close_button(&self, node: &Self::Node) -> Result<Option<Self::Node>> {
@@ -1361,14 +1347,6 @@ impl WindowApi for WindowOS {
         self.ax_element.identifier()
     }
 
-    /// Returns true if the window has a child role.
-    fn child_role(&self) -> Result<bool> {
-        let role = self.role()?;
-        Ok(["AXSheet", "AXDrawer"]
-            .iter()
-            .any(|axrole| axrole.eq(&role)))
-    }
-
     /// Retrieves the role of the window (e.g., "`AXWindow`").
     ///
     /// # Returns
@@ -1582,15 +1560,12 @@ impl WindowApi for WindowOS {
     fn pid(&self) -> Result<Pid> {
         self.pid
             .get_or_init(|| {
-                let pid: Pid = unsafe {
-                    NonNull::new_unchecked(self.ax_element.as_ptr::<Pid>())
-                        .byte_add(0x10)
-                        .read()
-                };
-                (pid != 0).then_some(pid).ok_or(Error::InvalidInput(format!(
-                    "can not get pid from {:?}.",
-                    self.ax_element
-                )))
+                let mut pid: Pid = 0;
+                unsafe { AXUIElementGetPid(self.ax_element.as_ptr(), &raw mut pid) }
+                    .to_result(function_name!())?;
+                (pid != 0).then_some(pid).ok_or_else(|| {
+                    Error::InvalidInput(format!("can not get pid from {:?}.", self.ax_element))
+                })
             })
             .clone()
     }

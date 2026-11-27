@@ -20,17 +20,11 @@
 //! For a spring that is exact: the curve from rest, entered later, is the
 //! same spring started with that speed.
 
-use bevy::ecs::change_detection::{DetectChanges as _, Ref};
 use bevy::ecs::component::Component;
-use bevy::ecs::system::{Populated, Res};
 use bevy::math::{DVec2, IVec2};
-use bevy::time::Time;
 
 use crate::config::Config;
-use crate::ecs::PresentedOrigin;
-use crate::ecs::shared_edge::Slide;
-use crate::ecs::systems::{AnimationStep, LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS};
-use crate::manager::Window;
+use crate::ecs::systems::LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS;
 
 /// The spring's response at Miri's `animation_speed` of 14, in seconds: the
 /// period it would swing at without damping. A shorter response is a stiffer,
@@ -209,6 +203,32 @@ impl Curve {
             Self::Spring => curve(s),
             Self::EaseOut => 1.0 - (1.0 - s.clamp(0.0, 1.0)).powi(4),
         }
+    }
+
+    /// The curve's slope `d(at)/ds` at `s`.
+    pub(crate) fn slope(self, s: f64) -> f64 {
+        let s = s.clamp(0.0, 1.0);
+        match self {
+            Self::Spring => curve_slope(s),
+            Self::EaseOut => 4.0 * (1.0 - s).powi(3),
+        }
+    }
+
+    /// Time derivative `d(share)/dt` (per second) of [`Self::share`] at `at`
+    /// seconds into a motion of `duration` seconds entered at `entry`.
+    pub(crate) fn share_rate(self, entry: f64, at: f64, duration: f64) -> f64 {
+        if duration <= 0.0 {
+            return 0.0;
+        }
+        let u = entry + (at / duration).max(0.0);
+        if u >= 1.0 {
+            return 0.0;
+        }
+        let remaining = 1.0 - self.at(entry);
+        if remaining <= 1e-12 {
+            return 0.0;
+        }
+        self.slope(u) / (remaining * duration)
     }
 
     /// Where to enter the curve so that it starts at `speed`, a multiple of
@@ -410,49 +430,6 @@ pub(crate) struct SizeEase(pub(crate) Ease);
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub(crate) struct SlideEase(pub(crate) Ease);
 
-/// Where a slide shows now, and where it heads. `None` while it lands, at
-/// rest under its photo.
-pub(crate) fn slide_heading(slide: &Slide, presented: IVec2) -> Option<(IVec2, IVec2)> {
-    match *slide {
-        Slide::Moving { at, .. } => Some((at, presented)),
-        Slide::Leaving { at, to, .. } | Slide::Tucking { at, to, .. } => Some((at, to)),
-        Slide::Landing { .. } => None,
-    }
-}
-
-/// Steps the ease of each slide, before pacing reads how far each photo
-/// steps this frame and the photos step by it. A photo that waits for its
-/// window to tuck under it holds its place on the curve, as it does not
-/// move. A slide that lands forgets its motion, so the next one starts from
-/// rest.
-pub(crate) fn step_slides(
-    slides: Populated<(&Window, Ref<Slide>, &PresentedOrigin, &mut SlideEase)>,
-    step: Res<AnimationStep>,
-    time: Res<Time>,
-    config: Res<Config>,
-) {
-    let duration = duration(&config);
-    for (window, slide, presented, mut ease) in slides {
-        let waits = matches!(*slide, Slide::Tucking { until, .. }
-            if window.write_pending() && time.elapsed() < until);
-        match slide_heading(&slide, presented.0) {
-            Some((at, to)) => {
-                if slide.is_added() {
-                    ease.0.restart();
-                }
-                if waits {
-                    ease.0.hold();
-                } else {
-                    let now = time.elapsed_secs_f64();
-                    ease.0
-                        .step(at, to, slide.is_added(), (now, step.secs()), duration);
-                }
-            }
-            None => ease.0 = Ease::default(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,7 +602,7 @@ mod tests {
     #[test]
     fn the_default_speed_lands_in_one_step() {
         let config = Config::default();
-        assert!(config.options().animation_speed.is_none());
+        assert!(!config.has_animation_speed());
         let duration = duration(&config);
         assert!(!animates(duration));
         for dt in [0.0, 0.004, 0.016] {
@@ -635,6 +612,37 @@ mod tests {
                 (t - 1.0).abs() < f32::EPSILON,
                 "a step of {dt} s covers {t}"
             );
+        }
+    }
+
+    #[test]
+    fn analytic_slope_and_share_rate_match_finite_differences() {
+        let eps = 1e-6;
+        for curve in [Curve::Spring, Curve::EaseOut] {
+            for s in [0.05, 0.25, 0.5, 0.85] {
+                let numeric = (curve.at(s + eps) - curve.at(s - eps)) / (2.0 * eps);
+                let analytic = curve.slope(s);
+                assert!(
+                    (analytic - numeric).abs() < 1e-5,
+                    "{curve:?} slope at {s}: analytic {analytic} vs numeric {numeric}"
+                );
+            }
+            for entry in [0.0, 0.3] {
+                let duration = 0.25;
+                for at in [0.02, 0.08, 0.14] {
+                    let numeric = (curve.share(entry, entry + (at + eps) / duration)
+                        - curve.share(entry, entry + (at - eps) / duration))
+                        / (2.0 * eps);
+                    let analytic = curve.share_rate(entry, at, duration);
+                    assert!(
+                        (analytic - numeric).abs() < 1e-4,
+                        "{curve:?} share_rate(entry={entry}, at={at}): analytic {analytic} vs numeric {numeric}"
+                    );
+                }
+                assert!(curve.share_rate(entry, 0.0, duration) >= 0.0);
+                assert_eq!(curve.share_rate(entry, duration * 2.0, duration), 0.0);
+                assert_eq!(curve.share_rate(entry, 0.05, 0.0), 0.0);
+            }
         }
     }
 

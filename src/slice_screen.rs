@@ -6,21 +6,17 @@ use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 
-use bevy::math::{IRect, IVec2};
+use bevy::math::IVec2;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly as _};
-use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSPanel, NSScreen, NSView,
-    NSViewLayerContentsRedrawPolicy, NSWindowCollectionBehavior, NSWindowOcclusionState,
-    NSWindowStyleMask,
-};
+use objc2::{AnyThread as _, MainThreadMarker};
+use objc2_app_kit::{NSColor, NSPanel, NSWindowOcclusionState};
 use objc2_core_foundation::{CFData, CFRetained, CFType, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo, CGPreflightScreenCaptureAccess,
 };
-use objc2_foundation::{NSError, NSPoint, NSRect, NSSize};
+use objc2_foundation::NSError;
 use objc2_quartz_core::CATransaction;
 use objc2_screen_capture_kit::{
     SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
@@ -31,9 +27,98 @@ use tracing::debug;
 use crate::ecs::shared_edge::EdgeSlice;
 use crate::ecs::slice_photos::{Digest, Lookup, Photo, PhotoError, SliceScreen, Ticket};
 use crate::events::{Event, EventSender};
-use crate::overlay::{cg_abs_to_cocoa, primary_screen_height};
 use crate::platform::WinID;
+use crate::platform::cocoa_ui::{OverlayLevel, cocoa_frame, make_layer_panel, scale_at};
 use crate::platform::slice_tap::{SlicePanel, set_slice_panels};
+
+/// Options controlling post-processing on a `ScreenCaptureKit` capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CaptureOptions {
+    /// Compute pixel digest (used by edge slices to detect unchanged frames).
+    pub digest: bool,
+    /// Sample opaque right-edge surface color (used by strip cover resize fill).
+    pub sample_edge_color: bool,
+}
+
+/// Caches per-window `SCContentFilter` instances so repeated captures skip
+/// `SCShareableContent` enumeration.
+#[derive(Default)]
+pub(crate) struct WindowFilterCache {
+    filters: HashMap<WinID, Arc<OnceLock<Filter>>>,
+}
+
+impl WindowFilterCache {
+    pub(crate) fn retain(&mut self, keep: impl FnMut(&WinID) -> bool) {
+        let mut keep = keep;
+        self.filters.retain(|id, _| keep(id));
+    }
+
+    pub(crate) fn forget(&mut self, window: Option<WinID>) {
+        match window {
+            Some(window) => {
+                self.filters.remove(&window);
+            }
+            None => self.filters.clear(),
+        }
+    }
+
+    /// Captures `window` at `size` points and `scale`, reusing a cached filter
+    /// when `reuse_filter` is true and one is ready. `canceled` is checked
+    /// after the asynchronous shareable-content lookup returns.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_window(
+        &mut self,
+        window: WinID,
+        size: IVec2,
+        scale: f64,
+        reuse_filter: bool,
+        options: CaptureOptions,
+        canceled: impl Fn() -> bool + 'static,
+        done: impl Fn(Result<Photo, PhotoError>) + Clone + 'static,
+    ) {
+        if reuse_filter
+            && let Some(filter) = self.filters.get(&window).and_then(|found| found.get())
+        {
+            capture(&filter.0, size, scale, options, done);
+            return;
+        }
+        let filter = Arc::new(OnceLock::new());
+        self.filters.insert(window, filter.clone());
+        let found = RcBlock::new(
+            move |content: *mut SCShareableContent, error: *mut NSError| {
+                // SAFETY: ScreenCaptureKit passes a valid content object or null.
+                let Some(content) = (unsafe { content.as_ref() }) else {
+                    done(Err(photo_error(error)));
+                    return;
+                };
+                let target = unsafe { content.windows() }
+                    .iter()
+                    .find(|candidate| unsafe { candidate.windowID() } == window.cast_unsigned());
+                let Some(target) = target else {
+                    done(Err(PhotoError::WindowGone));
+                    return;
+                };
+                if canceled() {
+                    return;
+                }
+                let filter = filter.get_or_init(|| {
+                    Filter(unsafe {
+                        SCContentFilter::initWithDesktopIndependentWindow(
+                            SCContentFilter::alloc(),
+                            &target,
+                        )
+                    })
+                });
+                capture(&filter.0, size, scale, options, done.clone());
+            },
+        );
+        unsafe {
+            SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+                true, false, &found,
+            );
+        }
+    }
+}
 
 pub struct SliceScreenOS {
     mtm: MainThreadMarker,
@@ -43,13 +128,11 @@ pub struct SliceScreenOS {
     stack: Vec<WinID>,
     /// The painted panels in the order they were last brought to the front.
     fronted: Vec<WinID>,
-    /// The filter of each placed or remembered window's last lookup, once it
-    /// arrives.
-    filters: HashMap<WinID, Arc<OnceLock<Filter>>>,
+    filters: WindowFilterCache,
 }
 
 /// A filter that `ScreenCaptureKit`'s queue makes and the main thread reuses.
-pub(crate) struct Filter(pub(crate) Retained<SCContentFilter>);
+struct Filter(Retained<SCContentFilter>);
 
 // SAFETY: no one changes a filter after making it, and Apple's own samples
 // share one filter across queues.
@@ -92,18 +175,8 @@ impl SliceScreenOS {
             panels: HashMap::new(),
             stack: Vec::new(),
             fronted: Vec::new(),
-            filters: HashMap::new(),
+            filters: WindowFilterCache::default(),
         }
-    }
-
-    fn cocoa_frame(&self, on_screen: IRect) -> NSRect {
-        cg_abs_to_cocoa(
-            NSRect::new(
-                NSPoint::new(f64::from(on_screen.min.x), f64::from(on_screen.min.y)),
-                NSSize::new(f64::from(on_screen.width()), f64::from(on_screen.height())),
-            ),
-            primary_screen_height(self.mtm),
-        )
     }
 
     /// Brings the painted panels to the front in stack order, so each shows
@@ -149,57 +222,6 @@ impl SliceScreenOS {
                 .collect(),
         );
     }
-
-    /// The backing scale of the screen that shows `on_screen`.
-    fn scale_at(&self, on_screen: IRect) -> f64 {
-        let frame = self.cocoa_frame(on_screen);
-        let (x, y) = (
-            frame.origin.x + frame.size.width / 2.0,
-            frame.origin.y + frame.size.height / 2.0,
-        );
-        NSScreen::screens(self.mtm)
-            .iter()
-            .find(|screen| {
-                let bounds = screen.frame();
-                (bounds.origin.x..bounds.origin.x + bounds.size.width).contains(&x)
-                    && (bounds.origin.y..bounds.origin.y + bounds.size.height).contains(&y)
-            })
-            .map_or(1.0, |screen| screen.backingScaleFactor())
-    }
-
-    /// A borderless panel above normal windows and below the dim overlay. It
-    /// takes clicks without activating the engine, so they reach no app.
-    fn make_panel(&self, frame: NSRect) -> Retained<NSPanel> {
-        let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
-            NSPanel::alloc(self.mtm),
-            frame,
-            NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
-            NSBackingStoreType::Buffered,
-            false,
-        );
-        panel.setOpaque(false);
-        panel.setBackgroundColor(Some(&NSColor::clearColor()));
-        panel.setHasShadow(false);
-        panel.setHidesOnDeactivate(false);
-        panel.setIgnoresMouseEvents(false);
-        // Above tiled windows, and one below the picture cover, which a
-        // resize puts up while its windows cross the edge underneath.
-        panel.setLevel(NSFloatingWindowLevel - 2);
-        panel.setCollectionBehavior(
-            NSWindowCollectionBehavior::Transient
-                | NSWindowCollectionBehavior::IgnoresCycle
-                | NSWindowCollectionBehavior::CanJoinAllSpaces
-                | NSWindowCollectionBehavior::FullScreenNone,
-        );
-        let view = NSView::initWithFrame(
-            NSView::alloc(self.mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), frame.size),
-        );
-        view.setWantsLayer(true);
-        view.setLayerContentsRedrawPolicy(NSViewLayerContentsRedrawPolicy::Never);
-        panel.setContentView(Some(&view));
-        panel
-    }
 }
 
 impl SliceScreen for SliceScreenOS {
@@ -208,7 +230,7 @@ impl SliceScreen for SliceScreenOS {
     }
 
     fn place(&mut self, slices: &[(WinID, EdgeSlice)], remembered: &[WinID]) {
-        self.filters.retain(|id, _| {
+        self.filters.retain(|id| {
             remembered.contains(id) || slices.iter().any(|(showing, _)| showing == id)
         });
         self.panels.retain(|id, panel| {
@@ -221,7 +243,7 @@ impl SliceScreen for SliceScreenOS {
         });
         self.fronted.retain(|id| self.panels.contains_key(id));
         for (id, slice) in slices {
-            let frame = self.cocoa_frame(slice.on_screen);
+            let frame = cocoa_frame(self.mtm, slice.on_screen);
             let panel = match self.panels.get_mut(id) {
                 Some(panel) if panel.slice.on_screen == slice.on_screen => {
                     panel.slice = *slice;
@@ -234,7 +256,14 @@ impl SliceScreen for SliceScreenOS {
                     panel
                 }
                 None => {
-                    let window = self.make_panel(frame);
+                    let window = make_layer_panel(
+                        self.mtm,
+                        frame,
+                        OverlayLevel::EdgeSlice,
+                        false,
+                        &NSColor::clearColor(),
+                        false,
+                    );
                     self.panels.entry(*id).or_insert(Panel {
                         window,
                         slice: *slice,
@@ -270,56 +299,25 @@ impl SliceScreen for SliceScreenOS {
             window,
             generation,
         };
-        let size = slice.size;
-        let scale = self.scale_at(slice.on_screen);
-        if lookup == Lookup::Reuse
-            && let Some(filter) = self.filters.get(&window).and_then(|found| found.get())
-        {
-            capture(&filter.0, size, scale, true, move |result| {
-                reply.send(result);
-            });
-            return;
-        }
-        debug!("edge slice window looked up: window {window} generation {generation}");
-        let filter = Arc::new(OnceLock::new());
-        self.filters.insert(window, filter.clone());
-        let found = RcBlock::new(
-            move |content: *mut SCShareableContent, error: *mut NSError| {
-                // SAFETY: ScreenCaptureKit passes a valid content object or null.
-                let Some(content) = (unsafe { content.as_ref() }) else {
-                    reply.fail(error);
-                    return;
-                };
-                let target = unsafe { content.windows() }
-                    .iter()
-                    .find(|candidate| unsafe { candidate.windowID() } == window.cast_unsigned());
-                let Some(target) = target else {
-                    reply.send(Err(PhotoError::WindowGone));
-                    return;
-                };
-                if ticket.called_off() {
-                    debug!("edge slice photo called off: window {window} generation {generation}");
-                    return;
-                }
-                let filter = filter.get_or_init(|| {
-                    Filter(unsafe {
-                        SCContentFilter::initWithDesktopIndependentWindow(
-                            SCContentFilter::alloc(),
-                            &target,
-                        )
-                    })
-                });
-                let reply = reply.clone();
-                capture(&filter.0, size, scale, true, move |result| {
-                    reply.send(result);
-                });
+        let scale = scale_at(self.mtm, slice.on_screen);
+        self.filters.capture_window(
+            window,
+            slice.size,
+            scale,
+            lookup == Lookup::Reuse,
+            CaptureOptions {
+                digest: true,
+                sample_edge_color: false,
             },
+            move || {
+                let called_off = ticket.called_off();
+                if called_off {
+                    debug!("edge slice photo called off: window {window} generation {generation}");
+                }
+                called_off
+            },
+            move |result| reply.send(result),
         );
-        unsafe {
-            SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-                true, false, &found,
-            );
-        }
     }
 
     fn paint(&mut self, window: WinID, photo: &Photo) {
@@ -367,10 +365,6 @@ impl Reply {
             result,
         });
     }
-
-    fn fail(&self, error: *mut NSError) {
-        self.send(Err(photo_error(error)));
-    }
 }
 
 /// Why `ScreenCaptureKit` gave no photo, from the error it passed.
@@ -391,7 +385,7 @@ pub(crate) fn capture(
     filter: &SCContentFilter,
     size: IVec2,
     scale: f64,
-    digested: bool,
+    options: CaptureOptions,
     done: impl Fn(Result<Photo, PhotoError>) + 'static,
 ) {
     let configuration = configuration(size, scale);
@@ -413,13 +407,15 @@ pub(crate) fn capture(
             done(Err(PhotoError::Blank));
             return;
         }
-        // Only an edge slice compares photos by digest.
-        let digest = if digested {
+        let digest = if options.digest {
             digest(&image, pixels)
         } else {
             Digest(0)
         };
-        let edge_color = sample_right_edge_color(&image, pixels);
+        let edge_color = options
+            .sample_edge_color
+            .then(|| sample_right_edge_color(&image, pixels))
+            .flatten();
         done(Ok(Photo {
             digest,
             image,

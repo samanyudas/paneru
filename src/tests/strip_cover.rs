@@ -41,8 +41,6 @@ struct Screen {
     slides: Vec<(f64, f64)>,
     /// Every strip x of each slide's path, one each [`PATH_STEP`].
     paths: Vec<Vec<f64>>,
-    /// Each strip x the engine told the tap about.
-    tracked: Vec<f64>,
     /// Each strip x a swipe put the cover's strip at.
     placed: Vec<f64>,
     /// Where Core Animation shows the cover's strip, if the test says.
@@ -167,10 +165,6 @@ impl CoverScreen for RecordingScreen {
         self.0.borrow().morph_share
     }
 
-    fn track(&mut self, _display: CGDirectDisplayID, x: f64) {
-        self.0.borrow_mut().tracked.push(x);
-    }
-
     fn place(&mut self, _display: CGDirectDisplayID, x: f64) {
         self.0.borrow_mut().placed.push(x);
     }
@@ -268,17 +262,6 @@ fn send(harness: &mut TestHarness, event: Event) {
     harness.world().write_message::<Event>(event);
 }
 
-fn window_x(world: &mut World, id: WinID) -> i32 {
-    let mut query = world.query::<&Window>();
-    query
-        .iter(world)
-        .find(|window| window.id() == id)
-        .expect("window not found")
-        .frame()
-        .min
-        .x
-}
-
 fn covered(world: &mut World) -> bool {
     world.query::<&CoverSlide>().iter(world).next().is_some()
 }
@@ -365,14 +348,16 @@ fn a_keyboard_move_slides_pictures_and_moves_each_window_once() {
     assert_eq!(path, vec![700, 700 - STEP], "the window moves once");
     assert_eq!(log.borrow().hidden, 1, "the cover comes down");
 
-    // The tap learns where the pictures are as they slide, so a press on
-    // one reaches its window.
-    let tracked = log.borrow().tracked.clone();
-    assert_eq!(tracked.first(), Some(&0.0), "from where the strip was");
-    assert_eq!(tracked.last(), Some(&f64::from(-STEP)), "to where it lands");
+    let slide_path = log.borrow().paths[0].clone();
+    assert_eq!(slide_path.first(), Some(&0.0), "from where the strip was");
+    assert_eq!(
+        slide_path.last(),
+        Some(&f64::from(-STEP)),
+        "to where it lands"
+    );
     assert!(
-        tracked.windows(2).all(|pair| pair[1] <= pair[0]) && tracked.len() > 3,
-        "along the slide, got {tracked:?}"
+        slide_path.windows(2).all(|pair| pair[1] <= pair[0]) && slide_path.len() > 3,
+        "along the slide, got {slide_path:?}"
     );
     assert_eq!(log.borrow().shown.len(), 1);
 }
@@ -1266,11 +1251,20 @@ fn a_swipe_that_catches_a_slide_starts_from_this_frames_place() {
             send(&mut harness, swipe(0.000_01));
         }
         harness.advance(ONE_FRAME);
-        let screen = log.borrow();
         if swiped {
-            screen.placed.last().copied().expect("the swipe places it")
+            log.borrow()
+                .placed
+                .last()
+                .copied()
+                .expect("the swipe places it")
         } else {
-            screen.tracked.last().copied().expect("the slide shows")
+            harness
+                .world()
+                .query::<&CoverSlide>()
+                .iter(harness.world())
+                .next()
+                .expect("the slide shows")
+                .shown_x()
         }
     };
     let (slid, caught) = (start(false), start(true));
@@ -2120,15 +2114,6 @@ fn resize(direction: crate::types::commands::ResizeDirection) -> Event {
     Event::Command {
         command: Command::Window(Operation::Resize(direction)),
     }
-}
-
-fn window_frame(world: &mut World, id: WinID) -> IRect {
-    let mut query = world.query::<&Window>();
-    query
-        .iter(world)
-        .find(|window| window.id() == id)
-        .expect("window not found")
-        .frame()
 }
 
 fn morphed(world: &mut World) -> bool {

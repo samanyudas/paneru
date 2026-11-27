@@ -812,8 +812,8 @@ fn member(
         .get(&id)
         .map(|&frame| Edges::from(window.margins().tracked(frame)));
     let width = bounds.0.x;
-    if let Some((at, heading_to)) =
-        slide.and_then(|(slide, presented)| ease::slide_heading(slide, presented.0))
+    if let Some((at, heading_to)) = slide
+        .and_then(|(slide, presented)| crate::ecs::shared_edge::slide_heading(slide, presented.0))
     {
         // The photo steps by its slide's ease, which has stepped this frame.
         let t = slide_ease.map_or(1.0, |ease| ease.0.t());

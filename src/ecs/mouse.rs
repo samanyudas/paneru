@@ -6,7 +6,7 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, Query, Res, Single};
 use bevy::time::Time;
 use std::time::{Duration, Instant};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use super::{MouseHeldMarker, Timeout};
 use crate::config::Config;
@@ -194,24 +194,6 @@ fn mouse_moved_trigger(
             trace!("can not find focused window: {window_id}");
             continue;
         };
-
-        let child_window = window_manager
-            .get_associated_windows(window_id)
-            .into_iter()
-            .find_map(|child_wid| {
-                windows.find(child_wid).and_then(|(window, _)| {
-                    window
-                        .child_role()
-                        .inspect_err(|err| {
-                            warn!("getting role {window_id}: {err}");
-                        })
-                        .is_ok_and(|child| child)
-                        .then_some(window)
-                })
-            });
-        if let Some(child) = child_window {
-            debug!("found child of {}: {}", child.id(), window.id());
-        }
 
         // Do not reshuffle windows due to moved mouse focus.
         global_state.set_skip_reshuffle(true);

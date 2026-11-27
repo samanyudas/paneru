@@ -3,7 +3,6 @@ use accessibility_sys::{
     kAXErrorNotificationAlreadyRegistered, kAXErrorSuccess,
 };
 use core::ptr::NonNull;
-use objc2_app_kit::NSRunningApplication;
 use objc2_core_foundation::{CFRetained, CFString, kCFRunLoopDefaultMode};
 use objc2_foundation::ns_string;
 use std::ffi::c_void;
@@ -85,23 +84,9 @@ impl MissionControlHandler {
             .inspect_err(|err| error!("error sending event: {err}"));
     }
 
-    /// Retrieves the process ID (`Pid`) of the Dock application.
-    /// This function uses `NSRunningApplication` to find the Dock by its bundle identifier.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Pid)` with the Dock's process ID if found, otherwise `Err(Error)`.
     fn dock_pid() -> Result<Pid> {
-        let dock = ns_string!("com.apple.dock");
-        let array = NSRunningApplication::runningApplicationsWithBundleIdentifier(dock);
-        array
-            .iter()
-            .next()
-            .map(|running| running.processIdentifier())
-            .ok_or(Error::NotFound(format!(
-                "{}: can not find dock.",
-                function_name!()
-            )))
+        super::process::pid_for_bundle_id(ns_string!("com.apple.dock"))
+            .ok_or_else(|| Error::NotFound(format!("{}: can not find dock.", function_name!())))
     }
 
     /// Starts observing Mission Control accessibility notifications from the Dock process.

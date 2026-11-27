@@ -8,10 +8,11 @@ use bevy::app::{App, PostUpdate, Update};
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_exists};
-use bevy::prelude::{ChildOf, Commands, Entity, Has, Query, Res, Resource, Time, With};
+use bevy::prelude::{Commands, Entity, Has, Query, Res, Resource, Time, With};
 use tracing::debug;
 
 use crate::commands::{FocusSource, focus_with_verification};
+use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::Windows;
 use crate::ecs::shared_edge::Slide;
 use crate::ecs::{PostUpdateSet, RepositionMarker, ResizeMarker, SpawnCommandsExt as _, UpdateSet};
@@ -89,8 +90,7 @@ fn reveal_pressed(
 fn deliver_press(
     pending: Res<PendingPress>,
     windows: Query<(&Window, Has<RepositionMarker>, Has<ResizeMarker>)>,
-    parents: Query<&ChildOf>,
-    covered: Query<(), crate::ecs::strip_cover::UnderCover>,
+    covered: Query<&LayoutStrip, crate::ecs::strip_cover::UnderCover>,
     sliding: Query<(), With<Slide>>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
@@ -117,9 +117,7 @@ fn deliver_press(
     };
     // A window under a picture cover sits where the move began until the
     // cover lifts, so its press waits for that.
-    let under_cover = parents
-        .get(pending.window)
-        .is_ok_and(|parent| covered.contains(parent.parent()));
+    let under_cover = covered.iter().any(|strip| strip.contains(pending.window));
     if moving
         || resizing
         || under_cover

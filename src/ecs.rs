@@ -167,7 +167,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
     native_membership::register(app);
     app.init_resource::<pacing::SlideHolds>();
     app.init_resource::<systems::AnimationStep>();
-    shared_edge::register(app);
     slice_photos::register(app);
     strip_cover::register(app);
     slice_input::register(app);
@@ -276,7 +275,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(not(resource_exists::<Initializing>))
                 .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
             systems::auto_discover_unmanaged_focused_windows,
-            triggers::answer_front_switch,
+            triggers::answer_front_switch.after(triggers::front_switched_trigger),
         )
             .in_set(UpdateSet::Events),
     );
@@ -335,7 +334,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
         ((
             systems::animate_entities,
             systems::animate_resize_entities,
-            ease::step_slides,
+            shared_edge::step_slides,
             pacing::pace_rows.run_if(not(resource_exists::<Initializing>)),
             systems::finish_repositions,
             systems::finish_resizes,

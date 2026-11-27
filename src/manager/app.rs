@@ -113,30 +113,16 @@ pub struct WindowList {
 
 #[automock]
 pub trait ApplicationApi: Send + Sync {
-    /// Returns the process ID of the application.
     fn pid(&self) -> Pid;
-    /// Returns the process serial number of the application.
     fn psn(&self) -> ProcessSerialNumber;
-    /// Returns the connection ID of the application.
     fn connection(&self) -> Option<ConnID>;
-    /// Returns the ID of the currently focused window for this application.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `Error` if the focused window cannot be determined.
     fn focused_window_id(&self) -> Result<WinID>;
     /// Asks for the ID of the app's focused window without waiting on the
     /// app, after the moves, resizes, and raise asked for its windows so
     /// far. A busy app can take the whole Accessibility timeout to answer,
     /// and a frame that waited on it stopped every window.
     fn ask_focused_window_id(&self) -> Answer<Result<WinID>>;
-    /// Returns the currently focused window for this application, if any.
     fn focused_window(&self, config: &Config) -> Option<Window>;
-    /// Returns the manageable windows of this application.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - The current Paneru configuration, used to evaluate window rules.
     fn window_list(&self, config: &Config) -> WindowList;
     /// Returns the IDs of the windows the app currently exposes over
     /// accessibility.
@@ -146,43 +132,19 @@ pub trait ApplicationApi: Send + Sync {
     fn ax_window_ids(&self) -> Vec<WinID>;
     /// Starts observing application-level accessibility notifications.
     ///
-    /// Returns `Ok(true)` when every notification is registered, and
-    /// `Ok(false)` when the app did not answer in time, as when its main
-    /// thread is busy, so a later call can succeed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `Error` if the app refused every registration, so calling
-    /// again will not help.
+    /// Returns `Ok(true)` when every notification is registered, `Ok(false)`
+    /// when the app did not answer in time so a later call can succeed, and
+    /// `Err` when the app refused every registration.
     fn observe(&mut self) -> Result<bool>;
-    /// Starts observing window-specific accessibility notifications for a given window.
-    ///
-    /// # Arguments
-    ///
-    /// * `window` - The `Window` to observe.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `Error` if observers cannot be registered.
     fn observe_window(&mut self, window: &Window) -> Result<bool>;
-    /// Stops observing window-specific accessibility notifications for a given window.
-    ///
-    /// # Arguments
-    ///
-    /// * `window` - The `Window` to unobserve.
     fn unobserve_window(&mut self, window: &Window);
-    /// Checks if the application is currently the frontmost application.
     fn is_frontmost(&self) -> bool;
     /// Checks if the user hid the application, as with Command-H.
     fn is_hidden(&self) -> bool;
-    /// Returns the bundle identifier of the application.
     fn bundle_id(&self) -> Option<String>;
-    /// Returns the display name of the application.
     fn name(&self) -> &str;
 }
 
-/// A wrapper struct for `ApplicationApi` trait objects, allowing for dynamic dispatch.
-/// It implements `Deref` and `DerefMut` to easily access the underlying `ApplicationApi` methods.
 #[derive(Component, Deref, DerefMut)]
 pub struct Application(Box<dyn ApplicationApi>);
 
@@ -199,18 +161,11 @@ impl std::fmt::Display for Application {
 }
 
 impl Application {
-    /// Creates a new `Application` instance from a boxed `ApplicationApi` trait object.
-    ///
-    /// # Arguments
-    ///
-    /// * `app` - A `Box<dyn ApplicationApi>` representing the application implementation.
     pub fn new(app: Box<dyn ApplicationApi>) -> Self {
         Application(app)
     }
 }
 
-/// `ApplicationOS` is a concrete implementation of the `ApplicationApi` trait for macOS.
-/// It manages an application's accessibility UI element, process information, and event observation.
 pub struct ApplicationOS {
     element: CFRetained<AXUIWrapper>,
     psn: ProcessSerialNumber,
@@ -222,7 +177,6 @@ pub struct ApplicationOS {
 }
 
 impl Drop for ApplicationOS {
-    /// Cleans up the `AXObserver` by removing all registered notifications when the `Application` is dropped.
     fn drop(&mut self) {
         self.handler
             .remove_observer(&ObserverType::Application, &self.element, &AX_NOTIFICATIONS);
@@ -236,18 +190,6 @@ impl std::fmt::Display for ApplicationOS {
 }
 
 impl ApplicationOS {
-    /// Creates a new `Application` instance for a given process.
-    /// It obtains the Accessibility UI element for the application and its connection ID.
-    ///
-    /// # Arguments
-    ///
-    /// * `connection` - The main connection ID for the `SkyLight` API.
-    /// * `process` - A reference to the `Process` associated with this application.
-    /// * `events` - An `EventSender` to send events from the `AXObserver`.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Self)` if the `Application` is created successfully, otherwise `Err(Error)`.
     pub fn new(
         connection: Option<ConnID>,
         process: &dyn ProcessApi,
@@ -283,38 +225,18 @@ impl ApplicationOS {
 }
 
 impl ApplicationApi for ApplicationOS {
-    /// Retrieves the process ID (Pid) of the application.
-    ///
-    /// # Returns
-    ///
-    /// The process ID.
     fn pid(&self) -> Pid {
         self.pid
     }
 
-    /// Retrieves the `ProcessSerialNumber` of the application.
-    ///
-    /// # Returns
-    ///
-    /// The process serial number.
     fn psn(&self) -> ProcessSerialNumber {
         self.psn
     }
 
-    /// Retrieves the connection ID (`ConnID`) of the application.
-    ///
-    /// # Returns
-    ///
-    /// The connection ID.
     fn connection(&self) -> Option<ConnID> {
         self.connection
     }
 
-    /// Retrieves the focused window ID of the application.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(WinID)` with the focused window ID if successful, otherwise `Err(Error)`.
     fn focused_window_id(&self) -> Result<WinID> {
         self.element.focused_window_id()
     }
@@ -336,11 +258,6 @@ impl ApplicationApi for ApplicationOS {
             })
     }
 
-    /// Retrieves a list of all windows associated with the application.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Vec<Result<Window>>)` containing the list of window objects if successful, otherwise `Err(Error)`.
     fn window_list(&self, config: &Config) -> WindowList {
         let bundle_id = self.bundle_id.as_deref();
         let elements = match self.element.windows() {
@@ -381,22 +298,12 @@ impl ApplicationApi for ApplicationOS {
             .unwrap_or_default()
     }
 
-    /// Registers observers for general application-level accessibility notifications (e.g., `kAXCreatedNotification`).
     fn observe(&mut self) -> Result<bool> {
         self.handler
             .add_observer(&self.element, &AX_NOTIFICATIONS, ObserverType::Application)
             .map(|retry| retry.is_empty())
     }
 
-    /// Registers observers for specific window-level accessibility notifications (e.g., `kAXUIElementDestroyedNotification`).
-    ///
-    /// # Arguments
-    ///
-    /// * `window` - A reference to the `Window` object to observe.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(bool)` where `true` means all observers were successfully registered and `retry` list is empty, otherwise `Err(Error)`.
     fn observe_window(&mut self, window: &Window) -> Result<bool> {
         if let Some(element) = window.element() {
             self.handler
@@ -411,11 +318,6 @@ impl ApplicationApi for ApplicationOS {
         }
     }
 
-    /// Unregisters observers for a specific window's accessibility notifications.
-    ///
-    /// # Arguments
-    ///
-    /// * `window` - A reference to the `Window` object to unobserve.
     fn unobserve_window(&mut self, window: &Window) {
         if let Some(element) = window.element() {
             self.handler.remove_observer(
@@ -426,11 +328,6 @@ impl ApplicationApi for ApplicationOS {
         }
     }
 
-    /// Checks if the application is currently the frontmost application.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the application is frontmost, `false` otherwise.
     fn is_frontmost(&self) -> bool {
         let mut psn = ProcessSerialNumber::default();
         unsafe { _SLPSGetFrontProcess(&mut psn) }
@@ -444,11 +341,6 @@ impl ApplicationApi for ApplicationOS {
             .is_some_and(|app| app.isHidden())
     }
 
-    /// Returns the bundle identifier of the application.
-    ///
-    /// # Returns
-    ///
-    /// An `Option<&str>` containing the bundle ID if available, otherwise `None`.
     fn bundle_id(&self) -> Option<String> {
         self.bundle_id.clone()
     }
@@ -458,17 +350,12 @@ impl ApplicationApi for ApplicationOS {
     }
 }
 
-/// An enum representing the type of observer being used.
-/// `Application` refers to an observer for application-level events.
-/// `Window(WinID)` refers to an observer for a specific window, identified by its `WinID`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ObserverType {
     Application,
     Window(WinID),
 }
 
-/// `ObserverContext` holds the `EventSender` and the `ObserverType`,
-/// which are used within the `AXObserver` callback to dispatch accessibility events.
 /// An application notification whose window is not named yet.
 #[derive(Clone, Copy, Debug)]
 enum WindowNotification {
@@ -567,13 +454,6 @@ struct ObserverContext {
 }
 
 impl ObserverContext {
-    /// Notifies the event sender about an accessibility event.
-    /// It dispatches the event to either `notify_app` or `notify_window` based on the `ObserverType`.
-    ///
-    /// # Arguments
-    ///
-    /// * `notification` - The name of the accessibility notification as a `&str`.
-    /// * `element` - The `AXUIElementRef` associated with the notification.
     fn notify(&self, notification: &str, element: AXUIElementRef) {
         match self.which {
             ObserverType::Application => self.notify_app(notification, element),
@@ -581,13 +461,6 @@ impl ObserverContext {
         }
     }
 
-    /// Notifies the event sender about an application-level accessibility event.
-    /// It translates the notification string and element into a corresponding `Event`.
-    ///
-    /// # Arguments
-    ///
-    /// * `notification` - The name of the accessibility notification as a `&str`.
-    /// * `element` - The `AXUIElementRef` associated with the notification.
     fn notify_app(&self, notification: &str, element: AXUIElementRef) {
         // Handled before the window-id lookup below: a creation notification is
         // the one case whose element is not yet a window paneru knows about.
@@ -614,14 +487,6 @@ impl ObserverContext {
         _ = self.resolver.send(PendingNotification { kind, element });
     }
 
-    /// Notifies the event sender about a window-level accessibility event.
-    /// It translates the notification string and window ID into a corresponding `Event`.
-    ///
-    /// # Arguments
-    ///
-    /// * `notification` - The name of the accessibility notification as a `&str`.
-    /// * `window_id` - The ID of the window associated with the notification.
-    /// * `element` - The window's AX element that sent the notification.
     fn notify_window(&self, notification: &str, window_id: WinID, element: AXUIElementRef) {
         let event = match notification {
             accessibility_sys::kAXWindowMiniaturizedNotification => {
@@ -649,8 +514,6 @@ impl ObserverContext {
     }
 }
 
-/// `AxObserverHandler` manages the lifecycle of an `AXObserver`,
-/// including its creation, registration of notifications, and removal from the run loop.
 struct AxObserverHandler {
     observer: CFRetained<AXUIWrapper>,
     events: EventSender,
@@ -659,25 +522,12 @@ struct AxObserverHandler {
 }
 
 impl Drop for AxObserverHandler {
-    /// Invalidates the run loop source associated with the `AXObserver` when the `AxObserverHandler` is dropped.
     fn drop(&mut self) {
         remove_run_loop(&self.observer);
     }
 }
 
 impl AxObserverHandler {
-    /// Creates a new `AxObserverHandler` instance for a given process ID.
-    /// It creates an `AXObserver` and adds its run loop source to the main run loop.
-    ///
-    /// # Arguments
-    ///
-    /// * `pid` - The process ID to create the observer for.
-    /// * `events` - An `EventSender` to send events generated by the observer.
-    /// * `resolver` - A channel sender to offload window identification.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Self)` if the handler is created successfully, otherwise `Err(Error)`.
     fn new(pid: Pid, events: EventSender, resolver: Sender<PendingNotification>) -> Result<Self> {
         let observer = unsafe {
             let mut observer_ref: AXObserverRef = null_mut();
@@ -700,18 +550,8 @@ impl AxObserverHandler {
         })
     }
 
-    /// Adds accessibility notifications to be observed for a given UI element.
-    ///
-    /// # Arguments
-    ///
-    /// * `element` - The `&AXUIWrapper` to observe.
-    /// * `notifications` - A slice of static strings representing the notification names to add.
-    /// * `which` - The type of observer context (application-specific or window-specific).
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Vec<&str>)` with the notifications the app did not answer in time, which a later call can register.
-    /// `Err(Error)` when the app refused every notification.
+    /// Returns the notifications the app did not answer in time so a later call
+    /// can retry them, or `Err` when the app refused every notification.
     pub fn add_observer(
         &mut self,
         element: &AXUIWrapper,
@@ -759,13 +599,6 @@ impl AxObserverHandler {
         }
     }
 
-    /// Removes accessibility notifications from being observed for a given UI element.
-    ///
-    /// # Arguments
-    ///
-    /// * `which` - The type of observer context (application-specific or window-specific) for which to remove notifications.
-    /// * `element` - The `&AXUIWrapper` from which to remove notifications.
-    /// * `notifications` - A slice of static strings representing the notification names to remove.
     pub fn remove_observer(
         &mut self,
         which: &ObserverType,
@@ -791,15 +624,6 @@ impl AxObserverHandler {
         // every refcon alive until `drop` removes the observer's run-loop source.
     }
 
-    /// The static callback function for `AXObserver`. This function is called by the macOS Accessibility API
-    /// when an observed accessibility event occurs. It dispatches the event to the appropriate `notify_app` or `notify_window` handler.
-    ///
-    /// # Arguments
-    ///
-    /// * `_observer` - The `AXObserverRef` (unused).
-    /// * `element` - The `AXUIElementRef` associated with the notification.
-    /// * `notification` - The raw `CFStringRef` representing the notification name.
-    /// * `context` - A raw pointer to the user-defined context `ObserverContext`.
     extern "C" fn callback(
         _observer: AXObserverRef,
         element: AXUIElementRef,

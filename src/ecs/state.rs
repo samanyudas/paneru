@@ -288,7 +288,7 @@ impl SavedWindow {
         apps: &Query<&Application>,
     ) -> Option<Self> {
         let window = windows.get(entity)?;
-        let (_, _, app_entity) = windows.find_parent(window.id())?;
+        let app_entity = windows.parent_of(entity)?;
         let app = apps.get(app_entity).ok()?;
 
         Some(Self {
@@ -396,7 +396,7 @@ impl PaneruState {
                             Some(SavedColumn::Tabs(saved_tabs))
                         }
                     }
-                    Column::Fullscren(entity) => SavedWindow::from_entity(*entity, windows, apps)
+                    Column::Fullscreen(entity) => SavedWindow::from_entity(*entity, windows, apps)
                         .map(SavedColumn::Fullscreen),
                     Column::Maximized(maximized) => {
                         let mut saved: Vec<_> = col
@@ -481,17 +481,7 @@ impl PaneruState {
     }
 
     pub fn save_to_file(&self, path: &Path) -> Result<(), std::io::Error> {
-        let json = serde_json::to_string_pretty(self).map_err(|e| {
-            error!("Failed to serialize state: {e}");
-            std::io::Error::other(e)
-        })?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let tmp_path = path.with_extension("json.tmp");
-        fs::write(&tmp_path, json)?;
-        fs::rename(tmp_path, path)?;
-        Ok(())
+        crate::util::write_json_atomic(path, self)
     }
 
     pub fn load_from_file(path: &Path) -> Option<Self> {
@@ -501,9 +491,7 @@ impl PaneruState {
     }
 
     pub fn default_state_file_path() -> PathBuf {
-        xdg::BaseDirectories::with_prefix("paneru")
-            .get_state_file(STATE_FILE_NAME)
-            .expect("XDG state directory should be available")
+        crate::util::xdg_state_file(STATE_FILE_NAME)
     }
 
     #[cfg(test)]
@@ -619,12 +607,8 @@ impl QueryStateParams<'_, '_> {
     }
 
     /// Builds the state document from the current world.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the window manager cannot enumerate a workspace.
-    pub fn extract(&self) -> crate::errors::Result<PaneruQueryState> {
-        PaneruQueryState::extract(
+    pub fn extract(&self) -> PaneruQueryState {
+        extract_query_state(
             &self.workspaces,
             &self.displays,
             &self.windows,
@@ -633,15 +617,12 @@ impl QueryStateParams<'_, '_> {
             &self.config,
         )
     }
-}
 
-/// Reads the layout as the tree a script transforms. Unlike
-/// [`QueryState::extract`], which flattens each workspace into a list of
-/// windows, this keeps the strip's column structure — needed for `ws:swap`,
-/// `ws:east`, `ws:stack` and friends to know what is beside what.
-impl QueryStateParams<'_, '_> {
-    #[allow(clippy::unnecessary_wraps)]
-    pub fn extract_window_set(&self) -> crate::errors::Result<WindowSet> {
+    /// Reads the layout as the tree a script transforms. Unlike
+    /// [`QueryStateParams::extract`], which flattens each workspace into a list
+    /// of windows, this keeps the strip's column structure - needed for
+    /// `ws:swap`, `ws:east`, `ws:stack` and friends to know what is beside what.
+    pub fn extract_window_set(&self) -> WindowSet {
         use crate::types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
 
         let focused_entity = self.windows.focused().map(|(_, entity)| entity);
@@ -753,7 +734,7 @@ impl QueryStateParams<'_, '_> {
         let focused = focused_entity
             .and_then(|entity| self.windows.get(entity))
             .map(|window| window.id());
-        Ok(WindowSet::new(displays, focused))
+        WindowSet::new(displays, focused)
     }
 
     /// One window, as a script sees it. `None` for an entity that is no longer
@@ -765,7 +746,7 @@ impl QueryStateParams<'_, '_> {
         sliver_width: i32,
     ) -> Option<crate::types::windowset::WindowRec> {
         let (window, _, unmanaged) = self.windows.get_managed(entity)?;
-        let (_, _, app_entity) = self.windows.find_parent(window.id())?;
+        let app_entity = self.windows.parent_of(entity)?;
         let app = self.apps.get(app_entity).ok()?;
         let frame = self.windows.frame(entity);
         // Minimized and hidden windows are never on screen, whatever their last
@@ -829,178 +810,150 @@ fn column_kind(column: &Column) -> crate::types::windowset::ColumnKind {
         Column::Single(_) | Column::Maximized(_) => ColumnKind::Single,
         Column::Stack(_) => ColumnKind::Stack,
         Column::Tabs(_) => ColumnKind::Tabs,
-        Column::Fullscren(_) => ColumnKind::Fullscreen,
+        Column::Fullscreen(_) => ColumnKind::Fullscreen,
     }
 }
 
-pub trait QueryState: std::marker::Sized {
-    fn extract(
-        workspaces: &Query<(
-            &ChildOf,
-            &LayoutStrip,
-            Has<ActiveWorkspaceMarker>,
-            Has<SelectedVirtualMarker>,
-        )>,
-        displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
-        windows: &Windows,
-        apps: &Query<&Application>,
-        window_manager: &WindowManager,
-        config: &Config,
-    ) -> crate::errors::Result<Self>;
-}
-
 /// Builds the query/subscribe state document from the ECS world.
-///
-/// A free function rather than an inherent method because [`PaneruQueryState`]
-/// belongs to the shared protocol crate, which knows nothing about the ECS.
-impl QueryState for PaneruQueryState {
-    #[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
-    fn extract(
-        workspaces: &Query<(
-            &ChildOf,
-            &LayoutStrip,
-            Has<ActiveWorkspaceMarker>,
-            Has<SelectedVirtualMarker>,
-        )>,
-        displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
-        windows: &Windows,
-        apps: &Query<&Application>,
-        window_manager: &WindowManager,
-        config: &Config,
-    ) -> crate::errors::Result<Self> {
-        let focused_entity = windows.focused().map(|(_, entity)| entity);
-        let sliver_width = config.sliver_width();
+#[allow(clippy::too_many_lines)]
+fn extract_query_state(
+    workspaces: &Query<(
+        &ChildOf,
+        &LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+    )>,
+    displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
+    windows: &Windows,
+    apps: &Query<&Application>,
+    window_manager: &WindowManager,
+    config: &Config,
+) -> PaneruQueryState {
+    let focused_entity = windows.focused().map(|(_, entity)| entity);
+    let sliver_width = config.sliver_width();
 
-        let active_display = displays
-            .iter()
-            .find_map(|(display, entity, active)| active.then_some((display.id(), entity)));
-        let active_workspace_id = workspaces
-            .iter()
-            .find_map(|(_, strip, active, _)| active.then_some(strip.id()));
+    let active_display = displays
+        .iter()
+        .find_map(|(display, entity, active)| active.then_some((display.id(), entity)));
+    let active_workspace_id = workspaces
+        .iter()
+        .find_map(|(_, strip, active, _)| active.then_some(strip.id()));
 
-        let mut virtual_workspaces = Vec::new();
-        let mut workspace_max_numbers: HashMap<WorkspaceId, u32> = HashMap::new();
-        let mut active = PaneruActiveState {
-            display_id: active_display.map(|(display_id, _)| display_id),
-            ..PaneruActiveState::default()
-        };
+    let mut virtual_workspaces = Vec::new();
+    let mut workspace_max_numbers: HashMap<WorkspaceId, u32> = HashMap::new();
+    let mut active = PaneruActiveState {
+        display_id: active_display.map(|(display_id, _)| display_id),
+        ..PaneruActiveState::default()
+    };
 
-        let has_floating = has_floating_windows(windows);
-        for (child, strip, active_workspace, selected_workspace) in workspaces {
-            let query_space =
-                active_workspace || selected_workspace && active_workspace_id != Some(strip.id());
-            let floating = untracked_floating_in_space(
-                window_manager,
-                strip.id(),
-                has_floating && query_space,
-            )
-            .into_iter()
-            .filter_map(|window_id| {
-                let (_, entity) = windows.find(window_id)?;
-                let (_, _, unmanaged) = windows.get_managed(entity)?;
-                (matches!(unmanaged, Some(Unmanaged::Floating)) && !strip.contains(entity))
-                    .then_some(entity)
-            });
-            let row_windows = strip
-                .all_windows()
+    let has_floating = has_floating_windows(windows);
+    for (child, strip, active_workspace, selected_workspace) in workspaces {
+        let query_space =
+            active_workspace || selected_workspace && active_workspace_id != Some(strip.id());
+        let floating =
+            untracked_floating_in_space(window_manager, strip.id(), has_floating && query_space)
                 .into_iter()
-                .chain(floating)
-                .filter_map(|entity| {
-                    let (window, _, unmanaged) = windows.get_managed(entity)?;
-                    let (_, _, app_entity) = windows.find_parent(window.id())?;
-                    let app = apps.get(app_entity).ok()?;
-                    let bundle_id = app.bundle_id().unwrap_or_default().clone();
-                    let app_name = app.name().to_string();
-                    let title = window.title().unwrap_or_default();
-                    let frame = windows.frame(entity);
-                    // Minimized and hidden windows are never on screen, whatever
-                    // their last known frame says.
-                    let hidden =
-                        matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
-                    let visibility = frame
-                        .and_then(|frame| window_visibility(frame, displays, sliver_width))
-                        .map(|(display_id, visible)| (display_id, visible && !hidden));
-                    Some(PaneruWindowState {
-                        window_id: window.id(),
-                        bundle_id,
-                        app_name,
-                        title,
-                        role: window.role().ok(),
-                        subrole: window.subrole().ok(),
-                        focused: focused_entity == Some(entity),
-                        floating: matches!(unmanaged, Some(Unmanaged::Floating)),
-                        display_id: visibility.map(|(display_id, _)| display_id),
-                        frame: frame.map(|frame| Frame {
-                            x: frame.min.x,
-                            y: frame.min.y,
-                            width: frame.width(),
-                            height: frame.height(),
-                        }),
-                        visible: visibility.is_some_and(|(_, visible)| visible),
-                    })
+                .filter_map(|window_id| {
+                    let (_, entity) = windows.find(window_id)?;
+                    let (_, _, unmanaged) = windows.get_managed(entity)?;
+                    (matches!(unmanaged, Some(Unmanaged::Floating)) && !strip.contains(entity))
+                        .then_some(entity)
+                });
+        let row_windows = strip
+            .all_windows()
+            .into_iter()
+            .chain(floating)
+            .filter_map(|entity| {
+                let (window, _, unmanaged) = windows.get_managed(entity)?;
+                let app_entity = windows.parent_of(entity)?;
+                let app = apps.get(app_entity).ok()?;
+                let bundle_id = app.bundle_id().unwrap_or_default().clone();
+                let app_name = app.name().to_string();
+                let title = window.title().unwrap_or_default();
+                let frame = windows.frame(entity);
+                // Minimized and hidden windows are never on screen, whatever
+                // their last known frame says.
+                let hidden = matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
+                let visibility = frame
+                    .and_then(|frame| window_visibility(frame, displays, sliver_width))
+                    .map(|(display_id, visible)| (display_id, visible && !hidden));
+                Some(PaneruWindowState {
+                    window_id: window.id(),
+                    bundle_id,
+                    app_name,
+                    title,
+                    role: window.role().ok(),
+                    subrole: window.subrole().ok(),
+                    focused: focused_entity == Some(entity),
+                    floating: matches!(unmanaged, Some(Unmanaged::Floating)),
+                    display_id: visibility.map(|(display_id, _)| display_id),
+                    frame: frame.map(|frame| Frame {
+                        x: frame.min.x,
+                        y: frame.min.y,
+                        width: frame.width(),
+                        height: frame.height(),
+                    }),
+                    visible: visibility.is_some_and(|(_, visible)| visible),
                 })
-                .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
 
-            let number = strip.virtual_index + 1;
-            workspace_max_numbers
-                .entry(strip.id())
-                .and_modify(|max| *max = (*max).max(number))
-                .or_insert(number);
-            if active_workspace {
-                active.native_workspace_id = Some(strip.id());
-                active.virtual_workspace_number = Some(number);
-            }
-
-            if active_workspace
-                && let Some(window) = row_windows.iter().find(|window| window.focused)
-            {
-                active.focused_window_id = Some(window.window_id);
-                active.focused_bundle_id = Some(window.bundle_id.clone());
-                active.focused_app_name = Some(window.app_name.clone());
-                active.focused_window_title = Some(window.title.clone());
-            }
-
-            virtual_workspaces.push(PaneruVirtualWorkspaceState {
-                number,
-                native_workspace_id: strip.id(),
-                active: active_workspace,
-                windows: row_windows,
-            });
-
-            if active_workspace
-                && let Some((display_id, display_entity)) = active_display
-                && child.parent() == display_entity
-            {
-                active.display_id = Some(display_id);
-            }
+        let number = strip.virtual_index + 1;
+        workspace_max_numbers
+            .entry(strip.id())
+            .and_modify(|max| *max = (*max).max(number))
+            .or_insert(number);
+        if active_workspace {
+            active.native_workspace_id = Some(strip.id());
+            active.virtual_workspace_number = Some(number);
         }
 
-        let present_numbers = virtual_workspaces
-            .iter()
-            .map(|workspace| (workspace.native_workspace_id, workspace.number))
-            .collect::<HashSet<_>>();
-        for (workspace_id, max_number) in workspace_max_numbers {
-            for number in 1..=max_number {
-                if !present_numbers.contains(&(workspace_id, number)) {
-                    virtual_workspaces.push(PaneruVirtualWorkspaceState {
-                        number,
-                        native_workspace_id: workspace_id,
-                        active: false,
-                        windows: Vec::new(),
-                    });
-                }
-            }
+        if active_workspace && let Some(window) = row_windows.iter().find(|window| window.focused) {
+            active.focused_window_id = Some(window.window_id);
+            active.focused_bundle_id = Some(window.bundle_id.clone());
+            active.focused_app_name = Some(window.app_name.clone());
+            active.focused_window_title = Some(window.title.clone());
         }
 
-        virtual_workspaces
-            .sort_by_key(|workspace| (workspace.native_workspace_id, workspace.number));
+        virtual_workspaces.push(PaneruVirtualWorkspaceState {
+            number,
+            native_workspace_id: strip.id(),
+            active: active_workspace,
+            windows: row_windows,
+        });
 
-        Ok(PaneruQueryState {
-            version: 1,
-            timestamp: now_timestamp(),
-            active,
-            virtual_workspaces,
-        })
+        if active_workspace
+            && let Some((display_id, display_entity)) = active_display
+            && child.parent() == display_entity
+        {
+            active.display_id = Some(display_id);
+        }
+    }
+
+    let present_numbers = virtual_workspaces
+        .iter()
+        .map(|workspace| (workspace.native_workspace_id, workspace.number))
+        .collect::<HashSet<_>>();
+    for (workspace_id, max_number) in workspace_max_numbers {
+        for number in 1..=max_number {
+            if !present_numbers.contains(&(workspace_id, number)) {
+                virtual_workspaces.push(PaneruVirtualWorkspaceState {
+                    number,
+                    native_workspace_id: workspace_id,
+                    active: false,
+                    windows: Vec::new(),
+                });
+            }
+        }
+    }
+
+    virtual_workspaces.sort_by_key(|workspace| (workspace.native_workspace_id, workspace.number));
+
+    PaneruQueryState {
+        version: 1,
+        timestamp: now_timestamp(),
+        active,
+        virtual_workspaces,
     }
 }
 

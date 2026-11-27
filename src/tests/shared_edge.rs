@@ -7,7 +7,7 @@ use bevy::math::{IRect, IVec2};
 use bevy::prelude::World;
 
 use super::*;
-use crate::commands::{Command, Direction, Operation, Side};
+use crate::commands::{Direction, Operation, Side};
 use crate::config::MainOptions;
 use crate::ecs::SpawnWindowTrigger;
 use crate::ecs::layout::LayoutStrip;
@@ -33,11 +33,7 @@ const BELOW: IRect = IRect {
     max: IVec2::new(EXT_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT),
 };
 
-fn command(operation: Operation) -> Event {
-    Event::Command {
-        command: Command::Window(operation),
-    }
-}
+use super::window_command as command;
 
 /// The test display holding `count` windows with gaps of `2 * PAD`, beside
 /// the empty displays `others`. Nothing is laid out until the first run.

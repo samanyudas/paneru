@@ -1935,17 +1935,6 @@ fn test_closing_floating_window_does_not_reinsert_it_into_the_strip() {
         .run(commands);
 }
 
-fn window_x(world: &mut World, id: i32) -> i32 {
-    let mut query = world.query::<&crate::manager::Window>();
-    query
-        .iter(world)
-        .find(|window| window.id() == id)
-        .unwrap_or_else(|| panic!("window {id} not found"))
-        .frame()
-        .min
-        .x
-}
-
 fn window_exists(world: &mut World, id: i32) -> bool {
     let mut query = world.query::<&crate::manager::Window>();
     query.iter(world).any(|window| window.id() == id)
@@ -2634,7 +2623,7 @@ fn test_maximize_fills_the_display_when_window_was_partially_offscreen() {
 #[test]
 fn floating_waits_for_the_window_macos_has_focused() {
     let mut harness = TestHarness::new().with_windows(2);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     let state = harness.mock_state.clone();
     let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
     state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 9, frame);
@@ -2675,7 +2664,7 @@ vertical_padding = 4
     )
     .expect("config parses");
     let mut harness = TestHarness::new().with_config(config).with_windows(3);
-    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
     harness.advance(Duration::from_secs(2));
     let slot = os_frame(&harness);
     (harness, slot)
