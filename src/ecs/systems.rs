@@ -55,6 +55,45 @@ use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::input::TapHealth;
 use crate::platform::{PlatformCallbacks, WinID};
 
+// Keep partially registered observers alive during slow AX startup.
+// A separate, low-frequency retry must not gate discovery of usable windows.
+#[derive(bevy::ecs::component::Component)]
+pub(super) struct PendingApplicationObservation;
+
+// Bounded post-launch recovery budget (in 1s ticks) for newly launched
+// processes and applications whose initial `FreshMarker` grace period expired
+// before readiness, observer registration, or their first window settled.
+#[derive(bevy::ecs::component::Component)]
+pub(crate) struct PendingWindowRecovery(u32);
+
+const WINDOW_RECOVERY_ATTEMPTS: u32 = 60;
+
+impl Default for PendingWindowRecovery {
+    fn default() -> Self {
+        Self(WINDOW_RECOVERY_ATTEMPTS)
+    }
+}
+
+type RecoverableApplications<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        Option<&'static Application>,
+        Option<&'static ChildOf>,
+        Option<&'static mut PendingWindowRecovery>,
+        Has<PendingApplicationObservation>,
+    ),
+    (
+        Without<Children>,
+        Without<FreshMarker>,
+        Or<(
+            With<PendingWindowRecovery>,
+            With<PendingApplicationObservation>,
+        )>,
+    ),
+>;
+
 /// Processes and applications still inside their spawn grace period, with the
 /// `FreshMarker` that says whether the spawn actually completed in time.
 type TimedOutSpawns<'w, 's> = Populated<
@@ -94,6 +133,7 @@ type ChangedWindowFrames<'w, 's> = Populated<
     'w,
     's,
     (
+        Entity,
         &'static mut Window,
         Option<Ref<'static, Position>>,
         Option<Ref<'static, Bounds>>,
@@ -234,7 +274,11 @@ pub(crate) fn add_existing_application(
     for (mut app, entity) in fresh_apps {
         let mut offscreen_windows = vec![];
 
-        if app.observe().is_ok_and(|result| result)
+        let observed = app.observe().is_ok_and(|result| result);
+        if !observed && let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(PendingApplicationObservation);
+        }
+        if observed
             && let Ok((found_windows, offscreen)) = window_manager
                 .find_existing_application_windows(&mut app, &spaces, &config)
                 .inspect_err(|err| warn!("{err}"))
@@ -465,7 +509,7 @@ pub(super) fn add_launched_process(
         if children {
             // Process already has an attached Application, so finish.
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<FreshMarker>();
+                entity_commands.try_remove::<(FreshMarker, PendingWindowRecovery)>();
             }
             continue;
         }
@@ -480,9 +524,14 @@ pub(super) fn add_launched_process(
                 // An app too busy to list its windows in time stays managed, so a
                 // window of it that is created or focused later still enters the
                 // layout.
-                commands.spawn((app, app_listing_watch(), ChildOf(entity)));
+                commands.spawn((
+                    app,
+                    app_listing_watch(),
+                    PendingWindowRecovery::default(),
+                    ChildOf(entity),
+                ));
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_remove::<AwaitingAccessibility>();
+                    entity_commands.try_remove::<(AwaitingAccessibility, PendingWindowRecovery)>();
                 }
             }
             Ok(false) => {
@@ -598,6 +647,62 @@ pub(super) fn add_launched_application(
             debug!("removing FreshMarker from {entity}: windows already created via AXCreated");
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<FreshMarker>();
+            }
+        }
+    }
+}
+
+/// Retry on the retained Application, preserving already registered callbacks.
+pub(super) fn retry_application_observers(
+    mut apps: Populated<(Entity, &mut Application), With<PendingApplicationObservation>>,
+    mut commands: Commands,
+) {
+    for (entity, mut app) in &mut apps {
+        if app.observe().is_ok_and(|ready| ready) {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<PendingApplicationObservation>();
+            }
+            debug!("application observers ready for pid {}", app.pid());
+        }
+    }
+}
+
+// Creation notifications can arrive while AX is unresponsive,
+// or before update_frame can read a usable rect. Retaining an observer alone
+// cannot replay that event. Retry newly launched applications with no managed
+// children at one-second intervals for a bounded recovery window, and despawn
+// headless or permanently unobservable processes once that window expires.
+pub(super) fn recover_windowless_applications(
+    mut apps: RecoverableApplications,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    for (entity, app, child_of, recovery, pending_observation) in &mut apps {
+        if !pending_observation && let Some(app) = app {
+            let windows = app.window_list(&config);
+            if !windows.windows.is_empty() {
+                commands.trigger(SpawnWindowTrigger(windows.windows));
+                continue;
+            }
+        }
+        if let Some(mut recovery) = recovery {
+            recovery.0 = recovery.0.saturating_sub(1);
+            if recovery.0 > 0 {
+                continue;
+            }
+            let despawn_target = if app.is_none() {
+                Some(entity)
+            } else if pending_observation {
+                Some(child_of.map_or(entity, ChildOf::parent))
+            } else {
+                None
+            };
+            if let Some(target) = despawn_target {
+                if let Ok(mut entity_commands) = commands.get_entity(target) {
+                    entity_commands.try_despawn();
+                }
+            } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<PendingWindowRecovery>();
             }
         }
     }
@@ -1598,6 +1703,34 @@ fn adopt_refused_frame(
     }
 }
 
+/// Spawns a process that was already running at startup. One that isn't
+/// Regular yet, such as an app keeping its Dock icon hidden while it sits in
+/// the menu bar, is kept with its activation policy watched (`ready` arms
+/// that), so it is adopted when it turns Regular, as a launched one is.
+pub(crate) fn spawn_initial_process(mut process: BProcess, forced: bool, commands: &mut Commands) {
+    if process.is_observable() || forced {
+        if forced {
+            debug!(
+                "Forcing management of existing process '{}' despite unobservable policy.",
+                process.name()
+            );
+            process.force_manage(true);
+        } else {
+            debug!("Adding existing process {}", process.name());
+        }
+        commands.spawn((ExistingMarker, process));
+    } else if process.ready() {
+        // Turned Regular since `is_observable` asked.
+        commands.spawn((ExistingMarker, process));
+    } else {
+        debug!(
+            "Existing application '{}' is not observable yet, watching its activation policy.",
+            process.name(),
+        );
+        commands.spawn(process);
+    }
+}
+
 pub(crate) fn gather_initial_processes(
     receiver: Option<NonSendMut<Receiver<Event>>>,
     config: Res<Config>,
@@ -1637,28 +1770,9 @@ pub(crate) fn gather_initial_processes(
         display.set_menubar_height_override(height);
     }
 
-    while let Some(mut process) = initial_processes.pop() {
+    while let Some(process) = initial_processes.pop() {
         let forced = config.should_force_manage_process(&**process);
-
-        if process.is_observable() || forced {
-            if forced {
-                debug!(
-                    "Forcing management of existing process '{}' despite unobservable policy.",
-                    process.name()
-                );
-                process.force_manage(true);
-            } else {
-                debug!("Adding existing process {}", process.name());
-            }
-            commands.spawn((ExistingMarker, process));
-        } else {
-            debug!(
-                "Existing application '{}' is not observable, watching it.",
-                process.name(),
-            );
-            let watch = launch_watch(process.name(), &mut commands);
-            commands.spawn((watch, process));
-        }
+        spawn_initial_process(process, forced, &mut commands);
     }
 }
 
@@ -1799,16 +1913,35 @@ pub(super) fn update_overlays(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_frame(
     active_display: Option<ActiveDisplay>,
+    strips: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<&Display>,
     mut windows: ChangedWindowFrames,
 ) {
-    let display_bounds = active_display.map(|display| display.bounds());
-    windows
-        .par_iter_mut()
-        .for_each(|(mut window, position, bounds, width_ratio, covered)| {
-            let size = match (bounds, width_ratio, display_bounds) {
-                (Some(bounds), Some(mut width_ratio), Some(display_bounds)) => {
-                    if bounds.is_changed() {
-                        width_ratio.0 = f64::from(bounds.0.x) / f64::from(display_bounds.width());
+    let fallback_width = active_display.map(|display| display.bounds().width());
+    let widths: bevy::ecs::entity::EntityHashMap<i32> = windows
+        .iter()
+        .filter_map(|(entity, _, _, bounds, width_ratio, _)| {
+            (bounds.as_ref().is_some_and(DetectChanges::is_changed) && width_ratio.is_some())
+                .then(|| {
+                    let width = strips
+                        .iter()
+                        .find(|(strip, _)| strip.contains(entity))
+                        .and_then(|(_, parent)| displays.get(parent.parent()).ok())
+                        .map(|display| display.bounds().width())
+                        .or(fallback_width)?;
+                    Some((entity, width))
+                })
+                .flatten()
+        })
+        .collect();
+    windows.par_iter_mut().for_each(
+        |(entity, mut window, position, bounds, width_ratio, covered)| {
+            let size = match (bounds, width_ratio) {
+                (Some(bounds), Some(mut width_ratio)) => {
+                    if bounds.is_changed()
+                        && let Some(&display_width) = widths.get(&entity)
+                    {
+                        width_ratio.0 = f64::from(bounds.0.x) / f64::from(display_width);
                     }
                     Some(bounds.0)
                 }
@@ -1827,7 +1960,8 @@ pub(super) fn commit_window_frame(
                 (None, Some(size)) => window.resize(size),
                 (None, None) => {}
             });
-        });
+        },
+    );
 }
 
 /// Ends each window's [`PlacedUnderCover`] once its frame is written.

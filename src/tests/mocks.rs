@@ -613,6 +613,12 @@ impl MockState {
         }
     }
 
+    /// The windows raised since this was last called, in the order they were.
+    #[allow(dead_code)]
+    pub fn take_raised(&self) -> Vec<WinID> {
+        std::mem::take(&mut self.inner.force_write().raised)
+    }
+
     #[allow(dead_code)]
     pub fn set_window_unordered(&self, window_id: WinID, unordered: bool) {
         let mut inner = self.inner.force_write();
@@ -1983,6 +1989,15 @@ impl MockState {
 
     #[allow(clippy::too_many_lines)]
     pub fn create_application(&self, pid: Pid) -> Application {
+        self.create_application_with_observer(pid, || Ok(true))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn create_application_with_observer(
+        &self,
+        pid: Pid,
+        _observe: impl FnMut() -> crate::errors::Result<bool> + Send + 'static,
+    ) -> Application {
         let mut ma = MockApplicationApi::new();
         let s = self.clone();
 
@@ -2296,8 +2311,14 @@ impl MockState {
             .returning(move || s.inner.force_read().windows.keys().copied().collect());
 
         let s = self.clone();
-        wm.expect_window_owner()
-            .returning(move |id| s.inner.force_read().windows.get(&id).map(|w| w.pid));
+        wm.expect_window_owner().returning(move |window_id| {
+            let inner = s.inner.force_read();
+            inner
+                .windows
+                .get(&window_id)
+                .map(|w| w.pid)
+                .or_else(|| inner.stale_window_ids.get(&window_id).copied())
+        });
 
         let s = self.clone();
         wm.expect_warp_mouse()

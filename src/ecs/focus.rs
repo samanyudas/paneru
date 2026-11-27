@@ -27,7 +27,9 @@ use super::{
     FocusedMarker, MouseHeldMarker, PointerFollowsFocus, SystemTheme, Timeout, Unmanaged,
     VerifyFocus, WindowFocusQuestion,
 };
+use crate::commands::visible_floating_entities;
 use crate::config::Config;
+use crate::ecs::display::FloatingLayer;
 use crate::ecs::drag::DragState;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
 use crate::ecs::maximize::FloatingMaximized;
@@ -607,6 +609,22 @@ fn detect_focus_rejection(
             continue;
         }
 
+        // A busy application, such as a browser playing video, can take longer
+        // than the first wait to act on the request, and then still reports the
+        // window it had focused before. Ask once more and wait longer, so only
+        // an application that keeps refusing gets its window floated.
+        if !verify.asked_again {
+            debug!(
+                "app focused window {} instead of {}; asking again.",
+                actual_window.id(),
+                target_window.id(),
+            );
+            verify.asked_again = true;
+            timeout.timer = Timer::new(VERIFY_FOCUS_AGAIN_TIMEOUT, TimerMode::Once);
+            commands.focus_entity(target_entity, true);
+            continue;
+        }
+
         info!(
             "focus rejection detected: requested window {} ({target_entity}), app focused window {} ({actual_entity}) instead; floating {target_entity}.",
             target_window.id(),
@@ -880,6 +898,9 @@ fn focus_window_trigger(
 fn raise_window_trigger(
     trigger: On<RaiseWindow>,
     windows: Query<(Entity, &Window, &Position, &Bounds)>,
+    all_windows: Windows,
+    floating_layers: Query<&FloatingLayer>,
+    window_manager: Res<WindowManager>,
     active_display: ActiveDisplay,
     config: Res<Config>,
 ) {
@@ -909,6 +930,30 @@ fn raise_window_trigger(
             .for_each(|(_, window, _, _)| {
                 window.raise_without_focus();
             });
+
+        // Raising the strip buried the floats, which a workspace switch would
+        // otherwise leave behind every tile. They go back over the other
+        // tiles, still under the focused window, unless the workspace has
+        // sent them behind on purpose.
+        let workspace_id = strip.id();
+        let floats_in_front = floating_layers
+            .iter()
+            .find(|layer| layer.workspace_id == workspace_id)
+            .is_none_or(|layer| layer.front);
+        if floats_in_front {
+            visible_floating_entities(
+                &all_windows,
+                &window_manager,
+                workspace_id,
+                active_display.bounds(),
+            )
+            .into_iter()
+            .filter(|&entity| entity != focus && !strip.contains(entity))
+            .filter_map(|entity| windows.get(entity).ok())
+            .for_each(|(_, window, _, _)| {
+                window.raise_without_focus();
+            });
+        }
     }
 
     // Raise the focused window last, because raised windows get OS focus events.
@@ -1198,7 +1243,6 @@ mod tests {
     use bevy::ecs::world::World;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI32, Ordering};
-
     #[test]
     fn overlapping_order_stays_idle_without_changes() {
         let mut harness = crate::tests::TestHarness::new().with_windows(1);

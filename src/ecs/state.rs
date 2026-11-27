@@ -178,6 +178,31 @@ pub use crate::types::state::{
     WindowState as PaneruWindowState,
 };
 
+/// Each tiled window's column in the strip and row within that column, both
+/// zero-based. Tabs share their row; a stack's tab group is one row of it.
+fn strip_positions(strip: &LayoutStrip) -> HashMap<Entity, (u32, u32)> {
+    let mut positions = HashMap::new();
+    for (column, windows) in (0u32..).zip(strip.columns()) {
+        match windows {
+            Column::Single(entity) | Column::Fullscreen(entity) => {
+                positions.insert(*entity, (column, 0));
+            }
+            Column::Tabs(tabs) => {
+                positions.extend(tabs.iter().map(|&entity| (entity, (column, 0))));
+            }
+            Column::Stack(items) => {
+                for (row, item) in (0u32..).zip(items) {
+                    positions.extend(item.window_iter().map(|entity| (entity, (column, row))));
+                }
+            }
+            Column::Maximized(_) => {
+                positions.extend(windows.window_iter().map(|entity| (entity, (column, 0))));
+            }
+        }
+    }
+    positions
+}
+
 /// Resolves which display a window frame is on and whether more than a sliver of
 /// it is showing there. Returns `None` when the frame misses every display.
 fn window_visibility(
@@ -848,6 +873,7 @@ fn extract_query_state(
 
     let has_floating = has_floating_windows(windows);
     for (child, strip, active_workspace, selected_workspace) in workspaces {
+        let positions = strip_positions(strip);
         let query_space =
             active_workspace || selected_workspace && active_workspace_id != Some(strip.id());
         let floating =
@@ -877,6 +903,9 @@ fn extract_query_state(
                 let visibility = frame
                     .and_then(|frame| window_visibility(frame, displays, sliver_width))
                     .map(|(display_id, visible)| (display_id, visible && !hidden));
+                let (column, row) = positions
+                    .get(&entity)
+                    .map_or((None, None), |&(column, row)| (Some(column), Some(row)));
                 Some(PaneruWindowState {
                     window_id: window.id(),
                     bundle_id,
@@ -894,6 +923,9 @@ fn extract_query_state(
                         height: frame.height(),
                     }),
                     visible: visibility.is_some_and(|(_, visible)| visible),
+                    column,
+                    row,
+                    tabbed: strip.is_tabbed_display(entity),
                 })
             })
             .collect::<Vec<_>>();
@@ -919,6 +951,7 @@ fn extract_query_state(
             number,
             native_workspace_id: strip.id(),
             active: active_workspace,
+            shown: query_space,
             windows: row_windows,
         });
 
@@ -941,6 +974,7 @@ fn extract_query_state(
                     number,
                     native_workspace_id: workspace_id,
                     active: false,
+                    shown: false,
                     windows: Vec::new(),
                 });
             }

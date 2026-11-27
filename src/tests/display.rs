@@ -772,6 +772,59 @@ fn test_vertical_swap_within_stack_stays_on_display() {
         .run(commands);
 }
 
+/// Paneru's exit cleanup centers each window on its own display. A hidden
+/// workspace's windows are parked at the display's bottom-right corner, so
+/// their centers lie in the display below; they used to be centered there.
+#[test]
+fn test_exit_keeps_hidden_windows_on_their_display() {
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(
+            0,
+            TEST_DISPLAY_HEIGHT,
+            EXT_DISPLAY_WIDTH,
+            TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
+        ),
+        vec![EXT_WORKSPACE_ID],
+    );
+
+    let commands = vec![
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(1)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    harness
+        .on_iteration(1, |world, _state| {
+            // Run the cleanup alone: a frame would also run the exit save,
+            // which writes the user's real state file.
+            world.write_message(AppExit::Success);
+            world
+                .run_system_once(crate::ecs::systems::cleanup_on_exit)
+                .expect("the exit cleanup runs");
+            world.resource_mut::<Messages<AppExit>>().clear();
+
+            let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+            let mut query = world.query::<&crate::manager::Window>();
+            for window in query.iter(world) {
+                let frame = window.frame();
+                assert!(
+                    display.contains(frame.min) && display.contains(frame.max),
+                    "window {} centered at {:?}, off its own display",
+                    window.id(),
+                    frame
+                );
+            }
+        })
+        .run(commands);
+}
+
 /// Focusing a window on another display and coming back must not re-derive the
 /// strip offset on the display we left: the centering the user asked for there
 /// is still what they want to see when they return.
@@ -3409,4 +3462,55 @@ fn test_move_to_display_appends_when_join_column_fails() {
         "window 0 should be appended as its own new column after join_column fails"
     );
     assert_eq!(strip.get(1).ok(), Some(Column::Single(entity)));
+}
+
+/// A window's width is kept as a share of its own display, not of the one
+/// with focus: 960 wide on the 1920 monitor is half, though the laptop has
+/// focus.
+#[test]
+fn test_a_window_keeps_its_share_of_its_own_display() {
+    let mut harness = TestHarness::new();
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+    let ext_origin = Origin::new(0, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        EXT_WORKSPACE_ID,
+        100,
+        IRect::from_corners(ext_origin, ext_origin + size),
+    );
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        200,
+        IRect::from_corners(Origin::new(0, 0), Size::new(0, 0) + size),
+    );
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 200 },
+        Event::MenuOpened { window_id: 200 },
+        Event::MenuOpened { window_id: 200 },
+    ];
+    harness
+        .on_iteration(1, |world, _state| {
+            let entity = crate::tests::harness::find_window_entity(100, world);
+            let mut bounds = world.get_mut::<crate::ecs::Bounds>(entity).expect("bounds");
+            bounds.0.x = EXT_DISPLAY_WIDTH / 2;
+        })
+        .on_iteration(2, |world, _state| {
+            let entity = crate::tests::harness::find_window_entity(100, world);
+            let ratio = world
+                .get::<crate::ecs::WidthRatio>(entity)
+                .expect("ratio")
+                .0;
+            assert!(
+                (ratio - 0.5).abs() < 0.01,
+                "half the monitor's width is a share of 0.5, not {ratio}"
+            );
+        })
+        .run(commands);
 }

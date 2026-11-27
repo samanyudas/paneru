@@ -208,6 +208,70 @@ fn test_edge_touching_focus_during_center_animation_returns_into_view() {
     );
 }
 
+// Exercise late AX readiness through the production lifecycle.
+#[test]
+fn delayed_application_keeps_observer_and_discovers_late_window() {
+    use crate::ecs::{BProcess, FreshMarker, Timeout};
+    use crate::manager::Application;
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.advance(Duration::from_secs(1));
+    let pid = 42;
+    harness.mock_state.spawn_app(pid, "org.gnu.Emacs", "Emacs");
+    let mut wm = harness.mock_state.create_window_manager();
+    let state = harness.mock_state.clone();
+    wm.expect_new_application()
+        .returning(move |process| Ok(state.create_application(process.pid())));
+    harness
+        .world()
+        .insert_resource(crate::manager::WindowManager(Box::new(wm)));
+    let process = harness.mock_state.create_process(pid);
+    harness
+        .world()
+        .spawn((BProcess(Box::new(process)), FreshMarker));
+    harness.advance(Duration::from_secs(12));
+    let world = harness.world();
+    let app_entity = world
+        .query::<(Entity, &Application)>()
+        .iter(world)
+        .find(|(_, app)| app.pid() == pid)
+        .map(|(entity, _)| entity)
+        .expect("timeout must retain application and AX observer");
+    assert!(world.get::<FreshMarker>(app_entity).is_none());
+    assert!(world.get::<Timeout>(app_entity).is_none());
+    assert!(
+        world
+            .get::<crate::ecs::systems::PendingWindowRecovery>(app_entity)
+            .is_some()
+    );
+
+    // No second creation/focus event: AX becomes usable after polling expires.
+    harness.mock_state.spawn_window(
+        pid,
+        TEST_WORKSPACE_ID,
+        42,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    harness.advance(Duration::from_secs(2));
+    find_window_entity(42, harness.world());
+    harness.advance(Duration::from_secs(2));
+    let world = harness.world();
+    assert!(
+        world
+            .get::<crate::ecs::systems::PendingWindowRecovery>(app_entity)
+            .is_none(),
+        "window discovery must clear post-launch recovery polling"
+    );
+    assert_eq!(
+        world
+            .query::<&Window>()
+            .iter(world)
+            .filter(|w| w.id() == 42)
+            .count(),
+        1
+    );
+}
+
 #[derive(Resource, Default)]
 struct PagingHapticCount(usize);
 
@@ -871,11 +935,12 @@ fn keyboard_focus_in_same_frame_does_not_stall_later_pages() {
 
 /// Fingers that touch the trackpad while the strip still moves stop it.
 #[test]
-#[allow(clippy::float_cmp)]
 fn test_scrolling_stop() {
     let config: Config = (
         MainOptions {
             swipe_gesture_fingers: Some(3),
+            // Slow enough to still be coasting a whole command later.
+            swipe_deceleration: Some(0.1),
             ..Default::default()
         },
         vec![],
@@ -1847,13 +1912,13 @@ fn toggle_floating_layer_flips_state() {
         .with_config(Config::default())
         .with_windows(3)
         .on_iteration(0, |world, _state| {
-            assert!(!current_layer(world).front);
+            assert!(current_layer(world).front, "floats start in front");
         })
         .on_iteration(1, |world, _state| {
-            assert!(current_layer(world).front);
+            assert!(!current_layer(world).front);
         })
         .on_iteration(2, |world, _state| {
-            assert!(!current_layer(world).front);
+            assert!(current_layer(world).front);
         })
         .run(commands);
 }
@@ -1876,6 +1941,9 @@ fn focus_unmanaged_ignores_floats_from_other_workspaces() {
         Event::MenuOpened { window_id: 0 },
         Event::Command {
             command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::FocusUnmanaged),
         },
         Event::Command {
             command: Command::Window(Operation::FocusUnmanaged),
@@ -2305,7 +2373,8 @@ fn test_stack_unstack_brings_focused_window_into_view() {
 
         assert!(
             position.x < -(TEST_WINDOW_WIDTH / 4),
-            "focused window should be somewhat offscreen after the scroll."
+            "focused window should be somewhat offscreen after the scroll, got x={}",
+            position.x
         );
     }
 
@@ -2330,7 +2399,6 @@ fn test_stack_unstack_brings_focused_window_into_view() {
 
     // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable.
     let harness = TestHarness::new().with_config(config).with_windows(5);
-
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {

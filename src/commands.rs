@@ -337,7 +337,8 @@ fn crossing_landing(
     focus_history.last_focused_in(&column)
 }
 
-fn visible_floating_entities(
+/// Floating windows of `workspace_id` that are on `display_bounds`.
+pub(crate) fn visible_floating_entities(
     windows: &Windows,
     window_manager: &WindowManager,
     workspace_id: WorkspaceId,
@@ -762,9 +763,11 @@ fn command_toggle_floating_layer(
             }
         })
         .unwrap_or_else(|| {
-            let layer = FloatingLayer::new(workspace_id);
+            // Started in front, so this first toggle puts it behind.
+            let mut layer = FloatingLayer::new(workspace_id);
+            layer.flip();
             commands.spawn((layer, ChildOf(active_display.entity())));
-            false
+            layer.front
         });
 
     if floating_front {
@@ -1023,6 +1026,9 @@ fn command_center_window(
             commands.reposition_entity(entity, origin);
         }
 
+        // Centering moves the window, not the pointer, unless the pointer is
+        // asked to follow focus. Warping regardless also re-associates the
+        // pointer, which undoes a hold another app has on it mid-gesture.
         if config.mouse_follows_focus() {
             window_manager.warp_mouse(active_display.bounds().center());
         }

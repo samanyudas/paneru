@@ -20,16 +20,15 @@ use tracing::{debug, warn};
 use crate::commands::{Command, Operation, Side};
 use crate::config::Config;
 use crate::ecs::drag::NativeResizeStart;
-use crate::ecs::focus::FocusWindow;
-use crate::ecs::layout::{Column, LayoutStrip, RestoreTo, StackItem, effective_stack_limit};
+use crate::ecs::layout::{Column, LayoutStrip, RestoreTo, effective_stack_limit};
 use crate::ecs::maximize::restore_tiled;
 use crate::ecs::params::Windows;
 use crate::ecs::{
-    ActiveWorkspaceMarker, DockPosition, SendMessageTrigger, SpawnCommandsExt, Unmanaged,
-    WidthRatio, Window,
+    ActiveWorkspaceMarker, DockPosition, SendMessageTrigger, SpawnCommandsExt, Unmanaged, Window,
 };
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size};
+use crate::util::round_px;
 
 type Workspaces<'w, 's> = Query<
     'w,
@@ -37,7 +36,7 @@ type Workspaces<'w, 's> = Query<
     (
         &'static mut LayoutStrip,
         Has<ActiveWorkspaceMarker>,
-        &'static ChildOf,
+        Option<&'static ChildOf>,
     ),
     Without<Window>,
 >;
@@ -110,10 +109,7 @@ fn apply(
     match op {
         LayoutOp::Focus(_) => {
             let entity = entity.expect("Focus names a window");
-            commands.trigger(FocusWindow {
-                entity,
-                raise: true,
-            });
+            commands.focus_entity(entity, true);
         }
 
         LayoutOp::Swap(_, other) => {
@@ -207,38 +203,44 @@ fn apply(
                     }
                 }
             }
-            // The layout pipeline turns the ratio into an actual width against
-            // whichever display the window is on, so this does not have to.
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_insert(WidthRatio(ratio));
-            }
-            // Stacked siblings share a column, and so its width.
-            if let Some((strip, ..)) = workspaces.iter().find(|(strip, ..)| strip.contains(entity))
-                && let Some(Column::Stack(stack)) = strip
-                    .index_of(entity)
-                    .ok()
-                    .and_then(|index| strip.get(index).ok())
-            {
-                for sibling in stack.iter().flat_map(StackItem::window_iter) {
-                    if sibling != entity
-                        && let Ok(mut entity_commands) = commands.get_entity(sibling)
-                    {
-                        entity_commands.try_insert(WidthRatio(ratio));
-                    }
-                }
-            }
-            // A stored ratio does not resize anything by itself: no system
-            // reacts to `WidthRatio` changes, and the next bounds sync
-            // recomputes it from the live frame, discarding the request. The
-            // interactive resize path (`resize_window`, used by the menubar
-            // width picker) does the real work — pixel size, viewport
-            // clamping, stacked siblings, reshuffle — but only for the
-            // focused window, so route through it when we can.
+            // The interactive resize path (`resize_window`, used by the menubar
+            // width picker) does the real work for the focused window: pixel
+            // size, viewport clamping, stacked siblings, reshuffle.
             if focused {
                 commands.trigger(SendMessageTrigger(Event::Command {
                     command: Command::Window(Operation::SetWidth(ratio)),
                 }));
                 return;
+            }
+            // Any other window is resized here, against the usable width of
+            // the display its strip is on. Storing a `WidthRatio` would not
+            // do: nothing reacts to it, and the next bounds sync recomputes it
+            // from the live frame.
+            let Some((strip, _, parent)) = workspaces
+                .iter()
+                .find(|(strip, _, _)| strip.contains(entity))
+            else {
+                debug!(target: "paneru::lua", "skipping {op:?}: the window is in no strip");
+                return;
+            };
+            let Some(viewport) = parent
+                .and_then(|parent| displays.get(parent.parent()).ok())
+                .map(|(display, dock)| display.actual_display_bounds(dock, config))
+            else {
+                debug!(target: "paneru::lua", "skipping {op:?}: the strip is on no display");
+                return;
+            };
+            let width = round_px(ratio * f64::from(viewport.width()));
+            // Stacked siblings share a column, and so its width.
+            let members: Vec<Entity> = strip
+                .index_of(entity)
+                .ok()
+                .and_then(|index| strip.get(index).ok())
+                .map_or_else(|| vec![entity], |column| column.window_iter().collect());
+            for member in members {
+                if let Some(size) = windows.size(member) {
+                    commands.resize_entity(member, size.with_x(width));
+                }
             }
             commands.reshuffle_around(entity);
         }
@@ -280,11 +282,7 @@ fn apply(
             };
             // The window, and a maximized column it would join, are restored
             // where they stand first, as for the stack commands.
-            let target = workspaces
-                .iter()
-                .find(|(strip, ..)| strip.contains(entity))
-                .and_then(|(strip, ..)| strip.left_neighbour(entity));
-            for window in std::iter::once(entity).chain(target) {
+            for window in [entity, onto_entity] {
                 restore_first(
                     window,
                     |_| RestoreTo::Here,
@@ -301,6 +299,27 @@ fn apply(
                 debug!(target: "paneru::lua", "skipping {op:?}: the two windows share no strip");
                 return;
             };
+            let (Ok(entity_index), Ok(onto_index)) =
+                (strip.index_of(entity), strip.index_of(onto_entity))
+            else {
+                return;
+            };
+            if entity_index == onto_index
+                || [entity_index, onto_index]
+                    .iter()
+                    .any(|&at| matches!(strip.get(at), Ok(Column::Fullscreen(_))))
+            {
+                return;
+            }
+            // `LayoutStrip::stack` joins a column onto its left neighbour, so
+            // first bring the window, alone, to just right of `onto`'s column:
+            // the window set told the script it would land in `onto`'s column,
+            // not in whichever one happened to sit to its left.
+            strip.remove(entity);
+            let Ok(index) = strip.index_of(onto_entity) else {
+                return;
+            };
+            strip.insert_at(index + 1, entity);
             if strip.stack(entity, Side::West).is_err() {
                 debug!(target: "paneru::lua", "skipping {op:?}: the layout refused the stack");
                 return;
@@ -383,7 +402,7 @@ fn restore_first(
     config: &Config,
     commands: &mut Commands,
 ) {
-    if let Some((mut strip, _, child_of)) = workspaces
+    if let Some((mut strip, _, Some(child_of))) = workspaces
         .iter_mut()
         .find(|(strip, ..)| strip.maximized(entity).is_some())
         && let Ok((display, dock)) = displays.get(child_of.parent())

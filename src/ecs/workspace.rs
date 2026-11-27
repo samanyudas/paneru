@@ -6,8 +6,9 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::Add;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Added, Has, With, Without};
+use bevy::ecs::query::{Added, Changed, Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
+use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::ecs::world::World;
 use bevy::time::Time;
@@ -24,9 +25,9 @@ use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, origin_exposing};
 use crate::ecs::native_membership::{NativeMembership, NativeScope};
 use crate::ecs::params::Windows;
 use crate::ecs::{
-    ActiveWorkspaceMarker, DockPosition, FocusedMarker, ManualStripOffset, NativeFullscreenMarker,
-    PointerFollowsFocus, Position, RaiseWindow, RepositionMarker, Scrolling, SelectedVirtualMarker,
-    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
+    ActiveWorkspaceMarker, DockPosition, FocusedMarker, Initializing, ManualStripOffset,
+    NativeFullscreenMarker, PointerFollowsFocus, Position, RaiseWindow, RepositionMarker,
+    Scrolling, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{Display, Origin, Window, WindowManager};
@@ -91,6 +92,19 @@ type PopupStrips<'w, 's> = Query<
     ),
 >;
 
+/// Strips whose layout changed this tick, along with whether they are shown.
+type ChangedStrips<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        &'static LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+    ),
+    Changed<LayoutStrip>,
+>;
+
 impl Plugin for WorkspaceEventsPlugin {
     fn build(&self, app: &mut App) {
         const DISPLAY_CHANGE_CHECK_FREQ: Duration = Duration::from_secs(1);
@@ -120,6 +134,10 @@ impl Plugin for WorkspaceEventsPlugin {
             (
                 merge_strips_per_space,
                 reap_empty_virtual_workspaces.run_if(reap_workspaces),
+                reap_emptied_virtual_workspaces
+                    .run_if(reap_workspaces)
+                    .run_if(not(resource_exists::<Initializing>))
+                    .run_if(not(resource_exists::<super::restore::SessionRestore>)),
                 workspace_change_handler,
                 workspace_created_handler,
             )
@@ -871,6 +889,42 @@ fn merge_strips_per_space(mut set: MergeStrips, mut commands: Commands) {
         if let Some(position) = kept_position {
             position.set_changed();
         }
+    }
+}
+
+/// Removes a workspace as its last window leaves it, while another is shown:
+/// otherwise it lingers, empty, until the active workspace next changes, and
+/// next/previous step into it. Only one that has had windows goes: one made
+/// empty (`default_workspaces`, a restore's place, a switch to a new number)
+/// is somewhere to go, and stays until it's left, as `reap_empty_virtual_workspaces`
+/// has it. Neither the first, nor one a display shows.
+fn reap_emptied_virtual_workspaces(
+    changed_strips: ChangedStrips,
+    all_strips: Query<Entity, With<LayoutStrip>>,
+    mut lengths: Local<EntityHashMap<usize>>,
+    mut commands: Commands,
+) {
+    lengths.retain(|&entity, _| all_strips.contains(entity));
+    for (entity, strip, active, selected) in &changed_strips {
+        let len = strip.len();
+        let had = lengths.get(&entity).copied().unwrap_or(0);
+        if had > 0
+            && len == 0
+            && !active
+            && !selected
+            && strip.virtual_index > 0
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            debug!(
+                "reaping virtual workspace {} of space {}, emptied",
+                strip.virtual_index,
+                strip.id()
+            );
+            lengths.remove(&entity);
+            entity_commands.try_despawn();
+            continue;
+        }
+        lengths.insert(entity, len);
     }
 }
 

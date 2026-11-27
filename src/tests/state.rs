@@ -581,6 +581,7 @@ fn current_window(
         identifier: "main".to_string(),
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
+        workspace_id: None,
     }
 }
 
@@ -699,6 +700,75 @@ fn test_query_state_includes_floating_windows() {
     assert_eq!(state.virtual_workspaces[0].windows.len(), 1);
     assert!(state.virtual_workspaces[0].windows[0].focused);
     assert!(state.virtual_workspaces[0].windows[0].floating);
+    assert_eq!(state.virtual_workspaces[0].windows[0].column, None);
+    assert_eq!(state.virtual_workspaces[0].windows[0].row, None);
+}
+
+#[test]
+fn test_query_state_reports_each_tiled_window_column_and_row() {
+    use crate::tests::harness::TestHarness;
+
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.app.update();
+
+    let world = harness.world();
+    let mut strips = world.query_filtered::<&mut LayoutStrip, With<ActiveWorkspaceMarker>>();
+    let mut strip = strips.single_mut(world).expect("active workspace");
+    let last = strip.all_windows()[2];
+    strip
+        .stack(last, crate::commands::Side::West)
+        .expect("the last column stacks onto its neighbour");
+
+    let state = extract_query_state(world).expect("query state extraction");
+    let positions = state.virtual_workspaces[0]
+        .windows
+        .iter()
+        .map(|window| (window.column, window.row))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        positions,
+        vec![(Some(0), Some(0)), (Some(1), Some(0)), (Some(1), Some(1))],
+        "a stacked window shares its column and sits in the row below"
+    );
+}
+
+#[test]
+fn test_query_state_reports_a_stack_shown_as_tabs() {
+    use crate::tests::harness::TestHarness;
+
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.app.update();
+
+    let world = harness.world();
+    let mut strips = world.query_filtered::<&mut LayoutStrip, With<ActiveWorkspaceMarker>>();
+    let mut strip = strips.single_mut(world).expect("active workspace");
+    let last = strip.all_windows()[2];
+    strip
+        .stack(last, crate::commands::Side::West)
+        .expect("the last column stacks onto its neighbour");
+    let tabbed = |world: &mut World| {
+        extract_query_state(world)
+            .expect("query state extraction")
+            .virtual_workspaces[0]
+            .windows
+            .iter()
+            .map(|window| window.tabbed)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(tabbed(world), vec![false, false, false], "a split stack");
+
+    let mut strip = strips.single_mut(world).expect("active workspace");
+    assert_eq!(strip.toggle_tabbed_display(last), Some(true));
+    assert_eq!(
+        tabbed(world),
+        vec![false, true, true],
+        "every window of the stack, and only those, is shown as a tab"
+    );
+
+    let mut strip = strips.single_mut(world).expect("active workspace");
+    assert_eq!(strip.toggle_tabbed_display(last), Some(false));
+    assert_eq!(tabbed(world), vec![false, false, false], "split again");
 }
 
 #[test]
@@ -746,6 +816,72 @@ fn test_query_state_assigns_float_only_to_active_row() {
 
     assert_eq!(occurrences, 1);
     assert_eq!(active.windows[0].window_id, 0);
+}
+
+#[test]
+fn test_query_state_shown_is_the_row_each_space_shows() {
+    use crate::tests::EXT_WORKSPACE_ID;
+    use crate::tests::harness::TestHarness;
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.app.update();
+
+    let world = harness.world();
+    let display_entity = world
+        .query_filtered::<Entity, With<ActiveDisplayMarker>>()
+        .single(world)
+        .expect("active display");
+    let (active_strip_entity, active_index) = world
+        .query_filtered::<(Entity, &LayoutStrip), With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .map(|(entity, strip)| (entity, strip.virtual_index))
+        .expect("active workspace");
+
+    // On the focused space, a selection that has moved off the active row
+    // leaves the active row the one shown.
+    world
+        .entity_mut(active_strip_entity)
+        .remove::<SelectedVirtualMarker>();
+    world.spawn((
+        LayoutStrip::new(TEST_WORKSPACE_ID, active_index + 1),
+        ChildOf(display_entity),
+        SelectedVirtualMarker,
+    ));
+    // A space without focus shows its selected row, not its lowest-numbered.
+    for index in 0..3 {
+        let mut strip = world.spawn((
+            LayoutStrip::new(EXT_WORKSPACE_ID, index),
+            ChildOf(display_entity),
+        ));
+        if index == 2 {
+            strip.insert(SelectedVirtualMarker);
+        }
+    }
+
+    let state = extract_query_state(world).expect("query state extraction");
+    let shown = |space: u64, number: u32| {
+        state
+            .virtual_workspaces
+            .iter()
+            .find(|row| row.native_workspace_id == space && row.number == number)
+            .unwrap_or_else(|| panic!("row {space}/{number} missing from the query state"))
+            .shown
+    };
+
+    assert!(shown(TEST_WORKSPACE_ID, active_index + 1), "the active row");
+    assert!(
+        !shown(TEST_WORKSPACE_ID, active_index + 2),
+        "selected, not active"
+    );
+    assert!(
+        !shown(EXT_WORKSPACE_ID, 1),
+        "parked, though lowest-numbered"
+    );
+    assert!(!shown(EXT_WORKSPACE_ID, 2), "parked");
+    assert!(
+        shown(EXT_WORKSPACE_ID, 3),
+        "selected on a space without focus"
+    );
 }
 
 #[test]
@@ -1033,6 +1169,104 @@ fn test_layout_ops_apply_to_the_named_window_not_the_focused_one() {
         .collect();
     assert_eq!(swapped, vec![order[0], right, left]);
     assert_eq!(after.focused(), Some(focused), "the focus did not move");
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn test_layout_op_stack_lands_in_the_named_column() {
+    use crate::commands::Command;
+    use crate::tests::harness::TestHarness;
+    use crate::types::windowset::LayoutOp;
+
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.app.update();
+
+    let columns = |harness: &mut TestHarness| -> Vec<Vec<i32>> {
+        extract_window_set(harness.world())
+            .expect("window set extraction")
+            .current()
+            .expect("an active workspace")
+            .columns
+            .iter()
+            .map(|column| column.windows.iter().map(|window| window.id).collect())
+            .collect()
+    };
+    let before = columns(&mut harness);
+    assert_eq!(before.len(), 3);
+    let (first, middle, last) = (before[0][0], before[1][0], before[2][0]);
+
+    // Onto the first column, not the middle one that sits to its left: the
+    // window set promised the script `onto`'s column, and so should the layout.
+    harness.app.world_mut().write_message(Event::Command {
+        command: Command::Layout(vec![LayoutOp::Stack {
+            window: last,
+            onto: first,
+            tabs: false,
+        }]),
+    });
+    harness.app.update();
+    harness.app.update();
+
+    assert_eq!(columns(&mut harness), vec![vec![first, last], vec![middle]]);
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn test_layout_op_stack_onto_fullscreen_column_leaves_window_in_place() {
+    use crate::commands::Command;
+    use crate::ecs::ActiveWorkspaceMarker;
+    use crate::tests::harness::{TestHarness, find_window_entity};
+    use crate::types::windowset::LayoutOp;
+
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.app.update();
+
+    let columns = |harness: &mut TestHarness| -> Vec<Vec<i32>> {
+        extract_window_set(harness.world())
+            .expect("window set extraction")
+            .current()
+            .expect("an active workspace")
+            .columns
+            .iter()
+            .map(|column| column.windows.iter().map(|window| window.id).collect())
+            .collect()
+    };
+    let before = columns(&mut harness);
+    assert_eq!(before.len(), 3);
+    let (first, middle, last) = (before[0][0], before[1][0], before[2][0]);
+
+    let first_entity = find_window_entity(first, harness.world());
+    let middle_entity = find_window_entity(middle, harness.world());
+    let last_entity = find_window_entity(last, harness.world());
+    {
+        let world = harness.world();
+        let strip_entity = world
+            .query_filtered::<Entity, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>()
+            .single(world)
+            .expect("active strip");
+        let mut strip = world
+            .get_mut::<LayoutStrip>(strip_entity)
+            .expect("layout strip");
+        *strip = LayoutStrip::fullscreen(TEST_WORKSPACE_ID, first_entity);
+        strip.append(middle_entity);
+        strip.append(last_entity);
+    }
+
+    harness.app.world_mut().write_message(Event::Command {
+        command: Command::Layout(vec![LayoutOp::Stack {
+            window: last,
+            onto: first,
+            tabs: false,
+        }]),
+    });
+    harness.app.update();
+    harness.app.update();
+
+    assert_eq!(
+        columns(&mut harness),
+        vec![vec![first], vec![middle], vec![last]],
+        "refused fullscreen stack must not move `last` next to `first`"
+    );
 }
 
 #[cfg(feature = "lua")]

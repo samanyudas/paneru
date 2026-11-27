@@ -20,8 +20,8 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 use super::{
     AboveOrdinaryCheck, ActiveDisplayMarker, AwaitingHandle, AwaitsTitleMatch, BProcess,
     DepartureConfirmed, FloatsWhenRestored, FocusedMarker, FrontSwitchQuestion,
-    MissionControlActive, OpenedHidden, PreviousManagedStrip, Rejoin, SpawnWindowTrigger,
-    StrayFocusEvent, SystemTheme, Timeout, Unmanaged, WindowFocusQuestion,
+    MissionControlActive, OpenedHidden, PreviousManagedStrip, Rejoin, SelectedVirtualMarker,
+    SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged, WindowFocusQuestion,
 };
 use crate::config::{Config, FocusOnClose};
 use crate::ecs::display::size_for_arrival;
@@ -750,6 +750,8 @@ pub(super) fn mission_control_trigger(
 
 /// Dispatches process-related messages, such as application launch and termination.
 ///
+/// Handles application launch and termination events.
+///
 /// # Arguments
 ///
 /// * `trigger` - The Bevy event trigger containing the application event.
@@ -774,7 +776,8 @@ pub(super) fn application_event_trigger(
                 // The observers of a process that was not ready sent this.
                 let watch = launch_watch(process.name(), &mut commands);
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_insert(watch);
+                    entity_commands
+                        .try_insert((watch, crate::ecs::systems::PendingWindowRecovery::default()));
                 }
             }
             Event::ApplicationLaunched { psn, observer } if find_process(*psn).is_none() => {
@@ -784,7 +787,11 @@ pub(super) fn application_event_trigger(
                     continue;
                 }
                 let watch = launch_watch(process.name(), &mut commands);
-                commands.spawn((watch, process));
+                commands.spawn((
+                    watch,
+                    crate::ecs::systems::PendingWindowRecovery::default(),
+                    process,
+                ));
             }
             _ => (),
         }
@@ -1776,6 +1783,9 @@ pub(super) fn spawn_window_trigger(
 
         // Insert the window into the internal Bevy state.
         // This insertion triggers window attributes observer.
+        if let Ok(mut app_commands) = commands.get_entity(app_entity) {
+            app_commands.try_remove::<crate::ecs::systems::PendingWindowRecovery>();
+        }
         let mut spawned = commands.spawn((
             position,
             bounds,
@@ -2170,12 +2180,62 @@ fn start_level_check(
     waits
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Finds the strip a newly created window belongs to, as `(strip, is_active)`.
+///
+/// Asks the window server which Space holds the window, starting with the active strip's
+/// Space. For another Space the target is its selected virtual row, else its lowest
+/// `virtual_index` (the same pick as `workspace_change_handler`). When the Space cannot be
+/// determined the active strip is returned, which is the historical behavior.
+fn home_strip(
+    window_id: WinID,
+    strips: &[(Entity, &LayoutStrip, bool, bool)],
+    window_manager: &WindowManager,
+) -> Option<(Entity, bool)> {
+    let (active_entity, active_id) = strips
+        .iter()
+        .find_map(|&(entity, strip, active, _)| active.then_some((entity, strip.id())))?;
+    let on_space = |space_id| {
+        window_manager
+            .windows_in_workspace(space_id)
+            .is_ok_and(|windows| windows.contains(&window_id))
+    };
+    if on_space(active_id) {
+        return Some((active_entity, true));
+    }
+
+    let mut checked = vec![active_id];
+    for (_, strip, _, _) in strips {
+        if checked.contains(&strip.id()) {
+            continue;
+        }
+        checked.push(strip.id());
+        if !on_space(strip.id()) {
+            continue;
+        }
+        let target = strips
+            .iter()
+            .filter(|(_, other, _, _)| other.id() == strip.id() && !other.is_fullscreen())
+            .min_by_key(|(_, other, _, selected)| (!selected, other.virtual_index))
+            .map(|(entity, _, _, _)| entity);
+        if let Some(entity) = target {
+            return Some((*entity, false));
+        }
+    }
+    debug!("Space of new window {window_id} unknown, using the active strip.");
+    Some((active_entity, true))
+}
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn apply_window_positions(
     added: Populated<Entity, Added<Window>>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut workspaces: Query<(
+        Entity,
+        &mut LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+    )>,
     displays: ActiveDisplays,
+    window_manager: Res<WindowManager>,
     apps: Query<&Application>,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
@@ -2185,7 +2245,10 @@ pub(super) fn apply_window_positions(
     mut ctx: WindowCtx,
 ) {
     for entity in added {
-        if workspaces.iter().any(|(strip, _)| strip.tabbed(entity)) {
+        if workspaces
+            .iter()
+            .any(|(_, strip, _, _)| strip.tabbed(entity))
+        {
             debug!("Ignoring tabbed {entity} attributes.");
             continue;
         }
@@ -2211,7 +2274,7 @@ pub(super) fn apply_window_positions(
         if properties.floating() && !overrides.contains(window, app) {
             if let Some(mut strip) = workspaces
                 .iter_mut()
-                .find_map(|(strip, _)| strip.contains(entity).then_some(strip))
+                .find_map(|(_, strip, _, _)| strip.contains(entity).then_some(strip))
             {
                 strip.remove(entity);
             }
@@ -2253,36 +2316,47 @@ pub(super) fn apply_window_positions(
 
         // During startup, the window is already inserted into some strip by finish_setup.
         let allready_inserted = workspaces
-            .iter_mut()
-            .find_map(|(strip, _)| strip.contains(entity).then_some(strip));
+            .iter()
+            .any(|(_, strip, _, _)| strip.contains(entity));
+        let mut on_hidden_space = false;
         if initializing.is_none()
-            && allready_inserted.is_none()
-            && let Some(mut strip) = workspaces
-                .iter_mut()
-                .find_map(|(strip, active)| active.then_some(strip))
+            && !allready_inserted
+            && let Some((target, is_active)) = home_strip(
+                window.id(),
+                &workspaces.iter().collect::<Vec<_>>(),
+                &window_manager,
+            )
+            && let Ok((_, mut strip, _, _)) = workspaces.get_mut(target)
         {
-            // Attempt inserting the window at a pre-defined position.
-            let insert_at = properties.insertion().map_or_else(
-                || {
-                    // Otherwise attempt inserting it after the current focus.
-                    let focused_window = ctx.windows.focused();
-                    // Insert to the right of the currently focused window
-                    focused_window
-                        .and_then(|(_, entity)| strip.index_of(entity).ok())
-                        .and_then(|insert_at| {
-                            (insert_at + 1 < strip.len()).then_some(insert_at + 1)
-                        })
-                },
-                Some,
-            );
+            if is_active {
+                // Attempt inserting the window at a pre-defined position.
+                let insert_at = properties.insertion().map_or_else(
+                    || {
+                        // Otherwise attempt inserting it after the current focus.
+                        let focused_window = ctx.windows.focused();
+                        // Insert to the right of the currently focused window
+                        focused_window
+                            .and_then(|(_, entity)| strip.index_of(entity).ok())
+                            .and_then(|insert_at| {
+                                (insert_at + 1 < strip.len()).then_some(insert_at + 1)
+                            })
+                    },
+                    Some,
+                );
 
-            debug!("New window {entity} adding at {}", *strip);
-            match insert_at {
-                Some(after) => {
-                    debug!("New window inserted at {after}");
-                    strip.insert_at(after, entity);
+                debug!("New window {entity} adding at {}", *strip);
+                match insert_at {
+                    Some(after) => {
+                        debug!("New window inserted at {after}");
+                        strip.insert_at(after, entity);
+                    }
+                    None => strip.append(entity),
                 }
-                None => strip.append(entity),
+            } else {
+                // The window opened on a Space the user is not looking at.
+                debug!("New window {entity} appended to inactive {}", *strip);
+                strip.append(entity);
+                on_hidden_space = true;
             }
             if let Ok(display) = displays.single() {
                 size_new_column(
@@ -2310,7 +2384,7 @@ pub(super) fn apply_window_positions(
                     );
                     ctx.commands.focus_entity(prev, true);
                 }
-            } else {
+            } else if !on_hidden_space {
                 debug!("Focusing newly spawned window {entity}");
                 focus_opened_window(entity, window, app, &properties, &mut ctx.commands);
             }

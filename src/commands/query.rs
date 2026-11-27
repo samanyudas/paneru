@@ -124,7 +124,10 @@ impl StateBroadcastIntent {
                             | Operation::VirtualMoveNumber(_, _)
                             | Operation::Swap(_)
                             | Operation::MoveStep(..)
-                            | Operation::MoveEdge(..),
+                            | Operation::MoveEdge(..)
+                            | Operation::Stack(_)
+                            | Operation::Unstack(_)
+                            | Operation::ToggleTabbedDisplay,
                         ),
                 } => intent.windows_changed = true,
                 Event::WindowFocused { .. } => intent.window_focused = true,
@@ -451,6 +454,9 @@ mod tests {
                     height: 600,
                 }),
                 visible: true,
+                column: Some(0),
+                row: Some(0),
+                tabbed: false,
             })
             .collect();
 
@@ -462,6 +468,7 @@ mod tests {
                 number: virtual_workspace_number,
                 native_workspace_id: 10,
                 active: true,
+                shown: true,
                 windows,
             }],
         }
@@ -700,5 +707,21 @@ mod tests {
         assert_eq!(intent.display_changes, vec![Some(2)]);
         assert!(intent.requires_state());
         assert!(!intent.is_empty());
+
+        for op in [
+            Operation::Stack(crate::commands::Side::West),
+            Operation::Unstack(crate::commands::Side::East),
+            Operation::ToggleTabbedDisplay,
+        ] {
+            let stack_intent = StateBroadcastIntent::from_events(
+                [PaneruEvent::Command {
+                    command: Command::Window(op),
+                }]
+                .iter(),
+                StateBroadcastSignals::default(),
+            );
+            assert!(stack_intent.windows_changed);
+            assert!(stack_intent.on_screen_changed);
+        }
     }
 }

@@ -73,6 +73,8 @@ pub(crate) struct CurrentWindowIdentity {
     pub identifier: String,
     pub role: String,
     pub subrole: String,
+    /// Space of the strip holding the window at restore time; `None` when it is in no strip yet.
+    pub workspace_id: Option<WorkspaceId>,
 }
 
 impl CurrentWindowIdentity {
@@ -91,6 +93,7 @@ impl CurrentWindowIdentity {
             identifier: "main".to_string(),
             role: "AXWindow".to_string(),
             subrole: "AXStandardWindow".to_string(),
+            workspace_id: None,
         }
     }
 }
@@ -193,10 +196,29 @@ impl<'a> RestorePlanner<'a> {
         current: &[CurrentWindowIdentity],
         plan: &mut RestorePlan,
     ) -> Vec<PlannedStrip> {
+        // When the saved Space still exists as a live Space, keep windows that
+        // currently live on another Space where they are. When the saved Space
+        // no longer exists (macOS renumbered Spaces across restarts), allow
+        // matching across Spaces so `follow_windows_to_their_spaces` can rebuild
+        // the strip on the new Space ID.
+        let saved_space_exists = current
+            .iter()
+            .any(|w| w.workspace_id == Some(workspace.workspace_id));
+        let candidates: Vec<CurrentWindowIdentity>;
+        let pool = if saved_space_exists {
+            candidates = current
+                .iter()
+                .filter(|w| w.workspace_id.is_none_or(|id| id == workspace.workspace_id))
+                .cloned()
+                .collect();
+            candidates.as_slice()
+        } else {
+            current
+        };
         workspace
             .strips
             .iter()
-            .filter_map(|strip| self.plan_strip(workspace, strip, current, plan))
+            .filter_map(|strip| self.plan_strip(workspace, strip, pool, plan))
             .collect()
     }
 
@@ -474,18 +496,25 @@ pub(super) fn restore_window_state(
         restoration
     };
 
-    let current =
-        current_window_identities(&ctx.windows, &apps, restoration, &ctx.config, &overrides);
-    let mut plan = RestorePlanner::new(restoration).plan(&current);
     let current_spaces = workspaces
         .iter()
         .flat_map(|(_, strip, _, _)| {
+            let id = strip.id();
             strip
                 .all_windows()
                 .into_iter()
-                .map(move |entity| (entity, strip.id()))
+                .map(move |entity| (entity, id))
         })
-        .collect();
+        .collect::<HashMap<_, _>>();
+    let current = current_window_identities(
+        &ctx.windows,
+        &apps,
+        restoration,
+        &ctx.config,
+        &overrides,
+        &current_spaces,
+    );
+    let mut plan = RestorePlanner::new(restoration).plan(&current);
     follow_windows_to_their_spaces(&mut plan, &current_spaces);
     merge_strips_per_space(&mut plan);
 
@@ -764,6 +793,7 @@ fn current_window_identities(
     restoration: &PaneruState,
     config: &Config,
     overrides: &TileOverrides,
+    window_workspaces: &HashMap<Entity, WorkspaceId>,
 ) -> Vec<CurrentWindowIdentity> {
     let mut current = windows
         .managed_iter()
@@ -785,6 +815,7 @@ fn current_window_identities(
                 identifier: String::new(),
                 role: String::new(),
                 subrole: String::new(),
+                workspace_id: window_workspaces.get(&entity).copied(),
             })
         })
         .collect::<Vec<_>>();

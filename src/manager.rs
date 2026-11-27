@@ -1018,6 +1018,19 @@ pub fn check_ax_privilege() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
+/// Whether the login session's screen is locked. While it is, Accessibility
+/// answers for no application's windows, so a scan then finds none.
+pub fn screen_is_locked() -> bool {
+    let Some(session) = objc2_core_graphics::CGSessionCopyCurrentDictionary() else {
+        return false;
+    };
+    let session = unsafe { session.cast_unchecked::<CFString, CFType>() };
+    session
+        .get(&CFString::from_static_str("CGSSessionScreenIsLocked"))
+        .and_then(|value| value.downcast_ref::<CFBoolean>().map(CFBoolean::value))
+        .unwrap_or(false)
+}
+
 /// Requests Accessibility privileges once through the native macOS prompt.
 ///
 /// Subsequent permission polling must use [`check_ax_privilege`] so the system

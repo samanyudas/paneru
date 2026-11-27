@@ -4,10 +4,10 @@ use crate::commands::{Command, Direction, Operation, ResizeDirection, Side};
 use crate::config::{
     Config, InitialWindowWidth, InitialWindowWidthMode, MainOptions, WindowParams,
 };
-use crate::ecs::SpawnWindowTrigger;
 use crate::ecs::layout::LayoutStrip;
+use crate::ecs::{ActiveWorkspaceMarker, SpawnWindowTrigger};
 use crate::events::{DestroySource, Event};
-use crate::{assert_window_at, assert_window_size};
+use crate::{assert_focused, assert_window_at, assert_window_size};
 use bevy::math::IRect;
 use bevy::prelude::*;
 
@@ -1110,8 +1110,40 @@ fn test_lua_set_width_layout_op_resizes_the_focused_window() {
 
     TestHarness::new()
         .with_windows(1)
-        .on_iteration(2, |world, _state| {
+        .on_iteration(1, |world, _state| {
             assert_window_size!(world, 0, TEST_DISPLAY_WIDTH / 2, VIEWPORT_HEIGHT);
+        })
+        .run(commands);
+}
+
+/// A `LayoutOp::SetWidth` names its window, so it must resize that window even
+/// when another one holds the focus, and leave the focused one alone.
+#[cfg(feature = "lua")]
+#[test]
+fn test_lua_set_width_layout_op_resizes_an_unfocused_window() {
+    use crate::types::windowset::LayoutOp;
+
+    const VIEWPORT_HEIGHT: i32 = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT;
+
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Layout(vec![LayoutOp::SetWidth {
+                window: 1,
+                ratio: 0.5,
+            }]),
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .with_focused_window(0)
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 0);
+            assert_window_size!(world, 0, TEST_WINDOW_WIDTH, VIEWPORT_HEIGHT);
+            assert_window_size!(world, 1, TEST_DISPLAY_WIDTH / 2, VIEWPORT_HEIGHT);
         })
         .run(commands);
 }
@@ -1871,6 +1903,112 @@ fn test_closing_window_of_live_app_closes_the_gap() {
         .run(commands);
 }
 
+/// Closing the focused window focuses its right neighbour, wherever the strip
+/// is scrolled; at the right edge, its left one.
+#[test]
+fn test_closing_focused_window_focuses_its_right_neighbour() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::West)),
+        }, // 2
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        }, // 4
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        }, // 6
+    ];
+
+    let config: Config = (
+        MainOptions {
+            focus_on_close: Some(crate::config::FocusOnClose::Right),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(5)
+        .on_iteration(2, |world, state| {
+            assert_focused!(world, 3);
+            state.os_close_window(3);
+        })
+        .on_iteration(4, |world, state| {
+            assert!(!window_exists(world, 3), "closed window must be dropped");
+            assert_focused!(world, 4);
+            state.os_close_window(4);
+        })
+        .on_iteration(6, |world, _state| {
+            assert!(!window_exists(world, 4), "closed window must be dropped");
+            assert_focused!(world, 2);
+        })
+        .run(commands);
+}
+
+/// Closing the focused window of a stack focuses the one below it, and the
+/// stack's bottom one the one above, so focus stays in the column.
+#[test]
+fn test_closing_focused_window_in_a_stack_stays_in_the_stack() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(Side::West)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(Side::West)),
+        }, // 4: 0, 1 and 2 stacked, 2 focused
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::North)),
+        }, // 5
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        }, // 7
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        }, // 9
+    ];
+
+    TestHarness::new()
+        .with_windows(4)
+        .on_iteration(5, |world, state| {
+            assert_focused!(world, 1);
+            state.os_close_window(1);
+        })
+        .on_iteration(7, |world, state| {
+            assert!(!window_exists(world, 1), "closed window must be dropped");
+            assert_focused!(world, 2);
+            state.os_close_window(2);
+        })
+        .on_iteration(9, |world, _state| {
+            assert!(!window_exists(world, 2), "closed window must be dropped");
+            assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
 /// A space notification for a window whose AX element is gone is a real close,
 /// not a space change. It must be recognised on its own, without waiting for
 /// the periodic unordered-window sweep, even though `role()` is cached.
@@ -1933,6 +2071,53 @@ fn test_closing_floating_window_does_not_reinsert_it_into_the_strip() {
             }
         })
         .run(commands);
+}
+
+// 2026-10-26: A captured Emacs popup disappeared just before focus jumped to
+// the other half-screen tile. Closing an unfocused popup must preserve focus.
+#[test]
+fn test_closing_unfocused_popup_preserves_editor_focus() {
+    let mut tiled = WindowParams::new(".*", None);
+    tiled.width = Some(InitialWindowWidth::Ratio(0.5));
+    let mut popup = WindowParams::new("^Window 2$", None);
+    popup.floating = Some(true);
+    popup.dont_focus = Some(true);
+    let config: Config = (MainOptions::default(), vec![tiled, popup]).into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.focus_window(1))
+        .on_iteration(1, |world, state| {
+            assert_focused!(world, 1);
+            state.os_close_window(2);
+        })
+        .on_iteration(2, |world, _state| {
+            assert!(!window_exists(world, 2), "closed popup must be removed");
+            assert_focused!(world, 1);
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+fn window_x(world: &mut World, id: i32) -> i32 {
+    let mut query = world.query::<&crate::manager::Window>();
+    query
+        .iter(world)
+        .find(|window| window.id() == id)
+        .unwrap_or_else(|| panic!("window {id} not found"))
+        .frame()
+        .min
+        .x
 }
 
 fn window_exists(world: &mut World, id: i32) -> bool {
@@ -2925,4 +3110,216 @@ fn toggling_float_on_a_mounted_disk_image_window_tiles_it() {
     );
     let mut query = world.query::<&LayoutStrip>();
     assert!(query.iter(world).any(|strip| strip.contains(entity)));
+}
+
+#[test]
+fn new_window_on_inactive_space_joins_that_space_strip() {
+    const OTHER_WORKSPACE_ID: WorkspaceId = 3;
+
+    TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, OTHER_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .on_iteration(0, |world, state| {
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let window = state.spawn_window(TEST_PROCESS_ID, OTHER_WORKSPACE_ID, 1, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(1, |world, _state| {
+            let mut strips = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+            let new_window = find_window_entity(1, world);
+            let mut active_ids = vec![];
+            for (strip, active) in strips.iter(world) {
+                if active {
+                    active_ids.push(strip.id());
+                }
+                assert_eq!(
+                    strip.contains(new_window),
+                    strip.id() == OTHER_WORKSPACE_ID,
+                    "window 1 must only be in the strip of its own Space (strip {})",
+                    strip.id()
+                );
+            }
+            assert_eq!(active_ids, vec![TEST_WORKSPACE_ID]);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+#[test]
+fn new_window_on_active_space_keeps_after_focus_placement() {
+    TestHarness::new()
+        .with_windows(2)
+        .with_focused_window(0)
+        .on_iteration(0, |world, state| {
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 2, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(1, |world, _state| {
+            let new_window = find_window_entity(2, world);
+            let mut strips = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+            let (strip, _) = strips
+                .iter(world)
+                .find(|(_, active)| *active)
+                .expect("active strip");
+            assert_eq!(strip.index_of(new_window).ok(), Some(1));
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// A harness with `count` windows and `auto_center` as given, settled.
+fn balance_harness(count: i32, auto_center: bool) -> TestHarness {
+    balance_harness_with(
+        count,
+        MainOptions {
+            auto_center: Some(auto_center),
+            ..Default::default()
+        },
+    )
+}
+
+fn balance_harness_with(count: i32, options: MainOptions) -> TestHarness {
+    let config: Config = (options, vec![]).into();
+    let mut h = TestHarness::new().with_config(config).with_windows(count);
+    balance_pump(&mut h, Command::PrintState);
+    h
+}
+
+/// A second of simulated time: long enough for any resize or slide to land.
+fn balance_settle(h: &mut TestHarness) {
+    h.advance(Duration::from_secs(1));
+}
+
+fn balance_pump(h: &mut TestHarness, command: Command) {
+    h.app
+        .world_mut()
+        .write_message::<Event>(Event::Command { command });
+    balance_settle(h);
+}
+
+fn balance_focus(h: &mut TestHarness, id: crate::platform::WinID) {
+    h.mock_state.focus_window(id);
+    balance_settle(h);
+}
+
+/// Window `id`'s frame as it was last placed.
+fn balance_frame(h: &mut TestHarness, id: crate::platform::WinID) -> IRect {
+    let world = h.app.world_mut();
+    let mut query = world.query::<&crate::manager::Window>();
+    query
+        .iter(world)
+        .find(|w| w.id() == id)
+        .expect("window not found")
+        .frame()
+}
+
+/// Gives each window its width, focuses `focused`, balances, and checks the
+/// focused window kept its place on screen while the others took its width.
+fn assert_balance_keeps_focused_in_place(
+    h: &mut TestHarness,
+    widths: &[(crate::platform::WinID, f64)],
+    focused: crate::platform::WinID,
+    ids: &[crate::platform::WinID],
+) {
+    for &(id, ratio) in widths {
+        balance_focus(h, id);
+        balance_pump(h, Command::Window(Operation::SetWidth(ratio)));
+    }
+    balance_focus(h, focused);
+    let before = balance_frame(h, focused);
+
+    balance_pump(h, Command::Window(Operation::Balance));
+
+    let after = balance_frame(h, focused);
+    assert_eq!(
+        after.min.x, before.min.x,
+        "focused window moved: {before:?} -> {after:?}"
+    );
+    for &id in ids {
+        assert_eq!(
+            balance_frame(h, id).width(),
+            before.width(),
+            "window {id} width"
+        );
+    }
+}
+
+#[test]
+fn balance_keeps_focused_in_place_when_others_were_wider() {
+    for auto_center in [true, false] {
+        let mut h = balance_harness(4, auto_center);
+        assert_balance_keeps_focused_in_place(&mut h, &[(2, 0.25)], 2, &[0, 1, 2, 3]);
+    }
+}
+
+#[test]
+fn balance_keeps_focused_in_place_when_others_were_narrower() {
+    for auto_center in [true, false] {
+        let mut h = balance_harness(4, auto_center);
+        assert_balance_keeps_focused_in_place(
+            &mut h,
+            &[(0, 0.25), (1, 0.25), (3, 0.25), (2, 0.5)],
+            2,
+            &[0, 1, 2, 3],
+        );
+    }
+}
+
+#[test]
+fn balance_of_first_column_leaves_it_in_place() {
+    for auto_center in [true, false] {
+        let mut h = balance_harness(4, auto_center);
+        assert_balance_keeps_focused_in_place(&mut h, &[(0, 0.25)], 0, &[0, 1, 2, 3]);
+    }
+}
+
+#[test]
+fn balance_keeps_focused_in_place_after_a_stack() {
+    for auto_center in [true, false] {
+        let mut h = balance_harness(5, auto_center);
+        // Window 1 onto window 0's column: a stack left of the focused window.
+        balance_focus(&mut h, 1);
+        balance_pump(&mut h, Command::Window(Operation::Stack(Side::West)));
+        assert_balance_keeps_focused_in_place(&mut h, &[(3, 0.25)], 3, &[0, 2, 3, 4]);
+    }
+}
+
+/// With `auto_center` and continuous swipes off, a strip that fits after
+/// balancing is pinned to the left edge, measured by its new width rather
+/// than the old.
+#[test]
+fn balance_pins_a_strip_that_now_fits_to_the_left_edge() {
+    let mut h = balance_harness_with(
+        3,
+        MainOptions {
+            auto_center: Some(false),
+            continuous_swipe: Some(false),
+            ..Default::default()
+        },
+    );
+    balance_focus(&mut h, 2);
+    balance_pump(&mut h, Command::Window(Operation::SetWidth(0.25)));
+    balance_pump(&mut h, Command::Window(Operation::Balance));
+
+    let first = balance_frame(&mut h, 0);
+    let last = balance_frame(&mut h, 2);
+    assert_eq!(first.width(), last.width());
+    assert_eq!(first.min.x, 0, "first window off the left edge: {first:?}");
+    assert!(
+        last.max.x <= TEST_DISPLAY_WIDTH,
+        "strip overflows: {last:?}"
+    );
 }

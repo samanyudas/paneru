@@ -379,3 +379,41 @@ fn an_app_focusing_its_window_leaves_the_pointer_in_place() {
         display.intersect(first.frame()).min + Origin::new(20, 20)
     });
 }
+
+/// `window center` warps the pointer to the display's centre only when the
+/// pointer follows focus: with it off the pointer stays where the user left it.
+#[test]
+fn window_center_warps_mouse_only_when_it_follows_focus() {
+    for follows in [false, true] {
+        let config: Config = (
+            MainOptions {
+                auto_center: Some(false),
+                mouse_follows_focus: Some(follows),
+                focus_follows_mouse: Some(false),
+                animation_speed: Some(30.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let commands = vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::Center),
+            },
+        ];
+        TestHarness::new()
+            .with_config(config)
+            .with_windows(2)
+            .on_iteration(1, move |_, state| {
+                if follows {
+                    assert_ne!(state.cursor_position(), Origin::ZERO);
+                } else {
+                    assert_eq!(state.cursor_position(), Origin::ZERO);
+                }
+            })
+            .run(commands);
+    }
+}

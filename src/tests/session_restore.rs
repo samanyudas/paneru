@@ -1486,6 +1486,73 @@ fn padded_config() -> Config {
     (options, vec![]).into()
 }
 
+/// A saved window that currently lives on another Space must stay there:
+/// restore must not pull it into the strip of the Space it was saved under.
+#[test]
+fn test_startup_restore_keeps_window_on_its_current_space() {
+    let mut display = saved_display(TEST_DISPLAY_ID, true);
+    display.workspace_ids = vec![TEST_WORKSPACE_ID, 200];
+
+    let mut harness = TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            bevy::math::IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, 200],
+        )
+        .with_workspace_window(0, TEST_WORKSPACE_ID, |_| {})
+        .with_workspace_window(1, TEST_WORKSPACE_ID, |_| {})
+        .with_workspace_window(2, 200, |_| {});
+    harness.world().insert_resource(PaneruState {
+        version: 2,
+        timestamp: 123_456_789,
+        active_display_id: Some(TEST_DISPLAY_ID),
+        displays: vec![display],
+        workspaces: vec![SavedWorkspace {
+            workspace_id: TEST_WORKSPACE_ID,
+            display_id: Some(TEST_DISPLAY_ID),
+            active_virtual_index: Some(1),
+            strips: vec![SavedStrip {
+                virtual_index: 1,
+                view: None,
+                columns: vec![
+                    SavedColumn::Single(saved_window(0)),
+                    SavedColumn::Single(saved_window(2)),
+                    SavedColumn::Single(saved_window(1)),
+                ],
+            }],
+        }],
+    });
+
+    for _ in 0..5 {
+        harness.app.update();
+    }
+
+    let world = harness.world();
+    let win0 = find_window_entity(0, world);
+    let win1 = find_window_entity(1, world);
+    let win2 = find_window_entity(2, world);
+    let mut query = world.query::<&LayoutStrip>();
+    let strips = query.iter(world).collect::<Vec<_>>();
+
+    let strip_of_win2 = strips
+        .iter()
+        .find(|strip| strip.contains(win2))
+        .expect("window 2 must still be in a strip");
+    assert_eq!(strip_of_win2.id(), 200, "window 2 must stay on its Space");
+
+    let row0 = strips
+        .iter()
+        .find(|strip| strip.id() == 200 && strip.virtual_index == 0)
+        .expect("row 0 of the window's Space must still exist");
+    assert!(row0.contains(win2));
+
+    let restored = strips
+        .iter()
+        .find(|strip| strip.id() == TEST_WORKSPACE_ID && strip.virtual_index == 0)
+        .expect("saved row 1 must be restored");
+    assert_eq!(restored.all_windows(), vec![win0, win1]);
+}
+
 fn saved_display(display_id: u32, active: bool) -> SavedDisplay {
     SavedDisplay {
         display_id,
@@ -2321,4 +2388,41 @@ fn a_window_that_refuses_both_width_and_height_still_widens_its_stack() {
             "window {id} must widen to its sibling's true minimum width {min_width}"
         );
     }
+}
+
+#[test]
+fn test_startup_waits_for_the_screen_to_be_unlocked() {
+    let (_sender, receiver) = crate::events::EventSender::new();
+    let polls = std::cell::Cell::new(0);
+    let locked = || {
+        polls.set(polls.get() + 1);
+        polls.get() <= 3
+    };
+    assert!(crate::wait_for_unlock(
+        &receiver,
+        locked,
+        Duration::from_millis(1)
+    ));
+    assert_eq!(polls.get(), 4, "it looks again until the lock is gone");
+}
+
+#[test]
+fn test_startup_goes_on_at_once_when_the_screen_is_unlocked() {
+    let (_sender, receiver) = crate::events::EventSender::new();
+    assert!(crate::wait_for_unlock(
+        &receiver,
+        || false,
+        Duration::from_secs(60)
+    ));
+}
+
+#[test]
+fn test_startup_waiting_for_the_unlock_quits_when_asked() {
+    let (sender, receiver) = crate::events::EventSender::new();
+    sender.send(crate::events::Event::Exit).unwrap();
+    assert!(!crate::wait_for_unlock(
+        &receiver,
+        || true,
+        Duration::from_millis(1)
+    ));
 }
