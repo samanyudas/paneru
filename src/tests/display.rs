@@ -3339,3 +3339,48 @@ fn test_move_to_display_keeps_a_window_that_refused_its_width_visible() {
         assert_focused!(harness.world(), 0);
     }
 }
+
+/// If `join_column` fails after a display move (for example because the target
+/// column is maximized and cannot accept a stack item), the moved window is
+/// appended to the destination strip instead of being lost outside every strip.
+#[test]
+fn test_move_to_display_appends_when_join_column_fails() {
+    use crate::ecs::display::{DisplayMoves, Placement};
+
+    let mut harness = TestHarness::new()
+        .with_windows(1)
+        .with_display(2, IRect::new(1024, 0, 2048, 768), vec![20])
+        .with_workspace_window(10, 20, |window| {
+            window.frame = IRect::new(1024, 40, 1524, 540);
+        });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.settle();
+
+    // Maximize column 0 on display 2 so `Placement::Into(0, 0)` passes the
+    // fullscreen pre-check but fails `join_column`.
+    harness.run(vec![
+        Event::WindowFocused { window_id: 10 },
+        window_command(Operation::Maximize),
+    ]);
+    harness.settle();
+
+    let entity = find_window_entity(0, harness.world());
+    let mut system = bevy::ecs::system::IntoSystem::into_system(
+        move |mut strips: DisplayMoves, mut commands: Commands| {
+            let moved = strips.move_to_display(
+                entity,
+                2,
+                Placement::Into(0, 0),
+                Size::new(500, 500),
+                |_| Some(IRect::new(0, 20, 500, 520)),
+                &mut commands,
+            );
+            assert!(moved.is_some(), "move_to_display should complete");
+        },
+    );
+    system.initialize(harness.world());
+    system.run((), harness.world()).expect("run DisplayMoves");
+    system.apply_deferred(harness.world());
+
+    assert_on_workspace!(harness.world(), 0, 20);
+}

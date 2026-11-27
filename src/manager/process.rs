@@ -18,6 +18,8 @@ use crate::util::MacResult;
 
 unsafe extern "C" {
     /// `OSStatus CopyProcessName(const ProcessSerialNumber *psn, CFStringRef *name);`
+    /// Follows Core Foundation's Create/Copy rule and returns an owned string,
+    /// so callers wrap it with `CFRetained::from_raw`.
     fn CopyProcessName(psn: *const ProcessSerialNumber, name: *mut *const CFString) -> OSStatus;
 
     /// `OSStatus GetProcessPID(const ProcessSerialNumber *psn, pid_t *pid);`

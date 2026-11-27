@@ -167,6 +167,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     native_membership::register(app);
     app.init_resource::<pacing::SlideHolds>();
     app.init_resource::<systems::AnimationStep>();
+    shared_edge::register(app);
     slice_photos::register(app);
     strip_cover::register(app);
     slice_input::register(app);

@@ -200,6 +200,8 @@ pub(super) fn register_query_commands(app: &mut App) {
 /// world access. The window set is a separate variant rather than folded into
 /// [`StateQueryKind`] since it projects a different value (the layout tree).
 fn state_query_handler(mut messages: MessageReader<Event>, state: QueryStateParams) {
+    // Each reply channel holds one message and gets exactly one, so try_send
+    // cannot fill; a client that hung up in the meantime is simply gone.
     for event in messages.read() {
         match event {
             Event::StateQuery { kind, respond_to } => {
@@ -391,13 +393,16 @@ fn state_event_broadcast_handler(
         return;
     }
 
-    // Each send is non-blocking and bounded, so a stalled reader just drops the
-    // event instead of blocking the main thread; an exited peer is reaped here.
+    // Each send is non-blocking and bounded, so a stalled reader drops the
+    // event instead of blocking the main thread.
     subscribers.streams.retain(|channel| {
         for event in &outgoing {
             match channel.try_send(event) {
                 Ok(()) => {}
+                // The subscriber's process is gone (a real kernel signal rather
+                // than a write error a merely slow reader would produce).
                 Err(wire::Error::PeerGone) => return false,
+                // Alive but not keeping up: drop this event and keep the subscriber.
                 Err(err) => warn!("pushing broadcast event: {err}"),
             }
         }

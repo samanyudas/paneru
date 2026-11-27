@@ -686,6 +686,10 @@ fn command_focus_managed(
     }
 }
 
+/// Focus-and-raise are deliberately coupled here: macOS AX raise can't lift a
+/// window above another app's frontmost window, so the target is focused to
+/// bring its app forward. Other floating windows are raised within their own
+/// apps' stacks as best effort.
 fn command_raise_floating(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -724,6 +728,7 @@ fn command_raise_floating(
 
 /// Toggles whether floating windows or tiled windows sit in front on the active
 /// workspace by raising the chosen tier without changing focus.
+/// Cross-app ordering is best effort because AX raise does not change the frontmost app.
 fn command_toggle_floating_layer(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
@@ -2140,6 +2145,7 @@ fn mouse_to_next_display(
         return;
     };
 
+    // Keep the first window on equal-width ties (e.g. top window of a stack).
     let Some((visible_frame, entity)) = other_strip
         .all_windows()
         .into_iter()
@@ -2147,7 +2153,13 @@ fn mouse_to_next_display(
             let visible = other.bounds().intersect(windows.frame(entity)?);
             (!visible.is_empty()).then_some((visible, entity))
         })
-        .max_by_key(|(visible, _)| visible.width())
+        .reduce(|best, cand| {
+            if cand.0.width() > best.0.width() {
+                cand
+            } else {
+                best
+            }
+        })
     else {
         debug!("no suitable windows on the other display to move the mouse.");
         window_manager.warp_mouse(other.bounds().center());

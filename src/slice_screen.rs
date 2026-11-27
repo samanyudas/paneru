@@ -53,6 +53,13 @@ impl WindowFilterCache {
         self.filters.retain(|id, _| keep(id));
     }
 
+    pub(crate) fn is_cached(&self, window: WinID) -> bool {
+        self.filters
+            .get(&window)
+            .and_then(|found| found.get())
+            .is_some()
+    }
+
     pub(crate) fn forget(&mut self, window: Option<WinID>) {
         match window {
             Some(window) => {
@@ -300,6 +307,9 @@ impl SliceScreen for SliceScreenOS {
             generation,
         };
         let scale = scale_at(self.mtm, slice.on_screen);
+        if lookup != Lookup::Reuse || !self.filters.is_cached(window) {
+            debug!("edge slice window looked up: window {window} generation {generation}");
+        }
         self.filters.capture_window(
             window,
             slice.size,

@@ -13,7 +13,9 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 /// Z-ordering of Paneru's borderless overlay windows above normal app windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlayLevel {
-    /// Edge-slice photo panels: above tiled windows, below strip covers.
+    /// Edge-slice photo panels: above tiled windows, and one level below the
+    /// picture cover, which a resize puts up while its windows cross the edge
+    /// underneath.
     EdgeSlice,
     /// Strip move/resize picture covers: above edge slices, below dim overlays.
     StripCover,
@@ -122,6 +124,8 @@ pub(crate) fn make_layer_panel(
     panel.setBackgroundColor(Some(background));
     panel.setHasShadow(false);
     panel.setHidesOnDeactivate(false);
+    // Panels take clicks without activating the engine: the event tap holds a
+    // press on a picture for its window, and a click between pictures stops here.
     panel.setIgnoresMouseEvents(false);
     if disable_animation {
         panel.setAnimationBehavior(NSWindowAnimationBehavior::None);

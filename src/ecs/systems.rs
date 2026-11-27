@@ -2821,4 +2821,38 @@ mod pump_timeout_tests {
             }
         }
     }
+
+    #[test]
+    fn add_existing_process_removes_marker_when_new_application_fails() {
+        use bevy::ecs::schedule::Schedule;
+        use bevy::ecs::world::World;
+
+        use crate::ecs::systems::add_existing_process;
+        use crate::ecs::{BProcess, ExistingMarker};
+        use crate::errors::Error;
+        use crate::manager::{MockProcessApi, MockWindowManagerApi, WindowManager};
+
+        let mut wm = MockWindowManagerApi::new();
+        wm.expect_new_application()
+            .once()
+            .returning(|_| Err(Error::InvalidInput("process exited".to_string())));
+
+        let mut process = MockProcessApi::new();
+        process.expect_name().return_const("gone".to_string());
+
+        let mut world = World::new();
+        world.insert_resource(WindowManager(Box::new(wm)));
+        let entity = world
+            .spawn((BProcess(Box::new(process)), ExistingMarker))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(add_existing_process);
+        schedule.run(&mut world);
+
+        assert!(
+            world.entity(entity).get::<ExistingMarker>().is_none(),
+            "ExistingMarker must be removed even when new_application fails"
+        );
+    }
 }

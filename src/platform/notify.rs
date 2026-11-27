@@ -130,7 +130,11 @@ fn from_bytes<T>(data: *const c_void, len: usize) -> Option<T> {
     (!data.is_null() && len >= size).then(|| unsafe { std::ptr::read_unaligned(data.cast::<T>()) })
 }
 
-// SkyLight CGS notification IDs registered by NotifyHandler::start.
+// Credits for reverse-engineered SkyLight CGS notification IDs:
+// - https://github.com/asmagill/hs._asm.undocumented.spaces/blob/master/CGSSpace.h
+// - https://github.com/koekeishiya/yabai/blob/d55a647913ab72d8d8b348bee2d3e59e52ce4a5d/src/misc/extern.h
+// - https://github.com/acsandmann/rift
+// Full catalog of observed IDs and payload layouts: docs/skylight-notifications.md.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IntoPrimitive, TryFromPrimitive)]
 enum SpaceEvent {
