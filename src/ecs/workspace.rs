@@ -185,7 +185,7 @@ pub(crate) struct RestoreFocusMarker {
 /// normal expose-reshuffle back.
 const RESTORE_FOCUS_GUARD_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn spawn_restore_focus_guard(entity: Entity, commands: &mut Commands) {
+pub(crate) fn spawn_restore_focus_guard(entity: Entity, commands: &mut Commands) {
     let timeout = Timeout::new(RESTORE_FOCUS_GUARD_TIMEOUT, None, commands);
     commands.spawn((timeout, RestoreFocusMarker { entity }));
 }
@@ -395,6 +395,12 @@ fn workspace_destroyed_handler(
                 debug!("Workspace destroyed {space_id} with its display; keeping its windows");
                 if let Some(parent) = parent {
                     crate::ecs::display::orphan_strip(strip, entity, parent, &mut commands);
+                    let destroyed_space = *space_id;
+                    commands.queue(move |world: &mut World| {
+                        world
+                            .resource_mut::<crate::ecs::display_homes::DisplayHomes>()
+                            .space_destroyed(destroyed_space);
+                    });
                 }
                 continue;
             }

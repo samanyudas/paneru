@@ -2464,14 +2464,35 @@ pub(super) fn apply_window_positions(
                             }
                             if let Some(mut scrolling) = strip_scrolling {
                                 let delta = -f64::from(width);
+                                let old_pos = scrolling.position;
+                                let old_settle = scrolling.settle;
                                 scrolling.position += delta;
                                 scrolling.anchor += delta;
                                 scrolling.origin += delta;
-                                if let Some(settle) = &mut scrolling.settle {
+                                // A pending settle whose destination column sits
+                                // before `insertion` did not shift in slot
+                                // coordinates; keep its target and retarget the
+                                // ease from the compensated position.
+                                let dest_shifted = scrolling
+                                    .landing_focus
+                                    .and_then(|dest| strip.index_of(dest).ok())
+                                    .is_none_or(|dest_idx| dest_idx > insertion);
+                                if dest_shifted && let Some(settle) = &mut scrolling.settle {
                                     *settle += delta;
                                 }
-                                if let Some(ease) = &mut scrolling.ease {
-                                    ease.from += delta;
+                                let new_pos = scrolling.position;
+                                let new_settle = scrolling.settle;
+                                if let (Some(ease), Some(old_target), Some(new_target)) =
+                                    (&mut scrolling.ease, old_settle, new_settle)
+                                {
+                                    crate::ecs::scroll::retarget_settle_ease(
+                                        ease,
+                                        old_pos,
+                                        old_target,
+                                        new_pos,
+                                        new_target,
+                                        &ctx.config,
+                                    );
                                 }
                             }
                         }
@@ -2495,6 +2516,14 @@ pub(super) fn apply_window_positions(
                         "Not focusing new window {entity}, keeping focus on '{}'",
                         focus.title().unwrap_or_default()
                     );
+                    // Re-asserting OS focus on `prev` echoes a repeat
+                    // `WindowFocused` event that would otherwise call
+                    // `ensure_visible(prev)` and abort an in-flight settle.
+                    if workspaces.iter().any(|(_, strip, _, _, scrolling, _, _)| {
+                        scrolling.is_some() && strip.contains(prev)
+                    }) {
+                        crate::ecs::workspace::spawn_restore_focus_guard(prev, &mut ctx.commands);
+                    }
                     ctx.commands.focus_entity(prev, true);
                 }
             } else if !on_hidden_space {

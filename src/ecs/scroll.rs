@@ -1335,6 +1335,52 @@ pub(crate) fn ease_speed(ease: &SettleEase, target: f64, config: &Config) -> f64
     }
 }
 
+/// Updates a running settle ease after the strip's position and/or target moved.
+///
+/// - When position and target shift by the same delta, translates `from` in
+///   place so progress, timing, and flick velocity stay exact.
+/// - When the strip is already within half a point of `new_target`, marks the
+///   ease finished (`start = 1.0`) so `settle_strip` completes on the next tick
+///   without delaying pending landing focus.
+/// - Otherwise retargets from `new_pos` toward `new_target`, carrying the
+///   in-flight speed into the new curve.
+pub(crate) fn retarget_settle_ease(
+    ease: &mut SettleEase,
+    old_pos: f64,
+    old_target: f64,
+    new_pos: f64,
+    new_target: f64,
+    config: &Config,
+) {
+    let delta_pos = new_pos - old_pos;
+    let delta_target = new_target - old_target;
+    let remaining = new_target - new_pos;
+    if remaining.abs() < 0.5 {
+        *ease = SettleEase {
+            from: new_target,
+            start: 1.0,
+            elapsed: 0.0,
+            animation_speed: ease.animation_speed,
+            flick: None,
+        };
+    } else if (delta_pos - delta_target).abs() < 1e-6 {
+        ease.from += delta_target;
+    } else {
+        let speed = ease_speed(ease, old_target, config);
+        let duration = ease::duration(config);
+        let flick = ease.flick.and_then(|_| {
+            (remaining.abs() >= 1.0 && speed * remaining.signum() > 0.0).then_some(speed)
+        });
+        *ease = SettleEase {
+            from: new_pos,
+            start: ease::entry_for_speed(speed, remaining, duration),
+            elapsed: 0.0,
+            animation_speed: ease.animation_speed,
+            flick,
+        };
+    }
+}
+
 /// How fast `scroll` shows its strip moving now, in points per second
 /// along the strip's x, on a display `display_width` points wide (matching
 /// the width used by `swipe_gesture` to convert gesture deltas and

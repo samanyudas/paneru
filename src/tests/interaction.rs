@@ -4096,6 +4096,116 @@ dont_focus = true
     );
 }
 
+/// Inserting immediately before focused column C during a settle whose
+/// `landing_focus` is column B (before the insertion) shifts C's slot but not
+/// B's, so the settle target stays at B's slot and the ease retargets from the
+/// compensated current position.
+#[test]
+fn test_insertion_before_focus_during_settle_to_earlier_column_keeps_destination_target() {
+    let config = Config::try_from(
+        r#"
+[options]
+auto_center = false
+animation_speed = 8.0
+
+[bindings]
+
+[windows.beforec]
+title = ".*"
+subrole = "AXBeforeC"
+index = 2
+dont_focus = true
+"#,
+    )
+    .expect("config should parse");
+
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_millis(500));
+
+    harness.mock_state.set_focused_window(2);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 2 });
+    harness.advance(Duration::from_millis(500));
+
+    let (strip_entity, before_x, col_b) = {
+        let world = harness.world();
+        let strip_entity = active_strip_entity(world);
+        let strip_x = world.get::<Position>(strip_entity).unwrap().x;
+        let col_b = find_window_entity(1, world);
+        (strip_entity, strip_x, col_b)
+    };
+    let last_event = harness.world().resource::<Time>().elapsed();
+    let target_b = -200.0;
+    harness
+        .world()
+        .entity_mut(strip_entity)
+        .insert(crate::ecs::Scrolling {
+            velocity: 0.0,
+            position: f64::from(before_x),
+            is_user_swiping: false,
+            last_event,
+            moved_at: last_event,
+            input: crate::ecs::ScrollInput::Gesture,
+            anchor: f64::from(before_x),
+            settle: Some(target_b),
+            ease: Some(crate::ecs::SettleEase {
+                from: f64::from(before_x),
+                start: 0.0,
+                elapsed: 0.05,
+                animation_speed: 8.0,
+                flick: None,
+            }),
+            detent: None,
+            origin: f64::from(before_x),
+            landing_focus: Some(col_b),
+            focus_at_start: None,
+            start: None,
+            fingers_down: false,
+            lifted_at: None,
+            caught: None,
+            slope: 1.0,
+            excess: None,
+        });
+
+    harness = harness.with_window(9, |window| {
+        window.subrole = "AXBeforeC".to_string();
+    });
+    harness.advance(Duration::from_millis(16));
+
+    let world = harness.world();
+    let inserted = find_window_entity(9, world);
+    let inserted_width = f64::from(world.get::<crate::ecs::Bounds>(inserted).unwrap().0.x);
+    let scrolling = world
+        .get::<crate::ecs::Scrolling>(strip_entity)
+        .expect("strip still settling toward B");
+    assert_eq!(
+        scrolling.settle,
+        Some(target_b),
+        "B's slot did not move when inserting at index 2, so the settle target must stay at B"
+    );
+    let ease = scrolling.ease.expect("ease must retarget toward B");
+    assert!(
+        ease.from <= f64::from(before_x) - inserted_width + 1.0,
+        "retargeted ease must start from the compensated strip position (got {}, before_x {}, width {})",
+        ease.from,
+        before_x,
+        inserted_width
+    );
+
+    harness.advance(Duration::from_secs(2));
+    let world = harness.world();
+    assert_eq!(
+        world
+            .get::<Position>(strip_entity)
+            .map(|position| position.x),
+        Some(-200),
+        "strip must still land at column B's target offset"
+    );
+    assert_focused!(world, 1);
+}
+
 /// A background application opening a window with `index = 0` and no
 /// `dont_focus` rule has its focus notification rejected, so the focused
 /// window keeps focus and must stay at the same screen x.

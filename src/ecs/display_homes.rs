@@ -83,10 +83,18 @@ pub(crate) struct RememberedColumn {
 }
 
 impl DisplayHomes {
-    /// Notes that macOS destroyed native `space`, so restoration treats it as
-    /// gone even if its strip is kept as an orphan until reconciliation.
+    /// Notes that macOS destroyed native `space`, if any remembered display
+    /// home still references it, so restoration treats it as gone even while
+    /// its orphan strip remains. Spaces outside any display home (such as
+    /// exiting native fullscreen) are ignored so the set cannot grow unbounded.
     pub(crate) fn space_destroyed(&mut self, space: WorkspaceId) {
-        self.destroyed_spaces.insert(space);
+        if self
+            .homes
+            .values()
+            .any(|home| home.strips.iter().any(|strip| strip.space == space))
+        {
+            self.destroyed_spaces.insert(space);
+        }
     }
 
     /// Clears a destroyed-space mark if macOS creates `space` again.
@@ -869,5 +877,21 @@ mod tests {
                 arrival(shown, 1, &[b], true),
             ])
         );
+    }
+
+    #[test]
+    fn space_destroyed_only_records_spaces_referenced_by_a_home() {
+        let [a] = entities(1)[..] else { panic!() };
+        let mut homes = DisplayHomes::default();
+        homes.space_destroyed(OTHER_SPACE);
+        assert!(
+            homes.destroyed_spaces.is_empty(),
+            "unrelated destroyed spaces (e.g. native fullscreen exit) must not accumulate"
+        );
+        homes.homes.insert(HOME, home(&[&[a]]));
+        homes.space_destroyed(OTHER_SPACE);
+        assert!(homes.destroyed_spaces.is_empty());
+        homes.space_destroyed(SPACE);
+        assert!(homes.destroyed_spaces.contains(&SPACE));
     }
 }

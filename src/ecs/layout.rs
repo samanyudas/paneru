@@ -312,31 +312,27 @@ pub(crate) fn compensate_left_removal(
         if let Some(settle) = &mut scrolling.settle {
             *settle = shift_f64(*settle);
         }
-        if let Some(ease) = &mut scrolling.ease {
-            if let (Some(old_target), Some(new_target)) = (old_settle, scrolling.settle) {
-                let delta_pos = scrolling.position - old_pos;
-                let delta_target = new_target - old_target;
-                if (delta_pos - delta_target).abs() < 1e-6 {
-                    ease.from += delta_target;
-                } else {
-                    let speed = crate::ecs::scroll::ease_speed(ease, old_target, config);
-                    let remaining = new_target - scrolling.position;
-                    let duration = crate::ecs::ease::duration(config);
-                    let flick = ease.flick.and_then(|_| {
-                        (remaining.abs() >= 1.0 && speed * remaining.signum() > 0.0)
-                            .then_some(speed)
-                    });
-                    *ease = crate::ecs::SettleEase {
-                        from: scrolling.position,
-                        start: crate::ecs::ease::entry_for_speed(speed, remaining, duration),
-                        elapsed: 0.0,
-                        animation_speed: ease.animation_speed,
-                        flick,
-                    };
-                }
-            } else {
-                scrolling.ease = None;
+        if let (Some(old_target), Some(new_target)) = (old_settle, scrolling.settle) {
+            if let Some(ease) = &mut scrolling.ease {
+                crate::ecs::scroll::retarget_settle_ease(
+                    ease,
+                    old_pos,
+                    old_target,
+                    scrolling.position,
+                    new_target,
+                    config,
+                );
+            } else if (new_target - scrolling.position).abs() < 0.5 {
+                scrolling.ease = Some(crate::ecs::SettleEase {
+                    from: new_target,
+                    start: 1.0,
+                    elapsed: 0.0,
+                    animation_speed: config.animation_speed(),
+                    flick: None,
+                });
             }
+        } else {
+            scrolling.ease = None;
         }
     }
 }
@@ -5831,5 +5827,28 @@ mod tests {
             "retargeted ease must carry positive curve entry for in-flight velocity, got {}",
             ease.start
         );
+
+        // Case 3: clamping puts both current position and settle target at the
+        // same edge (zero remaining distance), so the ease finishes immediately
+        // on the next settle pass rather than delaying landing_focus for ~237 ms.
+        let mut pos = Position(Origin::new(-100, 0));
+        let mut scrolling = Scrolling {
+            position: -100.0,
+            settle: Some(-200.0),
+            ease: Some(crate::ecs::SettleEase {
+                from: -50.0,
+                start: 0.0,
+                elapsed: 0.02,
+                animation_speed: 14.0,
+                flick: None,
+            }),
+            ..scrolling
+        };
+        compensate_left_removal(400, &mut pos, None, Some(&mut scrolling), false, 0, &config);
+        let ease = scrolling.ease.expect("zero-distance settle marks finished");
+        assert_eq!(scrolling.position, 0.0);
+        assert_eq!(scrolling.settle, Some(0.0));
+        assert_eq!(ease.start, 1.0);
+        assert_eq!(ease.flick, None);
     }
 }
