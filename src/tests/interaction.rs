@@ -3613,3 +3613,49 @@ fn focus_by_id_selects_the_requested_stack_member() {
             },
         ]);
 }
+
+#[test]
+fn previous_window_skips_hidden_apps_floating_window() {
+    const FLOAT_PID: i32 = TEST_PROCESS_ID + 1;
+    let previous = || Event::Command {
+        command: Command::Window(Operation::FocusPrevious),
+    };
+    let by_id = |id| Event::Command {
+        command: Command::Window(Operation::FocusId(id)),
+    };
+
+    let mut params = WindowParams::new(".*", Some("float.app".to_string()));
+    params.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .with_app(FLOAT_PID, "float.app", "FloatApp", |_| {});
+    harness.advance(Duration::from_secs(1));
+    let state = harness.mock_state.clone();
+    let floating = state.spawn_window(
+        FLOAT_PID,
+        TEST_WORKSPACE_ID,
+        2,
+        IRect::new(40, 40, 340, 240),
+    );
+    harness.world().trigger(SpawnWindowTrigger(vec![floating]));
+    harness.advance(Duration::from_secs(1));
+
+    harness
+        .on_iteration(2, |world, _state| assert_focused!(world, 2))
+        .on_iteration(3, |world, state| {
+            assert_focused!(world, 1);
+            state.update_app(FLOAT_PID, |app| app.is_hidden = true);
+        })
+        .on_iteration(5, |world, _state| assert_focused!(world, 0))
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            by_id(0),
+            by_id(2),
+            by_id(1),
+            Event::ApplicationHidden { pid: FLOAT_PID },
+            previous(),
+        ]);
+}
