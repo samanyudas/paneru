@@ -600,7 +600,7 @@ pub(crate) fn cleanup_unordered_windows(
 /// Removes previuos `ActiveWorkspaceMarker`'s when a new one is inserted.
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn cleanup_active_workspace_marker(
-    trigger: On<Add, ActiveWorkspaceMarker>,
+    trigger: On<Add<ActiveWorkspaceMarker>>,
     workspaces: Query<(Entity, Has<ActiveWorkspaceMarker>), With<LayoutStrip>>,
     mut commands: Commands,
 ) {
@@ -677,7 +677,7 @@ fn flash_workspace_on_activation(
 /// Removes previuos `SelectedVirtualMarker`'s when a new one is inserted.
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn cleanup_selected_space_marker(
-    trigger: On<Add, SelectedVirtualMarker>,
+    trigger: On<Add<SelectedVirtualMarker>>,
     workspaces: Query<(Entity, &LayoutStrip, Has<SelectedVirtualMarker>)>,
     mut commands: Commands,
 ) {

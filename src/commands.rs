@@ -1204,7 +1204,7 @@ fn end_width_runs(
     }
 }
 
-fn cancel_width_settlement(trigger: On<Remove, WidthRun>, mut commands: Commands) {
+fn cancel_width_settlement(trigger: On<Remove<WidthRun>>, mut commands: Commands) {
     if let Ok(mut entity) = commands.get_entity(trigger.entity) {
         entity.try_remove::<PendingWidthSettlement>();
     }
@@ -1212,7 +1212,7 @@ fn cancel_width_settlement(trigger: On<Remove, WidthRun>, mut commands: Commands
 
 /// Ends every width run when focus moves to a window.
 fn end_width_runs_on_focus(
-    _trigger: On<Add, FocusedMarker>,
+    _trigger: On<Add<FocusedMarker>>,
     runs: Query<Entity, With<WidthRun>>,
     mut commands: Commands,
 ) {

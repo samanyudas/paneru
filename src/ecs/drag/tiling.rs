@@ -515,7 +515,7 @@ pub(crate) fn supersede_native_resize(members: &[Entity], commands: &mut Command
 }
 
 pub(super) fn adopt_cancelled_native_resize(
-    removed: On<Remove, NativeResizeStart>,
+    removed: On<Remove<NativeResizeStart>>,
     mut windows: Query<(&Window, &NativeResizeStart, &mut Bounds), Without<Unmanaged>>,
     strips: Query<&LayoutStrip>,
 ) {

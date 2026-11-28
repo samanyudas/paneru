@@ -369,7 +369,7 @@ fn clear_pending_focus_layout(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn maintain_focus_singleton(
-    trigger: On<Add, FocusedMarker>,
+    trigger: On<Add<FocusedMarker>>,
     windows: Query<(Entity, Has<FocusedMarker>), With<Window>>,
     mut config: GlobalState,
     mut history: ResMut<FocusHistory>,
@@ -477,7 +477,7 @@ pub(super) fn fix_window_size_on_focus(
 /// rapid focus switching cancels verification on intermediate windows.
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn maintain_verify_focus_singleton(
-    trigger: On<Add, VerifyFocus>,
+    trigger: On<Add<VerifyFocus>>,
     verifying: Query<Entity, With<VerifyFocus>>,
     mut commands: Commands,
 ) {
@@ -822,7 +822,7 @@ fn clear_pointer_follows_focus(
 }
 
 fn dim_window_trigger(
-    trigger: On<Add, FocusedMarker>,
+    trigger: On<Add<FocusedMarker>>,
     windows: Windows,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
@@ -839,7 +839,7 @@ fn dim_window_trigger(
 }
 
 fn dim_remove_window_trigger(
-    trigger: On<Remove, FocusedMarker>,
+    trigger: On<Remove<FocusedMarker>>,
     windows: Windows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
@@ -866,7 +866,7 @@ fn dim_remove_window_trigger(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn virtual_strip_activated(
-    trigger: On<Add, FocusedMarker>,
+    trigger: On<Add<FocusedMarker>>,
     workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     mut commands: Commands,
 ) {
@@ -1235,7 +1235,7 @@ fn recover_lost_focus(
 }
 
 pub(super) fn stray_focus_observer(
-    trigger: On<Add, Window>,
+    trigger: On<Add<Window>>,
     focus_events: Populated<(Entity, &StrayFocusEvent)>,
     windows: Windows,
     mut commands: Commands,
