@@ -10,6 +10,7 @@ mod maximize;
 mod mission_control;
 mod mocks;
 mod mouse_focus;
+mod mouse_warp;
 mod new_window_width;
 mod next_display;
 mod pacing;

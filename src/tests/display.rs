@@ -3664,3 +3664,76 @@ fn test_destroyed_space_on_a_present_display_is_not_orphaned() {
         "a space destroyed on a connected display is dropped, as before"
     );
 }
+
+#[test]
+fn test_horizontal_mouse_warp_also_warps_a_drag() {
+    let config: Config = (
+        MainOptions {
+            horizontal_mouse_warp: Some(1),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let above = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    let approach = objc2_core_foundation::CGPoint {
+        x: f64::from(TEST_DISPLAY_WIDTH - 20),
+        y: f64::from(TEST_DISPLAY_HEIGHT / 2),
+    };
+    let edge = objc2_core_foundation::CGPoint {
+        x: f64::from(TEST_DISPLAY_WIDTH - 1),
+        y: f64::from(TEST_DISPLAY_HEIGHT / 2),
+    };
+    let modifiers = crate::platform::Modifiers::empty();
+    for (first, second) in [
+        (
+            Event::MouseMoved {
+                point: approach,
+                modifiers,
+            },
+            Event::MouseMoved {
+                point: edge,
+                modifiers,
+            },
+        ),
+        (
+            Event::MouseDragged {
+                point: approach,
+                modifiers,
+                button: crate::events::MouseButton::Left,
+            },
+            Event::MouseDragged {
+                point: edge,
+                modifiers,
+                button: crate::events::MouseButton::Left,
+            },
+        ),
+    ] {
+        let label = format!("{second:?}");
+        let commands = vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ];
+        TestHarness::new()
+            .with_config(config.clone())
+            .with_windows(1)
+            .with_display(EXT_DISPLAY_ID, above, vec![EXT_WORKSPACE_ID])
+            .on_iteration(1, move |world, _state| {
+                world.write_message(first.clone());
+                world.write_message(second.clone());
+            })
+            .on_iteration(2, move |_world, state| {
+                let cursor = state.cursor_position();
+                assert!(
+                    above.contains(cursor),
+                    "{label} at the right edge left the pointer at {cursor:?}"
+                );
+            })
+            .run(commands);
+    }
+}
