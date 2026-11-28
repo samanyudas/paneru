@@ -2188,10 +2188,8 @@ fn size_new_column(
     restore: Option<&crate::ecs::restore::SessionRestore>,
     config: &Config,
     commands: &mut Commands,
-) {
-    let Some(frame) = frame.filter(|_| !window.is_minimized()) else {
-        return;
-    };
+) -> Option<i32> {
+    let frame = frame.filter(|_| !window.is_minimized())?;
     let launched = launch_windows.is_some_and(|launch| launch.0.contains(&window.id()));
     let rule_sets_width = WindowProperties::new(app, window, config).sets_width();
     let mut new_window_width = config.new_window_width().filter(|_| !launched);
@@ -2215,6 +2213,7 @@ fn size_new_column(
     if let Some(width) = width {
         size_for_arrival(entity, Size::new(width, frame.height()), commands);
     }
+    width
 }
 
 /// Starts reading a new window's level again, because the read on arrival
@@ -2284,16 +2283,25 @@ fn home_strip(
     debug!("Space of new window {window_id} unknown, using the active strip.");
     Some((active_entity, true))
 }
+type SpawnStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        &'static mut Position,
+        Option<&'static mut RepositionMarker>,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+    ),
+    Without<Window>,
+>;
+
 #[instrument(level = Level::DEBUG, skip_all)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn apply_window_positions(
     added: Populated<Entity, Added<Window>>,
-    mut workspaces: Query<(
-        Entity,
-        &mut LayoutStrip,
-        Has<ActiveWorkspaceMarker>,
-        Has<SelectedVirtualMarker>,
-    )>,
+    mut workspaces: SpawnStrips,
     displays: ActiveDisplays,
     window_manager: Res<WindowManager>,
     apps: Query<&Application>,
@@ -2307,7 +2315,7 @@ pub(super) fn apply_window_positions(
     for entity in added {
         if workspaces
             .iter()
-            .any(|(_, strip, _, _)| strip.tabbed(entity))
+            .any(|(_, strip, _, _, _, _)| strip.tabbed(entity))
         {
             debug!("Ignoring tabbed {entity} attributes.");
             continue;
@@ -2334,7 +2342,7 @@ pub(super) fn apply_window_positions(
         if properties.floating() && !overrides.contains(window, app) {
             if let Some(mut strip) = workspaces
                 .iter_mut()
-                .find_map(|(_, strip, _, _)| strip.contains(entity).then_some(strip))
+                .find_map(|(_, strip, _, _, _, _)| strip.contains(entity).then_some(strip))
             {
                 strip.remove(entity);
             }
@@ -2377,48 +2385,22 @@ pub(super) fn apply_window_positions(
         // During startup, the window is already inserted into some strip by finish_setup.
         let allready_inserted = workspaces
             .iter()
-            .any(|(_, strip, _, _)| strip.contains(entity));
+            .any(|(_, strip, _, _, _, _)| strip.contains(entity));
         let mut on_hidden_space = false;
         if initializing.is_none()
             && !allready_inserted
             && let Some((target, is_active)) = home_strip(
                 window.id(),
-                &workspaces.iter().collect::<Vec<_>>(),
+                &workspaces
+                    .iter()
+                    .map(|(e, s, _, _, active, sel)| (e, s, active, sel))
+                    .collect::<Vec<_>>(),
                 &window_manager,
             )
-            && let Ok((_, mut strip, _, _)) = workspaces.get_mut(target)
+            && let Ok((_, mut strip, mut strip_position, strip_reposition, _, _)) =
+                workspaces.get_mut(target)
         {
-            if is_active {
-                // Attempt inserting the window at a pre-defined position.
-                let insert_at = properties.insertion().map_or_else(
-                    || {
-                        // Otherwise attempt inserting it after the current focus.
-                        let focused_window = ctx.windows.focused();
-                        // Insert to the right of the currently focused window
-                        focused_window
-                            .and_then(|(_, entity)| strip.index_of(entity).ok())
-                            .and_then(|insert_at| {
-                                (insert_at + 1 < strip.len()).then_some(insert_at + 1)
-                            })
-                    },
-                    Some,
-                );
-
-                debug!("New window {entity} adding at {}", *strip);
-                match insert_at {
-                    Some(after) => {
-                        debug!("New window inserted at {after}");
-                        strip.insert_at(after, entity);
-                    }
-                    None => strip.append(entity),
-                }
-            } else {
-                // The window opened on a Space the user is not looking at.
-                debug!("New window {entity} appended to inactive {}", *strip);
-                strip.append(entity);
-                on_hidden_space = true;
-            }
-            if let Ok(display) = displays.single() {
+            let resized_width = displays.single().ok().and_then(|display| {
                 size_new_column(
                     entity,
                     window,
@@ -2429,7 +2411,49 @@ pub(super) fn apply_window_positions(
                     restore.as_deref(),
                     &ctx.config,
                     &mut ctx.commands,
-                );
+                )
+            });
+            if is_active {
+                let focused_index = ctx
+                    .windows
+                    .focused()
+                    .and_then(|(_, focused)| strip.index_of(focused).ok());
+                // Attempt inserting the window at a pre-defined position.
+                let insert_at = properties.insertion().or_else(|| {
+                    // Otherwise attempt inserting it after the current focus.
+                    focused_index.and_then(|idx| (idx + 1 < strip.len()).then_some(idx + 1))
+                });
+
+                debug!("New window {entity} adding at {}", *strip);
+                match insert_at {
+                    Some(after) => {
+                        debug!("New window inserted at {after}");
+                        let insertion = after.min(strip.len());
+                        strip.insert_at(insertion, entity);
+                        // Keep the focused column at the same screen x when a
+                        // background window lands at or left of it: shifting the
+                        // strip origin (and any in-flight animation target) by
+                        // the new column's width absorbs the slot shift on the
+                        // left without moving existing windows.
+                        if properties.dont_focus()
+                            && focused_index.is_some_and(|idx| insertion <= idx)
+                            && let Some(width) = resized_width.or_else(|| {
+                                ctx.windows.moving_frame(entity).map(|frame| frame.width())
+                            })
+                        {
+                            strip_position.0.x -= width;
+                            if let Some(mut target) = strip_reposition {
+                                target.0.x -= width;
+                            }
+                        }
+                    }
+                    None => strip.append(entity),
+                }
+            } else {
+                // The window opened on a Space the user is not looking at.
+                debug!("New window {entity} appended to inactive {}", *strip);
+                strip.append(entity);
+                on_hidden_space = true;
             }
         }
 
