@@ -392,6 +392,10 @@ pub fn register_triggers(app: &mut bevy::app::App) {
                 .chain(),
             triggers::invalidate_window_title,
             triggers::refresh_configuration_trigger,
+            triggers::refresh_window_padding
+                .after(triggers::refresh_configuration_trigger)
+                .run_if(resource_changed::<Config>)
+                .run_if(not(resource_exists::<Initializing>)),
             triggers::theme_change_trigger,
             triggers::prune_dead_strip_entries,
         )
