@@ -3659,3 +3659,725 @@ fn previous_window_skips_hidden_apps_floating_window() {
             previous(),
         ]);
 }
+
+/// A wakeup must update the clock in the same frame: alternating long and
+/// short pump intervals must not feed the preceding interval to animation.
+#[test]
+fn test_clock_samples_the_current_event_pump_interval() {
+    use bevy::app::First;
+    use bevy::ecs::schedule::IntoScheduleConfigs;
+    use bevy::ecs::system::{Local, ResMut};
+    use bevy::time::{Real, Time, TimeUpdateStrategy};
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let start = harness
+        .world()
+        .resource::<Time<Real>>()
+        .last_update()
+        .expect("clock initialized by warm-up");
+    // Simulate the time observed when a blocking pump returns. Updating the
+    // manual clock strategy in the pump phase avoids wall-clock sleeps.
+    let intervals = [Duration::from_millis(200), Duration::from_millis(4)];
+    harness.app.add_systems(
+        First,
+        (move |mut strategy: ResMut<TimeUpdateStrategy>, mut step: Local<usize>| {
+            let elapsed: Duration = intervals[..=*step].iter().sum();
+            *strategy = TimeUpdateStrategy::ManualInstant(start + elapsed);
+            *step += 1;
+        })
+        .in_set(crate::ecs::FirstSet::Pump)
+        .after(crate::ecs::systems::pump_events),
+    );
+    for interval in intervals {
+        harness.app.update();
+        let world = harness.world();
+        assert_eq!(world.resource::<Time<Real>>().delta(), interval);
+        assert_eq!(world.resource::<Time>().delta(), interval);
+    }
+}
+
+#[test]
+fn swipe_ignores_stale_entity_at_strip_end() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            continuous_swipe: Some(true),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.advance(Duration::from_millis(40));
+
+    let stale = harness.world().spawn_empty().id();
+    harness.world().entity_mut(stale).despawn();
+    let initial_x = {
+        let world = harness.world();
+        let (mut strip, position) = world
+            .query_filtered::<(&mut LayoutStrip, &Position), With<ActiveWorkspaceMarker>>()
+            .single_mut(world)
+            .expect("active strip");
+        let x = position.0.x;
+        strip.append(stale);
+        x
+    };
+
+    let world = harness.world();
+    world.write_message::<Event>(Event::TouchpadDown);
+    world.write_message::<Event>(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+        distance_cm: 0.0,
+    });
+    harness.advance(Duration::from_millis(20));
+
+    let world = harness.world();
+    let position = world
+        .query_filtered::<&Position, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active strip");
+    assert!(
+        position.0.x < initial_x,
+        "a stale entity at the strip end must not block horizontal scrolling (initial={initial_x}, after={})",
+        position.0.x
+    );
+}
+
+#[test]
+fn window_removal_clears_entity_from_every_strip() {
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.advance(Duration::from_millis(40));
+
+    let win1 = find_window_entity(1, harness.world());
+    let extra_strip = {
+        let world = harness.world();
+        let mut strip = LayoutStrip::new(TEST_WORKSPACE_ID, 1);
+        strip.append(win1);
+        world.spawn(strip).id()
+    };
+
+    harness.world().entity_mut(win1).despawn();
+
+    let world = harness.world();
+    assert!(
+        !world
+            .get::<LayoutStrip>(extra_strip)
+            .unwrap()
+            .contains(win1),
+        "despawning a window must remove it from every strip, not only the first match"
+    );
+    for strip in world.query::<&LayoutStrip>().iter(world) {
+        assert!(
+            !strip.contains(win1),
+            "no strip may retain a despawned entity"
+        );
+    }
+}
+
+/// A background window rule (`dont_focus = true`, `index = 0`) that inserts to
+/// the left of the focused window must keep the focused window at its exact
+/// screen x — both on an unscrolled strip and on a scrolled strip — by shifting
+/// the strip origin by the inserted column's width.
+#[test]
+fn test_left_edge_insertion_keeps_focused_window_x_unscrolled_and_scrolled() {
+    for (auto_center, focused_id, expect_scrolled) in [(true, 1, false), (false, 2, true)] {
+        let config = Config::try_from(
+            format!(
+                r#"
+[options]
+auto_center = {auto_center}
+
+[bindings]
+
+[windows.leftedge]
+title = ".*"
+subrole = "AXLeftEdge"
+index = 0
+dont_focus = true
+"#
+            )
+            .as_str(),
+        )
+        .expect("config should parse");
+
+        let commands = vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::WindowFocused {
+                window_id: focused_id,
+            },
+        ];
+
+        let mut harness = TestHarness::new().with_config(config).with_windows(3);
+        harness = harness
+            .on_iteration(0, move |_world, state| {
+                state.set_focused_window(focused_id);
+            })
+            .on_iteration(1, move |world, _state| {
+                assert_focused!(world, focused_id);
+            });
+        harness.run(commands);
+        harness.advance(Duration::from_millis(500));
+
+        let (focused_x, initial_strip_origin) = {
+            let world = harness.world();
+            let entity = find_window_entity(focused_id, world);
+            let focused_x = world.get::<Position>(entity).expect("a position").x;
+            let strip_entity = active_strip_entity(world);
+            let strip_origin = world
+                .get::<Position>(strip_entity)
+                .expect("strip position")
+                .x;
+            (focused_x, strip_origin)
+        };
+        if expect_scrolled {
+            assert_ne!(
+                initial_strip_origin, 0,
+                "scrolled case needs a non-zero initial strip origin"
+            );
+        }
+
+        harness = harness.with_window(9, |window| {
+            window.subrole = "AXLeftEdge".to_string();
+        });
+        harness.advance(Duration::from_millis(500));
+
+        let world = harness.world();
+        assert_focused!(world, focused_id);
+        let focused = find_window_entity(focused_id, world);
+        assert_eq!(
+            world.get::<Position>(focused).map(|position| position.x),
+            Some(focused_x),
+            "left-edge insertion must not move the focused window (scrolled={expect_scrolled})"
+        );
+        let new_entity = find_window_entity(9, world);
+        let strip_entity = active_strip_entity(world);
+        let strip = world
+            .get::<LayoutStrip>(strip_entity)
+            .expect("the active strip");
+        assert_eq!(strip.len(), 4);
+        assert_eq!(strip.index_of(new_entity).ok(), Some(0));
+        assert_eq!(
+            world
+                .get::<Position>(strip_entity)
+                .expect("strip position")
+                .x,
+            initial_strip_origin - TEST_WINDOW_WIDTH,
+            "strip origin must shift left by the inserted column width"
+        );
+    }
+}
+
+/// Spawning both a left-of-focus background window and a right-of-focus
+/// background window in the same tick must still keep the focused window's
+/// screen x intact.
+#[test]
+fn test_same_tick_left_and_right_insertions_keep_focused_window_x() {
+    let config = Config::try_from(
+        r#"
+[options]
+auto_center = false
+
+[bindings]
+
+[windows.leftedge]
+title = ".*"
+subrole = "AXLeftEdge"
+index = 0
+dont_focus = true
+
+[windows.rightside]
+title = ".*"
+subrole = "AXRightSide"
+dont_focus = true
+"#,
+    )
+    .expect("config should parse");
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::WindowFocused { window_id: 1 },
+    ];
+
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness = harness
+        .on_iteration(0, |_world, state| state.set_focused_window(1))
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 1);
+        });
+    harness.run(commands);
+    harness.advance(Duration::from_millis(500));
+
+    let focused_x = {
+        let world = harness.world();
+        let entity = find_window_entity(1, world);
+        world.get::<Position>(entity).expect("a position").x
+    };
+
+    // Spawn left-edge and right-of-focus windows before advancing a single tick.
+    harness = harness
+        .with_window(9, |window| {
+            window.subrole = "AXLeftEdge".to_string();
+        })
+        .with_window(10, |window| {
+            window.subrole = "AXRightSide".to_string();
+        });
+    harness.advance(Duration::from_millis(500));
+
+    let world = harness.world();
+    assert_focused!(world, 1);
+    let focused = find_window_entity(1, world);
+    assert_eq!(
+        world.get::<Position>(focused).map(|position| position.x),
+        Some(focused_x),
+        "a right-of-focus insertion in the same tick must not cancel the left-edge shift"
+    );
+}
+
+/// A left-edge background insertion arriving while the strip is mid-animation
+/// must shift the strip's in-flight `RepositionMarker` target too, so the
+/// focused window still lands at its intended screen x once the slide finishes.
+#[test]
+fn test_left_edge_insertion_during_strip_animation_preserves_target_x() {
+    let config = Config::try_from(
+        r#"
+[options]
+auto_center = false
+animation_speed = 8.0
+
+[bindings]
+
+[windows.leftedge]
+title = ".*"
+subrole = "AXLeftEdge"
+index = 0
+dont_focus = true
+"#,
+    )
+    .expect("config should parse");
+
+    let mut harness = TestHarness::new().with_config(config).with_windows(4);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_millis(500));
+
+    harness.mock_state.set_focused_window(3);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 3 });
+    harness.advance(Duration::from_millis(32));
+
+    // Strip should still be animating toward window 3.
+    let expected_focused_x = {
+        let world = harness.world();
+        assert_focused!(world, 3);
+        let strip_entity = active_strip_entity(world);
+        let target_x = world
+            .get::<crate::ecs::RepositionMarker>(strip_entity)
+            .expect("strip must be mid-animation")
+            .0
+            .x;
+        let focused = find_window_entity(3, world);
+        let layout_x = world
+            .get::<crate::ecs::LayoutPosition>(focused)
+            .expect("layout position")
+            .0
+            .x;
+        layout_x + target_x
+    };
+
+    harness = harness.with_window(9, |window| {
+        window.subrole = "AXLeftEdge".to_string();
+    });
+    harness.advance(Duration::from_secs(2));
+
+    let world = harness.world();
+    assert_focused!(world, 3);
+    let focused = find_window_entity(3, world);
+    assert_eq!(
+        world.get::<Position>(focused).map(|position| position.x),
+        Some(expected_focused_x),
+        "mid-animation left-edge insertion must preserve the focused window's landing x"
+    );
+}
+
+/// A left-edge background insertion during an active swipe or settle must
+/// rebase `Scrolling`'s coordinates alongside the strip so the next scroll
+/// frame does not jump the focused window by the inserted width.
+#[test]
+fn test_left_edge_insertion_during_scrolling_rebases_scroll_state() {
+    let config = Config::try_from(
+        r#"
+[options]
+auto_center = false
+animation_speed = 8.0
+
+[bindings]
+
+[windows.leftedge]
+title = ".*"
+subrole = "AXLeftEdge"
+index = 0
+dont_focus = true
+"#,
+    )
+    .expect("config should parse");
+
+    let mut harness = TestHarness::new().with_config(config).with_windows(4);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_millis(500));
+
+    harness.mock_state.set_focused_window(2);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 2 });
+    harness.advance(Duration::from_millis(500));
+
+    let (strip_entity, before_x) = {
+        let world = harness.world();
+        let strip_entity = active_strip_entity(world);
+        let strip_x = world.get::<Position>(strip_entity).unwrap().x;
+        (strip_entity, strip_x)
+    };
+    let last_event = harness.world().resource::<Time>().elapsed();
+    harness
+        .world()
+        .entity_mut(strip_entity)
+        .insert(crate::ecs::Scrolling {
+            velocity: 0.0,
+            position: f64::from(before_x),
+            is_user_swiping: true,
+            last_event,
+            moved_at: last_event,
+            input: crate::ecs::ScrollInput::Gesture,
+            anchor: f64::from(before_x),
+            settle: Some(f64::from(before_x - 100)),
+            ease: Some(crate::ecs::SettleEase {
+                from: f64::from(before_x),
+                start: 0.0,
+                elapsed: 0.05,
+                animation_speed: 8.0,
+                flick: None,
+            }),
+            detent: None,
+            origin: f64::from(before_x),
+            landing_focus: None,
+            focus_at_start: None,
+            start: None,
+            fingers_down: true,
+            lifted_at: None,
+            caught: None,
+            slope: 1.0,
+            excess: None,
+        });
+
+    harness = harness.with_window(9, |window| {
+        window.subrole = "AXLeftEdge".to_string();
+    });
+    harness.advance(Duration::from_millis(16));
+
+    let world = harness.world();
+    let inserted = find_window_entity(9, world);
+    let inserted_width = f64::from(world.get::<crate::ecs::Bounds>(inserted).unwrap().0.x);
+    let scrolling = world
+        .get::<crate::ecs::Scrolling>(strip_entity)
+        .expect("strip still scrolling");
+    assert_eq!(scrolling.position, f64::from(before_x) - inserted_width);
+    assert_eq!(scrolling.anchor, f64::from(before_x) - inserted_width);
+    assert_eq!(scrolling.origin, f64::from(before_x) - inserted_width);
+    assert_eq!(
+        scrolling.settle,
+        Some(f64::from(before_x - 100) - inserted_width)
+    );
+    assert_eq!(
+        scrolling.ease.map(|ease| ease.from),
+        Some(f64::from(before_x) - inserted_width)
+    );
+}
+
+/// Inserting immediately before focused column C during a settle whose
+/// `landing_focus` is column B (before the insertion) shifts C's slot but not
+/// B's, so the settle target stays at B's slot and the ease retargets from the
+/// compensated current position.
+#[test]
+fn test_insertion_before_focus_during_settle_to_earlier_column_keeps_destination_target() {
+    let config = Config::try_from(
+        r#"
+[options]
+auto_center = false
+animation_speed = 8.0
+
+[bindings]
+
+[windows.beforec]
+title = ".*"
+subrole = "AXBeforeC"
+index = 2
+dont_focus = true
+"#,
+    )
+    .expect("config should parse");
+
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_millis(500));
+
+    harness.mock_state.set_focused_window(2);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 2 });
+    harness.advance(Duration::from_millis(500));
+
+    let (strip_entity, before_x, col_b) = {
+        let world = harness.world();
+        let strip_entity = active_strip_entity(world);
+        let strip_x = world.get::<Position>(strip_entity).unwrap().x;
+        let col_b = find_window_entity(1, world);
+        (strip_entity, strip_x, col_b)
+    };
+    let last_event = harness.world().resource::<Time>().elapsed();
+    let target_b = -200.0;
+    harness
+        .world()
+        .entity_mut(strip_entity)
+        .insert(crate::ecs::Scrolling {
+            velocity: 0.0,
+            position: f64::from(before_x),
+            is_user_swiping: false,
+            last_event,
+            moved_at: last_event,
+            input: crate::ecs::ScrollInput::Gesture,
+            anchor: f64::from(before_x),
+            settle: Some(target_b),
+            ease: Some(crate::ecs::SettleEase {
+                from: f64::from(before_x),
+                start: 0.0,
+                elapsed: 0.05,
+                animation_speed: 8.0,
+                flick: None,
+            }),
+            detent: None,
+            origin: f64::from(before_x),
+            landing_focus: Some(col_b),
+            focus_at_start: None,
+            start: None,
+            fingers_down: false,
+            lifted_at: None,
+            caught: None,
+            slope: 1.0,
+            excess: None,
+        });
+
+    harness = harness.with_window(9, |window| {
+        window.subrole = "AXBeforeC".to_string();
+    });
+    harness.advance(Duration::from_millis(16));
+
+    let world = harness.world();
+    let inserted = find_window_entity(9, world);
+    let inserted_width = f64::from(world.get::<crate::ecs::Bounds>(inserted).unwrap().0.x);
+    let scrolling = world
+        .get::<crate::ecs::Scrolling>(strip_entity)
+        .expect("strip still settling toward B");
+    assert_eq!(
+        scrolling.settle,
+        Some(target_b),
+        "B's slot did not move when inserting at index 2, so the settle target must stay at B"
+    );
+    let ease = scrolling.ease.expect("ease must retarget toward B");
+    assert!(
+        ease.from <= f64::from(before_x) - inserted_width + 1.0,
+        "retargeted ease must start from the compensated strip position (got {}, before_x {}, width {})",
+        ease.from,
+        before_x,
+        inserted_width
+    );
+
+    harness.advance(Duration::from_secs(2));
+    let world = harness.world();
+    assert_eq!(
+        world
+            .get::<Position>(strip_entity)
+            .map(|position| position.x),
+        Some(-200),
+        "strip must still land at column B's target offset"
+    );
+    assert_focused!(world, 1);
+}
+
+/// A background application opening a window with `index = 0` and no
+/// `dont_focus` rule has its focus notification rejected, so the focused
+/// window keeps focus and must stay at the same screen x.
+#[test]
+fn test_left_edge_insertion_from_background_app_without_dont_focus_keeps_focused_window_stationary()
+{
+    let config = Config::try_from(
+        r#"
+[options]
+auto_center = false
+
+[bindings]
+
+[windows.leftedge]
+title = ".*"
+subrole = "AXLeftEdge"
+index = 0
+"#,
+    )
+    .expect("config should parse");
+
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_millis(500));
+
+    harness.mock_state.set_focused_window(2);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 2 });
+    harness.advance(Duration::from_millis(500));
+
+    let focused_x = {
+        let world = harness.world();
+        assert_focused!(world, 2);
+        let focused = find_window_entity(2, world);
+        world.get::<Position>(focused).unwrap().x
+    };
+
+    let bg_pid = TEST_PROCESS_ID + 1;
+    harness
+        .mock_state
+        .spawn_app(bg_pid, "com.test.background", "Background");
+    harness
+        .mock_state
+        .update_app(bg_pid, |app| app.is_frontmost = false);
+    let bg_app = harness.mock_state.create_application(bg_pid);
+    harness.world().spawn(bg_app);
+    let window = harness.mock_state.spawn_window(
+        bg_pid,
+        TEST_WORKSPACE_ID,
+        9,
+        IRect::new(0, TEST_MENUBAR_HEIGHT, 400, TEST_DISPLAY_HEIGHT),
+    );
+    harness
+        .mock_state
+        .update_window(9, |window| window.subrole = "AXLeftEdge".to_string());
+    harness
+        .world()
+        .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_millis(500));
+
+    let world = harness.world();
+    assert_focused!(world, 2);
+    let focused = find_window_entity(2, world);
+    assert_eq!(
+        world.get::<Position>(focused).map(|position| position.x),
+        Some(focused_x),
+        "a background app's left-edge window must not shift the focused window"
+    );
+}
+
+/// Closing a column between the settle destination (column 1) and the focused
+/// column (column 4) during an active window-landing settle leaves column 1's
+/// slot unchanged, so `scrolling.settle` must stay at column 1's target rather
+/// than shifting rightward by the closed column's width.
+#[test]
+fn test_removal_before_focus_during_settle_to_earlier_column_keeps_destination_target() {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(false),
+            animation_speed: Some(8.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut harness = TestHarness::new().with_config(config).with_windows(5);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_millis(500));
+
+    harness.mock_state.set_focused_window(4);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 4 });
+    harness.advance(Duration::from_millis(500));
+
+    let (strip_entity, before_x, col_1, col_2_width) = {
+        let world = harness.world();
+        let strip_entity = active_strip_entity(world);
+        let strip_x = world.get::<Position>(strip_entity).unwrap().x;
+        let col_1 = find_window_entity(1, world);
+        let col_2 = find_window_entity(2, world);
+        let col_2_width = world.get::<crate::ecs::Bounds>(col_2).unwrap().0.x;
+        (strip_entity, strip_x, col_1, col_2_width)
+    };
+    let last_event = harness.world().resource::<Time>().elapsed();
+    let target_1 = -400.0;
+    harness
+        .world()
+        .entity_mut(strip_entity)
+        .insert(crate::ecs::Scrolling {
+            velocity: 0.0,
+            position: f64::from(before_x),
+            is_user_swiping: false,
+            last_event,
+            moved_at: last_event,
+            input: crate::ecs::ScrollInput::Gesture,
+            anchor: f64::from(before_x),
+            settle: Some(target_1),
+            ease: Some(crate::ecs::SettleEase {
+                from: f64::from(before_x),
+                start: 0.0,
+                elapsed: 0.05,
+                animation_speed: 8.0,
+                flick: None,
+            }),
+            detent: None,
+            origin: f64::from(before_x),
+            landing_focus: Some(col_1),
+            focus_at_start: None,
+            start: None,
+            fingers_down: false,
+            lifted_at: None,
+            caught: None,
+            slope: 1.0,
+            excess: None,
+        });
+
+    harness.world().write_message(Event::WindowDestroyed {
+        window_id: 2,
+        source: crate::events::DestroySource::Accessibility { element: None },
+    });
+    harness.advance(Duration::from_millis(16));
+
+    let world = harness.world();
+    let scrolling = world
+        .get::<crate::ecs::Scrolling>(strip_entity)
+        .expect("strip still settling toward column 1");
+    assert_eq!(
+        scrolling.settle,
+        Some(target_1),
+        "column 1's slot did not move when closing column 2, so the settle target must stay at {target_1}"
+    );
+    let min_from = f64::from((before_x + col_2_width).min(0));
+    let ease = scrolling.ease.expect("ease must retarget toward column 1");
+    assert!(
+        ease.from >= min_from - 1.0,
+        "retargeted ease must start from the compensated strip position (got {}, before_x {}, width {})",
+        ease.from,
+        before_x,
+        col_2_width
+    );
+
+    harness.advance(Duration::from_secs(2));
+    let world = harness.world();
+    assert_eq!(
+        world
+            .get::<Position>(strip_entity)
+            .map(|position| position.x),
+        Some(-400),
+        "strip must still land at column 1's target offset"
+    );
+    assert_focused!(world, 1);
+}

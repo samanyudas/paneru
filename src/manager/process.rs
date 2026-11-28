@@ -41,7 +41,7 @@ pub trait ProcessApi: Send + Sync {
     fn name(&self) -> &str;
     fn pid(&self) -> Pid;
     fn psn(&self) -> ProcessSerialNumber;
-    fn application(&self) -> Option<Retained<NSRunningApplication>>;
+    fn bundle_id(&self) -> Option<String>;
     fn ready(&mut self) -> bool;
     /// Forces the process to be treated as manageable even if macOS reports it as
     /// unobservable (e.g. `LSUIElement` background apps that create standard windows).
@@ -69,8 +69,8 @@ impl ProcessApi for ProcessOS {
         self.inner.psn
     }
 
-    fn application(&self) -> Option<Retained<NSRunningApplication>> {
-        self.inner.application.clone()
+    fn bundle_id(&self) -> Option<String> {
+        self.inner.bundle_id()
     }
 
     fn ready(&mut self) -> bool {
@@ -108,6 +108,12 @@ impl Drop for Process {
     }
 }
 
+fn lookup_running_application(pid: Pid) -> Option<Retained<NSRunningApplication>> {
+    (pid > 0)
+        .then(|| NSRunningApplication::runningApplicationWithProcessIdentifier(pid))
+        .flatten()
+}
+
 impl Process {
     pub fn new(psn: &ProcessSerialNumber, observer: Retained<WorkspaceObserver>) -> Pin<Box<Self>> {
         let mut pid: Pid = 0;
@@ -120,7 +126,7 @@ impl Process {
             .map(|name| name.to_string())
             .unwrap_or_default();
 
-        let apps = NSRunningApplication::runningApplicationWithProcessIdentifier(pid);
+        let apps = lookup_running_application(pid);
 
         Box::pin(Process {
             psn: *psn,
@@ -133,6 +139,13 @@ impl Process {
             observing_activated: AtomicBool::new(false),
             force_manage: false,
         })
+    }
+
+    pub fn bundle_id(&self) -> Option<String> {
+        self.application
+            .as_ref()
+            .and_then(|app| app.bundleIdentifier())
+            .map(|id| id.to_string())
     }
 
     pub fn is_observable(&mut self) -> bool {
@@ -156,7 +169,7 @@ impl Process {
     }
 
     pub fn observe_finished_launching(&self) {
-        if !self.observing_launched.swap(true, Ordering::Acquire) {
+        if self.application.is_some() && !self.observing_launched.swap(true, Ordering::Acquire) {
             self.observe("finishedLaunching");
         }
     }
@@ -168,7 +181,7 @@ impl Process {
     }
 
     pub fn observe_activation_policy(&self) {
-        if !self.observing_activated.swap(true, Ordering::Acquire) {
+        if self.application.is_some() && !self.observing_activated.swap(true, Ordering::Acquire) {
             self.observe("activationPolicy");
         }
     }
@@ -210,11 +223,17 @@ impl Process {
     }
 
     pub fn ready(&mut self) -> bool {
+        self.ready_with(lookup_running_application)
+    }
+
+    fn ready_with(
+        &mut self,
+        lookup: impl FnOnce(Pid) -> Option<Retained<NSRunningApplication>>,
+    ) -> bool {
         // macOS can announce a launch before `NSRunningApplication` knows the
         // process, and without one the process would never look launched.
         if self.application.is_none() {
-            self.application =
-                NSRunningApplication::runningApplicationWithProcessIdentifier(self.pid);
+            self.application = lookup(self.pid);
             if self.application.is_none() {
                 return false;
             }
@@ -239,5 +258,81 @@ impl Process {
         }
         self.unobserve_activation_policy();
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::EventSender;
+
+    fn test_process(pid: Pid) -> Pin<Box<Process>> {
+        let (events, _receiver) = EventSender::new();
+        Box::pin(Process {
+            psn: ProcessSerialNumber {
+                high: 0,
+                low: pid.max(0).cast_unsigned(),
+            },
+            pid,
+            name: "TestApp".to_string(),
+            application: None,
+            policy: NSApplicationActivationPolicy::Prohibited,
+            observer: WorkspaceObserver::new(events),
+            observing_launched: AtomicBool::new(false),
+            observing_activated: AtomicBool::new(false),
+            force_manage: false,
+        })
+    }
+
+    #[test]
+    fn observe_methods_ignore_missing_application() {
+        let mut process = test_process(42);
+        process.observe_finished_launching();
+        process.observe_activation_policy();
+        assert!(!process.observing_launched.load(Ordering::Relaxed));
+        assert!(!process.observing_activated.load(Ordering::Relaxed));
+
+        // Attaching an application later and dropping must not attempt to
+        // remove KVO observers that were never registered.
+        process.application = Some(NSRunningApplication::currentApplication());
+        drop(process);
+    }
+
+    #[test]
+    fn ready_with_retries_lookup_and_caches_resolved_application() {
+        let mut process = test_process(42);
+
+        let mut queried_pid = None;
+        assert!(!process.ready_with(|pid| {
+            queried_pid = Some(pid);
+            None
+        }));
+        assert_eq!(queried_pid, Some(42));
+        assert!(process.application.is_none());
+        assert!(!process.observing_launched.load(Ordering::Relaxed));
+        assert!(!process.observing_activated.load(Ordering::Relaxed));
+
+        let _ = process.ready_with(|pid| {
+            assert_eq!(pid, 42);
+            Some(NSRunningApplication::currentApplication())
+        });
+        assert!(process.application.is_some());
+
+        // Once resolved, subsequent readiness checks must reuse the cached application.
+        let _ = process.ready_with(|_| panic!("lookup must not rerun once application is cached"));
+    }
+
+    #[test]
+    fn lookup_running_application_ignores_non_positive_pid() {
+        assert!(lookup_running_application(0).is_none());
+        assert!(lookup_running_application(-1).is_none());
+
+        let mut zero_pid = test_process(0);
+        assert!(!zero_pid.ready());
+        assert!(zero_pid.application.is_none());
+
+        let mut negative_pid = test_process(-1);
+        assert!(!negative_pid.ready());
+        assert!(negative_pid.application.is_none());
     }
 }

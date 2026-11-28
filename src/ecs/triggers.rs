@@ -26,7 +26,10 @@ use super::{
 use crate::config::{Config, FocusOnClose};
 use crate::ecs::display::size_for_arrival;
 use crate::ecs::focus::FocusHistory;
-use crate::ecs::layout::{Column, ExposeFocusedSurvivorAfterRemoval, LayoutStrip, anchored_origin};
+use crate::ecs::layout::{
+    Column, DisplayViewports, ExposeFocusedSurvivorAfterRemoval, LayoutStrip, RemovableStrips,
+    anchored_origin,
+};
 use crate::ecs::maximize::EDGE_RELEASE;
 use crate::ecs::maximize::FloatingMaximized;
 use crate::ecs::native_membership::{NativeMembership, NativeScope};
@@ -93,6 +96,59 @@ type WindowDefaultsQueries<'w, 's> = ParamSet<
         Query<'static, 'static, &'static Bounds, With<FocusedMarker>>,
     ),
 >;
+
+const MAX_WINDOW_PADDING: i32 = 50;
+
+fn clamped_window_padding(properties: &WindowProperties) -> (i32, i32) {
+    (
+        properties.horizontal_padding().clamp(0, MAX_WINDOW_PADDING),
+        properties.vertical_padding().clamp(0, MAX_WINDOW_PADDING),
+    )
+}
+
+type ManagedWindowPadding<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        &'static ChildOf,
+        &'static mut Position,
+        &'static mut Bounds,
+        &'static mut LayoutPosition,
+    ),
+    Without<Unmanaged>,
+>;
+
+/// Re-applies per-window `horizontal_padding` and `vertical_padding` rules to
+/// already-open managed windows whenever [`Config`] changes (TOML or Lua reload).
+///
+/// Only windows whose clamped padding actually changed are mutated or marked
+/// dirty; floating, minimized, and hidden windows are excluded (becoming tiled
+/// again re-applies padding in [`window_managed_trigger`]).
+#[instrument(level = Level::DEBUG, skip_all)]
+pub(super) fn refresh_window_padding(
+    mut windows: ManagedWindowPadding,
+    apps: Query<&Application>,
+    config: Res<Config>,
+) {
+    for (mut window, child_of, mut position, mut bounds, mut layout_position) in &mut windows {
+        let Ok(app) = apps.get(child_of.parent()) else {
+            continue;
+        };
+        let properties = WindowProperties::new(app, &window, &config);
+        let (horizontal, vertical) = clamped_window_padding(&properties);
+        if horizontal == window.horizontal_padding() && vertical == window.vertical_padding() {
+            continue;
+        }
+        window.set_padding(WindowPadding::Horizontal(horizontal));
+        window.set_padding(WindowPadding::Vertical(vertical));
+        if !window.is_full_screen() {
+            layout_position.set_changed();
+            position.set_changed();
+            bounds.set_changed();
+        }
+    }
+}
 
 /// Computes the passthrough keybinding set for the given window/app and
 /// publishes it to the input thread. Called on focus change and config reload.
@@ -685,20 +741,16 @@ pub(super) fn window_focused_trigger(
 ///
 /// * `trigger` - The Bevy event trigger containing the Mission Control event.
 /// * `mission_control_active` - The `MissionControlActive` resource.
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn mission_control_trigger(
     mut messages: MessageReader<Event>,
-    windows: Windows,
-    mut workspaces: Query<(
-        Entity,
-        &mut LayoutStrip,
-        Has<ActiveWorkspaceMarker>,
-        Option<&Scrolling>,
-    )>,
+    mut workspaces: RemovableStrips,
+    displays: DisplayViewports,
     mut mission_control_active: ResMut<MissionControlActive>,
     window_manager: Res<WindowManager>,
     mut native: ResMut<NativeMembership>,
-    mut commands: Commands,
+    mut ctx: WindowCtx,
 ) {
     for event in messages.read() {
         match event {
@@ -706,9 +758,9 @@ pub(super) fn mission_control_trigger(
             | Event::MissionControlShowFrontWindows
             | Event::MissionControlShowDesktop => {
                 mission_control_active.as_mut().0 = true;
-                for (entity, _, _, scroll) in &workspaces {
-                    if scroll.is_some()
-                        && let Ok(mut entity_commands) = commands.get_entity(entity)
+                for item in &workspaces {
+                    if item.scrolling.is_some()
+                        && let Ok(mut entity_commands) = ctx.commands.get_entity(item.entity)
                     {
                         entity_commands.try_remove::<Scrolling>();
                     }
@@ -720,26 +772,33 @@ pub(super) fn mission_control_trigger(
 
                 // Check if some windows disappeared from the current workspace
                 // - e.g. they were moved away during mission control.
-                if let Some(mut active_strip) = workspaces
-                    .iter_mut()
-                    .find_map(|(_, strip, active, _)| active.then_some(strip))
+                if let Some(mut active_strip) = workspaces.iter_mut().find(|item| item.active)
                     && let Ok(present_windows) =
-                        window_manager.windows_in_workspace(active_strip.id())
+                        window_manager.windows_in_workspace(active_strip.strip.id())
                 {
-                    let moved_windows = active_strip
+                    let focused = ctx.windows.focused().map(|(_, focused)| focused);
+                    let moved_windows: Vec<_> = active_strip
+                        .strip
                         .all_windows()
                         .into_iter()
-                        .filter_map(|entity| windows.get(entity).zip(Some(entity)))
-                        .filter(|(window, _)| !present_windows.contains(&window.id()));
-                    for (window, entity) in moved_windows {
+                        .filter_map(|entity| ctx.windows.get(entity).zip(Some(entity)))
+                        .filter(|(window, _)| !present_windows.contains(&window.id()))
+                        .map(|(window, entity)| (window.id(), entity))
+                        .collect();
+                    for (window_id, entity) in moved_windows {
                         debug!(
-                            "window {} {entity} moved, removing from workspace {}",
-                            window.id(),
-                            active_strip.id(),
+                            "window {window_id} {entity} moved, removing from workspace {}",
+                            active_strip.strip.id(),
                         );
                         // Simply removing them from the current strip is enough,
                         // they will be re-detected during the workspace change.
-                        active_strip.remove(entity);
+                        active_strip.remove_preserving_focus(
+                            entity,
+                            focused,
+                            &ctx.windows,
+                            &displays,
+                            &ctx.config,
+                        );
                     }
                 }
             }
@@ -908,11 +967,13 @@ pub(super) fn dispatch_application_messages(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_unmanaged_trigger(
     trigger: On<Add, Unmanaged>,
     apps: Query<(Entity, &Application)>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut workspaces: RemovableStrips,
+    displays: DisplayViewports,
     // `Option<Single>` rather than `Single`: an unresolvable display would skip the
     // whole observer, but the strip removal below must still run without one.
     active_display: Option<ActiveDisplayViewport>,
@@ -970,15 +1031,19 @@ pub(super) fn window_unmanaged_trigger(
     // is actually looking at.
     let parked_out_of_view = workspaces
         .iter()
-        .any(|(strip, active)| !active && strip.contains(entity));
+        .any(|item| !item.active && item.strip.contains(entity));
 
     // Drop the strip membership first, before anything below can bail early —
     // a floating window still reserves column space in the strip otherwise,
     // leaving a gap that never closes on its own.
-    for (mut strip, _) in &mut workspaces {
-        if strip.contains(entity) {
-            remember_managed_strip(entity, &strip, Rejoin::VisibleRow, &mut ctx.commands);
-            strip.remove(entity);
+    let focused = initializing
+        .is_none()
+        .then(|| ctx.windows.focused().map(|(_, focused)| focused))
+        .flatten();
+    for mut item in &mut workspaces {
+        if item.strip.contains(entity) {
+            remember_managed_strip(entity, &item.strip, Rejoin::VisibleRow, &mut ctx.commands);
+            item.remove_preserving_focus(entity, focused, &ctx.windows, &displays, &ctx.config);
         }
     }
 
@@ -1057,42 +1122,45 @@ fn remember_managed_strip(
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_minimized_trigger(
     trigger: On<Add, Unmanaged>,
-    windows: Windows,
-    workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut workspaces: RemovableStrips,
+    displays: DisplayViewports,
     focus_history: Res<FocusHistory>,
-    config: Res<Config>,
     mut global_state: GlobalState,
-    mut commands: Commands,
+    mut ctx: WindowCtx,
 ) {
     let entity = trigger.event().entity;
     if let Some((_, _, Some(Unmanaged::Minimized | Unmanaged::Hidden))) =
-        windows.get_managed(entity)
+        ctx.windows.get_managed(entity)
     {
         debug!("Entity {entity} is minimized or hidden.");
-        let focused = windows
+        let is_focused = ctx
+            .windows
             .focused()
             .is_some_and(|(_, focused)| focused == entity);
         let departing = EntityHashSet::from_iter([entity]);
-        let has_focused_survivor = has_focused_survivor(&windows, &departing);
+        let has_focused_survivor = has_focused_survivor(&ctx.windows, &departing);
+        let focused = (!global_state.initializing())
+            .then(|| ctx.windows.focused().map(|(_, focused)| focused))
+            .flatten();
 
-        for (mut strip, active) in workspaces {
+        for mut item in &mut workspaces {
             // A window of a hidden app that opens in no strip and without focus has no focus to
             // give away. (#374)
-            if active && !has_focused_survivor && (focused || strip.contains(entity)) {
+            if item.active && !has_focused_survivor && (is_focused || item.strip.contains(entity)) {
                 give_away_focus_for_departing(
                     entity,
                     &departing,
-                    &windows,
-                    &strip,
+                    &ctx.windows,
+                    &item.strip,
                     &focus_history,
-                    &config,
+                    &ctx.config,
                     &mut global_state,
-                    &mut commands,
+                    &mut ctx.commands,
                 );
             }
-            if strip.contains(entity) {
-                remember_managed_strip(entity, &strip, Rejoin::AnyRow, &mut commands);
-                strip.remove(entity);
+            if item.strip.contains(entity) {
+                remember_managed_strip(entity, &item.strip, Rejoin::AnyRow, &mut ctx.commands);
+                item.remove_preserving_focus(entity, focused, &ctx.windows, &displays, &ctx.config);
             }
         }
     }
@@ -1169,8 +1237,7 @@ pub(super) fn window_managed_trigger(
 
         // A window that opened floating never got the padding that
         // `apply_window_defaults` gives a tiled one.
-        let vertical = properties.vertical_padding().clamp(0, 50);
-        let horizontal = properties.horizontal_padding().clamp(0, 50);
+        let (horizontal, vertical) = clamped_window_padding(&properties);
         ctx.commands
             .entity(entity)
             .queue_silenced(move |mut entity: EntityWorldMut| {
@@ -1878,10 +1945,9 @@ pub(super) fn apply_window_defaults(
             }
             continue;
         }
-        let vpadding = properties.vertical_padding();
-        let hpadding = properties.horizontal_padding();
-        window.set_padding(WindowPadding::Vertical(vpadding.clamp(0, 50)));
-        window.set_padding(WindowPadding::Horizontal(hpadding.clamp(0, 50)));
+        let (hpadding, vpadding) = clamped_window_padding(&properties);
+        window.set_padding(WindowPadding::Vertical(vpadding));
+        window.set_padding(WindowPadding::Horizontal(hpadding));
         let display_width = f64::from(active_display.bounds().width());
         if let Ok(frame) = window.update_frame() {
             position.0 = frame.min;
@@ -2137,10 +2203,8 @@ fn size_new_column(
     restore: Option<&crate::ecs::restore::SessionRestore>,
     config: &Config,
     commands: &mut Commands,
-) {
-    let Some(frame) = frame.filter(|_| !window.is_minimized()) else {
-        return;
-    };
+) -> Option<i32> {
+    let frame = frame.filter(|_| !window.is_minimized())?;
     let launched = launch_windows.is_some_and(|launch| launch.0.contains(&window.id()));
     let rule_sets_width = WindowProperties::new(app, window, config).sets_width();
     let mut new_window_width = config.new_window_width().filter(|_| !launched);
@@ -2164,6 +2228,7 @@ fn size_new_column(
     if let Some(width) = width {
         size_for_arrival(entity, Size::new(width, frame.height()), commands);
     }
+    width
 }
 
 /// Starts reading a new window's level again, because the read on arrival
@@ -2233,16 +2298,26 @@ fn home_strip(
     debug!("Space of new window {window_id} unknown, using the active strip.");
     Some((active_entity, true))
 }
+type SpawnStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        &'static mut Position,
+        Option<&'static mut RepositionMarker>,
+        Option<&'static mut crate::ecs::Scrolling>,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+    ),
+    Without<Window>,
+>;
+
 #[instrument(level = Level::DEBUG, skip_all)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn apply_window_positions(
     added: Populated<Entity, Added<Window>>,
-    mut workspaces: Query<(
-        Entity,
-        &mut LayoutStrip,
-        Has<ActiveWorkspaceMarker>,
-        Has<SelectedVirtualMarker>,
-    )>,
+    mut workspaces: SpawnStrips,
     displays: ActiveDisplays,
     window_manager: Res<WindowManager>,
     apps: Query<&Application>,
@@ -2256,7 +2331,7 @@ pub(super) fn apply_window_positions(
     for entity in added {
         if workspaces
             .iter()
-            .any(|(_, strip, _, _)| strip.tabbed(entity))
+            .any(|(_, strip, _, _, _, _, _)| strip.tabbed(entity))
         {
             debug!("Ignoring tabbed {entity} attributes.");
             continue;
@@ -2283,7 +2358,7 @@ pub(super) fn apply_window_positions(
         if properties.floating() && !overrides.contains(window, app) {
             if let Some(mut strip) = workspaces
                 .iter_mut()
-                .find_map(|(_, strip, _, _)| strip.contains(entity).then_some(strip))
+                .find_map(|(_, strip, _, _, _, _, _)| strip.contains(entity).then_some(strip))
             {
                 strip.remove(entity);
             }
@@ -2326,48 +2401,22 @@ pub(super) fn apply_window_positions(
         // During startup, the window is already inserted into some strip by finish_setup.
         let allready_inserted = workspaces
             .iter()
-            .any(|(_, strip, _, _)| strip.contains(entity));
+            .any(|(_, strip, _, _, _, _, _)| strip.contains(entity));
         let mut on_hidden_space = false;
         if initializing.is_none()
             && !allready_inserted
             && let Some((target, is_active)) = home_strip(
                 window.id(),
-                &workspaces.iter().collect::<Vec<_>>(),
+                &workspaces
+                    .iter()
+                    .map(|(e, s, _, _, _, active, sel)| (e, s, active, sel))
+                    .collect::<Vec<_>>(),
                 &window_manager,
             )
-            && let Ok((_, mut strip, _, _)) = workspaces.get_mut(target)
+            && let Ok((_, mut strip, mut strip_position, strip_reposition, strip_scrolling, _, _)) =
+                workspaces.get_mut(target)
         {
-            if is_active {
-                // Attempt inserting the window at a pre-defined position.
-                let insert_at = properties.insertion().map_or_else(
-                    || {
-                        // Otherwise attempt inserting it after the current focus.
-                        let focused_window = ctx.windows.focused();
-                        // Insert to the right of the currently focused window
-                        focused_window
-                            .and_then(|(_, entity)| strip.index_of(entity).ok())
-                            .and_then(|insert_at| {
-                                (insert_at + 1 < strip.len()).then_some(insert_at + 1)
-                            })
-                    },
-                    Some,
-                );
-
-                debug!("New window {entity} adding at {}", *strip);
-                match insert_at {
-                    Some(after) => {
-                        debug!("New window inserted at {after}");
-                        strip.insert_at(after, entity);
-                    }
-                    None => strip.append(entity),
-                }
-            } else {
-                // The window opened on a Space the user is not looking at.
-                debug!("New window {entity} appended to inactive {}", *strip);
-                strip.append(entity);
-                on_hidden_space = true;
-            }
-            if let Ok(display) = displays.single() {
+            let resized_width = displays.single().ok().and_then(|display| {
                 size_new_column(
                     entity,
                     window,
@@ -2378,7 +2427,83 @@ pub(super) fn apply_window_positions(
                     restore.as_deref(),
                     &ctx.config,
                     &mut ctx.commands,
-                );
+                )
+            });
+            if is_active {
+                let focused_index = ctx
+                    .windows
+                    .focused()
+                    .and_then(|(_, focused)| strip.index_of(focused).ok());
+                // Attempt inserting the window at a pre-defined position.
+                let insert_at = properties.insertion().or_else(|| {
+                    // Otherwise attempt inserting it after the current focus.
+                    focused_index.and_then(|idx| (idx + 1 < strip.len()).then_some(idx + 1))
+                });
+
+                debug!("New window {entity} adding at {}", *strip);
+                match insert_at {
+                    Some(after) => {
+                        debug!("New window inserted at {after}");
+                        let insertion = after.min(strip.len());
+                        strip.insert_at(insertion, entity);
+                        // Keep the focused column at the same screen x when a
+                        // window that will not take focus (dont_focus rule or
+                        // background app) lands at or left of it: shifting the
+                        // strip origin and any in-flight animation/scroll state
+                        // by the new column's width absorbs the slot shift on
+                        // the left without moving existing windows.
+                        if (properties.dont_focus() || !app.is_frontmost())
+                            && focused_index.is_some_and(|idx| insertion <= idx)
+                            && let Some(width) = resized_width.or_else(|| {
+                                ctx.windows.moving_frame(entity).map(|frame| frame.width())
+                            })
+                        {
+                            strip_position.0.x -= width;
+                            if let Some(mut target) = strip_reposition {
+                                target.0.x -= width;
+                            }
+                            if let Some(mut scrolling) = strip_scrolling {
+                                let delta = -f64::from(width);
+                                let old_pos = scrolling.position;
+                                let old_settle = scrolling.settle;
+                                scrolling.position += delta;
+                                scrolling.anchor += delta;
+                                scrolling.origin += delta;
+                                // A pending settle whose destination column sits
+                                // before `insertion` did not shift in slot
+                                // coordinates; keep its target and retarget the
+                                // ease from the compensated position.
+                                let dest_shifted = scrolling
+                                    .landing_focus
+                                    .and_then(|dest| strip.index_of(dest).ok())
+                                    .is_none_or(|dest_idx| dest_idx > insertion);
+                                if dest_shifted && let Some(settle) = &mut scrolling.settle {
+                                    *settle += delta;
+                                }
+                                let new_pos = scrolling.position;
+                                let new_settle = scrolling.settle;
+                                if let (Some(ease), Some(old_target), Some(new_target)) =
+                                    (&mut scrolling.ease, old_settle, new_settle)
+                                {
+                                    crate::ecs::scroll::retarget_settle_ease(
+                                        ease,
+                                        old_pos,
+                                        old_target,
+                                        new_pos,
+                                        new_target,
+                                        &ctx.config,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    None => strip.append(entity),
+                }
+            } else {
+                // The window opened on a Space the user is not looking at.
+                debug!("New window {entity} appended to inactive {}", *strip);
+                strip.append(entity);
+                on_hidden_space = true;
             }
         }
 
@@ -2391,6 +2516,14 @@ pub(super) fn apply_window_positions(
                         "Not focusing new window {entity}, keeping focus on '{}'",
                         focus.title().unwrap_or_default()
                     );
+                    // Re-asserting OS focus on `prev` echoes a repeat
+                    // `WindowFocused` event that would otherwise call
+                    // `ensure_visible(prev)` and abort an in-flight settle.
+                    if workspaces.iter().any(|(_, strip, _, _, scrolling, _, _)| {
+                        scrolling.is_some() && strip.contains(prev)
+                    }) {
+                        crate::ecs::workspace::spawn_restore_focus_guard(prev, &mut ctx.commands);
+                    }
                     ctx.commands.focus_entity(prev, true);
                 }
             } else if !on_hidden_space {
@@ -2474,31 +2607,38 @@ pub(super) fn refresh_configuration_trigger(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
-    windows: Query<&Window>,
-    mut workspaces: Query<(Entity, &mut LayoutStrip)>,
+    windows: Windows,
+    mut workspaces: RemovableStrips,
+    displays: DisplayViewports,
+    initializing: Option<Res<Initializing>>,
+    config: Res<Config>,
     mut focus_history: ResMut<FocusHistory>,
     mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
     focus_history.forget(entity);
+    let focused = initializing
+        .is_none()
+        .then(|| windows.focused().map(|(_, focused)| focused))
+        .flatten();
 
-    if let Some((strip_entity, mut strip)) = workspaces
-        .iter_mut()
-        .find(|(_, strip)| strip.contains(entity))
-    {
-        // Every path that stops managing a window ends here, so this line
-        // names each loss even when the path that caused it logs nothing.
-        info!(
-            "Stopped managing window {} (entity {entity}): removed from strip {}.",
-            windows.get(entity).map_or(0, |window| window.id()),
-            strip.id()
-        );
-        strip.remove(entity);
-        commands
-            .entity(strip_entity)
-            .try_insert(ExposeFocusedSurvivorAfterRemoval);
+    for mut item in &mut workspaces {
+        if item.strip.contains(entity) {
+            // Every path that stops managing a window ends here, so this line
+            // names each loss even when the path that caused it logs nothing.
+            info!(
+                "Stopped managing window {} (entity {entity}): removed from strip {}.",
+                windows.get(entity).map_or(0, |window| window.id()),
+                item.strip.id()
+            );
+            item.remove_preserving_focus(entity, focused, &windows, &displays, &config);
+            commands
+                .entity(item.entity)
+                .try_insert(ExposeFocusedSurvivorAfterRemoval);
+        }
     }
 }
 

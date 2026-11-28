@@ -2432,4 +2432,38 @@ mod writer_tests {
             "the superseded frame read must not run on the writer"
         );
     }
+
+    /// Changing window padding keeps the logical slot identical while changing
+    /// the native inset. Rebasing the tracked frame through old->new margins
+    /// makes `FrameWrites::place` write the new native frame.
+    #[test]
+    fn rebasing_tracked_frame_for_padding_change_writes_new_inset_frame() {
+        use crate::manager::Margins;
+        use bevy::math::IVec2;
+
+        let (probe, _entered) = Probe::new();
+        let pool = Arc::new(writers(&probe, SECOND, SETTLE));
+        let mut writes = FrameWrites::new(pool.clone());
+        let slot = IRect::new(0, 20, 800, 620);
+        let old_margins = Margins::padding(IVec2::ZERO);
+        let new_margins = Margins::padding(IVec2::new(20, 10));
+
+        writes.track(slot);
+        let shown = old_margins.shown(writes.frame());
+        writes.track(new_margins.tracked(shown));
+
+        writes.place(Some(1), || 7, slot);
+        assert!(pool.flush(SECOND));
+        assert_eq!(writes.frame(), slot);
+        let applied: Vec<_> = probe
+            .log(1)
+            .into_iter()
+            .filter(|op| matches!(op, Op::Position(..) | Op::Size(..)))
+            .collect();
+        assert_eq!(
+            applied,
+            vec![Op::Size(7, slot.size()), Op::Position(7, slot.min)],
+            "writer must emit both resize and move for the new padded inset"
+        );
+    }
 }

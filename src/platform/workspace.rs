@@ -335,7 +335,7 @@ mod delayed_readiness_tests {
         };
         process.expect_psn().return_const(psn);
         process.expect_name().return_const("Bitwarden".to_string());
-        process.expect_application().return_const(None);
+        process.expect_bundle_id().return_const(None);
         let flag = regular.clone();
         process
             .expect_is_observable()
@@ -435,6 +435,97 @@ mod delayed_readiness_tests {
                 .iter(world)
                 .any(|p| p.pid() == pid),
             "headless process must be despawned once the recovery window expires"
+        );
+    }
+
+    #[test]
+    fn force_managed_app_missing_at_launch_is_adopted_when_application_appears() {
+        use crate::config::{Config, MainOptions, WindowParams};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let mut rule = WindowParams::new(".*", Some("com.example.LateAccessory".to_string()));
+        rule.manage = Some(true);
+        let config: Config = (MainOptions::default(), vec![rule]).into();
+
+        let mut harness = TestHarness::new().with_config(config).with_windows(1);
+        harness.advance(Duration::from_secs(1));
+        let pid: i32 = 47;
+        harness
+            .mock_state
+            .spawn_app(pid, "com.example.LateAccessory", "LateAccessory");
+        let mut wm = harness.mock_state.create_window_manager();
+        let state = harness.mock_state.clone();
+        wm.expect_new_application()
+            .returning(move |process| Ok(state.create_application(process.pid())));
+        harness.world().insert_resource(WindowManager(Box::new(wm)));
+
+        // Simulate an unobservable (LSUIElement/Accessory) app whose NSRunningApplication
+        // is initially missing at launch, so `bundle_id()` returns `None` until the first
+        // `ready()` call resolves it.
+        let resolved = Arc::new(AtomicBool::new(false));
+        let forced = Arc::new(AtomicBool::new(false));
+        let ready_calls = Arc::new(AtomicUsize::new(0));
+
+        let mut process = crate::manager::MockProcessApi::new();
+        process.expect_pid().return_const(pid);
+        process
+            .expect_psn()
+            .return_const(crate::platform::ProcessSerialNumber {
+                high: 0,
+                low: pid.cast_unsigned(),
+            });
+        process
+            .expect_name()
+            .return_const("LateAccessory".to_string());
+        let resolved_for_bundle = resolved.clone();
+        process.expect_bundle_id().returning(move || {
+            resolved_for_bundle
+                .load(Ordering::SeqCst)
+                .then(|| "com.example.LateAccessory".to_string())
+        });
+        let forced_for_setter = forced.clone();
+        process.expect_force_manage().returning(move |value| {
+            forced_for_setter.store(value, Ordering::SeqCst);
+        });
+        let resolved_for_ready = resolved.clone();
+        let forced_for_ready = forced.clone();
+        let calls_for_ready = ready_calls.clone();
+        process.expect_ready().returning(move || {
+            calls_for_ready.fetch_add(1, Ordering::SeqCst);
+            resolved_for_ready.store(true, Ordering::SeqCst);
+            // Accessory app is only ready once `force_manage(true)` has been applied.
+            forced_for_ready.load(Ordering::SeqCst)
+        });
+
+        harness
+            .world()
+            .spawn((crate::ecs::FreshMarker, BProcess(Box::new(process))));
+
+        // Advance only until the very first `add_launched_process` poll runs so
+        // a later 200 ms poll cannot mask a missing same-tick re-check.
+        for _ in 0..50 {
+            harness.app.update();
+            if ready_calls.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+        }
+        let world = harness.world();
+        assert!(
+            forced.load(Ordering::SeqCst),
+            "manage = true rule must re-run on the same poll after ready() resolves the application"
+        );
+        assert_eq!(
+            ready_calls.load(Ordering::SeqCst),
+            2,
+            "accessory app must be adopted on the same poll tick once force_manage engages"
+        );
+        assert!(
+            world
+                .query::<&Application>()
+                .iter(world)
+                .any(|app| app.pid() == pid),
+            "force-managed app whose NSRunningApplication appeared late must be adopted on that poll"
         );
     }
 }

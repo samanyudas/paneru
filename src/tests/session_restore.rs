@@ -2214,7 +2214,7 @@ fn restart_keeps_where_a_row_was_scrolled(returned_width: i32) {
     let last = row
         .columns()
         .filter_map(Column::top)
-        .last()
+        .next_back()
         .expect("the row has columns");
     let last = world
         .entity(last)

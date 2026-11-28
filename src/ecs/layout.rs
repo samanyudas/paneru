@@ -5,7 +5,7 @@ use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Changed, Has, Or, With, Without};
+use bevy::ecs::query::{Changed, Has, Or, QueryData, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, EntityCommands, Local, ParamSet, Populated, Query, Res};
@@ -117,7 +117,28 @@ fn strip_destination(
 
 /// Displays paired with the Dock's current edge, which is what turns a display's
 /// raw bounds into the usable viewport.
-type DisplayViewports<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
+pub(crate) type DisplayViewports<'w, 's> =
+    Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
+
+/// Query data for removing windows from a [`LayoutStrip`] while keeping the
+/// focused window stationary on screen when a column to its left disappears.
+#[derive(QueryData)]
+#[query_data(mutable)]
+pub(crate) struct RemovableStrip {
+    pub(crate) entity: Entity,
+    pub(crate) strip: &'static mut LayoutStrip,
+    pub(crate) position: Option<&'static mut Position>,
+    pub(crate) reposition: Option<&'static mut RepositionMarker>,
+    pub(crate) scrolling: Option<&'static mut Scrolling>,
+    pub(crate) child_of: Option<&'static ChildOf>,
+    pub(crate) active: Has<ActiveWorkspaceMarker>,
+    pub(crate) has_previous_position: Has<PreviousStripPosition>,
+    pub(crate) has_manual_offset: Has<ManualStripOffset>,
+}
+
+/// Every strip with the placement state needed to compensate its origin after
+/// removing a column left of focus.
+pub(crate) type RemovableStrips<'w, 's> = Query<'w, 's, RemovableStrip, Without<Window>>;
 
 type ReshuffleRequests<'w, 's> = Query<
     'w,
@@ -199,6 +220,176 @@ type RepositionedWindows<'w, 's> = Populated<
 /// Strips whose position or target offset changed this tick.
 type MovedStrips<'w, 's> =
     Populated<'w, 's, &'static LayoutStrip, Or<(Changed<Position>, Changed<RepositionMarker>)>>;
+
+/// Computes the adjusted strip `x` after removing a column of `removed_width`
+/// strictly left of the focused column.
+///
+/// When `clamp_left` is `true` (neither `auto_center` nor `ManualStripOffset`
+/// is active), the result is capped at `viewport_min_x.max(origin_x)` so
+/// off-screen columns to the left slide in to fill the gap without opening a
+/// new blank gap on the left edge (while never yanking leftward if the strip
+/// was already scrolled past `viewport_min_x` via continuous swipe).
+#[must_use]
+pub(crate) fn shift_origin_after_left_removal(
+    origin_x: i32,
+    removed_width: i32,
+    viewport_min_x: i32,
+    clamp_left: bool,
+) -> i32 {
+    let shifted = origin_x.saturating_add(removed_width);
+    if clamp_left {
+        shifted.min(viewport_min_x.max(origin_x))
+    } else {
+        shifted
+    }
+}
+
+/// Removes `entity` from `strip`, returning the removed column's index and
+/// width when removing `entity` dropped a whole column strictly to the left of
+/// `focused`.
+pub(crate) fn remove_left_column_width(
+    strip: &mut LayoutStrip,
+    entity: Entity,
+    focused: Option<Entity>,
+    windows: &Windows,
+) -> Option<(usize, i32)> {
+    let left_removed = focused.and_then(|focused| {
+        let removed_idx = strip.index_of(entity).ok()?;
+        let focused_idx = strip.index_of(focused).ok()?;
+        if removed_idx >= focused_idx {
+            return None;
+        }
+        let width = strip
+            .get(removed_idx)
+            .ok()?
+            .window_iter()
+            .filter_map(|member| windows.moving_frame(member))
+            .map(|frame| frame.width())
+            .max()
+            .filter(|&width| width > 0)?;
+        Some((removed_idx, width))
+    });
+    let len_before = strip.len();
+    strip.remove(entity);
+    (strip.len() < len_before).then_some(left_removed).flatten()
+}
+
+/// Shifts an active strip's origin (and any in-flight reposition/scroll state)
+/// rightward by `removed_width` so windows at or right of the focused column
+/// stay at the same screen `x`. When `shift_settle` is false (a window-landing
+/// settle targets a column left of the removed one, so its slot did not move),
+/// `scrolling.settle` is kept and the ease retargets from the shifted position.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compensate_left_removal(
+    removed_width: i32,
+    shift_settle: bool,
+    position: &mut Position,
+    reposition: Option<&mut RepositionMarker>,
+    scrolling: Option<&mut Scrolling>,
+    has_manual_offset: bool,
+    viewport_min_x: i32,
+    config: &Config,
+) {
+    let clamp_left = !config.auto_center() && !has_manual_offset;
+    position.0.x =
+        shift_origin_after_left_removal(position.0.x, removed_width, viewport_min_x, clamp_left);
+    if let Some(reposition) = reposition {
+        reposition.0.x = shift_origin_after_left_removal(
+            reposition.0.x,
+            removed_width,
+            viewport_min_x,
+            clamp_left,
+        );
+    }
+    if let Some(scrolling) = scrolling {
+        let shift_f64 = |x: f64| {
+            let shifted = x + f64::from(removed_width);
+            if clamp_left {
+                shifted.min(f64::from(viewport_min_x).max(x))
+            } else {
+                shifted
+            }
+        };
+        let old_pos = scrolling.position;
+        let old_settle = scrolling.settle;
+        scrolling.position = shift_f64(old_pos);
+        scrolling.anchor = shift_f64(scrolling.anchor);
+        scrolling.origin = shift_f64(scrolling.origin);
+        if shift_settle && let Some(settle) = &mut scrolling.settle {
+            *settle = shift_f64(*settle);
+        }
+        if let (Some(old_target), Some(new_target)) = (old_settle, scrolling.settle) {
+            if let Some(ease) = &mut scrolling.ease {
+                crate::ecs::scroll::retarget_settle_ease(
+                    ease,
+                    old_pos,
+                    old_target,
+                    scrolling.position,
+                    new_target,
+                    config,
+                );
+            } else if (new_target - scrolling.position).abs() < 0.5
+                && ((scrolling.position - old_pos) - (new_target - old_target)).abs() >= 1e-6
+            {
+                scrolling.ease = Some(crate::ecs::SettleEase {
+                    from: new_target,
+                    start: 1.0,
+                    elapsed: 0.0,
+                    animation_speed: config.animation_speed(),
+                    flick: None,
+                });
+            }
+        } else {
+            scrolling.ease = None;
+        }
+    }
+}
+
+impl RemovableStripItem<'_, '_> {
+    /// Removes `entity` from this strip, shifting the strip's origin when a
+    /// whole column left of `focused` disappears from an active, non-parked
+    /// strip so the focused window stays at the same screen `x`.
+    pub(crate) fn remove_preserving_focus(
+        &mut self,
+        entity: Entity,
+        focused: Option<Entity>,
+        windows: &Windows,
+        displays: &DisplayViewports,
+        config: &Config,
+    ) {
+        let effective_focused = (self.active && !self.has_previous_position)
+            .then_some(focused)
+            .flatten();
+        if let Some((removed_idx, removed_width)) =
+            remove_left_column_width(&mut self.strip, entity, effective_focused, windows)
+            && let Some(position) = self.position.as_deref_mut()
+            && let Some(viewport_min_x) = self
+                .child_of
+                .and_then(|parent| displays.get(parent.parent()).ok())
+                .map(|(display, dock)| display.actual_display_bounds(dock, config).min.x)
+        {
+            // A pending settle whose destination column sits before the removed
+            // column did not shift in slot coordinates; keep its target and
+            // retarget the ease from the compensated position.
+            let shift_settle = self
+                .scrolling
+                .as_deref()
+                .and_then(|scrolling| scrolling.landing_focus)
+                .and_then(|dest| self.strip.index_of(dest).ok())
+                .is_none_or(|dest_idx| dest_idx >= removed_idx);
+            compensate_left_removal(
+                removed_width,
+                shift_settle,
+                position,
+                self.reposition.as_deref_mut(),
+                self.scrolling.as_deref_mut(),
+                self.has_manual_offset,
+                viewport_min_x,
+                config,
+            );
+        }
+    }
+}
 
 /// Clamp a window origin to the range where it still touches both viewport
 /// edges. For an oversized window this range is reversed: from right-aligned
@@ -354,7 +545,23 @@ fn expose_focused_survivor_after_removal(
             {
                 continue;
             }
-            if !new_focus && !skip_reshuffle.0 {
+            // Left-of-focus removals already keep the focused column stationary
+            // via `remove_preserving_focus`, so do not yank a scrolled-away
+            // viewport back to focus. Only rescue the display when closes left
+            // it showing nothing more than slivers; bring the focused survivor
+            // back on screen so keyboard focus does not stay off-screen.
+            if !new_focus
+                && !skip_reshuffle.0
+                && column_to_show(
+                    strip_entity,
+                    &strips,
+                    &displays,
+                    &windows,
+                    &config,
+                    &window_manager,
+                )
+                .is_some()
+            {
                 commands.ensure_visible(entity);
             }
         } else if selected && !previous_position {
@@ -1584,8 +1791,21 @@ impl LayoutStrip {
         self.id
     }
 
-    pub fn columns(&self) -> impl Iterator<Item = &Column> {
+    pub fn columns(&self) -> impl DoubleEndedIterator<Item = &Column> {
         self.columns.iter()
+    }
+
+    /// Resolves a value for `column` by preferring its `top()` entity and
+    /// falling back to the first member in `column` for which `resolve`
+    /// returns `Some`.
+    pub fn resolve_column<T>(
+        column: &Column,
+        mut resolve: impl FnMut(Entity) -> Option<T>,
+    ) -> Option<T> {
+        column
+            .top()
+            .and_then(&mut resolve)
+            .or_else(|| column.window_iter().find_map(resolve))
     }
 
     #[cfg(test)]
@@ -2727,10 +2947,19 @@ pub(crate) fn strip_content_range(
     strip: &LayoutStrip,
     windows: &Windows,
 ) -> Option<std::ops::Range<i32>> {
-    let first = strip.first().ok()?.top()?;
-    let last = strip.last().ok()?.top()?;
-    let start = windows.layout_position(first)?.x;
-    let end = windows.layout_position(last)?.x + windows.moving_frame(last)?.width();
+    let start = strip.columns().find_map(|column| {
+        LayoutStrip::resolve_column(column, |entity| {
+            windows.layout_position(entity).map(|pos| pos.x)
+        })
+    })?;
+    let end = strip.columns().rev().find_map(|column| {
+        LayoutStrip::resolve_column(column, |entity| {
+            windows
+                .layout_position(entity)
+                .zip(windows.moving_frame(entity))
+                .map(|(pos, frame)| pos.x + frame.width())
+        })
+    })?;
     Some(start..end)
 }
 
@@ -5484,5 +5713,190 @@ mod tests {
         }
         assert_eq!(strip.right_neighbour(leader), Some(b));
         assert_eq!(strip.right_neighbour(follower), Some(b));
+    }
+
+    #[test]
+    fn test_resolve_column_skips_stale_members() {
+        let mut world = World::new();
+        let stack_stale = world.spawn_empty().id();
+        let stack_live = world.spawn_empty().id();
+        let native_stale = world.spawn_empty().id();
+        let native_live = world.spawn_empty().id();
+        let single_stale = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(stack_stale);
+        strip.append(stack_live);
+        strip.stack(stack_live, Side::West).unwrap();
+        strip.append_tab_group(&[native_stale, native_live]);
+        strip.append(single_stale);
+
+        let columns: Vec<_> = strip.columns().collect();
+
+        // Plain stack: falls back to a lower member when `top()` is stale.
+        let resolved =
+            LayoutStrip::resolve_column(columns[0], |entity| (entity == stack_live).then_some(250));
+        assert_eq!(resolved, Some(250));
+
+        // Native tab group: falls back to a surviving tab when `top()` is stale.
+        let resolved = LayoutStrip::resolve_column(columns[1], |entity| {
+            (entity == native_live).then_some(300)
+        });
+        assert_eq!(resolved, Some(300));
+
+        // Single stale column: resolves to None so callers skip it.
+        assert_eq!(
+            LayoutStrip::resolve_column(columns[2], |_| Option::<i32>::None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_shift_origin_after_left_removal() {
+        // Enough off-screen left strip: shifts by the full removed width.
+        assert_eq!(shift_origin_after_left_removal(-800, 500, 0, true), -300);
+        // Partial off-screen left strip in edge-invariant mode: clamps at viewport min x.
+        assert_eq!(shift_origin_after_left_removal(-200, 500, 0, true), 0);
+        // Leftmost column closed when clamped: stays pinned at viewport min x.
+        assert_eq!(shift_origin_after_left_removal(0, 500, 0, true), 0);
+        // Strip already scrolled past viewport min x (e.g. continuous swipe): neither snaps left nor widens the gap.
+        assert_eq!(shift_origin_after_left_removal(150, 500, 0, true), 150);
+        // Unclamped (auto_center or ManualStripOffset): preserves exact screen x.
+        assert_eq!(shift_origin_after_left_removal(-238, 500, 0, false), 262);
+        // Secondary displays with non-zero viewport origins clamp to their own min x.
+        assert_eq!(shift_origin_after_left_removal(1600, 500, 1920, true), 1920);
+        assert_eq!(
+            shift_origin_after_left_removal(-2420, 500, -1920, true),
+            -1920
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_compensate_left_removal_preserves_and_retargets_settle_ease() {
+        let config: Config = (
+            crate::config::MainOptions {
+                auto_center: Some(false),
+                animation_speed: Some(14.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+
+        // Case 1: unclamped translation shifts `from` and `settle` identically,
+        // preserving `elapsed`, `start`, and `flick` untouched.
+        let mut pos = Position(Origin::new(-900, 0));
+        let mut scrolling = Scrolling {
+            velocity: 0.0,
+            position: -900.0,
+            is_user_swiping: false,
+            last_event: Duration::ZERO,
+            moved_at: Duration::ZERO,
+            input: crate::ecs::ScrollInput::Gesture,
+            anchor: -800.0,
+            settle: Some(-1100.0),
+            ease: Some(crate::ecs::SettleEase {
+                from: -800.0,
+                start: 0.1,
+                elapsed: 0.04,
+                animation_speed: 14.0,
+                flick: Some(-1200.0),
+            }),
+            detent: None,
+            origin: -800.0,
+            landing_focus: None,
+            focus_at_start: None,
+            start: None,
+            fingers_down: false,
+            lifted_at: None,
+            caught: None,
+            slope: 1.0,
+            excess: None,
+        };
+        compensate_left_removal(
+            400,
+            true,
+            &mut pos,
+            None,
+            Some(&mut scrolling),
+            false,
+            0,
+            &config,
+        );
+        let ease = scrolling.ease.expect("unclamped ease must be preserved");
+        assert_eq!(ease.from, -400.0);
+        assert_eq!(ease.elapsed, 0.04);
+        assert_eq!(ease.flick, Some(-1200.0));
+        assert_eq!(scrolling.settle, Some(-700.0));
+
+        // Case 2: clamping changes the remaining distance (`position` clamps at 0
+        // while `settle` shifts freely), so the ease retargets from the shifted
+        // position carrying the in-flight velocity rather than starting from rest.
+        let mut pos = Position(Origin::new(-100, 0));
+        let mut scrolling = Scrolling {
+            position: -100.0,
+            settle: Some(-600.0),
+            ease: Some(crate::ecs::SettleEase {
+                from: -50.0,
+                start: 0.0,
+                elapsed: 0.05,
+                animation_speed: 14.0,
+                flick: None,
+            }),
+            ..scrolling
+        };
+        compensate_left_removal(
+            400,
+            true,
+            &mut pos,
+            None,
+            Some(&mut scrolling),
+            false,
+            0,
+            &config,
+        );
+        let ease = scrolling.ease.expect("clamped ease must retarget");
+        assert_eq!(scrolling.position, 0.0);
+        assert_eq!(scrolling.settle, Some(-200.0));
+        assert_eq!(ease.from, 0.0);
+        assert_eq!(ease.elapsed, 0.0);
+        assert!(
+            ease.start > 0.0,
+            "retargeted ease must carry positive curve entry for in-flight velocity, got {}",
+            ease.start
+        );
+
+        // Case 3: clamping puts both current position and settle target at the
+        // same edge (zero remaining distance), so the ease finishes immediately
+        // on the next settle pass rather than delaying landing_focus for ~237 ms.
+        let mut pos = Position(Origin::new(-100, 0));
+        let mut scrolling = Scrolling {
+            position: -100.0,
+            settle: Some(-200.0),
+            ease: Some(crate::ecs::SettleEase {
+                from: -50.0,
+                start: 0.0,
+                elapsed: 0.02,
+                animation_speed: 14.0,
+                flick: None,
+            }),
+            ..scrolling
+        };
+        compensate_left_removal(
+            400,
+            true,
+            &mut pos,
+            None,
+            Some(&mut scrolling),
+            false,
+            0,
+            &config,
+        );
+        let ease = scrolling.ease.expect("zero-distance settle marks finished");
+        assert_eq!(scrolling.position, 0.0);
+        assert_eq!(scrolling.settle, Some(0.0));
+        assert_eq!(ease.start, 1.0);
+        assert_eq!(ease.flick, None);
     }
 }

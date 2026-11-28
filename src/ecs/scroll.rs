@@ -27,7 +27,6 @@ use crate::ecs::{
     NativeFullscreenMarker, Position, PreUpdateSet, RepositionMarker, ScrollInput, Scrolling,
     SelectedVirtualMarker, SendMessageTrigger, SettleEase, UpdateSet,
 };
-use crate::errors::Result;
 use bevy::ecs::schedule::common_conditions::on_message;
 
 use crate::events::{Event, InputEvent};
@@ -1008,6 +1007,32 @@ fn settle_range(
 /// A window-landing `step` instead lands one column on from the column the
 /// swipe began on, whatever the column widths, or springs back to where the
 /// swipe began.
+fn live_column_anchor(column: &Column, windows: &Windows) -> Option<(Entity, i32, i32)> {
+    column.window_iter().find_map(|entity| {
+        let slot = windows.layout_position(entity)?.x;
+        let width = windows.moving_frame(entity)?.width();
+        Some((entity, slot, width))
+    })
+}
+
+fn live_landing_focus(
+    column: &Column,
+    windows: &Windows,
+    focus_history: &FocusHistory,
+) -> Option<Entity> {
+    column
+        .window_iter()
+        .filter(|&entity| windows.get(entity).is_some())
+        .filter_map(|entity| Some((entity, focus_history.recency(entity)?)))
+        .max_by_key(|&(_, recency)| recency)
+        .map(|(entity, _)| entity)
+        .or_else(|| {
+            column
+                .window_iter()
+                .find(|&entity| windows.get(entity).is_some())
+        })
+}
+
 fn landing(
     resting: i32,
     step: Option<Step>,
@@ -1020,9 +1045,7 @@ fn landing(
     let columns: Vec<_> = strip
         .columns()
         .filter_map(|column| {
-            let top = column.top()?;
-            let slot = windows.layout_position(top)?.x;
-            let width = windows.moving_frame(top)?.width();
+            let (_, slot, width) = live_column_anchor(column, windows)?;
             Some((column, slot, width))
         })
         .collect();
@@ -1221,10 +1244,11 @@ fn settle_strip(
             // there, so a resisting release flicks only as fast as it shows.
             scroll.position = f64::from(position.x);
             scroll.velocity *= scroll.slope;
-            if window_landing && config.swipe_gesture_haptics() && column.top() != scroll.detent {
+            let column_anchor = live_column_anchor(&column, &windows).map(|(entity, _, _)| entity);
+            if window_landing && config.swipe_gesture_haptics() && column_anchor != scroll.detent {
                 haptics.write(PageHapticRequest);
             }
-            if let Some(window) = focus_history.last_focused_in(&column) {
+            if let Some(window) = live_landing_focus(&column, &windows, &focus_history) {
                 if window_landing {
                     // An app can take a moment to answer a focus request,
                     // which would stall the landing partway, so it waits for
@@ -1301,6 +1325,62 @@ fn settled_at(ease: &SettleEase, elapsed: f64, target: f64, config: &Config) -> 
     }
 }
 
+/// Current instantaneous velocity of a running settle ease in points per second.
+pub(crate) fn ease_speed(ease: &SettleEase, target: f64, config: &Config) -> f64 {
+    let dt = 1e-3;
+    let at = |elapsed: f64| settled_at(ease, elapsed.max(0.0), target, config);
+    match (at(ease.elapsed), at(ease.elapsed - dt)) {
+        (Some(now), Some(before)) => (now - before) / dt,
+        _ => 0.0,
+    }
+}
+
+/// Updates a running settle ease after the strip's position and/or target moved.
+///
+/// - When position and target shift by the same delta, translates `from` in
+///   place so progress, timing, and flick velocity stay exact.
+/// - When the strip is already within half a point of `new_target`, marks the
+///   ease finished (`start = 1.0`) so `settle_strip` completes on the next tick
+///   without delaying pending landing focus.
+/// - Otherwise retargets from `new_pos` toward `new_target`, carrying the
+///   in-flight speed into the new curve.
+pub(crate) fn retarget_settle_ease(
+    ease: &mut SettleEase,
+    old_pos: f64,
+    old_target: f64,
+    new_pos: f64,
+    new_target: f64,
+    config: &Config,
+) {
+    let delta_pos = new_pos - old_pos;
+    let delta_target = new_target - old_target;
+    let remaining = new_target - new_pos;
+    if (delta_pos - delta_target).abs() < 1e-6 {
+        ease.from += delta_target;
+    } else if remaining.abs() < 0.5 {
+        *ease = SettleEase {
+            from: new_target,
+            start: 1.0,
+            elapsed: 0.0,
+            animation_speed: ease.animation_speed,
+            flick: None,
+        };
+    } else {
+        let speed = ease_speed(ease, old_target, config);
+        let duration = ease::duration(config);
+        let flick = ease.flick.and_then(|_| {
+            (remaining.abs() >= 1.0 && speed * remaining.signum() > 0.0).then_some(speed)
+        });
+        *ease = SettleEase {
+            from: new_pos,
+            start: ease::entry_for_speed(speed, remaining, duration),
+            elapsed: 0.0,
+            animation_speed: ease.animation_speed,
+            flick,
+        };
+    }
+}
+
 /// How fast `scroll` shows its strip moving now, in points per second
 /// along the strip's x, on a display `display_width` points wide (matching
 /// the width used by `swipe_gesture` to convert gesture deltas and
@@ -1309,12 +1389,7 @@ fn settled_at(ease: &SettleEase, elapsed: f64, target: f64, config: &Config) -> 
 /// column.
 pub(crate) fn strip_speed(scroll: &Scrolling, display_width: f64, config: &Config) -> f64 {
     let raw = if let (Some(ease), Some(target)) = (scroll.ease, scroll.settle) {
-        let dt = 1e-3;
-        let at = |elapsed: f64| settled_at(&ease, elapsed.max(0.0), target, config);
-        match (at(ease.elapsed), at(ease.elapsed - dt)) {
-            (Some(now), Some(before)) => (now - before) / dt,
-            _ => 0.0,
-        }
+        ease_speed(&ease, target, config)
     } else {
         scroll.velocity * display_width * direction_modifier(config)
     };
@@ -1366,7 +1441,8 @@ fn landing_detents(
         let step = Step::of(&scroll, scroll.position, None, f64::from(viewport.width()));
         let column_top = |step| {
             landing(position.x, Some(step), strip, &windows, viewport)
-                .and_then(|(column, _)| column.top())
+                .and_then(|(column, _)| live_column_anchor(&column, &windows))
+                .map(|(entity, _, _)| entity)
         };
         // A swipe starts on the column it began on, even when its first frame
         // already moved the strip far enough to step.
@@ -1589,33 +1665,19 @@ fn clamp_viewport_offset(
     viewport: &IRect,
     config: &Config,
 ) -> Option<i32> {
-    let total_strip_width = layout_strip
-        .last()
-        .ok()
-        .and_then(|column| column.top())
-        .and_then(|entity| {
-            windows
-                .layout_position(entity)
-                .zip(windows.moving_frame(entity))
-        })
-        .map(|(position, frame)| position.x + frame.width())?;
-
-    let continuous_swipe = config.continuous_swipe();
-    let strip_position = |column: Result<Column>| {
-        column
-            .ok()
-            .and_then(|column| column.top())
-            .and_then(|entity| windows.layout_position(entity))
-            .map(|position| position.0.x)
+    let geometry = |entity| {
+        windows
+            .layout_position(entity)
+            .zip(windows.moving_frame(entity))
+            .map(|(position, frame)| (position.x, position.x + frame.width()))
     };
-
-    let left_snap = strip_position(layout_strip.last());
-    // NOTE: this snaps to the second window on purpose.
-    // For a single colum workspace this will return None
-    let right_snap = strip_position(layout_strip.get(1));
+    let live_column = |column| LayoutStrip::resolve_column(column, geometry);
+    let (left_snap, total_strip_width) = layout_strip.columns().rev().find_map(live_column)?;
 
     Some(
-        if continuous_swipe && let Some((left_snap, right_snap)) = left_snap.zip(right_snap) {
+        if config.continuous_swipe()
+            && let Some((right_snap, _)) = layout_strip.columns().filter_map(live_column).nth(1)
+        {
             // Allow to scroll away until the last or first window snaps.
             current_offset.clamp(viewport.min.x - left_snap, viewport.max.x - right_snap)
         } else if viewport.width() < total_strip_width {
@@ -1713,5 +1775,95 @@ mod paging_tests {
             settled_at(&flick_ease, 0.05, -200.0, &slow),
             "flick keeps the animation_speed captured when the settle began"
         );
+    }
+
+    #[test]
+    fn landing_and_focus_skip_stale_top_in_stack() {
+        use crate::ecs::layout::StackItem;
+        use crate::ecs::{Bounds, LayoutPosition, Position, WidthRatio};
+        use crate::manager::Origin;
+        use crate::tests::MockState;
+        use bevy::ecs::system::SystemState;
+        use bevy::ecs::world::World;
+        use bevy::math::IVec2;
+
+        let mut world = World::new();
+        let mock = MockState::new();
+        let app = world.spawn_empty().id();
+        let spawn_live = |world: &mut World, id: i32, x: i32, width: i32| {
+            let win = mock.spawn_window(1, 1, id, IRect::new(x, 20, x + width, 600));
+            world
+                .spawn((
+                    win,
+                    ChildOf(app),
+                    Position(Origin::new(x, 20)),
+                    Bounds(IVec2::new(width, 580)),
+                    LayoutPosition(Origin::new(x, 20)),
+                    WidthRatio(0.6),
+                ))
+                .id()
+        };
+
+        let left = spawn_live(&mut world, 1, 0, 600);
+        let stale_top = world.spawn_empty().id();
+        let live_bottom = spawn_live(&mut world, 2, 600, 600);
+
+        let mut strip = LayoutStrip::new(1, 0);
+        strip.append(left);
+        strip.append(stale_top);
+        strip.append(live_bottom);
+        strip
+            .stack(live_bottom, crate::types::commands::Side::West)
+            .unwrap();
+
+        let mut state = SystemState::<Windows>::new(&mut world);
+        let windows = state.get(&world).unwrap();
+        let viewport = IRect::new(0, 20, 1000, 600);
+        let step = Step {
+            from: 0,
+            start: Some(left),
+            toward_end: Some(true),
+        };
+        let (column, offset) = landing(0, Some(step), &strip, &windows, viewport)
+            .expect("stack with live lower member must be selectable as a landing target");
+        assert!(
+            matches!(column, Column::Stack(ref items) if items == &[StackItem::Single(stale_top), StackItem::Single(live_bottom)]),
+            "landing must select the stack column instead of dropping it: {column:?}"
+        );
+        assert_eq!(offset, -200);
+
+        let history = FocusHistory::default();
+        assert_eq!(
+            live_landing_focus(&column, &windows, &history),
+            Some(live_bottom),
+            "fallback focus must skip the stale top and pick the live lower member"
+        );
+    }
+
+    #[test]
+    fn retarget_settle_ease_preserves_flick_across_equal_shift_near_target() {
+        let config = Config::default();
+        let mut ease = SettleEase {
+            from: -800.0,
+            start: 0.35,
+            elapsed: 0.08,
+            animation_speed: config.animation_speed(),
+            flick: Some(1200.0),
+        };
+        // Passing within 0.5 pt of target while carrying flick overshoot: an
+        // equal shift of both position and target must translate `from` in
+        // place without clearing the flick or completing early.
+        retarget_settle_ease(&mut ease, -200.2, -200.0, -600.2, -600.0, &config);
+        assert_eq!(ease.from, -1200.0);
+        assert_eq!(ease.start, 0.35);
+        assert_eq!(ease.elapsed, 0.08);
+        assert_eq!(ease.flick, Some(1200.0));
+
+        // When clamping collapses position and target onto the same edge, mark
+        // the ease finished immediately.
+        retarget_settle_ease(&mut ease, -600.2, -500.0, 0.0, 0.0, &config);
+        assert_eq!(ease.from, 0.0);
+        assert_eq!(ease.start, 1.0);
+        assert_eq!(ease.flick, None);
     }
 }

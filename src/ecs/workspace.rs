@@ -185,7 +185,7 @@ pub(crate) struct RestoreFocusMarker {
 /// normal expose-reshuffle back.
 const RESTORE_FOCUS_GUARD_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn spawn_restore_focus_guard(entity: Entity, commands: &mut Commands) {
+pub(crate) fn spawn_restore_focus_guard(entity: Entity, commands: &mut Commands) {
     let timeout = Timeout::new(RESTORE_FOCUS_GUARD_TIMEOUT, None, commands);
     commands.spawn((timeout, RestoreFocusMarker { entity }));
 }
@@ -342,10 +342,15 @@ fn workspace_change_handler(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
+#[allow(clippy::too_many_arguments)]
 fn workspace_destroyed_handler(
     mut messages: MessageReader<Event>,
     mut workspaces: Populated<(&mut LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
+    parents: Query<&ChildOf, With<LayoutStrip>>,
+    displays: Query<&Display>,
+    window_manager: Res<WindowManager>,
     mut focus_history: ResMut<FocusHistory>,
+    mut display_homes: ResMut<crate::ecs::display_homes::DisplayHomes>,
     mut native: ResMut<NativeMembership>,
     time: Res<Time>,
     mut commands: Commands,
@@ -355,6 +360,7 @@ fn workspace_destroyed_handler(
             continue;
         };
         focus_history.forget_workspace(*space_id);
+        display_homes.space_destroyed(*space_id);
         for (strip, _, fullscreen) in &workspaces {
             if fullscreen.is_none() && strip.id() == *space_id {
                 native.space_destroyed(strip, time.elapsed());
@@ -369,6 +375,36 @@ fn workspace_destroyed_handler(
         else {
             continue;
         };
+
+        // macOS deletes the spaces of a removed display and moves their windows later.
+        // Keep the strip, so that display reconciliation can move the windows in order.
+        if fullscreen.is_none()
+            && let Ok((strip, _, _)) = workspaces.get(entity)
+            && strip.len() > 0
+        {
+            let parent = parents.get(entity).ok().map(ChildOf::parent);
+            let display_present = parent
+                .and_then(|parent| displays.get(parent).ok())
+                .is_some_and(|display| {
+                    window_manager
+                        .present_displays()
+                        .iter()
+                        .any(|(present, _)| present.id() == display.id())
+                });
+            if !display_present {
+                debug!("Workspace destroyed {space_id} with its display; keeping its windows");
+                if let Some(parent) = parent {
+                    crate::ecs::display::orphan_strip(strip, entity, parent, &mut commands);
+                    let destroyed_space = *space_id;
+                    commands.queue(move |world: &mut World| {
+                        world
+                            .resource_mut::<crate::ecs::display_homes::DisplayHomes>()
+                            .space_destroyed(destroyed_space);
+                    });
+                }
+                continue;
+            }
+        }
 
         if let Some((
             window,
@@ -410,12 +446,14 @@ fn workspace_created_handler(
     mut messages: MessageReader<Event>,
     active_display: Single<(&Display, Entity), With<ActiveDisplayMarker>>,
     workspaces: Query<&LayoutStrip>,
+    mut display_homes: ResMut<crate::ecs::display_homes::DisplayHomes>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::SpaceCreated { space_id } = event else {
             continue;
         };
+        display_homes.space_created(*space_id);
 
         if workspaces.into_iter().any(|strip| strip.id() == *space_id) {
             warn!("Workspace {space_id} already exists!");

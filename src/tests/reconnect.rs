@@ -1327,3 +1327,51 @@ fn a_floating_window_that_had_focus_gets_it_back_after_the_space_switch() {
         "focus returns to the floating window that had it"
     );
 }
+
+#[test]
+fn space_destroyed_before_display_removed_still_restores_external_home() {
+    const NEW_EXT_SPACE: WorkspaceId = 1555;
+    let mut harness = two_displays();
+
+    // Unplug EXT and deliver SpaceDestroyed one frame before DisplayRemoved,
+    // with macOS migrating one of its windows onto the surviving display.
+    harness.mock_state.remove_display(EXT);
+    harness
+        .mock_state
+        .add_display(BUILTIN, builtin_alone_bounds(), vec![BUILTIN_SPACE]);
+    harness.world().write_message(Event::SpaceDestroyed {
+        space_id: EXT_SPACE,
+    });
+    harness.advance(Duration::from_millis(50));
+
+    harness
+        .mock_state
+        .update_window(50, |window| window.workspace_id = BUILTIN_SPACE);
+    carry(&harness, &[50], ext_bounds(), builtin_alone_bounds());
+    harness
+        .world()
+        .write_message(Event::DisplayRemoved { display_id: EXT });
+    harness.advance(SETTLE);
+
+    // Replug EXT with a fresh Space. Both the migrated window (50) and the
+    // windows kept in the orphaned strip (51..53) must return to EXT.
+    harness
+        .mock_state
+        .add_display(BUILTIN, builtin_bounds(), vec![BUILTIN_SPACE]);
+    harness
+        .mock_state
+        .add_display(EXT, ext_bounds(), vec![NEW_EXT_SPACE]);
+    harness
+        .world()
+        .write_message(Event::DisplayAdded { display_id: EXT });
+    harness.advance(SETTLE);
+
+    assert_eq!(
+        layout_on(harness.world(), NEW_EXT_SPACE),
+        (EXT, vec![vec![50], vec![51, 52], vec![53]])
+    );
+    assert_eq!(
+        layout_on(harness.world(), BUILTIN_SPACE),
+        (BUILTIN, vec![vec![10], vec![11, 12]])
+    );
+}
