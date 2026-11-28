@@ -122,6 +122,9 @@ impl StateBroadcastIntent {
                         Command::Window(
                             Operation::VirtualMove(_, _)
                             | Operation::VirtualMoveNumber(_, _)
+                            | Operation::ToNextDisplay(_)
+                            | Operation::ToDisplay(..)
+                            | Operation::MoveToDisplay(_)
                             | Operation::Swap(_)
                             | Operation::MoveStep(..)
                             | Operation::MoveEdge(..)

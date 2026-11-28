@@ -321,6 +321,8 @@ pub enum Operation {
     /// order: left to right by left edge, then top to bottom, wrapping from the
     /// last to the first.
     ToNextDisplay(MoveFocus),
+    /// Moves the focused window's whole column to the display with this ID.
+    ToDisplay(u32, MoveFocus),
     /// Focuses the display that lies north, south, west, or east of the active
     /// display in the physical arrangement.
     FocusDisplay(Direction),
@@ -403,6 +405,8 @@ pub enum Operation {
 pub enum MouseMove {
     /// Moves the mouse pointer to the next available display.
     ToNextDisplay,
+    /// Moves the mouse pointer to the display with this ID.
+    ToDisplay(u32),
 }
 
 /// Represents a command that can be issued to the window manager.

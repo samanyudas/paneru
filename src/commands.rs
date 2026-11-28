@@ -1795,6 +1795,7 @@ fn copy_window_rule(
 #[derive(Debug)]
 enum DisplayTarget {
     Next,
+    Id(u32),
     Direction(Direction),
     Touching(Side),
 }
@@ -1817,6 +1818,7 @@ fn display_move(
 ) -> Option<DisplayMove> {
     let (focus, target) = match operation {
         Operation::ToNextDisplay(move_focus) => (move_focus, DisplayTarget::Next),
+        Operation::ToDisplay(id, move_focus) => (move_focus, DisplayTarget::Id(id)),
         Operation::MoveToDisplay(direction) => {
             (MoveFocus::Follow, DisplayTarget::Direction(direction))
         }
@@ -1900,6 +1902,7 @@ fn to_next_display(
         matches!(
             op,
             Operation::ToNextDisplay(_)
+                | Operation::ToDisplay(..)
                 | Operation::MoveToDisplay(_)
                 | Operation::MoveEdge(..)
                 | Operation::MoveStep(..)
@@ -1937,6 +1940,7 @@ fn to_next_display(
                 .other_displays()
                 .map(|display| (display, display.physical_bounds(), display.id())),
         ),
+        DisplayTarget::Id(id) => moves.other_displays().find(|display| display.id() == *id),
         DisplayTarget::Direction(direction) => display_in_direction(
             direction,
             source_bounds,
@@ -2203,7 +2207,7 @@ fn check_desktop_focus(
     }
 }
 
-/// Moves the mouse pointer to the next available display.
+/// Moves the mouse pointer to the next available display, or to a display by ID.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn mouse_to_next_display(
     mut messages: MessageReader<Event>,
@@ -2213,39 +2217,44 @@ fn mouse_to_next_display(
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
-    if !messages.read().any(|event| {
-        matches!(
-            event,
-            Event::Command {
-                command: Command::Mouse(MouseMove::ToNextDisplay),
-            }
-        )
-    }) {
-        return;
-    }
-
-    let Some(cursor_position) = window_manager.cursor_position().map(origin_from) else {
+    let Some(target) = messages.read().find_map(|event| match event {
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToNextDisplay),
+        } => Some(None),
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToDisplay(id)),
+        } => Some(Some(*id)),
+        _ => None,
+    }) else {
         return;
     };
-    let other = displays
-        .iter()
-        .find(|display| display.physical_bounds().contains(cursor_position))
-        .and_then(|current| {
-            next_in_screen_order(
-                (current.physical_bounds(), current.id()),
+
+    let other = if let Some(id) = target {
+        displays.iter().find(|display| display.id() == id)
+    } else {
+        let Some(cursor_position) = window_manager.cursor_position().map(origin_from) else {
+            return;
+        };
+        displays
+            .iter()
+            .find(|display| display.physical_bounds().contains(cursor_position))
+            .and_then(|current| {
+                next_in_screen_order(
+                    (current.physical_bounds(), current.id()),
+                    displays
+                        .iter()
+                        .filter(|display| display.id() != current.id())
+                        .map(|display| (display, display.physical_bounds(), display.id())),
+                )
+            })
+            .or_else(|| {
                 displays
                     .iter()
-                    .filter(|display| display.id() != current.id())
-                    .map(|display| (display, display.physical_bounds(), display.id())),
-            )
-        })
-        .or_else(|| {
-            displays
-                .iter()
-                .find(|display| !display.physical_bounds().contains(cursor_position))
-        });
+                    .find(|display| !display.physical_bounds().contains(cursor_position))
+            })
+    };
     let Some(other) = other else {
-        debug!("no other display to move mouse to.");
+        debug!("no other display to move mouse to: {target:?}.");
         return;
     };
     let Some((other_strip, _)) = window_manager

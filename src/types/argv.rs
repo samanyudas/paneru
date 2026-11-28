@@ -112,6 +112,8 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "tabbeddisplay" => Operation::ToggleTabbedDisplay,
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
+        "displaymove" => Operation::ToDisplay(parse_display_id(argument()?)?, MoveFocus::Follow),
+        "displaysend" => Operation::ToDisplay(parse_display_id(argument()?)?, MoveFocus::Stay),
         "focusdisplay" => Operation::FocusDisplay(Direction::parse_compass(argument()?)?),
         "movedisplay" => Operation::MoveToDisplay(Direction::parse_compass(argument()?)?),
         "focusedge" => Operation::FocusEdge(Side::parse(argument()?)?, Reach::Display),
@@ -171,10 +173,17 @@ fn virtual_target(
     }
 }
 
+fn parse_display_id(input: &str) -> Result<u32> {
+    input
+        .parse::<u32>()
+        .map_err(|_| ParseError::new(format!("invalid display id '{input}'")))
+}
+
 /// Parses a mouse command (e.g. `["nextdisplay"]`).
 fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
-    match *argv.first().unwrap_or(&"") {
-        "nextdisplay" => Ok(MouseMove::ToNextDisplay),
+    match (argv.first().copied().unwrap_or(""), argv.get(1).copied()) {
+        ("nextdisplay", _) => Ok(MouseMove::ToNextDisplay),
+        ("display", Some(id)) => Ok(MouseMove::ToDisplay(parse_display_id(id)?)),
         _ => Err(ParseError::new(format!("invalid mouse command '{argv:?}'"))),
     }
 }
@@ -195,6 +204,9 @@ impl Command {
             }
             Command::Mouse(MouseMove::ToNextDisplay) => {
                 vec!["mouse".to_string(), "nextdisplay".to_string()]
+            }
+            Command::Mouse(MouseMove::ToDisplay(id)) => {
+                vec!["mouse".to_string(), "display".to_string(), id.to_string()]
             }
             Command::Quit => vec!["quit".to_string()],
             Command::Restart => vec!["restart".to_string()],
@@ -233,6 +245,12 @@ impl Operation {
             Operation::SetWidth(_) | Operation::Maximize => owned(&["maximize"]),
             Operation::ToNextDisplay(MoveFocus::Follow) => owned(&["nextdisplay"]),
             Operation::ToNextDisplay(MoveFocus::Stay) => owned(&["nextdisplaysend"]),
+            Operation::ToDisplay(id, MoveFocus::Follow) => {
+                vec!["displaymove".to_string(), id.to_string()]
+            }
+            Operation::ToDisplay(id, MoveFocus::Stay) => {
+                vec!["displaysend".to_string(), id.to_string()]
+            }
             Operation::FocusDisplay(direction) => {
                 vec!["focusdisplay".to_string(), direction.token()]
             }
@@ -362,6 +380,8 @@ mod tests {
             Operation::Maximize,
             Operation::ToNextDisplay(MoveFocus::Follow),
             Operation::ToNextDisplay(MoveFocus::Stay),
+            Operation::ToDisplay(3, MoveFocus::Follow),
+            Operation::ToDisplay(3, MoveFocus::Stay),
             Operation::FocusDisplay(Direction::North),
             Operation::FocusDisplay(Direction::West),
             Operation::MoveToDisplay(Direction::South),
@@ -416,12 +436,32 @@ mod tests {
             Command::MenuBar(true),
             Command::MenuBar(false),
             Command::Mouse(MouseMove::ToNextDisplay),
+            Command::Mouse(MouseMove::ToDisplay(3)),
         ] {
             assert_eq!(
                 format!("{:?}", round_trip(&command)),
                 format!("{command:?}")
             );
         }
+    }
+
+    #[test]
+    fn display_commands_need_a_numeric_id() {
+        assert!(parse_command(&["window", "displaymove"]).is_err());
+        assert!(parse_command(&["window", "displaysend", "left"]).is_err());
+        assert!(parse_command(&["mouse", "display"]).is_err());
+        assert_eq!(
+            parse_command(&["window", "displaymove", "2"]).unwrap(),
+            Command::Window(Operation::ToDisplay(2, MoveFocus::Follow))
+        );
+        assert_eq!(
+            parse_command(&["window", "displaysend", "2"]).unwrap(),
+            Command::Window(Operation::ToDisplay(2, MoveFocus::Stay))
+        );
+        assert_eq!(
+            parse_command(&["mouse", "display", "2"]).unwrap(),
+            Command::Mouse(MouseMove::ToDisplay(2))
+        );
     }
 
     #[test]

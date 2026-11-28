@@ -289,6 +289,8 @@ $ paneru send-cmd <command> [args...]
 | `window unstack [east\|west]` | Pop the focused window out of its stack into a new column (default east) |
 | `window nextdisplay`       | Move the focused window's column to the next display |
 | `window nextdisplaysend`   | Move the window's column to the next display but stay here |
+| `window displaymove <id>`  | Move the focused window's column to display `<id>` |
+| `window displaysend <id>`  | Move the window's column to display `<id>` but stay here |
 | `window focusdisplay <direction>` | Focus the display north, south, west, or east |
 | `window movedisplay <direction>` | Move the window's column to the display in that direction |
 | `window focusedge <west\|east>` | Focus the first or last column, then the display on that side |
@@ -301,6 +303,7 @@ $ paneru send-cmd <command> [args...]
 | `window virtualsendnum <n>` | Send the window to numbered virtual workspace but stay |
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
+| `mouse display <id>`       | Warp the mouse pointer to display `<id>`         |
 | `printstate`               | Print the internal ECS state to the debug log    |
 | `quit`                     | Quit Paneru                                      |
 | `restart`                  | Restart the Paneru service                         |

@@ -284,7 +284,10 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_balance` | Make all columns in the strip the same width as the focused window. |
 | `window_nextdisplay` | Move the focused window's whole column to the next monitor and follow it. |
 | `window_nextdisplaysend` | Move the focused window's whole column to the next monitor but stay on current. |
+| `window_displaymove_<id>` | Move the focused window's whole column to the monitor with this display ID and follow it. `paneru query active` reports display IDs. |
+| `window_displaysend_<id>` | Move the focused window's whole column to the monitor with this display ID but stay on current. |
 | `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
+| `mouse_display_<id>` | Warp mouse cursor to the monitor with this display ID. |
 | `window_focusdisplay_north` / `_south` / `_west` / `_east` | Focus the display in that direction in the physical arrangement, on its last-focused or most visible window. |
 | `window_movedisplay_north` / `_south` / `_west` / `_east` | Move the focused window's whole column to the display in that direction and follow it. |
 | `window_focusedge_west` / `_east` | Focus the first/last column, as `window_focus_first`/`_last` do. When that column already has focus, or the strip is empty, focus the display on that side, as `window_focusdisplay_west`/`_east` do. |
