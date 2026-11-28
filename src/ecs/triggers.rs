@@ -2535,21 +2535,20 @@ pub(super) fn window_removal_trigger(
     let entity = trigger.event().entity;
     focus_history.forget(entity);
 
-    if let Some((strip_entity, mut strip)) = workspaces
-        .iter_mut()
-        .find(|(_, strip)| strip.contains(entity))
-    {
-        // Every path that stops managing a window ends here, so this line
-        // names each loss even when the path that caused it logs nothing.
-        info!(
-            "Stopped managing window {} (entity {entity}): removed from strip {}.",
-            windows.get(entity).map_or(0, |window| window.id()),
-            strip.id()
-        );
-        strip.remove(entity);
-        commands
-            .entity(strip_entity)
-            .try_insert(ExposeFocusedSurvivorAfterRemoval);
+    for (strip_entity, mut strip) in &mut workspaces {
+        if strip.contains(entity) {
+            // Every path that stops managing a window ends here, so this line
+            // names each loss even when the path that caused it logs nothing.
+            info!(
+                "Stopped managing window {} (entity {entity}): removed from strip {}.",
+                windows.get(entity).map_or(0, |window| window.id()),
+                strip.id()
+            );
+            strip.remove(entity);
+            commands
+                .entity(strip_entity)
+                .try_insert(ExposeFocusedSurvivorAfterRemoval);
+        }
     }
 }
 

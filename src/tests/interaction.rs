@@ -3696,3 +3696,83 @@ fn test_clock_samples_the_current_event_pump_interval() {
         assert_eq!(world.resource::<Time>().delta(), interval);
     }
 }
+
+#[test]
+fn swipe_ignores_stale_entity_at_strip_end() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            continuous_swipe: Some(true),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.advance(Duration::from_millis(40));
+
+    let stale = harness.world().spawn_empty().id();
+    harness.world().entity_mut(stale).despawn();
+    let initial_x = {
+        let world = harness.world();
+        let (mut strip, position) = world
+            .query_filtered::<(&mut LayoutStrip, &Position), With<ActiveWorkspaceMarker>>()
+            .single_mut(world)
+            .expect("active strip");
+        let x = position.0.x;
+        strip.append(stale);
+        x
+    };
+
+    let world = harness.world();
+    world.write_message::<Event>(Event::TouchpadDown);
+    world.write_message::<Event>(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+        distance_cm: 0.0,
+    });
+    harness.advance(Duration::from_millis(20));
+
+    let world = harness.world();
+    let position = world
+        .query_filtered::<&Position, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active strip");
+    assert!(
+        position.0.x < initial_x,
+        "a stale entity at the strip end must not block horizontal scrolling (initial={initial_x}, after={})",
+        position.0.x
+    );
+}
+
+#[test]
+fn window_removal_clears_entity_from_every_strip() {
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.advance(Duration::from_millis(40));
+
+    let win1 = find_window_entity(1, harness.world());
+    let extra_strip = {
+        let world = harness.world();
+        let mut strip = LayoutStrip::new(TEST_WORKSPACE_ID, 1);
+        strip.append(win1);
+        world.spawn(strip).id()
+    };
+
+    harness.world().entity_mut(win1).despawn();
+
+    let world = harness.world();
+    assert!(
+        !world
+            .get::<LayoutStrip>(extra_strip)
+            .unwrap()
+            .contains(win1),
+        "despawning a window must remove it from every strip, not only the first match"
+    );
+    for strip in world.query::<&LayoutStrip>().iter(world) {
+        assert!(
+            !strip.contains(win1),
+            "no strip may retain a despawned entity"
+        );
+    }
+}

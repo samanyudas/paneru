@@ -27,7 +27,6 @@ use crate::ecs::{
     NativeFullscreenMarker, Position, PreUpdateSet, RepositionMarker, ScrollInput, Scrolling,
     SelectedVirtualMarker, SendMessageTrigger, SettleEase, UpdateSet,
 };
-use crate::errors::Result;
 use bevy::ecs::schedule::common_conditions::on_message;
 
 use crate::events::{Event, InputEvent};
@@ -1589,33 +1588,19 @@ fn clamp_viewport_offset(
     viewport: &IRect,
     config: &Config,
 ) -> Option<i32> {
-    let total_strip_width = layout_strip
-        .last()
-        .ok()
-        .and_then(|column| column.top())
-        .and_then(|entity| {
-            windows
-                .layout_position(entity)
-                .zip(windows.moving_frame(entity))
-        })
-        .map(|(position, frame)| position.x + frame.width())?;
-
-    let continuous_swipe = config.continuous_swipe();
-    let strip_position = |column: Result<Column>| {
-        column
-            .ok()
-            .and_then(|column| column.top())
-            .and_then(|entity| windows.layout_position(entity))
-            .map(|position| position.0.x)
+    let geometry = |entity| {
+        windows
+            .layout_position(entity)
+            .zip(windows.moving_frame(entity))
+            .map(|(position, frame)| (position.x, position.x + frame.width()))
     };
-
-    let left_snap = strip_position(layout_strip.last());
-    // NOTE: this snaps to the second window on purpose.
-    // For a single colum workspace this will return None
-    let right_snap = strip_position(layout_strip.get(1));
+    let live_column = |column| LayoutStrip::resolve_column(column, geometry);
+    let (left_snap, total_strip_width) = layout_strip.columns().rev().find_map(live_column)?;
 
     Some(
-        if continuous_swipe && let Some((left_snap, right_snap)) = left_snap.zip(right_snap) {
+        if config.continuous_swipe()
+            && let Some((right_snap, _)) = layout_strip.columns().filter_map(live_column).nth(1)
+        {
             // Allow to scroll away until the last or first window snaps.
             current_offset.clamp(viewport.min.x - left_snap, viewport.max.x - right_snap)
         } else if viewport.width() < total_strip_width {

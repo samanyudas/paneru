@@ -1584,8 +1584,21 @@ impl LayoutStrip {
         self.id
     }
 
-    pub fn columns(&self) -> impl Iterator<Item = &Column> {
+    pub fn columns(&self) -> impl DoubleEndedIterator<Item = &Column> {
         self.columns.iter()
+    }
+
+    /// Resolves a value for `column` by preferring its `top()` entity and
+    /// falling back to the first member in `column` for which `resolve`
+    /// returns `Some`.
+    pub fn resolve_column<T>(
+        column: &Column,
+        mut resolve: impl FnMut(Entity) -> Option<T>,
+    ) -> Option<T> {
+        column
+            .top()
+            .and_then(&mut resolve)
+            .or_else(|| column.window_iter().find_map(resolve))
     }
 
     #[cfg(test)]
@@ -2727,10 +2740,19 @@ pub(crate) fn strip_content_range(
     strip: &LayoutStrip,
     windows: &Windows,
 ) -> Option<std::ops::Range<i32>> {
-    let first = strip.first().ok()?.top()?;
-    let last = strip.last().ok()?.top()?;
-    let start = windows.layout_position(first)?.x;
-    let end = windows.layout_position(last)?.x + windows.moving_frame(last)?.width();
+    let start = strip.columns().find_map(|column| {
+        LayoutStrip::resolve_column(column, |entity| {
+            windows.layout_position(entity).map(|pos| pos.x)
+        })
+    })?;
+    let end = strip.columns().rev().find_map(|column| {
+        LayoutStrip::resolve_column(column, |entity| {
+            windows
+                .layout_position(entity)
+                .zip(windows.moving_frame(entity))
+                .map(|(pos, frame)| pos.x + frame.width())
+        })
+    })?;
     Some(start..end)
 }
 
@@ -5484,5 +5506,41 @@ mod tests {
         }
         assert_eq!(strip.right_neighbour(leader), Some(b));
         assert_eq!(strip.right_neighbour(follower), Some(b));
+    }
+
+    #[test]
+    fn test_resolve_column_skips_stale_members() {
+        let mut world = World::new();
+        let stack_stale = world.spawn_empty().id();
+        let stack_live = world.spawn_empty().id();
+        let native_stale = world.spawn_empty().id();
+        let native_live = world.spawn_empty().id();
+        let single_stale = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(stack_stale);
+        strip.append(stack_live);
+        strip.stack(stack_live, Side::West).unwrap();
+        strip.append_tab_group(&[native_stale, native_live]);
+        strip.append(single_stale);
+
+        let columns: Vec<_> = strip.columns().collect();
+
+        // Plain stack: falls back to a lower member when `top()` is stale.
+        let resolved =
+            LayoutStrip::resolve_column(columns[0], |entity| (entity == stack_live).then_some(250));
+        assert_eq!(resolved, Some(250));
+
+        // Native tab group: falls back to a surviving tab when `top()` is stale.
+        let resolved = LayoutStrip::resolve_column(columns[1], |entity| {
+            (entity == native_live).then_some(300)
+        });
+        assert_eq!(resolved, Some(300));
+
+        // Single stale column: resolves to None so callers skip it.
+        assert_eq!(
+            LayoutStrip::resolve_column(columns[2], |_| Option::<i32>::None),
+            None
+        );
     }
 }
