@@ -1240,6 +1240,7 @@ impl InputHandler {
                 events.send(Event::MouseDragged {
                     point,
                     delta_y,
+                    timestamp: Instant::now(),
                     modifiers,
                     button,
                 })
@@ -1251,6 +1252,7 @@ impl InputHandler {
                 events.send(Event::MouseMoved {
                     point,
                     delta_y,
+                    timestamp: Instant::now(),
                     modifiers,
                 })
             }

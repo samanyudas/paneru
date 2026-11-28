@@ -178,6 +178,7 @@ impl Desk {
             Mouse::Dragged(button) => Event::MouseDragged {
                 point,
                 delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers,
                 button,
             },
@@ -189,6 +190,7 @@ impl Desk {
             Mouse::Moved => Event::MouseMoved {
                 point,
                 delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers,
             },
             Mouse::Scrolled => Event::Scroll { delta: 0.5 },

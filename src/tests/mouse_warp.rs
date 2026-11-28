@@ -40,18 +40,29 @@ fn desk(lowest_below: bool) -> TestHarness {
         .with_display(RIGHT_DISPLAY_ID, right_monitor(), vec![RIGHT_WORKSPACE_ID])
 }
 
-fn moves_with_delta(points: &[(i32, i32, i64)]) -> Vec<Event> {
+fn moves_with_delta_and_time(points: &[(i32, i32, i64, u64)]) -> Vec<Event> {
+    let base = std::time::Instant::now();
     points
         .iter()
-        .map(|&(x, y, delta_y)| Event::MouseMoved {
+        .map(|&(x, y, delta_y, offset_ms)| Event::MouseMoved {
             point: objc2_core_foundation::CGPoint {
                 x: f64::from(x),
                 y: f64::from(y),
             },
             delta_y,
+            timestamp: base + std::time::Duration::from_millis(offset_ms),
             modifiers: crate::platform::Modifiers::empty(),
         })
         .collect()
+}
+
+fn moves_with_delta(points: &[(i32, i32, i64)]) -> Vec<Event> {
+    let timed = points
+        .iter()
+        .enumerate()
+        .map(|(i, &(x, y, delta_y))| (x, y, delta_y, (i as u64) * 10))
+        .collect::<Vec<_>>();
+    moves_with_delta_and_time(&timed)
 }
 
 fn moves(points: &[(i32, i32)]) -> Vec<Event> {
@@ -412,5 +423,36 @@ fn fast_downward_flick_across_native_seam_in_one_drain_still_warps_to_laptop() {
         cursor,
         IVec2::new(612, 6),
         "both sides of a native display seam in one drain must stay ordered for row_crossing"
+    );
+}
+
+#[test]
+fn duplicate_edge_samples_in_one_drain_warp_only_once_without_spurious_carry() {
+    let (_, cursor) = pointer_pumped_events(
+        desk(true),
+        moves_with_delta_and_time(&[(511, -600, 0, 0), (511, -600, 0, 10)]),
+    );
+    // Landing inset is 6 px from right_monitor.min.x (-1408) -> -1402 with zero
+    // velocity carry (a second warp from the first landing would add 80 px carry).
+    assert_eq!(
+        cursor,
+        IVec2::new(-1402, -1800),
+        "remaining pre-warp samples in the same drain must be discarded after a warp succeeds"
+    );
+}
+
+#[test]
+fn velocity_carry_uses_event_timestamps_within_a_single_drain() {
+    // 509 is outside the 3-px edge threshold (`512 - 509 == 3`), then moving
+    // 1 px rightward to 510 over 10 ms = 100 px/s -> 30 ms carry = 3 px ->
+    // landing at -1408 + 6 + 3 = -1399 (not clamped to +80 px from read-time dt).
+    let (_, cursor) = pointer_pumped_events(
+        desk(true),
+        moves_with_delta_and_time(&[(509, -600, 0, 0), (510, -600, 0, 10)]),
+    );
+    assert_eq!(
+        cursor,
+        IVec2::new(-1399, -1800),
+        "carry-over must use original event timestamps rather than trigger read times"
     );
 }

@@ -5,6 +5,7 @@ use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::CGDirectDisplayID;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::Instant;
 
 use crate::commands::Command;
 use crate::ecs::state::StateQueryKind;
@@ -63,6 +64,7 @@ pub struct InputEvent(pub Event);
 pub struct PointerMotion {
     pub point: CGPoint,
     pub delta_y: i64,
+    pub timestamp: Instant,
 }
 
 /// Several variants carry a payload used only by the Lua bridge
@@ -174,6 +176,7 @@ pub enum Event {
     MouseDragged {
         point: CGPoint,
         delta_y: i64,
+        timestamp: Instant,
         modifiers: Modifiers,
         button: MouseButton,
     },
@@ -181,6 +184,7 @@ pub enum Event {
     MouseMoved {
         point: CGPoint,
         delta_y: i64,
+        timestamp: Instant,
         modifiers: Modifiers,
     },
 

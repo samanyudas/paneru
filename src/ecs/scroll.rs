@@ -711,6 +711,7 @@ pub(super) fn swiping_timeout(
                 commands.trigger(SendMessageTrigger(Event::MouseMoved {
                     point,
                     delta_y: 0,
+                    timestamp: std::time::Instant::now(),
                     modifiers: Modifiers::empty(),
                 }));
             }

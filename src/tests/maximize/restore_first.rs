@@ -334,6 +334,7 @@ fn drag(harness: &mut TestHarness, id: WinID, from: Origin, to: Origin) -> Optio
         harness.world().write_message(Event::MouseDragged {
             point: CGPoint::new(point.x.into(), point.y.into()),
             delta_y: 0,
+            timestamp: std::time::Instant::now(),
             modifiers: Modifiers::empty(),
             button: MouseButton::Left,
         });

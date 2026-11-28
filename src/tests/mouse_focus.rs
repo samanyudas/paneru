@@ -49,6 +49,7 @@ fn mouse_focus_resumes_after_slide_without_intermediate_mouse_events() {
                     y: f64::from(center.y),
                 },
                 delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers: Modifiers::empty(),
             });
         })
@@ -129,6 +130,7 @@ fn keyboard_focus_survives_mouse_movement_during_slide() {
                     y: f64::from(center.y),
                 },
                 delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers: Modifiers::empty(),
             });
             harness.advance(Duration::from_millis(20));
@@ -149,6 +151,7 @@ fn keyboard_focus_survives_mouse_movement_during_slide() {
                     y: f64::from(center.y),
                 },
                 delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers: Modifiers::empty(),
             });
             harness.advance(Duration::from_millis(100));
@@ -621,6 +624,7 @@ fn focus_follows_mouse_uses_final_sample_of_a_move_burst() {
                     y: f64::from(center.y),
                 },
                 delta_y,
+                timestamp: std::time::Instant::now(),
                 modifiers: Modifiers::empty(),
             },
             &mut pending_mouse,
@@ -646,12 +650,14 @@ fn pump_flushes_mouse_move_before_non_input_window_resized() {
         Event::MouseMoved {
             point: CGPoint { x: 100.0, y: 100.0 },
             delta_y: 0,
+            timestamp: std::time::Instant::now(),
             modifiers: Modifiers::empty(),
         },
         Event::WindowResized { window_id: 0 },
         Event::MouseMoved {
             point: CGPoint { x: 500.0, y: 100.0 },
             delta_y: 0,
+            timestamp: std::time::Instant::now(),
             modifiers: Modifiers::LALT,
         },
     ];

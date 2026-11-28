@@ -1003,10 +1003,24 @@ pub(crate) fn demux_input_events(
     for event in messages.read() {
         if event.is_input() {
             if mirror_motion
-                && let Event::MouseMoved { point, delta_y, .. }
-                | Event::MouseDragged { point, delta_y, .. } = *event
+                && let Event::MouseMoved {
+                    point,
+                    delta_y,
+                    timestamp,
+                    ..
+                }
+                | Event::MouseDragged {
+                    point,
+                    delta_y,
+                    timestamp,
+                    ..
+                } = *event
             {
-                pointer_motion.write(crate::events::PointerMotion { point, delta_y });
+                pointer_motion.write(crate::events::PointerMotion {
+                    point,
+                    delta_y,
+                    timestamp,
+                });
             }
             input.write(InputEvent(event.clone()));
         }
@@ -1023,10 +1037,24 @@ pub(crate) fn push_pumped_event(
     received_events: &mut Vec<Event>,
     pointer_motion: &mut Vec<crate::events::PointerMotion>,
 ) {
-    if let Event::MouseMoved { point, delta_y, .. } | Event::MouseDragged { point, delta_y, .. } =
-        event
+    if let Event::MouseMoved {
+        point,
+        delta_y,
+        timestamp,
+        ..
+    }
+    | Event::MouseDragged {
+        point,
+        delta_y,
+        timestamp,
+        ..
+    } = event
     {
-        pointer_motion.push(crate::events::PointerMotion { point, delta_y });
+        pointer_motion.push(crate::events::PointerMotion {
+            point,
+            delta_y,
+            timestamp,
+        });
     }
     if matches!(event, Event::MouseMoved { .. }) {
         *pending_mouse = Some(event);

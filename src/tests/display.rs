@@ -3746,11 +3746,13 @@ fn test_horizontal_mouse_warp_also_warps_a_drag() {
             Event::MouseMoved {
                 point: approach,
                 delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers,
             },
             Event::MouseMoved {
                 point: edge,
                 delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers,
             },
         ),
@@ -3758,12 +3760,14 @@ fn test_horizontal_mouse_warp_also_warps_a_drag() {
             Event::MouseDragged {
                 point: approach,
                 delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers,
                 button: crate::events::MouseButton::Left,
             },
             Event::MouseDragged {
                 point: edge,
                 delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers,
                 button: crate::events::MouseButton::Left,
             },

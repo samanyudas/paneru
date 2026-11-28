@@ -669,8 +669,15 @@ fn horizontal_warp_mouse_trigger(
     mut state: Local<WarpVelocityState>,
 ) {
     let mut desk: Option<Option<WarpDesk>> = None;
+    let mut warped = false;
     for motion in messages.read() {
-        let now = Instant::now();
+        // Once a warp succeeds, any remaining samples from this drain were
+        // queued before the warp and must be discarded so the landing point
+        // stays the baseline for subsequent motion.
+        if warped {
+            continue;
+        }
+        let now = motion.timestamp;
         let point = origin_from(motion.point);
         let delta_y = motion.delta_y;
 
@@ -706,6 +713,7 @@ fn horizontal_warp_mouse_trigger(
         {
             window_manager.warp_mouse(landing);
             state.last = Some((landing, now));
+            warped = true;
             continue;
         }
 
@@ -792,6 +800,7 @@ fn horizontal_warp_mouse_trigger(
         // Reset the velocity sample to the landing point so the next motion
         // event computes velocity from the new position, not the pre-warp one.
         state.last = Some((landing, now));
+        warped = true;
     }
 }
 

@@ -167,6 +167,7 @@ fn ending_a_press_replays_layout_changes_for_every_native_tab() {
                 harness.world().write_message(Event::MouseMoved {
                     point: cg(point),
                     delta_y: 0,
+                    timestamp: std::time::Instant::now(),
                     modifiers: Modifiers::empty(),
                 });
             }
@@ -2062,6 +2063,7 @@ fn a_lost_mouse_up_keeps_grace_for_a_delayed_manual_edge_resize() {
             harness.world().write_message(Event::MouseMoved {
                 point: cg(edge + IVec2::new(60, 0)),
                 delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers: Modifiers::empty(),
             });
             harness.advance(ms(150));
