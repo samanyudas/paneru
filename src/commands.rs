@@ -324,51 +324,94 @@ fn command_focus_window(
     history: Res<FocusHistory>,
     mut commands: Commands,
 ) {
+    #[derive(Clone, Copy)]
     struct FocusCandidate {
         id: i32,
         entity: Entity,
         tiled: bool,
     }
 
-    let Some(operation) = filter_window_operations(&mut messages, |op| {
-        matches!(op, Operation::FocusPrevious | Operation::FocusId(_))
-    })
-    .last() else {
+    let events: Vec<&Event> = messages.read().collect();
+    let has_focus_cmd = events.iter().any(|event| {
+        matches!(
+            event,
+            Event::Command {
+                command: Command::Window(Operation::FocusPrevious | Operation::FocusId(_))
+            }
+        )
+    });
+    if !has_focus_cmd {
         return;
+    }
+
+    let is_hidden = |entity| {
+        windows
+            .parent_of(entity)
+            .and_then(|app| apps.get(app).ok())
+            .is_some_and(|app| app.is_hidden())
     };
-    let focused = windows.focused().map(|(_, entity)| entity);
-    let mut candidates = windows.iter().filter_map(|(window, entity)| {
-        let (_, _, unmanaged) = windows.get_managed(entity)?;
-        match unmanaged {
-            None if workspaces.iter().any(|strip| strip.contains(entity)) => Some(FocusCandidate {
+    let candidates: Vec<FocusCandidate> = windows
+        .iter()
+        .filter_map(|(window, entity)| {
+            let tiled = match windows.get_managed(entity)?.2 {
+                None if workspaces.iter().any(|strip| strip.contains(entity)) => true,
+                Some(Unmanaged::Floating) if !is_hidden(entity) => false,
+                _ => return None,
+            };
+            Some(FocusCandidate {
                 id: window.id(),
                 entity,
-                tiled: true,
-            }),
-            Some(Unmanaged::Floating)
-                if !windows
-                    .parent_of(entity)
-                    .and_then(|app_entity| apps.get(app_entity).ok())
-                    .is_some_and(|app| app.is_hidden()) =>
-            {
-                Some(FocusCandidate {
-                    id: window.id(),
-                    entity,
-                    tiled: false,
-                })
+                tiled,
+            })
+        })
+        .collect();
+
+    let focused = windows.focused().map(|(_, entity)| entity);
+    let find_id = |id| candidates.iter().copied().find(|c| c.id == id);
+    let mut current = focused.and_then(|e| candidates.iter().copied().find(|c| c.entity == e));
+    let mut previous = candidates
+        .iter()
+        .copied()
+        .filter(|c| Some(c.entity) != focused)
+        .filter_map(|c| Some((history.window_recency(c.entity)?, c)))
+        .max_by_key(|(recency, _)| *recency)
+        .map(|(_, c)| c);
+
+    let mut target = None;
+    for event in events {
+        match event {
+            Event::WindowFocused { window_id } => {
+                if let Some(next) = find_id(*window_id)
+                    && current.map(|c| c.entity) != Some(next.entity)
+                {
+                    previous = current;
+                    current = Some(next);
+                }
             }
-            _ => None,
+            Event::Command {
+                command: Command::Window(Operation::FocusPrevious),
+            } => {
+                if let Some(prev) = previous {
+                    previous = current;
+                    current = Some(prev);
+                    target = Some(prev);
+                }
+            }
+            Event::Command {
+                command: Command::Window(Operation::FocusId(id)),
+            } => {
+                if let Some(next) = find_id(*id) {
+                    if current.map(|c| c.entity) != Some(next.entity) {
+                        previous = current;
+                        current = Some(next);
+                    }
+                    target = Some(next);
+                }
+            }
+            _ => {}
         }
-    });
-    let target = match operation {
-        Operation::FocusPrevious => candidates
-            .filter(|candidate| Some(candidate.entity) != focused)
-            .filter_map(|candidate| Some((history.window_recency(candidate.entity)?, candidate)))
-            .max_by_key(|(recency, _)| *recency)
-            .map(|(_, candidate)| candidate),
-        Operation::FocusId(id) => candidates.find(|candidate| candidate.id == *id),
-        _ => None,
-    };
+    }
+
     if let Some(candidate) = target {
         if candidate.tiled {
             focus_into_view(candidate.entity, focused, &mut commands);

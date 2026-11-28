@@ -144,6 +144,10 @@ impl FocusHistory {
         self.window_recency.get(&entity).copied()
     }
 
+    pub fn forget_window_recency(&mut self, entity: Entity) {
+        self.window_recency.remove(&entity);
+    }
+
     pub fn forget(&mut self, entity: Entity) {
         self.window_recency.remove(&entity);
         self.managed_recency.remove(&entity);
@@ -658,7 +662,7 @@ fn detect_focus_rejection(
             }
         }
         if let Some(history) = &mut history {
-            history.forget(target_entity);
+            history.forget_window_recency(target_entity);
         }
         commands.focus_entity(actual_entity, false);
     }
