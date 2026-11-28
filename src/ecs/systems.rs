@@ -981,6 +981,13 @@ pub(super) fn finish_resize_motions(
     }
 }
 
+/// Set by [`pump_events`] when it has already published this frame's
+/// uncoalesced [`crate::events::PointerMotion`] samples, so
+/// [`demux_input_events`] only mirrors `Event` motion in unit tests that bypass
+/// the pump.
+#[derive(Resource, Default)]
+pub(crate) struct PumpedPointerMotion(pub bool);
+
 /// Republishes the pointer and gesture events onto [`InputEvent`], so the input
 /// systems do not have to sift the whole stream for them every frame.
 ///
@@ -989,22 +996,38 @@ pub(super) fn finish_resize_motions(
 pub(crate) fn demux_input_events(
     mut messages: MessageReader<Event>,
     mut input: MessageWriter<InputEvent>,
+    mut pointer_motion: MessageWriter<crate::events::PointerMotion>,
+    mut pumped: ResMut<PumpedPointerMotion>,
 ) {
+    let mirror_motion = !std::mem::take(&mut pumped.0);
     for event in messages.read() {
         if event.is_input() {
+            if mirror_motion
+                && let Event::MouseMoved { point, delta_y, .. }
+                | Event::MouseDragged { point, delta_y, .. } = *event
+            {
+                pointer_motion.write(crate::events::PointerMotion { point, delta_y });
+            }
             input.write(InputEvent(event.clone()));
         }
     }
 }
 
-/// Coalesces consecutive `MouseMoved` events to the latest sample, flushing
-/// any pending move whenever another event (including non-input notifications
-/// like `WindowResized`) arrives.
+/// Records every pointer motion sample in arrival order for horizontal mouse
+/// warp, then coalesces consecutive `MouseMoved` events to the latest sample
+/// while flushing on every other event (including non-input notifications like
+/// `WindowResized`).
 pub(crate) fn push_pumped_event(
     event: Event,
     pending_mouse: &mut Option<Event>,
     received_events: &mut Vec<Event>,
+    pointer_motion: &mut Vec<crate::events::PointerMotion>,
 ) {
+    if let Event::MouseMoved { point, delta_y, .. } | Event::MouseDragged { point, delta_y, .. } =
+        event
+    {
+        pointer_motion.push(crate::events::PointerMotion { point, delta_y });
+    }
     if matches!(event, Event::MouseMoved { .. }) {
         *pending_mouse = Some(event);
     } else {
@@ -1017,6 +1040,8 @@ pub(crate) fn push_pumped_event(
 pub(crate) fn pump_events(
     mut exit: MessageWriter<AppExit>,
     mut messages: MessageWriter<Event>,
+    mut pointer_motion: MessageWriter<crate::events::PointerMotion>,
+    mut pumped: ResMut<PumpedPointerMotion>,
     low_power_mode: Option<Res<LowPowerMode>>,
     incoming_events: Option<NonSend<Receiver<Event>>>,
     platform: Option<NonSendMut<Pin<Box<PlatformCallbacks>>>>,
@@ -1037,6 +1062,7 @@ pub(crate) fn pump_events(
 
     let deadline = Instant::now() + PUMP_BUDGET;
     let mut received_events = Vec::new();
+    let mut motion_samples = Vec::new();
     let mut pending_mouse = None;
     let mut woke = false;
 
@@ -1063,7 +1089,12 @@ pub(crate) fn pump_events(
             }
             Ok(event) => {
                 woke |= matches!(event, Event::SystemWoke { .. });
-                push_pumped_event(event, &mut pending_mouse, &mut received_events);
+                push_pumped_event(
+                    event,
+                    &mut pending_mouse,
+                    &mut received_events,
+                    &mut motion_samples,
+                );
                 *timeout = LOOP_TIMEOUT_STEP;
             }
             Err(TryRecvError::Empty) => break true,
@@ -1072,6 +1103,8 @@ pub(crate) fn pump_events(
 
     received_events.extend(pending_mouse.take());
     messages.write_batch(received_events);
+    pointer_motion.write_batch(motion_samples);
+    pumped.0 = true;
 
     if drained {
         let frame_active = activity.mid_frame();

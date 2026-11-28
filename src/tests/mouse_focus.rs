@@ -611,6 +611,7 @@ fn focus_follows_mouse_uses_final_sample_of_a_move_burst() {
     // `pump_events` now does when the earlier sample has a non-zero `delta_y`):
     // focus-follows-mouse must focus window 2 (the final sample), not window 1.
     let mut pumped = Vec::new();
+    let mut motion = Vec::new();
     let mut pending_mouse = None;
     for (center, delta_y) in [(center_1, 4), (center_2, 0)] {
         crate::ecs::systems::push_pumped_event(
@@ -624,10 +625,12 @@ fn focus_follows_mouse_uses_final_sample_of_a_move_burst() {
             },
             &mut pending_mouse,
             &mut pumped,
+            &mut motion,
         );
     }
     pumped.extend(pending_mouse.take());
     assert_eq!(pumped.len(), 1);
+    assert_eq!(motion.len(), 2);
 
     harness.world().write_message_batch(pumped);
     harness.advance(Duration::from_millis(100));
@@ -637,6 +640,7 @@ fn focus_follows_mouse_uses_final_sample_of_a_move_burst() {
 #[test]
 fn pump_flushes_mouse_move_before_non_input_window_resized() {
     let mut pumped = Vec::new();
+    let mut motion = Vec::new();
     let mut pending_mouse = None;
     let raw = vec![
         Event::MouseMoved {
@@ -652,7 +656,7 @@ fn pump_flushes_mouse_move_before_non_input_window_resized() {
         },
     ];
     for event in raw {
-        crate::ecs::systems::push_pumped_event(event, &mut pending_mouse, &mut pumped);
+        crate::ecs::systems::push_pumped_event(event, &mut pending_mouse, &mut pumped, &mut motion);
     }
     pumped.extend(pending_mouse.take());
     assert_eq!(

@@ -22,7 +22,7 @@ use crate::ecs::{
 };
 use bevy::ecs::schedule::common_conditions::on_message;
 
-use crate::events::{Event, InputEvent};
+use crate::events::{Event, InputEvent, PointerMotion};
 use crate::manager::{Display, Origin, WindowManager, origin_from};
 use crate::platform::WinID;
 use crate::util::round_px;
@@ -47,16 +47,19 @@ impl Plugin for MouseEventsPlugin {
         app.add_systems(
             Update,
             (
-                (
-                    mouse_moved_trigger,
-                    mouse_resize_trigger,
-                    mouse_down_trigger,
-                )
-                    .run_if(mission_control_inactive),
-                horizontal_warp_mouse_trigger,
+                mouse_moved_trigger,
+                mouse_resize_trigger,
+                mouse_down_trigger,
             )
+                .run_if(mission_control_inactive)
                 .in_set(UpdateSet::Input)
                 .run_if(on_message::<InputEvent>),
+        );
+        app.add_systems(
+            Update,
+            horizontal_warp_mouse_trigger
+                .in_set(UpdateSet::Input)
+                .run_if(on_message::<PointerMotion>),
         );
         app.add_systems(
             Update,
@@ -659,23 +662,17 @@ const MAX_CARRY_PX: i32 = 80;
 const VELOCITY_FRESHNESS: Duration = Duration::from_millis(80);
 
 fn horizontal_warp_mouse_trigger(
-    mut messages: MessageReader<InputEvent>,
+    mut messages: MessageReader<PointerMotion>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut state: Local<WarpVelocityState>,
 ) {
     let mut desk: Option<Option<WarpDesk>> = None;
-    for InputEvent(event) in messages.read() {
-        let (Event::MouseMoved { point, delta_y, .. } | Event::MouseDragged { point, delta_y, .. }) =
-            event
-        else {
-            continue;
-        };
-
+    for motion in messages.read() {
         let now = Instant::now();
-        let point = origin_from(*point);
-        let delta_y = *delta_y;
+        let point = origin_from(motion.point);
+        let delta_y = motion.delta_y;
 
         // Compute velocity from the previous sample before deciding whether to
         // warp, then refresh the sample so subsequent events build on this one.

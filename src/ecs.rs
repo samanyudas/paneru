@@ -258,6 +258,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // Registered with `add_message`, not `init_resource`, so the buffer is
     // double-buffered and dropped after a frame like any other message stream.
     app.add_message::<InputEvent>();
+    app.add_message::<crate::events::PointerMotion>();
+    app.init_resource::<systems::PumpedPointerMotion>();
     app.add_message::<state::SaveSession>();
     // Sample Bevy time after the blocking OS wait, so this frame uses its own
     // elapsed interval rather than the previous frame's sleep.

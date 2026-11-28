@@ -283,6 +283,42 @@ fn moving_up_from_the_laptop_after_a_pause_still_reaches_the_upper_monitor() {
     assert_eq!(cursor, IVec2::new(800 - 1920, -EXT_DISPLAY_HEIGHT - 7));
 }
 
+fn pointer_pumped_events(harness: TestHarness, raw: Vec<Event>) -> (IVec2, IVec2) {
+    let mut pumped = Vec::new();
+    let mut motion = Vec::new();
+    let mut pending_mouse = None;
+    for event in raw {
+        crate::ecs::systems::push_pumped_event(event, &mut pending_mouse, &mut pumped, &mut motion);
+    }
+    pumped.extend(pending_mouse.take());
+
+    let seen = Arc::new(Mutex::new((IVec2::ZERO, IVec2::ZERO)));
+    let before = Arc::clone(&seen);
+    let after = Arc::clone(&seen);
+    harness
+        .on_iteration(1, move |world, state| {
+            before.lock().expect("cursor record").0 = state.cursor_position();
+            world.write_message_batch(pumped.iter().cloned());
+            world.write_message_batch(motion.iter().copied());
+            world
+                .resource_mut::<crate::ecs::systems::PumpedPointerMotion>()
+                .0 = true;
+        })
+        .on_iteration(2, move |_world, state| {
+            after.lock().expect("cursor record").1 = state.cursor_position();
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+    *seen.lock().expect("cursor record")
+}
+
 #[test]
 fn coalescing_downward_push_outside_laptop_before_sideways_slide_does_not_warp() {
     let config: Config = (
@@ -307,27 +343,74 @@ fn coalescing_downward_push_outside_laptop_before_sideways_slide_does_not_warp()
         .with_display(EXT_DISPLAY_ID, staggered_left, vec![EXT_WORKSPACE_ID])
         .with_display(RIGHT_DISPLAY_ID, staggered_right, vec![RIGHT_WORKSPACE_ID]);
 
-    // Simulate `pump_events` receiving a downward push outside the laptop's
-    // mapped range followed by a sideways slide into it within the same frame.
-    let raw = moves_with_delta(&[
-        (-1480, -EXT_DISPLAY_HEIGHT - 1, 4),
-        (-1520, -EXT_DISPLAY_HEIGHT - 1, 0),
-    ]);
-    let mut pumped = Vec::new();
-    let mut pending_mouse = None;
-    for event in raw {
-        crate::ecs::systems::push_pumped_event(event, &mut pending_mouse, &mut pumped);
-    }
-    pumped.extend(pending_mouse.take());
-    assert_eq!(
-        pumped.len(),
-        1,
-        "coalescing keeps only the latest move without attaching the earlier point's delta_y"
+    // Push down outside the laptop's mapped range, then slide sideways into it
+    // in the same pump drain: warp sees both samples in order and does not jump.
+    let (before, cursor) = pointer_pumped_events(
+        harness,
+        moves_with_delta(&[
+            (-1480, -EXT_DISPLAY_HEIGHT - 1, 4),
+            (-1520, -EXT_DISPLAY_HEIGHT - 1, 0),
+        ]),
     );
-
-    let (before, cursor) = pointer_events(harness, pumped);
     assert_eq!(
         cursor, before,
         "a downward push outside the laptop followed by sideways motion into its range must not warp"
+    );
+}
+
+#[test]
+fn downward_push_then_sideways_sample_in_same_drain_still_warps_from_overhang() {
+    let config: Config = (
+        MainOptions {
+            horizontal_mouse_warp: Some(1),
+            horizontal_mouse_warp_lowest_below: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let staggered_left = IRect::new(-1408, -EXT_DISPLAY_HEIGHT, 512, 0);
+    let staggered_right = IRect::new(-1708, -2 * EXT_DISPLAY_HEIGHT, 212, -EXT_DISPLAY_HEIGHT);
+    let harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_display(EXT_DISPLAY_ID, staggered_left, vec![EXT_WORKSPACE_ID])
+        .with_display(RIGHT_DISPLAY_ID, staggered_right, vec![RIGHT_WORKSPACE_ID]);
+
+    let (_, cursor) = pointer_pumped_events(
+        harness,
+        moves_with_delta(&[
+            (-1608, -EXT_DISPLAY_HEIGHT - 1, 4),
+            (-1600, -EXT_DISPLAY_HEIGHT - 1, 0),
+        ]),
+    );
+    assert_eq!(
+        cursor,
+        IVec2::new(612, 6),
+        "a downward overhang push followed by a sideways sample in the same drain must still warp"
+    );
+}
+
+#[test]
+fn upward_move_then_sideways_sample_in_same_drain_still_warps_from_laptop() {
+    let (_, cursor) =
+        pointer_pumped_events(desk(true), moves_with_delta(&[(800, 0, -5), (810, 0, 0)]));
+    assert_eq!(
+        cursor,
+        IVec2::new(800 - 1920, -EXT_DISPLAY_HEIGHT - 7),
+        "an upward sample after a pause followed by a sideways sample in the same drain must still warp"
+    );
+}
+
+#[test]
+fn fast_downward_flick_across_native_seam_in_one_drain_still_warps_to_laptop() {
+    let (_, cursor) = pointer_pumped_events(
+        desk(true),
+        moves_with_delta(&[(-1308, -1500, 0), (-1308, -900, 600)]),
+    );
+    assert_eq!(
+        cursor,
+        IVec2::new(612, 6),
+        "both sides of a native display seam in one drain must stay ordered for row_crossing"
     );
 }

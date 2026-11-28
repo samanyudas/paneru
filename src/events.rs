@@ -56,6 +56,15 @@ pub type Reply = async_channel::Sender<Response>;
 #[derive(Clone, Debug, Message)]
 pub struct InputEvent(pub Event);
 
+/// An uncoalesced pointer motion sample (`MouseMoved` or `MouseDragged`)
+/// published in arrival order before `pump_events` coalesces `Event::MouseMoved`
+/// for focus-follows-mouse and mouse-resize.
+#[derive(Clone, Copy, Debug, Message)]
+pub struct PointerMotion {
+    pub point: CGPoint,
+    pub delta_y: i64,
+}
+
 /// Several variants carry a payload used only by the Lua bridge
 /// (`src/lua/convert.rs`). The dead-code lint is suppressed only when the
 /// `lua` feature is off, so it still applies to the build that ships.
