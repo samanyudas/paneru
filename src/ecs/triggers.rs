@@ -1072,11 +1072,8 @@ pub(super) fn window_minimized_trigger(
         let focused = windows
             .focused()
             .is_some_and(|(_, focused)| focused == entity);
-        let has_focused_survivor = windows
-            .focused()
-            .and_then(|(_, focused)| windows.get_managed(focused))
-            .is_some_and(|(_, focused, unmanaged)| focused != entity && unmanaged.is_none());
         let departing = EntityHashSet::from_iter([entity]);
+        let has_focused_survivor = has_focused_survivor(&windows, &departing);
 
         for (mut strip, active) in workspaces {
             // A window of a hidden app that opens in no strip and without focus has no focus to
@@ -1539,24 +1536,24 @@ pub(super) fn window_destroyed_trigger(
         return;
     }
 
+    let Some((strip, _)) = workspaces.iter().find(|(_, active)| *active) else {
+        return;
+    };
     let focused_departing = windows
         .focused()
         .map(|(_, focused)| focused)
         .filter(|focused| departing_set.contains(focused));
-    let has_focused_survivor = windows
-        .focused()
-        .and_then(|(_, focused)| windows.get_managed(focused))
-        .is_some_and(|(_, focused, unmanaged)| {
-            !departing_set.contains(&focused) && unmanaged.is_none()
-        });
     let anchor = focused_departing.or_else(|| {
-        (!has_focused_survivor)
-            .then(|| destroyed_order.first().copied())
+        (!has_focused_survivor(&windows, &departing_set))
+            .then(|| {
+                destroyed_order
+                    .iter()
+                    .copied()
+                    .find(|entity| strip.contains(*entity))
+            })
             .flatten()
     });
-    if let Some(anchor) = anchor
-        && let Some((strip, _)) = workspaces.iter().find(|(_, active)| *active)
-    {
+    if let Some(anchor) = anchor {
         give_away_focus_for_departing(
             anchor,
             &departing_set,
@@ -1568,6 +1565,18 @@ pub(super) fn window_destroyed_trigger(
             &mut commands,
         );
     }
+}
+
+/// Returns true when the currently focused window is still visible (tiled or floating)
+/// and not part of the departing set.
+fn has_focused_survivor(windows: &Windows, departing: &EntityHashSet) -> bool {
+    windows
+        .focused()
+        .and_then(|(_, focused)| windows.get_managed(focused))
+        .is_some_and(|(_, focused, unmanaged)| {
+            !departing.contains(&focused)
+                && !matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden))
+        })
 }
 
 /// Drops a window's cached title when its app reports the title changed.
