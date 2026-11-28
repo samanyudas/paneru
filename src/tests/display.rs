@@ -3614,6 +3614,26 @@ fn test_remove_display_keeps_windows_when_the_space_goes_after_the_display() {
         }),
         "windows from the destroyed space must keep their order on the surviving display: {main_strips:?}"
     );
+    let expected_width = crate::util::round_px(
+        f64::from(TEST_WINDOW_WIDTH) / f64::from(EXT_DISPLAY_WIDTH) * f64::from(TEST_DISPLAY_WIDTH),
+    );
+    for id in [100, 101] {
+        let entity = find_window_entity(id, world);
+        let bounds = world.get::<crate::ecs::Bounds>(entity).expect("bounds");
+        assert!(
+            (bounds.0.x - expected_width).abs() <= 2,
+            "migrated tiled width must preserve its viewport share: expected {expected_width}, got {}",
+            bounds.0.x
+        );
+    }
+    assert_eq!(
+        world
+            .query::<&crate::ecs::display::OrphanedWindowWidths>()
+            .iter(world)
+            .count(),
+        0,
+        "all temporary width snapshots must be consumed"
+    );
 }
 
 #[test]
