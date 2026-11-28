@@ -164,12 +164,14 @@ pub enum Event {
     /// A mouse drag event has occurred.
     MouseDragged {
         point: CGPoint,
+        delta_y: i64,
         modifiers: Modifiers,
         button: MouseButton,
     },
     /// A mouse move event has occurred.
     MouseMoved {
         point: CGPoint,
+        delta_y: i64,
         modifiers: Modifiers,
     },
 

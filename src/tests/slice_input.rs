@@ -177,6 +177,7 @@ impl Desk {
             },
             Mouse::Dragged(button) => Event::MouseDragged {
                 point,
+                delta_y: 0,
                 modifiers,
                 button,
             },
@@ -185,7 +186,11 @@ impl Desk {
                 modifiers,
                 button,
             },
-            Mouse::Moved => Event::MouseMoved { point, modifiers },
+            Mouse::Moved => Event::MouseMoved {
+                point,
+                delta_y: 0,
+                modifiers,
+            },
             Mouse::Scrolled => Event::Scroll { delta: 0.5 },
         };
         self.harness.world().write_message(event);

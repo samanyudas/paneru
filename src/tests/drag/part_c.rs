@@ -166,6 +166,7 @@ fn ending_a_press_replays_layout_changes_for_every_native_tab() {
                 harness.mock_state.set_left_button_down(false);
                 harness.world().write_message(Event::MouseMoved {
                     point: cg(point),
+                    delta_y: 0,
                     modifiers: Modifiers::empty(),
                 });
             }
@@ -2060,6 +2061,7 @@ fn a_lost_mouse_up_keeps_grace_for_a_delayed_manual_edge_resize() {
         if pointer_moved {
             harness.world().write_message(Event::MouseMoved {
                 point: cg(edge + IVec2::new(60, 0)),
+                delta_y: 0,
                 modifiers: Modifiers::empty(),
             });
             harness.advance(ms(150));

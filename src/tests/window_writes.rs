@@ -505,6 +505,7 @@ fn a_pressed_window_is_not_polled_while_the_engines_write_is_pending() {
     harness.advance(FRAME);
     harness.world().write_message(Event::MouseDragged {
         point: cg(press + IVec2::new(60, 0)),
+        delta_y: 0,
         modifiers: Modifiers::empty(),
         button: MouseButton::Left,
     });

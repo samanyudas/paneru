@@ -111,7 +111,10 @@ fn mouse_moved_trigger(
     const FIND_WINDOW_THROTTLE: Duration = Duration::from_millis(50);
 
     for InputEvent(event) in messages.read() {
-        let Event::MouseMoved { point, modifiers } = event else {
+        let Event::MouseMoved {
+            point, modifiers, ..
+        } = event
+        else {
             continue;
         };
 
@@ -381,7 +384,10 @@ fn mouse_resize_trigger(
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
-        let Event::MouseMoved { point, modifiers } = event else {
+        let Event::MouseMoved {
+            point, modifiers, ..
+        } = event
+        else {
             continue;
         };
 
@@ -524,13 +530,14 @@ impl WarpDesk {
         &self,
         previous: Option<Origin>,
         point: Origin,
+        delta_y: i64,
         edge: i32,
         inset: i32,
     ) -> Option<Origin> {
-        previous.and_then(|previous| {
-            self.row_crossing(previous, point, edge, inset)
-                .or_else(|| self.up_from_lowest(previous, point, edge, inset))
-        })
+        previous
+            .and_then(|previous| self.row_crossing(previous, point, inset))
+            .or_else(|| self.down_from_row_overhang(previous, point, delta_y, edge, inset))
+            .or_else(|| self.up_from_lowest(previous, point, delta_y, edge, inset))
     }
 
     fn member(&self, point: Origin) -> Option<RowDisplay> {
@@ -542,40 +549,14 @@ impl WarpDesk {
 
     // macOS moves the pointer across a shared edge without a stop at the edge.
     // Thus only the previous point shows that the pointer left a row display.
-    fn row_crossing(
-        &self,
-        previous: Origin,
-        point: Origin,
-        edge: i32,
-        inset: i32,
-    ) -> Option<Origin> {
+    fn row_crossing(&self, previous: Origin, point: Origin, inset: i32) -> Option<Origin> {
         // An event from before a sideways warp still has the old position.
         // It jumps by the width of a display, which a real crossing does not.
         const MAX_CROSSING_STEP_X: i32 = 400;
         let from = self.member(previous)?;
         let to = self.member(point)?;
-        if (point.x - previous.x).abs() >= MAX_CROSSING_STEP_X {
+        if to.frame == from.frame || (point.x - previous.x).abs() >= MAX_CROSSING_STEP_X {
             return None;
-        }
-        if to.frame == from.frame {
-            // When an upper row display overhangs the monitor beneath it in
-            // macOS's virtual layout, downward motion clamps at its bottom
-            // edge without entering another row display.
-            let at_bottom_edge = point.y > previous.y && from.frame.max.y - point.y <= edge;
-            let below = Origin::new(point.x, from.frame.max.y);
-            let native_below = rect_contains(self.lowest, below) || self.member(below).is_some();
-            if !at_bottom_edge || native_below {
-                return None;
-            }
-            let row_x = point.x + from.row_offset_x;
-            return (self.lowest.min.x..self.lowest.max.x)
-                .contains(&row_x)
-                .then(|| {
-                    Origin::new(
-                        row_x.clamp(self.lowest.min.x + inset, self.lowest.max.x - 1 - inset),
-                        self.lowest.min.y + inset,
-                    )
-                });
         }
         let row_x = previous.x + from.row_offset_x;
         let over_lowest = (self.lowest.min.x..self.lowest.max.x).contains(&row_x);
@@ -593,19 +574,60 @@ impl WarpDesk {
         }
     }
 
-    fn up_from_lowest(
+    /// When an upper row display overhangs the monitor beneath it in macOS's
+    /// virtual layout, downward motion clamps at its bottom edge without
+    /// entering another row display. Detect downward pushes via `delta_y`
+    /// (which stays positive even when macOS clamps the Y coordinate) or a
+    /// downward position step within the same display.
+    fn down_from_row_overhang(
         &self,
-        previous: Origin,
+        previous: Option<Origin>,
         point: Origin,
+        delta_y: i64,
         edge: i32,
         inset: i32,
     ) -> Option<Origin> {
+        let from = self.member(point)?;
+        if previous.is_some_and(|prev| !rect_contains(from.frame, prev)) {
+            return None;
+        }
+        let at_bottom_edge = from.frame.max.y - point.y <= edge;
+        let moving_down =
+            delta_y > 0 || (delta_y == 0 && previous.is_some_and(|prev| point.y > prev.y));
+        let below = Origin::new(point.x, from.frame.max.y);
+        let native_below = rect_contains(self.lowest, below) || self.member(below).is_some();
+        if !at_bottom_edge || !moving_down || native_below {
+            return None;
+        }
+        let row_x = point.x + from.row_offset_x;
+        (self.lowest.min.x..self.lowest.max.x)
+            .contains(&row_x)
+            .then(|| {
+                Origin::new(
+                    row_x.clamp(self.lowest.min.x + inset, self.lowest.max.x - 1 - inset),
+                    self.lowest.min.y + inset,
+                )
+            })
+    }
+
+    fn up_from_lowest(
+        &self,
+        previous: Option<Origin>,
+        point: Origin,
+        delta_y: i64,
+        edge: i32,
+        inset: i32,
+    ) -> Option<Origin> {
+        if previous.is_some_and(|prev| !rect_contains(self.lowest, prev)) {
+            return None;
+        }
         let on_top_edge = rect_contains(self.lowest, point) && point.y - self.lowest.min.y < edge;
-        let moving_up_from_lowest = rect_contains(self.lowest, previous) && point.y < previous.y;
+        let moving_up =
+            delta_y < 0 || (delta_y == 0 && previous.is_some_and(|prev| point.y < prev.y));
         let native_above = self
             .member(Origin::new(point.x, self.lowest.min.y - 1))
             .is_some();
-        if !on_top_edge || !moving_up_from_lowest || native_above {
+        if !on_top_edge || !moving_up || native_above {
             return None;
         }
         self.row
@@ -624,6 +646,18 @@ impl WarpDesk {
     }
 }
 
+const EDGE_THRESHOLD: i32 = 3;
+/// Inset from the destination display's edge so the cursor doesn't land
+/// directly on the threshold and immediately re-warp back.
+const LANDING_INSET: i32 = 6;
+/// Extrapolate pre-warp horizontal motion by this duration so the cursor
+/// does not feel like it starts from rest on the target display.
+const CARRY_DURATION: Duration = Duration::from_millis(30);
+/// Cap on how far the carry-over can push past the inset, in pixels.
+const MAX_CARRY_PX: i32 = 80;
+/// Stale velocity samples (e.g. from a prior gesture) shouldn't carry.
+const VELOCITY_FRESHNESS: Duration = Duration::from_millis(80);
+
 fn horizontal_warp_mouse_trigger(
     mut messages: MessageReader<InputEvent>,
     displays: Query<&Display>,
@@ -631,26 +665,17 @@ fn horizontal_warp_mouse_trigger(
     config: Res<Config>,
     mut state: Local<WarpVelocityState>,
 ) {
-    const EDGE_THRESHOLD: i32 = 3;
-    /// Inset from the destination display's edge so the cursor doesn't land
-    /// directly on the threshold and immediately re-warp back.
-    const LANDING_INSET: i32 = 6;
-    /// Extrapolate pre-warp horizontal motion by this duration so the cursor
-    /// does not feel like it starts from rest on the target display.
-    const CARRY_DURATION: Duration = Duration::from_millis(30);
-    /// Cap on how far the carry-over can push past the inset, in pixels.
-    const MAX_CARRY_PX: i32 = 80;
-    /// Stale velocity samples (e.g. from a prior gesture) shouldn't carry.
-    const VELOCITY_FRESHNESS: Duration = Duration::from_millis(80);
-
     let mut desk: Option<Option<WarpDesk>> = None;
     for InputEvent(event) in messages.read() {
-        let (Event::MouseMoved { point, .. } | Event::MouseDragged { point, .. }) = event else {
+        let (Event::MouseMoved { point, delta_y, .. } | Event::MouseDragged { point, delta_y, .. }) =
+            event
+        else {
             continue;
         };
 
         let now = Instant::now();
         let point = origin_from(*point);
+        let delta_y = *delta_y;
 
         // Compute velocity from the previous sample before deciding whether to
         // warp, then refresh the sample so subsequent events build on this one.
@@ -679,8 +704,8 @@ fn horizontal_warp_mouse_trigger(
             .get_or_insert_with(|| WarpDesk::from_displays(&displays, &config, warp_direction))
             .as_ref();
 
-        if let Some(landing) =
-            desk.and_then(|desk| desk.landing(previous, point, EDGE_THRESHOLD, LANDING_INSET))
+        if let Some(landing) = desk
+            .and_then(|desk| desk.landing(previous, point, delta_y, EDGE_THRESHOLD, LANDING_INSET))
         {
             window_manager.warp_mouse(landing);
             state.last = Some((landing, now));

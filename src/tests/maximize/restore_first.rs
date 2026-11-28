@@ -333,6 +333,7 @@ fn drag(harness: &mut TestHarness, id: WinID, from: Origin, to: Origin) -> Optio
         let point = from + (to - from) * step / 3;
         harness.world().write_message(Event::MouseDragged {
             point: CGPoint::new(point.x.into(), point.y.into()),
+            delta_y: 0,
             modifiers: Modifiers::empty(),
             button: MouseButton::Left,
         });

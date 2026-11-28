@@ -184,9 +184,9 @@ impl TryFrom<&Event> for LuaEvent {
             Event::MouseDragged {
                 point, modifiers, ..
             } => LuaEvent::MouseDragged(mouse(point, *modifiers)),
-            Event::MouseMoved { point, modifiers } => {
-                LuaEvent::MouseMoved(mouse(point, *modifiers))
-            }
+            Event::MouseMoved {
+                point, modifiers, ..
+            } => LuaEvent::MouseMoved(mouse(point, *modifiers)),
 
             Event::Swipe { delta, fingers, .. } => LuaEvent::Swipe {
                 delta: *delta,

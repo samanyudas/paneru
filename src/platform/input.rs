@@ -1234,16 +1234,25 @@ impl InputHandler {
             }
             CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
                 let point = CGEvent::location(Some(event));
+                let delta_y =
+                    CGEvent::integer_value_field(Some(event), CGEventField::MouseEventDeltaY);
                 let button = mouse_button(event_type);
                 events.send(Event::MouseDragged {
                     point,
+                    delta_y,
                     modifiers,
                     button,
                 })
             }
             CGEventType::MouseMoved => {
                 let point = CGEvent::location(Some(event));
-                events.send(Event::MouseMoved { point, modifiers })
+                let delta_y =
+                    CGEvent::integer_value_field(Some(event), CGEventField::MouseEventDeltaY);
+                events.send(Event::MouseMoved {
+                    point,
+                    delta_y,
+                    modifiers,
+                })
             }
             CGEventType::KeyDown => {
                 let keycode =

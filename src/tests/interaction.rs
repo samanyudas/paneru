@@ -695,6 +695,7 @@ fn paging_first_reveals_a_mouse_focused_window_clipped_on_the_swipe_side() {
     // focus changes to window 0 without moving the strip.
     h.world().write_message::<Event>(Event::MouseMoved {
         point: CGPoint { x: 25.0, y: 400.0 },
+        delta_y: 0,
         modifiers: Modifiers::empty(),
     });
     h.advance(Duration::from_millis(100));
@@ -1799,6 +1800,7 @@ fn mouse_in_bottom_right_corner_does_not_change_focus() {
                 x: 1010.0,
                 y: 750.0,
             },
+            delta_y: 0,
             modifiers: Modifiers::empty(),
         },
     ];
@@ -1841,6 +1843,7 @@ fn mouse_outside_corner_still_changes_focus() {
         },
         Event::MouseMoved {
             point: CGPoint { x: 500.0, y: 400.0 },
+            delta_y: 0,
             modifiers: Modifiers::empty(),
         },
     ];
@@ -1873,6 +1876,7 @@ fn mouse_movement_does_not_change_focus_by_default() {
         },
         Event::MouseMoved {
             point: CGPoint { x: 500.0, y: 400.0 },
+            delta_y: 0,
             modifiers: Modifiers::empty(),
         },
     ];

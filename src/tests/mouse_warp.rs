@@ -40,21 +40,26 @@ fn desk(lowest_below: bool) -> TestHarness {
         .with_display(RIGHT_DISPLAY_ID, right_monitor(), vec![RIGHT_WORKSPACE_ID])
 }
 
-fn moves(points: &[(i32, i32)]) -> Vec<Event> {
+fn moves_with_delta(points: &[(i32, i32, i64)]) -> Vec<Event> {
     points
         .iter()
-        .map(|&(x, y)| Event::MouseMoved {
+        .map(|&(x, y, delta_y)| Event::MouseMoved {
             point: objc2_core_foundation::CGPoint {
                 x: f64::from(x),
                 y: f64::from(y),
             },
+            delta_y,
             modifiers: crate::platform::Modifiers::empty(),
         })
         .collect()
 }
 
-fn pointer_moves(harness: TestHarness, points: &[(i32, i32)]) -> (IVec2, IVec2) {
-    let events = moves(points);
+fn moves(points: &[(i32, i32)]) -> Vec<Event> {
+    let with_delta = points.iter().map(|&(x, y)| (x, y, 0)).collect::<Vec<_>>();
+    moves_with_delta(&with_delta)
+}
+
+fn pointer_events(harness: TestHarness, events: Vec<Event>) -> (IVec2, IVec2) {
     let seen = Arc::new(Mutex::new((IVec2::ZERO, IVec2::ZERO)));
     let before = Arc::clone(&seen);
     let after = Arc::clone(&seen);
@@ -76,6 +81,10 @@ fn pointer_moves(harness: TestHarness, points: &[(i32, i32)]) -> (IVec2, IVec2) 
             },
         ]);
     *seen.lock().expect("cursor record")
+}
+
+fn pointer_moves(harness: TestHarness, points: &[(i32, i32)]) -> (IVec2, IVec2) {
+    pointer_events(harness, moves(points))
 }
 
 #[test]
@@ -227,4 +236,49 @@ fn moving_down_from_a_staggered_upper_monitor_overhang_reaches_the_laptop() {
         IVec2::new(612, 6),
         "downward motion into the clamped overhang edge must reach the laptop below it"
     );
+}
+
+#[test]
+fn pushing_down_at_clamped_overhang_bottom_edge_after_sideways_slide_reaches_laptop() {
+    let config: Config = (
+        MainOptions {
+            horizontal_mouse_warp: Some(1),
+            horizontal_mouse_warp_lowest_below: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let staggered_left = IRect::new(-1408, -EXT_DISPLAY_HEIGHT, 512, 0);
+    let staggered_right = IRect::new(-1708, -2 * EXT_DISPLAY_HEIGHT, 212, -EXT_DISPLAY_HEIGHT);
+    let harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_display(EXT_DISPLAY_ID, staggered_left, vec![EXT_WORKSPACE_ID])
+        .with_display(RIGHT_DISPLAY_ID, staggered_right, vec![RIGHT_WORKSPACE_ID]);
+    // Slide sideways along the clamped bottom pixel row into the overhang
+    // (delta_y = 0 stays on the upper monitor), then push down (delta_y > 0)
+    // while the clamped Y coordinate remains unchanged.
+    let (_, cursor) = pointer_events(
+        harness,
+        moves_with_delta(&[
+            (-1650, -EXT_DISPLAY_HEIGHT - 1, 0),
+            (-1608, -EXT_DISPLAY_HEIGHT - 1, 0),
+            (-1608, -EXT_DISPLAY_HEIGHT - 1, 4),
+        ]),
+    );
+    assert_eq!(
+        cursor,
+        IVec2::new(612, 6),
+        "positive vertical delta at the clamped overhang edge must warp to the laptop"
+    );
+}
+
+#[test]
+fn moving_up_from_the_laptop_after_a_pause_still_reaches_the_upper_monitor() {
+    // A single event with negative delta_y (such as moving straight from
+    // (800, 5) to (800, 0) after pausing >80 ms, where no recent sample exists)
+    // must still warp up to the upper monitor.
+    let (_, cursor) = pointer_events(desk(true), moves_with_delta(&[(800, 0, -5)]));
+    assert_eq!(cursor, IVec2::new(800 - 1920, -EXT_DISPLAY_HEIGHT - 7));
 }

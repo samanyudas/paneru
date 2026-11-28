@@ -48,6 +48,7 @@ fn mouse_focus_resumes_after_slide_without_intermediate_mouse_events() {
                     x: f64::from(center.x),
                     y: f64::from(center.y),
                 },
+                delta_y: 0,
                 modifiers: Modifiers::empty(),
             });
         })
@@ -127,6 +128,7 @@ fn keyboard_focus_survives_mouse_movement_during_slide() {
                     x: f64::from(center.x),
                     y: f64::from(center.y),
                 },
+                delta_y: 0,
                 modifiers: Modifiers::empty(),
             });
             harness.advance(Duration::from_millis(20));
@@ -146,6 +148,7 @@ fn keyboard_focus_survives_mouse_movement_during_slide() {
                     x: f64::from(center.x),
                     y: f64::from(center.y),
                 },
+                delta_y: 0,
                 modifiers: Modifiers::empty(),
             });
             harness.advance(Duration::from_millis(100));

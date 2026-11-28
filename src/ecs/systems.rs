@@ -1047,8 +1047,24 @@ pub(crate) fn pump_events(
             }
             Ok(event) => {
                 woke |= matches!(event, Event::SystemWoke { .. });
-                if matches!(event, Event::MouseMoved { .. }) {
-                    pending_mouse = Some(event);
+                if let Event::MouseMoved {
+                    point,
+                    delta_y,
+                    modifiers,
+                } = event
+                {
+                    let accumulated = match pending_mouse {
+                        Some(Event::MouseMoved {
+                            delta_y: prev_delta_y,
+                            ..
+                        }) => prev_delta_y.saturating_add(delta_y),
+                        _ => delta_y,
+                    };
+                    pending_mouse = Some(Event::MouseMoved {
+                        point,
+                        delta_y: accumulated,
+                        modifiers,
+                    });
                 } else {
                     received_events.extend(pending_mouse.take());
                     received_events.push(event);
