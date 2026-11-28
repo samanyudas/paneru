@@ -523,7 +523,7 @@ pub(super) fn register(app: &mut App) {
 }
 
 fn forget_removed_window(
-    removed: On<Remove, Window>,
+    removed: On<Remove<Window>>,
     windows: Query<(&Window, Option<&ChildOf>)>,
     time: Res<Time>,
     mut native: ResMut<NativeMembership>,
@@ -546,7 +546,7 @@ fn forget_removed_window(
 }
 
 fn accept_created_window(
-    created: On<Insert, Window>,
+    created: On<Insert<Window>>,
     windows: Query<&Window>,
     mut native: ResMut<NativeMembership>,
 ) {

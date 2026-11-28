@@ -710,6 +710,8 @@ pub(super) fn swiping_timeout(
             if let Some(point) = window_manager.cursor_position() {
                 commands.trigger(SendMessageTrigger(Event::MouseMoved {
                     point,
+                    delta_y: 0,
+                    timestamp: std::time::Instant::now(),
                     modifiers: Modifiers::empty(),
                 }));
             }

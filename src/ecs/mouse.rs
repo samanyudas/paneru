@@ -22,7 +22,7 @@ use crate::ecs::{
 };
 use bevy::ecs::schedule::common_conditions::on_message;
 
-use crate::events::{Event, InputEvent};
+use crate::events::{Event, InputEvent, PointerMotion};
 use crate::manager::{Display, Origin, WindowManager, origin_from};
 use crate::platform::WinID;
 use crate::util::round_px;
@@ -47,16 +47,19 @@ impl Plugin for MouseEventsPlugin {
         app.add_systems(
             Update,
             (
-                (
-                    mouse_moved_trigger,
-                    mouse_resize_trigger,
-                    mouse_down_trigger,
-                )
-                    .run_if(mission_control_inactive),
-                horizontal_warp_mouse_trigger,
+                mouse_moved_trigger,
+                mouse_resize_trigger,
+                mouse_down_trigger,
             )
+                .run_if(mission_control_inactive)
                 .in_set(UpdateSet::Input)
                 .run_if(on_message::<InputEvent>),
+        );
+        app.add_systems(
+            Update,
+            horizontal_warp_mouse_trigger
+                .in_set(UpdateSet::Input)
+                .run_if(on_message::<PointerMotion>),
         );
         app.add_systems(
             Update,
@@ -111,7 +114,10 @@ fn mouse_moved_trigger(
     const FIND_WINDOW_THROTTLE: Duration = Duration::from_millis(50);
 
     for InputEvent(event) in messages.read() {
-        let Event::MouseMoved { point, modifiers } = event else {
+        let Event::MouseMoved {
+            point, modifiers, ..
+        } = event
+        else {
             continue;
         };
 
@@ -381,7 +387,10 @@ fn mouse_resize_trigger(
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
-        let Event::MouseMoved { point, modifiers } = event else {
+        let Event::MouseMoved {
+            point, modifiers, ..
+        } = event
+        else {
             continue;
         };
 
@@ -449,69 +458,292 @@ fn mouse_resize_trigger(
 #[derive(Default)]
 pub(super) struct WarpVelocityState {
     last: Option<(Origin, Instant)>,
+    warped_at: Option<Instant>,
 }
 
+impl WarpVelocityState {
+    fn record_warp(&mut self, landing: Origin, window_manager: &WindowManager) {
+        window_manager.warp_mouse(landing);
+        let warp_time = Instant::now();
+        self.last = Some((landing, warp_time));
+        self.warped_at = Some(warp_time);
+    }
+}
+
+fn rect_contains(rect: IRect, point: Origin) -> bool {
+    (rect.min.x..rect.max.x).contains(&point.x) && (rect.min.y..rect.max.y).contains(&point.y)
+}
+
+#[derive(Clone, Copy)]
+struct RowDisplay {
+    frame: IRect,
+    row_offset_x: i32,
+}
+
+struct WarpDesk {
+    row: Vec<RowDisplay>,
+    lowest: IRect,
+}
+
+impl WarpDesk {
+    fn from_displays(
+        displays: &Query<&Display>,
+        config: &Config,
+        warp_direction: i16,
+    ) -> Option<Self> {
+        if !config.horizontal_mouse_warp_lowest_below() {
+            return None;
+        }
+        // The pointer can be in a menu bar, which `Display::bounds` leaves out.
+        let frames = displays
+            .iter()
+            .map(Display::physical_bounds)
+            .collect::<Vec<_>>();
+        Self::new(&frames, warp_direction)
+    }
+
+    fn new(frames: &[IRect], warp_direction: i16) -> Option<Self> {
+        if frames.len() < 3 {
+            return None;
+        }
+        let lowest = *frames.iter().max_by_key(|frame| frame.min.y)?;
+        let mut upward = frames
+            .iter()
+            .copied()
+            .filter(|frame| *frame != lowest)
+            .collect::<Vec<_>>();
+        upward.sort_by_key(|frame| std::cmp::Reverse((frame.min.y, frame.min.x)));
+        upward.dedup_by_key(|frame| (frame.min.y, frame.min.x));
+        // The display above the lowest one keeps its macOS x.
+        // Thus the native crossing between these two displays agrees with the row.
+        let anchor = *upward.first()?;
+        let row = upward
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let row_min_x = if warp_direction > 0 {
+                    anchor.min.x + upward[..index].iter().map(IRect::width).sum::<i32>()
+                } else {
+                    anchor.max.x - upward[..=index].iter().map(IRect::width).sum::<i32>()
+                };
+                RowDisplay {
+                    frame: *frame,
+                    row_offset_x: row_min_x - frame.min.x,
+                }
+            })
+            .collect();
+        Some(Self { row, lowest })
+    }
+
+    fn is_lowest(&self, display: &Display) -> bool {
+        self.lowest == display.physical_bounds()
+    }
+
+    fn landing(
+        &self,
+        previous: Option<Origin>,
+        point: Origin,
+        delta_y: i64,
+        edge: i32,
+        inset: i32,
+    ) -> Option<Origin> {
+        previous
+            .and_then(|previous| self.row_crossing(previous, point, inset))
+            .or_else(|| self.down_from_row_overhang(previous, point, delta_y, edge, inset))
+            .or_else(|| self.up_from_lowest(previous, point, delta_y, edge, inset))
+    }
+
+    fn member(&self, point: Origin) -> Option<RowDisplay> {
+        self.row
+            .iter()
+            .copied()
+            .find(|display| rect_contains(display.frame, point))
+    }
+
+    // macOS moves the pointer across a shared edge without a stop at the edge.
+    // Thus only the previous point shows that the pointer left a row display.
+    fn row_crossing(&self, previous: Origin, point: Origin, inset: i32) -> Option<Origin> {
+        // An event from before a sideways warp still has the old position.
+        // It jumps by the width of a display, which a real crossing does not.
+        const MAX_CROSSING_STEP_X: i32 = 400;
+        let from = self.member(previous)?;
+        let to = self.member(point)?;
+        if to.frame == from.frame || (point.x - previous.x).abs() >= MAX_CROSSING_STEP_X {
+            return None;
+        }
+        let row_x = previous.x + from.row_offset_x;
+        let over_lowest = (self.lowest.min.x..self.lowest.max.x).contains(&row_x);
+        if to.frame.min.y >= from.frame.max.y {
+            Some(if over_lowest {
+                Origin::new(
+                    row_x.clamp(self.lowest.min.x + inset, self.lowest.max.x - 1 - inset),
+                    self.lowest.min.y + inset,
+                )
+            } else {
+                Origin::new(previous.x, from.frame.max.y - 1)
+            })
+        } else {
+            (to.frame.max.y <= from.frame.min.y).then(|| Origin::new(previous.x, from.frame.min.y))
+        }
+    }
+
+    /// When an upper row display overhangs the monitor beneath it in macOS's
+    /// virtual layout, downward motion clamps at its bottom edge without
+    /// entering another row display. Detect downward pushes via `delta_y`
+    /// (which stays positive even when macOS clamps the Y coordinate) or a
+    /// downward position step within the same display.
+    fn down_from_row_overhang(
+        &self,
+        previous: Option<Origin>,
+        point: Origin,
+        delta_y: i64,
+        edge: i32,
+        inset: i32,
+    ) -> Option<Origin> {
+        let from = self.member(point)?;
+        if previous.is_some_and(|prev| !rect_contains(from.frame, prev)) {
+            return None;
+        }
+        let at_bottom_edge = from.frame.max.y - point.y <= edge;
+        let moving_down =
+            delta_y > 0 || (delta_y == 0 && previous.is_some_and(|prev| point.y > prev.y));
+        let below = Origin::new(point.x, from.frame.max.y);
+        let native_below = rect_contains(self.lowest, below) || self.member(below).is_some();
+        if !at_bottom_edge || !moving_down || native_below {
+            return None;
+        }
+        let row_x = point.x + from.row_offset_x;
+        (self.lowest.min.x..self.lowest.max.x)
+            .contains(&row_x)
+            .then(|| {
+                Origin::new(
+                    row_x.clamp(self.lowest.min.x + inset, self.lowest.max.x - 1 - inset),
+                    self.lowest.min.y + inset,
+                )
+            })
+    }
+
+    fn up_from_lowest(
+        &self,
+        previous: Option<Origin>,
+        point: Origin,
+        delta_y: i64,
+        edge: i32,
+        inset: i32,
+    ) -> Option<Origin> {
+        if previous.is_some_and(|prev| !rect_contains(self.lowest, prev)) {
+            return None;
+        }
+        let on_top_edge = rect_contains(self.lowest, point) && point.y - self.lowest.min.y < edge;
+        let moving_up =
+            delta_y < 0 || (delta_y == 0 && previous.is_some_and(|prev| point.y < prev.y));
+        let native_above = self
+            .member(Origin::new(point.x, self.lowest.min.y - 1))
+            .is_some();
+        if !on_top_edge || !moving_up || native_above {
+            return None;
+        }
+        self.row
+            .iter()
+            .find(|display| {
+                (display.frame.min.x + display.row_offset_x
+                    ..display.frame.max.x + display.row_offset_x)
+                    .contains(&point.x)
+            })
+            .map(|display| {
+                Origin::new(
+                    point.x - display.row_offset_x,
+                    display.frame.max.y - 1 - inset,
+                )
+            })
+    }
+}
+
+const EDGE_THRESHOLD: i32 = 3;
+/// Inset from the destination display's edge so the cursor doesn't land
+/// directly on the threshold and immediately re-warp back.
+const LANDING_INSET: i32 = 6;
+/// Extrapolate pre-warp horizontal motion by this duration so the cursor
+/// does not feel like it starts from rest on the target display.
+const CARRY_DURATION: Duration = Duration::from_millis(30);
+/// Cap on how far the carry-over can push past the inset, in pixels.
+const MAX_CARRY_PX: i32 = 80;
+/// Stale velocity samples (e.g. from a prior gesture) shouldn't carry.
+const VELOCITY_FRESHNESS: Duration = Duration::from_millis(80);
+
 fn horizontal_warp_mouse_trigger(
-    mut messages: MessageReader<InputEvent>,
+    mut messages: MessageReader<PointerMotion>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut state: Local<WarpVelocityState>,
 ) {
-    const EDGE_THRESHOLD: i32 = 3;
-    /// Inset from the destination display's edge so the cursor doesn't land
-    /// directly on the threshold and immediately re-warp back.
-    const LANDING_INSET: i32 = 6;
-    /// Extrapolate pre-warp horizontal motion by this duration so the cursor
-    /// does not feel like it starts from rest on the target display.
-    const CARRY_DURATION: Duration = Duration::from_millis(30);
-    /// Cap on how far the carry-over can push past the inset, in pixels.
-    const MAX_CARRY_PX: i32 = 80;
-    /// Stale velocity samples (e.g. from a prior gesture) shouldn't carry.
-    const VELOCITY_FRESHNESS: Duration = Duration::from_millis(80);
+    let Some(warp_direction) = config.horizontal_mouse_warp() else {
+        messages.clear();
+        return;
+    };
+    if displays.count() < 2 {
+        messages.clear();
+        return;
+    }
 
-    for InputEvent(event) in messages.read() {
-        let Event::MouseMoved { point, .. } = event else {
+    let desk = WarpDesk::from_displays(&displays, &config, warp_direction);
+    let desk = desk.as_ref();
+    let mut warped = false;
+    for motion in messages.read() {
+        let now = motion.timestamp;
+        // Discard remaining pre-warp samples in this drain and any stale
+        // pre-warp HID events arriving in a later drain so the landing point
+        // stays the baseline for subsequent motion.
+        if warped || state.warped_at.is_some_and(|warped_at| now < warped_at) {
             continue;
-        };
-
-        let now = Instant::now();
-        let point = origin_from(*point);
+        }
+        let point = origin_from(motion.point);
+        let delta_y = motion.delta_y;
 
         // Compute velocity from the previous sample before deciding whether to
         // warp, then refresh the sample so subsequent events build on this one.
-        let velocity_x = state.last.and_then(|(prev, t)| {
+        let recent_previous = state
+            .last
+            .filter(|(_, t)| now.saturating_duration_since(*t) <= VELOCITY_FRESHNESS);
+        let velocity_x = recent_previous.and_then(|(prev, t)| {
             let dt = now.saturating_duration_since(t);
-            if dt.is_zero() || dt > VELOCITY_FRESHNESS {
+            if dt.is_zero() {
                 return None;
             }
             let dx = f64::from(point.x - prev.x);
             Some(dx / dt.as_secs_f64())
         });
+        let previous = recent_previous.map(|(previous, _)| previous);
         state.last = Some((point, now));
 
-        let Some(warp_direction) = config.horizontal_mouse_warp() else {
-            return;
-        };
-        if displays.count() < 2 {
-            return;
+        if let Some(landing) = desk
+            .and_then(|desk| desk.landing(previous, point, delta_y, EDGE_THRESHOLD, LANDING_INSET))
+        {
+            state.record_warp(landing, &window_manager);
+            warped = true;
+            continue;
         }
 
         let Some(current_display) = displays
             .iter()
-            .find(|display| display.bounds().contains(point))
+            .find(|display| rect_contains(display.bounds(), point))
         else {
-            return;
+            continue;
         };
+        if desk.is_some_and(|desk| desk.is_lowest(current_display)) {
+            continue;
+        }
 
         let on_left_edge = (point.x - current_display.bounds().min.x).abs() < EDGE_THRESHOLD;
         let on_right_edge = (current_display.bounds().max.x - point.x).abs() < EDGE_THRESHOLD;
         if !on_left_edge && !on_right_edge {
-            return;
+            continue;
         }
 
         let mut target_displays = displays
             .iter()
+            .filter(|display| desk.is_none_or(|desk| !desk.is_lowest(display)))
             .filter(|display| {
                 let above = display.bounds().min.y < current_display.bounds().min.y;
                 let below = display.bounds().min.y > current_display.bounds().min.y;
@@ -528,14 +760,14 @@ fn horizontal_warp_mouse_trigger(
         target_displays
             .sort_by_key(|display| (display.bounds().min.y - current_display.bounds().min.y).abs());
         let Some(warp_to) = target_displays.first() else {
-            return;
+            continue;
         };
         let target = warp_to.bounds();
 
         // Land at the *opposite* edge so the cursor flow is continuous: leaving
         // the right edge appears at the left edge of the target, and vice versa.
         // Carry over horizontal velocity so the cursor does not feel "stuck" at
-        // the edge — extrapolate motion forward into the target display.
+        // the edge - extrapolate motion forward into the target display.
         let carry = velocity_x
             .map_or(0, |v| round_px(v * CARRY_DURATION.as_secs_f64()))
             .clamp(-MAX_CARRY_PX, MAX_CARRY_PX);
@@ -553,11 +785,11 @@ fn horizontal_warp_mouse_trigger(
         // motion feels continuous (matches macOS's behavior for side-by-side
         // displays). Apply the configured offset signed by warp direction:
         // positive offset pushes the cursor lower when warping downward, and
-        // raises it when warping upward — matching the user's physical desk
+        // raises it when warping upward - matching the user's physical desk
         // arrangement (e.g. monitor sitting below the laptop).
         // If the equivalent position falls outside the target's Y range (e.g. a
         // tall portrait monitor's bottom region maps off a shorter laptop's
-        // bottom), skip the warp — matches macOS native side-by-side behavior
+        // bottom), skip the warp - matches macOS native side-by-side behavior
         // where the cursor can only cross at Y values where both displays exist.
         let relative_y = point.y - current_display.bounds().min.y;
         let direction_sign = if target.min.y > current_display.bounds().min.y {
@@ -568,14 +800,12 @@ fn horizontal_warp_mouse_trigger(
         let signed_offset = config.horizontal_mouse_warp_offset() * direction_sign;
         let target_y = target.min.y + relative_y + signed_offset;
         if target_y < target.min.y || target_y >= target.max.y {
-            return;
+            continue;
         }
 
         let landing = Origin::new(target_x, target_y);
-        window_manager.warp_mouse(landing);
-        // Reset the velocity sample to the landing point so the next motion
-        // event computes velocity from the new position, not the pre-warp one.
-        state.last = Some((landing, now));
+        state.record_warp(landing, &window_manager);
+        warped = true;
     }
 }
 

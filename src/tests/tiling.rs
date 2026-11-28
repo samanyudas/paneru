@@ -2268,6 +2268,8 @@ fn test_a_mouse_resize_gesture_ends_the_width_run() {
             .world_mut()
             .write_message(crate::events::InputEvent(Event::MouseMoved {
                 point: objc2_core_foundation::CGPoint::new(x, 5.0),
+                delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers: crate::platform::Modifiers::LALT,
             }));
         harness.advance(Duration::from_millis(20));

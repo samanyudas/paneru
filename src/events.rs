@@ -5,6 +5,7 @@ use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::CGDirectDisplayID;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::Instant;
 
 use crate::commands::Command;
 use crate::ecs::state::StateQueryKind;
@@ -55,6 +56,16 @@ pub type Reply = async_channel::Sender<Response>;
 /// appear on [`Event`] too, for the Lua bridge and IPC subscribers.
 #[derive(Clone, Debug, Message)]
 pub struct InputEvent(pub Event);
+
+/// An uncoalesced pointer motion sample (`MouseMoved` or `MouseDragged`)
+/// published in arrival order before `pump_events` coalesces `Event::MouseMoved`
+/// for focus-follows-mouse and mouse-resize.
+#[derive(Clone, Copy, Debug, Message)]
+pub struct PointerMotion {
+    pub point: CGPoint,
+    pub delta_y: i64,
+    pub timestamp: Instant,
+}
 
 /// Several variants carry a payload used only by the Lua bridge
 /// (`src/lua/convert.rs`). The dead-code lint is suppressed only when the
@@ -164,12 +175,16 @@ pub enum Event {
     /// A mouse drag event has occurred.
     MouseDragged {
         point: CGPoint,
+        delta_y: i64,
+        timestamp: Instant,
         modifiers: Modifiers,
         button: MouseButton,
     },
     /// A mouse move event has occurred.
     MouseMoved {
         point: CGPoint,
+        delta_y: i64,
+        timestamp: Instant,
         modifiers: Modifiers,
     },
 

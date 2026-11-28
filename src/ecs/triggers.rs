@@ -970,7 +970,7 @@ pub(super) fn dispatch_application_messages(
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_unmanaged_trigger(
-    trigger: On<Add, Unmanaged>,
+    trigger: On<Add<Unmanaged>>,
     apps: Query<(Entity, &Application)>,
     mut workspaces: RemovableStrips,
     displays: DisplayViewports,
@@ -1121,7 +1121,7 @@ fn remember_managed_strip(
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_minimized_trigger(
-    trigger: On<Add, Unmanaged>,
+    trigger: On<Add<Unmanaged>>,
     mut workspaces: RemovableStrips,
     displays: DisplayViewports,
     focus_history: Res<FocusHistory>,
@@ -1169,7 +1169,7 @@ pub(super) fn window_minimized_trigger(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_managed_trigger(
-    trigger: On<Remove, Unmanaged>,
+    trigger: On<Remove<Unmanaged>>,
     active_display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
     apps: Query<(Entity, &Application)>,
     mut workspaces: Query<
@@ -2609,7 +2609,7 @@ pub(super) fn refresh_configuration_trigger(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn window_removal_trigger(
-    trigger: On<Remove, Window>,
+    trigger: On<Remove<Window>>,
     windows: Windows,
     mut workspaces: RemovableStrips,
     displays: DisplayViewports,
@@ -2693,7 +2693,7 @@ pub(super) fn send_message_trigger(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn cleanup_timeout_trigger(
-    trigger: On<Remove, Timeout>,
+    trigger: On<Remove<Timeout>>,
     all_timeouts: Query<&Timeout>,
     mut commands: Commands,
 ) {
@@ -2727,7 +2727,7 @@ pub(super) struct SizeVerification<'w, 's> {
 }
 
 pub(super) fn drop_step_partners_trigger(
-    trigger: On<Remove, VerifyWindowSize>,
+    trigger: On<Remove<VerifyWindowSize>>,
     mut commands: Commands,
 ) {
     if let Ok(mut entity_commands) = commands.get_entity(trigger.entity) {

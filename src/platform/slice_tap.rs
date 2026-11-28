@@ -241,7 +241,7 @@ impl Pointer {
 }
 
 /// Time since startup, not counting sleep, as `CLOCK_UPTIME_RAW` counts it.
-fn uptime() -> Duration {
+pub(crate) fn uptime() -> Duration {
     from_ticks(unsafe { mach_absolute_time() })
 }
 
@@ -251,21 +251,45 @@ fn uptime() -> Duration {
 /// in ticks is never past the tick count now. One in nanoseconds is, unless
 /// a tick is a nanosecond and the two agree, or the event was made in the
 /// first `denom / numer` of the uptime, 2.4% of it on Apple silicon.
-fn made_at(stamp: u64) -> Duration {
-    if stamp <= unsafe { mach_absolute_time() } {
-        from_ticks(stamp)
+pub(crate) fn made_at(stamp: u64) -> Duration {
+    let timebase = timebase();
+    made_at_with_timebase(
+        stamp,
+        unsafe { mach_absolute_time() },
+        timebase.numer,
+        timebase.denom,
+    )
+}
+
+pub(crate) fn made_at_with_timebase(
+    stamp: u64,
+    now_ticks: u64,
+    numer: u32,
+    denom: u32,
+) -> Duration {
+    if stamp <= now_ticks {
+        from_ticks_with_timebase(stamp, numer, denom)
     } else {
         Duration::from_nanos(stamp)
     }
 }
 
-fn from_ticks(ticks: u64) -> Duration {
+fn timebase() -> mach_timebase_info {
     static TIMEBASE: LazyLock<mach_timebase_info> = LazyLock::new(|| {
         let mut timebase = mach_timebase_info { numer: 1, denom: 1 };
         unsafe { mach_timebase_info(&raw mut timebase) };
         timebase
     });
-    let nanos = u128::from(ticks) * u128::from(TIMEBASE.numer) / u128::from(TIMEBASE.denom);
+    *TIMEBASE
+}
+
+fn from_ticks(ticks: u64) -> Duration {
+    let timebase = timebase();
+    from_ticks_with_timebase(ticks, timebase.numer, timebase.denom)
+}
+
+fn from_ticks_with_timebase(ticks: u64, numer: u32, denom: u32) -> Duration {
+    let nanos = u128::from(ticks) * u128::from(numer) / u128::from(denom);
     Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 

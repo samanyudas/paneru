@@ -230,6 +230,8 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
         ("stack_east", Operation::Stack(Side::East)),
         ("unstack", Operation::Unstack(Side::East)),
         ("unstack_west", Operation::Unstack(Side::West)),
+        ("consume", Operation::Consume),
+        ("expel", Operation::Expel),
         ("maximize", Operation::Maximize),
         ("full_width", Operation::Maximize),
         ("grow", Operation::Resize(ResizeDirection::Grow)),

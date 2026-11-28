@@ -321,6 +321,8 @@ pub enum Operation {
     /// order: left to right by left edge, then top to bottom, wrapping from the
     /// last to the first.
     ToNextDisplay(MoveFocus),
+    /// Moves the focused window's whole column to the display with this ID.
+    ToDisplay(u32, MoveFocus),
     /// Focuses the display that lies north, south, west, or east of the active
     /// display in the physical arrangement.
     FocusDisplay(Direction),
@@ -349,6 +351,13 @@ pub enum Operation {
     /// Moves the focused window out of its stack into a new column on the
     /// given side of the stack.
     Unstack(Side),
+    /// Consumes the column to the right of the focused window's column into
+    /// it, appending the consumed column's item(s) below whatever is already
+    /// there.
+    Consume,
+    /// Pulls the focused window out of its stack into its own column to the
+    /// right, leaving focus on a sibling remaining in the stack.
+    Expel,
     /// Toggles the focused window's stack between a normal split display
     /// (all windows visible, sharing height) and a tabbed display (one
     /// window visible at a time, sharing the full column). Cycle tabs with
@@ -403,6 +412,8 @@ pub enum Operation {
 pub enum MouseMove {
     /// Moves the mouse pointer to the next available display.
     ToNextDisplay,
+    /// Moves the mouse pointer to the display with this ID.
+    ToDisplay(u32),
 }
 
 /// Represents a command that can be issued to the window manager.

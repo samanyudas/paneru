@@ -953,6 +953,13 @@ impl Config {
             .unwrap_or(0)
     }
 
+    pub fn horizontal_mouse_warp_lowest_below(&self) -> bool {
+        self.inner()
+            .options
+            .horizontal_mouse_warp_lowest_below
+            .unwrap_or(false)
+    }
+
     pub fn reap_empty_workspaces(&self) -> bool {
         self.inner()
             .options
@@ -1381,6 +1388,8 @@ pub struct MainOptions {
     /// higher or lower than the laptop). When warping downward (target below
     /// source) the offset is added; when warping upward, subtracted.
     pub horizontal_mouse_warp_offset: Option<i32>,
+    /// Keeps the lowest display below a horizontal warp row rather than in it.
+    pub horizontal_mouse_warp_lowest_below: Option<bool>,
     /// A list of preset column widths (as ratios) used for resizing windows.
     #[serde(default = "default_preset_column_widths")]
     pub preset_column_widths: Vec<f64>,

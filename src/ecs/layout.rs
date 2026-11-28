@@ -1,5 +1,5 @@
 use bevy::app::{App, Plugin, Update};
-use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
+use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
@@ -74,8 +74,10 @@ pub struct LayoutEventsPlugin;
 /// frame has left the display entirely to whichever display it landed on.
 pub(crate) const PARKED_STRIP_SLIVER: i32 = 10;
 
-/// A strip, its entity, origin, display, whether it's the active one, and the
-/// offset it is animating or settling toward if a move is already in flight.
+/// A strip, its entity, origin, display, the offset it is animating or
+/// settling toward if a move is already in flight, and whether it carries a
+/// saved position waiting to be restored by
+/// [`crate::ecs::workspace::show_active_workspace`].
 /// Shared by [`reshuffle_layout_strip`] and [`ensure_visible_in_strip`].
 type StripPlacements<'w, 's> = Query<
     'w,
@@ -85,7 +87,6 @@ type StripPlacements<'w, 's> = Query<
         Entity,
         &'static Position,
         &'static ChildOf,
-        Option<Ref<'static, ActiveWorkspaceMarker>>,
         Option<&'static RepositionMarker>,
         Option<&'static Scrolling>,
         Has<PreviousStripPosition>,
@@ -1508,6 +1509,47 @@ impl LayoutStrip {
         } else {
             self.stack(entity, side)
         }
+    }
+
+    /// Consumes the column to the right of `entity`'s column into it. The
+    /// column survives at its own position; its own item(s) stay on top and
+    /// the consumed column's item(s) join the bottom. A no-op if there is no
+    /// column to the right, or if either column cannot be stacked (such as
+    /// `Column::Fullscreen` or `Column::Maximized`), checked before removing
+    /// anything from `self.columns`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Error)` if the window is not in the strip.
+    pub fn consume(&mut self, entity: Entity) -> Result<()> {
+        let index = self.index_of(entity)?;
+        let Some(own_items) = self.columns.get(index).and_then(Column::stack_items) else {
+            return Ok(());
+        };
+        let Some(neighbor_items) = self.columns.get(index + 1).and_then(Column::stack_items) else {
+            return Ok(());
+        };
+
+        self.columns.remove(index);
+        self.columns.remove(index);
+        self.even_splits.insert(entity);
+
+        if own_items
+            .iter()
+            .flat_map(StackItem::window_iter)
+            .any(|e| self.tabbed_stacks.contains(&e))
+        {
+            self.tabbed_stacks
+                .extend(neighbor_items.iter().flat_map(StackItem::window_iter));
+        } else {
+            for member in neighbor_items.iter().flat_map(StackItem::window_iter) {
+                self.tabbed_stacks.remove(&member);
+            }
+        }
+
+        self.columns
+            .insert(index, Column::Stack([own_items, neighbor_items].concat()));
+        Ok(())
     }
 
     /// Moves the stack item holding `entity` out of its stack into a new
@@ -2992,7 +3034,6 @@ fn resolve_strip_scroll_context<'a>(
         strip_entity,
         strip_position,
         child,
-        active_marker,
         strip_reposition,
         strip_scrolling,
         has_previous_position,
@@ -3012,7 +3053,11 @@ fn resolve_strip_scroll_context<'a>(
         strip_target,
         display_bounds: display.actual_display_bounds(dock, config),
         raw_display_bounds: display.bounds(),
-        is_new_activation: has_previous_position && active_marker.is_some_and(|m| m.is_added()),
+        // A strip with `PreviousStripPosition` is either parked off-screen or
+        // on the first tick of activation (before `show_active_workspace`
+        // removes the component), so layout reshuffles must not pull it onto
+        // the visible viewport.
+        is_new_activation: has_previous_position,
         user_swiping: strip_scrolling.is_some_and(|scrolling| {
             scrolling.is_user_swiping && super::scroll::lands_on_window(config, scrolling.input)
         }),

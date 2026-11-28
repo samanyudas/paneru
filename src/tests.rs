@@ -1,5 +1,6 @@
 mod app_quit;
 mod column_moves;
+mod consume_expel;
 mod crossing_focus;
 mod display;
 mod drag;
@@ -10,6 +11,7 @@ mod maximize;
 mod mission_control;
 mod mocks;
 mod mouse_focus;
+mod mouse_warp;
 mod new_window_width;
 mod next_display;
 mod pacing;

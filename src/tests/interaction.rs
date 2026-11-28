@@ -695,6 +695,8 @@ fn paging_first_reveals_a_mouse_focused_window_clipped_on_the_swipe_side() {
     // focus changes to window 0 without moving the strip.
     h.world().write_message::<Event>(Event::MouseMoved {
         point: CGPoint { x: 25.0, y: 400.0 },
+        delta_y: 0,
+        timestamp: std::time::Instant::now(),
         modifiers: Modifiers::empty(),
     });
     h.advance(Duration::from_millis(100));
@@ -1799,6 +1801,8 @@ fn mouse_in_bottom_right_corner_does_not_change_focus() {
                 x: 1010.0,
                 y: 750.0,
             },
+            delta_y: 0,
+            timestamp: std::time::Instant::now(),
             modifiers: Modifiers::empty(),
         },
     ];
@@ -1841,6 +1845,8 @@ fn mouse_outside_corner_still_changes_focus() {
         },
         Event::MouseMoved {
             point: CGPoint { x: 500.0, y: 400.0 },
+            delta_y: 0,
+            timestamp: std::time::Instant::now(),
             modifiers: Modifiers::empty(),
         },
     ];
@@ -1873,6 +1879,8 @@ fn mouse_movement_does_not_change_focus_by_default() {
         },
         Event::MouseMoved {
             point: CGPoint { x: 500.0, y: 400.0 },
+            delta_y: 0,
+            timestamp: std::time::Instant::now(),
             modifiers: Modifiers::empty(),
         },
     ];
@@ -4380,4 +4388,85 @@ fn test_removal_before_focus_during_settle_to_earlier_column_keeps_destination_t
         "strip must still land at column 1's target offset"
     );
     assert_focused!(world, 1);
+}
+
+/// A parked strip carrying `PreviousStripPosition` is ineligible for
+/// `reshuffle_layout_strip` and `ensure_visible_in_strip` so background
+/// activity cannot pull it into the viewport; once `PreviousStripPosition` is
+/// removed, normal focus scrolling resumes.
+#[test]
+fn test_parked_strip_with_previous_position_skips_reshuffle_until_unparked() {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_millis(500));
+
+    // Focus window 2 so the strip is scrolled to -176, then park the strip
+    // with `PreviousStripPosition` at a parked corner origin.
+    harness.mock_state.set_focused_window(2);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 2 });
+    harness.advance(Duration::from_millis(500));
+
+    let parked_origin = Origin::new(1019, 760);
+    let (strip_entity, win_0) = {
+        let world = harness.world();
+        let strip_entity = active_strip_entity(world);
+        let win_0 = find_window_entity(0, world);
+        (strip_entity, win_0)
+    };
+    {
+        let mut strip = harness.world().entity_mut(strip_entity);
+        strip.get_mut::<Position>().unwrap().0 = parked_origin;
+        strip.insert(crate::ecs::workspace::PreviousStripPosition {
+            origin: Origin::new(-176, TEST_MENUBAR_HEIGHT),
+            focus: None,
+        });
+    }
+
+    // Trigger both reshuffle and ensure_visible for off-screen window 0 while
+    // `PreviousStripPosition` is present: the parked strip must not move.
+    harness.world().entity_mut(win_0).insert((
+        crate::ecs::ReshuffleAroundMarker,
+        crate::ecs::EnsureVisibleMarker { snap: false },
+    ));
+    harness.advance(Duration::from_millis(200));
+    assert_eq!(
+        harness
+            .world()
+            .get::<Position>(strip_entity)
+            .map(|position| position.0),
+        Some(parked_origin),
+        "a strip carrying PreviousStripPosition must stay parked during reshuffle/ensure_visible"
+    );
+
+    // Unpark the strip (as `show_active_workspace` does) and focus window 0:
+    // normal reshuffling must now scroll the strip back to 0.
+    {
+        let mut strip = harness.world().entity_mut(strip_entity);
+        strip.remove::<crate::ecs::workspace::PreviousStripPosition>();
+        strip.get_mut::<Position>().unwrap().0 = Origin::new(-176, TEST_MENUBAR_HEIGHT);
+    }
+    harness.mock_state.set_focused_window(0);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 0 });
+    harness.advance(Duration::from_millis(500));
+    assert_eq!(
+        harness
+            .world()
+            .get::<Position>(strip_entity)
+            .map(|position| position.x),
+        Some(0),
+        "once PreviousStripPosition is cleared, focusing window 0 must scroll the strip back to 0"
+    );
 }

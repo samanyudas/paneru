@@ -930,6 +930,40 @@ impl Drop for EventTap {
     }
 }
 
+/// Maps a native `CGEvent` timestamp (Mach ticks for physical HID devices or
+/// nanoseconds for software-posted events, normalized via `slice_tap::made_at`)
+/// directly onto Rust's monotonic `Instant` clock via `slice_tap::uptime()`.
+/// That keeps event timestamps comparable with `Instant::now()` across threads
+/// and preserves true inter-event intervals through delayed dispatch bursts.
+/// Synthetic events with timestamp 0 fall back to `dispatch_now`.
+pub(crate) fn cg_event_timestamp_to_instant(cg_timestamp: u64, dispatch_now: Instant) -> Instant {
+    if cg_timestamp == 0 {
+        return dispatch_now;
+    }
+    event_timestamp_from_uptime(
+        super::slice_tap::made_at(cg_timestamp),
+        super::slice_tap::uptime(),
+        dispatch_now,
+    )
+}
+
+pub(crate) fn event_timestamp_from_uptime(
+    event_time: Duration,
+    now_uptime: Duration,
+    dispatch_now: Instant,
+) -> Instant {
+    dispatch_now
+        .checked_sub(now_uptime.saturating_sub(event_time))
+        .unwrap_or(dispatch_now)
+}
+
+fn read_motion_fields(event: &CGEvent) -> (objc2_core_foundation::CGPoint, i64, Instant) {
+    let point = CGEvent::location(Some(event));
+    let delta_y = CGEvent::integer_value_field(Some(event), CGEventField::MouseEventDeltaY);
+    let timestamp = cg_event_timestamp_to_instant(CGEvent::timestamp(Some(event)), Instant::now());
+    (point, delta_y, timestamp)
+}
+
 /// `InputHandler` manages low-level input events from macOS event taps.
 /// It intercepts keyboard and mouse events, processes gestures, and dispatches them as higher-level `Event`s.
 pub(super) struct InputHandler {
@@ -1233,17 +1267,23 @@ impl InputHandler {
                 })
             }
             CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
-                let point = CGEvent::location(Some(event));
-                let button = mouse_button(event_type);
+                let (point, delta_y, timestamp) = read_motion_fields(event);
                 events.send(Event::MouseDragged {
                     point,
+                    delta_y,
+                    timestamp,
                     modifiers,
-                    button,
+                    button: mouse_button(event_type),
                 })
             }
             CGEventType::MouseMoved => {
-                let point = CGEvent::location(Some(event));
-                events.send(Event::MouseMoved { point, modifiers })
+                let (point, delta_y, timestamp) = read_motion_fields(event);
+                events.send(Event::MouseMoved {
+                    point,
+                    delta_y,
+                    timestamp,
+                    modifiers,
+                })
             }
             CGEventType::KeyDown => {
                 let keycode =

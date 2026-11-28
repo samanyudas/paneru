@@ -14,7 +14,7 @@ use bevy::ecs::schedule::common_conditions::{
     any_with_component, not, on_message, resource_changed, resource_exists,
 };
 use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor, SystemSet};
-use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
+use bevy::ecs::system::{Commands, EntityCommands, Local, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
 use bevy::tasks::Task;
 use bevy::time::Timer;
@@ -176,9 +176,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
     strip_cover::register(app);
     slice_input::register(app);
 
+    #[allow(clippy::too_many_arguments)]
     let overlays_dirty = |config: Option<Res<Config>>,
                           theme: Option<Res<SystemTheme>>,
                           mission_control: Option<Res<MissionControlActive>>,
+                          drag: Option<Res<drag::DragState>>,
+                          mut was_dragging: Local<bool>,
                           strip_changed: OverlayStripChanged,
                           mut scrolling_removed: RemovedComponents<Scrolling>,
                           mut covers_removed: RemovedComponents<strip_cover::CoverSlide>,
@@ -193,19 +196,24 @@ pub fn register_systems(app: &mut bevy::app::App) {
             || !covers_added.is_empty()
             || morphs_removed.read().count() > 0
             || !morphs_added.is_empty();
+        let dragging = drag.is_some_and(|drag| drag.is_dragging());
+        let drag_toggled = dragging != *was_dragging;
+        *was_dragging = dragging;
         let Some(config) = config else {
             return false;
         };
         let enabled = config.has_dim_inactive_color() || config.border_active_window();
         config.is_changed()
             || (enabled
-                && (theme.is_some_and(|theme| theme.is_changed())
-                    || mission_control.is_some_and(|mc| mc.is_changed())
-                    || scrolling_ended
-                    || !strip_changed.is_empty()
-                    || !focus_gained.is_empty()
-                    || !workspace_changed.is_empty()
-                    || !focused_moved.is_empty()))
+                && (drag_toggled
+                    || (!dragging
+                        && (theme.is_some_and(|theme| theme.is_changed())
+                            || mission_control.is_some_and(|mc| mc.is_changed())
+                            || scrolling_ended
+                            || !strip_changed.is_empty()
+                            || !focus_gained.is_empty()
+                            || !workspace_changed.is_empty()
+                            || !focused_moved.is_empty()))))
     };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
@@ -250,6 +258,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // Registered with `add_message`, not `init_resource`, so the buffer is
     // double-buffered and dropped after a frame like any other message stream.
     app.add_message::<InputEvent>();
+    app.add_message::<crate::events::PointerMotion>();
+    app.init_resource::<systems::PumpedPointerMotion>();
     app.add_message::<state::SaveSession>();
     // Sample Bevy time after the blocking OS wait, so this frame uses its own
     // elapsed interval rather than the previous frame's sleep.
@@ -1792,6 +1802,59 @@ mod tests {
         assert!(
             !overlay_runs_after(&mut harness, &|_| {}),
             "idle frame after Scrolling ends"
+        );
+    }
+
+    #[test]
+    fn overlays_pause_during_drag_and_resume_on_end() {
+        let mut harness = TestHarness::new()
+            .with_config(border_config(true))
+            .with_windows(1);
+        harness
+            .world()
+            .insert_resource(SystemTheme { is_dark: false });
+        harness.advance(Duration::from_secs(1));
+
+        let window_entity = harness
+            .world()
+            .query_filtered::<Entity, With<super::FocusedMarker>>()
+            .single(harness.world())
+            .unwrap();
+
+        let overlay_runs_after = |harness: &mut TestHarness, change: &dyn Fn(&mut World)| {
+            let before = overlays_last_run(harness);
+            change(harness.world());
+            harness.app.update();
+            overlays_last_run(harness) != before
+        };
+
+        assert!(!overlay_runs_after(&mut harness, &|_| {}), "idle frame");
+        assert!(
+            overlay_runs_after(&mut harness, &|world| {
+                world.insert_resource(super::drag::DragState::Dragging(super::drag::Drag {
+                    window: window_entity,
+                    pointer: IVec2::ZERO,
+                    target: super::drag::DropTarget::Home,
+                    button_up_since: None,
+                }));
+            }),
+            "overlay must rerun to hide when dragging starts"
+        );
+        assert!(
+            !overlay_runs_after(&mut harness, &|world| {
+                world.resource_mut::<SystemTheme>().is_dark = true;
+            }),
+            "overlay must stay paused while dragging"
+        );
+        assert!(
+            overlay_runs_after(&mut harness, &|world| {
+                world.insert_resource(super::drag::DragState::Idle);
+            }),
+            "overlay must rerun to reappear when dragging ends"
+        );
+        assert!(
+            !overlay_runs_after(&mut harness, &|_| {}),
+            "idle frame after drag ends"
         );
     }
 }

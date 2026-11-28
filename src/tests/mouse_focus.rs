@@ -48,6 +48,8 @@ fn mouse_focus_resumes_after_slide_without_intermediate_mouse_events() {
                     x: f64::from(center.x),
                     y: f64::from(center.y),
                 },
+                delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers: Modifiers::empty(),
             });
         })
@@ -127,6 +129,8 @@ fn keyboard_focus_survives_mouse_movement_during_slide() {
                     x: f64::from(center.x),
                     y: f64::from(center.y),
                 },
+                delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers: Modifiers::empty(),
             });
             harness.advance(Duration::from_millis(20));
@@ -146,6 +150,8 @@ fn keyboard_focus_survives_mouse_movement_during_slide() {
                     x: f64::from(center.x),
                     y: f64::from(center.y),
                 },
+                delta_y: 0,
+                timestamp: std::time::Instant::now(),
                 modifiers: Modifiers::empty(),
             });
             harness.advance(Duration::from_millis(100));
@@ -576,4 +582,100 @@ fn clicking_partially_offscreen_focused_window_brings_it_into_view() {
             );
         })
         .run(commands);
+}
+
+#[test]
+fn focus_follows_mouse_uses_final_sample_of_a_move_burst() {
+    let config: Config = (
+        MainOptions {
+            focus_follows_mouse: Some(true),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_millis(200));
+    assert_focused!(harness.world(), 0);
+
+    let (center_1, center_2) = {
+        let world = harness.world();
+        let e1 = find_window_entity(1, world);
+        let e2 = find_window_entity(2, world);
+        (
+            world.get::<Window>(e1).unwrap().frame().center(),
+            world.get::<Window>(e2).unwrap().frame().center(),
+        )
+    };
+
+    // Two consecutive MouseMoved samples in one pump coalesce to the final
+    // sample, so focus-follows-mouse focuses window 2 (not window 1).
+    let mut pumped = Vec::new();
+    let mut motion = Vec::new();
+    let mut pending_mouse = None;
+    for (center, delta_y) in [(center_1, 4), (center_2, 0)] {
+        crate::ecs::systems::push_pumped_event(
+            Event::MouseMoved {
+                point: CGPoint {
+                    x: f64::from(center.x),
+                    y: f64::from(center.y),
+                },
+                delta_y,
+                timestamp: std::time::Instant::now(),
+                modifiers: Modifiers::empty(),
+            },
+            &mut pending_mouse,
+            &mut pumped,
+            &mut motion,
+        );
+    }
+    pumped.extend(pending_mouse.take());
+    assert_eq!(pumped.len(), 1);
+    assert_eq!(motion.len(), 2);
+
+    harness.world().write_message_batch(pumped);
+    harness.advance(Duration::from_millis(100));
+    assert_focused!(harness.world(), 2);
+}
+
+#[test]
+fn pump_flushes_mouse_move_before_non_input_window_resized() {
+    let mut pumped = Vec::new();
+    let mut motion = Vec::new();
+    let mut pending_mouse = None;
+    let raw = vec![
+        Event::MouseMoved {
+            point: CGPoint { x: 100.0, y: 100.0 },
+            delta_y: 0,
+            timestamp: std::time::Instant::now(),
+            modifiers: Modifiers::empty(),
+        },
+        Event::WindowResized { window_id: 0 },
+        Event::MouseMoved {
+            point: CGPoint { x: 500.0, y: 100.0 },
+            delta_y: 0,
+            timestamp: std::time::Instant::now(),
+            modifiers: Modifiers::LALT,
+        },
+    ];
+    for event in raw {
+        crate::ecs::systems::push_pumped_event(event, &mut pending_mouse, &mut pumped, &mut motion);
+    }
+    pumped.extend(pending_mouse.take());
+    assert_eq!(
+        pumped.len(),
+        3,
+        "a non-input WindowResized event must flush the earlier MouseMoved so modifier releases are not dropped"
+    );
+    assert!(matches!(
+        pumped[0],
+        Event::MouseMoved { modifiers, .. } if modifiers.is_empty()
+    ));
+    assert!(matches!(pumped[1], Event::WindowResized { window_id: 0 }));
+    assert!(matches!(
+        pumped[2],
+        Event::MouseMoved { modifiers, .. } if modifiers == Modifiers::LALT
+    ));
 }

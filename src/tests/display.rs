@@ -3664,3 +3664,278 @@ fn test_destroyed_space_on_a_present_display_is_not_orphaned() {
         "a space destroyed on a connected display is dropped, as before"
     );
 }
+
+#[test]
+fn test_destroyed_space_removes_all_strips_sharing_the_space() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {});
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    let ext_display = {
+        let world = harness.world();
+        world
+            .query::<(Entity, &Display)>()
+            .iter(world)
+            .find_map(|(entity, display)| (display.id() == EXT_DISPLAY_ID).then_some(entity))
+            .expect("external display should exist")
+    };
+    harness
+        .world()
+        .spawn((LayoutStrip::new(EXT_WORKSPACE_ID, 1), ChildOf(ext_display)));
+
+    let before = {
+        let world = harness.world();
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .filter(|strip| strip.id() == EXT_WORKSPACE_ID)
+            .count()
+    };
+    assert_eq!(
+        before, 2,
+        "both strips sharing the native Space must exist before SpaceDestroyed"
+    );
+
+    harness.world().write_message(Event::SpaceDestroyed {
+        space_id: EXT_WORKSPACE_ID,
+    });
+    harness.world().run_schedule(PostUpdate);
+
+    let after = {
+        let world = harness.world();
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .filter(|strip| strip.id() == EXT_WORKSPACE_ID)
+            .count()
+    };
+    assert_eq!(
+        after, 0,
+        "SpaceDestroyed must remove every strip belonging to the destroyed native Space"
+    );
+}
+
+#[test]
+fn test_horizontal_mouse_warp_also_warps_a_drag() {
+    let config: Config = (
+        MainOptions {
+            horizontal_mouse_warp: Some(1),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let above = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    let approach = objc2_core_foundation::CGPoint {
+        x: f64::from(TEST_DISPLAY_WIDTH - 20),
+        y: f64::from(TEST_DISPLAY_HEIGHT / 2),
+    };
+    let edge = objc2_core_foundation::CGPoint {
+        x: f64::from(TEST_DISPLAY_WIDTH - 1),
+        y: f64::from(TEST_DISPLAY_HEIGHT / 2),
+    };
+    let modifiers = crate::platform::Modifiers::empty();
+    for (first, second) in [
+        (
+            Event::MouseMoved {
+                point: approach,
+                delta_y: 0,
+                timestamp: std::time::Instant::now(),
+                modifiers,
+            },
+            Event::MouseMoved {
+                point: edge,
+                delta_y: 0,
+                timestamp: std::time::Instant::now(),
+                modifiers,
+            },
+        ),
+        (
+            Event::MouseDragged {
+                point: approach,
+                delta_y: 0,
+                timestamp: std::time::Instant::now(),
+                modifiers,
+                button: crate::events::MouseButton::Left,
+            },
+            Event::MouseDragged {
+                point: edge,
+                delta_y: 0,
+                timestamp: std::time::Instant::now(),
+                modifiers,
+                button: crate::events::MouseButton::Left,
+            },
+        ),
+    ] {
+        let label = format!("{second:?}");
+        let commands = vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ];
+        TestHarness::new()
+            .with_config(config.clone())
+            .with_windows(1)
+            .with_display(EXT_DISPLAY_ID, above, vec![EXT_WORKSPACE_ID])
+            .on_iteration(1, move |world, _state| {
+                world.write_message(first.clone());
+                world.write_message(second.clone());
+            })
+            .on_iteration(2, move |_world, state| {
+                let cursor = state.cursor_position();
+                assert!(
+                    above.contains(cursor),
+                    "{label} at the right edge left the pointer at {cursor:?}"
+                );
+            })
+            .run(commands);
+    }
+}
+
+const THIRD_DISPLAY_ID: u32 = 3;
+const THIRD_WORKSPACE_ID: u64 = 30;
+
+fn ext_display_bounds() -> IRect {
+    IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0)
+}
+
+fn third_display_bounds() -> IRect {
+    IRect::new(
+        0,
+        TEST_DISPLAY_HEIGHT,
+        EXT_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
+    )
+}
+
+/// The harness adds the external display first, so it is the "next" display.
+fn with_stacked_displays(harness: TestHarness) -> TestHarness {
+    harness
+        .with_display(EXT_DISPLAY_ID, ext_display_bounds(), vec![EXT_WORKSPACE_ID])
+        .with_display(
+            THIRD_DISPLAY_ID,
+            third_display_bounds(),
+            vec![THIRD_WORKSPACE_ID],
+        )
+}
+
+fn display_window_commands(operation: Operation) -> Vec<Event> {
+    vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(operation),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ]
+}
+
+#[test]
+fn test_display_move_targets_the_named_display() {
+    with_stacked_displays(TestHarness::new().with_windows(1))
+        .on_iteration(1, |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_on_workspace!(world, 0, THIRD_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(display_window_commands(Operation::ToDisplay(
+            THIRD_DISPLAY_ID,
+            MoveFocus::Follow,
+        )));
+}
+
+#[test]
+fn test_display_send_moves_the_window_and_keeps_the_source_active() {
+    with_stacked_displays(TestHarness::new().with_windows(2))
+        .on_iteration(2, |world, state| {
+            assert_on_workspace!(world, 0, THIRD_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_on_workspace!(world, 1, TEST_WORKSPACE_ID);
+            assert_eq!(state.active_display(), TEST_DISPLAY_ID);
+        })
+        .run(display_window_commands(Operation::ToDisplay(
+            THIRD_DISPLAY_ID,
+            MoveFocus::Stay,
+        )));
+}
+
+#[test]
+fn test_display_send_of_last_column_focuses_source_desktop() {
+    let source_bounds = IRect::new(
+        0,
+        TEST_MENUBAR_HEIGHT,
+        TEST_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT,
+    );
+    with_stacked_displays(TestHarness::new().with_windows(1))
+        .on_iteration(2, move |world, state| {
+            assert_on_workspace!(world, 0, THIRD_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_eq!(state.focused_desktop(), Some(source_bounds));
+            assert_eq!(state.active_display(), TEST_DISPLAY_ID);
+        })
+        .run(display_window_commands(Operation::ToDisplay(
+            THIRD_DISPLAY_ID,
+            MoveFocus::Stay,
+        )));
+}
+
+#[test]
+fn test_display_move_to_an_unknown_display_keeps_the_window() {
+    with_stacked_displays(TestHarness::new().with_windows(1))
+        .on_iteration(3, |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(display_window_commands(Operation::ToDisplay(
+            99,
+            MoveFocus::Follow,
+        )));
+}
+
+#[test]
+fn test_mouse_display_targets_the_named_display() {
+    let bounds = third_display_bounds();
+    with_stacked_displays(TestHarness::new().with_windows(1))
+        .on_iteration(3, move |_world, state| {
+            let cursor = state.cursor_position();
+            assert!(
+                bounds.contains(cursor),
+                "mouse display {THIRD_DISPLAY_ID} left the pointer at {cursor:?}, outside {bounds:?}"
+            );
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Mouse(MouseMove::ToDisplay(THIRD_DISPLAY_ID)),
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}

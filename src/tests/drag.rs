@@ -1234,6 +1234,8 @@ fn mouse_down(point: Origin, window_id: Option<WinID>) -> Event {
 fn mouse_dragged(point: Origin) -> Event {
     Event::MouseDragged {
         point: cg(point),
+        delta_y: 0,
+        timestamp: std::time::Instant::now(),
         modifiers: Modifiers::empty(),
         button: MouseButton::Left,
     }
@@ -1709,6 +1711,8 @@ fn a_lost_release_in_the_engine_returns_the_window() {
     ));
     harness.world().write_message(Event::MouseMoved {
         point: cg(into_the_column),
+        delta_y: 0,
+        timestamp: std::time::Instant::now(),
         modifiers: Modifiers::empty(),
     });
     harness.advance(SETTLE);
@@ -2096,6 +2100,8 @@ fn a_lost_release_hides_the_overlay() {
 
     harness.world().write_message(Event::MouseMoved {
         point: cg(into_the_column),
+        delta_y: 0,
+        timestamp: std::time::Instant::now(),
         modifiers: Modifiers::empty(),
     });
     harness.advance(FRAME);

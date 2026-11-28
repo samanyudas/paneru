@@ -1308,6 +1308,8 @@ impl MockState {
         });
         inner.event_queue.push_back(Event::MouseDragged {
             point: end_p,
+            delta_y: 0,
+            timestamp: std::time::Instant::now(),
             modifiers: Modifiers::empty(),
             button: MouseButton::Left,
         });
