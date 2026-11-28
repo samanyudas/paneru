@@ -443,16 +443,47 @@ fn duplicate_edge_samples_in_one_drain_warp_only_once_without_spurious_carry() {
 
 #[test]
 fn velocity_carry_uses_event_timestamps_within_a_single_drain() {
+    // Two events generated 10 ms apart in native CGEvent timestamps, then
+    // dispatched only 50 microseconds apart after a main-run-loop stall:
     // 509 is outside the 3-px edge threshold (`512 - 509 == 3`), then moving
     // 1 px rightward to 510 over 10 ms = 100 px/s -> 30 ms carry = 3 px ->
-    // landing at -1408 + 6 + 3 = -1399 (not clamped to +80 px from read-time dt).
-    let (_, cursor) = pointer_pumped_events(
-        desk(true),
-        moves_with_delta_and_time(&[(509, -600, 0, 0), (510, -600, 0, 10)]),
+    // landing at -1408 + 6 + 3 = -1399 (not clamped to +80 px from burst dispatch).
+    let mut anchor = None;
+    let stalled_dispatch = std::time::Instant::now();
+    let t1 = crate::platform::input::cg_event_timestamp_to_instant(
+        50_000_000_000,
+        &mut anchor,
+        stalled_dispatch,
     );
+    let t2 = crate::platform::input::cg_event_timestamp_to_instant(
+        50_010_000_000,
+        &mut anchor,
+        stalled_dispatch + std::time::Duration::from_micros(50),
+    );
+    let events = vec![
+        Event::MouseMoved {
+            point: objc2_core_foundation::CGPoint {
+                x: 509.0,
+                y: -600.0,
+            },
+            delta_y: 0,
+            timestamp: t1,
+            modifiers: crate::platform::Modifiers::empty(),
+        },
+        Event::MouseMoved {
+            point: objc2_core_foundation::CGPoint {
+                x: 510.0,
+                y: -600.0,
+            },
+            delta_y: 0,
+            timestamp: t2,
+            modifiers: crate::platform::Modifiers::empty(),
+        },
+    ];
+    let (_, cursor) = pointer_pumped_events(desk(true), events);
     assert_eq!(
         cursor,
         IVec2::new(-1399, -1800),
-        "carry-over must use original event timestamps rather than trigger read times"
+        "carry-over must use native CGEvent timestamps even when run-loop dispatch stalls into a burst"
     );
 }

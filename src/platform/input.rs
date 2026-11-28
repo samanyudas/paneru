@@ -930,6 +930,40 @@ impl Drop for EventTap {
     }
 }
 
+/// Maps a native `CGEvent` timestamp (nanoseconds since startup) onto Rust's
+/// monotonic `Instant` clock using the first non-zero event timestamp as
+/// anchor, so delayed main-run-loop dispatch bursts preserve the true interval
+/// between events. Synthetic events with timestamp 0 fall back to
+/// `dispatch_now`.
+pub(crate) fn cg_event_timestamp_to_instant(
+    cg_timestamp_ns: u64,
+    anchor: &mut Option<(u64, Instant)>,
+    dispatch_now: Instant,
+) -> Instant {
+    if cg_timestamp_ns == 0 {
+        return dispatch_now;
+    }
+    let (anchor_ns, anchor_instant) = *anchor.get_or_insert((cg_timestamp_ns, dispatch_now));
+    if cg_timestamp_ns >= anchor_ns {
+        anchor_instant + Duration::from_nanos(cg_timestamp_ns - anchor_ns)
+    } else {
+        anchor_instant
+            .checked_sub(Duration::from_nanos(anchor_ns - cg_timestamp_ns))
+            .unwrap_or(anchor_instant)
+    }
+}
+
+fn read_motion_fields(
+    event: &CGEvent,
+    anchor: &mut Option<(u64, Instant)>,
+) -> (objc2_core_foundation::CGPoint, i64, Instant) {
+    let point = CGEvent::location(Some(event));
+    let delta_y = CGEvent::integer_value_field(Some(event), CGEventField::MouseEventDeltaY);
+    let timestamp =
+        cg_event_timestamp_to_instant(CGEvent::timestamp(Some(event)), anchor, Instant::now());
+    (point, delta_y, timestamp)
+}
+
 /// `InputHandler` manages low-level input events from macOS event taps.
 /// It intercepts keyboard and mouse events, processes gestures, and dispatches them as higher-level `Event`s.
 pub(super) struct InputHandler {
@@ -946,6 +980,8 @@ pub(super) struct InputHandler {
     /// scrolling windows underneath (including momentum scroll after finger lift).
     last_swipe_time: Option<Instant>,
     last_window_scroll: Option<(Instant, Direction)>,
+    /// Anchor mapping native `CGEvent` nanosecond timestamps onto `Instant`.
+    event_time_anchor: Option<(u64, Instant)>,
     invalid_device_size_warned: bool,
     // Prevents from being Unpin automatically
     _pin: PhantomPinned,
@@ -974,6 +1010,7 @@ impl InputHandler {
             taps: None,
             last_swipe_time: None,
             last_window_scroll: None,
+            event_time_anchor: None,
             invalid_device_size_warned: false,
             _pin: PhantomPinned,
         }
@@ -1189,7 +1226,7 @@ impl InputHandler {
         {
             return intercept;
         }
-        let Some(events) = &self.events else {
+        let (Some(events), event_time_anchor) = (&self.events, &mut self.event_time_anchor) else {
             return false;
         };
 
@@ -1233,26 +1270,21 @@ impl InputHandler {
                 })
             }
             CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
-                let point = CGEvent::location(Some(event));
-                let delta_y =
-                    CGEvent::integer_value_field(Some(event), CGEventField::MouseEventDeltaY);
-                let button = mouse_button(event_type);
+                let (point, delta_y, timestamp) = read_motion_fields(event, event_time_anchor);
                 events.send(Event::MouseDragged {
                     point,
                     delta_y,
-                    timestamp: Instant::now(),
+                    timestamp,
                     modifiers,
-                    button,
+                    button: mouse_button(event_type),
                 })
             }
             CGEventType::MouseMoved => {
-                let point = CGEvent::location(Some(event));
-                let delta_y =
-                    CGEvent::integer_value_field(Some(event), CGEventField::MouseEventDeltaY);
+                let (point, delta_y, timestamp) = read_motion_fields(event, event_time_anchor);
                 events.send(Event::MouseMoved {
                     point,
                     delta_y,
-                    timestamp: Instant::now(),
+                    timestamp,
                     modifiers,
                 })
             }
