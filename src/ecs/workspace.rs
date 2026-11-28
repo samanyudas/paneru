@@ -350,6 +350,7 @@ fn workspace_destroyed_handler(
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut focus_history: ResMut<FocusHistory>,
+    mut display_homes: ResMut<crate::ecs::display_homes::DisplayHomes>,
     mut native: ResMut<NativeMembership>,
     time: Res<Time>,
     mut commands: Commands,
@@ -359,6 +360,7 @@ fn workspace_destroyed_handler(
             continue;
         };
         focus_history.forget_workspace(*space_id);
+        display_homes.space_destroyed(*space_id);
         for (strip, _, fullscreen) in &workspaces {
             if fullscreen.is_none() && strip.id() == *space_id {
                 native.space_destroyed(strip, time.elapsed());
@@ -438,12 +440,14 @@ fn workspace_created_handler(
     mut messages: MessageReader<Event>,
     active_display: Single<(&Display, Entity), With<ActiveDisplayMarker>>,
     workspaces: Query<&LayoutStrip>,
+    mut display_homes: ResMut<crate::ecs::display_homes::DisplayHomes>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::SpaceCreated { space_id } = event else {
             continue;
         };
+        display_homes.space_created(*space_id);
 
         if workspaces.into_iter().any(|strip| strip.id() == *space_id) {
             warn!("Workspace {space_id} already exists!");

@@ -1622,10 +1622,12 @@ impl WindowApi for WindowOS {
     }
 
     fn set_padding(&mut self, padding: WindowPadding) {
+        let shown = self.margins().shown(self.writes.frame());
         match padding {
             WindowPadding::Vertical(padding) => self.vertical_padding = padding,
             WindowPadding::Horizontal(padding) => self.horizontal_padding = padding,
         }
+        self.writes.track(self.margins().tracked(shown));
     }
 
     fn horizontal_padding(&self) -> i32 {

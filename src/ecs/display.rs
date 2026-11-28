@@ -1116,7 +1116,9 @@ pub(crate) fn orphan_strip(
     display_entity: Entity,
     commands: &mut Commands,
 ) {
-    // Queue this before detaching ChildOf or despawning the source Display.
+    // Queue display-home and width snapshots before detaching ChildOf or
+    // despawning the source Display.
+    commands.queue(DisplayHomes::freeze);
     commands.queue(move |world: &mut World| {
         remember_strip_widths(world, entity, display_entity);
     });

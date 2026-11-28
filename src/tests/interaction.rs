@@ -4001,3 +4001,168 @@ dont_focus = true
         "mid-animation left-edge insertion must preserve the focused window's landing x"
     );
 }
+
+/// A left-edge background insertion during an active swipe or settle must
+/// rebase `Scrolling`'s coordinates alongside the strip so the next scroll
+/// frame does not jump the focused window by the inserted width.
+#[test]
+fn test_left_edge_insertion_during_scrolling_rebases_scroll_state() {
+    let config = Config::try_from(
+        r#"
+[options]
+auto_center = false
+animation_speed = 8.0
+
+[bindings]
+
+[windows.leftedge]
+title = ".*"
+subrole = "AXLeftEdge"
+index = 0
+dont_focus = true
+"#,
+    )
+    .expect("config should parse");
+
+    let mut harness = TestHarness::new().with_config(config).with_windows(4);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_millis(500));
+
+    harness.mock_state.set_focused_window(2);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 2 });
+    harness.advance(Duration::from_millis(500));
+
+    let (strip_entity, before_x) = {
+        let world = harness.world();
+        let strip_entity = active_strip_entity(world);
+        let strip_x = world.get::<Position>(strip_entity).unwrap().x;
+        (strip_entity, strip_x)
+    };
+    let last_event = harness.world().resource::<Time>().elapsed();
+    harness
+        .world()
+        .entity_mut(strip_entity)
+        .insert(crate::ecs::Scrolling {
+            velocity: 0.0,
+            position: f64::from(before_x),
+            is_user_swiping: true,
+            last_event,
+            moved_at: last_event,
+            input: crate::ecs::ScrollInput::Gesture,
+            anchor: f64::from(before_x),
+            settle: Some(f64::from(before_x - 100)),
+            ease: Some(crate::ecs::SettleEase {
+                from: f64::from(before_x),
+                start: 0.0,
+                elapsed: 0.05,
+                animation_speed: 8.0,
+                flick: None,
+            }),
+            detent: None,
+            origin: f64::from(before_x),
+            landing_focus: None,
+            focus_at_start: None,
+            start: None,
+            fingers_down: true,
+            lifted_at: None,
+            caught: None,
+            slope: 1.0,
+            excess: None,
+        });
+
+    harness = harness.with_window(9, |window| {
+        window.subrole = "AXLeftEdge".to_string();
+    });
+    harness.advance(Duration::from_millis(16));
+
+    let world = harness.world();
+    let inserted = find_window_entity(9, world);
+    let inserted_width = f64::from(world.get::<crate::ecs::Bounds>(inserted).unwrap().0.x);
+    let scrolling = world
+        .get::<crate::ecs::Scrolling>(strip_entity)
+        .expect("strip still scrolling");
+    assert_eq!(scrolling.position, f64::from(before_x) - inserted_width);
+    assert_eq!(scrolling.anchor, f64::from(before_x) - inserted_width);
+    assert_eq!(scrolling.origin, f64::from(before_x) - inserted_width);
+    assert_eq!(
+        scrolling.settle,
+        Some(f64::from(before_x - 100) - inserted_width)
+    );
+    assert_eq!(
+        scrolling.ease.map(|ease| ease.from),
+        Some(f64::from(before_x) - inserted_width)
+    );
+}
+
+/// A background application opening a window with `index = 0` and no
+/// `dont_focus` rule has its focus notification rejected, so the focused
+/// window keeps focus and must stay at the same screen x.
+#[test]
+fn test_left_edge_insertion_from_background_app_without_dont_focus_keeps_focused_window_stationary()
+{
+    let config = Config::try_from(
+        r#"
+[options]
+auto_center = false
+
+[bindings]
+
+[windows.leftedge]
+title = ".*"
+subrole = "AXLeftEdge"
+index = 0
+"#,
+    )
+    .expect("config should parse");
+
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_millis(500));
+
+    harness.mock_state.set_focused_window(2);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 2 });
+    harness.advance(Duration::from_millis(500));
+
+    let focused_x = {
+        let world = harness.world();
+        assert_focused!(world, 2);
+        let focused = find_window_entity(2, world);
+        world.get::<Position>(focused).unwrap().x
+    };
+
+    let bg_pid = TEST_PROCESS_ID + 1;
+    harness
+        .mock_state
+        .spawn_app(bg_pid, "com.test.background", "Background");
+    harness
+        .mock_state
+        .update_app(bg_pid, |app| app.is_frontmost = false);
+    let bg_app = harness.mock_state.create_application(bg_pid);
+    harness.world().spawn(bg_app);
+    let window = harness.mock_state.spawn_window(
+        bg_pid,
+        TEST_WORKSPACE_ID,
+        9,
+        IRect::new(0, TEST_MENUBAR_HEIGHT, 400, TEST_DISPLAY_HEIGHT),
+    );
+    harness
+        .mock_state
+        .update_window(9, |window| window.subrole = "AXLeftEdge".to_string());
+    harness
+        .world()
+        .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    harness.advance(Duration::from_millis(500));
+
+    let world = harness.world();
+    assert_focused!(world, 2);
+    let focused = find_window_entity(2, world);
+    assert_eq!(
+        world.get::<Position>(focused).map(|position| position.x),
+        Some(focused_x),
+        "a background app's left-edge window must not shift the focused window"
+    );
+}

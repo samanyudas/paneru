@@ -2306,6 +2306,7 @@ type SpawnStrips<'w, 's> = Query<
         &'static mut LayoutStrip,
         &'static mut Position,
         Option<&'static mut RepositionMarker>,
+        Option<&'static mut crate::ecs::Scrolling>,
         Has<ActiveWorkspaceMarker>,
         Has<SelectedVirtualMarker>,
     ),
@@ -2330,7 +2331,7 @@ pub(super) fn apply_window_positions(
     for entity in added {
         if workspaces
             .iter()
-            .any(|(_, strip, _, _, _, _)| strip.tabbed(entity))
+            .any(|(_, strip, _, _, _, _, _)| strip.tabbed(entity))
         {
             debug!("Ignoring tabbed {entity} attributes.");
             continue;
@@ -2357,7 +2358,7 @@ pub(super) fn apply_window_positions(
         if properties.floating() && !overrides.contains(window, app) {
             if let Some(mut strip) = workspaces
                 .iter_mut()
-                .find_map(|(_, strip, _, _, _, _)| strip.contains(entity).then_some(strip))
+                .find_map(|(_, strip, _, _, _, _, _)| strip.contains(entity).then_some(strip))
             {
                 strip.remove(entity);
             }
@@ -2400,7 +2401,7 @@ pub(super) fn apply_window_positions(
         // During startup, the window is already inserted into some strip by finish_setup.
         let allready_inserted = workspaces
             .iter()
-            .any(|(_, strip, _, _, _, _)| strip.contains(entity));
+            .any(|(_, strip, _, _, _, _, _)| strip.contains(entity));
         let mut on_hidden_space = false;
         if initializing.is_none()
             && !allready_inserted
@@ -2408,11 +2409,11 @@ pub(super) fn apply_window_positions(
                 window.id(),
                 &workspaces
                     .iter()
-                    .map(|(e, s, _, _, active, sel)| (e, s, active, sel))
+                    .map(|(e, s, _, _, _, active, sel)| (e, s, active, sel))
                     .collect::<Vec<_>>(),
                 &window_manager,
             )
-            && let Ok((_, mut strip, mut strip_position, strip_reposition, _, _)) =
+            && let Ok((_, mut strip, mut strip_position, strip_reposition, strip_scrolling, _, _)) =
                 workspaces.get_mut(target)
         {
             let resized_width = displays.single().ok().and_then(|display| {
@@ -2446,11 +2447,12 @@ pub(super) fn apply_window_positions(
                         let insertion = after.min(strip.len());
                         strip.insert_at(insertion, entity);
                         // Keep the focused column at the same screen x when a
-                        // background window lands at or left of it: shifting the
-                        // strip origin (and any in-flight animation target) by
-                        // the new column's width absorbs the slot shift on the
-                        // left without moving existing windows.
-                        if properties.dont_focus()
+                        // window that will not take focus (dont_focus rule or
+                        // background app) lands at or left of it: shifting the
+                        // strip origin and any in-flight animation/scroll state
+                        // by the new column's width absorbs the slot shift on
+                        // the left without moving existing windows.
+                        if (properties.dont_focus() || !app.is_frontmost())
                             && focused_index.is_some_and(|idx| insertion <= idx)
                             && let Some(width) = resized_width.or_else(|| {
                                 ctx.windows.moving_frame(entity).map(|frame| frame.width())
@@ -2459,6 +2461,18 @@ pub(super) fn apply_window_positions(
                             strip_position.0.x -= width;
                             if let Some(mut target) = strip_reposition {
                                 target.0.x -= width;
+                            }
+                            if let Some(mut scrolling) = strip_scrolling {
+                                let delta = -f64::from(width);
+                                scrolling.position += delta;
+                                scrolling.anchor += delta;
+                                scrolling.origin += delta;
+                                if let Some(settle) = &mut scrolling.settle {
+                                    *settle += delta;
+                                }
+                                if let Some(ease) = &mut scrolling.ease {
+                                    ease.from += delta;
+                                }
                             }
                         }
                     }

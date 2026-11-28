@@ -304,13 +304,40 @@ pub(crate) fn compensate_left_removal(
                 shifted
             }
         };
-        scrolling.position = shift_f64(scrolling.position);
+        let old_pos = scrolling.position;
+        let old_settle = scrolling.settle;
+        scrolling.position = shift_f64(old_pos);
         scrolling.anchor = shift_f64(scrolling.anchor);
         scrolling.origin = shift_f64(scrolling.origin);
         if let Some(settle) = &mut scrolling.settle {
             *settle = shift_f64(*settle);
         }
-        scrolling.ease = None;
+        if let Some(ease) = &mut scrolling.ease {
+            if let (Some(old_target), Some(new_target)) = (old_settle, scrolling.settle) {
+                let delta_pos = scrolling.position - old_pos;
+                let delta_target = new_target - old_target;
+                if (delta_pos - delta_target).abs() < 1e-6 {
+                    ease.from += delta_target;
+                } else {
+                    let speed = crate::ecs::scroll::ease_speed(ease, old_target, config);
+                    let remaining = new_target - scrolling.position;
+                    let duration = crate::ecs::ease::duration(config);
+                    let flick = ease.flick.and_then(|_| {
+                        (remaining.abs() >= 1.0 && speed * remaining.signum() > 0.0)
+                            .then_some(speed)
+                    });
+                    *ease = crate::ecs::SettleEase {
+                        from: scrolling.position,
+                        start: crate::ecs::ease::entry_for_speed(speed, remaining, duration),
+                        elapsed: 0.0,
+                        animation_speed: ease.animation_speed,
+                        flick,
+                    };
+                }
+            } else {
+                scrolling.ease = None;
+            }
+        }
     }
 }
 
@@ -5725,6 +5752,84 @@ mod tests {
         assert_eq!(
             shift_origin_after_left_removal(-2420, 500, -1920, true),
             -1920
+        );
+    }
+
+    #[test]
+    fn test_compensate_left_removal_preserves_and_retargets_settle_ease() {
+        let config: Config = (
+            crate::config::MainOptions {
+                auto_center: Some(false),
+                animation_speed: Some(14.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+
+        // Case 1: unclamped translation shifts `from` and `settle` identically,
+        // preserving `elapsed`, `start`, and `flick` untouched.
+        let mut pos = Position(Origin::new(-900, 0));
+        let mut scrolling = Scrolling {
+            velocity: 0.0,
+            position: -900.0,
+            is_user_swiping: false,
+            last_event: Duration::ZERO,
+            moved_at: Duration::ZERO,
+            input: crate::ecs::ScrollInput::Gesture,
+            anchor: -800.0,
+            settle: Some(-1100.0),
+            ease: Some(crate::ecs::SettleEase {
+                from: -800.0,
+                start: 0.1,
+                elapsed: 0.04,
+                animation_speed: 14.0,
+                flick: Some(-1200.0),
+            }),
+            detent: None,
+            origin: -800.0,
+            landing_focus: None,
+            focus_at_start: None,
+            start: None,
+            fingers_down: false,
+            lifted_at: None,
+            caught: None,
+            slope: 1.0,
+            excess: None,
+        };
+        compensate_left_removal(400, &mut pos, None, Some(&mut scrolling), false, 0, &config);
+        let ease = scrolling.ease.expect("unclamped ease must be preserved");
+        assert_eq!(ease.from, -400.0);
+        assert_eq!(ease.elapsed, 0.04);
+        assert_eq!(ease.flick, Some(-1200.0));
+        assert_eq!(scrolling.settle, Some(-700.0));
+
+        // Case 2: clamping changes the remaining distance (`position` clamps at 0
+        // while `settle` shifts freely), so the ease retargets from the shifted
+        // position carrying the in-flight velocity rather than starting from rest.
+        let mut pos = Position(Origin::new(-100, 0));
+        let mut scrolling = Scrolling {
+            position: -100.0,
+            settle: Some(-600.0),
+            ease: Some(crate::ecs::SettleEase {
+                from: -50.0,
+                start: 0.0,
+                elapsed: 0.05,
+                animation_speed: 14.0,
+                flick: None,
+            }),
+            ..scrolling
+        };
+        compensate_left_removal(400, &mut pos, None, Some(&mut scrolling), false, 0, &config);
+        let ease = scrolling.ease.expect("clamped ease must retarget");
+        assert_eq!(scrolling.position, 0.0);
+        assert_eq!(scrolling.settle, Some(-200.0));
+        assert_eq!(ease.from, 0.0);
+        assert_eq!(ease.elapsed, 0.0);
+        assert!(
+            ease.start > 0.0,
+            "retargeted ease must carry positive curve entry for in-flight velocity, got {}",
+            ease.start
         );
     }
 }

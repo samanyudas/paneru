@@ -52,6 +52,9 @@ pub(crate) enum Pass {
 #[derive(Default, Resource)]
 pub(crate) struct DisplayHomes {
     homes: BTreeMap<CGDirectDisplayID, Home>,
+    /// Native Spaces macOS destroyed while their strips may still be retained
+    /// as orphans. Kept until no remembered home references them.
+    destroyed_spaces: HashSet<WorkspaceId>,
 }
 
 /// What one display held when the burst began.
@@ -80,6 +83,17 @@ pub(crate) struct RememberedColumn {
 }
 
 impl DisplayHomes {
+    /// Notes that macOS destroyed native `space`, so restoration treats it as
+    /// gone even if its strip is kept as an orphan until reconciliation.
+    pub(crate) fn space_destroyed(&mut self, space: WorkspaceId) {
+        self.destroyed_spaces.insert(space);
+    }
+
+    /// Clears a destroyed-space mark if macOS creates `space` again.
+    pub(crate) fn space_created(&mut self, space: WorkspaceId) {
+        self.destroyed_spaces.remove(&space);
+    }
+
     /// Remembers every present display that has no home yet, minus the
     /// windows another home holds. Runs on the first display event of a
     /// burst, before macOS has moved or destroyed any Space.
@@ -154,7 +168,18 @@ impl DisplayHomes {
         for space in emptied {
             compact_workspace_strips(world, space);
         }
-        world.resource_mut::<Self>().homes = kept;
+        let retained_spaces = kept
+            .values()
+            .flat_map(|home| &home.strips)
+            .map(|strip| strip.space)
+            .collect::<HashSet<_>>();
+        {
+            let mut resource = world.resource_mut::<Self>();
+            resource.homes = kept;
+            resource
+                .destroyed_spaces
+                .retain(|space| retained_spaces.contains(space));
+        }
         let focused = world
             .query_filtered::<Entity, With<FocusedMarker>>()
             .iter(world)
@@ -263,6 +288,8 @@ pub(crate) struct Topology {
     /// Managed windows outside native fullscreen strips. A window missing
     /// here closed or left the tiling layout, and the restore forgets it.
     windows: HashMap<Entity, WindowNow>,
+    /// Native Spaces macOS destroyed even if an orphan strip still holds their ID.
+    destroyed_spaces: HashSet<WorkspaceId>,
 }
 
 struct DisplayNow {
@@ -359,17 +386,20 @@ impl Topology {
                 (window, now)
             })
             .collect();
+        let destroyed_spaces = world.resource::<DisplayHomes>().destroyed_spaces.clone();
         Self {
             displays,
             strips,
             windows,
+            destroyed_spaces,
         }
     }
 
     /// Whether `window` is still managed, and in `space`, in no strip, or
     /// anywhere once macOS destroyed `space` and moved its windows elsewhere.
     fn still_in(&self, window: Entity, space: WorkspaceId) -> bool {
-        let destroyed = !self.strips.values().any(|strip| strip.space == space);
+        let destroyed = self.destroyed_spaces.contains(&space)
+            || !self.strips.values().any(|strip| strip.space == space);
         self.windows
             .get(&window)
             .is_some_and(|now| match now.strip {
@@ -808,6 +838,36 @@ mod tests {
         assert_eq!(
             plan(HOME, &remembered, &now),
             Plan::Apply(vec![resized(arrival(strip, 0, &[a], false), HALF)])
+        );
+    }
+
+    #[test]
+    fn destroyed_space_with_retained_orphan_strip_restores_migrated_windows() {
+        let [a, b, orphan, surviving, shown] = entities(5)[..] else {
+            panic!()
+        };
+        let mut now = Topology::default()
+            .display(HOME, Some(shown))
+            .display(OTHER, Some(surviving))
+            .strip(shown, HOME, NEW_SPACE)
+            .strip(surviving, OTHER, OTHER_SPACE)
+            .windows(Some(surviving), &[a], HALF)
+            .windows(Some(orphan), &[b], HALF);
+        now.strips.insert(
+            orphan,
+            StripNow {
+                display: None,
+                space: SPACE,
+                virtual_index: 0,
+            },
+        );
+        now.destroyed_spaces.insert(SPACE);
+        assert_eq!(
+            plan(HOME, &home(&[&[a], &[b]]), &now),
+            Plan::Apply(vec![
+                arrival(shown, 0, &[a], true),
+                arrival(shown, 1, &[b], true),
+            ])
         );
     }
 }
