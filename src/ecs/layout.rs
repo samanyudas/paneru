@@ -322,7 +322,9 @@ pub(crate) fn compensate_left_removal(
                     new_target,
                     config,
                 );
-            } else if (new_target - scrolling.position).abs() < 0.5 {
+            } else if (new_target - scrolling.position).abs() < 0.5
+                && ((scrolling.position - old_pos) - (new_target - old_target)).abs() >= 1e-6
+            {
                 scrolling.ease = Some(crate::ecs::SettleEase {
                     from: new_target,
                     start: 1.0,

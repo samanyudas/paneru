@@ -1355,7 +1355,9 @@ pub(crate) fn retarget_settle_ease(
     let delta_pos = new_pos - old_pos;
     let delta_target = new_target - old_target;
     let remaining = new_target - new_pos;
-    if remaining.abs() < 0.5 {
+    if (delta_pos - delta_target).abs() < 1e-6 {
+        ease.from += delta_target;
+    } else if remaining.abs() < 0.5 {
         *ease = SettleEase {
             from: new_target,
             start: 1.0,
@@ -1363,8 +1365,6 @@ pub(crate) fn retarget_settle_ease(
             animation_speed: ease.animation_speed,
             flick: None,
         };
-    } else if (delta_pos - delta_target).abs() < 1e-6 {
-        ease.from += delta_target;
     } else {
         let speed = ease_speed(ease, old_target, config);
         let duration = ease::duration(config);
@@ -1838,5 +1838,32 @@ mod paging_tests {
             Some(live_bottom),
             "fallback focus must skip the stale top and pick the live lower member"
         );
+    }
+
+    #[test]
+    fn retarget_settle_ease_preserves_flick_across_equal_shift_near_target() {
+        let config = Config::default();
+        let mut ease = SettleEase {
+            from: -800.0,
+            start: 0.35,
+            elapsed: 0.08,
+            animation_speed: config.animation_speed(),
+            flick: Some(1200.0),
+        };
+        // Passing within 0.5 pt of target while carrying flick overshoot: an
+        // equal shift of both position and target must translate `from` in
+        // place without clearing the flick or completing early.
+        retarget_settle_ease(&mut ease, -200.2, -200.0, -600.2, -600.0, &config);
+        assert_eq!(ease.from, -1200.0);
+        assert_eq!(ease.start, 0.35);
+        assert_eq!(ease.elapsed, 0.08);
+        assert_eq!(ease.flick, Some(1200.0));
+
+        // When clamping collapses position and target onto the same edge, mark
+        // the ease finished immediately.
+        retarget_settle_ease(&mut ease, -600.2, -500.0, 0.0, 0.0, &config);
+        assert_eq!(ease.from, 0.0);
+        assert_eq!(ease.start, 1.0);
+        assert_eq!(ease.flick, None);
     }
 }
