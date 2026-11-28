@@ -1,9 +1,11 @@
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
+use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::With;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, Query, Res, Single};
+use bevy::math::IRect;
 use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace};
@@ -13,7 +15,7 @@ use crate::config::Config;
 use crate::ecs::drag::DragState;
 use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::params::{GlobalState, Windows};
+use crate::ecs::params::{GlobalState, WindowCtx, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, FocusedMarker, MissionControlActive, Position,
     RepositionMarker, Scrolling, SpawnCommandsExt, UpdateSet,
@@ -202,26 +204,63 @@ fn mouse_moved_trigger(
     }
 }
 
+type ClickableWorkspaces<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static LayoutStrip,
+        &'static Position,
+        Option<&'static RepositionMarker>,
+        &'static ChildOf,
+        Option<&'static Scrolling>,
+    ),
+>;
+
+fn is_window_obscured_beyond_ratio(
+    entity: Entity,
+    windows: &Windows,
+    workspaces: &ClickableWorkspaces,
+    displays: &Query<(&Display, Option<&DockPosition>)>,
+    config: &Config,
+) -> bool {
+    let Some(((display, dock), strip_target)) = workspaces
+        .iter()
+        .find(|(_, strip, ..)| strip.contains(entity))
+        .and_then(|(_, _, pos, repo, child, _)| {
+            let target = repo.map_or(pos.0, |r| r.0);
+            Some((displays.get(child.parent()).ok()?, target))
+        })
+    else {
+        return false;
+    };
+    let (Some(layout_pos), Some(frame)) = (
+        windows.layout_position(entity),
+        windows.moving_frame(entity),
+    ) else {
+        return false;
+    };
+    let size = frame.size();
+    let viewport = display.actual_display_bounds(dock, config);
+    let projected_min = layout_pos.0 + strip_target;
+    let projected_frame = IRect::from_corners(projected_min, projected_min + size);
+    let visible_width = viewport.intersect(projected_frame).width().max(0);
+    let hidden_fraction = 1.0 - f64::from(visible_width) / f64::from(size.x.max(1));
+    visible_width == 0 || hidden_fraction > config.window_hidden_ratio()
+}
+
 /// Handles mouse down events.
 ///
-/// This function finds the window at the click point. If the window is not fully visible,
-/// it triggers a reshuffle to expose it.
-///
-/// # Arguments
-///
-/// * `trigger` - The Bevy event trigger containing the mouse down event.
-/// * `windows` - A query for all windows.
-/// * `active_display` - A query for the active display.
-/// * `main_cid` - The main connection ID resource.
-/// * `commands` - Bevy commands to trigger a reshuffle.
+/// This function finds the window at the click point. If the click changes focus,
+/// stops a settling scroll, or targets a window obscured beyond
+/// `window_hidden_ratio`, it defers a reshuffle until mouse-up.
 fn mouse_down_trigger(
     mut messages: MessageReader<InputEvent>,
-    windows: Windows,
-    scrolling: Query<(Entity, &LayoutStrip), With<Scrolling>>,
+    workspaces: ClickableWorkspaces,
+    displays: Query<(&Display, Option<&DockPosition>)>,
     window_manager: Res<WindowManager>,
-    config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
-    mut commands: Commands,
+    mut ctx: WindowCtx,
 ) {
     for InputEvent(event) in messages.read() {
         let Event::MouseDown {
@@ -238,12 +277,12 @@ fn mouse_down_trigger(
         // The window the tap saw under the press, because by now the pressed
         // window may have moved off the point.
         let Some((_, entity)) = window_id
-            .and_then(|window_id| windows.find(window_id))
+            .and_then(|window_id| ctx.windows.find(window_id))
             .or_else(|| {
                 window_manager
                     .find_window_at_point(point)
                     .ok()
-                    .and_then(|window_id| windows.find(window_id))
+                    .and_then(|window_id| ctx.windows.find(window_id))
             })
         else {
             continue;
@@ -252,30 +291,45 @@ fn mouse_down_trigger(
         // Stop the scroll of the clicked window's strip, which the mouse-up
         // reshuffle then places. A strip settling on another display keeps
         // settling, so it never stays stretched past its end.
-        for (strip_entity, strip) in &scrolling {
-            if strip.contains(entity)
-                && let Ok(mut entity_commands) = commands.get_entity(strip_entity)
+        let mut stopped_scrolling = false;
+        for (strip_entity, strip, _, _, _, scrolling) in &workspaces {
+            if scrolling.is_some()
+                && strip.contains(entity)
+                && let Ok(mut entity_commands) = ctx.commands.get_entity(strip_entity)
             {
                 entity_commands.try_remove::<Scrolling>();
+                stopped_scrolling = true;
             }
         }
 
         // Clean up any stale marker from a previous click.
         for held in &mouse_held {
-            if let Ok(mut entity_commands) = commands.get_entity(held) {
+            if let Ok(mut entity_commands) = ctx.commands.get_entity(held) {
                 entity_commands.try_despawn();
             }
         }
 
-        if *clicks > 1 || config.window_hidden_ratio() >= 1.0 {
-            // Multi-clicks (such as a title-bar double-click to maximize or
-            // restore) do not defer a second reshuffle to MouseUp, and at max
-            // hidden ratio clicks never reshuffle.
-        } else {
+        let focused_changed = ctx
+            .windows
+            .focused()
+            .is_none_or(|(_, focused)| focused != entity);
+
+        if *clicks <= 1
+            && ctx.config.window_hidden_ratio() < 1.0
+            && (stopped_scrolling
+                || focused_changed
+                || is_window_obscured_beyond_ratio(
+                    entity,
+                    &ctx.windows,
+                    &workspaces,
+                    &displays,
+                    &ctx.config,
+                ))
+        {
             // Defer reshuffle until mouse-up so the window doesn't shift
             // mid-click. The Timeout auto-despawns if mouse-up is lost.
-            let timeout = Timeout::new(Duration::from_secs(5), None, &mut commands);
-            commands.spawn((MouseHeldMarker(entity), timeout));
+            let timeout = Timeout::new(Duration::from_secs(5), None, &mut ctx.commands);
+            ctx.commands.spawn((MouseHeldMarker(entity), timeout));
         }
     }
 }
