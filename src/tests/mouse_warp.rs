@@ -443,47 +443,80 @@ fn duplicate_edge_samples_in_one_drain_warp_only_once_without_spurious_carry() {
 
 #[test]
 fn velocity_carry_uses_event_timestamps_within_a_single_drain() {
-    // Two events generated 10 ms apart in native CGEvent timestamps, then
-    // dispatched only 50 microseconds apart after a main-run-loop stall:
-    // 509 is outside the 3-px edge threshold (`512 - 509 == 3`), then moving
-    // 1 px rightward to 510 over 10 ms = 100 px/s -> 30 ms carry = 3 px ->
-    // landing at -1408 + 6 + 3 = -1399 (not clamped to +80 px from burst dispatch).
-    let mut anchor = None;
+    // Physical HID devices report Mach ticks (24 MHz on Apple silicon:
+    // numer = 125, denom = 3 -> 240_000 ticks == 10 ms), while software-posted
+    // events report nanoseconds above `mach_absolute_time()`. Even if a
+    // main-run-loop stall dispatches both events 50 us apart, a 1 px move over
+    // 10 ms = 100 px/s -> 30 ms carry = 3 px -> landing at -1408 + 6 + 3 = -1399.
     let stalled_dispatch = std::time::Instant::now();
-    let t1 = crate::platform::input::cg_event_timestamp_to_instant(
-        50_000_000_000,
-        &mut anchor,
+    let burst_second = stalled_dispatch + std::time::Duration::from_micros(50);
+
+    // 1. Mach-tick timestamps (Apple silicon 125/3 timebase: 240_000 ticks = 10 ms).
+    let now_ticks = 10_000_000_000;
+    let mut mach_anchor = None;
+    let t1_mach = crate::platform::input::anchor_event_time(
+        crate::platform::slice_tap::made_at_with_timebase(now_ticks - 240_000, now_ticks, 125, 3),
+        &mut mach_anchor,
         stalled_dispatch,
     );
-    let t2 = crate::platform::input::cg_event_timestamp_to_instant(
-        50_010_000_000,
-        &mut anchor,
-        stalled_dispatch + std::time::Duration::from_micros(50),
+    let t2_mach = crate::platform::input::anchor_event_time(
+        crate::platform::slice_tap::made_at_with_timebase(now_ticks, now_ticks, 125, 3),
+        &mut mach_anchor,
+        burst_second,
     );
-    let events = vec![
-        Event::MouseMoved {
-            point: objc2_core_foundation::CGPoint {
-                x: 509.0,
-                y: -600.0,
-            },
-            delta_y: 0,
-            timestamp: t1,
-            modifiers: crate::platform::Modifiers::empty(),
-        },
-        Event::MouseMoved {
-            point: objc2_core_foundation::CGPoint {
-                x: 510.0,
-                y: -600.0,
-            },
-            delta_y: 0,
-            timestamp: t2,
-            modifiers: crate::platform::Modifiers::empty(),
-        },
-    ];
-    let (_, cursor) = pointer_pumped_events(desk(true), events);
     assert_eq!(
-        cursor,
-        IVec2::new(-1399, -1800),
-        "carry-over must use native CGEvent timestamps even when run-loop dispatch stalls into a burst"
+        t2_mach.saturating_duration_since(t1_mach),
+        std::time::Duration::from_millis(10)
     );
+
+    // 2. Software-posted nanosecond timestamps through `cg_event_timestamp_to_instant`,
+    //    plus zero-timestamp fallback to `dispatch_now`.
+    let mut ns_anchor = None;
+    let far_ns = u64::MAX / 4;
+    let t1_ns = crate::platform::input::cg_event_timestamp_to_instant(
+        far_ns,
+        &mut ns_anchor,
+        stalled_dispatch,
+    );
+    let t2_ns = crate::platform::input::cg_event_timestamp_to_instant(
+        far_ns + 10_000_000,
+        &mut ns_anchor,
+        burst_second,
+    );
+    assert_eq!(
+        crate::platform::input::cg_event_timestamp_to_instant(0, &mut ns_anchor, burst_second),
+        burst_second
+    );
+
+    for (label, t1, t2) in [
+        ("mach ticks", t1_mach, t2_mach),
+        ("nanoseconds", t1_ns, t2_ns),
+    ] {
+        let events = vec![
+            Event::MouseMoved {
+                point: objc2_core_foundation::CGPoint {
+                    x: 509.0,
+                    y: -600.0,
+                },
+                delta_y: 0,
+                timestamp: t1,
+                modifiers: crate::platform::Modifiers::empty(),
+            },
+            Event::MouseMoved {
+                point: objc2_core_foundation::CGPoint {
+                    x: 510.0,
+                    y: -600.0,
+                },
+                delta_y: 0,
+                timestamp: t2,
+                modifiers: crate::platform::Modifiers::empty(),
+            },
+        ];
+        let (_, cursor) = pointer_pumped_events(desk(true), events);
+        assert_eq!(
+            cursor,
+            IVec2::new(-1399, -1800),
+            "carry-over ({label}) must use normalized CGEvent timestamps even when run-loop dispatch stalls into a burst"
+        );
+    }
 }
