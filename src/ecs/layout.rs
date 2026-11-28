@@ -1511,6 +1511,47 @@ impl LayoutStrip {
         }
     }
 
+    /// Consumes the column to the right of `entity`'s column into it. The
+    /// column survives at its own position; its own item(s) stay on top and
+    /// the consumed column's item(s) join the bottom. A no-op if there is no
+    /// column to the right, or if either column cannot be stacked (such as
+    /// `Column::Fullscreen` or `Column::Maximized`), checked before removing
+    /// anything from `self.columns`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Error)` if the window is not in the strip.
+    pub fn consume(&mut self, entity: Entity) -> Result<()> {
+        let index = self.index_of(entity)?;
+        let Some(own_items) = self.columns.get(index).and_then(Column::stack_items) else {
+            return Ok(());
+        };
+        let Some(neighbor_items) = self.columns.get(index + 1).and_then(Column::stack_items) else {
+            return Ok(());
+        };
+
+        self.columns.remove(index);
+        self.columns.remove(index);
+        self.even_splits.insert(entity);
+
+        if own_items
+            .iter()
+            .flat_map(StackItem::window_iter)
+            .any(|e| self.tabbed_stacks.contains(&e))
+        {
+            self.tabbed_stacks
+                .extend(neighbor_items.iter().flat_map(StackItem::window_iter));
+        } else {
+            for member in neighbor_items.iter().flat_map(StackItem::window_iter) {
+                self.tabbed_stacks.remove(&member);
+            }
+        }
+
+        self.columns
+            .insert(index, Column::Stack([own_items, neighbor_items].concat()));
+        Ok(())
+    }
+
     /// Moves the stack item holding `entity` out of its stack into a new
     /// column on `side` of the stack. A no-op if the window is not stacked.
     ///

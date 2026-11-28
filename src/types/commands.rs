@@ -351,6 +351,13 @@ pub enum Operation {
     /// Moves the focused window out of its stack into a new column on the
     /// given side of the stack.
     Unstack(Side),
+    /// Consumes the column to the right of the focused window's column into
+    /// it, appending the consumed column's item(s) below whatever is already
+    /// there.
+    Consume,
+    /// Pulls the focused window out of its stack into its own column to the
+    /// right, leaving focus on a sibling remaining in the stack.
+    Expel,
     /// Toggles the focused window's stack between a normal split display
     /// (all windows visible, sharing height) and a tabbed display (one
     /// window visible at a time, sharing the full column). Cycle tabs with

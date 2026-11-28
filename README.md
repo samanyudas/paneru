@@ -287,6 +287,8 @@ $ paneru send-cmd <command> [args...]
 | `window balance`           | Make all columns match the focused window width  |
 | `window stack [west\|east]` | Move the focused window into the neighbouring column (default west) |
 | `window unstack [east\|west]` | Pop the focused window out of its stack into a new column (default east) |
+| `window consume`           | Pull the column to the right into the current column |
+| `window expel`             | Pop the focused window out of its stack, keeping focus on the stack |
 | `window nextdisplay`       | Move the focused window's column to the next display |
 | `window nextdisplaysend`   | Move the window's column to the next display but stay here |
 | `window displaymove <id>`  | Move the focused window's column to display `<id>` |

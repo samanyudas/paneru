@@ -141,6 +141,8 @@ pub fn register_commands(app: &mut bevy::app::App) {
             copy_window_rule,
             command_focus_window,
             toggle_tabbed_display_handler,
+            consume_windows_handler,
+            expel_windows_handler,
             focus_display.after(command_move_focus),
             check_desktop_focus.after(focus_display),
             // A width command and a maximize restore each start a run, which
@@ -2555,6 +2557,113 @@ pub fn stack_windows_handler(
         // edge-clamp in reshuffle_layout_strip keeps the strip pinned so the
         // leftmost window touches the left edge and the rightmost the right.
         commands.reshuffle_around(entity);
+    }
+}
+
+/// Pulls the column to the right of the focused window's column into it,
+/// respecting the display's stack limit and restoring any maximized column
+/// involved before merging.
+#[instrument(level = Level::DEBUG, skip_all)]
+pub fn consume_windows_handler(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    mut active_display: ActiveDisplayMut,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::Consume))
+        .next()
+        .is_none()
+    {
+        return;
+    }
+
+    if let Some((_, entity, unmanaged)) = windows
+        .focused()
+        .and_then(|(_, entity)| windows.get_managed(entity))
+        && unmanaged.is_none()
+    {
+        let viewport = active_display.actual_bounds(&config);
+        let limit = effective_stack_limit(&config, viewport.height());
+        let strip = active_display.strip();
+        let Ok(index) = strip.index_of(entity) else {
+            return;
+        };
+        let Ok(own_col) = strip.get(index) else {
+            return;
+        };
+        let Ok(neighbor_col) = strip.get(index + 1) else {
+            return;
+        };
+        if matches!(own_col, Column::Fullscreen(_)) || matches!(neighbor_col, Column::Fullscreen(_))
+        {
+            return;
+        }
+        let item_count = |column: &Column| match column {
+            Column::Single(_) | Column::Tabs(_) | Column::Maximized(_) => 1,
+            Column::Stack(items) => items.len(),
+            Column::Fullscreen(_) => 0,
+        };
+        if item_count(&own_col) + item_count(&neighbor_col) > limit {
+            return;
+        }
+        let neighbor_top = neighbor_col.top();
+        let strip_entity = active_display.active_strip_entity();
+        let strip = active_display.active_strip();
+        for window in std::iter::once(entity).chain(neighbor_top) {
+            restore_tiled(window, strip, RestoreTo::Here, viewport, &mut commands);
+        }
+        if strip.consume(entity).is_err() {
+            return;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+            entity_commands.try_remove::<crate::ecs::Scrolling>();
+        }
+        commands.reshuffle_around(entity);
+    }
+}
+
+/// Pulls the focused window out of its stack into its own column to the
+/// right, leaving focus on a sibling remaining in the stack.
+#[instrument(level = Level::DEBUG, skip_all)]
+pub fn expel_windows_handler(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    mut active_display: ActiveDisplayMut,
+    mut commands: Commands,
+) {
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::Expel))
+        .next()
+        .is_none()
+    {
+        return;
+    }
+
+    if let Some((_, entity, unmanaged)) = windows
+        .focused()
+        .and_then(|(_, entity)| windows.get_managed(entity))
+        && unmanaged.is_none()
+    {
+        let strip = active_display.strip();
+        let Some(sibling) = get_window_in_direction(&Direction::South, entity, strip)
+            .or_else(|| get_window_in_direction(&Direction::North, entity, strip))
+        else {
+            return;
+        };
+
+        let strip_entity = active_display.active_strip_entity();
+        if active_display
+            .active_strip()
+            .unstack(entity, Side::East)
+            .is_err()
+        {
+            return;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+            entity_commands.try_remove::<crate::ecs::Scrolling>();
+        }
+        commands.focus_entity_for_command(sibling, false);
+        commands.reshuffle_around(sibling);
     }
 }
 

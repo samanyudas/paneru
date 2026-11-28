@@ -130,6 +130,8 @@ impl StateBroadcastIntent {
                             | Operation::MoveEdge(..)
                             | Operation::Stack(_)
                             | Operation::Unstack(_)
+                            | Operation::Consume
+                            | Operation::Expel
                             | Operation::ToggleTabbedDisplay,
                         ),
                 } => intent.windows_changed = true,

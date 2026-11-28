@@ -1,5 +1,6 @@
 mod app_quit;
 mod column_moves;
+mod consume_expel;
 mod crossing_focus;
 mod display;
 mod drag;
