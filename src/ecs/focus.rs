@@ -487,7 +487,7 @@ fn maintain_verify_focus_singleton(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn detect_focus_rejection(
     mut pending: Populated<(Entity, &Window, &ChildOf, &mut Timeout, &mut VerifyFocus)>,
@@ -496,6 +496,7 @@ fn detect_focus_rejection(
     windows: Windows,
     events: Option<Res<Messages<Event>>>,
     mut event_cursor: Local<MessageCursor<Event>>,
+    mut history: Option<ResMut<FocusHistory>>,
     mut commands: Commands,
 ) {
     let mut focused_apps = Vec::new();
@@ -655,6 +656,9 @@ fn detect_focus_rejection(
             if strip.contains(target_entity) {
                 strip.remove(target_entity);
             }
+        }
+        if let Some(history) = &mut history {
+            history.forget(target_entity);
         }
         commands.focus_entity(actual_entity, false);
     }
