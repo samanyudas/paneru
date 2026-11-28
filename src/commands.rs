@@ -139,6 +139,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
         PreUpdate,
         (
             copy_window_rule,
+            command_focus_window,
             toggle_tabbed_display_handler,
             focus_display.after(command_move_focus),
             check_desktop_focus.after(focus_display),
@@ -312,6 +313,51 @@ fn touching_display<T>(
 fn focus_into_view(entity: Entity, focused: Option<Entity>, commands: &mut Commands) {
     focus_with_verification(entity, focused, None, FocusSource::Command, commands);
     commands.reshuffle_around(entity);
+}
+
+/// Direct focus and previous-window focus share the same eligibility and reveal path.
+fn command_focus_window(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    workspaces: Query<&LayoutStrip>,
+    history: Res<FocusHistory>,
+    mut commands: Commands,
+) {
+    let Some(operation) = filter_window_operations(&mut messages, |op| {
+        matches!(op, Operation::FocusPrevious | Operation::FocusId(_))
+    })
+    .last() else {
+        return;
+    };
+    let focused = windows.focused().map(|(_, entity)| entity);
+    let mut candidates = windows.iter().filter_map(|(window, entity)| {
+        let (_, _, unmanaged) = windows.get_managed(entity)?;
+        match unmanaged {
+            None if workspaces.iter().any(|strip| strip.contains(entity)) => {
+                Some((window.id(), entity, true))
+            }
+            Some(Unmanaged::Floating) => Some((window.id(), entity, false)),
+            _ => None,
+        }
+    });
+    let target = match operation {
+        Operation::FocusPrevious => candidates
+            .filter(|(_, entity, _)| Some(*entity) != focused)
+            .filter_map(|(_, entity, tiled)| Some((history.window_recency(entity)?, entity, tiled)))
+            .max_by_key(|(recency, ..)| *recency)
+            .map(|(_, entity, tiled)| (entity, tiled)),
+        Operation::FocusId(id) => candidates
+            .find(|(candidate, ..)| candidate == id)
+            .map(|(_, entity, tiled)| (entity, tiled)),
+        _ => None,
+    };
+    if let Some((entity, tiled)) = target {
+        if tiled {
+            focus_into_view(entity, focused, &mut commands);
+        } else {
+            focus_with_verification(entity, focused, None, FocusSource::Command, &mut commands);
+        }
+    }
 }
 
 /// A plain focus step that crossed toward `crossed` to display `display`.

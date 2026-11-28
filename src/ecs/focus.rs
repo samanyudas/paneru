@@ -83,6 +83,8 @@ pub struct FocusHistory {
     /// When each managed window last had focus, as a count of focus records,
     /// so a jump into a column can return to the window that had it last.
     managed_recency: EntityHashMap<u64>,
+    /// Unlike `managed_recency`, records actual focus changes and includes floating windows.
+    window_recency: EntityHashMap<u64>,
     records: u64,
 }
 
@@ -133,7 +135,17 @@ impl FocusHistory {
             .or_else(|| column.top())
     }
 
+    fn record_window_focus(&mut self, entity: Entity) {
+        self.records += 1;
+        self.window_recency.insert(entity, self.records);
+    }
+
+    pub fn window_recency(&self, entity: Entity) -> Option<u64> {
+        self.window_recency.get(&entity).copied()
+    }
+
     pub fn forget(&mut self, entity: Entity) {
+        self.window_recency.remove(&entity);
         self.managed_recency.remove(&entity);
         for slot in self.by_workspace.values_mut() {
             if slot.last_managed == Some(entity) {
@@ -356,9 +368,13 @@ fn maintain_focus_singleton(
     trigger: On<Add, FocusedMarker>,
     windows: Query<(Entity, Has<FocusedMarker>), With<Window>>,
     mut config: GlobalState,
+    mut history: ResMut<FocusHistory>,
     mut commands: Commands,
 ) {
     let focused_entity = trigger.event().entity;
+    if windows.contains(focused_entity) {
+        history.record_window_focus(focused_entity);
+    }
 
     for (entity, focused) in windows {
         if focused

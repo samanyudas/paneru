@@ -66,6 +66,13 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "focus" => match argument()? {
             "unmanaged" => Operation::FocusUnmanaged,
             "managed" => Operation::FocusManaged,
+            "previous" => Operation::FocusPrevious,
+            "id" => Operation::FocusId(
+                argv.get(2)
+                    .and_then(|id| id.parse::<i32>().ok())
+                    .filter(|id| *id > 0)
+                    .ok_or_else(err)?,
+            ),
             direction => Operation::Focus(Direction::parse_positional(direction)?),
         },
         "raise" => match argument()? {
@@ -207,6 +214,8 @@ impl Operation {
         let owned = |args: &[&str]| args.iter().map(|arg| (*arg).to_string()).collect();
         match self {
             Operation::Focus(direction) => vec!["focus".to_string(), direction.token()],
+            Operation::FocusPrevious => owned(&["focus", "previous"]),
+            Operation::FocusId(id) => owned(&["focus", "id", &id.to_string()]),
             Operation::Swap(direction) => vec!["swap".to_string(), direction.token()],
             Operation::FocusStep(side, _) => owned(&["focus", side.token()]),
             Operation::MoveStep(side, _) => owned(&["swap", side.token()]),
@@ -380,6 +389,8 @@ mod tests {
             Operation::VirtualMoveNumber(0, MoveFocus::Stay),
             Operation::FocusUnmanaged,
             Operation::FocusManaged,
+            Operation::FocusPrevious,
+            Operation::FocusId(42),
             Operation::RaiseFloating,
             Operation::ToggleFloatingLayer,
             Operation::CopyRule,

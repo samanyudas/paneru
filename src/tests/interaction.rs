@@ -3562,3 +3562,54 @@ fn test_last_column_jump_focuses_the_stacks_last_focused_window() {
         .on_iteration(4, |world, _state| assert_focused!(world, 2))
         .run(commands);
 }
+
+#[test]
+fn previous_window_toggles_between_two_distinct_windows() {
+    let previous = || Event::Command {
+        command: Command::Window(Operation::FocusPrevious),
+    };
+    let by_id = |id| Event::Command {
+        command: Command::Window(Operation::FocusId(id)),
+    };
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(3, |world, _state| assert_focused!(world, 2))
+        .on_iteration(4, |world, _state| assert_focused!(world, 1))
+        .on_iteration(5, |world, _state| assert_focused!(world, 2))
+        .on_iteration(6, |world, _state| assert_focused!(world, 2))
+        .on_iteration(8, |world, _state| assert_focused!(world, 0))
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            focus(Direction::First),
+            by_id(1),
+            by_id(2),
+            previous(),
+            previous(),
+            by_id(999),
+            Event::WindowMinimized { window_id: 1 },
+            previous(),
+        ]);
+}
+
+#[test]
+fn focus_by_id_selects_the_requested_stack_member() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(2, |world, _state| {
+            assert_eq!(strip_slots(world, 3), [(0, 0), (0, 1), (1, 0)]);
+            assert_focused!(world, 1);
+        })
+        .on_iteration(3, |world, _state| assert_focused!(world, 2))
+        .on_iteration(4, |world, _state| assert_focused!(world, 1))
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            focus(Direction::Nth(1)),
+            Event::Command {
+                command: Command::Window(Operation::Stack(Side::West)),
+            },
+            focus(Direction::Last),
+            Event::Command {
+                command: Command::Window(Operation::FocusId(1)),
+            },
+        ]);
+}
