@@ -1088,7 +1088,6 @@ fn test_window_can_resize_to_two_display_widths_and_scroll() {
 /// window just like the interactive `Operation::SetWidth` path, instead of only
 /// storing a `WidthRatio` that nothing consumes and the next bounds sync
 /// overwrites from the live frame.
-#[cfg(feature = "lua")]
 #[test]
 fn test_lua_set_width_layout_op_resizes_the_focused_window() {
     use crate::types::windowset::LayoutOp;
@@ -1118,7 +1117,6 @@ fn test_lua_set_width_layout_op_resizes_the_focused_window() {
 
 /// A `LayoutOp::SetWidth` names its window, so it must resize that window even
 /// when another one holds the focus, and leave the focused one alone.
-#[cfg(feature = "lua")]
 #[test]
 fn test_lua_set_width_layout_op_resizes_an_unfocused_window() {
     use crate::types::windowset::LayoutOp;

@@ -49,7 +49,6 @@ pub mod drag;
 pub(crate) mod ease;
 pub mod focus;
 pub mod layout;
-#[cfg(feature = "lua")]
 pub mod layout_ops;
 pub(crate) mod maximize;
 pub mod mouse;
