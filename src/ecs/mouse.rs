@@ -463,8 +463,8 @@ pub(super) struct WarpVelocityState {
 
 impl WarpVelocityState {
     fn record_warp(&mut self, landing: Origin, window_manager: &WindowManager) {
-        let warp_time = Instant::now();
         window_manager.warp_mouse(landing);
+        let warp_time = Instant::now();
         self.last = Some((landing, warp_time));
         self.warped_at = Some(warp_time);
     }

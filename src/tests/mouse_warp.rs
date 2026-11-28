@@ -533,7 +533,7 @@ fn velocity_carry_uses_event_timestamps_within_a_single_drain() {
 fn pre_warp_edge_sample_arriving_in_next_drain_does_not_re_warp() {
     // Drain 1 warps from the right edge of `left_monitor` onto `right_monitor`.
     // Drain 2 (next frame) delivers a stale HID event created BEFORE Drain 1's
-    // warp still carrying the source display's edge coordinate `(511, -600)`.
+    // warp still carrying the source display's edge coordinate `(511, -590)`.
     // Comparing `motion.timestamp < warped_at` must drop it without re-warping.
     let pre_warp = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_millis(20))
@@ -550,7 +550,7 @@ fn pre_warp_edge_sample_arriving_in_next_drain_does_not_re_warp() {
     let drain_2_stale = [Event::MouseMoved {
         point: objc2_core_foundation::CGPoint {
             x: 511.0,
-            y: -600.0,
+            y: -590.0,
         },
         delta_y: 0,
         timestamp: pre_warp + std::time::Duration::from_millis(5),
