@@ -344,18 +344,15 @@ fn command_focus_window(
         return;
     }
 
-    let is_hidden = |entity| {
-        windows
-            .parent_of(entity)
-            .and_then(|app| apps.get(app).ok())
-            .is_some_and(|app| app.is_hidden())
-    };
+    let app_of = |entity| windows.parent_of(entity).and_then(|app| apps.get(app).ok());
     let candidates: Vec<FocusCandidate> = windows
         .iter()
         .filter_map(|(window, entity)| {
             let tiled = match windows.get_managed(entity)?.2 {
                 None if workspaces.iter().any(|strip| strip.contains(entity)) => true,
-                Some(Unmanaged::Floating) if !is_hidden(entity) => false,
+                Some(Unmanaged::Floating) if !app_of(entity).is_some_and(|app| app.is_hidden()) => {
+                    false
+                }
                 _ => return None,
             };
             Some(FocusCandidate {
@@ -382,6 +379,7 @@ fn command_focus_window(
         match event {
             Event::WindowFocused { window_id } => {
                 if let Some(next) = find_id(*window_id)
+                    && app_of(next.entity).is_some_and(|app| app.is_frontmost())
                     && current.map(|c| c.entity) != Some(next.entity)
                 {
                     previous = current;
