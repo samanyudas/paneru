@@ -105,6 +105,17 @@ type ChangedStrips<'w, 's> = Populated<
     Changed<LayoutStrip>,
 >;
 
+type DestroyableStrips<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        &'static mut LayoutStrip,
+        Entity,
+        Option<&'static ChildOf>,
+        Option<&'static NativeFullscreenMarker>,
+    ),
+>;
+
 impl Plugin for WorkspaceEventsPlugin {
     fn build(&self, app: &mut App) {
         const DISPLAY_CHANGE_CHECK_FREQ: Duration = Duration::from_secs(1);
@@ -345,8 +356,7 @@ fn workspace_change_handler(
 #[allow(clippy::too_many_arguments)]
 fn workspace_destroyed_handler(
     mut messages: MessageReader<Event>,
-    mut workspaces: Populated<(&mut LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
-    parents: Query<&ChildOf, With<LayoutStrip>>,
+    mut workspaces: DestroyableStrips,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut focus_history: ResMut<FocusHistory>,
@@ -355,88 +365,97 @@ fn workspace_destroyed_handler(
     time: Res<Time>,
     mut commands: Commands,
 ) {
+    let mut present_display_ids = None;
     for event in messages.read() {
         let Event::SpaceDestroyed { space_id } = event else {
             continue;
         };
         focus_history.forget_workspace(*space_id);
         display_homes.space_destroyed(*space_id);
-        for (strip, _, fullscreen) in &workspaces {
-            if fullscreen.is_none() && strip.id() == *space_id {
-                native.space_destroyed(strip, time.elapsed());
-            }
+
+        let matching: Vec<_> = workspaces
+            .iter()
+            .filter(|(strip, _, _, _)| strip.id() == *space_id)
+            .map(|(strip, entity, parent, fullscreen)| {
+                if fullscreen.is_none() {
+                    native.space_destroyed(strip, time.elapsed());
+                }
+                let window = strip.first().ok().and_then(|col| col.top());
+                (
+                    entity,
+                    parent.map(ChildOf::parent),
+                    window.zip(fullscreen.cloned()),
+                )
+            })
+            .collect();
+        if matching.is_empty() {
+            continue;
         }
 
-        let Some((entity, fullscreen)) =
-            workspaces.iter().find_map(|(strip, entity, fullscreen)| {
-                let window = strip.first().ok().and_then(|col| col.top());
-                (strip.id() == *space_id).then_some((entity, window.zip(fullscreen.cloned())))
-            })
-        else {
-            continue;
-        };
-
-        // macOS deletes the spaces of a removed display and moves their windows later.
-        // Keep the strip, so that display reconciliation can move the windows in order.
-        if fullscreen.is_none()
-            && let Ok((strip, _, _)) = workspaces.get(entity)
-            && strip.len() > 0
-        {
-            let parent = parents.get(entity).ok().map(ChildOf::parent);
-            let display_present = parent
-                .and_then(|parent| displays.get(parent).ok())
-                .is_some_and(|display| {
+        for (entity, parent, fullscreen) in matching {
+            // macOS deletes the spaces of a removed display and moves their windows later.
+            // Keep the strip, so that display reconciliation can move the windows in order.
+            if fullscreen.is_none()
+                && let Ok((strip, _, _, _)) = workspaces.get(entity)
+                && strip.len() > 0
+            {
+                let present_ids = present_display_ids.get_or_insert_with(|| {
                     window_manager
                         .present_displays()
-                        .iter()
-                        .any(|(present, _)| present.id() == display.id())
+                        .into_iter()
+                        .map(|(present, _)| present.id())
+                        .collect::<HashSet<_>>()
                 });
-            if !display_present {
-                debug!("Workspace destroyed {space_id} with its display; keeping its windows");
-                if let Some(parent) = parent {
-                    crate::ecs::display::orphan_strip(strip, entity, parent, &mut commands);
-                    let destroyed_space = *space_id;
-                    commands.queue(move |world: &mut World| {
-                        world
-                            .resource_mut::<crate::ecs::display_homes::DisplayHomes>()
-                            .space_destroyed(destroyed_space);
-                    });
+                let display_present = parent
+                    .and_then(|parent| displays.get(parent).ok())
+                    .is_some_and(|display| present_ids.contains(&display.id()));
+                if !display_present {
+                    debug!("Workspace destroyed {space_id} with its display; keeping its windows");
+                    if let Some(parent) = parent {
+                        crate::ecs::display::orphan_strip(strip, entity, parent, &mut commands);
+                        let destroyed_space = *space_id;
+                        commands.queue(move |world: &mut World| {
+                            world
+                                .resource_mut::<crate::ecs::display_homes::DisplayHomes>()
+                                .space_destroyed(destroyed_space);
+                        });
+                    }
+                    continue;
                 }
-                continue;
             }
-        }
 
-        if let Some((
-            window,
-            NativeFullscreenMarker {
-                layout_strip,
-                workspace_id,
-                index,
-            },
-        )) = fullscreen
-        {
-            let mut strip = workspaces
-                .iter_mut()
-                .find_map(|(strip, entity, _)| (entity == layout_strip).then_some(strip));
-            if strip.is_none() {
-                strip = workspaces
+            if let Some((
+                window,
+                NativeFullscreenMarker {
+                    layout_strip,
+                    workspace_id,
+                    index,
+                },
+            )) = fullscreen
+            {
+                let mut strip = workspaces
                     .iter_mut()
-                    .find_map(|(strip, _, _)| (strip.id() == workspace_id).then_some(strip));
+                    .find_map(|(strip, entity, _, _)| (entity == layout_strip).then_some(strip));
+                if strip.is_none() {
+                    strip = workspaces
+                        .iter_mut()
+                        .find_map(|(strip, _, _, _)| (strip.id() == workspace_id).then_some(strip));
+                }
+
+                debug!(
+                    "previously fullscreened window {entity} inserted at {}",
+                    index
+                );
+                if let Some(mut strip) = strip {
+                    strip.insert_at(index, window);
+                    commands.reshuffle_around(window);
+                }
             }
 
-            debug!(
-                "previously fullscreened window {entity} inserted at {}",
-                index
-            );
-            if let Some(mut strip) = strip {
-                strip.insert_at(index, window);
-                commands.reshuffle_around(window);
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                debug!("Workspace destroyed {space_id} {entity}");
+                entity_commands.try_despawn();
             }
-        }
-
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            debug!("Workspace destroyed {space_id} {entity}");
-            entity_commands.try_despawn();
         }
     }
 }
