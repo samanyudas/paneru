@@ -501,6 +501,11 @@ pub(crate) enum DragState {
 }
 
 impl DragState {
+    /// Whether a title-bar drag is actively moving a window.
+    pub(crate) fn is_dragging(&self) -> bool {
+        matches!(self, Self::Dragging(_))
+    }
+
     /// Whether a press or drag holds a window, so nothing else should move
     /// it.
     pub(crate) fn holds_window(&self) -> bool {

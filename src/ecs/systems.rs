@@ -1804,6 +1804,7 @@ pub(super) fn update_overlays(
     applications: Query<&Application>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mission_control_active: Res<MissionControlActive>,
+    drag: Option<Res<DragState>>,
     config: Res<Config>,
     theme: Option<Res<SystemTheme>>,
     mut window_config_cache: Local<OverlayWindowConfigCache>,
@@ -1823,14 +1824,22 @@ pub(super) fn update_overlays(
         window_config_cache.window_id = None;
     }
 
-    // Hide overlays during swipe, mission control, native fullscreen spaces,
+    // Hide overlays during swipe, drag, mission control, native fullscreen spaces,
     // or briefly after a space change (macOS space-switch animation).
     let Some((swiping, sliding, resizing, active_strip)) = active_workspace.iter().next() else {
         return;
     };
 
+    let dragging = drag.is_some_and(|drag| drag.is_dragging());
+
     // A picture cover moves pictures, not the windows the overlays follow.
-    if swiping || sliding || resizing || mission_control_active.0 || active_strip.is_fullscreen() {
+    if swiping
+        || sliding
+        || resizing
+        || dragging
+        || mission_control_active.0
+        || active_strip.is_fullscreen()
+    {
         overlay_mgr.hide_all();
         return;
     }
