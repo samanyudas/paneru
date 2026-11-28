@@ -1,10 +1,15 @@
+mod consume_expel;
+mod desktop_mock;
 mod display;
+mod drag;
 mod focus_or_virtual;
 mod harness;
 mod interaction;
 mod mocks;
 mod mouse_focus;
+mod mouse_warp;
 mod session_restore;
+mod setups;
 mod state;
 mod tabbed_display;
 mod tabs;

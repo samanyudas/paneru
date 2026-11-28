@@ -21,11 +21,13 @@ pub(crate) fn focus_direction(gesture_direction: SwipeGestureDirection, delta: f
 #[derive(Deserialize, Clone, Debug, Default)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct SwipeOptions {
-    /// Swipe sensitivity multiplier. Lower values = less distance per finger
-    /// movement. Range: 0.1–2.0. Default: 0.35.
+    /// Swipe sensitivity multiplier. The resolved value is calibrated by 5×
+    /// for normalized finger coordinates.
+    /// Range: 0.1–2.0. Default: 0.35.
     pub sensitivity: Option<f64>,
 
-    /// Swipe inertia deceleration rate. Higher values = faster stop.
+    /// Swipe inertia deceleration rate. The resolved rate is calibrated by 2×
+    /// so higher values stop more quickly.
     /// Range: 1.0–10.0. Default: 4.0.
     pub deceleration: Option<f64>,
 
@@ -59,6 +61,12 @@ pub struct GestureOptions {
 
     /// Play a haptic pulse for each confirmed paging focus change. Default: true.
     pub haptics: Option<bool>,
+
+    /// Finger count whose vertical swipe scrubs the overview open (up) and
+    /// closed (down). Unset disables the gesture. Must differ from
+    /// `fingers_count`; macOS's own gesture for the same count (Mission
+    /// Control on 4 fingers) has to be turned off in System Settings.
+    pub overview_fingers: Option<usize>,
 }
 
 fn positive_distance_cm<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>

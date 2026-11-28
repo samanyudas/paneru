@@ -4,7 +4,6 @@ use bevy::{
         hierarchy::ChildOf,
         query::{With, Without},
         system::{Commands, Query, Res, ResMut, Single, SystemParam},
-        world::Mut,
     },
     math::IRect,
 };
@@ -155,7 +154,7 @@ impl ActiveDisplay<'_, '_> {
 /// It allows systems to modify the active display and its associated `LayoutStrip`s.
 #[derive(SystemParam)]
 pub struct ActiveDisplayMut<'w, 's> {
-    strip: Single<'w, 's, &'static mut LayoutStrip, With<ActiveWorkspaceMarker>>,
+    strip: Single<'w, 's, (&'static mut LayoutStrip, Entity), With<ActiveWorkspaceMarker>>,
     /// The single active `Display` component, marked with `ActiveDisplayMarker`.
     display: Single<
         'w,
@@ -164,7 +163,7 @@ pub struct ActiveDisplayMut<'w, 's> {
         With<ActiveDisplayMarker>,
     >,
     /// A query for all other `Display` components that are not marked as active.
-    other_displays: Query<'w, 's, &'static mut Display, Without<ActiveDisplayMarker>>,
+    other_displays: Query<'w, 's, &'static Display, Without<ActiveDisplayMarker>>,
 }
 
 impl ActiveDisplayMut<'_, '_> {
@@ -176,13 +175,21 @@ impl ActiveDisplayMut<'_, '_> {
         self.display.2
     }
 
-    /// Returns an iterator over mutable references to all other displays (non-active).
-    pub fn other(&mut self) -> impl Iterator<Item = Mut<'_, Display>> {
-        self.other_displays.iter_mut()
+    /// Returns an iterator over immutable references to all other displays (non-active).
+    pub fn other(&self) -> impl Iterator<Item = &Display> {
+        self.other_displays.iter()
+    }
+
+    pub fn strip(&self) -> &LayoutStrip {
+        &self.strip.0
     }
 
     pub fn active_strip(&mut self) -> &mut LayoutStrip {
-        &mut self.strip
+        &mut self.strip.0
+    }
+
+    pub fn active_strip_entity(&self) -> Entity {
+        self.strip.1
     }
 
     /// Returns the `CGRect` representing the bounds of the active display.
@@ -205,6 +212,8 @@ pub struct FrameActivity<'w, 's> {
     resizing: Query<'w, 's, (), With<ResizeMarker>>,
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
+    overview: Option<bevy::ecs::system::NonSend<'w, crate::overview::view::OverviewManager>>,
+    pending_desktop_ops: Option<Res<'w, crate::ecs::desktop::PendingDesktopOps>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -215,6 +224,21 @@ impl FrameActivity<'_, '_> {
             || !self.resizing.is_empty()
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
+            || self
+                .overview
+                .as_ref()
+                .is_some_and(|overview| overview.has_pending_deadline())
+    }
+
+    /// Maximum event-pump sleep (in ms) while waiting for an async `WMBridge`
+    /// desktop mutation to confirm.
+    pub fn desktop_poll_timeout_ms(&self) -> Option<u32> {
+        self.pending_desktop_ops
+            .as_ref()
+            .is_some_and(|pending| !pending.is_empty())
+            .then_some(
+                u32::try_from(crate::ecs::desktop::DESKTOP_POLL_INTERVAL.as_millis()).unwrap_or(50),
+            )
     }
 }
 

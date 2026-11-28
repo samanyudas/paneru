@@ -44,6 +44,19 @@ pub type Reply = async_channel::Sender<Response>;
 #[derive(Clone, Debug, Message)]
 pub struct InputEvent(pub Event);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseButton {
+    Left,
+    Right,
+}
+
+/// Overview commands, gestures, capture completions, and environment changes
+/// that invalidate an open overview, republished on their own stream by
+/// [`demux_input_events`](crate::ecs::systems::demux_input_events) so
+/// `overview_handler` stays idle during normal desktop activity.
+#[derive(Clone, Debug, Message)]
+pub struct OverviewEvent(pub Event);
+
 /// Several variants carry a payload used only by the Lua bridge
 /// (`src/lua/convert.rs`). The dead-code lint is suppressed only when the
 /// `lua` feature is off, so it still applies to the build that ships.
@@ -121,17 +134,22 @@ pub enum Event {
     MouseDown {
         point: CGPoint,
         modifiers: Modifiers,
+        button: MouseButton,
     },
     /// A mouse up event has occurred.
     MouseUp {
         point: CGPoint,
         modifiers: Modifiers,
+        button: MouseButton,
     },
     /// A mouse drag event has occurred.
     MouseDragged {
         point: CGPoint,
         modifiers: Modifiers,
+        button: MouseButton,
     },
+    /// Escape was pressed during a tiled title-bar drag.
+    CancelDrag,
     /// A mouse move event has occurred.
     MouseMoved {
         point: CGPoint,
@@ -144,6 +162,9 @@ pub enum Event {
         fingers: usize,
         /// Signed mean horizontal finger travel in centimeters.
         distance_cm: f64,
+        /// Elapsed source-event time since the finger positions used as the
+        /// displacement anchor. `None` is for synthetic events without a clock.
+        elapsed_secs: Option<f64>,
     },
 
     /// A vertical trackpad gesture (accumulates delta to threshold before firing).
@@ -160,10 +181,37 @@ pub enum Event {
     /// All fingers are up from the touchpad.
     TouchpadUp,
 
+    /// A click on an open overview panel, in absolute CG coordinates.
+    OverviewClick { point: CGPoint },
+    /// Scroll over an open overview panel (point in absolute CG coordinates,
+    /// deltas in points, natural direction already applied).
+    OverviewScroll { point: CGPoint, dx: f64, dy: f64 },
+    /// Escape pressed while an overview panel had key focus: close back to
+    /// how things were.
+    OverviewDismiss,
+    /// Return pressed while an overview panel had key focus: close into
+    /// what the overview shows.
+    OverviewAccept,
+    /// The overview transition with this generation finished animating.
+    OverviewTransitionDone { generation: u64 },
+    /// Continuous overview gesture progress: vertical finger travel in
+    /// trackpad-normalized units since the previous sample (up is positive).
+    OverviewSwipe { delta: f64, elapsed_secs: f64 },
+    /// The fingers driving an overview gesture lifted.
+    OverviewSwipeEnd,
+    /// The overview's finger count landed on the trackpad (before moving).
+    OverviewTouchDown,
+    /// A background overview capture finished; picks it up promptly.
+    OverviewCaptureLanded,
+
     /// A new space (virtual desktop) has been created.
     SpaceCreated { space_id: WorkspaceId },
     /// A space has been destroyed.
     SpaceDestroyed { space_id: WorkspaceId },
+    /// The active space on a display changed (`CGS` 1329), carrying the new space ID.
+    SpaceCurrentChanged { space_id: WorkspaceId },
+    /// Space window memberships finished updating (`CGS` 1342).
+    SpaceMembershipChanged,
     /// The active space has changed.
     SpaceChanged,
 
@@ -208,6 +256,10 @@ pub enum Event {
 
     /// A command has been issued to the window manager.
     Command { command: Command },
+
+    /// A tab-indicator segment was clicked. Raw `AppKit` signal, not a
+    /// `Command`, like `MenuOpened`/`MenuClosed`.
+    TabIndicatorClicked { window_id: WinID },
 
     /// A structured state query has been issued by a client.
     StateQuery {
@@ -254,12 +306,65 @@ impl Event {
                 | Event::MouseUp { .. }
                 | Event::MouseDragged { .. }
                 | Event::MouseMoved { .. }
+                | Event::CancelDrag
                 | Event::Swipe { .. }
                 | Event::VerticalSwipe { .. }
                 | Event::VerticalScrollTick { .. }
                 | Event::Scroll { .. }
                 | Event::TouchpadDown
                 | Event::TouchpadUp
+        )
+    }
+
+    /// Maps bare `Escape` (`0x35`) and `Return` (`0x24`) virtual keycodes to
+    /// their overview actions, shared by the `CGEvent` tap and `OverviewView`.
+    pub const fn from_overview_keycode(keycode: u16) -> Option<Self> {
+        match keycode {
+            0x35 => Some(Self::OverviewDismiss),
+            0x24 => Some(Self::OverviewAccept),
+            _ => None,
+        }
+    }
+
+    /// Whether this event directly drives or wakes the workspace overview.
+    pub fn is_overview(&self) -> bool {
+        matches!(
+            self,
+            Event::Command {
+                command: Command::Overview,
+            } | Event::OverviewClick { .. }
+                | Event::OverviewScroll { .. }
+                | Event::OverviewDismiss
+                | Event::OverviewAccept
+                | Event::OverviewTransitionDone { .. }
+                | Event::OverviewSwipe { .. }
+                | Event::OverviewSwipeEnd
+                | Event::OverviewTouchDown
+                | Event::OverviewCaptureLanded
+        )
+    }
+
+    /// Whether this OS environment change invalidates an open overview and
+    /// requires tearing down its stationary panels immediately.
+    pub fn invalidates_overview(&self) -> bool {
+        matches!(
+            self,
+            Event::SpaceChanged
+                | Event::SpaceCurrentChanged { .. }
+                | Event::SpaceDestroyed { .. }
+                | Event::Command {
+                    command: Command::Desktop(_),
+                }
+                | Event::DisplayAdded { .. }
+                | Event::DisplayRemoved { .. }
+                | Event::DisplayMoved { .. }
+                | Event::DisplayResized { .. }
+                | Event::DisplayConfigured { .. }
+                | Event::DisplayChanged
+                | Event::MissionControlShowAllWindows
+                | Event::MissionControlShowFrontWindows
+                | Event::MissionControlShowDesktop
+                | Event::Exit
         )
     }
 }

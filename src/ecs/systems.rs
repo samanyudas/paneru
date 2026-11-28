@@ -7,7 +7,7 @@ use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
 use bevy::ecs::system::{
     Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
 };
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2, Vec2};
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
@@ -25,7 +25,7 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::layout::{Column, LayoutStrip};
+use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
@@ -33,14 +33,54 @@ use crate::ecs::{
     Scrolling, SendMessageTrigger, SpawnCommandsExt, SystemTheme, Unmanaged, WidthRatio,
     WindowProperties,
 };
-use crate::events::{Event, InputEvent};
+use crate::events::{Event, InputEvent, OverviewEvent};
 use crate::manager::{
-    Application, Display, Origin, Process, Size, Window, WindowManager, WindowOS,
+    Application, Display, Origin, Process, ProcessApi, Size, Window, WindowManager, WindowOS,
     bruteforce_windows,
 };
-use crate::overlay::{FlashMessageManager, OverlayManager};
+use crate::overlay::{FlashMessageManager, OverlayManager, TabIndicatorGroup, TabIndicatorManager};
 use crate::platform::input::TapHealth;
 use crate::platform::{PlatformCallbacks, WinID};
+use crate::tab_indicator::TabIndicatorLayout;
+
+// Keep partially registered observers alive during slow AX startup.
+// A separate, low-frequency retry must not gate discovery of usable windows.
+#[derive(bevy::ecs::component::Component)]
+pub(super) struct PendingApplicationObservation;
+
+// Bounded post-launch recovery budget (in 1s ticks) for newly launched
+// processes and applications whose initial `FreshMarker` grace period expired
+// before readiness, observer registration, or their first window settled.
+#[derive(bevy::ecs::component::Component)]
+pub(crate) struct PendingWindowRecovery(u32);
+
+const WINDOW_RECOVERY_ATTEMPTS: u32 = 60;
+
+impl Default for PendingWindowRecovery {
+    fn default() -> Self {
+        Self(WINDOW_RECOVERY_ATTEMPTS)
+    }
+}
+
+type RecoverableApplications<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        Option<&'static Application>,
+        Option<&'static ChildOf>,
+        Option<&'static mut PendingWindowRecovery>,
+        Has<PendingApplicationObservation>,
+    ),
+    (
+        Without<Children>,
+        Without<FreshMarker>,
+        Or<(
+            With<PendingWindowRecovery>,
+            With<PendingApplicationObservation>,
+        )>,
+    ),
+>;
 
 /// Processes and applications still inside their spawn grace period, with the
 /// `FreshMarker` that says whether the spawn actually completed in time.
@@ -246,7 +286,11 @@ pub(crate) fn add_existing_application(
     for (mut app, entity) in fresh_apps {
         let mut offscreen_windows = vec![];
 
-        if app.observe().is_ok_and(|result| result)
+        let observed = app.observe().is_ok_and(|result| result);
+        if !observed && let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(PendingApplicationObservation);
+        }
+        if observed
             && let Ok((found_windows, offscreen)) = window_manager
                 .find_existing_application_windows(&mut app, &spaces, &config)
                 .inspect_err(|err| warn!("{err}"))
@@ -359,7 +403,7 @@ pub(crate) fn finish_setup(
         }
         debug!("space {}: after refresh {strip:?}", strip.id());
 
-        if active_strip && let Some(entity) = strip.first().ok().and_then(|column| column.top()) {
+        if active_strip && let Some(entity) = strip.first() {
             commands.focus_entity(entity, true);
             focused_managed_window = true;
         }
@@ -381,6 +425,19 @@ pub(crate) fn finish_setup(
 
     commands.remove_resource::<Initializing>();
     commands.trigger(RestoreWindowState);
+}
+
+fn check_force_manage(config: &Config, process: &mut dyn ProcessApi) -> bool {
+    if config.should_force_manage_process(process) {
+        debug!(
+            "Forcing management of launched process '{}' despite unobservable policy.",
+            process.name()
+        );
+        process.force_manage(true);
+        true
+    } else {
+        false
+    }
 }
 
 /// Handles the event when a new application is launched. It creates a `Process` and `Application` object,
@@ -410,22 +467,22 @@ pub(super) fn add_launched_process(
             continue;
         }
 
-        if config.should_force_manage_process(process) {
-            debug!(
-                "Forcing management of launched process '{}' despite unobservable policy.",
-                process.name()
-            );
-            process.force_manage(true);
-        }
-
+        let forced = check_force_manage(&config, process);
         if !process.ready() {
-            continue;
+            // `ready()` may have just resolved `NSRunningApplication` for a
+            // process that lacked one at launch, making its bundle ID available
+            // for `manage = true` rules. Re-check once and retry readiness so
+            // force-managed accessory apps are adopted immediately without
+            // leaving an activationPolicy KVO observer behind.
+            if forced || !check_force_manage(&config, process) || !process.ready() {
+                continue;
+            }
         }
 
         if children {
             // Process already has an attached Application, so finish.
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<FreshMarker>();
+                entity_commands.try_remove::<(FreshMarker, PendingWindowRecovery)>();
             }
             continue;
         }
@@ -435,18 +492,42 @@ pub(super) fn add_launched_process(
             return;
         };
 
-        if app.observe().is_ok_and(|good| good) {
-            let timeout = Timeout::new(
-                APP_OBSERVABLE_TIMEOUT,
-                Some(format!(
-                    "{app} did not become observable in {}s.",
-                    APP_OBSERVABLE_TIMEOUT.as_secs()
-                )),
-                &mut commands,
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<(FreshMarker, PendingWindowRecovery)>();
+        }
+
+        // Process readiness precedes usable AX during Emacs startup.
+        // Keep this Application even when subscriptions fail; poll windows separately.
+        let observed = app.observe().is_ok_and(|good| good);
+        let timeout = Timeout::new(
+            APP_OBSERVABLE_TIMEOUT,
+            Some(format!(
+                "{app} did not become observable in {}s.",
+                APP_OBSERVABLE_TIMEOUT.as_secs()
+            )),
+            &mut commands,
+        );
+        // Timing out AX discovery must not destroy the app's
+        // observer. Slow Emacs startup can outlast this grace period.
+        let timeout = Timeout {
+            on_expire: Some(|entity| {
+                entity.try_remove::<(FreshMarker, Timeout)>();
+            }),
+            ..timeout
+        };
+        let mut entity_commands = commands.spawn((
+            app,
+            FreshMarker,
+            PendingWindowRecovery::default(),
+            timeout,
+            ChildOf(entity),
+        ));
+        if !observed {
+            entity_commands.insert(PendingApplicationObservation);
+            debug!(
+                "retaining application with pending observers {}",
+                process.name()
             );
-            commands.spawn((app, FreshMarker, timeout, ChildOf(entity)));
-        } else {
-            debug!("failed to register some observers {}", process.name());
         }
     }
 }
@@ -490,6 +571,62 @@ pub(super) fn add_launched_application(
             debug!("removing FreshMarker from {entity}: windows already created via AXCreated");
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<FreshMarker>();
+            }
+        }
+    }
+}
+
+/// Retry on the retained Application, preserving already registered callbacks.
+pub(super) fn retry_application_observers(
+    mut apps: Populated<(Entity, &mut Application), With<PendingApplicationObservation>>,
+    mut commands: Commands,
+) {
+    for (entity, mut app) in &mut apps {
+        if app.observe().is_ok_and(|ready| ready) {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<PendingApplicationObservation>();
+            }
+            debug!("application observers ready for pid {}", app.pid());
+        }
+    }
+}
+
+// Creation notifications can arrive while AX is unresponsive,
+// or before update_frame can read a usable rect. Retaining an observer alone
+// cannot replay that event. Retry newly launched applications with no managed
+// children at one-second intervals for a bounded recovery window, and despawn
+// headless or permanently unobservable processes once that window expires.
+pub(super) fn recover_windowless_applications(
+    mut apps: RecoverableApplications,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    for (entity, app, child_of, recovery, pending_observation) in &mut apps {
+        if let Some(app) = app {
+            let windows = app.window_list(&config);
+            if !windows.is_empty() {
+                commands.trigger(SpawnWindowTrigger(windows));
+                continue;
+            }
+        }
+        if let Some(mut recovery) = recovery {
+            recovery.0 = recovery.0.saturating_sub(1);
+            if recovery.0 > 0 {
+                continue;
+            }
+            let despawn_target = if app.is_none() {
+                Some(entity)
+            } else if pending_observation {
+                Some(child_of.map_or(entity, ChildOf::parent))
+            } else {
+                None
+            };
+            if let Some(target) = despawn_target {
+                if let Ok(mut entity_commands) = commands.get_entity(target) {
+                    entity_commands.try_despawn();
+                }
+            } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<PendingWindowRecovery>();
             }
         }
     }
@@ -594,6 +731,30 @@ pub(super) fn retry_front_switch(
 /// scroll integrator's `MAX_STEP_SECS`) so the wakeup frame steps smoothly.
 const MAX_ANIMATION_STEP_SECS: f64 = 1.0 / 30.0;
 
+/// Keep fractional progress between OS pixel writes. Rounding the integrator's
+/// input every frame otherwise discards small steps and can stall indefinitely.
+#[derive(Default)]
+pub(super) struct AnimationProgress {
+    precise: Vec2,
+    written: IVec2,
+}
+
+impl AnimationProgress {
+    fn step(&mut self, current: IVec2, target: IVec2, t: f32, reset: bool) -> (IVec2, bool) {
+        if reset || self.written != current {
+            self.precise = current.as_vec2();
+        }
+        self.precise = self.precise.lerp(target.as_vec2(), t);
+        let finished = (target.as_vec2() - self.precise).length() <= ANIAMTE_SNAP_THRESHOLD;
+        self.written = if finished {
+            target
+        } else {
+            self.precise.round().as_ivec2()
+        };
+        (self.written, finished)
+    }
+}
+
 /// Animates window movement.
 /// Fraction of the remaining distance an exponential ease-out consumes in a
 /// frame, given a decay `rate` (per second) and the frame's `delta` in seconds.
@@ -621,38 +782,43 @@ fn ease_out_factor(rate: f64, delta: f64) -> f32 {
 /// * `commands` - Bevy commands to remove the `RepositionMarker` when animation is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
+    animate: Populated<(
+        &mut Position,
+        Entity,
+        bevy::ecs::change_detection::Ref<RepositionMarker>,
+    )>,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
+    mut progress: Local<EntityHashMap<AnimationProgress>>,
 ) {
+    progress.retain(|entity, _| animate.contains(*entity));
     // Frame-rate-independent exponential smoothing (ease-out).
     // `animation_speed` is the decay rate (per second); higher = snappier.
     let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
 
     animate
         .into_iter()
-        .for_each(|(mut position, entity, RepositionMarker(origin))| {
-            let target = origin.as_vec2();
-            let current = position.0.as_vec2();
-            let lerped = current.lerp(target, t);
-
-            // Snap once we're within a pixel of the target (or after one effectively-
-            // complete tick), so the marker is dropped promptly.
-            let finished = (target - lerped).length() <= ANIAMTE_SNAP_THRESHOLD;
-            let new_pos = if finished {
-                *origin
-            } else {
-                lerped.round().as_ivec2()
-            };
+        .for_each(|(mut position, entity, marker)| {
+            let origin = &marker.0;
+            let (new_pos, finished) =
+                progress
+                    .entry(entity)
+                    .or_default()
+                    .step(position.0, *origin, t, marker.is_added());
 
             trace!(
                 "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
                 position.0,
             );
-            position.0 = new_pos;
-            if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<RepositionMarker>();
+            if position.0 != new_pos {
+                position.0 = new_pos;
+            }
+            if finished {
+                progress.remove(&entity);
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<RepositionMarker>();
+                }
             }
         });
 }
@@ -669,51 +835,68 @@ pub(super) fn animate_entities(
 /// * `commands` - Bevy commands to remove the `ResizeMarker` when resizing is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
-    animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
+    animate: Populated<(
+        &mut Bounds,
+        Entity,
+        bevy::ecs::change_detection::Ref<ResizeMarker>,
+    )>,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
+    mut progress: Local<EntityHashMap<AnimationProgress>>,
 ) {
+    progress.retain(|entity, _| animate.contains(*entity));
     // Matches animate_entities: exponential ease-out, frame-rate independent.
     let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
 
     animate
         .into_iter()
-        .for_each(|(mut bounds, entity, ResizeMarker(size))| {
-            let target = size.as_vec2();
-            let current = bounds.0.as_vec2();
-            let lerped = current.lerp(target, t);
-
-            let finished = (target - lerped).length() <= ANIAMTE_SNAP_THRESHOLD;
-            let new_size = if finished {
-                *size
-            } else {
-                lerped.round().as_ivec2()
-            };
+        .for_each(|(mut bounds, entity, marker)| {
+            let size = &marker.0;
+            let (new_size, finished) =
+                progress
+                    .entry(entity)
+                    .or_default()
+                    .step(bounds.0, *size, t, marker.is_added());
 
             trace!(
                 "entity {entity} source {} dest {size} t {t:.3} resizing to {new_size}",
                 bounds.0,
             );
-            bounds.0 = new_size;
-            if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<ResizeMarker>();
+            if bounds.0 != new_size {
+                bounds.0 = new_size;
+            }
+            if finished {
+                progress.remove(&entity);
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<ResizeMarker>();
+                }
             }
         });
 }
 
-/// Republishes the pointer and gesture events onto [`InputEvent`], so the input
-/// systems do not have to sift the whole stream for them every frame.
+/// Republishes the pointer, gesture, and overview events onto [`InputEvent`]
+/// and [`OverviewEvent`] so downstream systems do not have to sift the whole
+/// stream for them every frame.
 ///
 /// Runs right after [`pump_events`], which is what puts this frame's events on
 /// the stream in the first place.
 pub(crate) fn demux_input_events(
     mut messages: MessageReader<Event>,
     mut input: MessageWriter<InputEvent>,
+    mut overview: MessageWriter<OverviewEvent>,
+    overview_phase: Option<Res<crate::ecs::overview::OverviewPhase>>,
 ) {
+    let mut overview_active = overview_phase.is_some_and(|phase| phase.is_active());
     for event in messages.read() {
         if event.is_input() {
             input.write(InputEvent(event.clone()));
+        }
+        if event.is_overview() {
+            overview_active = true;
+            overview.write(OverviewEvent(event.clone()));
+        } else if overview_active && event.invalidates_overview() {
+            overview.write(OverviewEvent(event.clone()));
         }
     }
 }
@@ -794,6 +977,12 @@ pub(crate) fn pump_events(
             LOOP_MAX_TIMEOUT_MS
         };
         *timeout = next_pump_timeout(*timeout, timeout_limit);
+        if let Some(restore_ms) = crate::manager::next_enhanced_ui_restore_timeout_ms() {
+            *timeout = (*timeout).min(restore_ms);
+        }
+        if let Some(desktop_poll_ms) = activity.desktop_poll_timeout_ms() {
+            *timeout = (*timeout).min(desktop_poll_ms);
+        }
     } else {
         // Still backed up: come straight back rather than sleeping on it.
         *timeout = LOOP_TIMEOUT_STEP;
@@ -815,6 +1004,7 @@ pub(crate) fn pump_events(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn window_resized_update_frame(
     mut messages: MessageReader<Event>,
+    drag: Res<crate::ecs::drag::WindowDrag>,
     mut windows: ResizableWindows,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
 ) {
@@ -836,15 +1026,21 @@ pub(super) fn window_resized_update_frame(
         // and `animate_resize_entities` is still stepping toward it, so reading
         // the echo in here would fight the animation producing that difference.
         // Only a resize we did not initiate is new information.
-        if resizing {
+        if resizing || drag.holds(entity) {
+            continue;
+        }
+        let active_strip = workspaces
+            .iter_mut()
+            .find(|(strip, _)| strip.contains(entity));
+        if active_strip
+            .as_ref()
+            .is_some_and(|(strip, _)| strip.is_parked_tab(entity))
+        {
             continue;
         }
         let Ok(new_frame) = window.update_frame() else {
             continue;
         };
-        let active_strip = workspaces
-            .iter_mut()
-            .find(|(strip, _)| strip.contains(entity));
         let tabbed = active_strip
             .as_ref()
             .is_some_and(|strip| strip.0.tabbed(entity));
@@ -924,6 +1120,34 @@ pub(crate) fn window_moved_update_frame(
     }
 }
 
+/// Spawns a process that was already running at startup. One that isn't
+/// Regular yet, such as an app keeping its Dock icon hidden while it sits in
+/// the menu bar, is kept with its activation policy watched (`ready` arms
+/// that), so it is adopted when it turns Regular, as a launched one is.
+pub(crate) fn spawn_initial_process(mut process: BProcess, forced: bool, commands: &mut Commands) {
+    if process.is_observable() || forced {
+        if forced {
+            debug!(
+                "Forcing management of existing process '{}' despite unobservable policy.",
+                process.name()
+            );
+            process.force_manage(true);
+        } else {
+            debug!("Adding existing process {}", process.name());
+        }
+        commands.spawn((ExistingMarker, process));
+    } else if process.ready() {
+        // Turned Regular since `is_observable` asked.
+        commands.spawn((ExistingMarker, process));
+    } else {
+        debug!(
+            "Existing application '{}' is not observable yet, watching its activation policy.",
+            process.name(),
+        );
+        commands.spawn(process);
+    }
+}
+
 pub(crate) fn gather_initial_processes(
     receiver: Option<NonSendMut<Receiver<Event>>>,
     existing_config: Option<Res<Config>>,
@@ -969,28 +1193,11 @@ pub(crate) fn gather_initial_processes(
         }
     }
 
-    while let Some(mut process) = initial_processes.pop() {
+    while let Some(process) = initial_processes.pop() {
         let forced = effective
             .as_ref()
             .is_some_and(|c| c.should_force_manage_process(&**process));
-
-        if process.is_observable() || forced {
-            if forced {
-                debug!(
-                    "Forcing management of existing process '{}' despite unobservable policy.",
-                    process.name()
-                );
-                process.force_manage(true);
-            } else {
-                debug!("Adding existing process {}", process.name());
-            }
-            commands.spawn((ExistingMarker, process));
-        } else {
-            debug!(
-                "Existing application '{}' is not observable, ignoring it.",
-                process.name(),
-            );
-        }
+        spawn_initial_process(process, forced, &mut commands);
     }
 
     // The input event tap holds its own clone of the `Config` handle from
@@ -1022,6 +1229,7 @@ pub(super) fn update_overlays(
     windows: Windows,
     applications: Query<&Application>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
+    drag: Option<Res<crate::ecs::drag::WindowDrag>>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
     theme: Option<Res<SystemTheme>>,
@@ -1038,13 +1246,17 @@ pub(super) fn update_overlays(
     let dim_opacity = config.dim_inactive_opacity();
     let border_enabled = config.border_active_window();
 
-    // Hide overlays during swipe, mission control, native fullscreen spaces,
-    // or briefly after a space change (macOS space-switch animation).
+    // Hide overlays during swipe, title-bar drag, mission control, native
+    // fullscreen spaces, or briefly after a space change (macOS space-switch animation).
     let Some((swiping, active_strip)) = active_workspace.iter().next() else {
         return;
     };
 
-    if swiping || mission_control_active.0 || active_strip.is_fullscreen() {
+    if swiping
+        || drag.is_some_and(|drag| drag.dragging())
+        || mission_control_active.0
+        || active_strip.is_fullscreen()
+    {
         overlay_mgr.hide_all();
         return;
     }
@@ -1130,16 +1342,120 @@ pub(super) fn update_overlays(
     );
 }
 
+/// Rebuilds the tab indicators, one per tabbed `Column::Stack` on each
+/// display's active workspace.
+pub(super) fn update_tab_indicators(
+    active_strips: Query<(Has<Scrolling>, &LayoutStrip, &ChildOf), With<ActiveWorkspaceMarker>>,
+    displays: Query<(&Display, Option<&crate::ecs::DockPosition>)>,
+    windows: Windows,
+    tab_indicator_mgr: Option<NonSendMut<TabIndicatorManager>>,
+    mission_control_active: Res<MissionControlActive>,
+    config: Res<Config>,
+) {
+    let Some(mut manager) = tab_indicator_mgr else {
+        return;
+    };
+
+    if !config.tab_indicator_enabled() || mission_control_active.0 {
+        manager.remove_all();
+        return;
+    }
+
+    let layout = TabIndicatorLayout {
+        position: config.tab_indicator_position(),
+        #[allow(clippy::cast_possible_truncation)]
+        width: config.tab_indicator_width() as i32,
+        #[allow(clippy::cast_possible_truncation)]
+        gap: config.tab_indicator_gap() as i32,
+        #[allow(clippy::cast_possible_truncation)]
+        segment_gap: config.tab_indicator_segment_gap() as i32,
+    };
+
+    let sliver_width = config.sliver_width();
+    let mut groups = Vec::new();
+    for (swiping, strip, child_of) in &active_strips {
+        if swiping || !strip.has_tabbed_stacks() || strip.is_fullscreen() {
+            continue;
+        }
+        let Ok((display, dock)) = displays.get(child_of.parent()) else {
+            continue;
+        };
+        let viewport = display.actual_display_bounds(dock, &config);
+        for column in strip.columns() {
+            let Column::Stack(items) = column else {
+                continue;
+            };
+            let Some(first) = column.top() else {
+                continue;
+            };
+            let Some(active_entity) = strip.active_tab(first) else {
+                continue;
+            };
+            let Some(active_window) = windows.get(active_entity) else {
+                continue;
+            };
+
+            // `Window::frame()` includes padding; strip it as `update_overlays`
+            // does, or the indicator drifts toward the neighboring column.
+            let frame = active_window.frame();
+            let h_pad = active_window.horizontal_padding();
+            let v_pad = active_window.vertical_padding();
+            let column_rect = IRect::from_corners(
+                frame.min + Origin::new(h_pad, v_pad),
+                frame.max - Origin::new(h_pad, v_pad),
+            );
+
+            // Skip columns scrolled out of the viewport (beyond the
+            // off-screen sliver).
+            if !crate::tab_indicator::column_is_visible(column_rect, viewport, sliver_width) {
+                continue;
+            }
+
+            let mut active_index = None;
+            let mut window_ids = Vec::with_capacity(items.len());
+            for (idx, entity) in items.iter().flat_map(StackItem::window_iter).enumerate() {
+                let Some(window) = windows.get(entity) else {
+                    window_ids.clear();
+                    break;
+                };
+                if entity == active_entity {
+                    active_index = Some(idx);
+                }
+                window_ids.push(window.id());
+            }
+            let Some(active_index) = active_index.filter(|_| window_ids.len() >= 2) else {
+                continue;
+            };
+
+            groups.push(TabIndicatorGroup {
+                column_rect,
+                window_ids,
+                active_index,
+            });
+        }
+    }
+
+    manager.update(
+        &groups,
+        &layout,
+        config.tab_indicator_active_color(),
+        config.tab_indicator_inactive_color(),
+    );
+}
+
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_position(
-    mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
+    drag: Res<crate::ecs::drag::WindowDrag>,
+    mut moved_windows: Populated<(Entity, &mut Window, &Position), Changed<Position>>,
 ) {
     // `par_iter_mut` runs on `ComputeTaskPool` worker threads, which have no
     // `CFRunLoop` of their own to drain thread-local autorelease pools.
     moved_windows
         .par_iter_mut()
-        .for_each(|(mut window, position)| {
-            objc2::rc::autoreleasepool(|_| window.reposition(position.0));
+        .for_each(|(entity, mut window, position)| {
+            if !drag.holds(entity) {
+                objc2::rc::autoreleasepool(|_| window.reposition(position.0));
+            }
         });
 }
 
@@ -1168,56 +1484,114 @@ pub(super) fn verify_window_position(
     }
 }
 
+/// Resizes windows whose `Bounds` changed, keeping each one's width as a
+/// share of the display its strip is on: a strip on the display without
+/// focus is sized for its own, and a share of the other would grow or shrink
+/// the window wherever it went next. A window in no strip is of the active
+/// display.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_size(
+    drag: Res<crate::ecs::drag::WindowDrag>,
     active_display: ActiveDisplay,
-    mut resized_windows: Populated<(&mut Window, &Bounds, &mut WidthRatio), Changed<Bounds>>,
+    strips: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<&Display>,
+    mut resized_windows: Populated<
+        (Entity, &mut Window, &Bounds, &mut WidthRatio),
+        Changed<Bounds>,
+    >,
 ) {
-    let display_bounds = active_display.bounds();
+    let fallback = active_display.bounds().width();
+    let widths: EntityHashMap<i32> = resized_windows
+        .iter()
+        .map(|(entity, ..)| {
+            let width = strips
+                .iter()
+                .find(|(strip, _)| strip.contains(entity))
+                .and_then(|(_, parent)| displays.get(parent.parent()).ok())
+                .map_or(fallback, |display| display.bounds().width());
+            (entity, width)
+        })
+        .collect();
     resized_windows
         .par_iter_mut()
-        .for_each(|(mut window, size, mut width_ratio)| {
-            width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
+        .for_each(|(entity, mut window, size, mut width_ratio)| {
+            if drag.holds(entity) {
+                return;
+            }
+            let width = widths.get(&entity).copied().unwrap_or(fallback);
+            width_ratio.0 = f64::from(size.0.x) / f64::from(width);
             objc2::rc::autoreleasepool(|_| window.resize(size.0));
         });
 }
 
+/// Re-enables `AXEnhancedUserInterface` on apps whose windows stopped moving.
+/// Window operations leave it disabled for a short while after the last one so
+/// an animation does not toggle it every frame; this hands it back afterwards.
+/// Gated on [`crate::manager::enhanced_ui_restore_pending`], so it only runs
+/// while a restoration is owed.
+pub(super) fn restore_enhanced_ui() {
+    crate::manager::restore_deferred_enhanced_ui(false);
+}
+
 /// Restores user-visible window state before Paneru shuts down: clears any
 /// brightness dim, removes the dim/border overlay window, and centers every
-/// managed window on the display its frame center falls in.
-pub(super) fn cleanup_on_exit(
+/// tiled window on its own display: the one whose strip holds it, else the
+/// one its frame center falls in. A hidden workspace's windows are parked off
+/// screen, where their centers lie in another display or in none. Hidden apps'
+/// windows still hold tiled frames, so they are centered too. Floating and
+/// minimized windows stay where they are.
+pub(crate) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    mut all_windows: Query<&mut Window>,
+    mut all_windows: Query<(Entity, &mut Window, Option<&Unmanaged>)>,
+    strips: Query<(&LayoutStrip, &ChildOf)>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
+    mut tab_indicator_mgr: Option<NonSendMut<TabIndicatorManager>>,
 ) {
     for _ in exit_events.read() {
-        let ids = all_windows.iter().map(|w| w.id()).collect::<Vec<_>>();
+        let ids = all_windows
+            .iter()
+            .map(|(_, w, _)| w.id())
+            .collect::<Vec<_>>();
         info!("exit cleanup: restoring {} window(s)", ids.len());
         window_manager.dim_windows(&ids, 0.0);
 
         if let Some(ref mut overlay_mgr) = overlay_mgr {
             overlay_mgr.remove_all();
         }
+        if let Some(ref mut tab_indicator_mgr) = tab_indicator_mgr {
+            tab_indicator_mgr.remove_all();
+        }
 
         let display_bounds = displays.iter().map(Display::bounds).collect::<Vec<_>>();
         if display_bounds.is_empty() {
+            crate::manager::restore_deferred_enhanced_ui(true);
             return;
         }
 
-        for mut window in &mut all_windows {
+        for (entity, mut window, unmanaged) in &mut all_windows {
+            if matches!(unmanaged, Some(Unmanaged::Floating | Unmanaged::Minimized)) {
+                continue;
+            }
             let frame = window.frame();
             let center = frame.center();
-            let bounds = display_bounds
+            let bounds = strips
                 .iter()
-                .find(|b| {
-                    center.x >= b.min.x
-                        && center.x <= b.max.x
-                        && center.y >= b.min.y
-                        && center.y <= b.max.y
+                .find(|(strip, _)| strip.contains(entity))
+                .and_then(|(_, parent)| displays.get(parent.parent()).ok())
+                .map(Display::bounds)
+                .or_else(|| {
+                    display_bounds
+                        .iter()
+                        .find(|b| {
+                            center.x >= b.min.x
+                                && center.x <= b.max.x
+                                && center.y >= b.min.y
+                                && center.y <= b.max.y
+                        })
+                        .copied()
                 })
-                .copied()
                 .unwrap_or(display_bounds[0]);
 
             let mut size = frame.size();
@@ -1242,6 +1616,9 @@ pub(super) fn cleanup_on_exit(
             );
             window.reposition(origin);
         }
+        // Hand back every flag the moves above (or a cut-short animation)
+        // left disabled: nothing will run the delayed restoration after this.
+        crate::manager::restore_deferred_enhanced_ui(true);
     }
 }
 
@@ -1601,11 +1978,16 @@ pub(crate) fn detect_tabbed_windows(
 
 /// Listens for focus events for unknown window IDs and attempts to auto-discover
 /// and manage them on the fly (e.g., when a user clicks an unmanaged tab or window).
+///
+/// Asks only the application that owns the window. This runs on the main
+/// thread, which also carries the input tap: asking every application in turn
+/// held each keystroke for as long as the unresponsive ones took to time out.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn auto_discover_unmanaged_focused_windows(
     mut messages: MessageReader<Event>,
     windows: Query<&Window>,
     apps: Query<&Application>,
+    window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut cache: Local<HashSet<WinID>>,
     mut commands: Commands,
@@ -1626,26 +2008,32 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
 
         trace!("Focus event for unknown window id {window_id}; attempting on-the-fly discovery.");
 
-        let mut discovered = None;
-        let (frontmost, non_frontmost): (Vec<_>, Vec<_>) =
-            apps.iter().partition(|app| app.is_frontmost());
+        // Not cached: an owner that isn't known yet may be by the next focus.
+        let Some(owner) = window_manager.window_owner(window_id) else {
+            trace!("No owner for focused window {window_id}; skipping discovery.");
+            continue;
+        };
+        let Some(app) = apps.iter().find(|app| app.pid() == owner) else {
+            trace!(
+                "Focused window {window_id} belongs to unknown pid {owner}; skipping discovery."
+            );
+            continue;
+        };
 
-        for app in frontmost.into_iter().chain(non_frontmost) {
-            if let Some(window) = app.focused_window(&config)
-                && window.id() == window_id
-            {
+        let discovered = app
+            .focused_window(&config)
+            .filter(|window| window.id() == window_id)
+            .inspect(|_| {
                 debug!("Discovered unknown focused window {window_id} via focused_window.");
-                discovered = Some(window);
-                break;
-            }
-
-            let window_list = app.window_list(&config);
-            if let Some(window) = window_list.into_iter().find(|w| w.id() == window_id) {
+            })
+            .or_else(|| {
+                let window = app
+                    .window_list(&config)
+                    .into_iter()
+                    .find(|w| w.id() == window_id)?;
                 debug!("Discovered unknown focused window {window_id} via window_list scan.");
-                discovered = Some(window);
-                break;
-            }
-        }
+                Some(window)
+            });
 
         if let Some(window) = discovered {
             commands.trigger(SpawnWindowTrigger(vec![window]));
@@ -1768,5 +2156,55 @@ mod pump_timeout_tests {
                 assert!(timeout <= idle, "waiting {timeout} ms after {idle} ms idle");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod animation_tests {
+    use super::{AnimationProgress, ease_out_factor};
+    use bevy::math::IVec2;
+
+    #[test]
+    fn subpixel_steps_accumulate_and_finish_even_at_short_event_intervals() {
+        // The old rounded recurrence stopped 31 pixels short at this rate.
+        for delta in [0.001, 1.0 / 60.0, 1.0 / 120.0] {
+            let mut progress = AnimationProgress::default();
+            let mut current = IVec2::new(100, 200);
+            let target = IVec2::new(140, 220);
+            let mut finished = false;
+            let mut elapsed = 0.0;
+            while elapsed < 1.0 && !finished {
+                (current, finished) = progress.step(
+                    current,
+                    target,
+                    ease_out_factor(16.0, delta),
+                    elapsed == 0.0,
+                );
+                elapsed += delta;
+            }
+            assert!(finished, "animation stalled with delta {delta}");
+            assert_eq!(current, target);
+        }
+    }
+
+    #[test]
+    fn fractional_progress_does_not_override_external_moves_or_new_animations() {
+        let mut progress = AnimationProgress::default();
+        progress.step(IVec2::ZERO, IVec2::splat(100), 0.25, true);
+        assert_eq!(
+            progress
+                .step(IVec2::splat(200), IVec2::splat(300), 0.5, false)
+                .0,
+            IVec2::splat(250),
+        );
+        // A marker removed and re-added starts at the written pixel, even
+        // when it happens to equal the preceding animation's last write.
+        progress.step(IVec2::ZERO, IVec2::splat(100), 0.254, true);
+        assert_eq!(
+            progress
+                .step(IVec2::splat(25), IVec2::splat(100), 0.0, true)
+                .0,
+            IVec2::splat(25),
+        );
     }
 }

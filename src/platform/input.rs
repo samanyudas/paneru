@@ -17,6 +17,7 @@ use std::ffi::c_void;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use stdext::function_name;
@@ -26,8 +27,19 @@ use crate::commands::{Command, Direction, Operation};
 use crate::config::Config;
 use crate::config::swipe::focus_direction;
 use crate::errors::{Error, Result};
-use crate::events::{Event, EventSender};
+use crate::events::{Event, EventSender, MouseButton};
 use crate::platform::Modifiers;
+
+fn mouse_button(event_type: CGEventType) -> MouseButton {
+    if matches!(
+        event_type,
+        CGEventType::RightMouseDown | CGEventType::RightMouseUp | CGEventType::RightMouseDragged
+    ) {
+        MouseButton::Right
+    } else {
+        MouseButton::Left
+    }
+}
 
 const NX_DEVICEFNKEYMASK: u64 = 0x0080_0100;
 
@@ -42,25 +54,124 @@ pub fn set_focused_passthrough(keys: Vec<(u8, Modifiers)>) {
     FOCUSED_PASSTHROUGH.store(Arc::new(keys));
 }
 
+/// Escape's key code.
+const ESCAPE: i64 = 53;
+
+/// The left button as the tap has seen it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum LeftButton {
+    #[default]
+    Up,
+    Down,
+    /// Down, with the drag it held called off by Escape: the window server
+    /// sees the pointer move without it till the button comes up, and its
+    /// drag ends then.
+    Cancelled,
+}
+
+/// What the tap does with an event, for a drag Escape calls off.
+#[derive(Debug, PartialEq, Eq)]
+enum DragInput {
+    /// Handled as ever.
+    Pass,
+    /// Escape during a drag: swallowed, and the drag called off.
+    Cancel,
+    /// Escape again before the button comes up, or repeating: swallowed.
+    Swallow,
+    /// A drag after a cancel: the pointer only moves, and the window stays.
+    Move,
+    /// The release after a cancel: it ends the window server's drag, which
+    /// only the hand's own release does, but drops nothing here.
+    Release,
+}
+
+/// Follows the left button through `event_type`, and says what becomes of
+/// the event. `keycode` and `modifiers` are a key press's, and `dragging`
+/// whether a window is being dragged.
+fn drag_input(
+    button: &mut LeftButton,
+    event_type: CGEventType,
+    keycode: i64,
+    modifiers: Modifiers,
+    dragging: bool,
+) -> DragInput {
+    let plain_escape = keycode == ESCAPE && modifiers.is_empty();
+    match (event_type, *button) {
+        (CGEventType::LeftMouseDown, _) => {
+            *button = LeftButton::Down;
+            DragInput::Pass
+        }
+        (CGEventType::LeftMouseUp, was) => {
+            *button = LeftButton::Up;
+            if was == LeftButton::Cancelled {
+                DragInput::Release
+            } else {
+                DragInput::Pass
+            }
+        }
+        (CGEventType::LeftMouseDragged, LeftButton::Cancelled) => DragInput::Move,
+        // The pointer moving without the button: its release was lost.
+        (CGEventType::MouseMoved, _) => {
+            *button = LeftButton::Up;
+            DragInput::Pass
+        }
+        (CGEventType::KeyDown, LeftButton::Down) if plain_escape && dragging => {
+            *button = LeftButton::Cancelled;
+            DragInput::Cancel
+        }
+        (CGEventType::KeyDown, LeftButton::Cancelled) if plain_escape => DragInput::Swallow,
+        _ => DragInput::Pass,
+    }
+}
+
 /// How long to suppress scroll wheel events after a vertical swipe gesture,
 /// covering macOS momentum scroll that continues after finger lift.
 const VERTICAL_GESTURE_SCROLL_SUPPRESS: Duration = Duration::from_millis(1200);
+
+/// Fingers of a 4-finger touch land a few tens of milliseconds apart, so a
+/// touch passes through three fingers first. Strip and row swipes from this
+/// long after a finger landed are held back, and dropped if the overview
+/// claims the touch.
+const LANDING_GRACE_SECS: f64 = 0.08;
+
+/// `kCGScrollPhaseBegan`: the first event of a trackpad scroll.
+const SCROLL_PHASE_BEGAN: i64 = 1;
 
 /// Limit repeated wheel inputs while the next window moves into view.
 const WINDOW_SCROLL_INTERVAL: Duration = Duration::from_millis(180);
 
 /// One finger, as a single gesture event saw it.
-struct Touch {
-    identity: Retained<AnyObject>,
+#[derive(Clone)]
+struct Touch<I> {
+    identity: I,
     x: f64,
     y: f64,
     device_width_points: f64,
-    /// Whether the finger landed this event, which suppresses delta tracking
-    /// until every finger is down.
+    /// Whether the finger landed this event, which starts a new sample series.
     began: bool,
+    /// Whether the finger lifted (or was cancelled) this event.
+    ended: bool,
 }
 
-impl Touch {
+/// Whether a sample at `timestamp` is too soon after a finger landed to
+/// tell a strip swipe from a higher-finger overview gesture still arriving.
+fn within_landing_grace(landed: Option<f64>, timestamp: f64) -> bool {
+    landed.is_some_and(|landed| (0.0..LANDING_GRACE_SECS).contains(&(timestamp - landed)))
+}
+
+/// Whether any finger in `fingers` is one of `claimed`.
+fn shares_finger<I>(fingers: &[Touch<I>], claimed: &[I], same: impl Fn(&I, &I) -> bool) -> bool {
+    fingers
+        .iter()
+        .any(|finger| claimed.iter().any(|c| same(c, &finger.identity)))
+}
+
+fn same_touch_identity(a: &Retained<AnyObject>, b: &Retained<AnyObject>) -> bool {
+    // SAFETY: `NSTouch` identities conform to `NSObject` and answer `isEqual:`.
+    unsafe { msg_send![&**a, isEqual: &**b] }
+}
+
+impl Touch<Retained<AnyObject>> {
     /// Samples the whole set in one pass.
     fn sample(touches: &NSSet<NSTouch>) -> Vec<Self> {
         touches
@@ -73,19 +184,13 @@ impl Touch {
                     y: position.y,
                     device_width_points: touch.deviceSize().width,
                     began: touch.phase() == NSTouchPhase::Began,
+                    ended: touch
+                        .phase()
+                        .intersects(NSTouchPhase::Ended | NSTouchPhase::Cancelled),
                 }
             })
             .collect()
     }
-}
-
-/// An anchor for a finger's unconsumed travel. Touch identity matters because
-/// `NSSet` does not preserve iteration order between events.
-struct SwipeSample<I> {
-    identity: I,
-    x: f64,
-    y: f64,
-    device_width_points: f64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -97,78 +202,60 @@ enum SwipeMovement {
     Vertical(f64),
 }
 
-struct SwipeAccumulator<I> {
-    anchors: Vec<SwipeSample<I>>,
-}
-
-impl<I> Default for SwipeAccumulator<I> {
-    fn default() -> Self {
-        Self {
-            anchors: Vec::new(),
-        }
-    }
-}
-
-impl<I> SwipeAccumulator<I> {
-    fn reset(&mut self) {
-        self.anchors.clear();
+/// Compare consecutive touch samples. Matching identities matters because
+/// `NSSet` can change iteration order between gesture events.
+fn swipe_movement<I>(
+    previous_touches: &[Touch<I>],
+    touches: &[Touch<I>],
+    same_identity: impl Fn(&I, &I) -> bool,
+) -> Option<SwipeMovement> {
+    if previous_touches.len() != touches.len() || previous_touches.is_empty() {
+        return None;
     }
 
-    fn sample(
-        &mut self,
-        touches: Vec<SwipeSample<I>>,
-        same_identity: impl Fn(&I, &I) -> bool,
-    ) -> Option<SwipeMovement> {
-        if self.anchors.len() != touches.len() || self.anchors.is_empty() {
-            self.anchors = touches;
-            return None;
-        }
+    let deltas = touches
+        .iter()
+        .map(|current| {
+            previous_touches
+                .iter()
+                .find(|previous| same_identity(&previous.identity, &current.identity))
+                .map(|previous| {
+                    (
+                        previous.x - current.x,
+                        previous.y - current.y,
+                        current.device_width_points,
+                    )
+                })
+        })
+        .collect::<Option<Vec<_>>>()?;
 
-        let deltas = touches
-            .iter()
-            .map(|current| {
-                self.anchors
+    let x_sum: f64 = deltas.iter().map(|(x, _, _)| x).sum();
+    let y_sum: f64 = deltas.iter().map(|(_, y, _)| y).sum();
+    let horizontal = x_sum.abs() >= y_sum.abs();
+    let moved_fingers = deltas
+        .iter()
+        .filter(|(x, y, _)| (if horizontal { *x } else { *y }).abs() > SWIPE_THRESHOLD)
+        .count();
+    if moved_fingers == 0 {
+        return None;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a gesture cannot have enough fingers to lose precision"
+    )]
+    let moved_fingers = moved_fingers as f64;
+    if horizontal {
+        Some(SwipeMovement::Horizontal {
+            delta: x_sum / moved_fingers,
+            distance_cm: physical_swipe_distance_cm(
+                deltas
                     .iter()
-                    .find(|previous| same_identity(&previous.identity, &current.identity))
-                    .map(|previous| {
-                        (
-                            previous.x - current.x,
-                            previous.y - current.y,
-                            current.device_width_points,
-                        )
-                    })
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(deltas) = deltas else {
-            self.anchors = touches;
-            return None;
-        };
-
-        let x_sum: f64 = deltas.iter().map(|(x, _, _)| x).sum();
-        let y_sum: f64 = deltas.iter().map(|(_, y, _)| y).sum();
-        // Once a gesture has begun, the movement of _any_ finger is enough to warrant a swipe.
-        let horizontally_moved_fingers = deltas
-            .iter()
-            .filter(|(x, _, _)| x.abs() > SWIPE_THRESHOLD)
-            .count();
-        let vertically_moved_fingers = deltas
-            .iter()
-            .filter(|(_, y, _)| y.abs() > SWIPE_THRESHOLD)
-            .count();
-        let movement = if x_sum.abs() >= y_sum.abs() {
-            (horizontally_moved_fingers > 0).then(|| SwipeMovement::Horizontal {
-                delta: x_sum,
-                distance_cm: physical_swipe_distance_cm(
-                    deltas.iter().map(|(x, _, width)| (*x, *width)),
-                ),
-            })
-        } else {
-            (vertically_moved_fingers > 0).then_some(SwipeMovement::Vertical(y_sum))
-        };
-        if movement.is_some() {
-            self.anchors = touches;
-        }
-        movement
+                    .filter(|(x, _, _)| x.abs() > SWIPE_THRESHOLD)
+                    .map(|(x, _, width)| (*x, *width)),
+            ),
+        })
+    } else {
+        Some(SwipeMovement::Vertical(y_sum / moved_fingers))
     }
 }
 
@@ -202,13 +289,33 @@ pub(crate) enum TapHealth {
 
 /// `InputHandler` manages low-level input events from the macOS `CGEventTap`.
 /// It intercepts keyboard and mouse events, processes gestures, and dispatches them as higher-level `Event`s.
+#[allow(clippy::struct_excessive_bools, reason = "independent gesture flags")]
 pub(super) struct InputHandler {
+    left_button: LeftButton,
+    /// Shared with the ECS `WindowDrag` resource so the tap knows when
+    /// unmodified Escape should cancel an active title-bar drag.
+    dragging: Arc<AtomicBool>,
     /// The `EventSender` for dispatching input events.
     events: Option<EventSender>,
     /// The application `Config` for looking up keybindings.
     config: Config,
-    /// Tracks finger motion since the last swipe sent to the ECS.
-    swipe_accumulator: SwipeAccumulator<Retained<AnyObject>>,
+    /// The preceding gesture event's touch positions.
+    previous_touches: Vec<Touch<Retained<AnyObject>>>,
+    /// Timestamp of `previous_touches`.
+    last_swipe_sample_timestamp: Option<f64>,
+    /// Set once the overview's finger count lands, and held until every
+    /// finger is off: the whole touch sequence belongs to the overview, so
+    /// fingers landing or lifting one at a time never pass through the
+    /// 3-finger strip/row gestures.
+    overview_tracking: bool,
+    /// The overview was already told this sequence's scrub is over (fingers
+    /// started lifting); the rest of the sequence is swallowed.
+    overview_released: bool,
+    /// The fingers that started the overview's sequence. The claim lasts
+    /// while any of them is still down: macOS restarts the gesture when the
+    /// finger count changes, and may then report the remaining fingers as
+    /// newly began, so phases alone can't tell the sequence apart.
+    overview_touches: Vec<Retained<AnyObject>>,
     /// The `CFMachPort` representing the `CGEventTap`.
     tap_port: Option<CFRetained<CFMachPort>>,
     /// Run loop source feeding `tap_port`. Retained so the tap can be torn down
@@ -218,6 +325,17 @@ pub(super) struct InputHandler {
     /// are suppressed for a short window after this to prevent the OS from
     /// scrolling windows underneath (including momentum scroll after finger lift).
     last_swipe_time: Option<Instant>,
+    /// Whether the overview may take the current trackpad scroll stream:
+    /// only one that began after the overview's touch was over. Scrolls
+    /// from the overview's own fingers lifting, and their momentum, are
+    /// dropped instead of scrolling the overview.
+    overview_scroll_live: bool,
+    /// Gesture timestamp of the last finger landing.
+    finger_landed_at: Option<f64>,
+    /// Strip/row swipe events from just after a finger landed, held back in
+    /// case it is the overview's fingers arriving one by one; see
+    /// [`LANDING_GRACE_SECS`].
+    held_swipes: Vec<Event>,
     last_window_scroll: Option<(Instant, Direction)>,
     invalid_device_size_warned: bool,
     // Prevents from being Unpin automatically
@@ -238,14 +356,23 @@ impl InputHandler {
     /// # Returns
     ///
     /// A new `InputHandler`.
-    pub(super) fn new(events: EventSender, config: Config) -> Self {
+    pub(super) fn new(events: EventSender, config: Config, dragging: Arc<AtomicBool>) -> Self {
         InputHandler {
+            left_button: LeftButton::default(),
+            dragging,
             events: Some(events),
             config,
-            swipe_accumulator: SwipeAccumulator::default(),
+            previous_touches: Vec::new(),
+            last_swipe_sample_timestamp: None,
+            overview_tracking: false,
+            overview_released: false,
+            overview_touches: Vec::new(),
             tap_port: None,
             run_loop_source: None,
             last_swipe_time: None,
+            overview_scroll_live: false,
+            finger_landed_at: None,
+            held_swipes: Vec::new(),
             last_window_scroll: None,
             invalid_device_size_warned: false,
             _pin: PhantomPinned,
@@ -440,26 +567,75 @@ impl InputHandler {
         let flags = CGEvent::flags(Some(event));
         let modifiers = get_modifiers(flags);
 
+        let keycode = if event_type == CGEventType::KeyDown {
+            CGEvent::integer_value_field(Some(event), CGEventField::KeyboardEventKeycode)
+        } else {
+            0
+        };
+        let dragging = self.dragging.load(Ordering::Relaxed)
+            && !crate::overview::OVERVIEW_OPEN.load(Ordering::Relaxed);
+        match drag_input(
+            &mut self.left_button,
+            event_type,
+            keycode,
+            modifiers,
+            dragging,
+        ) {
+            DragInput::Pass => {}
+            DragInput::Swallow => return true,
+            DragInput::Cancel => {
+                info!("drag called off by Escape");
+                if let Err(err) = events.send(Event::CancelDrag) {
+                    error!("error sending event: {err}");
+                }
+                return true;
+            }
+            DragInput::Move => {
+                // Rewrite to MouseMoved so WindowServer stops pulling the
+                // window with the pointer, without forwarding MouseMoved into
+                // ECS while the button is still held (which would let
+                // focus-follows-mouse steal focus before release).
+                CGEvent::set_type(Some(event), CGEventType::MouseMoved);
+                return false;
+            }
+            DragInput::Release => {
+                // Let the real LeftMouseUp reach WindowServer to end its drag
+                // loop without forwarding a drop or synthetic MouseMoved to
+                // Paneru; normal pointer movement resumes FFM afterwards.
+                return false;
+            }
+        }
+
         let result = match event_type {
             CGEventType::LeftMouseDown | CGEventType::RightMouseDown => {
                 let point = CGEvent::location(Some(event));
-                events.send(Event::MouseDown { point, modifiers })
+                events.send(Event::MouseDown {
+                    point,
+                    modifiers,
+                    button: mouse_button(event_type),
+                })
             }
             CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {
                 let point = CGEvent::location(Some(event));
-                events.send(Event::MouseUp { point, modifiers })
+                events.send(Event::MouseUp {
+                    point,
+                    modifiers,
+                    button: mouse_button(event_type),
+                })
             }
             CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
                 let point = CGEvent::location(Some(event));
-                events.send(Event::MouseDragged { point, modifiers })
+                events.send(Event::MouseDragged {
+                    point,
+                    modifiers,
+                    button: mouse_button(event_type),
+                })
             }
             CGEventType::MouseMoved => {
                 let point = CGEvent::location(Some(event));
                 events.send(Event::MouseMoved { point, modifiers })
             }
             CGEventType::KeyDown => {
-                let keycode =
-                    CGEvent::integer_value_field(Some(event), CGEventField::KeyboardEventKeycode);
                 // handle_keypress can intercept the event, so it may return true.
                 return self.handle_keypress(keycode, flags);
             }
@@ -484,6 +660,51 @@ impl InputHandler {
 
     /// Use the configured modifier to scroll the strip or select an adjacent window.
     fn handle_scroll_wheel(&mut self, event: &CGEvent) -> bool {
+        // The open overview owns every scroll: it pans and scrolls its
+        // strips, and nothing should reach the windows behind it.
+        if crate::overview::OVERVIEW_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
+            let int = |f| CGEvent::integer_value_field(Some(event), f);
+            let scroll_phase = int(CGEventField::ScrollWheelEventScrollPhase);
+            let momentum = int(CGEventField::ScrollWheelEventMomentumPhase);
+            if self.overview_tracking {
+                // The overview's fingers are (partly) still down.
+                self.overview_scroll_live = false;
+                return true;
+            }
+            if scroll_phase == SCROLL_PHASE_BEGAN {
+                self.overview_scroll_live = true;
+            }
+            // Wheels report neither phase and always count.
+            let trackpad = scroll_phase != 0 || momentum != 0;
+            if trackpad && !self.overview_scroll_live {
+                return true;
+            }
+            if let Some(events) = &self.events {
+                let field = |f| CGEvent::double_value_field(Some(event), f);
+                let precise = CGEvent::integer_value_field(
+                    Some(event),
+                    CGEventField::ScrollWheelEventIsContinuous,
+                ) != 0;
+                // Trackpads report points; wheels report lines.
+                let (dx, dy) = if precise {
+                    (
+                        field(CGEventField::ScrollWheelEventPointDeltaAxis2),
+                        field(CGEventField::ScrollWheelEventPointDeltaAxis1),
+                    )
+                } else {
+                    (
+                        field(CGEventField::ScrollWheelEventFixedPtDeltaAxis2) * 12.0,
+                        field(CGEventField::ScrollWheelEventFixedPtDeltaAxis1) * 12.0,
+                    )
+                };
+                _ = events.send(Event::OverviewScroll {
+                    point: CGEvent::location(Some(event)),
+                    dx,
+                    dy,
+                });
+            }
+            return true;
+        }
         // Suppress scroll events shortly after a swipe gesture to prevent
         // the OS from scrolling windows underneath, including momentum scroll events
         // that arrive after finger lift.
@@ -563,20 +784,108 @@ impl InputHandler {
         false
     }
 
+    /// Sends a strip/row swipe, or holds it back while a finger has only
+    /// just landed and an overview gesture with more fingers may still be
+    /// arriving (see [`LANDING_GRACE_SECS`]).
+    fn send_swipe(&mut self, event: Event, configured_fingers: usize, timestamp: f64) {
+        let may_escalate_to_overview = self
+            .config
+            .overview_gesture_fingers()
+            .is_some_and(|overview| overview > configured_fingers);
+        if may_escalate_to_overview && within_landing_grace(self.finger_landed_at, timestamp) {
+            self.held_swipes.push(event);
+            return;
+        }
+        self.flush_held_swipes();
+        if let Some(events) = &self.events {
+            _ = events.send(event);
+            self.last_swipe_time = Some(Instant::now());
+        }
+    }
+
+    fn flush_held_swipes(&mut self) {
+        let held = std::mem::take(&mut self.held_swipes);
+        if held.is_empty() {
+            return;
+        }
+        if let Some(events) = &self.events {
+            for event in held {
+                _ = events.send(event);
+            }
+            self.last_swipe_time = Some(Instant::now());
+        }
+    }
+
+    /// A gesture sample while the touch sequence belongs to the overview.
+    /// Returns whether to intercept the event, or `None` when a new touch
+    /// sequence began and the event should be handled as usual.
+    fn overview_sample(
+        &mut self,
+        fingers: &[Touch<Retained<AnyObject>>],
+        overview_fingers: Option<usize>,
+        timestamp: f64,
+    ) -> Option<bool> {
+        if fingers.is_empty() {
+            // AppKit interleaves empty touch sets; they don't mean a lift.
+            return Some(true);
+        }
+        if self.overview_released {
+            // Swallowed while any finger of the overview's sequence is down.
+            // Only fingers that are all new start a new sequence.
+            if !shares_finger(fingers, &self.overview_touches, same_touch_identity) {
+                self.overview_tracking = false;
+                self.overview_released = false;
+                self.overview_touches.clear();
+                self.previous_touches.clear();
+                self.last_swipe_sample_timestamp = None;
+                return None;
+            }
+            return Some(true);
+        }
+        // Every finger ended, or one lifted first: the scrub is over. The
+        // phase-ended event doesn't always arrive, so don't wait for it.
+        if fingers.iter().all(|finger| finger.ended) || overview_fingers != Some(fingers.len()) {
+            self.overview_released = true;
+            self.previous_touches.clear();
+            self.last_swipe_sample_timestamp = None;
+            if let Some(events) = &self.events {
+                _ = events.send(Event::OverviewSwipeEnd);
+            }
+            return Some(true);
+        }
+        let movement = swipe_movement(&self.previous_touches, fingers, same_touch_identity);
+        let elapsed_secs = self
+            .last_swipe_sample_timestamp
+            .replace(timestamp)
+            .map_or(0.0, |previous| (timestamp - previous).max(0.0));
+        self.previous_touches = fingers.to_vec();
+        // Only the vertical component drives the overview. Touch positions
+        // are Y-up and the delta is previous - current, so up is negative.
+        if let (Some(SwipeMovement::Vertical(delta)), Some(events)) = (movement, &self.events) {
+            _ = events.send(Event::OverviewSwipe {
+                delta: -delta,
+                elapsed_secs,
+            });
+        }
+        Some(true)
+    }
+
     /// Handles swipe gesture events. Routes to horizontal `Swipe` or vertical
     /// `VerticalSwipe` based on axis dominance. Returns true to intercept the event.
+    #[allow(clippy::too_many_lines)]
     fn handle_swipe(&mut self, event: &CGEvent) -> bool {
         const NS_EVENT_PHASE_ENDED: usize = 1 << 3; // 8
         const NS_EVENT_PHASE_CANCELLED: usize = 1 << 4; // 16
 
-        let Some(configured_fingers) = self
+        let configured_fingers = self
             .config
             .swipe_gesture_fingers()
-            .filter(|fingers| *fingers >= GESTURE_MINIMAL_FINGERS)
-        else {
+            .filter(|fingers| *fingers >= GESTURE_MINIMAL_FINGERS);
+        let overview_fingers = self.config.overview_gesture_fingers();
+        if configured_fingers.is_none() && overview_fingers.is_none() {
             // No valid gesture is configured, so leave native macOS gestures alone.
             return false;
-        };
+        }
 
         objc2::rc::autoreleasepool(|_| {
             let Some(ns_event) = NSEvent::eventWithCGEvent(event) else {
@@ -587,81 +896,139 @@ impl InputHandler {
                 return false;
             }
 
+            let timestamp = ns_event.timestamp();
+
             // Fingers lifted off touchpad.
             let phase = ns_event.phase();
             if phase.0 & NS_EVENT_PHASE_CANCELLED != 0 || phase.0 & NS_EVENT_PHASE_ENDED != 0 {
-                self.swipe_accumulator.reset();
+                self.previous_touches.clear();
                 self.invalid_device_size_warned = false;
+                self.last_swipe_sample_timestamp = None;
+                // A quick flick shorter than the grace still counts.
+                if !self.overview_tracking {
+                    self.flush_held_swipes();
+                }
                 if let Some(events) = &self.events {
                     _ = events.send(Event::TouchpadUp);
+                    // macOS also ends the gesture when the finger count
+                    // changes (one finger lifts), with the rest still down.
+                    // So this ends the overview's scrub but keeps claiming
+                    // the sequence: only a finger landing again (see
+                    // `overview_sample`) starts a new one, otherwise the
+                    // remaining fingers would drive the strip gestures.
+                    if self.overview_tracking && !self.overview_released {
+                        self.overview_released = true;
+                        _ = events.send(Event::OverviewSwipeEnd);
+                    }
                 }
                 return false;
             }
 
             let fingers = Touch::sample(&ns_event.allTouches());
-            if !gesture_should_intercept(Some(configured_fingers), fingers.len()) {
+            if self.overview_tracking
+                && let Some(intercept) = self.overview_sample(&fingers, overview_fingers, timestamp)
+            {
+                return intercept;
+            }
+            let overview = overview_fingers == Some(fingers.len())
+                && !fingers.iter().all(|finger| finger.ended);
+            if overview {
+                // The overview's fingers just landed: claim the sequence and
+                // let the ECS build the overview now, while nothing moves
+                // yet, so the first movement doesn't wait on captures.
+                self.overview_tracking = true;
+                self.overview_released = false;
+                self.overview_touches = fingers.iter().map(|f| f.identity.clone()).collect();
+                self.previous_touches = fingers;
+                self.last_swipe_sample_timestamp = Some(timestamp);
+                // Swipes from the first fingers to land were the overview's.
+                self.held_swipes.clear();
+                self.overview_scroll_live = false;
+                if let Some(events) = &self.events {
+                    _ = events.send(Event::OverviewTouchDown);
+                }
+                return true;
+            }
+            if !overview && !gesture_should_intercept(configured_fingers, fingers.len()) {
                 // AppKit interleaves phase events with an empty touch set
                 // between usable samples. They do not mean the fingers lifted.
                 // That's why empty finger counts don't trigger a reset.
-                if should_reset_swipe_anchors(fingers.len(), self.swipe_accumulator.anchors.len()) {
-                    self.swipe_accumulator.reset();
+                if should_reset_swipe_samples(fingers.len(), self.previous_touches.len()) {
+                    self.previous_touches.clear();
+                    self.last_swipe_sample_timestamp = None;
                 }
                 return false;
             }
             if fingers.iter().any(|finger| finger.began) {
+                self.finger_landed_at = Some(timestamp);
                 self.invalid_device_size_warned = false;
                 // A fresh gesture: nothing carries over from the last one.
-                self.swipe_accumulator.reset();
+                self.previous_touches.clear();
+                self.last_swipe_sample_timestamp = None;
                 if let Some(events) = &self.events {
                     _ = events.send(Event::TouchpadDown);
                 }
             }
 
-            let samples = fingers
-                .into_iter()
-                .map(|finger| SwipeSample {
-                    identity: finger.identity,
-                    x: finger.x,
-                    y: finger.y,
-                    device_width_points: finger.device_width_points,
-                })
-                .collect();
-            let movement = self.swipe_accumulator.sample(samples, |previous, current| {
-                // SAFETY: NSTouch identities conform to NSObject and answer isEqual:.
-                unsafe { msg_send![&**previous, isEqual: &**current] }
-            });
-            match movement {
-                Some(SwipeMovement::Horizontal { delta, distance_cm }) => {
-                    if distance_cm.is_none() && !self.invalid_device_size_warned {
-                        warn!("trackpad did not provide a valid device size for paging");
-                        self.invalid_device_size_warned = true;
-                    }
-                    if let Some(events) = &self.events {
-                        let _ = events.send(Event::Swipe {
-                            delta,
-                            fingers: configured_fingers,
-                            distance_cm: distance_cm.unwrap_or(0.0),
-                        });
-                        self.last_swipe_time = Some(Instant::now());
-                    }
-                }
-                Some(SwipeMovement::Vertical(delta)) if self.config.swipe_vertical() => {
-                    if let Some(events) = &self.events {
-                        let _ = events.send(Event::VerticalSwipe {
-                            delta,
-                            fingers: configured_fingers,
-                        });
-                        self.last_swipe_time = Some(Instant::now());
-                    }
-                }
-                Some(SwipeMovement::Vertical(_)) => return false,
-                None => (),
-            }
+            let movement = swipe_movement(&self.previous_touches, &fingers, same_touch_identity);
+            let elapsed_secs = self
+                .last_swipe_sample_timestamp
+                .replace(timestamp)
+                .map(|previous| (timestamp - previous).max(0.0));
+            self.previous_touches = fingers;
+            let Some(configured_fingers) = configured_fingers else {
+                return false;
+            };
+            self.dispatch_swipe_movement(movement, configured_fingers, elapsed_secs, timestamp);
 
             // If we have 3 or more fingers on the trackpad, we intercept the event
             // to prevent it from being interpreted as a scroll by the OS.
             true
         })
+    }
+
+    fn dispatch_swipe_movement(
+        &mut self,
+        movement: Option<SwipeMovement>,
+        configured_fingers: usize,
+        elapsed_secs: Option<f64>,
+        timestamp: f64,
+    ) {
+        match movement {
+            Some(SwipeMovement::Horizontal { delta, distance_cm }) => {
+                if distance_cm.is_none() && !self.invalid_device_size_warned {
+                    warn!("trackpad did not provide a valid device size for paging");
+                    self.invalid_device_size_warned = true;
+                }
+                self.send_swipe(
+                    Event::Swipe {
+                        delta,
+                        fingers: configured_fingers,
+                        distance_cm: distance_cm.unwrap_or(0.0),
+                        elapsed_secs,
+                    },
+                    configured_fingers,
+                    timestamp,
+                );
+            }
+            Some(SwipeMovement::Vertical(delta)) => {
+                if self.config.swipe_vertical() {
+                    self.send_swipe(
+                        Event::VerticalSwipe {
+                            delta,
+                            fingers: configured_fingers,
+                        },
+                        configured_fingers,
+                        timestamp,
+                    );
+                } else {
+                    // Vertical swipes are disabled, but still swallow the
+                    // gesture so the OS does not scroll the window under it.
+                    self.last_swipe_time = Some(Instant::now());
+                }
+            }
+            None => (),
+        }
     }
 
     /// Handles key press events. It determines the modifier mask and attempts to find a matching keybinding in the configuration.
@@ -686,7 +1053,17 @@ impl InputHandler {
         // that paneru can actively switch back to the previous workspace.
         // Non-paneru keys pass through naturally (find_keybind returns None).
 
-        let keycode = keycode.try_into().ok();
+        let keycode: Option<u8> = keycode.try_into().ok();
+        if mask.is_empty()
+            && crate::overview::OVERVIEW_ACCEPTS_KEYS.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(event) = keycode.and_then(|c| Event::from_overview_keycode(u16::from(c)))
+        {
+            return events
+                .send(event)
+                .inspect_err(|err| error!("Error sending overview key event: {err}"))
+                .is_ok();
+        }
+
         keycode
             .and_then(|keycode| {
                 let passthrough = FOCUSED_PASSTHROUGH.load();
@@ -722,8 +1099,8 @@ fn gesture_should_intercept(configured_fingers: Option<usize>, actual_fingers: u
     })
 }
 
-fn should_reset_swipe_anchors(actual_fingers: usize, anchored_fingers: usize) -> bool {
-    actual_fingers != 0 && actual_fingers != anchored_fingers
+fn should_reset_swipe_samples(actual_fingers: usize, previous_fingers: usize) -> bool {
+    actual_fingers != 0 && actual_fingers != previous_fingers
 }
 
 // Remote mouse tools can send group flags without left or right flags.
@@ -816,15 +1193,175 @@ fn accept_window_scroll(
 mod tests {
     use super::*;
 
-    fn three_fingers(x: f64) -> Vec<SwipeSample<usize>> {
+    #[test]
+    fn escape_calls_off_a_drag_till_the_button_comes_up() {
+        let mut button = LeftButton::Up;
+        let mut step = |event_type, keycode, dragging| {
+            drag_input(
+                &mut button,
+                event_type,
+                keycode,
+                Modifiers::empty(),
+                dragging,
+            )
+        };
+        // Escape with no drag, or only a press, is the app's.
+        assert_eq!(step(CGEventType::KeyDown, ESCAPE, true), DragInput::Pass);
+        assert_eq!(step(CGEventType::LeftMouseDown, 0, false), DragInput::Pass);
+        assert_eq!(step(CGEventType::KeyDown, ESCAPE, false), DragInput::Pass);
+        assert_eq!(
+            step(CGEventType::LeftMouseDragged, 0, true),
+            DragInput::Pass
+        );
+        // Another key during the drag is too.
+        assert_eq!(step(CGEventType::KeyDown, 0, true), DragInput::Pass);
+        assert_eq!(step(CGEventType::KeyDown, ESCAPE, true), DragInput::Cancel);
+        assert_eq!(
+            step(CGEventType::KeyDown, ESCAPE, false),
+            DragInput::Swallow
+        );
+        assert_eq!(
+            step(CGEventType::LeftMouseDragged, 0, false),
+            DragInput::Move
+        );
+        assert_eq!(step(CGEventType::LeftMouseUp, 0, false), DragInput::Release);
+        // After the release, all is as ever.
+        assert_eq!(
+            step(CGEventType::LeftMouseDragged, 0, false),
+            DragInput::Pass
+        );
+        assert_eq!(step(CGEventType::KeyDown, ESCAPE, true), DragInput::Pass);
+        // A drop's release, then Escape before the drag's end is shared.
+        assert_eq!(step(CGEventType::LeftMouseDown, 0, true), DragInput::Pass);
+        assert_eq!(step(CGEventType::LeftMouseUp, 0, true), DragInput::Pass);
+        assert_eq!(step(CGEventType::KeyDown, ESCAPE, true), DragInput::Pass);
+    }
+
+    #[test]
+    fn modified_escape_passes_through_during_drag() {
+        let mut button = LeftButton::Down;
+        for modifiers in [
+            Modifiers::LCMD | Modifiers::LALT,
+            Modifiers::LCMD,
+            Modifiers::LCTRL,
+            Modifiers::LSHIFT,
+        ] {
+            assert_eq!(
+                drag_input(&mut button, CGEventType::KeyDown, ESCAPE, modifiers, true),
+                DragInput::Pass,
+                "modified Escape ({modifiers:?}) must not cancel a drag"
+            );
+            assert_eq!(button, LeftButton::Down);
+        }
+
+        // Plain Escape still cancels, and modified Escape afterwards is not swallowed.
+        assert_eq!(
+            drag_input(
+                &mut button,
+                CGEventType::KeyDown,
+                ESCAPE,
+                Modifiers::empty(),
+                true
+            ),
+            DragInput::Cancel
+        );
+        assert_eq!(
+            drag_input(
+                &mut button,
+                CGEventType::KeyDown,
+                ESCAPE,
+                Modifiers::LCMD | Modifiers::LALT,
+                false
+            ),
+            DragInput::Pass
+        );
+    }
+
+    #[test]
+    fn a_lost_release_after_escape_ends_the_cancel() {
+        let mut button = LeftButton::Down;
+        assert_eq!(
+            drag_input(
+                &mut button,
+                CGEventType::KeyDown,
+                ESCAPE,
+                Modifiers::empty(),
+                true
+            ),
+            DragInput::Cancel
+        );
+        assert_eq!(
+            drag_input(
+                &mut button,
+                CGEventType::MouseMoved,
+                0,
+                Modifiers::empty(),
+                true
+            ),
+            DragInput::Pass
+        );
+        assert_eq!(button, LeftButton::Up);
+        assert_eq!(
+            drag_input(
+                &mut button,
+                CGEventType::LeftMouseDragged,
+                0,
+                Modifiers::empty(),
+                true
+            ),
+            DragInput::Pass
+        );
+    }
+
+    fn three_fingers(x: f64) -> Vec<Touch<usize>> {
         (0..3)
-            .map(|identity| SwipeSample {
+            .map(|identity| Touch {
                 identity,
                 x,
                 y: 0.0,
                 device_width_points: 144.0,
+                began: false,
+                ended: false,
             })
             .collect()
+    }
+
+    #[test]
+    fn swipes_wait_out_the_landing_grace() {
+        assert!(within_landing_grace(Some(10.0), 10.03));
+        assert!(!within_landing_grace(Some(10.0), 10.0 + LANDING_GRACE_SECS));
+        assert!(!within_landing_grace(None, 10.0));
+    }
+
+    #[test]
+    fn overview_claim_lasts_while_any_of_its_fingers_is_down() {
+        let claimed = [0, 1, 2, 3];
+        let same = |a: &usize, b: &usize| a == b;
+        // One finger lifted: the three left are still the overview's, even
+        // if macOS restarts the gesture and reports them as began.
+        let mut rest = three_fingers(0.0);
+        for f in &mut rest {
+            f.began = true;
+        }
+        assert!(shares_finger(&rest, &claimed, same));
+        // A single original finger left among new ones still holds it.
+        let mut mixed = three_fingers(0.0);
+        mixed[0].identity = 10;
+        mixed[1].identity = 11;
+        assert!(shares_finger(&mixed, &claimed, same));
+        // All new fingers: a new sequence.
+        let fresh: Vec<_> = three_fingers(0.0)
+            .into_iter()
+            .map(|mut f| {
+                f.identity += 20;
+                f
+            })
+            .collect();
+        assert!(!shares_finger(&fresh, &claimed, same));
+    }
+
+    fn movement(previous: &[Touch<usize>], current: &[Touch<usize>]) -> Option<SwipeMovement> {
+        swipe_movement(previous, current, |a, b| a == b)
     }
 
     fn assert_horizontal(movement: Option<SwipeMovement>, expected: f64) {
@@ -835,115 +1372,112 @@ mod tests {
     }
 
     #[test]
-    fn accumulated_horizontal_swipe_reports_the_full_physical_distance() {
-        let mut swipe = SwipeAccumulator::default();
-        assert_eq!(swipe.sample(three_fingers(0.0), |a, b| a == b), None);
-        assert_eq!(swipe.sample(three_fingers(0.0004), |a, b| a == b), None);
-
-        let movement = swipe.sample(three_fingers(0.0006), |a, b| a == b);
-        let Some(SwipeMovement::Horizontal { delta, distance_cm }) = movement else {
-            panic!("expected horizontal swipe, got {movement:?}");
+    fn horizontal_sample_reports_its_physical_distance() {
+        let actual = movement(&three_fingers(0.0), &three_fingers(0.0006));
+        let Some(SwipeMovement::Horizontal { delta, distance_cm }) = actual else {
+            panic!("expected horizontal swipe, got {actual:?}");
         };
-        assert!((delta + 0.0018).abs() < 1e-12);
+        assert!((delta + 0.0006).abs() < 1e-12);
         assert_eq!(distance_cm, Some(-0.003_048));
     }
 
     #[test]
-    fn slow_finger_motion_accumulates_until_it_can_move_the_strip() {
-        let mut swipe = SwipeAccumulator::default();
-        assert_eq!(swipe.sample(three_fingers(0.0), |a, b| a == b), None);
-        assert_eq!(swipe.sample(three_fingers(0.0002), |a, b| a == b), None);
-        assert_eq!(swipe.sample(three_fingers(0.0004), |a, b| a == b), None);
-        assert_horizontal(swipe.sample(three_fingers(0.0006), |a, b| a == b), -0.0018);
-        assert_eq!(swipe.sample(three_fingers(0.0008), |a, b| a == b), None);
-        assert_horizontal(swipe.sample(three_fingers(0.0012), |a, b| a == b), -0.0018);
+    fn subthreshold_samples_do_not_accumulate() {
+        assert_eq!(movement(&three_fingers(0.0), &three_fingers(0.0002)), None);
+        assert_eq!(
+            movement(&three_fingers(0.0002), &three_fingers(0.0004)),
+            None
+        );
+        assert_eq!(
+            movement(&three_fingers(0.0004), &three_fingers(0.0006)),
+            None
+        );
+        assert_horizontal(
+            movement(&three_fingers(0.0006), &three_fingers(0.0012)),
+            -0.0006,
+        );
     }
 
     #[test]
-    fn subthreshold_reversal_cancels_without_emitting_a_swipe() {
-        let mut swipe = SwipeAccumulator::default();
-        swipe.sample(three_fingers(0.0), |a, b| a == b);
-        assert_eq!(swipe.sample(three_fingers(0.0004), |a, b| a == b), None);
-        assert_eq!(swipe.sample(three_fingers(0.0001), |a, b| a == b), None);
-        assert_eq!(swipe.sample(three_fingers(0.0), |a, b| a == b), None);
+    fn subthreshold_reversal_is_ignored() {
+        assert_eq!(movement(&three_fingers(0.0), &three_fingers(0.0004)), None);
+        assert_eq!(
+            movement(&three_fingers(0.0004), &three_fingers(0.0001)),
+            None
+        );
     }
 
     #[test]
-    fn new_gesture_discards_unconsumed_motion() {
-        let mut swipe = SwipeAccumulator::default();
-        swipe.sample(three_fingers(0.0), |a, b| a == b);
-        assert_eq!(swipe.sample(three_fingers(0.0004), |a, b| a == b), None);
-        swipe.reset();
-        assert_eq!(swipe.sample(three_fingers(0.0004), |a, b| a == b), None);
-        assert_eq!(swipe.sample(three_fingers(0.0006), |a, b| a == b), None);
+    fn still_fingers_emit_no_motion() {
+        assert_eq!(
+            movement(&three_fingers(0.0004), &three_fingers(0.0004)),
+            None
+        );
     }
 
     #[test]
-    fn finger_replacement_resets_unconsumed_motion() {
-        let mut swipe = SwipeAccumulator::default();
-        swipe.sample(three_fingers(0.0), |a, b| a == b);
-        assert_eq!(swipe.sample(three_fingers(0.0004), |a, b| a == b), None);
+    fn finger_replacement_does_not_report_a_jump() {
         let mut replacement = three_fingers(0.002);
         replacement[2].identity = 3;
-        assert_eq!(swipe.sample(replacement, |a, b| a == b), None);
+        assert_eq!(movement(&three_fingers(0.0004), &replacement), None);
         let mut next = three_fingers(0.0026);
         next[2].identity = 3;
-        assert_horizontal(swipe.sample(next, |a, b| a == b), -0.0018);
+        assert_horizontal(movement(&replacement, &next), -0.0006);
     }
 
     #[test]
-    fn finger_order_changes_do_not_reset_a_slow_swipe() {
-        let mut swipe = SwipeAccumulator::default();
-        swipe.sample(three_fingers(0.0), |a, b| a == b);
-        let mut first = three_fingers(0.0003);
-        first.reverse();
-        assert_eq!(swipe.sample(first, |a, b| a == b), None);
-        assert_horizontal(swipe.sample(three_fingers(0.0006), |a, b| a == b), -0.0018);
+    fn finger_order_changes_do_not_change_delta() {
+        let mut current = three_fingers(0.0006);
+        current.reverse();
+        assert_horizontal(movement(&three_fingers(0.0), &current), -0.0006);
     }
 
     #[test]
     fn sustained_swipe_continues_when_one_finger_lags() {
-        let mut swipe = SwipeAccumulator::default();
-        swipe.sample(three_fingers(0.0), |a, b| a == b);
-        assert_horizontal(swipe.sample(three_fingers(0.002), |a, b| a == b), -0.006);
-
         let mut next = three_fingers(0.004);
         next[2].x = 0.002;
-        assert_horizontal(swipe.sample(next, |a, b| a == b), -0.004);
+        assert_horizontal(movement(&three_fingers(0.002), &next), -0.004 / 2.0);
 
-        let mut next = three_fingers(0.006);
-        next[2].x = 0.002;
-        assert_horizontal(swipe.sample(next, |a, b| a == b), -0.004);
+        let mut later = three_fingers(0.006);
+        later[2].x = 0.002;
+        assert_horizontal(movement(&next, &later), -0.004 / 2.0);
     }
 
     #[test]
     fn one_moving_finger_can_start_a_swipe() {
-        let mut swipe = SwipeAccumulator::default();
-        swipe.sample(three_fingers(0.0), |a, b| a == b);
         let mut one_finger_moves = three_fingers(0.0);
         one_finger_moves[0].x = 0.02;
-        assert_horizontal(swipe.sample(one_finger_moves, |a, b| a == b), -0.02);
+        assert_horizontal(movement(&three_fingers(0.0), &one_finger_moves), -0.02);
+    }
+
+    #[test]
+    fn one_moving_finger_sets_vertical_delta() {
+        let previous = three_fingers(0.0);
+        let mut current = three_fingers(0.0);
+        current[0].y = 0.02;
+        let actual = movement(&previous, &current);
+        assert_eq!(actual, Some(SwipeMovement::Vertical(-0.02)));
     }
 
     #[test]
     fn fast_vertical_motion_keeps_its_existing_direction() {
-        let mut swipe = SwipeAccumulator::default();
         let vertical = |y| {
             (0..3)
-                .map(|identity| SwipeSample {
+                .map(|identity| Touch {
                     identity,
                     x: 0.0,
                     y,
                     device_width_points: 144.0,
+                    began: false,
+                    ended: false,
                 })
-                .collect()
+                .collect::<Vec<_>>()
         };
-        swipe.sample(vertical(0.0), |a, b| a == b);
-        let movement = swipe.sample(vertical(0.002), |a, b| a == b);
-        let Some(SwipeMovement::Vertical(delta)) = movement else {
-            panic!("expected vertical swipe, got {movement:?}");
+        let actual = movement(&vertical(0.0), &vertical(0.002));
+        let Some(SwipeMovement::Vertical(delta)) = actual else {
+            panic!("expected vertical swipe, got {actual:?}");
         };
-        assert!((delta + 0.006).abs() < 1e-12);
+        assert!((delta + 0.002).abs() < 1e-12);
     }
 
     fn step_config(extra: &str) -> Config {
@@ -1230,21 +1764,172 @@ mod tests {
     }
 
     #[test]
-    fn empty_intermediate_gesture_event_preserves_pending_movement() {
-        let mut swipe = SwipeAccumulator::default();
-        swipe.sample(three_fingers(0.0), |a, b| a == b);
-        assert!(!should_reset_swipe_anchors(0, swipe.anchors.len()));
-        assert_horizontal(swipe.sample(three_fingers(0.0006), |a, b| a == b), -0.0018);
-        assert!(!should_reset_swipe_anchors(0, swipe.anchors.len()));
-        assert_horizontal(swipe.sample(three_fingers(0.0012), |a, b| a == b), -0.0018);
+    fn empty_intermediate_gesture_event_keeps_the_previous_sample() {
+        assert!(!should_reset_swipe_samples(0, 3));
+        assert_horizontal(
+            movement(&three_fingers(0.0), &three_fingers(0.0006)),
+            -0.0006,
+        );
     }
 
     #[test]
-    fn nonempty_finger_count_change_resets_pending_movement() {
-        let mut swipe = SwipeAccumulator::default();
-        swipe.sample(three_fingers(0.0), |a, b| a == b);
-        assert!(should_reset_swipe_anchors(2, swipe.anchors.len()));
-        swipe.reset();
-        assert_eq!(swipe.sample(three_fingers(0.0006), |a, b| a == b), None);
+    fn nonempty_finger_count_change_starts_new_samples() {
+        assert!(should_reset_swipe_samples(2, 3));
+        assert_eq!(
+            movement(&three_fingers(0.0), &three_fingers(0.0006)[..2]),
+            None
+        );
+    }
+
+    #[test]
+    fn disabled_vertical_swipe_suppresses_scroll_without_emitting_vertical_event() {
+        let (sender, receiver) = EventSender::new();
+        let config =
+            Config::try_from("[swipe.gesture]\nfingers_count = 3\nvertical = false\n").unwrap();
+        let mut handler = InputHandler::new(sender, config, Arc::new(AtomicBool::new(false)));
+
+        handler.dispatch_swipe_movement(Some(SwipeMovement::Vertical(0.02)), 3, Some(0.008), 0.0);
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "vertical = false must not emit Event::VerticalSwipe"
+        );
+        assert!(
+            handler.last_swipe_time.is_some(),
+            "vertical = false must still arm scroll suppression for the configured gesture"
+        );
+    }
+
+    #[test]
+    fn swipes_are_not_held_back_without_higher_finger_overview_gesture() {
+        for toml in [
+            "[swipe.gesture]\nfingers_count = 3\n",
+            "[swipe.gesture]\nfingers_count = 4\noverview_fingers = 3\n",
+        ] {
+            let (sender, receiver) = EventSender::new();
+            let config = Config::try_from(toml).unwrap();
+            let fingers = config.swipe_gesture_fingers().unwrap();
+            let mut handler = InputHandler::new(sender, config, Arc::new(AtomicBool::new(false)));
+            handler.finger_landed_at = Some(10.0);
+
+            handler.dispatch_swipe_movement(
+                Some(SwipeMovement::Horizontal {
+                    delta: 0.02,
+                    distance_cm: Some(0.5),
+                }),
+                fingers,
+                Some(0.008),
+                10.01,
+            );
+
+            assert!(
+                handler.held_swipes.is_empty(),
+                "swipe should not be buffered for config:\n{toml}"
+            );
+            assert!(
+                matches!(receiver.try_recv(), Ok(Event::Swipe { .. })),
+                "swipe must dispatch immediately without landing grace delay"
+            );
+        }
+    }
+
+    #[test]
+    fn swipes_wait_out_landing_grace_when_higher_finger_overview_is_configured() {
+        let (sender, receiver) = EventSender::new();
+        let config =
+            Config::try_from("[swipe.gesture]\nfingers_count = 3\noverview_fingers = 4\n").unwrap();
+        let mut handler = InputHandler::new(sender, config, Arc::new(AtomicBool::new(false)));
+        handler.finger_landed_at = Some(10.0);
+
+        handler.dispatch_swipe_movement(
+            Some(SwipeMovement::Horizontal {
+                delta: 0.01,
+                distance_cm: Some(0.25),
+            }),
+            3,
+            Some(0.008),
+            10.02,
+        );
+        assert_eq!(handler.held_swipes.len(), 1);
+        assert!(receiver.try_recv().is_err());
+
+        handler.dispatch_swipe_movement(
+            Some(SwipeMovement::Horizontal {
+                delta: 0.02,
+                distance_cm: Some(0.5),
+            }),
+            3,
+            Some(0.008),
+            10.0 + LANDING_GRACE_SECS,
+        );
+        assert!(handler.held_swipes.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::Swipe { delta, .. }) if (delta - 0.01).abs() < 1e-12
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::Swipe { delta, .. }) if (delta - 0.02).abs() < 1e-12
+        ));
+    }
+
+    #[test]
+    fn overview_intercepts_escape_and_return_even_without_key_window_focus() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::overview::OVERVIEW_OPEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _reset = scopeguard::guard((), |()| {
+            crate::overview::OVERVIEW_OPEN.store(false, Ordering::Relaxed);
+            crate::overview::OVERVIEW_ACCEPTS_KEYS.store(false, Ordering::Relaxed);
+        });
+
+        let (sender, receiver) = EventSender::new();
+        let config =
+            Config::try_from("[bindings]\nwindow_focus_west = \"cmd - h\"\n").expect("config");
+        let handler = InputHandler::new(sender, config, Arc::new(AtomicBool::new(false)));
+
+        // When closed, bare Escape (53) and Return (36) pass through untouched.
+        crate::overview::OVERVIEW_OPEN.store(false, Ordering::Relaxed);
+        crate::overview::OVERVIEW_ACCEPTS_KEYS.store(false, Ordering::Relaxed);
+        assert!(!handler.handle_keypress(53, CGEventFlags(0)));
+        assert!(!handler.handle_keypress(36, CGEventFlags(0)));
+        assert!(receiver.try_recv().is_err());
+
+        // While open (including after `cmd - h` / `cmd - l` moves key-window focus
+        // to another app), focus chords still dispatch and bare Escape / Return
+        // are intercepted globally by the event tap.
+        crate::overview::OVERVIEW_OPEN.store(true, Ordering::Relaxed);
+        crate::overview::OVERVIEW_ACCEPTS_KEYS.store(true, Ordering::Relaxed);
+
+        // `cmd - h` (keycode 4, LCMD = 0x08) dispatches Focus(West).
+        assert!(handler.handle_keypress(4, CGEventFlags(0x0000_0008)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::Command {
+                command: Command::Window(Operation::Focus(Direction::West)),
+            })
+        ));
+
+        // Bare Escape -> OverviewDismiss, bare Return -> OverviewAccept.
+        assert!(handler.handle_keypress(53, CGEventFlags(0)));
+        assert!(matches!(receiver.try_recv(), Ok(Event::OverviewDismiss)));
+
+        assert!(handler.handle_keypress(36, CGEventFlags(0)));
+        assert!(matches!(receiver.try_recv(), Ok(Event::OverviewAccept)));
+
+        // Modified Escape / Return (e.g. Cmd+Escape) must NOT trigger dismiss/accept.
+        assert!(!handler.handle_keypress(53, CGEventFlags(0x0000_0008)));
+        assert!(!handler.handle_keypress(36, CGEventFlags(0x0000_0008)));
+        assert!(receiver.try_recv().is_err());
+
+        // During touch-down prebuild or closing (`OVERVIEW_OPEN == true`,
+        // `OVERVIEW_ACCEPTS_KEYS == false`), bare Escape / Return pass through
+        // to the focused app instead of being swallowed.
+        crate::overview::OVERVIEW_ACCEPTS_KEYS.store(false, Ordering::Relaxed);
+        assert!(!handler.handle_keypress(53, CGEventFlags(0)));
+        assert!(!handler.handle_keypress(36, CGEventFlags(0)));
+        assert!(receiver.try_recv().is_err());
     }
 }

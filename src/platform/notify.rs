@@ -50,14 +50,15 @@ impl NotifyHandler {
             KnownCGSEvent::SpaceCreated,
             KnownCGSEvent::SpaceCurrentChanged,
             KnownCGSEvent::SpaceDestroyed,
+            KnownCGSEvent::ManagedSpaceMembershipUpdated,
             KnownCGSEvent::SpaceWindowDestroyed,
         ];
-        for event in events {
+        events.into_iter().try_for_each(|event| {
             unsafe {
                 SLSRegisterConnectionNotifyProc(cid, Self::callback, event.into(), this.cast())
             }
-            .to_result(function_name!())?;
-        }
+            .to_result(function_name!())
+        })?;
 
         Ok(scopeguard::guard(
             pinned,
@@ -75,7 +76,7 @@ impl NotifyHandler {
         cid: ConnID,
     ) {
         if let Some(this) =
-            NonNull::new(context).map(|this| unsafe { this.cast::<NotifyHandler>().as_mut() })
+            NonNull::new(context).map(|this| unsafe { this.cast::<NotifyHandler>().as_ref() })
         {
             this.notify_handler(event_id, data, len, cid);
         } else {
@@ -91,21 +92,37 @@ impl NotifyHandler {
         };
 
         match event {
-            KnownCGSEvent::SpaceCreated
-            | KnownCGSEvent::SpaceDestroyed
-            | KnownCGSEvent::SpaceCurrentChanged => {
-                if let Some(space_id) = from_bytes::<WorkspaceId>(data, len) {
-                    if matches!(event, KnownCGSEvent::SpaceDestroyed) {
-                        _ = self.events.send(Event::SpaceDestroyed { space_id });
+            KnownCGSEvent::SpaceDestroyed => {
+                if let Some(space_id) = from_bytes::<WorkspaceId>(data, len)
+                    && space_id != 0
+                {
+                    _ = self.events.send(Event::SpaceDestroyed { space_id });
+                }
+            }
+
+            KnownCGSEvent::SpaceCurrentChanged => {
+                if let Some(space_id) = from_bytes::<WorkspaceId>(data, len)
+                    && space_id != 0
+                {
+                    _ = self.events.send(Event::SpaceCurrentChanged { space_id });
+                }
+            }
+
+            KnownCGSEvent::SpaceCreated => {
+                if let Some(space_id) = from_bytes::<WorkspaceId>(data, len)
+                    && space_id != 0
+                {
+                    let space_type = unsafe { SLSSpaceGetType(self.conn, space_id) };
+                    if space_type == 0 {
+                        _ = self.events.send(Event::SpaceCreated { space_id });
                     } else {
-                        let space_type = unsafe { SLSSpaceGetType(self.conn, space_id) };
-                        if space_type == 0 && matches!(event, KnownCGSEvent::SpaceCreated) {
-                            _ = self.events.send(Event::SpaceCreated { space_id });
-                        } else {
-                            debug!("{event} space = {space_id}, space_type = {space_type}");
-                        }
+                        debug!("{event} space = {space_id}, space_type = {space_type}");
                     }
                 }
+            }
+
+            KnownCGSEvent::ManagedSpaceMembershipUpdated => {
+                _ = self.events.send(Event::SpaceMembershipChanged);
             }
 
             KnownCGSEvent::SpaceWindowDestroyed => {
@@ -141,7 +158,7 @@ impl NotifyHandler {
 
             _ => {
                 let bytes = (!data.is_null() && len > 0)
-                    .then_some(unsafe { std::slice::from_raw_parts(data as *const u8, len) });
+                    .then(|| unsafe { std::slice::from_raw_parts(data as *const u8, len) });
                 debug!("Unhandled event {event}: {bytes:?}");
             }
         }
@@ -150,8 +167,7 @@ impl NotifyHandler {
 
 fn from_bytes<T>(data: *const c_void, len: usize) -> Option<T> {
     let size = std::mem::size_of::<T>();
-    (!data.is_null() && len >= size)
-        .then_some(unsafe { std::ptr::read_unaligned(data.cast::<T>()) })
+    (!data.is_null() && len >= size).then(|| unsafe { std::ptr::read_unaligned(data.cast::<T>()) })
 }
 
 // credits

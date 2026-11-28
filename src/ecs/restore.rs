@@ -30,6 +30,7 @@ pub(crate) struct SessionRestore {
     state: PaneruState,
     timer: Timer,
     saved_hard_keys: HashSet<WindowHardMatchKey>,
+    cross_space: bool,
 }
 
 impl SessionRestore {
@@ -39,6 +40,18 @@ impl SessionRestore {
             state,
             timer: Timer::new(grace, TimerMode::Once),
             saved_hard_keys,
+            cross_space: false,
+        }
+    }
+
+    pub(crate) fn is_cross_space(&self) -> bool {
+        self.cross_space
+    }
+
+    pub(crate) fn for_setup(state: PaneruState, grace: Duration) -> Self {
+        Self {
+            cross_space: true,
+            ..Self::new(state, grace)
         }
     }
 }
@@ -70,6 +83,8 @@ pub(crate) struct CurrentWindowIdentity {
     pub identifier: String,
     pub role: String,
     pub subrole: String,
+    /// Space of the strip holding the window at restore time; `None` when it is in no strip yet.
+    pub workspace_id: Option<WorkspaceId>,
 }
 
 impl CurrentWindowIdentity {
@@ -88,6 +103,7 @@ impl CurrentWindowIdentity {
             identifier: "main".to_string(),
             role: "AXWindow".to_string(),
             subrole: "AXStandardWindow".to_string(),
+            workspace_id: None,
         }
     }
 }
@@ -112,7 +128,9 @@ impl WindowHardMatchKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlannedColumn {
     Single(Entity),
-    Stack(Vec<PlannedStackItem>),
+    /// The second field is the active tab; `None` if split or if the saved
+    /// active window didn't match.
+    Stack(Vec<PlannedStackItem>, Option<Entity>),
     Tabs(Vec<Entity>),
     Fullscreen(Entity),
 }
@@ -171,10 +189,16 @@ impl<'a> RestorePlanner<'a> {
         current: &[CurrentWindowIdentity],
         plan: &mut RestorePlan,
     ) -> Vec<PlannedStrip> {
+        // A window already on another Space stays there; unknown Space matches as before.
+        let on_workspace = current
+            .iter()
+            .filter(|w| w.workspace_id.is_none_or(|id| id == workspace.workspace_id))
+            .cloned()
+            .collect::<Vec<_>>();
         workspace
             .strips
             .iter()
-            .filter_map(|strip| self.plan_strip(workspace, strip, current, plan))
+            .filter_map(|strip| self.plan_strip(workspace, strip, &on_workspace, plan))
             .collect()
     }
 
@@ -217,30 +241,53 @@ impl<'a> RestorePlanner<'a> {
                     .filter_map(|saved| self.match_window(saved, current, plan))
                     .collect(),
             ),
-            SavedColumn::Stack(items) => compact_stack_items(
-                items
+            SavedColumn::Stack(items, active) => {
+                let mut active_entity = None;
+                let planned_items = items
                     .iter()
-                    .filter_map(|item| self.plan_stack_item(item, current, plan))
-                    .collect(),
-            ),
+                    .filter_map(|item| {
+                        let (planned, matched_active) =
+                            self.plan_stack_item(item, active.as_ref(), current, plan);
+                        if matched_active.is_some() {
+                            active_entity = matched_active;
+                        }
+                        planned
+                    })
+                    .collect();
+                compact_stack_items(planned_items, active_entity)
+            }
         }
     }
 
+    /// Plans one stack item and returns its entity if it is `saved_active`.
+    /// Reuses this match: a second `match_window` would double-consume it.
     fn plan_stack_item(
         &self,
         item: &SavedStackItem,
+        saved_active: Option<&SavedWindow>,
         current: &[CurrentWindowIdentity],
         plan: &mut RestorePlan,
-    ) -> Option<PlannedStackItem> {
+    ) -> (Option<PlannedStackItem>, Option<Entity>) {
         match item {
-            SavedStackItem::Single(saved) => self
-                .match_window(saved, current, plan)
-                .map(PlannedStackItem::Single),
-            SavedStackItem::Tabs(tabs) => compact_stack_tabs(
-                tabs.iter()
-                    .filter_map(|saved| self.match_window(saved, current, plan))
-                    .collect(),
-            ),
+            SavedStackItem::Single(saved) => {
+                let entity = self.match_window(saved, current, plan);
+                let matched_active = entity.filter(|_| saved_active == Some(saved));
+                (entity.map(PlannedStackItem::Single), matched_active)
+            }
+            SavedStackItem::Tabs(tabs) => {
+                let mut matched_active = None;
+                let entities = tabs
+                    .iter()
+                    .filter_map(|saved| {
+                        let entity = self.match_window(saved, current, plan)?;
+                        if saved_active == Some(saved) {
+                            matched_active = Some(entity);
+                        }
+                        Some(entity)
+                    })
+                    .collect();
+                (compact_stack_tabs(entities), matched_active)
+            }
         }
     }
 
@@ -322,26 +369,7 @@ fn saved_windows_in_state(state: &PaneruState) -> impl Iterator<Item = &SavedWin
         .iter()
         .flat_map(|workspace| &workspace.strips)
         .flat_map(|strip| &strip.columns)
-        .flat_map(saved_windows_in_column)
-}
-
-fn saved_windows_in_column(column: &SavedColumn) -> Box<dyn Iterator<Item = &SavedWindow> + '_> {
-    match column {
-        SavedColumn::Single(saved) | SavedColumn::Fullscreen(saved) => {
-            Box::new(std::iter::once(saved))
-        }
-        SavedColumn::Tabs(tabs) => Box::new(tabs.iter()),
-        SavedColumn::Stack(items) => Box::new(items.iter().flat_map(saved_windows_in_stack_item)),
-    }
-}
-
-fn saved_windows_in_stack_item(
-    item: &SavedStackItem,
-) -> Box<dyn Iterator<Item = &SavedWindow> + '_> {
-    match item {
-        SavedStackItem::Single(saved) => Box::new(std::iter::once(saved)),
-        SavedStackItem::Tabs(tabs) => Box::new(tabs.iter()),
-    }
+        .flat_map(SavedColumn::windows)
 }
 
 impl SavedWindow {
@@ -376,24 +404,23 @@ pub(crate) fn matches_startup_restore_state(
     restoration: Option<&PaneruState>,
     config: &Config,
 ) -> bool {
-    if !config.restore_enabled() {
+    if !config.restore_enabled() || (session.is_none() && restoration.is_none()) {
         return false;
     }
 
     let Ok(pid) = window.pid() else {
         return false;
     };
-    let bundle_id = app.bundle_id().unwrap_or_default().clone();
-    let key = WindowHardMatchKey::new(window.id(), pid, bundle_id.clone());
+    let bundle_id = app.bundle_id().unwrap_or_default();
 
     if let Some(session) = session {
+        let key = WindowHardMatchKey::new(window.id(), pid, bundle_id);
         return session.saved_hard_keys.contains(&key);
     }
 
-    let Some(state) = restoration else {
-        return false;
-    };
-    saved_windows_in_state(state).any(|saved| saved.hard_match(window.id(), pid, &bundle_id))
+    restoration.is_some_and(|state| {
+        saved_windows_in_state(state).any(|saved| saved.hard_match(window.id(), pid, &bundle_id))
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -433,8 +460,27 @@ pub(super) fn restore_window_state(
         restoration
     };
 
-    let current = current_window_identities(&ctx.windows, &apps, restoration);
-    let plan = RestorePlanner::new(restoration).plan(&current);
+    // An unknown space matches any saved space. Thus a setup restore can move windows across displays.
+    let cross_space = session
+        .as_deref()
+        .is_some_and(|session| session.cross_space);
+    let window_workspaces = workspaces
+        .iter()
+        .filter(|_| !cross_space)
+        .flat_map(|(_, strip, _, _)| {
+            let id = strip.id();
+            strip.window_iter().map(move |entity| (entity, id))
+        })
+        .collect::<HashMap<_, _>>();
+    let planner = RestorePlanner::new(restoration);
+    let current = current_window_identities(
+        &ctx.windows,
+        &apps,
+        restoration,
+        &planner.saved_hard_keys,
+        &window_workspaces,
+    );
+    let plan = planner.plan(&current);
 
     if plan.consumed_entities.is_empty() {
         info!(
@@ -446,10 +492,14 @@ pub(super) fn restore_window_state(
 
     let mut existing_workspace_parents = HashMap::new();
     let mut active_workspace_ids = HashSet::new();
+    let mut active_display_entities = HashSet::new();
     let mut emptied_existing_strips = HashSet::new();
     for (entity, mut strip, child, active) in &mut workspaces {
         if active {
             active_workspace_ids.insert(strip.id());
+            if let Some(child) = child {
+                active_display_entities.insert(child.parent());
+            }
         }
         if let Some(child) = child {
             existing_workspace_parents
@@ -469,7 +519,7 @@ pub(super) fn restore_window_state(
         // (its windows move onto the restored rows), but despawning it leaves
         // the space numbered from "2" with no row that any later switch or
         // reap path recreates, so it is kept and reused instead.
-        if had_consumed_window && strip.all_windows().is_empty() && strip.virtual_index > 0 {
+        if had_consumed_window && strip.len() == 0 && strip.virtual_index > 0 {
             emptied_existing_strips.insert(entity);
         }
     }
@@ -502,7 +552,7 @@ pub(super) fn restore_window_state(
         };
 
         let mut strip = layout_strip_from_plan(planned);
-        if strip.all_windows().is_empty() {
+        if strip.len() == 0 {
             continue;
         }
 
@@ -529,7 +579,9 @@ pub(super) fn restore_window_state(
             .get(&planned.workspace_id)
             .is_some_and(|active| *active == planned.virtual_index);
         let is_global_active = is_active && active_workspace_ids.contains(&planned.workspace_id);
-        let origin = if is_global_active {
+        let is_shown =
+            is_global_active || (is_active && !active_display_entities.contains(&display_entity));
+        let origin = if is_shown {
             display.bounds().min
         } else {
             display.bounds().max - PARKED_STRIP_SLIVER
@@ -543,7 +595,7 @@ pub(super) fn restore_window_state(
                 {
                     let existing_previous = PreviousStripPosition {
                         origin: display.bounds().min,
-                        focus: strip.all_windows().first().copied(),
+                        focus: strip.first(),
                     };
                     entity_commands
                         .try_remove::<ActiveWorkspaceMarker>()
@@ -555,7 +607,7 @@ pub(super) fn restore_window_state(
 
         let previous = PreviousStripPosition {
             origin: display.bounds().min,
-            focus: strip.all_windows().first().copied(),
+            focus: strip.first(),
         };
 
         let mut spawned =
@@ -564,6 +616,8 @@ pub(super) fn restore_window_state(
 
         if is_global_active {
             spawned.insert(RestoredActivation);
+        } else if is_shown {
+            spawned.insert(SelectedVirtualMarker);
         } else {
             if is_active {
                 spawned.insert(SelectedVirtualMarker);
@@ -599,6 +653,8 @@ fn current_window_identities(
     windows: &Windows,
     apps: &Query<&Application>,
     restoration: &PaneruState,
+    saved_hard_keys: &HashSet<WindowHardMatchKey>,
+    window_workspaces: &HashMap<Entity, WorkspaceId>,
 ) -> Vec<CurrentWindowIdentity> {
     let mut current = windows
         .managed_iter()
@@ -613,13 +669,13 @@ fn current_window_identities(
                 identifier: String::new(),
                 role: String::new(),
                 subrole: String::new(),
+                workspace_id: window_workspaces.get(&entity).copied(),
             })
         })
         .collect::<Vec<_>>();
 
     if has_saved_fallback_windows(restoration) {
-        let saved_hard_keys = saved_hard_match_keys(restoration);
-        hydrate_fallback_identities(&mut current, windows, &saved_hard_keys);
+        hydrate_fallback_identities(&mut current, windows, saved_hard_keys);
     }
 
     current
@@ -701,8 +757,8 @@ fn apply_planned_columns(strip: &mut LayoutStrip, columns: &[PlannedColumn]) {
             PlannedColumn::Tabs(entities) => {
                 append_tabs(strip, entities);
             }
-            PlannedColumn::Stack(items) => {
-                append_stack(strip, items);
+            PlannedColumn::Stack(items, active) => {
+                append_stack(strip, items, *active);
             }
         }
     }
@@ -717,7 +773,7 @@ fn append_tabs(strip: &mut LayoutStrip, entities: &[Entity]) -> Option<Entity> {
     Some(leader)
 }
 
-fn append_stack(strip: &mut LayoutStrip, items: &[PlannedStackItem]) {
+fn append_stack(strip: &mut LayoutStrip, items: &[PlannedStackItem], active: Option<Entity>) {
     let mut first = true;
     for item in items {
         let Some(leader) = append_stack_item(strip, item) else {
@@ -728,6 +784,9 @@ fn append_stack(strip: &mut LayoutStrip, items: &[PlannedStackItem]) {
         } else {
             _ = strip.stack(leader);
         }
+    }
+    if let Some(active) = active {
+        _ = strip.toggle_tabbed_display(active);
     }
 }
 
@@ -757,11 +816,15 @@ fn compact_stack_tabs(entities: Vec<Entity>) -> Option<PlannedStackItem> {
     }
 }
 
-fn compact_stack_items(items: Vec<PlannedStackItem>) -> Option<PlannedColumn> {
+fn compact_stack_items(
+    items: Vec<PlannedStackItem>,
+    active: Option<Entity>,
+) -> Option<PlannedColumn> {
     match items.as_slice() {
         [] => None,
+        // A single item can't be tabbed, so `active` is dropped with the stack.
         [PlannedStackItem::Single(entity)] => Some(PlannedColumn::Single(*entity)),
         [PlannedStackItem::Tabs(entities)] => Some(PlannedColumn::Tabs(entities.clone())),
-        _ => Some(PlannedColumn::Stack(items)),
+        _ => Some(PlannedColumn::Stack(items, active)),
     }
 }

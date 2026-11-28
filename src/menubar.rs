@@ -25,11 +25,12 @@ use crate::accessibility_prompt::{
     AccessibilitySetupAction, handle_accessibility_setup_action, permission_pane_name,
     show_accessibility_setup,
 };
-use crate::commands::{Command, Operation};
+use crate::commands::{Command, DesktopOperation, DesktopTarget, Operation};
 use crate::config::Config;
 use crate::config::decorations::{
     DescriptorStyle, IndicatorFormat, IndicatorStyle, MenubarOrientation,
 };
+use crate::ecs::desktop::DesktopCensus;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::ActiveDisplay;
 use crate::ecs::{
@@ -178,6 +179,35 @@ define_class!(
             self.send_command(Command::Window(Operation::CopyRule));
         }
 
+        #[unsafe(method(selectDesktop:))]
+        fn select_desktop(&self, item: &NSMenuItem) {
+            let Ok(number) = u32::try_from(item.tag()) else {
+                return;
+            };
+            if number == 0 {
+                return;
+            }
+            self.send_command(Command::Desktop(DesktopOperation::Focus(
+                DesktopTarget::Number {
+                    number,
+                    display: None,
+                },
+            )));
+        }
+
+        #[unsafe(method(createDesktop:))]
+        fn create_desktop(&self, _: &NSMenuItem) {
+            self.send_command(Command::Desktop(DesktopOperation::Create { focus: true }));
+        }
+
+        #[unsafe(method(destroyDesktop:))]
+        fn destroy_desktop(&self, _: &NSMenuItem) {
+            self.send_command(Command::Desktop(DesktopOperation::Destroy {
+                target: None,
+                empty_only: false,
+            }));
+        }
+
         #[unsafe(method(openAccessibilitySettings:))]
         fn open_accessibility_settings(&self, _: &NSMenuItem) {
             if let Err(error) = std::process::Command::new("/usr/bin/open")
@@ -232,6 +262,56 @@ impl MenuActionTarget {
 
 const MENU_BAR_SPACING: CGFloat = 5.0;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MenuDesktopSnapshot {
+    pub desktop_count: u32,
+    pub active_desktop: Option<u32>,
+}
+
+impl MenuDesktopSnapshot {
+    #[must_use]
+    pub fn can_close_active(&self) -> bool {
+        self.desktop_count >= 2 && self.active_desktop.is_some()
+    }
+}
+
+#[must_use]
+pub(crate) fn menu_desktop_snapshot(
+    census: Option<&DesktopCensus>,
+    display_id: u32,
+    active_space_id: u64,
+) -> MenuDesktopSnapshot {
+    let Some(disp) = census.and_then(|c| c.0.display(display_id)) else {
+        return MenuDesktopSnapshot::default();
+    };
+    let active_id = disp.current_space.get();
+    let (desktop_count, active_rec) =
+        disp.spaces.iter().fold((0u32, None), |(count, active), s| {
+            let next_count = count.saturating_add(u32::from(s.kind.is_desktop()));
+            let next_active = active.or_else(|| {
+                (s.id.get() == active_id || s.id.get() == active_space_id).then_some(s)
+            });
+            (next_count, next_active)
+        });
+    MenuDesktopSnapshot {
+        desktop_count,
+        active_desktop: active_rec.and_then(|s| s.desktop_number),
+    }
+}
+
+/// Fixed insertion offset for the optional `"Desktops"` section inside
+/// `MenuBarManager::menu`, immediately after `"Paneru — Running"` and its
+/// trailing separator.
+const DESKTOP_SECTION_START: NSInteger = 2;
+
+struct DesktopMenuSection {
+    header: Retained<NSMenuItem>,
+    rows: Vec<(u32, Retained<NSMenuItem>)>,
+    create_item: Retained<NSMenuItem>,
+    destroy_item: Retained<NSMenuItem>,
+    separator: Retained<NSMenuItem>,
+}
+
 pub struct MenuBarManager {
     mtm: MainThreadMarker,
     status_bar: Retained<NSStatusBar>,
@@ -239,13 +319,16 @@ pub struct MenuBarManager {
     menu: Retained<NSMenu>,
     action_target: Retained<MenuActionTarget>,
     width_items: Vec<(i32, Retained<NSMenuItem>)>,
+    desktop_section: Option<DesktopMenuSection>,
     managed_window_items: Vec<Retained<NSMenuItem>>,
     manage_item: Option<Retained<NSMenuItem>>,
     copy_rule_item: Option<Retained<NSMenuItem>>,
     configured_widths: Vec<i32>,
+    configured_desktop_count: u32,
     current_content: Option<MenuBarContent>,
     visible: bool,
     current_enablement: Option<WindowMenuEnablement>,
+    current_desktop: Option<MenuDesktopSnapshot>,
     selected_widths: Option<Vec<i32>>,
 }
 
@@ -299,13 +382,16 @@ impl MenuBarManager {
             menu,
             action_target,
             width_items: Vec::new(),
+            desktop_section: None,
             managed_window_items: Vec::new(),
             manage_item: None,
             copy_rule_item: None,
             configured_widths: Vec::new(),
+            configured_desktop_count: 0,
             current_content: None,
             visible,
             current_enablement: None,
+            current_desktop: None,
             selected_widths: None,
         }
     }
@@ -349,6 +435,7 @@ impl MenuBarManager {
         &mut self,
         virtual_index: u32,
         virtual_indices: &[u32],
+        desktops: &MenuDesktopSnapshot,
         config: &Config,
         has_focused_window: bool,
         focused_width_ratio: Option<f64>,
@@ -356,7 +443,23 @@ impl MenuBarManager {
         let preset_widths = config.preset_column_widths();
         let widths = normalized_width_percentages(&preset_widths);
         if self.configured_widths != widths || self.manage_item.is_none() {
-            self.rebuild_menu(&widths);
+            self.rebuild_menu(&widths, desktops.desktop_count);
+        } else if self.configured_desktop_count != desktops.desktop_count {
+            self.sync_desktop_section(desktops.desktop_count);
+        }
+
+        if self.current_desktop.as_ref() != Some(desktops) {
+            if let Some(section) = &self.desktop_section {
+                for (number, item) in &section.rows {
+                    item.setState(if desktops.active_desktop == Some(*number) {
+                        NSControlStateValueOn
+                    } else {
+                        NSControlStateValueOff
+                    });
+                }
+                section.destroy_item.setEnabled(desktops.can_close_active());
+            }
+            self.current_desktop = Some(desktops.clone());
         }
 
         let enablement = window_menu_enablement(has_focused_window, focused_width_ratio);
@@ -393,9 +496,11 @@ impl MenuBarManager {
         self.show_workspaces(config, current, all);
     }
 
-    fn rebuild_menu(&mut self, widths: &[i32]) {
+    fn rebuild_menu(&mut self, widths: &[i32], desktop_count: u32) {
         self.menu.removeAllItems();
         self.width_items.clear();
+        self.desktop_section = None;
+        self.configured_desktop_count = 0;
         self.managed_window_items.clear();
         self.manage_item = None;
         self.copy_rule_item = None;
@@ -428,9 +533,131 @@ impl MenuBarManager {
             "Show again with: paneru showmenu",
         )));
         self.add_item("Quit Paneru", Some(sel!(quitPaneru:)));
+
+        self.sync_desktop_section(desktop_count);
         self.configured_widths = widths.to_vec();
         self.current_enablement = None;
+        self.current_desktop = None;
         self.selected_widths = None;
+    }
+
+    /// Updates only the `"Desktops"` section in-place so cross-display focus
+    /// moves between displays with different Desktop counts never rebuild the
+    /// entire `NSMenu`.
+    fn sync_desktop_section(&mut self, desktop_count: u32) {
+        if self.configured_desktop_count == desktop_count {
+            return;
+        }
+        if desktop_count == 0 {
+            if let Some(section) = self.desktop_section.take() {
+                self.menu.removeItem(&section.header);
+                for (_, item) in section.rows {
+                    self.menu.removeItem(&item);
+                }
+                self.menu.removeItem(&section.create_item);
+                self.menu.removeItem(&section.destroy_item);
+                self.menu.removeItem(&section.separator);
+            }
+            self.configured_desktop_count = 0;
+            self.current_desktop = None;
+            return;
+        }
+
+        if let Some(section) = &mut self.desktop_section {
+            let target_len = usize::try_from(desktop_count).unwrap_or(usize::MAX);
+            while section.rows.len() > target_len {
+                if let Some((_, item)) = section.rows.pop() {
+                    self.menu.removeItem(&item);
+                }
+            }
+            let existing = u32::try_from(section.rows.len()).unwrap_or(u32::MAX);
+            for number in existing.saturating_add(1)..=desktop_count {
+                let insert_at = self.menu.indexOfItem(&section.create_item);
+                let item =
+                    Self::insert_desktop_item(&self.menu, &self.action_target, number, insert_at);
+                section.rows.push((number, item));
+            }
+        } else {
+            let mut idx = DESKTOP_SECTION_START;
+            let header = Self::insert_item(&self.menu, &self.action_target, "Desktops", None, idx);
+            header.setEnabled(false);
+            idx += 1;
+            let rows: Vec<(u32, Retained<NSMenuItem>)> = (1..=desktop_count)
+                .map(|number| {
+                    let item =
+                        Self::insert_desktop_item(&self.menu, &self.action_target, number, idx);
+                    idx += 1;
+                    (number, item)
+                })
+                .collect();
+            let create_item = Self::insert_item(
+                &self.menu,
+                &self.action_target,
+                "New Desktop",
+                Some(sel!(createDesktop:)),
+                idx,
+            );
+            idx += 1;
+            let destroy_item = Self::insert_item(
+                &self.menu,
+                &self.action_target,
+                "Close Desktop",
+                Some(sel!(destroyDesktop:)),
+                idx,
+            );
+            idx += 1;
+            let separator = NSMenuItem::separatorItem(self.mtm);
+            self.menu.insertItem_atIndex(&separator, idx);
+            self.desktop_section = Some(DesktopMenuSection {
+                header,
+                rows,
+                create_item,
+                destroy_item,
+                separator,
+            });
+        }
+        self.configured_desktop_count = desktop_count;
+        self.current_desktop = None;
+    }
+
+    fn insert_desktop_item(
+        menu: &NSMenu,
+        action_target: &MenuActionTarget,
+        number: u32,
+        index: NSInteger,
+    ) -> Retained<NSMenuItem> {
+        let item = Self::insert_item(
+            menu,
+            action_target,
+            &format!("Desktop {number}"),
+            Some(sel!(selectDesktop:)),
+            index,
+        );
+        if let Ok(tag) = isize::try_from(number) {
+            item.setTag(tag);
+        }
+        item
+    }
+
+    fn insert_item(
+        menu: &NSMenu,
+        action_target: &MenuActionTarget,
+        title: &str,
+        action: Option<objc2::runtime::Sel>,
+        index: NSInteger,
+    ) -> Retained<NSMenuItem> {
+        let item = unsafe {
+            menu.insertItemWithTitle_action_keyEquivalent_atIndex(
+                &NSString::from_str(title),
+                action,
+                &NSString::from_str(""),
+                index,
+            )
+        };
+        if action.is_some() {
+            unsafe { item.setTarget(Some(action_target)) };
+        }
+        item
     }
 
     fn add_item(&self, title: &str, action: Option<objc2::runtime::Sel>) -> Retained<NSMenuItem> {
@@ -836,6 +1063,7 @@ pub fn update_menu_bar(
     active_display: ActiveDisplay,
     workspaces: Query<&LayoutStrip>,
     focused: Query<(&Bounds, Has<Unmanaged>), With<FocusedMarker>>,
+    census: Option<Res<DesktopCensus>>,
     config: Res<Config>,
     visibility: Res<MenuBarVisibility>,
     menu_bar: Option<NonSendMut<MenuBarManager>>,
@@ -865,10 +1093,12 @@ pub fn update_menu_bar(
     let focused_width_ratio = focused_window.and_then(|(bounds, unmanaged)| {
         (!unmanaged).then(|| f64::from(bounds.0.x) / f64::from(viewport.width()))
     });
+    let desktops = menu_desktop_snapshot(census.as_deref(), active_display.id(), strip.id());
 
     menu_bar.update(
         strip.virtual_index,
         &virtual_indices,
+        &desktops,
         &config,
         focused_window.is_some(),
         focused_width_ratio,
@@ -1386,5 +1616,94 @@ mod tests {
                 toggle_managed: true,
             }
         );
+    }
+
+    #[test]
+    fn menu_desktop_snapshot_reflects_census_and_guards_closing_last_or_fullscreen() {
+        use super::{DesktopCensus, MenuDesktopSnapshot, menu_desktop_snapshot};
+        use crate::manager::spaces::{RawDisplaySpaces, SpaceCensus, SpaceId, SpaceKind};
+
+        assert_eq!(
+            menu_desktop_snapshot(None, 1, 2),
+            MenuDesktopSnapshot::default()
+        );
+
+        let sid = |n| SpaceId::new(n).unwrap();
+        let census = DesktopCensus(
+            SpaceCensus::from_raw(vec![RawDisplaySpaces {
+                display_id: 1,
+                skylight_display: "Main".to_string(),
+                current_space: sid(20),
+                spaces: vec![
+                    (sid(10), "u10".to_string(), SpaceKind::Desktop),
+                    (
+                        sid(20),
+                        "u20".to_string(),
+                        SpaceKind::Fullscreen {
+                            owner_wid: Some(50),
+                            single_tile: true,
+                        },
+                    ),
+                    (sid(30), "u30".to_string(), SpaceKind::Desktop),
+                ],
+            }])
+            .unwrap(),
+        );
+        let snap_fs = menu_desktop_snapshot(Some(&census), 1, 20);
+        assert_eq!(snap_fs.desktop_count, 2);
+        assert_eq!(snap_fs.active_desktop, None);
+        assert!(
+            !snap_fs.can_close_active(),
+            "fullscreen space cannot be closed as a Desktop"
+        );
+
+        let census_other = DesktopCensus(
+            SpaceCensus::from_raw(vec![RawDisplaySpaces {
+                display_id: 1,
+                skylight_display: "Main".to_string(),
+                current_space: sid(25),
+                spaces: vec![
+                    (sid(10), "u10".to_string(), SpaceKind::Desktop),
+                    (sid(25), "u25".to_string(), SpaceKind::Other(2)),
+                    (sid(30), "u30".to_string(), SpaceKind::Desktop),
+                ],
+            }])
+            .unwrap(),
+        );
+        let snap_other = menu_desktop_snapshot(Some(&census_other), 1, 25);
+        assert_eq!(snap_other.desktop_count, 2);
+        assert_eq!(snap_other.active_desktop, None);
+        assert!(
+            !snap_other.can_close_active(),
+            "non-Desktop SpaceKind::Other cannot be closed as a Desktop"
+        );
+
+        let census_d2 = DesktopCensus(
+            SpaceCensus::from_raw(vec![RawDisplaySpaces {
+                display_id: 1,
+                skylight_display: "Main".to_string(),
+                current_space: sid(30),
+                spaces: vec![
+                    (sid(10), "u10".to_string(), SpaceKind::Desktop),
+                    (sid(30), "u30".to_string(), SpaceKind::Desktop),
+                ],
+            }])
+            .unwrap(),
+        );
+        let snap_d2 = menu_desktop_snapshot(Some(&census_d2), 1, 30);
+        assert_eq!(snap_d2.desktop_count, 2);
+        assert_eq!(snap_d2.active_desktop, Some(2));
+        assert!(snap_d2.can_close_active());
+
+        let census_single = DesktopCensus(
+            SpaceCensus::from_raw(vec![RawDisplaySpaces {
+                display_id: 1,
+                skylight_display: "Main".to_string(),
+                current_space: sid(10),
+                spaces: vec![(sid(10), "u10".to_string(), SpaceKind::Desktop)],
+            }])
+            .unwrap(),
+        );
+        assert!(!menu_desktop_snapshot(Some(&census_single), 1, 10).can_close_active());
     }
 }

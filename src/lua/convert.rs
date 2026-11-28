@@ -175,11 +175,15 @@ impl TryFrom<&Event> for LuaEvent {
                 window_id: *window_id,
             },
 
-            Event::MouseDown { point, modifiers } => LuaEvent::MouseDown(mouse(point, *modifiers)),
-            Event::MouseUp { point, modifiers } => LuaEvent::MouseUp(mouse(point, *modifiers)),
-            Event::MouseDragged { point, modifiers } => {
-                LuaEvent::MouseDragged(mouse(point, *modifiers))
-            }
+            Event::MouseDown {
+                point, modifiers, ..
+            } => LuaEvent::MouseDown(mouse(point, *modifiers)),
+            Event::MouseUp {
+                point, modifiers, ..
+            } => LuaEvent::MouseUp(mouse(point, *modifiers)),
+            Event::MouseDragged {
+                point, modifiers, ..
+            } => LuaEvent::MouseDragged(mouse(point, *modifiers)),
             Event::MouseMoved { point, modifiers } => {
                 LuaEvent::MouseMoved(mouse(point, *modifiers))
             }
@@ -258,10 +262,23 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::ApplicationFrontSwitched { .. }
             | Event::WindowCreated { .. }
             | Event::Command { .. }
+            | Event::TabIndicatorClicked { .. }
+            | Event::CancelDrag
             | Event::StateQuery { .. }
             | Event::WindowSetQuery { .. }
             | Event::StateSubscribe { .. }
-            | Event::ScriptState { .. } => return Err(NotMarshallable),
+            | Event::ScriptState { .. }
+            | Event::OverviewClick { .. }
+            | Event::OverviewScroll { .. }
+            | Event::OverviewDismiss
+            | Event::OverviewAccept
+            | Event::OverviewTransitionDone { .. }
+            | Event::OverviewSwipe { .. }
+            | Event::OverviewSwipeEnd
+            | Event::OverviewTouchDown
+            | Event::OverviewCaptureLanded
+            | Event::SpaceCurrentChanged { .. }
+            | Event::SpaceMembershipChanged => return Err(NotMarshallable),
         })
     }
 }
@@ -532,6 +549,7 @@ mod tests {
                 delta: 1.5,
                 fingers: 3,
                 distance_cm: 0.0,
+                elapsed_secs: None,
             },
         )
         .expect("swipe should marshal");
@@ -548,6 +566,7 @@ mod tests {
             &lua,
             &Event::MouseDown {
                 point: objc2_core_foundation::CGPoint { x: 10.0, y: 20.0 },
+                button: crate::events::MouseButton::Left,
                 modifiers: Modifiers::ALT,
             },
         )

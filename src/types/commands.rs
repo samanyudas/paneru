@@ -234,6 +234,8 @@ pub enum Operation {
     FullWidth,
     /// Moves the focused window to the next available display.
     ToNextDisplay(MoveFocus),
+    /// Moves the focused window to the display with this ID.
+    ToDisplay(u32, MoveFocus),
     /// Distributes heights equally among windows in the focused stack.
     Equalize,
     /// Makes all columns in the active strip the same width as the focused window.
@@ -242,6 +244,17 @@ pub enum Operation {
     Manage,
     /// Stacks or unstacks a window. The boolean indicates whether to stack (`true`) or unstack (`false`).
     Stack(bool),
+    /// Consumes the column to the right of the focused window's column into
+    /// it, appending the consumed column's item(s) below whatever is
+    /// already there. Mirror of `Stack(true)` in the opposite direction —
+    /// the focused window's own column survives at its position; the
+    /// neighbor's does not.
+    Consume,
+    /// Pulls the focused window out of its stack into its own column to
+    /// the right — mechanically identical to `Stack(false)` — but leaves
+    /// focus on a sibling remaining in the stack instead of following the
+    /// ejected window.
+    Expel,
     /// Toggles the focused window's stack between a normal split display
     /// (all windows visible, sharing height) and a tabbed display (one
     /// window visible at a time, sharing the full column). Cycle tabs with
@@ -284,12 +297,99 @@ pub enum Operation {
     CopyRule,
 }
 
+/// Identifies a native macOS Desktop or managed Space target.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopTarget {
+    /// Directional step (`West`, `East`, `First`, `Last`) on `display` (or active display).
+    Direction {
+        direction: Direction,
+        display: Option<u32>,
+    },
+    /// 1-based ordinary Desktop number (`1..=N`) on `display` (or active display).
+    Number { number: u32, display: Option<u32> },
+    /// Explicit native `SkyLight` Space ID (`id64`).
+    SpaceId(u64),
+}
+
+/// Target for per-window multi-Desktop pinning (`desktop pin ...`).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopPinTarget {
+    /// Join all ordinary Desktops on the window's display and auto-join future Desktops.
+    All,
+    /// Join a specific existing Desktop on the window's display.
+    Desktop(DesktopTarget),
+}
+
+/// Target for process-wide Space assignment (`desktop assign ...`).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopAssignTarget {
+    /// Assign owning process to all Desktops (`0x800`).
+    All,
+    /// Assign owning process to the currently active Desktop.
+    This,
+    /// Assign owning process to a specific Desktop.
+    Desktop(DesktopTarget),
+    /// Clear process-level Space assignment (`spaceID = 0`).
+    None,
+}
+
+impl DesktopAssignTarget {
+    /// Parses one of the non-targeted mode keywords (`"all"`, `"this"`, `"none"`).
+    #[must_use]
+    pub fn parse_mode(token: &str) -> Option<Self> {
+        match token {
+            "all" => Some(Self::All),
+            "this" => Some(Self::This),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+/// Operations on native macOS Desktops (`SkyLight` / `WMBridge`).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopOperation {
+    /// Instantaneously activates a Space without Mission Control's slide animation.
+    Focus(DesktopTarget),
+    /// Moves (or sends) the focused window and its tab group to a Desktop.
+    MoveWindow {
+        target: DesktopTarget,
+        move_focus: MoveFocus,
+    },
+    /// Appends a new Desktop on the active display, optionally switching to it.
+    Create { focus: bool },
+    /// Destroys the active (or targeted) Desktop, migrating windows unless `empty_only`.
+    Destroy {
+        target: Option<DesktopTarget>,
+        empty_only: bool,
+    },
+    /// Moves the active Desktop to a new position on its display.
+    Reorder(DesktopTarget),
+    /// Swaps the active Desktop with another Desktop on its display.
+    Swap(DesktopTarget),
+    /// Pins the focused window onto another Desktop or all Desktops.
+    Pin(DesktopPinTarget),
+    /// Collapses a pinned multi-Desktop window back onto the active Desktop.
+    Unpin,
+    /// Assigns the focused window's (or `pid`'s) process to Desktop(s).
+    Assign {
+        target: DesktopAssignTarget,
+        pid: Option<i32>,
+    },
+}
+
 /// Defines operations that can be performed on the mouse.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MouseMove {
     /// Moves the mouse pointer to the next available display.
     ToNextDisplay,
+    /// Moves the mouse pointer to the display with this ID.
+    ToDisplay(u32),
 }
 
 /// Represents a command that can be issued to the window manager.
@@ -298,6 +398,8 @@ pub enum MouseMove {
 pub enum Command {
     /// A command targeting a window with a specific `Operation`.
     Window(Operation),
+    /// A command targeting native macOS Desktops / Spaces.
+    Desktop(DesktopOperation),
     /// A command targeting the mouse with a specific `MouseOperation`.
     Mouse(MouseMove),
     /// A command to quit the window manager application.
@@ -314,4 +416,6 @@ pub enum Command {
     Layout(Vec<crate::types::windowset::LayoutOp>),
     /// Shows or hides the menu bar item and remembers the choice.
     MenuBar(bool),
+    /// Toggles the niri-style overview of every virtual workspace row.
+    Overview,
 }

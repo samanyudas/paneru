@@ -24,7 +24,7 @@ use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::types::windowset::WindowSet;
 
 pub const STATE_FILE_NAME: &str = "state.json";
-const SUPPORTED_STATE_VERSION: u32 = 2;
+const SUPPORTED_STATE_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Resource)]
 pub struct PaneruState {
@@ -42,6 +42,8 @@ pub struct SavedDisplay {
     pub bounds: SavedRect,
     pub active: bool,
     pub workspace_ids: Vec<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,15 +71,39 @@ pub struct SavedStrip {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum SavedColumn {
     Single(SavedWindow),
-    Stack(Vec<SavedStackItem>),
+    /// The second field is the active tab of a tabbed-display stack (`None` if
+    /// split). It duplicates one of the stack's `SavedWindow`s.
+    Stack(Vec<SavedStackItem>, Option<SavedWindow>),
     Tabs(Vec<SavedWindow>),
     Fullscreen(SavedWindow),
+}
+
+impl SavedColumn {
+    pub fn windows(&self) -> impl Iterator<Item = &SavedWindow> {
+        let (slice, stack) = match self {
+            Self::Single(saved) | Self::Fullscreen(saved) => (std::slice::from_ref(saved), &[][..]),
+            Self::Tabs(tabs) => (tabs.as_slice(), &[][..]),
+            Self::Stack(items, _) => (&[][..], items.as_slice()),
+        };
+        slice
+            .iter()
+            .chain(stack.iter().flat_map(SavedStackItem::windows))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum SavedStackItem {
     Single(SavedWindow),
     Tabs(Vec<SavedWindow>),
+}
+
+impl SavedStackItem {
+    pub fn windows(&self) -> &[SavedWindow] {
+        match self {
+            Self::Single(saved) => std::slice::from_ref(saved),
+            Self::Tabs(tabs) => tabs.as_slice(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -93,15 +119,40 @@ pub struct SavedWindow {
     pub identifier: String,
     pub role: String,
     pub subrole: String,
+    // Relative to the usable display width, as `LayoutOp::SetWidth` reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_ratio: Option<f64>,
 }
 
 // These wire-format types live in the shared `paneru_shared_types` crate;
 // aliased here to the names the rest of the daemon already uses.
 pub use crate::types::state::{
-    ActiveState as PaneruActiveState, Frame, QueryState as PaneruQueryState, StateEvent,
-    StateQueryKind, VirtualWorkspaceState as PaneruVirtualWorkspaceState,
-    WindowState as PaneruWindowState,
+    ActiveState as PaneruActiveState, DesktopKindState, DesktopState as PaneruDesktopState, Frame,
+    QueryState as PaneruQueryState, StateEvent, StateQueryKind,
+    VirtualWorkspaceState as PaneruVirtualWorkspaceState, WindowState as PaneruWindowState,
 };
+
+/// Each tiled window's column in the strip and row within that column, both
+/// zero-based. Tabs share their row; a stack's tab group is one row of it.
+fn strip_positions(strip: &LayoutStrip) -> HashMap<Entity, (u32, u32)> {
+    let mut positions = HashMap::new();
+    for (column, windows) in (0u32..).zip(strip.columns()) {
+        match windows {
+            Column::Single(entity) | Column::Fullscren(entity) => {
+                positions.insert(*entity, (column, 0));
+            }
+            Column::Tabs(tabs) => {
+                positions.extend(tabs.iter().map(|&entity| (entity, (column, 0))));
+            }
+            Column::Stack(items) => {
+                for (row, item) in (0u32..).zip(items) {
+                    positions.extend(item.window_iter().map(|entity| (entity, (column, row))));
+                }
+            }
+        }
+    }
+    positions
+}
 
 /// Resolves which display a window frame is on and whether more than a sliver of
 /// it is showing there. Returns `None` when the frame misses every display.
@@ -145,6 +196,7 @@ impl SavedWindow {
         let app = apps.get(app_entity).ok()?;
 
         Some(Self {
+            width_ratio: None,
             window_id: window.id(),
             pid: window.pid().ok()?,
             psn: app.psn(),
@@ -201,17 +253,28 @@ impl PaneruState {
                         SavedWindow::from_entity(*entity, windows, apps).map(SavedColumn::Single)
                     }
                     Column::Stack(items) => {
+                        let active_entity = col.top().and_then(|top| strip.active_tab(top));
+                        let mut active = None;
                         let saved_items = items
                             .iter()
                             .filter_map(|item| match item {
                                 StackItem::Single(entity) => {
-                                    SavedWindow::from_entity(*entity, windows, apps)
-                                        .map(SavedStackItem::Single)
+                                    let saved = SavedWindow::from_entity(*entity, windows, apps)?;
+                                    if active_entity == Some(*entity) {
+                                        active = Some(saved.clone());
+                                    }
+                                    Some(SavedStackItem::Single(saved))
                                 }
                                 StackItem::Tabs(tabs) => {
                                     let saved_tabs: Vec<_> = tabs
                                         .iter()
-                                        .filter_map(|&e| SavedWindow::from_entity(e, windows, apps))
+                                        .filter_map(|&e| {
+                                            let saved = SavedWindow::from_entity(e, windows, apps)?;
+                                            if active_entity == Some(e) {
+                                                active = Some(saved.clone());
+                                            }
+                                            Some(saved)
+                                        })
                                         .collect();
                                     if saved_tabs.is_empty() {
                                         None
@@ -224,7 +287,8 @@ impl PaneruState {
                         if saved_items.is_empty() {
                             None
                         } else {
-                            Some(SavedColumn::Stack(saved_items))
+                            let active = active.filter(|_| saved_items.len() >= 2);
+                            Some(SavedColumn::Stack(saved_items, active))
                         }
                     }
                     Column::Tabs(tabs) => {
@@ -282,6 +346,7 @@ impl PaneruState {
         let displays = displays
             .iter()
             .map(|(display, entity, active)| SavedDisplay {
+                uuid: None,
                 display_id: display.id(),
                 bounds: display.bounds().into(),
                 active,
@@ -334,64 +399,16 @@ impl PaneruState {
         for workspace in &self.workspaces {
             for strip in &workspace.strips {
                 for (col_idx, column) in strip.columns.iter().enumerate() {
-                    let match_in_col = |sw: &SavedWindow| {
-                        if sw.hard_match(window_id, pid, bundle_id) {
-                            return Some(sw.clone());
-                        }
-                        None
-                    };
-
-                    match column {
-                        SavedColumn::Single(sw) | SavedColumn::Fullscreen(sw) => {
-                            if let Some(matched) = match_in_col(sw) {
-                                return Some((
-                                    workspace.workspace_id,
-                                    strip.virtual_index,
-                                    col_idx,
-                                    matched,
-                                ));
-                            }
-                        }
-                        SavedColumn::Stack(items) => {
-                            for item in items {
-                                match item {
-                                    SavedStackItem::Single(sw) => {
-                                        if let Some(matched) = match_in_col(sw) {
-                                            return Some((
-                                                workspace.workspace_id,
-                                                strip.virtual_index,
-                                                col_idx,
-                                                matched,
-                                            ));
-                                        }
-                                    }
-                                    SavedStackItem::Tabs(tabs) => {
-                                        for sw in tabs {
-                                            if let Some(matched) = match_in_col(sw) {
-                                                return Some((
-                                                    workspace.workspace_id,
-                                                    strip.virtual_index,
-                                                    col_idx,
-                                                    matched,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        SavedColumn::Tabs(tabs) => {
-                            for sw in tabs {
-                                if let Some(matched) = match_in_col(sw) {
-                                    return Some((
-                                        workspace.workspace_id,
-                                        strip.virtual_index,
-                                        col_idx,
-                                        matched,
-                                    ));
-                                }
-                            }
-                        }
+                    if let Some(matched) = column
+                        .windows()
+                        .find(|sw| sw.hard_match(window_id, pid, bundle_id))
+                    {
+                        return Some((
+                            workspace.workspace_id,
+                            strip.virtual_index,
+                            col_idx,
+                            matched.clone(),
+                        ));
                     }
                 }
             }
@@ -427,6 +444,7 @@ pub struct QueryStateParams<'w, 's> {
     apps: Query<'w, 's, &'static Application>,
     window_manager: Res<'w, WindowManager>,
     config: Res<'w, Config>,
+    desktop_census: Option<Res<'w, crate::ecs::desktop::DesktopCensus>>,
 }
 
 impl QueryStateParams<'_, '_> {
@@ -436,21 +454,67 @@ impl QueryStateParams<'_, '_> {
         &self.windows
     }
 
+    pub fn desktop_census_changed(&self) -> bool {
+        self.desktop_census
+            .as_ref()
+            .is_some_and(bevy::ecs::change_detection::DetectChanges::is_changed)
+    }
+
+    /// Builds only the native Desktops snapshot from [`DesktopCensus`] without
+    /// enumerating windows or calling into the window server.
+    #[must_use]
+    pub fn extract_desktops(&self) -> Vec<PaneruDesktopState> {
+        self.desktop_census
+            .as_deref()
+            .map_or_else(Vec::new, |census| extract_desktop_states(&census.0))
+    }
+
     /// Builds the state document from the current world.
     ///
     /// # Errors
     ///
     /// Returns an error if the window manager cannot enumerate a workspace.
     pub fn extract(&self) -> crate::errors::Result<PaneruQueryState> {
-        PaneruQueryState::extract(
+        let mut doc = PaneruQueryState::extract(
             &self.workspaces,
             &self.displays,
             &self.windows,
             &self.apps,
             &self.window_manager,
             &self.config,
-        )
+        )?;
+        if let Some(census) = self.desktop_census.as_deref() {
+            doc.active.desktop_number = doc
+                .active
+                .native_workspace_id
+                .and_then(|ws| census.desktop_number(ws));
+            doc.desktops = extract_desktop_states(&census.0);
+        }
+        Ok(doc)
     }
+}
+
+fn extract_desktop_states(census: &crate::manager::spaces::SpaceCensus) -> Vec<PaneruDesktopState> {
+    use crate::manager::spaces::SpaceKind;
+    census
+        .displays
+        .iter()
+        .flat_map(|disp| {
+            disp.spaces.iter().map(move |rec| PaneruDesktopState {
+                space_id: rec.id.get(),
+                uuid: rec.uuid.clone(),
+                display_id: rec.display_id,
+                number: rec.desktop_number,
+                space_index: u32::try_from(rec.space_index).unwrap_or(u32::MAX),
+                kind: match rec.kind {
+                    SpaceKind::Desktop => DesktopKindState::Desktop,
+                    SpaceKind::Fullscreen { .. } => DesktopKindState::Fullscreen,
+                    SpaceKind::Other(raw) => DesktopKindState::Other(raw),
+                },
+                active: rec.active,
+            })
+        })
+        .collect()
 }
 
 /// Reads the layout as the tree a script transforms. Unlike
@@ -511,6 +575,7 @@ impl QueryStateParams<'_, '_> {
                     .unwrap_or(1.0);
                 let selected = column
                     .top()
+                    .map(|top| strip.active_tab(top).unwrap_or(top))
                     .and_then(|top| self.windows.get(top).map(|window| window.id()))
                     .and_then(|id| tiled.iter().position(|window| window.id == id))
                     .unwrap_or(0);
@@ -704,6 +769,7 @@ impl QueryState for PaneruQueryState {
 
         let has_floating = has_floating_windows(windows);
         for (child, strip, active_workspace, selected_workspace) in workspaces {
+            let positions = strip_positions(strip);
             let query_space =
                 active_workspace || selected_workspace && active_workspace_id != Some(strip.id());
             let floating = untracked_floating_in_space(
@@ -719,8 +785,7 @@ impl QueryState for PaneruQueryState {
                     .then_some(entity)
             });
             let row_windows = strip
-                .all_windows()
-                .into_iter()
+                .window_iter()
                 .chain(floating)
                 .filter_map(|entity| {
                     let (window, _, unmanaged) = windows.get_managed(entity)?;
@@ -737,6 +802,9 @@ impl QueryState for PaneruQueryState {
                     let visibility = frame
                         .and_then(|frame| window_visibility(frame, displays, sliver_width))
                         .map(|(display_id, visible)| (display_id, visible && !hidden));
+                    let (column, row) = positions
+                        .get(&entity)
+                        .map_or((None, None), |&(column, row)| (Some(column), Some(row)));
                     Some(PaneruWindowState {
                         window_id: window.id(),
                         bundle_id,
@@ -754,6 +822,9 @@ impl QueryState for PaneruQueryState {
                             height: frame.height(),
                         }),
                         visible: visibility.is_some_and(|(_, visible)| visible),
+                        column,
+                        row,
+                        tabbed: strip.is_tabbed_display(entity),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -781,6 +852,7 @@ impl QueryState for PaneruQueryState {
                 number,
                 native_workspace_id: strip.id(),
                 active: active_workspace,
+                shown: query_space,
                 windows: row_windows,
             });
 
@@ -803,6 +875,7 @@ impl QueryState for PaneruQueryState {
                         number,
                         native_workspace_id: workspace_id,
                         active: false,
+                        shown: false,
                         windows: Vec::new(),
                     });
                 }
@@ -817,6 +890,7 @@ impl QueryState for PaneruQueryState {
             timestamp: now_timestamp(),
             active,
             virtual_workspaces,
+            desktops: Vec::new(),
         })
     }
 }

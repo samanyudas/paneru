@@ -9,11 +9,13 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::commands::register_commands;
 use crate::config::Config;
+use crate::ecs::desktop::DesktopEventsPlugin;
 use crate::ecs::display::DisplayEventsPlugin;
 use crate::ecs::focus::FocusEventsPlugin;
 use crate::ecs::layout::LayoutEventsPlugin;
 use crate::ecs::mouse::MouseEventsPlugin;
 use crate::ecs::scroll::ScrollEventsPlugin;
+use crate::ecs::setups::DisplaySetupsPlugin;
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::WorkspaceEventsPlugin;
 use crate::ecs::{
@@ -75,6 +77,9 @@ impl TestHarness {
 
         let wm = mock_state.create_window_manager();
         world.insert_resource(WindowManager(Box::new(wm)));
+        world.insert_non_send(crate::manager::spaces::DesktopBridge(Box::new(
+            mock_state.create_desktop_bridge(),
+        )));
 
         Self {
             app,
@@ -209,6 +214,17 @@ impl TestHarness {
     }
 
     pub(crate) fn run(&mut self, commands: Vec<Event>) {
+        let unreached: Vec<usize> = self
+            .verifiers
+            .keys()
+            .copied()
+            .filter(|iteration| *iteration >= commands.len())
+            .collect();
+        assert!(
+            unreached.is_empty(),
+            "verifiers for iterations {unreached:?} never run: only {} commands",
+            commands.len()
+        );
         for (iteration, command) in commands.into_iter().enumerate() {
             self.app.world_mut().write_message::<Event>(command);
 
@@ -263,10 +279,12 @@ fn setup_world() -> App {
         .insert_resource(Initializing)
         .add_plugins(MouseEventsPlugin)
         .add_plugins(ScrollEventsPlugin)
+        .add_plugins(DesktopEventsPlugin)
         .add_plugins(WorkspaceEventsPlugin)
         .add_plugins(LayoutEventsPlugin)
         .add_plugins(FocusEventsPlugin)
         .add_plugins(DisplayEventsPlugin)
+        .add_plugins(DisplaySetupsPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));
 
     bevy_app.insert_resource(TimeUpdateStrategy::ManualDuration(FRAME));
@@ -337,7 +355,7 @@ macro_rules! assert_focused {
 #[macro_export]
 macro_rules! assert_on_workspace {
     ($world:expr, $window_id:expr, $workspace_id:expr) => {{
-        let entity = $crate::tests::harness::find_window_entity($window_id, $world);
+        let entity = $crate::tests::find_window_entity($window_id, $world);
         let mut query = $world.query::<&$crate::ecs::layout::LayoutStrip>();
         let found = query
             .iter($world)
@@ -353,7 +371,7 @@ macro_rules! assert_on_workspace {
 #[macro_export]
 macro_rules! assert_not_on_workspace {
     ($world:expr, $window_id:expr, $workspace_id:expr) => {{
-        let entity = $crate::tests::harness::find_window_entity($window_id, $world);
+        let entity = $crate::tests::find_window_entity($window_id, $world);
         let mut query = $world.query::<&$crate::ecs::layout::LayoutStrip>();
         let found = query
             .iter($world)

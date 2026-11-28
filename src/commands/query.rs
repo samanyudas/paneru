@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
 
-use super::{Command, Operation};
+use super::{Command, DesktopOperation, Operation};
 
 use crate::ecs::state::{
-    PaneruActiveState, PaneruQueryState, PaneruVirtualWorkspaceState, PaneruWindowState,
-    QueryStateParams, StateEvent,
+    PaneruActiveState, PaneruDesktopState, PaneruQueryState, PaneruVirtualWorkspaceState,
+    PaneruWindowState, QueryStateParams, StateEvent, StateQueryKind,
 };
 use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker, Unmanaged};
 use crate::events::Event;
@@ -42,6 +42,7 @@ struct StateBroadcastCache {
     workspace: Option<WorkspaceBroadcastSnapshot>,
     focus: Option<FocusBroadcastSnapshot>,
     virtual_workspaces: Option<Vec<PaneruVirtualWorkspaceState>>,
+    desktops: Option<Vec<PaneruDesktopState>>,
     on_screen: Option<Vec<PaneruWindowState>>,
     titles: BTreeMap<WinID, String>,
 }
@@ -50,6 +51,7 @@ struct StateBroadcastCache {
 struct WorkspaceBroadcastSnapshot {
     display_id: Option<u32>,
     native_workspace_id: Option<u64>,
+    desktop_number: Option<u32>,
     virtual_workspace_number: Option<u32>,
 }
 
@@ -58,6 +60,7 @@ impl From<&PaneruActiveState> for WorkspaceBroadcastSnapshot {
         Self {
             display_id: active.display_id,
             native_workspace_id: active.native_workspace_id,
+            desktop_number: active.desktop_number,
             virtual_workspace_number: active.virtual_workspace_number,
         }
     }
@@ -82,9 +85,11 @@ impl From<&PaneruActiveState> for FocusBroadcastSnapshot {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Default)]
 struct StateBroadcastSignals {
     virtual_workspace_changed: bool,
+    desktops_changed: bool,
     windows_changed: bool,
     window_focused: bool,
 }
@@ -93,6 +98,7 @@ struct StateBroadcastSignals {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct StateBroadcastIntent {
     virtual_workspace_changed: bool,
+    desktops_changed: bool,
     windows_changed: bool,
     window_focused: bool,
     on_screen_changed: bool,
@@ -108,6 +114,7 @@ impl StateBroadcastIntent {
     ) -> Self {
         let mut intent = Self {
             virtual_workspace_changed: signals.virtual_workspace_changed,
+            desktops_changed: signals.desktops_changed,
             windows_changed: signals.windows_changed,
             window_focused: signals.window_focused,
             ..Self::default()
@@ -115,8 +122,22 @@ impl StateBroadcastIntent {
 
         for event in events {
             match event {
-                Event::SpaceChanged
-                | Event::Command {
+                Event::SpaceChanged | Event::SpaceCurrentChanged { .. } => {
+                    intent.virtual_workspace_changed = true;
+                    intent.desktops_changed = true;
+                }
+                Event::SpaceCreated { .. } => {
+                    intent.desktops_changed = true;
+                }
+                Event::SpaceDestroyed { .. } => {
+                    intent.desktops_changed = true;
+                    intent.virtual_workspace_changed = true;
+                    intent.windows_changed = true;
+                }
+                Event::SpaceMembershipChanged => {
+                    intent.windows_changed = true;
+                }
+                Event::Command {
                     command:
                         Command::Window(
                             Operation::Virtual(_)
@@ -124,6 +145,22 @@ impl StateBroadcastIntent {
                             | Operation::VirtualAdd,
                         ),
                 } => intent.virtual_workspace_changed = true,
+                Event::Command {
+                    command: Command::Desktop(op),
+                } => {
+                    intent.desktops_changed = true;
+                    intent.virtual_workspace_changed = true;
+                    if matches!(
+                        op,
+                        DesktopOperation::Destroy { .. }
+                            | DesktopOperation::MoveWindow { .. }
+                            | DesktopOperation::Pin(_)
+                            | DesktopOperation::Unpin
+                            | DesktopOperation::Assign { .. }
+                    ) {
+                        intent.windows_changed = true;
+                    }
+                }
                 Event::WindowCreated { .. }
                 | Event::WindowSpawned { .. }
                 | Event::WindowDestroyed { .. }
@@ -134,7 +171,13 @@ impl StateBroadcastIntent {
                         Command::Window(
                             Operation::VirtualMove(_, _)
                             | Operation::VirtualMoveNumber(_, _)
-                            | Operation::Swap(_),
+                            | Operation::ToNextDisplay(_)
+                            | Operation::ToDisplay(..)
+                            | Operation::Swap(_)
+                            | Operation::Stack(_)
+                            | Operation::Consume
+                            | Operation::Expel
+                            | Operation::ToggleTabbedDisplay,
                         ),
                 } => intent.windows_changed = true,
                 Event::WindowFocused { .. } => intent.window_focused = true,
@@ -175,6 +218,7 @@ impl StateBroadcastIntent {
 
     fn requires_state(&self) -> bool {
         self.virtual_workspace_changed
+            || self.desktops_changed
             || self.windows_changed
             || self.window_focused
             || self.on_screen_changed
@@ -201,6 +245,7 @@ pub(super) fn register_query_commands(app: &mut App) {
         PostUpdate,
         state_event_broadcast_handler
             .in_set(crate::ecs::PostUpdateSet::Bookkeeping)
+            .after(crate::ecs::workspace::workspace_destroyed_handler)
             .run_if(active_subscribers),
     );
 }
@@ -219,12 +264,21 @@ fn state_query_handler(mut messages: MessageReader<Event>, state: QueryStatePara
 
     for event in messages.read() {
         match event {
+            Event::StateQuery {
+                kind: StateQueryKind::Desktops,
+                respond_to,
+            } => reply(
+                respond_to,
+                Ok(Response::Query(wire::QueryPayload::Desktops(
+                    state.extract_desktops(),
+                ))),
+            ),
             Event::StateQuery { kind, respond_to } => reply(
                 respond_to,
                 state
                     .extract()
                     .map_err(|err| err.to_string())
-                    .map(|state| Response::Query(state.to_query_payload(*kind))),
+                    .map(|state| Response::Query(state.into_query_payload(*kind))),
             ),
             Event::WindowSetQuery { respond_to } => reply(
                 respond_to,
@@ -317,6 +371,14 @@ fn collect_state_broadcast_events_for_intent(
         }
     }
 
+    if intent.desktops_changed && cache.desktops.as_ref() != Some(&state.desktops) {
+        outgoing.push(StateEvent::DesktopsChanged {
+            desktops: state.desktops.clone(),
+            active: state.active.clone(),
+        });
+        cache.desktops = Some(state.desktops.clone());
+    }
+
     if intent.windows_changed
         && cache.virtual_workspaces.as_ref() != Some(&state.virtual_workspaces)
     {
@@ -383,8 +445,10 @@ fn state_event_broadcast_handler(
         return;
     }
 
+    let census_changed = state.desktop_census_changed();
     let signals = StateBroadcastSignals {
-        virtual_workspace_changed: !active_workspace_changes.is_empty(),
+        virtual_workspace_changed: !active_workspace_changes.is_empty() || census_changed,
+        desktops_changed: census_changed,
         windows_changed: events.iter().any(|event| {
             let Event::WindowMoved { window_id } = event else {
                 return false;
@@ -472,6 +536,7 @@ mod tests {
         let active = PaneruActiveState {
             display_id: Some(1),
             native_workspace_id: Some(10),
+            desktop_number: Some(1),
             virtual_workspace_number: Some(virtual_workspace_number),
             focused_window_id: Some(window_id),
             focused_bundle_id: Some(bundle_id.to_string()),
@@ -497,6 +562,9 @@ mod tests {
                     height: 600,
                 }),
                 visible: true,
+                column: Some(0),
+                row: Some(0),
+                tabbed: false,
             })
             .collect();
 
@@ -508,8 +576,10 @@ mod tests {
                 number: virtual_workspace_number,
                 native_workspace_id: 10,
                 active: true,
+                shown: true,
                 windows,
             }],
+            desktops: Vec::new(),
         }
     }
 
@@ -714,6 +784,7 @@ mod tests {
                 PaneruEvent::ThemeChanged,
                 PaneruEvent::MouseUp {
                     point: objc2_core_foundation::CGPoint::default(),
+                    button: crate::events::MouseButton::Left,
                     modifiers: crate::platform::Modifiers::empty(),
                 },
             ]
@@ -745,5 +816,74 @@ mod tests {
         assert_eq!(intent.display_changes, vec![Some(2)]);
         assert!(intent.requires_state());
         assert!(!intent.is_empty());
+
+        for op in [
+            Operation::Stack(true),
+            Operation::Stack(false),
+            Operation::ToggleTabbedDisplay,
+        ] {
+            let stack_intent = StateBroadcastIntent::from_events(
+                [PaneruEvent::Command {
+                    command: Command::Window(op),
+                }]
+                .iter(),
+                StateBroadcastSignals::default(),
+            );
+            assert!(stack_intent.windows_changed);
+            assert!(stack_intent.on_screen_changed);
+        }
+    }
+
+    #[test]
+    fn test_state_broadcast_emits_desktops_changed_and_deduplicates() {
+        use crate::ecs::state::DesktopKindState;
+
+        let mut state =
+            query_state_with_active_window(26_261, "com.cmuxterm.app", "term", 1, vec![26_261]);
+        state.desktops = vec![
+            PaneruDesktopState {
+                space_id: 10,
+                uuid: "uuid-10".to_string(),
+                display_id: 1,
+                number: Some(1),
+                space_index: 0,
+                kind: DesktopKindState::Desktop,
+                active: true,
+            },
+            PaneruDesktopState {
+                space_id: 11,
+                uuid: "uuid-11".to_string(),
+                display_id: 1,
+                number: Some(2),
+                space_index: 1,
+                kind: DesktopKindState::Desktop,
+                active: false,
+            },
+        ];
+
+        let mut cache = StateBroadcastCache::default();
+        let outgoing = collect_state_broadcast_events(
+            [PaneruEvent::SpaceCreated { space_id: 11 }].iter(),
+            &state,
+            &mut cache,
+            |_| None,
+            StateBroadcastSignals::default(),
+        );
+        assert_eq!(
+            outgoing,
+            vec![StateEvent::DesktopsChanged {
+                desktops: state.desktops.clone(),
+                active: state.active.clone(),
+            }]
+        );
+
+        let repeat = collect_state_broadcast_events(
+            [PaneruEvent::SpaceCreated { space_id: 11 }].iter(),
+            &state,
+            &mut cache,
+            |_| None,
+            StateBroadcastSignals::default(),
+        );
+        assert_eq!(repeat, []);
     }
 }

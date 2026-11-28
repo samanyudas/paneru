@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy::app::{App, Plugin, PostUpdate, Update};
+use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
@@ -16,19 +17,25 @@ use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::Time;
 use bevy::time::common_conditions::on_timer;
+use bevy::time::{Timer, TimerMode};
 use std::pin::Pin;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
-use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, VerifyFocus};
+use super::{
+    ClickFocusMarker, FocusedMarker, MouseHeldMarker, OpenedFrom, SystemTheme, Timeout, Unmanaged,
+    VerifyFocus,
+};
+use crate::commands::visible_floating_entities;
 use crate::config::Config;
+use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::scroll::{PageGestureState, PageInFlight};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, RepositionMarker, ReshuffleAroundMarker,
-    ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
-    VerifyWindowSize,
+    ActiveWorkspaceMarker, Bounds, LayoutPosition, Position, RaiseWindow, RepositionMarker,
+    ReshuffleAroundMarker, ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    StrayFocusEvent, VerifyWindowSize,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -36,6 +43,8 @@ use crate::platform::WorkspaceId;
 
 const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
 pub(crate) const VERIFY_FOCUS_TIMEOUT: Duration = Duration::from_millis(300);
+/// How long a busy application gets to answer the repeated focus request.
+const VERIFY_FOCUS_AGAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 type MouseFocusStrips<'w, 's> = Query<
     'w,
@@ -121,6 +130,9 @@ impl Plugin for FocusEventsPlugin {
             Update,
             (
                 detect_focus_rejection.in_set(super::UpdateSet::Events),
+                handle_tab_indicator_click
+                    .in_set(super::UpdateSet::Events)
+                    .run_if(bevy::ecs::schedule::common_conditions::on_message::<Event>),
                 fix_window_size_on_focus.in_set(super::UpdateSet::Focus),
                 autocenter_window_on_focus
                     .in_set(super::UpdateSet::Layout)
@@ -152,8 +164,10 @@ impl Plugin for FocusEventsPlugin {
         app.add_observer(dim_remove_window_trigger)
             .add_observer(dim_window_trigger)
             .add_observer(maintain_focus_singleton)
+            .add_observer(forget_openers)
             .add_observer(maintain_verify_focus_singleton)
             .add_observer(virtual_strip_activated)
+            .add_observer(update_tabbed_active_on_focus)
             .add_observer(stray_focus_observer)
             .add_observer(focus_window_trigger)
             .add_observer(raise_window_trigger);
@@ -304,7 +318,7 @@ fn clear_pending_focus_layout(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn maintain_focus_singleton(
-    trigger: On<Add, FocusedMarker>,
+    trigger: On<Add<FocusedMarker>>,
     windows: Query<(Entity, Has<FocusedMarker>), With<Window>>,
     mut config: GlobalState,
     mut commands: Commands,
@@ -330,6 +344,29 @@ fn maintain_focus_singleton(
             .try_insert(PendingFocusLayout);
     }
     config.set_ffm_flag(None);
+}
+
+/// Focus reaching another column of a strip forgets where that strip's windows
+/// were opened from, as niri does.
+fn forget_openers(
+    trigger: On<Add<FocusedMarker>>,
+    openers: Populated<Entity, With<OpenedFrom>>,
+    workspaces: Query<&LayoutStrip>,
+    mut commands: Commands,
+) {
+    let focused = trigger.event().entity;
+    let Some(strip) = workspaces.iter().find(|strip| strip.contains(focused)) else {
+        return;
+    };
+    let column = strip.index_of(focused).ok();
+    for entity in &openers {
+        if strip.contains(entity)
+            && strip.index_of(entity).ok() != column
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<OpenedFrom>();
+        }
+    }
 }
 
 /// Whether two windows are members of one native tab group: the app shows one
@@ -398,15 +435,11 @@ pub(super) fn fix_window_size_on_focus(
     }
 }
 
-/// Ensures at most one window entity carries [`VerifyFocus`] at any time, so
-/// rapid focus switching cancels verification on intermediate windows.
-#[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-fn maintain_verify_focus_singleton(
-    trigger: On<Add, VerifyFocus>,
-    verifying: Query<Entity, With<VerifyFocus>>,
-    mut commands: Commands,
+fn cancel_other_verify_focus(
+    target: Entity,
+    verifying: &Query<Entity, With<VerifyFocus>>,
+    commands: &mut Commands,
 ) {
-    let target = trigger.event().entity;
     for entity in verifying {
         if entity != target
             && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -416,15 +449,26 @@ fn maintain_verify_focus_singleton(
     }
 }
 
+/// Ensures at most one window entity carries [`VerifyFocus`] at any time, so
+/// rapid focus switching cancels verification on intermediate windows.
+#[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
+fn maintain_verify_focus_singleton(
+    trigger: On<Add<VerifyFocus>>,
+    verifying: Query<Entity, With<VerifyFocus>>,
+    mut commands: Commands,
+) {
+    cancel_other_verify_focus(trigger.event().entity, &verifying, &mut commands);
+}
+
 #[instrument(level = Level::DEBUG, skip_all)]
 fn detect_focus_rejection(
-    pending: Populated<(Entity, &Window, &ChildOf, &Timeout), With<VerifyFocus>>,
+    mut pending: Populated<(Entity, &Window, &ChildOf, &mut Timeout, &mut VerifyFocus)>,
     apps: Query<&Application>,
     mut workspaces: Query<(Entity, &mut LayoutStrip)>,
     windows: Windows,
     mut commands: Commands,
 ) {
-    for (target_entity, target_window, child_of, timeout) in &pending {
+    for (target_entity, target_window, child_of, mut timeout, mut verify) in &mut pending {
         if !timeout.timer.is_finished() {
             continue;
         }
@@ -469,6 +513,22 @@ fn detect_focus_rejection(
             debug!(
                 "focus landed on tab sibling {actual_entity} of {target_entity}; not a rejection.",
             );
+            continue;
+        }
+
+        // A busy application, such as a browser playing video, can take longer
+        // than the first wait to act on the request, and then still reports the
+        // window it had focused before. Ask once more and wait longer, so only
+        // an application that keeps refusing gets its window floated.
+        if !verify.asked_again {
+            debug!(
+                "app focused window {} instead of {}; asking again.",
+                actual_window.id(),
+                target_window.id(),
+            );
+            verify.asked_again = true;
+            timeout.timer = Timer::new(VERIFY_FOCUS_AGAIN_TIMEOUT, TimerMode::Once);
+            commands.focus_entity(target_entity, true);
             continue;
         }
 
@@ -529,11 +589,32 @@ fn mouse_follows_focus(
     displays: Query<&Display>,
     workspaces: MouseFocusStrips,
     restored: Query<&RestoreFocusMarker>,
+    clicked: Query<(Entity, &ClickFocusMarker)>,
+    mut commands: Commands,
 ) {
     let entity = *focused;
+    let mut click_focused = false;
+    for (marker_entity, marker) in &clicked {
+        if marker.0 == entity {
+            click_focused = true;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(marker_entity) {
+            entity_commands.try_despawn();
+        }
+    }
     let Some(window) = windows.get(entity) else {
         return;
     };
+    if click_focused {
+        debug!("Suppressing center mouse after a click");
+        return;
+    }
+    if !config.mouse_follows_focus()
+        || global_state.skip_reshuffle()
+        || global_state.ffm_flag().is_some_and(|id| id == window.id())
+    {
+        return;
+    }
     if workspaces
         .iter()
         .find_map(|(_, _, scrolling, active, _, _)| if active { scrolling } else { None })
@@ -549,10 +630,7 @@ fn mouse_follows_focus(
         global_state.skip_reshuffle(),
         global_state.ffm_flag()
     );
-    if config.mouse_follows_focus()
-        && !global_state.skip_reshuffle()
-        && global_state.ffm_flag().is_none_or(|id| id != window.id())
-        && let Some(frame) = windows.moving_frame(entity)
+    if let Some(frame) = windows.moving_frame(entity)
         && let Some((_, child, _, _, position, reposition)) = workspaces
             .into_iter()
             .find(|(strip, _, _, _, _, _)| strip.contains(entity))
@@ -581,7 +659,7 @@ fn mouse_follows_focus(
 }
 
 fn dim_window_trigger(
-    trigger: On<Add, FocusedMarker>,
+    trigger: On<Add<FocusedMarker>>,
     windows: Windows,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
@@ -598,7 +676,7 @@ fn dim_window_trigger(
 }
 
 fn dim_remove_window_trigger(
-    trigger: On<Remove, FocusedMarker>,
+    trigger: On<Remove<FocusedMarker>>,
     windows: Windows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
@@ -625,7 +703,7 @@ fn dim_remove_window_trigger(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn virtual_strip_activated(
-    trigger: On<Add, FocusedMarker>,
+    trigger: On<Add<FocusedMarker>>,
     workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     mut commands: Commands,
 ) {
@@ -639,6 +717,68 @@ fn virtual_strip_activated(
     }
 }
 
+/// Marks a newly-focused tabbed-display member as its group's active tab.
+/// Observes `FocusedMarker` rather than `WindowFocused` so it fires without
+/// waiting for the OS round-trip.
+#[allow(clippy::needless_pass_by_value)]
+fn update_tabbed_active_on_focus(
+    trigger: On<Add<FocusedMarker>>,
+    mut workspaces: Query<&mut LayoutStrip>,
+    mut positions: Query<&mut LayoutPosition>,
+) {
+    let entity = trigger.entity;
+    for mut strip in &mut workspaces {
+        // Check via `&self` first so untouched strips aren't marked changed.
+        if strip.is_parked_tab(entity) && strip.set_active_tab(entity) {
+            // All members share one `LayoutPosition`, so a tab switch alone
+            // changes nothing and `position_layout_windows` (gated on
+            // `Changed<LayoutPosition>`) wouldn't swap the tabs, e.g. when a
+            // `ManualStripOffset` pins the strip. Force the mark.
+            if let Ok(index) = strip.index_of(entity)
+                && let Ok(column) = strip.get(index)
+            {
+                for member in column.window_iter() {
+                    if let Ok(mut layout_position) = positions.get_mut(member) {
+                        layout_position.set_changed();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Focuses the tab clicked in the tab indicator
+/// (`Event::TabIndicatorClicked`), keeping the pointer in place like a normal
+/// window click.
+fn handle_tab_indicator_click(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    stale_markers: super::mouse::StaleClickMarkers,
+    mut commands: Commands,
+) {
+    for event in messages.read() {
+        let Event::TabIndicatorClicked { window_id } = &event else {
+            continue;
+        };
+        let Some((_, entity)) = windows.find(*window_id) else {
+            continue;
+        };
+        for marker in &stale_markers {
+            if let Ok(mut entity_commands) = commands.get_entity(marker) {
+                entity_commands.try_despawn();
+            }
+        }
+        if windows
+            .focused()
+            .is_none_or(|(_, focused)| focused != entity)
+        {
+            let grace = Timeout::new(super::mouse::CLICK_FOCUS_GRACE, None, &mut commands);
+            commands.spawn((ClickFocusMarker(entity), grace));
+        }
+        commands.focus_entity(entity, true);
+    }
+}
+
 fn focus_window_trigger(
     trigger: On<FocusWindow>,
     windows: Windows,
@@ -647,13 +787,7 @@ fn focus_window_trigger(
     mut commands: Commands,
 ) {
     let FocusWindow { entity, raise } = *trigger.event();
-    for other in verifying {
-        if other != entity
-            && let Ok(mut entity_commands) = commands.get_entity(other)
-        {
-            entity_commands.try_remove::<(Timeout, VerifyFocus)>();
-        }
-    }
+    cancel_other_verify_focus(entity, &verifying, &mut commands);
     let Some(window) = windows.get(entity) else {
         return;
     };
@@ -673,6 +807,9 @@ fn focus_window_trigger(
 fn raise_window_trigger(
     trigger: On<RaiseWindow>,
     windows: Query<(Entity, &Window, &Position, &Bounds)>,
+    all_windows: Windows,
+    floating_layers: Query<&FloatingLayer>,
+    window_manager: Res<WindowManager>,
     active_display: ActiveDisplay,
     config: Res<Config>,
 ) {
@@ -686,8 +823,7 @@ fn raise_window_trigger(
         let viewport = active_display.actual_bounds(&config);
         let strip = active_display.active_strip();
         strip
-            .all_windows()
-            .into_iter()
+            .window_iter()
             .filter_map(|entity| {
                 if entity == focus {
                     None
@@ -702,6 +838,30 @@ fn raise_window_trigger(
             .for_each(|(_, window, _, _)| {
                 window.raise_without_focus();
             });
+
+        // Raising the strip buried the floats, which a workspace switch would
+        // otherwise leave behind every tile. They go back over the other
+        // tiles, still under the focused window, unless the workspace has
+        // sent them behind on purpose.
+        let workspace_id = strip.id();
+        let floats_in_front = floating_layers
+            .iter()
+            .find(|layer| layer.workspace_id == workspace_id)
+            .is_none_or(|layer| layer.front);
+        if floats_in_front {
+            visible_floating_entities(
+                &all_windows,
+                &window_manager,
+                workspace_id,
+                active_display.bounds(),
+            )
+            .into_iter()
+            .filter(|&entity| entity != focus && !strip.contains(entity))
+            .filter_map(|entity| windows.get(entity).ok())
+            .for_each(|(_, window, _, _)| {
+                window.raise_without_focus();
+            });
+        }
     }
 
     // Raise the focused window last, because raised windows get OS focus events.
@@ -720,7 +880,7 @@ fn recover_lost_focus(
     if let Ok(strip) = active_workspace
         .single()
         .inspect_err(|err| error!("Unable to get current workspace: {err}"))
-        && let Some(entity) = strip.first().ok().and_then(|col| col.top())
+        && let Some(entity) = strip.first()
     {
         error!("Lost focus marker, recovering!");
         commands.focus_entity(entity, false);
@@ -728,7 +888,7 @@ fn recover_lost_focus(
 }
 
 pub(super) fn stray_focus_observer(
-    trigger: On<Add, Window>,
+    trigger: On<Add<Window>>,
     focus_events: Populated<(Entity, &StrayFocusEvent)>,
     windows: Windows,
     mut commands: Commands,
@@ -757,6 +917,8 @@ mod tests {
     use crate::manager::app::MockApplicationApi;
     use crate::platform::WinID;
     use bevy::ecs::world::World;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI32, Ordering};
 
     fn spawn_app(world: &mut World, frontmost: bool, focused_id: WinID) -> Entity {
         let mut api = MockApplicationApi::new();
@@ -764,6 +926,47 @@ mod tests {
         api.expect_focused_window_id()
             .returning(move || Ok(focused_id));
         world.spawn(Application::new(Box::new(api))).id()
+    }
+
+    /// An app whose focused window the test can change between frames.
+    fn spawn_app_with_focus(world: &mut World, focused_id: Arc<AtomicI32>) -> Entity {
+        let mut api = MockApplicationApi::new();
+        api.expect_is_frontmost().returning(|| true);
+        api.expect_focused_window_id()
+            .returning(move || Ok(focused_id.load(Ordering::SeqCst)));
+        world.spawn(Application::new(Box::new(api))).id()
+    }
+
+    /// Lets the verify timer run out again, as the next frames would.
+    fn expire_verify_timer(world: &mut World, entity: Entity) {
+        let mut timeout = world.get_mut::<Timeout>(entity).expect("verify timer");
+        let remaining = timeout.timer.remaining();
+        timeout.timer.tick(remaining);
+    }
+
+    /// Two windows of one app side by side in a strip, the target asked for focus.
+    fn two_columns_verifying(world: &mut World, app: Entity) -> (Entity, Entity) {
+        let target = spawn_window(world, app, 1);
+        let actual = spawn_window(world, app, 2);
+        // Move actual so it does not share a frame with target (not a tab group).
+        world
+            .entity_mut(actual)
+            .insert(Position(bevy::math::IVec2::new(800, 0)));
+        let mut strip = LayoutStrip::default();
+        strip.append(target);
+        strip.append(actual);
+        world.spawn(strip);
+        world.entity_mut(target).insert((
+            FocusedMarker,
+            VerifyFocus::default(),
+            expired_verify_timeout(),
+        ));
+        (target, actual)
+    }
+
+    fn in_strip(world: &mut World, entity: Entity) -> bool {
+        let mut strips = world.query::<&LayoutStrip>();
+        strips.single(world).expect("one strip").contains(entity)
     }
 
     fn spawn_window(world: &mut World, app: Entity, id: WinID) -> Entity {
@@ -873,9 +1076,11 @@ mod tests {
             .expect("target is in the strip");
         world.spawn(strip);
 
-        world
-            .entity_mut(target)
-            .insert((FocusedMarker, VerifyFocus, expired_verify_timeout()));
+        world.entity_mut(target).insert((
+            FocusedMarker,
+            VerifyFocus::default(),
+            expired_verify_timeout(),
+        ));
 
         let system_id = world.register_system(detect_focus_rejection);
         _ = world.run_system(system_id);
@@ -891,27 +1096,187 @@ mod tests {
         );
     }
 
+    /// An app that is still busy when the first wait ends reports the window it
+    /// had focused before. That is not a refusal yet: the request is repeated
+    /// and the window keeps its place in the layout.
+    #[test]
+    fn a_slow_app_is_asked_again_instead_of_floating_the_window() {
+        let mut world = World::new();
+        let asked = Arc::new(AtomicI32::new(0));
+        let counter = asked.clone();
+        world.add_observer(move |trigger: On<FocusWindow>| {
+            assert!(trigger.event().raise);
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let app = spawn_app(&mut world, true, 2);
+        let (target, _) = two_columns_verifying(&mut world, app);
+
+        let system_id = world.register_system(detect_focus_rejection);
+        _ = world.run_system(system_id);
+
+        assert!(world.get::<Unmanaged>(target).is_none());
+        assert!(in_strip(&mut world, target));
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "focus is requested again");
+        assert!(
+            world
+                .get::<VerifyFocus>(target)
+                .is_some_and(|v| v.asked_again)
+        );
+        let timeout = world.get::<Timeout>(target).expect("still verifying");
+        assert_eq!(timeout.timer.remaining(), VERIFY_FOCUS_AGAIN_TIMEOUT);
+    }
+
+    /// The case from the field: a browser playing video answers late, then
+    /// focuses the requested window. It must stay tiled.
+    #[test]
+    fn a_slow_app_that_answers_late_keeps_the_window_tiled() {
+        let mut world = World::new();
+        let focused = Arc::new(AtomicI32::new(2));
+        let app = spawn_app_with_focus(&mut world, focused.clone());
+        let (target, _) = two_columns_verifying(&mut world, app);
+        let system_id = world.register_system(detect_focus_rejection);
+
+        _ = world.run_system(system_id);
+        focused.store(1, Ordering::SeqCst);
+        expire_verify_timer(&mut world, target);
+        _ = world.run_system(system_id);
+
+        assert!(world.get::<Unmanaged>(target).is_none());
+        assert!(in_strip(&mut world, target));
+    }
+
+    /// Runs the detector and the timer system in their production order, one
+    /// frame after `ms` milliseconds.
+    fn run_frame(world: &mut World, schedule: &mut bevy::ecs::schedule::Schedule, ms: u64) {
+        world
+            .resource_mut::<bevy::time::Time>()
+            .advance_by(Duration::from_millis(ms));
+        schedule.run(world);
+    }
+
+    fn verify_schedule(world: &mut World) -> bevy::ecs::schedule::Schedule {
+        world.insert_resource(bevy::time::Time::<()>::default());
+        world.add_observer(|_: On<FocusWindow>| {});
+        let mut schedule = bevy::ecs::schedule::Schedule::default();
+        schedule.add_systems(
+            (
+                detect_focus_rejection,
+                super::super::systems::timeout_ticker,
+            )
+                .chain(),
+        );
+        schedule
+    }
+
+    fn arm_fresh_verify(world: &mut World, target: Entity) {
+        world.entity_mut(target).insert((
+            VerifyFocus::default(),
+            Timeout::for_component::<VerifyFocus>(VERIFY_FOCUS_TIMEOUT),
+        ));
+    }
+
+    /// With the real timer system, the repeated request keeps the verification
+    /// alive through the retry frame, and a late answer ends it cleanly.
+    #[test]
+    fn a_late_answer_ends_the_verification_with_the_timer_system() {
+        let mut world = World::new();
+        let focused = Arc::new(AtomicI32::new(2));
+        let app = spawn_app_with_focus(&mut world, focused.clone());
+        let (target, _) = two_columns_verifying(&mut world, app);
+        arm_fresh_verify(&mut world, target);
+        let mut schedule = verify_schedule(&mut world);
+
+        run_frame(&mut world, &mut schedule, 350);
+        run_frame(&mut world, &mut schedule, 16);
+        assert!(
+            world
+                .get::<VerifyFocus>(target)
+                .is_some_and(|v| v.asked_again),
+            "the retry frame must not expire the verification"
+        );
+
+        focused.store(1, Ordering::SeqCst);
+        run_frame(&mut world, &mut schedule, 1100);
+        run_frame(&mut world, &mut schedule, 16);
+
+        assert!(
+            world.get_entity(target).is_ok(),
+            "the window entity survives"
+        );
+        assert!(world.get::<VerifyFocus>(target).is_none());
+        assert!(world.get::<Timeout>(target).is_none());
+        assert!(world.get::<Unmanaged>(target).is_none());
+        assert!(in_strip(&mut world, target));
+    }
+
+    /// With the real timer system, an app that keeps refusing gets the window
+    /// floated after the second wait, and the verification is cleared.
+    #[test]
+    fn a_repeated_refusal_floats_the_window_with_the_timer_system() {
+        let mut world = World::new();
+        let app = spawn_app(&mut world, true, 2);
+        let (target, _) = two_columns_verifying(&mut world, app);
+        arm_fresh_verify(&mut world, target);
+        let mut schedule = verify_schedule(&mut world);
+
+        run_frame(&mut world, &mut schedule, 350);
+        run_frame(&mut world, &mut schedule, 16);
+        run_frame(&mut world, &mut schedule, 500);
+        assert!(
+            world.get::<Unmanaged>(target).is_none(),
+            "the second wait has not ended yet"
+        );
+        run_frame(&mut world, &mut schedule, 600);
+        run_frame(&mut world, &mut schedule, 16);
+
+        assert!(matches!(
+            world.get::<Unmanaged>(target),
+            Some(Unmanaged::Floating)
+        ));
+        assert!(!in_strip(&mut world, target));
+        assert!(world.get::<VerifyFocus>(target).is_none());
+        assert!(world.get::<Timeout>(target).is_none());
+    }
+
+    /// A new focus request on the same window replaces the old verification,
+    /// so the retry flag from an earlier request does not carry over.
+    #[test]
+    fn a_new_request_starts_a_fresh_verification() {
+        let mut world = World::new();
+        let app = spawn_app(&mut world, true, 2);
+        let (target, _) = two_columns_verifying(&mut world, app);
+        let system_id = world.register_system(detect_focus_rejection);
+        _ = world.run_system(system_id);
+        assert!(
+            world
+                .get::<VerifyFocus>(target)
+                .is_some_and(|v| v.asked_again)
+        );
+
+        let rearm = world.register_system(move |mut commands: Commands| {
+            crate::commands::focus_with_verification(target, None, None, &mut commands);
+        });
+        world.add_observer(|_: On<FocusWindow>| {});
+        _ = world.run_system(rearm);
+
+        assert!(
+            world
+                .get::<VerifyFocus>(target)
+                .is_some_and(|v| !v.asked_again)
+        );
+        let timeout = world.get::<Timeout>(target).expect("verifying");
+        assert_eq!(timeout.timer.remaining(), VERIFY_FOCUS_TIMEOUT);
+    }
+
     #[test]
     fn focus_rejection_floats_target_and_clears_verify_focus() {
         let mut world = World::new();
         let app = spawn_app(&mut world, true, 2);
-        let target = spawn_window(&mut world, app, 1);
-        let actual = spawn_window(&mut world, app, 2);
-        // Move actual so it does not share a frame with target (not a tab group).
-        world
-            .entity_mut(actual)
-            .insert(Position(bevy::math::IVec2::new(800, 0)));
-
-        let mut strip = LayoutStrip::default();
-        strip.append(target);
-        strip.append(actual);
-        world.spawn(strip);
-
-        world
-            .entity_mut(target)
-            .insert((FocusedMarker, VerifyFocus, expired_verify_timeout()));
-
+        let (target, _) = two_columns_verifying(&mut world, app);
         let system_id = world.register_system(detect_focus_rejection);
+
+        _ = world.run_system(system_id);
+        expire_verify_timer(&mut world, target);
         _ = world.run_system(system_id);
 
         assert!(
@@ -919,6 +1284,7 @@ mod tests {
                 .get::<Unmanaged>(target)
                 .is_some_and(|u| matches!(u, Unmanaged::Floating))
         );
+        assert!(!in_strip(&mut world, target));
         assert!(world.get::<VerifyFocus>(target).is_none());
         assert!(world.get::<Timeout>(target).is_none());
     }
@@ -934,10 +1300,10 @@ mod tests {
 
         world
             .entity_mut(first)
-            .insert((VerifyFocus, expired_verify_timeout()));
+            .insert((VerifyFocus::default(), expired_verify_timeout()));
         world
             .entity_mut(second)
-            .insert((VerifyFocus, expired_verify_timeout()));
+            .insert((VerifyFocus::default(), expired_verify_timeout()));
         world.flush();
 
         assert!(

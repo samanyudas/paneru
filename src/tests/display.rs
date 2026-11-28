@@ -246,6 +246,56 @@ fn test_next_display_inserts_into_target_strip() {
         .run(commands);
 }
 
+/// A window macOS filled covers its display and ignores the edge padding, so
+/// it is wider than the tiled viewport. Moved to another display, it fits
+/// that display's viewport instead of keeping the extra width past its edge.
+#[test]
+fn test_next_display_fits_a_filled_window_to_the_target_viewport() {
+    const PADDING: u16 = 40;
+    let config: Config = (
+        MainOptions {
+            padding_left: Some(PADDING),
+            padding_right: Some(PADDING),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        );
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness
+        .mock_state
+        .os_move_window(0, Origin::new(0, TEST_MENUBAR_HEIGHT));
+    harness.mock_state.os_resize_window(
+        0,
+        Size::new(
+            TEST_DISPLAY_WIDTH,
+            TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT,
+        ),
+    );
+    harness.advance(Duration::from_secs(1));
+
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+    }]);
+    harness.advance(Duration::from_secs(1));
+
+    let padding = i32::from(PADDING);
+    let frame = harness.mock_state.create_window(0).frame();
+    assert_eq!(
+        (frame.min.x, frame.max.x),
+        (padding, EXT_DISPLAY_WIDTH - padding),
+        "the filled window must fit the target viewport, got {frame:?}"
+    );
+}
+
 #[test]
 fn test_send_next_display_stays_on_source() {
     let mut harness = TestHarness::new();
@@ -826,6 +876,59 @@ fn test_hidden_stack_stays_off_the_display_below() {
             assert_not_on_workspace!(world, 1, EXT_WORKSPACE_ID);
             assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
             assert_window_at!(world, 1, 0, 394);
+        })
+        .run(commands);
+}
+
+/// Paneru's exit cleanup centers each window on its own display. A hidden
+/// workspace's windows are parked at the display's bottom-right corner, so
+/// their centers lie in the display below; they used to be centered there.
+#[test]
+fn test_exit_keeps_hidden_windows_on_their_display() {
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(
+            0,
+            TEST_DISPLAY_HEIGHT,
+            EXT_DISPLAY_WIDTH,
+            TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
+        ),
+        vec![EXT_WORKSPACE_ID],
+    );
+
+    let commands = vec![
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(1)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    harness
+        .on_iteration(1, |world, _state| {
+            // Run the cleanup alone: a frame would also run the exit save,
+            // which writes the user's real state file.
+            world.write_message(AppExit::Success);
+            world
+                .run_system_once(crate::ecs::systems::cleanup_on_exit)
+                .expect("the exit cleanup runs");
+            world.resource_mut::<Messages<AppExit>>().clear();
+
+            let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+            let mut query = world.query::<&crate::manager::Window>();
+            for window in query.iter(world) {
+                let frame = window.frame();
+                assert!(
+                    display.contains(frame.min) && display.contains(frame.max),
+                    "window {} centered at {:?}, off its own display",
+                    window.id(),
+                    frame
+                );
+            }
         })
         .run(commands);
 }
@@ -1607,4 +1710,1019 @@ fn test_mouse_to_next_display_preserves_selected_virtual_workspace() {
             );
         })
         .run(commands);
+}
+
+#[test]
+fn test_horizontal_mouse_warp_also_warps_a_drag() {
+    let config: Config = (
+        MainOptions {
+            horizontal_mouse_warp: Some(1),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let above = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    let approach = objc2_core_foundation::CGPoint {
+        x: f64::from(TEST_DISPLAY_WIDTH - 20),
+        y: f64::from(TEST_DISPLAY_HEIGHT / 2),
+    };
+    let edge = objc2_core_foundation::CGPoint {
+        x: f64::from(TEST_DISPLAY_WIDTH - 1),
+        y: f64::from(TEST_DISPLAY_HEIGHT / 2),
+    };
+    let modifiers = crate::platform::Modifiers::empty();
+    for (first, second) in [
+        (
+            Event::MouseMoved {
+                point: approach,
+                modifiers,
+            },
+            Event::MouseMoved {
+                point: edge,
+                modifiers,
+            },
+        ),
+        (
+            Event::MouseDragged {
+                button: crate::events::MouseButton::Left,
+                point: approach,
+                modifiers,
+            },
+            Event::MouseDragged {
+                button: crate::events::MouseButton::Left,
+                point: edge,
+                modifiers,
+            },
+        ),
+    ] {
+        let label = format!("{second:?}");
+        let commands = vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ];
+        TestHarness::new()
+            .with_config(config.clone())
+            .with_windows(1)
+            .with_display(EXT_DISPLAY_ID, above, vec![EXT_WORKSPACE_ID])
+            .on_iteration(1, move |world, _state| {
+                world.write_message(first.clone());
+                world.write_message(second.clone());
+            })
+            .on_iteration(2, move |_world, state| {
+                let cursor = state.cursor_position();
+                assert!(
+                    above.contains(cursor),
+                    "{label} at the right edge left the pointer at {cursor:?}"
+                );
+            })
+            .run(commands);
+    }
+}
+
+/// A window's width is kept as a share of its own display, not of the one
+/// with focus: 960 wide on the 1920 monitor is half, though the laptop has
+/// focus.
+#[test]
+fn test_a_window_keeps_its_share_of_its_own_display() {
+    let mut harness = TestHarness::new();
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+    let ext_origin = Origin::new(0, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        EXT_WORKSPACE_ID,
+        100,
+        IRect::from_corners(ext_origin, ext_origin + size),
+    );
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        200,
+        IRect::from_corners(Origin::new(0, 0), Size::new(0, 0) + size),
+    );
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 200 },
+        Event::MenuOpened { window_id: 200 },
+        Event::MenuOpened { window_id: 200 },
+    ];
+    harness
+        .on_iteration(1, |world, _state| {
+            let entity = crate::tests::harness::find_window_entity(100, world);
+            let mut bounds = world.get_mut::<crate::ecs::Bounds>(entity).expect("bounds");
+            bounds.0.x = EXT_DISPLAY_WIDTH / 2;
+        })
+        .on_iteration(2, |world, _state| {
+            let entity = crate::tests::harness::find_window_entity(100, world);
+            let ratio = world
+                .get::<crate::ecs::WidthRatio>(entity)
+                .expect("ratio")
+                .0;
+            assert!(
+                (ratio - 0.5).abs() < 0.01,
+                "half the monitor's width is a share of 0.5, not {ratio}"
+            );
+        })
+        .run(commands);
+}
+
+/// Unplugs `EXT_DISPLAY_ID`, which holds window 100, after focusing window 100
+/// (`focus_removed` is true) or window 0 on the surviving display. macOS moves
+/// window 100 to the surviving display, where it becomes a second row.
+fn remove_display_holding_window_100(
+    focus_removed: bool,
+    verify: impl FnMut(&mut World, MockState) + 'static,
+) {
+    let focused = if focus_removed { 100 } else { 0 };
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::WindowFocused { window_id: focused },
+        Event::DisplayRemoved {
+            display_id: EXT_DISPLAY_ID,
+        },
+    ];
+
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(2)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {});
+    harness
+        .app
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            500,
+        )));
+
+    harness
+        .on_iteration(0, move |_world, state| {
+            if focus_removed {
+                state.activate_display(EXT_DISPLAY_ID);
+            }
+            state.set_focused_window(focused);
+        })
+        .on_iteration(1, move |world, state| {
+            crate::assert_focused!(world, focused);
+            state.remove_display(EXT_DISPLAY_ID);
+            state.update_window(100, |w| w.workspace_id = TEST_WORKSPACE_ID);
+        })
+        .on_iteration(2, verify)
+        .run(commands);
+}
+
+/// Each row on the surviving display, in `virtual_index` order: its windows,
+/// and whether it is active, selected, and parked.
+fn surviving_rows(world: &mut World) -> Vec<(Vec<WinID>, bool, bool, bool)> {
+    use crate::ecs::workspace::PreviousStripPosition;
+    use crate::ecs::{ActiveWorkspaceMarker, SelectedVirtualMarker};
+
+    let ids: std::collections::HashMap<Entity, WinID> = world
+        .query::<(Entity, &Window)>()
+        .iter(world)
+        .map(|(entity, window)| (entity, window.id()))
+        .collect();
+    let mut rows: Vec<_> = world
+        .query::<(
+            &LayoutStrip,
+            Has<ActiveWorkspaceMarker>,
+            Has<SelectedVirtualMarker>,
+            Has<PreviousStripPosition>,
+        )>()
+        .iter(world)
+        .filter(|(strip, ..)| strip.id() == TEST_WORKSPACE_ID)
+        .map(|(strip, active, selected, parked)| {
+            (
+                strip.virtual_index,
+                strip.all_windows().iter().map(|e| ids[e]).collect(),
+                active,
+                selected,
+                parked,
+            )
+        })
+        .collect();
+    rows.sort_by_key(|(index, ..)| *index);
+    rows.into_iter()
+        .map(|(_, windows, active, selected, parked)| (windows, active, selected, parked))
+        .collect()
+}
+
+#[test]
+fn test_remove_focused_display_shows_the_focused_window() {
+    remove_display_holding_window_100(true, |world, state| {
+        crate::assert_focused!(world, 100);
+        let focused = state.create_window(100).frame();
+        for id in [0, 1] {
+            let frame = state.create_window(id).frame();
+            assert!(
+                frame.intersect(focused).is_empty(),
+                "window {id} at {frame:?} overlaps the focused window at {focused:?}"
+            );
+        }
+        assert_eq!(
+            focused,
+            IRect::new(
+                0,
+                TEST_MENUBAR_HEIGHT,
+                TEST_WINDOW_WIDTH,
+                TEST_DISPLAY_HEIGHT
+            ),
+            "the focused window takes the first slot of the shown row"
+        );
+    });
+}
+
+#[test]
+fn test_remove_unfocused_display_keeps_the_shown_row() {
+    remove_display_holding_window_100(false, |world, state| {
+        crate::assert_focused!(world, 0);
+        assert_eq!(
+            surviving_rows(world),
+            vec![
+                (vec![0, 1], true, true, false),
+                (vec![100], false, false, true)
+            ],
+        );
+        let parked_y = TEST_DISPLAY_HEIGHT - PARKED_STRIP_SLIVER;
+        assert_eq!(state.create_window(100).frame().min.y, parked_y);
+        assert!(state.create_window(0).frame().min.y < parked_y);
+    });
+}
+
+#[test]
+fn test_remove_display_keeps_windows_whose_space_is_destroyed() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(2)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {})
+        .with_workspace_window(101, EXT_WORKSPACE_ID, |_| {});
+
+    harness
+        .app
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            500,
+        )));
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::DisplayRemoved {
+            display_id: EXT_DISPLAY_ID,
+        },
+    ];
+
+    harness
+        .on_iteration(0, |world, state| {
+            state.remove_display(EXT_DISPLAY_ID);
+            state.update_window(100, |w| w.workspace_id = TEST_WORKSPACE_ID);
+            state.update_window(101, |w| w.workspace_id = TEST_WORKSPACE_ID);
+            world.write_message(Event::SpaceDestroyed {
+                space_id: EXT_WORKSPACE_ID,
+            });
+        })
+        .on_iteration(1, |world, _state| {
+            let win100 = find_window_entity(100, world);
+            let win101 = find_window_entity(101, world);
+            let main_strips: Vec<(u32, Vec<Entity>)> = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|s| s.id() == TEST_WORKSPACE_ID)
+                .map(|s| (s.virtual_index, s.all_windows()))
+                .collect();
+            assert!(
+                main_strips
+                    .iter()
+                    .any(|(_, windows)| windows.contains(&win100) && windows.contains(&win101)),
+                "windows from the destroyed space must land in a strip on the surviving display: {main_strips:?}"
+            );
+            for id in [100, 101] {
+                assert_hotplug_window_width(world, id,
+                    crate::util::round_px(f64::from(TEST_WINDOW_WIDTH) / f64::from(EXT_DISPLAY_WIDTH)
+                        * f64::from(TEST_DISPLAY_WIDTH)));
+            }
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_remove_display_keeps_windows_when_the_space_goes_after_the_display() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(2)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {})
+        .with_workspace_window(101, EXT_WORKSPACE_ID, |_| {});
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.mock_state.remove_display(EXT_DISPLAY_ID);
+    harness
+        .mock_state
+        .update_window(100, |w| w.workspace_id = TEST_WORKSPACE_ID);
+    harness
+        .mock_state
+        .update_window(101, |w| w.workspace_id = TEST_WORKSPACE_ID);
+    harness.world().write_message(Event::DisplayRemoved {
+        display_id: EXT_DISPLAY_ID,
+    });
+    harness.advance(Duration::from_millis(100));
+    harness.world().write_message(Event::SpaceDestroyed {
+        space_id: EXT_WORKSPACE_ID,
+    });
+    harness.advance(Duration::from_secs(2));
+
+    let world = harness.world();
+    let win100 = find_window_entity(100, world);
+    let win101 = find_window_entity(101, world);
+    let main_strips: Vec<(u32, Vec<Entity>)> = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|s| s.id() == TEST_WORKSPACE_ID)
+        .map(|s| (s.virtual_index, s.all_windows()))
+        .collect();
+    assert!(
+        main_strips
+            .iter()
+            .any(|(_, windows)| windows == &vec![win100, win101]),
+        "windows from the destroyed space must keep their order on the surviving display: {main_strips:?}"
+    );
+    for id in [100, 101] {
+        assert_hotplug_window_width(
+            world,
+            id,
+            crate::util::round_px(
+                f64::from(TEST_WINDOW_WIDTH) / f64::from(EXT_DISPLAY_WIDTH)
+                    * f64::from(TEST_DISPLAY_WIDTH),
+            ),
+        );
+    }
+}
+
+#[test]
+fn test_destroyed_space_on_a_present_display_is_not_orphaned() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {});
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.world().write_message(Event::SpaceDestroyed {
+        space_id: EXT_WORKSPACE_ID,
+    });
+    harness.advance(Duration::from_millis(100));
+
+    let world = harness.world();
+    let leftover = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|strip| strip.id() == EXT_WORKSPACE_ID)
+        .count();
+    assert_eq!(
+        leftover, 0,
+        "a space destroyed on a connected display is dropped, as before"
+    );
+}
+
+fn hotplug_viewport_width(world: &mut World, display_id: u32) -> i32 {
+    let mut displays = world.query::<(&Display, Option<&DockPosition>)>();
+    let (display, dock) = displays
+        .iter(world)
+        .find(|(display, _)| display.id() == display_id)
+        .expect("display must exist");
+    display
+        .actual_display_bounds(dock, world.resource::<Config>())
+        .width()
+}
+
+fn assert_hotplug_window_width(world: &mut World, id: WinID, expected_width: i32) {
+    let entity = find_window_entity(id, world);
+    let bounds = world.get::<crate::ecs::Bounds>(entity).expect("bounds");
+    let frame = world.get::<Window>(entity).expect("window").frame();
+    assert!(
+        (bounds.0.x - expected_width).abs() <= 2,
+        "#430: migrated tiled width must preserve its viewport share: expected {expected_width}, got {}",
+        bounds.0.x
+    );
+    assert!(
+        (frame.width() - expected_width).abs() <= 2,
+        "the committed window width must also be {expected_width}, got {}",
+        frame.width()
+    );
+}
+
+fn assert_hotplug_width_and_order(world: &mut World, expected_width: i32) {
+    let local = find_window_entity(0, world);
+    let first = find_window_entity(100, world);
+    let second = find_window_entity(101, world);
+    let mut strips = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .map(|strip| (strip.virtual_index, strip.all_windows()))
+        .collect::<Vec<_>>();
+    strips.sort_by_key(|(index, _)| *index);
+    assert_eq!(strips, vec![(0, vec![local]), (1, vec![first, second])]);
+    let first_x = world
+        .get::<crate::ecs::LayoutPosition>(first)
+        .expect("layout")
+        .0
+        .x;
+    let second_x = world
+        .get::<crate::ecs::LayoutPosition>(second)
+        .expect("layout")
+        .0
+        .x;
+    assert!(
+        second_x >= first_x + expected_width - 2,
+        "columns must not overlap after resizing"
+    );
+    assert_eq!(
+        world
+            .query::<&crate::ecs::display::OrphanedWindowWidths>()
+            .iter(world)
+            .count(),
+        0,
+        "all temporary width snapshots must be consumed"
+    );
+    for id in [100, 101] {
+        assert_hotplug_window_width(world, id, expected_width);
+    }
+}
+
+fn hotplug_config(remember_setups: bool) -> Config {
+    (
+        MainOptions {
+            remember_display_setups: Some(remember_setups),
+            disable_native_tabs: Some(true),
+            animation_speed: Some(12.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into()
+}
+
+fn hotplug_harness(config: Config) -> TestHarness {
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {})
+        .with_workspace_window(101, EXT_WORKSPACE_ID, |_| {});
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness
+}
+
+fn set_hotplug_widths(harness: &mut TestHarness, ratio: f64) -> i32 {
+    let source_width = crate::util::round_px(
+        ratio * f64::from(hotplug_viewport_width(harness.world(), EXT_DISPLAY_ID)),
+    );
+    let expected_width = crate::util::round_px(
+        ratio * f64::from(hotplug_viewport_width(harness.world(), TEST_DISPLAY_ID)),
+    );
+    for id in [100, 101] {
+        let world = harness.world();
+        let entity = find_window_entity(id, world);
+        world
+            .get_mut::<crate::ecs::Bounds>(entity)
+            .expect("bounds")
+            .0
+            .x = source_width;
+    }
+    harness.advance(Duration::from_millis(500));
+    for id in [100, 101] {
+        let world = harness.world();
+        let entity = find_window_entity(id, world);
+        assert_eq!(
+            world.get::<Window>(entity).expect("window").frame().width(),
+            source_width
+        );
+    }
+    expected_width
+}
+
+fn unplug_hotplug_windows(harness: &mut TestHarness, ids: &[WinID], space_destroyed_first: bool) {
+    harness.mock_state.remove_display(EXT_DISPLAY_ID);
+    let space_destroyed = Event::SpaceDestroyed {
+        space_id: EXT_WORKSPACE_ID,
+    };
+    let display_removed = Event::DisplayRemoved {
+        display_id: EXT_DISPLAY_ID,
+    };
+    let (first_event, second_event, delay) = if space_destroyed_first {
+        (space_destroyed, display_removed, Duration::from_millis(100))
+    } else {
+        // Let reconciliation remove the Display entity before SpaceDestroyed.
+        (display_removed, space_destroyed, Duration::from_millis(600))
+    };
+    harness.world().write_message(first_event);
+    harness.advance(delay);
+    for &id in ids {
+        harness
+            .mock_state
+            .update_window(id, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    }
+    harness.world().write_message(second_event);
+    // Use the harness's normal 20 ms clock through both reconciliation passes.
+    harness.advance(Duration::from_secs(3));
+}
+
+fn check_hotplug_width_ratio(ratio: f64, space_destroyed_first: bool, remember_setups: bool) {
+    let mut harness = hotplug_harness(hotplug_config(remember_setups));
+    let expected_width = set_hotplug_widths(&mut harness, ratio);
+    unplug_hotplug_windows(&mut harness, &[100, 101], space_destroyed_first);
+    assert_hotplug_width_and_order(harness.world(), expected_width);
+
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: TEST_DISPLAY_ID,
+    });
+    harness.advance(Duration::from_secs(3));
+    assert_hotplug_width_and_order(harness.world(), expected_width);
+
+    harness.mock_state.focus_window(100);
+    harness.advance(Duration::from_secs(2));
+    assert_hotplug_width_and_order(harness.world(), expected_width);
+}
+
+#[test]
+fn test_hotplug_preserves_full_viewport_width() {
+    for space_first in [true, false] {
+        for remember in [false, true] {
+            check_hotplug_width_ratio(1.0, space_first, remember);
+        }
+    }
+}
+
+#[test]
+fn test_hotplug_preserves_half_viewport_width() {
+    for space_first in [true, false] {
+        for remember in [false, true] {
+            check_hotplug_width_ratio(0.5, space_first, remember);
+        }
+    }
+}
+
+#[test]
+fn test_hotplug_preserves_oversized_viewport_width() {
+    check_hotplug_width_ratio(1.5, true, false);
+}
+
+fn padded_hotplug_harness() -> TestHarness {
+    let config = Config::try_from(
+        "[options]\ndisable_native_tabs = true\nanimation_speed = 12.0\n[padding]\nleft = 17\nright = 31\ntop = 14\nbottom = 22\n[bindings]",
+    ).expect("valid padding configuration");
+    let mut harness = hotplug_harness(config);
+    let world = harness.world();
+    let displays = world
+        .query::<(Entity, &Display)>()
+        .iter(world)
+        .map(|(entity, display)| (entity, display.id()))
+        .collect::<Vec<_>>();
+    for (entity, id) in displays {
+        world.entity_mut(entity).insert(if id == EXT_DISPLAY_ID {
+            DockPosition::Right(156)
+        } else {
+            DockPosition::Left(92)
+        });
+    }
+    harness
+}
+
+#[test]
+fn test_hotplug_preserves_width_with_dock_and_padding() {
+    for ratio in [0.5, 1.0, 1.5] {
+        let mut harness = padded_hotplug_harness();
+        let expected_width = set_hotplug_widths(&mut harness, ratio);
+        unplug_hotplug_windows(&mut harness, &[100, 101], true);
+        assert_hotplug_width_and_order(harness.world(), expected_width);
+    }
+}
+
+#[test]
+fn test_hotplug_fullwidth_toggle_restores_viewport_share() {
+    let mut harness = padded_hotplug_harness();
+    let expected_half = set_hotplug_widths(&mut harness, 0.5);
+    harness.mock_state.activate_display(EXT_DISPLAY_ID);
+    harness.mock_state.focus_window(100);
+    harness.advance(Duration::from_millis(500));
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::FullWidth),
+    }]);
+    harness.advance(Duration::from_secs(1));
+    let source_width = hotplug_viewport_width(harness.world(), EXT_DISPLAY_ID);
+    let target_width = hotplug_viewport_width(harness.world(), TEST_DISPLAY_ID);
+    let world = harness.world();
+    let entity = find_window_entity(100, world);
+    assert_eq!(
+        world.get::<Window>(entity).expect("window").frame().width(),
+        source_width
+    );
+
+    unplug_hotplug_windows(&mut harness, &[100, 101], false);
+    let world = harness.world();
+    let entity = find_window_entity(100, world);
+    assert!(world.get::<crate::ecs::FullWidthMarker>(entity).is_some());
+    assert!(
+        (world.get::<Window>(entity).expect("window").frame().width() - target_width).abs() <= 2
+    );
+    harness.mock_state.focus_window(100);
+    harness.advance(Duration::from_millis(500));
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::FullWidth),
+    }]);
+    harness.advance(Duration::from_secs(1));
+    assert_hotplug_width_and_order(harness.world(), expected_half);
+}
+
+#[test]
+fn test_hotplug_preserves_stack_and_tabs() {
+    use crate::ecs::layout::{Column, StackItem};
+    for space_first in [true, false] {
+        let mut harness = hotplug_harness(hotplug_config(false));
+        for id in [102, 103, 104] {
+            let window = harness.mock_state.spawn_window(
+                TEST_PROCESS_ID,
+                EXT_WORKSPACE_ID,
+                id,
+                IRect::new(
+                    0,
+                    -EXT_DISPLAY_HEIGHT,
+                    TEST_WINDOW_WIDTH,
+                    -EXT_DISPLAY_HEIGHT + 500,
+                ),
+            );
+            harness
+                .world()
+                .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+        }
+        harness.advance(Duration::from_millis(500));
+        let expected = set_hotplug_widths(&mut harness, 0.5);
+        let world = harness.world();
+        let windows = (100..=104)
+            .map(|id| find_window_entity(id, world))
+            .collect::<Vec<_>>();
+        let strip_entity = world
+            .query::<(Entity, &LayoutStrip)>()
+            .iter(world)
+            .find_map(|(entity, strip)| (strip.id() == EXT_WORKSPACE_ID).then_some(entity))
+            .expect("source strip");
+        let mut strip = world.get_mut::<LayoutStrip>(strip_entity).expect("strip");
+        strip.stack(windows[2]).expect("stack");
+        strip.stack(windows[3]).expect("stack");
+        strip.convert_to_tabs(windows[1], windows[2]).expect("tabs");
+        // Give every member the same half-viewport column width.
+        for entity in &windows {
+            world
+                .get_mut::<crate::ecs::Bounds>(*entity)
+                .expect("bounds")
+                .0
+                .x = EXT_DISPLAY_WIDTH / 2;
+        }
+        harness.advance(Duration::from_millis(500));
+        unplug_hotplug_windows(&mut harness, &[100, 101, 102, 103, 104], space_first);
+        let world = harness.world();
+        let strip = world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .find(|strip| strip.contains(windows[0]))
+            .expect("migrated strip");
+        assert_eq!(strip.id(), TEST_WORKSPACE_ID);
+        assert_eq!(strip.len(), 3);
+        assert!(matches!(strip.get(0).unwrap(), Column::Single(entity) if entity == windows[0]));
+        assert!(matches!(strip.get(1).unwrap(), Column::Stack(items)
+            if items == vec![StackItem::Tabs(vec![windows[2], windows[1]]), StackItem::Single(windows[3])]));
+        assert!(matches!(strip.get(2).unwrap(), Column::Single(entity) if entity == windows[4]));
+        for entity in windows {
+            assert!(
+                (world.get::<Window>(entity).expect("window").frame().width() - expected).abs()
+                    <= 2
+            );
+        }
+    }
+}
+
+#[test]
+fn test_hotplug_reparents_a_surviving_space_once() {
+    let mut harness = hotplug_harness(hotplug_config(false));
+    let expected = set_hotplug_widths(&mut harness, 0.5);
+    harness.mock_state.remove_display(EXT_DISPLAY_ID);
+    harness.world().write_message(Event::DisplayRemoved {
+        display_id: EXT_DISPLAY_ID,
+    });
+    harness.advance(Duration::from_millis(600));
+    assert_eq!(
+        harness
+            .world()
+            .query::<&crate::ecs::display::OrphanedWindowWidths>()
+            .iter(harness.app.world())
+            .count(),
+        1
+    );
+    // macOS later assigns the original Space ID to the remaining display.
+    harness.mock_state.add_display(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+        vec![TEST_WORKSPACE_ID, EXT_WORKSPACE_ID],
+    );
+    harness.advance(Duration::from_secs(3));
+    for id in [100, 101] {
+        let world = harness.world();
+        let entity = find_window_entity(id, world);
+        assert!(
+            (world.get::<Window>(entity).expect("window").frame().width() - expected).abs() <= 2
+        );
+        assert_on_workspace!(world, id, EXT_WORKSPACE_ID);
+    }
+    assert_eq!(
+        harness
+            .world()
+            .query::<&crate::ecs::display::OrphanedWindowWidths>()
+            .iter(harness.app.world())
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn test_hotplug_leaves_floating_and_native_fullscreen_widths_alone() {
+    use crate::ecs::{Bounds, NativeFullscreenMarker, Position, Unmanaged};
+    let mut harness = hotplug_harness(hotplug_config(false));
+    for id in [102, 103] {
+        let window = harness.mock_state.spawn_window(
+            TEST_PROCESS_ID,
+            EXT_WORKSPACE_ID,
+            id,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, 700, -EXT_DISPLAY_HEIGHT + 500),
+        );
+        harness
+            .world()
+            .trigger(crate::ecs::SpawnWindowTrigger(vec![window]));
+    }
+    harness.advance(Duration::from_millis(500));
+    let expected = set_hotplug_widths(&mut harness, 0.5);
+    let world = harness.world();
+    let floating = find_window_entity(102, world);
+    let fullscreen = find_window_entity(103, world);
+    let (strip_entity, display_entity) = world
+        .query::<(Entity, &LayoutStrip, &ChildOf)>()
+        .iter(world)
+        .find_map(|(entity, strip, parent)| {
+            (strip.id() == EXT_WORKSPACE_ID).then_some((entity, parent.parent()))
+        })
+        .expect("source strip");
+    world.entity_mut(floating).insert(Unmanaged::Floating);
+    let mut strip = world.get_mut::<LayoutStrip>(strip_entity).expect("strip");
+    strip.remove(fullscreen);
+    world.spawn((
+        LayoutStrip::fullscreen(30, fullscreen),
+        NativeFullscreenMarker {
+            layout_strip: strip_entity,
+            workspace_id: EXT_WORKSPACE_ID,
+            index: 2,
+        },
+        ChildOf(display_entity),
+        Position(Origin::new(0, -EXT_DISPLAY_HEIGHT)),
+    ));
+    harness.mock_state.update_window(103, |window| {
+        window.workspace_id = 30;
+        window.is_full_screen = true;
+    });
+    harness.advance(Duration::from_millis(500));
+    let world = harness.world();
+    let original =
+        [floating, fullscreen].map(|entity| world.get::<Bounds>(entity).expect("bounds").0.x);
+    unplug_hotplug_windows(&mut harness, &[100, 101, 102, 103], true);
+    let world = harness.world();
+    assert_hotplug_width_and_order(world, expected);
+    for (entity, width) in [floating, fullscreen].into_iter().zip(original) {
+        assert_eq!(world.get::<Bounds>(entity).expect("bounds").0.x, width);
+        assert_eq!(
+            world.get::<Window>(entity).expect("window").frame().width(),
+            width
+        );
+    }
+}
+
+#[test]
+fn test_hotplug_consumes_each_width_once_when_windows_arrive_late() {
+    let mut harness = hotplug_harness(hotplug_config(false));
+    let expected = set_hotplug_widths(&mut harness, 0.5);
+    harness.mock_state.remove_display(EXT_DISPLAY_ID);
+    harness.world().write_message(Event::SpaceDestroyed {
+        space_id: EXT_WORKSPACE_ID,
+    });
+    harness.advance(Duration::from_millis(100));
+    harness
+        .mock_state
+        .update_window(100, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    harness.world().write_message(Event::DisplayRemoved {
+        display_id: EXT_DISPLAY_ID,
+    });
+    // Finish the first resize animation, before the one-second verification pass.
+    harness.advance(Duration::from_millis(1100));
+    let world = harness.world();
+    let entity = find_window_entity(100, world);
+    assert!((world.get::<Window>(entity).expect("window").frame().width() - expected).abs() <= 2);
+    assert_eq!(
+        world
+            .query::<&crate::ecs::display::OrphanedWindowWidths>()
+            .iter(world)
+            .count(),
+        1
+    );
+    harness
+        .mock_state
+        .update_window(101, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    harness.advance(Duration::from_secs(3));
+    let world = harness.world();
+    for id in [100, 101] {
+        let entity = find_window_entity(id, world);
+        assert!(
+            (world.get::<Window>(entity).expect("window").frame().width() - expected).abs() <= 2
+        );
+        assert_on_workspace!(world, id, TEST_WORKSPACE_ID);
+    }
+    assert_eq!(
+        world
+            .query::<&crate::ecs::display::OrphanedWindowWidths>()
+            .iter(world)
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn test_hotplug_width_snapshot_expires_with_unresolved_orphan() {
+    let mut harness = hotplug_harness(hotplug_config(false));
+    set_hotplug_widths(&mut harness, 0.5);
+    harness.mock_state.remove_display(EXT_DISPLAY_ID);
+    harness.world().write_message(Event::SpaceDestroyed {
+        space_id: EXT_WORKSPACE_ID,
+    });
+    harness.world().write_message(Event::DisplayRemoved {
+        display_id: EXT_DISPLAY_ID,
+    });
+    harness.advance(Duration::from_secs(1));
+    let world = harness.world();
+    assert_eq!(
+        world
+            .query::<&crate::ecs::display::OrphanedWindowWidths>()
+            .iter(world)
+            .count(),
+        1
+    );
+    harness.advance(Duration::from_secs(31));
+    let world = harness.world();
+    assert_eq!(
+        world
+            .query::<&crate::ecs::display::OrphanedWindowWidths>()
+            .iter(world)
+            .count(),
+        0
+    );
+}
+
+const THIRD_DISPLAY_ID: u32 = 3;
+const THIRD_WORKSPACE_ID: u64 = 30;
+
+fn ext_display_bounds() -> IRect {
+    IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0)
+}
+
+fn third_display_bounds() -> IRect {
+    IRect::new(
+        0,
+        TEST_DISPLAY_HEIGHT,
+        EXT_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT + EXT_DISPLAY_HEIGHT,
+    )
+}
+
+/// The harness adds the external display first, so it is the "next" display.
+fn with_stacked_displays(harness: TestHarness) -> TestHarness {
+    harness
+        .with_display(EXT_DISPLAY_ID, ext_display_bounds(), vec![EXT_WORKSPACE_ID])
+        .with_display(
+            THIRD_DISPLAY_ID,
+            third_display_bounds(),
+            vec![THIRD_WORKSPACE_ID],
+        )
+}
+
+fn window_commands(operation: Operation) -> Vec<Event> {
+    vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(operation),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ]
+}
+
+#[test]
+fn test_display_move_targets_the_named_display() {
+    with_stacked_displays(TestHarness::new().with_windows(1))
+        .on_iteration(1, |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_on_workspace!(world, 0, THIRD_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(window_commands(Operation::ToDisplay(
+            THIRD_DISPLAY_ID,
+            MoveFocus::Follow,
+        )));
+}
+
+#[test]
+fn test_display_send_moves_the_window_and_keeps_the_source_active() {
+    with_stacked_displays(TestHarness::new().with_windows(2))
+        .on_iteration(2, |world, state| {
+            assert_on_workspace!(world, 0, THIRD_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_on_workspace!(world, 1, TEST_WORKSPACE_ID);
+            assert_eq!(state.active_display(), TEST_DISPLAY_ID);
+        })
+        .run(window_commands(Operation::ToDisplay(
+            THIRD_DISPLAY_ID,
+            MoveFocus::Stay,
+        )));
+}
+
+#[test]
+fn test_display_move_to_an_unknown_display_keeps_the_window() {
+    with_stacked_displays(TestHarness::new().with_windows(1))
+        .on_iteration(3, |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(window_commands(Operation::ToDisplay(99, MoveFocus::Follow)));
+}
+
+#[test]
+fn test_vertical_swap_moves_to_the_nearest_display_in_that_direction() {
+    for (direction, workspace, other) in [
+        (Direction::South, THIRD_WORKSPACE_ID, EXT_WORKSPACE_ID),
+        (Direction::North, EXT_WORKSPACE_ID, THIRD_WORKSPACE_ID),
+    ] {
+        with_stacked_displays(TestHarness::new().with_windows(1))
+            .on_iteration(3, move |world, _state| {
+                assert_on_workspace!(world, 0, workspace);
+                assert_not_on_workspace!(world, 0, other);
+                assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            })
+            .run(window_commands(Operation::Swap(direction)));
+    }
+}
+
+#[test]
+fn test_vertical_focus_moves_the_pointer_to_the_nearest_display_in_that_direction() {
+    for (direction, bounds) in [
+        (Direction::South, third_display_bounds()),
+        (Direction::North, ext_display_bounds()),
+    ] {
+        let label = format!("{direction:?}");
+        with_stacked_displays(TestHarness::new().with_windows(1))
+            .on_iteration(3, move |_world, state| {
+                let cursor = state.cursor_position();
+                assert!(
+                    bounds.contains(cursor),
+                    "focus {label} left the pointer at {cursor:?}, outside {bounds:?}"
+                );
+            })
+            .run(window_commands(Operation::Focus(direction)));
+    }
 }

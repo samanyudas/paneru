@@ -1,12 +1,10 @@
 use std::{ffi::c_void, os::raw::c_float, ptr::NonNull};
 
 use accessibility_sys::AXUIElementRef;
-use objc2_core_foundation::{
-    CFArray, CFDictionary, CFMutableData, CFNumber, CFString, CFType, CFUUID, CGPoint,
-};
+use objc2_core_foundation::{CFArray, CFMutableData, CFString, CFType, CFUUID, CGPoint};
 use objc2_core_graphics::{CGDirectDisplayID, CGError};
 
-use crate::platform::{CFStringRef, ConnID, OSStatus, ProcessSerialNumber, WinID};
+use crate::platform::{CFStringRef, ConnID, OSStatus, Pid, ProcessSerialNumber, WinID};
 
 #[link(name = "SkyLight", kind = "framework")]
 unsafe extern "C" {
@@ -99,6 +97,16 @@ unsafe extern "C" {
     /// # Original signature
     /// extern `CFStringRef` SLSCopyBestManagedDisplayForRect(int cid, `CGRect` rect);
     // pub fn SLSCopyBestManagedDisplayForRect(cid: ConnID, frame: CGRect) -> CFStringRef;
+
+    /// Copies the managed space IDs (`u64` `CFNumber`s) hosting the given windows (`SInt32` `CFNumber`s).
+    ///
+    /// # Original signature
+    /// extern `CFArrayRef` SLSCopySpacesForWindows(int cid, int selector, `CFArrayRef` `window_list`);
+    pub fn SLSCopySpacesForWindows(
+        cid: ConnID,
+        selector: i32,
+        window_list: *const CFArray,
+    ) -> *mut CFArray<CFType>;
 
     /// Creates a `CFUUIDRef` from a `CGDirectDisplayID`.
     ///
@@ -235,9 +243,7 @@ unsafe extern "C" {
     ///
     /// # Original signature
     /// extern `CFArrayRef` SLSCopyManagedDisplaySpaces(int cid);
-    pub fn SLSCopyManagedDisplaySpaces(
-        cid: ConnID,
-    ) -> *mut CFArray<CFDictionary<CFString, CFString>>;
+    pub fn SLSCopyManagedDisplaySpaces(cid: ConnID) -> *mut CFArray<CFType>;
 
     /// Copies a list of associated windows for a given window ID.
     /// This typically refers to child windows or windows grouped with the primary window.
@@ -249,11 +255,11 @@ unsafe extern "C" {
     ///
     /// # Returns
     ///
-    /// A `NonNull<CFArray>` containing associated windows, or `NULL` if not found or an error occurs.
+    /// A raw pointer to a `CFArray` containing associated windows, or `NULL` if not found or an error occurs.
     ///
     /// # Original signature
     /// extern `CFArrayRef` SLSCopyAssociatedWindows(int cid, `uint32_t` wid);
-    pub fn SLSCopyAssociatedWindows(cid: ConnID, window_id: WinID) -> NonNull<CFArray<CFNumber>>;
+    pub fn SLSCopyAssociatedWindows(cid: ConnID, window_id: WinID) -> *mut CFArray<CFType>;
 
     /// Queries windows based on a provided `CFArray` of window IDs.
     ///
@@ -265,15 +271,12 @@ unsafe extern "C" {
     ///
     /// # Returns
     ///
-    /// A `NonNull<CFType>` representing the window query result.
+    /// A raw pointer to a `CFType` representing the window query result, or `NULL` on failure.
     ///
     /// # Original signature
     /// extern `CFTypeRef` SLSWindowQueryWindows(int cid, `CFArrayRef` windows, int count);
-    pub fn SLSWindowQueryWindows(
-        cid: ConnID,
-        windows: *const CFArray,
-        count: isize,
-    ) -> NonNull<CFType>;
+    pub fn SLSWindowQueryWindows(cid: ConnID, windows: *const CFArray, count: isize)
+    -> *mut CFType;
 
     /// Copies windows from a window query result.
     ///
@@ -283,11 +286,11 @@ unsafe extern "C" {
     ///
     /// # Returns
     ///
-    /// A `NonNull<CFType>` representing an iterator for the windows.
+    /// A raw pointer to a `CFType` representing an iterator for the windows, or `NULL` on failure.
     ///
     /// # Original signature
     /// extern `CFTypeRef` SLSWindowQueryResultCopyWindows(CFTypeRef `window_query`);
-    pub fn SLSWindowQueryResultCopyWindows(type_ref: NonNull<CFType>) -> NonNull<CFType>;
+    pub fn SLSWindowQueryResultCopyWindows(type_ref: NonNull<CFType>) -> *mut CFType;
 
     /// Advances the window iterator to the next window.
     ///
@@ -392,6 +395,37 @@ unsafe extern "C" {
         psn: &ProcessSerialNumber,
         psn_cid: &mut ConnID,
     ) -> CGError;
+
+    /// Retrieves the connection ID of the process that owns a window.
+    ///
+    /// # Arguments
+    ///
+    /// * `cid` - The main connection ID.
+    /// * `wid` - The `WinID` of the window.
+    /// * `wid_cid` - A mutable reference to a `ConnID` where the owner's connection ID will be stored.
+    ///
+    /// # Returns
+    ///
+    /// A `CGError` indicating success or failure.
+    ///
+    /// # Original signature
+    /// extern `CGError` SLSGetWindowOwner(int cid, `uint32_t` wid, int *`wid_cid`);
+    pub fn SLSGetWindowOwner(cid: ConnID, wid: WinID, wid_cid: &mut ConnID) -> CGError;
+
+    /// Retrieves the process ID behind a connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `cid` - The `ConnID` of the connection.
+    /// * `pid` - A mutable reference to a `Pid` where the process ID will be stored.
+    ///
+    /// # Returns
+    ///
+    /// A `CGError` indicating success or failure.
+    ///
+    /// # Original signature
+    /// extern `CGError` SLSConnectionGetPID(int cid, `pid_t` *pid);
+    pub fn SLSConnectionGetPID(cid: ConnID, pid: &mut Pid) -> CGError;
 
     /// Sets the frontmost process with additional options and a target window ID.
     /// This function brings the specified process to the front and can optionally focus on a specific window within that process.

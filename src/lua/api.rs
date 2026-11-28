@@ -621,11 +621,14 @@ fn install_script_state(
 ///
 /// Uses exhaustive destructuring of the option structs (without `..`) so adding a
 /// new field to `MainOptions`, `PaddingOptions`, `SwipeOptions`, `GestureOptions`,
-/// `ScrollOptions`, or `RestoreOptions` fails to compile until handled here.
+/// `ScrollOptions`, `RestoreOptions`, or `OverviewOptions` fails to compile until
+/// handled here.
 #[allow(clippy::too_many_lines)]
 fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     use crate::config::{
-        MainOptions, RestoreOptions, format_modifiers,
+        MainOptions, OverviewOptions, RestoreOptions,
+        decorations::{DecorationsOptions, TabIndicatorOptions},
+        format_modifiers,
         padding::PaddingOptions,
         swipe::{GestureOptions, ScrollOptions, SwipeOptions},
     };
@@ -642,6 +645,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         mouse_follows_focus: _,
         horizontal_mouse_warp: _,
         horizontal_mouse_warp_offset: _,
+        horizontal_mouse_warp_lowest_below: _,
         preset_column_widths: _,
         preset_stack_heights: _,
         animation_speed,
@@ -669,6 +673,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         window_hidden_ratio: _,
         window_resize_cycle: _,
         reap_empty_workspaces: _,
+        remember_display_setups: _,
         disable_native_tabs: _,
         virtual_workspace_animations: _,
         insert_windows_mid_strip: _,
@@ -681,6 +686,10 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     options.set(
         "horizontal_mouse_warp_offset",
         config.horizontal_mouse_warp_offset(),
+    )?;
+    options.set(
+        "horizontal_mouse_warp_lowest_below",
+        config.horizontal_mouse_warp_lowest_below(),
     )?;
     options.set("preset_column_widths", config.preset_column_widths())?;
     options.set("preset_stack_heights", config.preset_stack_heights())?;
@@ -696,6 +705,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     options.set("window_hidden_ratio", config.window_hidden_ratio())?;
     options.set("window_resize_cycle", config.window_resize_cycle())?;
     options.set("reap_empty_workspaces", config.reap_empty_workspaces())?;
+    options.set("remember_display_setups", config.remember_display_setups())?;
     options.set("disable_native_tabs", !config.native_tabs_enabled())?;
     options.set(
         "virtual_workspace_animations",
@@ -744,6 +754,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         paging: _,
         page_distance_cm: _,
         haptics: _,
+        overview_fingers: _,
     } = GestureOptions::default();
     let gesture = lua.create_table()?;
     gesture.set("fingers_count", config.swipe_gesture_fingers())?;
@@ -756,6 +767,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     gesture.set("paging", config.swipe_gesture_paging())?;
     gesture.set("page_distance_cm", config.swipe_gesture_page_distance_cm())?;
     gesture.set("haptics", config.swipe_gesture_haptics())?;
+    gesture.set("overview_fingers", config.overview_gesture_fingers())?;
     swipe.set("gesture", gesture)?;
 
     let ScrollOptions {
@@ -774,6 +786,24 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     )?;
     swipe.set("scroll", scroll)?;
     root.set("swipe", swipe)?;
+
+    let DecorationsOptions {
+        active: _,
+        inactive: _,
+        workspace_menu_status: _,
+        menu: _,
+        workspace_popup_status: _,
+        tab_indicator: _,
+    } = DecorationsOptions::default();
+    let TabIndicatorOptions {
+        enabled: _,
+        position: _,
+        width: _,
+        gap: _,
+        segment_gap: _,
+        active_color: _,
+        inactive_color: _,
+    } = TabIndicatorOptions::default();
 
     let decorations = lua.create_table()?;
     decorations.set("workspace_menu_status", config.workspace_menu_status())?;
@@ -797,6 +827,22 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     dim.set("color", "#000000")?;
     inactive.set("dim", dim)?;
     decorations.set("inactive", inactive)?;
+
+    let tab_indicator = lua.create_table()?;
+    tab_indicator.set("enabled", config.tab_indicator_enabled())?;
+    let position_str = match config.tab_indicator_position() {
+        crate::tab_indicator::TabIndicatorPosition::Left => "left",
+        crate::tab_indicator::TabIndicatorPosition::Right => "right",
+        crate::tab_indicator::TabIndicatorPosition::Top => "top",
+        crate::tab_indicator::TabIndicatorPosition::Bottom => "bottom",
+    };
+    tab_indicator.set("position", position_str)?;
+    tab_indicator.set("width", config.tab_indicator_width())?;
+    tab_indicator.set("gap", config.tab_indicator_gap())?;
+    tab_indicator.set("segment_gap", config.tab_indicator_segment_gap())?;
+    tab_indicator.set("active_color", "#5AC8FA")?;
+    tab_indicator.set("inactive_color", "#666666")?;
+    decorations.set("tab_indicator", tab_indicator)?;
     root.set("decorations", decorations)?;
 
     let RestoreOptions {
@@ -812,6 +858,15 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     )?;
     restore.set("missing_windows", "ignore")?;
     root.set("restore", restore)?;
+
+    let OverviewOptions {
+        live_previews: _,
+        live_margin: _,
+    } = OverviewOptions::default();
+    let overview = lua.create_table()?;
+    overview.set("live_previews", config.overview_live_previews())?;
+    overview.set("live_margin", config.overview_live_margin())?;
+    root.set("overview", overview)?;
 
     let windows = lua.create_table()?;
     root.set("windows", windows)?;
@@ -845,7 +900,8 @@ fn merge_lua_tables(dst: &Table, src: &Table) -> mlua::Result<()> {
 mod tests {
     use super::*;
     use crate::config::{
-        MainOptions, RestoreOptions,
+        MainOptions, OverviewOptions, RestoreOptions,
+        decorations::TabIndicatorOptions,
         padding::PaddingOptions,
         swipe::{GestureOptions, ScrollOptions, SwipeOptions},
     };
@@ -880,6 +936,13 @@ mod tests {
         map.keys().cloned().collect()
     }
 
+    fn assert_all_fields_present<T: serde::Serialize + Default>(table: &Table, path: &str) {
+        for field in struct_field_names::<T>() {
+            let val: Value = table.get(field.as_str()).unwrap();
+            assert!(!val.is_nil(), "field '{field}' is missing from {path}!");
+        }
+    }
+
     #[test]
     fn config_to_lua_table_covers_every_struct_field() {
         // Build a config where optional fields without built-in scalar defaults
@@ -899,6 +962,7 @@ mod tests {
             paging = true
             page_distance_cm = 3.0
             haptics = false
+            overview_fingers = 4
 
             [swipe.scroll]
             modifier = "alt"
@@ -924,52 +988,35 @@ mod tests {
         }
 
         let padding_table: Table = root.get("padding").unwrap();
-        for field in struct_field_names::<PaddingOptions>() {
-            let val: Value = padding_table.get(field.as_str()).unwrap();
-            assert!(
-                !val.is_nil(),
-                "PaddingOptions field '{field}' is missing from paneru.config.padding!"
-            );
-        }
+        assert_all_fields_present::<PaddingOptions>(&padding_table, "paneru.config.padding");
 
         let swipe_table: Table = root.get("swipe").unwrap();
-        for field in struct_field_names::<SwipeOptions>() {
-            let val: Value = swipe_table.get(field.as_str()).unwrap();
-            assert!(
-                !val.is_nil(),
-                "SwipeOptions field '{field}' is missing from paneru.config.swipe!"
-            );
-        }
+        assert_all_fields_present::<SwipeOptions>(&swipe_table, "paneru.config.swipe");
 
         let gesture_table: Table = swipe_table.get("gesture").unwrap();
-        for field in struct_field_names::<GestureOptions>() {
-            let val: Value = gesture_table.get(field.as_str()).unwrap();
-            assert!(
-                !val.is_nil(),
-                "GestureOptions field '{field}' is missing from paneru.config.swipe.gesture!"
-            );
-        }
+        assert_all_fields_present::<GestureOptions>(&gesture_table, "paneru.config.swipe.gesture");
         assert!(gesture_table.get::<bool>("paging").unwrap());
         assert_eq!(gesture_table.get::<f64>("page_distance_cm").unwrap(), 3.0);
         assert!(!gesture_table.get::<bool>("haptics").unwrap());
 
         let scroll_table: Table = swipe_table.get("scroll").unwrap();
-        for field in struct_field_names::<ScrollOptions>() {
-            let val: Value = scroll_table.get(field.as_str()).unwrap();
-            assert!(
-                !val.is_nil(),
-                "ScrollOptions field '{field}' is missing from paneru.config.swipe.scroll!"
-            );
-        }
+        assert_all_fields_present::<ScrollOptions>(&scroll_table, "paneru.config.swipe.scroll");
 
         let restore_table: Table = root.get("restore").unwrap();
-        for field in struct_field_names::<RestoreOptions>() {
-            let val: Value = restore_table.get(field.as_str()).unwrap();
-            assert!(
-                !val.is_nil(),
-                "RestoreOptions field '{field}' is missing from paneru.config.restore!"
-            );
-        }
+        assert_all_fields_present::<RestoreOptions>(&restore_table, "paneru.config.restore");
+
+        let overview_table: Table = root.get("overview").unwrap();
+        assert_all_fields_present::<OverviewOptions>(&overview_table, "paneru.config.overview");
+        assert_eq!(overview_table.get::<usize>("live_previews").unwrap(), 4);
+        assert_eq!(overview_table.get::<f64>("live_margin").unwrap(), 0.0);
+
+        let decorations_table: Table = root.get("decorations").unwrap();
+        let tab_indicator_table: Table = decorations_table.get("tab_indicator").unwrap();
+        assert_all_fields_present::<TabIndicatorOptions>(
+            &tab_indicator_table,
+            "paneru.config.decorations.tab_indicator",
+        );
+
         let defaults = config_to_lua_table(&lua, &Config::default()).unwrap();
         let swipe: Table = defaults.get("swipe").unwrap();
         let gesture: Table = swipe.get("gesture").unwrap();

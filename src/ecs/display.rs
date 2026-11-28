@@ -24,16 +24,16 @@ use crate::config::Config;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, EnsureVisibleMarker, FocusedMarker, LayoutPosition,
-    ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties, RepositionMarker,
-    SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
-    VerifyWindowSize,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker,
+    FocusedMarker, LayoutPosition, ManualStripOffset, NativeFullscreenMarker, Position,
+    ReadDisplayProperties, RepositionMarker, ResizeMarker, SelectedVirtualMarker,
+    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged, VerifyWindowSize,
 };
 use crate::events::Event;
 use crate::manager::{Display, Window, WindowManager, irect_from};
 use crate::platform::{PlatformCallbacks, WinID, WorkspaceId};
 use crate::util::{read_screen_property, round_px};
-use bevy::ecs::entity::EntityHashSet;
+use bevy::ecs::entity::{EntityHashMap, EntityHashSet};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::ResMut;
 
@@ -42,6 +42,123 @@ const DISPLAY_SETTLE_DELAY: Duration = Duration::from_millis(350);
 const DISPLAY_VERIFY_DELAY: Duration = Duration::from_secs(1);
 const DISPLAY_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DISPLAY_RETRIES: u8 = 3;
+
+/// Width shares awaiting an orphan's destination. Owned by the strip so its
+/// existing 30-second timeout also bounds this snapshot's lifetime.
+#[derive(Component)]
+pub(crate) struct OrphanedWindowWidths(EntityHashMap<f64>);
+
+fn strip_width_ratios(
+    world: &World,
+    strip: &LayoutStrip,
+    display_entity: Entity,
+) -> EntityHashMap<f64> {
+    let Some(display) = world.get::<Display>(display_entity) else {
+        return EntityHashMap::default();
+    };
+    let width = display
+        .actual_display_bounds(
+            world.get::<DockPosition>(display_entity),
+            world.resource::<Config>(),
+        )
+        .width();
+    if width <= 0 || strip.is_fullscreen() {
+        return EntityHashMap::default();
+    }
+    strip
+        .all_windows()
+        .into_iter()
+        .filter(|entity| world.get::<Unmanaged>(*entity).is_none())
+        .filter_map(|entity| {
+            let size = world
+                .get::<ResizeMarker>(entity)
+                .map(|resize| resize.0)
+                .or_else(|| world.get::<Bounds>(entity).map(|bounds| bounds.0))?;
+            Some((entity, f64::from(size.x) / f64::from(width)))
+        })
+        .collect()
+}
+
+fn remember_strip_widths(world: &mut World, strip_entity: Entity, display_entity: Entity) {
+    // SpaceDestroyed and DisplayRemoved can both orphan a strip in one frame.
+    if world.get::<OrphanedWindowWidths>(strip_entity).is_some() {
+        return;
+    }
+    let Some(strip) = world.get::<LayoutStrip>(strip_entity) else {
+        return;
+    };
+    let ratios = strip_width_ratios(world, strip, display_entity);
+    if !ratios.is_empty() {
+        world
+            .entity_mut(strip_entity)
+            .insert(OrphanedWindowWidths(ratios));
+    }
+}
+
+fn take_migrating_widths(
+    world: &mut World,
+    source: Entity,
+    target: Entity,
+    windows: &EntityHashSet,
+) -> EntityHashMap<f64> {
+    let saved = world.entity_mut(source).take::<OrphanedWindowWidths>();
+    let was_orphan = saved.is_some();
+    let mut ratios = saved.map_or_else(
+        || {
+            let Some(parent) = world.get::<ChildOf>(source).map(ChildOf::parent) else {
+                return EntityHashMap::default();
+            };
+            if parent == target {
+                return EntityHashMap::default();
+            }
+            world
+                .get::<LayoutStrip>(source)
+                .map_or_else(EntityHashMap::default, |strip| {
+                    strip_width_ratios(world, strip, parent)
+                })
+        },
+        |saved| saved.0,
+    );
+    let moved = windows
+        .iter()
+        .filter_map(|entity| ratios.remove(entity).map(|ratio| (*entity, ratio)))
+        .collect();
+    if was_orphan && !ratios.is_empty() {
+        world
+            .entity_mut(source)
+            .insert(OrphanedWindowWidths(ratios));
+    }
+    moved
+}
+
+fn apply_width_ratios(world: &mut World, display_entity: Entity, ratios: EntityHashMap<f64>) {
+    let Some(display) = world.get::<Display>(display_entity) else {
+        return;
+    };
+    let width = display
+        .actual_display_bounds(
+            world.get::<DockPosition>(display_entity),
+            world.resource::<Config>(),
+        )
+        .width();
+    if width <= 0 {
+        return;
+    }
+    for (entity, ratio) in ratios {
+        if world.get::<Unmanaged>(entity).is_some() {
+            continue;
+        }
+        let Some(size) = world.get::<Bounds>(entity).map(|bounds| bounds.0) else {
+            continue;
+        };
+        let size = world
+            .get::<ResizeMarker>(entity)
+            .map_or(size, |resize| resize.0);
+        world
+            .commands()
+            .resize_entity(entity, size.with_x(round_px(ratio * f64::from(width))));
+    }
+}
 
 #[derive(Default, Resource)]
 pub(crate) struct DisplayReconcileState {
@@ -53,6 +170,10 @@ pub(crate) struct DisplayReconcileState {
 impl DisplayReconcileState {
     pub(crate) fn is_settling(&self) -> bool {
         self.pending.is_some() && self.verify_again
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        self.pending.is_none()
     }
 }
 
@@ -74,7 +195,7 @@ impl Plugin for DisplayEventsPlugin {
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn cleanup_active_display_marker(
-    trigger: On<Add, ActiveDisplayMarker>,
+    trigger: On<Add<ActiveDisplayMarker>>,
     displays: Query<(Entity, Has<ActiveDisplayMarker>), With<Display>>,
     mut commands: Commands,
 ) {
@@ -258,6 +379,8 @@ pub(crate) fn reconcile_displays(
         // requiring a second notification from Core Graphics.
         state.verify_again = false;
         state.pending = Some(Timer::new(DISPLAY_VERIFY_DELAY, TimerMode::Once));
+    } else {
+        commands.trigger(crate::ecs::setups::DisplaysSettled);
     }
 }
 
@@ -359,17 +482,30 @@ fn migrate_moved_windows_to_space(
         return;
     }
 
-    let mut source_groups: Vec<(Entity, WorkspaceId, u32, EntityHashSet)> = world
-        .query::<(Entity, &LayoutStrip, Has<NativeFullscreenMarker>)>()
+    let mut source_strips = world.query::<(
+        Entity,
+        &LayoutStrip,
+        Has<NativeFullscreenMarker>,
+        Has<ChildOf>,
+    )>();
+    let mut transit = world.query::<&super::drag::ColumnInTransit>();
+    let in_transit: Vec<_> = transit.iter(world).collect();
+    let drag = world.get_resource::<super::drag::WindowDrag>();
+    let mut source_groups: Vec<(Entity, WorkspaceId, u32, EntityHashSet)> = source_strips
         .iter(world)
-        .filter_map(|(src_entity, src_strip, fullscreen)| {
+        .filter_map(|(src_entity, src_strip, fullscreen, attached)| {
             if fullscreen || src_strip.id() == target_space_id {
                 return None;
             }
             let matching: EntityHashSet = src_strip
                 .all_windows()
                 .into_iter()
-                .filter(|entity| moved_entities.contains(entity))
+                .filter(|&entity| {
+                    moved_entities.contains(&entity)
+                        && (!attached
+                            || !(drag.is_some_and(|drag| drag.carries(entity))
+                                || in_transit.iter().any(|column| column.contains(entity))))
+                })
                 .flat_map(|entity| src_strip.tab_group(entity).unwrap_or_else(|| vec![entity]))
                 .collect();
             (!matching.is_empty()).then_some((
@@ -388,6 +524,7 @@ fn migrate_moved_windows_to_space(
 
     for (src_entity, src_space_id, _, moved_in_src) in source_groups {
         affected_source_spaces.insert(src_space_id);
+        let ratios = take_migrating_widths(world, src_entity, display_entity, &moved_in_src);
         let mut extracted = LayoutStrip::new(target_space_id, 0);
         if let Some(mut src_strip) = world.get_mut::<LayoutStrip>(src_entity) {
             src_strip.extract_windows_into(&moved_in_src, &mut extracted);
@@ -400,6 +537,7 @@ fn migrate_moved_windows_to_space(
                 target_space_id,
                 extracted,
             );
+            apply_width_ratios(world, display_entity, ratios);
         }
     }
 }
@@ -411,6 +549,13 @@ fn place_extracted_strip(
     target_space_id: WorkspaceId,
     mut extracted: LayoutStrip,
 ) {
+    // The strip that receives the focused window becomes the active one.
+    // Otherwise the old row stays shown and the focused window is scrolled into
+    // view on top of it.
+    let holds_focus = extracted
+        .all_windows()
+        .into_iter()
+        .any(|entity| world.get::<FocusedMarker>(entity).is_some());
     let empty_row_0 = world
         .query::<(Entity, &LayoutStrip, Has<NativeFullscreenMarker>)>()
         .iter(world)
@@ -436,6 +581,9 @@ fn place_extracted_strip(
                 .remove::<PreviousStripPosition>()
                 .insert((Position(display_bounds.min), SelectedVirtualMarker));
         }
+        if holds_focus {
+            world.entity_mut(dst_entity).insert(ActiveWorkspaceMarker);
+        }
         return;
     }
 
@@ -448,14 +596,14 @@ fn place_extracted_strip(
         .map_or(0, |max_idx| max_idx + 1);
 
     extracted.virtual_index = next_virtual_index;
-    let focus = extracted.first().ok().and_then(|col| col.top());
-    if next_virtual_index == 0 {
+    let focus = extracted.first();
+    let strip_entity = if next_virtual_index == 0 {
         world.spawn((
             Position(display_bounds.min),
             extracted,
             ChildOf(display_entity),
             SelectedVirtualMarker,
-        ));
+        ))
     } else {
         world.spawn((
             Position(display_bounds.max - PARKED_STRIP_SLIVER),
@@ -465,7 +613,11 @@ fn place_extracted_strip(
             },
             extracted,
             ChildOf(display_entity),
-        ));
+        ))
+    }
+    .id();
+    if holds_focus {
+        world.entity_mut(strip_entity).insert(ActiveWorkspaceMarker);
     }
 }
 
@@ -623,6 +775,12 @@ fn refresh_strip_layout(
     let Some(display_bounds) = world.get::<Display>(display_entity).map(Display::bounds) else {
         return;
     };
+    if let Some(saved) = world
+        .entity_mut(strip_entity)
+        .take::<OrphanedWindowWidths>()
+    {
+        apply_width_ratios(world, display_entity, saved.0);
+    }
     if previous_bounds.is_none() {
         // A rescued orphan has no usable display-relative scroll offset.
         world.entity_mut(strip_entity).remove::<ManualStripOffset>();
@@ -698,6 +856,33 @@ fn add_display(
     );
 }
 
+/// After the orphan timeout, the windows of the strip float.
+pub(crate) fn orphan_strip(
+    strip: &LayoutStrip,
+    entity: Entity,
+    display_entity: Entity,
+    commands: &mut Commands,
+) {
+    // Queue this before detaching ChildOf or despawning the source Display.
+    commands.queue(move |world: &mut World| {
+        remember_strip_widths(world, entity, display_entity);
+    });
+    let timeout = Timeout::new(
+        Duration::from_secs(ORPHANED_SPACES_TIMEOUT_SEC),
+        Some(format!(
+            "Orphaned strip {} ({strip}) could not be re-inserted after {ORPHANED_SPACES_TIMEOUT_SEC}s.",
+            strip.id()
+        )),
+        commands,
+    );
+    if let Ok(mut commands) = commands.get_entity(entity) {
+        commands.try_insert(timeout);
+    }
+    if let Ok(mut commands) = commands.get_entity(display_entity) {
+        commands.detach_child(entity);
+    }
+}
+
 #[instrument(level = Level::DEBUG, skip_all, fields(display_id))]
 fn remove_display(
     display: &Display,
@@ -724,20 +909,7 @@ fn remove_display(
             "orphaning strip {} after removal of display {display_id}.",
             strip.id(),
         );
-        let timeout = Timeout::new(
-            Duration::from_secs(ORPHANED_SPACES_TIMEOUT_SEC),
-            Some(format!(
-                "Orphaned strip {} ({strip}) could not be re-inserted after {ORPHANED_SPACES_TIMEOUT_SEC}s.",
-                strip.id()
-            )),
-            commands,
-        );
-        if let Ok(mut commands) = commands.get_entity(entity) {
-            commands.try_insert(timeout);
-        }
-        if let Ok(mut commands) = commands.get_entity(display_entity) {
-            commands.detach_child(entity);
-        }
+        orphan_strip(strip, entity, display_entity, commands);
     }
 
     if let Ok(mut commands) = commands.get_entity(display_entity) {
@@ -788,6 +960,11 @@ fn reparent_existing_workspaces(
             if strip.id() == id {
                 found = true;
                 if child.is_none_or(|child| child.parent() != display_entity) {
+                    if let Some(source) = child.map(ChildOf::parent) {
+                        commands.queue(move |world: &mut World| {
+                            remember_strip_widths(world, entity, source);
+                        });
+                    }
                     // Re-parent this workspace
                     if let Ok(mut cmd) = commands.get_entity(entity) {
                         debug!("reparenting workspace {id} to display {display_entity}");
@@ -820,7 +997,7 @@ impl FloatingLayer {
     pub fn new(workspace_id: WorkspaceId) -> Self {
         Self {
             workspace_id,
-            front: false,
+            front: true,
         }
     }
 

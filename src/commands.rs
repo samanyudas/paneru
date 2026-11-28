@@ -3,10 +3,12 @@ use std::time::Duration;
 use bevy::app::{PostUpdate, PreUpdate};
 use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::Add;
 use bevy::ecs::message::{MessageReader, MessageWriter};
-use bevy::ecs::query::{Has, With, Without};
-use bevy::ecs::schedule::IntoScheduleConfigs as _;
+use bevy::ecs::observer::On;
+use bevy::ecs::query::{Has, Or, With, Without};
 use bevy::ecs::schedule::common_conditions::{on_message, resource_changed};
+use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition};
 use bevy::ecs::system::{Commands, Query, Res, ResMut, Single, SystemParam};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
@@ -24,18 +26,19 @@ use crate::ecs::layout::{
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::scroll::{PageFocusRequest, PageGestureState, PageInFlight};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, AwaitResize, Bounds, DockPosition, FocusedMarker,
     FullWidthMarker, ManualStripOffset, NativeFullscreenMarker, Position, RaiseWindow,
-    RepositionMarker, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout,
-    Unmanaged,
+    RepositionMarker, ResizeAnchor, ResizeMarker, Scrolling, SelectedVirtualMarker,
+    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
 };
-use crate::events::Event;
+use crate::events::{Event, InputEvent};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::platform::WorkspaceId;
 use crate::util::round_px;
 
 pub use crate::types::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
+    Command, DesktopAssignTarget, DesktopOperation, DesktopPinTarget, DesktopTarget, Direction,
+    MouseMove, MoveFocus, Operation, ResizeDirection,
 };
 
 /// The strips that are selected on their display but not the one on screen —
@@ -70,6 +73,8 @@ struct PagingFocusParams<'w, 's> {
     strip_positions:
         Query<'w, 's, (&'static Position, Option<&'static RepositionMarker>), With<LayoutStrip>>,
     haptics: MessageWriter<'w, PageHapticRequest>,
+    focus_history: Option<Res<'w, FocusHistory>>,
+    overview_phase: Option<Res<'w, crate::ecs::overview::OverviewPhase>>,
 }
 
 pub fn register_commands(app: &mut bevy::app::App) {
@@ -86,9 +91,9 @@ pub fn register_commands(app: &mut bevy::app::App) {
                 .in_set(crate::ecs::PostUpdateSet::Bookkeeping)
                 .run_if(resource_changed::<crate::menubar::MenuBarVisibility>),
         );
-    // Registered here (not with the Lua systems) so it's exercised by the mock
-    // harness without a running interpreter.
-    #[cfg(feature = "lua")]
+    // Registered here (not with the Lua systems) and in every build: an IPC
+    // client's `Request::WindowSetApply` needs no embedded interpreter, and the
+    // mock harness exercises it without one.
     app.add_systems(
         PreUpdate,
         crate::ecs::layout_ops::apply_layout_ops.in_set(crate::ecs::PreUpdateSet::Dispatch),
@@ -136,9 +141,95 @@ pub fn register_commands(app: &mut bevy::app::App) {
     app.init_resource::<SnippetDialect>();
     app.add_systems(
         PreUpdate,
-        (copy_window_rule, toggle_tabbed_display_handler)
+        (
+            copy_window_rule,
+            toggle_tabbed_display_handler,
+            consume_windows_handler,
+            expel_windows_handler,
+        )
             .in_set(crate::ecs::PreUpdateSet::Dispatch),
     );
+    app.add_systems(
+        PreUpdate,
+        cancel_resize_intent
+            .after(crate::ecs::PreUpdateSet::Dispatch)
+            .run_if(on_message::<Event>.or_eager(on_message::<InputEvent>)),
+    );
+    app.add_observer(cancel_resize_intent_on_focus);
+}
+
+type ResizeIntents<'w, 's> = Query<'w, 's, Entity, Or<(With<ResizeAnchor>, With<AwaitResize>)>>;
+
+fn cancel_resize_intent(
+    mut messages: MessageReader<Event>,
+    mut inputs: MessageReader<InputEvent>,
+    intents: ResizeIntents,
+    focused: Query<&Window, With<FocusedMarker>>,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    if intents.is_empty() {
+        messages.clear();
+        inputs.clear();
+        return;
+    }
+    let focused_id = focused.single().ok().map(|window| window.id());
+    let mut interrupted = false;
+    for event in messages.read() {
+        if let Event::Command { command } = event {
+            interrupted |= match command {
+                Command::Window(
+                    Operation::Resize(_)
+                    | Operation::SetWidth(_)
+                    | Operation::ResizeVertical(_)
+                    | Operation::FullWidth,
+                )
+                | Command::PrintState
+                | Command::Lua(_) => false,
+                Command::Layout(ops) => ops.iter().any(|op| {
+                    !matches!(
+                        op,
+                        crate::types::windowset::LayoutOp::SetWidth { window, .. }
+                            if Some(*window) == focused_id
+                    )
+                }),
+                _ => true,
+            };
+        }
+    }
+    let mouse_resize = config.mouse_resize_modifier();
+    for InputEvent(event) in inputs.read() {
+        interrupted |= match &event {
+            Event::Swipe { .. }
+            | Event::Scroll { .. }
+            | Event::VerticalSwipe { .. }
+            | Event::VerticalScrollTick { .. }
+            | Event::MouseDragged { .. } => true,
+            Event::MouseMoved { modifiers, .. } => {
+                mouse_resize.is_some_and(|modifier| modifier.matches(*modifiers))
+            }
+            _ => false,
+        };
+    }
+    if interrupted {
+        for entity in intents {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<(ResizeAnchor, AwaitResize)>();
+            }
+        }
+    }
+}
+
+fn cancel_resize_intent_on_focus(
+    _trigger: On<Add<FocusedMarker>>,
+    intents: ResizeIntents,
+    mut commands: Commands,
+) {
+    for entity in intents {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<(ResizeAnchor, AwaitResize)>();
+        }
+    }
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -148,7 +239,7 @@ pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
     messages.read().filter_map(move |event| {
         if let Event::Command {
             command: Command::Window(op),
-        } = event
+        } = &event
             && filter(op)
         {
             Some(op)
@@ -181,11 +272,9 @@ pub(crate) fn get_window_in_direction(
         Direction::West => strip.left_neighbour(entity),
         Direction::East => strip.right_neighbour(entity),
 
-        Direction::First => strip.first().ok().and_then(|column| column.top()),
-
-        Direction::Last => strip.last().ok().and_then(|column| column.top()),
-
-        Direction::Nth(index) => strip.get(*index).ok().and_then(|column| column.top()),
+        Direction::First => strip.first(),
+        Direction::Last => strip.last(),
+        Direction::Nth(index) => strip.column_at(*index),
 
         Direction::North => match strip.get(index).ok()? {
             Column::Single(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
@@ -238,7 +327,8 @@ fn pick_nearest_in_direction(
         .map(|(entity, _)| entity)
 }
 
-fn visible_floating_entities(
+/// Floating windows of `workspace_id` that are on `display_bounds`.
+pub(crate) fn visible_floating_entities(
     windows: &Windows,
     window_manager: &WindowManager,
     workspace_id: WorkspaceId,
@@ -296,7 +386,7 @@ fn nearest_float_in_direction(
 /// # Returns
 ///
 /// `Some(Entity)` with the entity of the newly focused window, otherwise `None`.
-fn focus_with_verification(
+pub(crate) fn focus_with_verification(
     entity: Entity,
     focused_entity: Option<Entity>,
     paging: Option<&mut PageGestureState>,
@@ -309,7 +399,7 @@ fn focus_with_verification(
             paging.await_focus(entity);
         }
         entity_commands.try_insert((
-            crate::ecs::VerifyFocus,
+            crate::ecs::VerifyFocus::default(),
             Timeout::for_component::<crate::ecs::VerifyFocus>(
                 crate::ecs::focus::VERIFY_FOCUS_TIMEOUT,
             ),
@@ -327,14 +417,9 @@ fn active_focus_candidate(
     // Enter the active strip from the appropriate side when focus is outside it.
     if !active_strip.contains(focused_entity) {
         return match direction {
-            Direction::East | Direction::First => {
-                active_strip.first().ok().and_then(|col| col.top())
-            }
-            Direction::West | Direction::Last => active_strip.last().ok().and_then(|col| col.top()),
-            Direction::Nth(index) => active_strip
-                .get(*index)
-                .ok()
-                .and_then(|column| column.top()),
+            Direction::East | Direction::First => active_strip.first(),
+            Direction::West | Direction::Last => active_strip.last(),
+            Direction::Nth(index) => active_strip.column_at(*index),
             Direction::North | Direction::South => None,
         };
     }
@@ -349,10 +434,51 @@ fn active_focus_candidate(
                 .find(|(strip, _, fullscreen)| {
                     fullscreen.is_some() && strip.id() != active_strip.id()
                 })
-                .and_then(|(strip, _, _)| strip.get(0).ok().and_then(|col| col.top()))
+                .and_then(|(strip, _, _)| strip.first())
         })
         .flatten()
     })
+}
+
+/// Next window to focus when `focused_entity` is `Unmanaged::Floating`, paired
+/// with whether to reshuffle the active strip: prefers a floating neighbour in
+/// `direction`, and while the overview is open falls back onto the active
+/// tiled strip so navigation never gets stuck on a lone floating card.
+fn floating_focus_target(
+    direction: &Direction,
+    focused_entity: Entity,
+    windows: &Windows,
+    window_manager: &WindowManager,
+    active_display: &ActiveDisplay,
+    workspaces: &Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
+    paging: &PagingFocusParams,
+) -> Option<(Entity, bool)> {
+    let active_strip = active_display.active_strip();
+    if let Some(entity) = nearest_float_in_direction(
+        direction,
+        focused_entity,
+        windows,
+        window_manager,
+        active_strip.id(),
+        active_display.bounds(),
+    ) {
+        return Some((entity, false));
+    }
+    if !paging
+        .overview_phase
+        .as_ref()
+        .is_some_and(|phase| phase.is_active())
+    {
+        return None;
+    }
+    paging
+        .focus_history
+        .as_ref()
+        .and_then(|history| history.last_managed(active_strip.id()))
+        .filter(|entity| active_strip.contains(*entity))
+        .or_else(|| active_focus_candidate(direction, focused_entity, active_strip, workspaces))
+        .or_else(|| active_strip.all_columns().into_iter().next())
+        .map(|entity| (entity, true))
 }
 
 fn command_move_focus(
@@ -411,13 +537,14 @@ fn command_move_focus(
     if let Some((_, _, Some(Unmanaged::Floating))) = windows.get_managed(focused_entity)
         && !matches!(direction, Direction::Nth(_))
     {
-        if let Some(entity) = nearest_float_in_direction(
+        if let Some((entity, reshuffle)) = floating_focus_target(
             direction,
             focused_entity,
             &windows,
             &window_manager,
-            active_strip.id(),
-            active_display.bounds(),
+            &active_display,
+            &workspaces,
+            &paging,
         ) {
             focus_with_verification(
                 entity,
@@ -425,6 +552,9 @@ fn command_move_focus(
                 is_page.then_some(&mut *paging.page_state),
                 &mut commands,
             );
+            if reshuffle {
+                commands.reshuffle_around(entity);
+            }
         }
         return;
     }
@@ -458,21 +588,33 @@ fn command_move_focus(
         return;
     }
 
-    // Check if the movement can switch to another display.
-    let Some(other_display) = active_display.other().next() else {
+    let Some(target) =
+        display_in_direction(active_display.bounds(), active_display.other(), direction)
+    else {
         return;
     };
-    let change_display = match direction {
-        Direction::North => active_display.bounds().min.y > other_display.bounds().min.y,
-        Direction::South => active_display.bounds().min.y < other_display.bounds().min.y,
-        _ => false,
-    };
-    debug!("moving focus to another display: {change_display}");
-    if change_display {
-        commands.trigger(SendMessageTrigger(Event::Command {
-            command: Command::Mouse(MouseMove::ToNextDisplay),
-        }));
+    debug!("moving focus to display {target}");
+    commands.trigger(SendMessageTrigger(Event::Command {
+        command: Command::Mouse(MouseMove::ToDisplay(target)),
+    }));
+}
+
+fn display_in_direction<'a>(
+    bounds: IRect,
+    others: impl Iterator<Item = &'a Display>,
+    direction: &Direction,
+) -> Option<u32> {
+    if !matches!(direction, Direction::North | Direction::South) {
+        return None;
     }
+    others
+        .filter(|display| match direction {
+            Direction::North => display.bounds().min.y < bounds.min.y,
+            Direction::South => display.bounds().min.y > bounds.min.y,
+            _ => false,
+        })
+        .min_by_key(|display| (display.bounds().min.y - bounds.min.y).abs())
+        .map(Display::id)
 }
 
 fn focus_from_fullscreen(
@@ -492,7 +634,7 @@ fn focus_from_fullscreen(
             .find_map(|(strip, _, _)| (strip.id() == fullscreen.workspace_id).then_some(strip));
     }
 
-    if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
+    if let Some(entity) = strip.and_then(LayoutStrip::last) {
         debug!("fullscreen: swap raising {entity}");
         focus_with_verification(
             entity,
@@ -638,9 +780,11 @@ fn command_toggle_floating_layer(
             }
         })
         .unwrap_or_else(|| {
-            let layer = FloatingLayer::new(workspace_id);
+            // Started in front, so this first toggle puts it behind.
+            let mut layer = FloatingLayer::new(workspace_id);
+            layer.flip();
             commands.spawn((layer, ChildOf(active_display.entity())));
-            false
+            layer.front
         });
 
     let visible_floats =
@@ -711,6 +855,13 @@ fn command_swap_focus(
     let mut handler = || {
         let (_, current) = windows.focused()?;
         let index = active_strip.index_of(current).ok()?;
+        // Reordering tabs North/South is invisible (only the active tab is
+        // shown), so fall through to the cross-display fallback instead.
+        if matches!(direction, Direction::North | Direction::South)
+            && active_strip.is_tabbed_display(current)
+        {
+            return None;
+        }
         let other_window = get_window_in_direction(direction, current, active_strip)?;
         let new_index = active_strip.index_of(other_window).ok()?;
         debug!(
@@ -756,22 +907,14 @@ fn command_swap_focus(
     // neighbour left in that direction - which sent every successful vertical
     // swap straight on to the other display.
     if swapped.is_none() {
-        // Check if the movement can swap to another display.
         let bounds = active_display.bounds();
-        let Some(other_display) = active_display.other().next() else {
+        let Some(target) = display_in_direction(bounds, active_display.other(), direction) else {
             return;
         };
-        let change_display = match direction {
-            Direction::North => bounds.min.y > other_display.bounds().min.y,
-            Direction::South => bounds.min.y < other_display.bounds().min.y,
-            _ => false,
-        };
-        debug!("swapping window to another display: {change_display}");
-        if change_display {
-            commands.trigger(SendMessageTrigger(Event::Command {
-                command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
-            }));
-        }
+        debug!("swapping window to display {target}");
+        commands.trigger(SendMessageTrigger(Event::Command {
+            command: Command::Window(Operation::ToDisplay(target, MoveFocus::Follow)),
+        }));
     }
 }
 
@@ -798,6 +941,7 @@ fn command_center_window(
     windows: Windows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::Center))
@@ -834,7 +978,12 @@ fn command_center_window(
             commands.reposition_entity(entity, origin);
         }
 
-        window_manager.warp_mouse(active_display.bounds().center());
+        // Centering moves the window, not the pointer, unless the pointer is
+        // asked to follow focus. Warping regardless also re-associates the
+        // pointer, which undoes a hold another app has on it mid-gesture.
+        if config.mouse_follows_focus() {
+            window_manager.warp_mouse(active_display.bounds().center());
+        }
     }
 }
 
@@ -874,7 +1023,10 @@ fn resize_window(
     }
 
     let viewport = active_display.actual_bounds(&config);
-    let current_ratio = f64::from(frame.width()) / f64::from(viewport.width());
+    // Pending resizes count: a press during the animation must advance from the
+    // width already requested, not a mid-animation width.
+    let pending_width = windows.moving_frame(entity).unwrap_or(frame).width();
+    let current_ratio = f64::from(pending_width) / f64::from(viewport.width());
     let widths = config.preset_column_widths();
     let fallback = *widths.first().unwrap_or(&0.5);
     let cycle = config.window_resize_cycle();
@@ -957,6 +1109,9 @@ fn resize_window_vertical(
     };
 
     let strip = active_display.active_strip();
+    if strip.is_tabbed_display(entity) {
+        return;
+    }
     let Some(Column::Stack(items)) = strip
         .index_of(entity)
         .ok()
@@ -1081,7 +1236,11 @@ fn full_width_window(
         {
             _ = strip.unstack(entity);
         }
-        let width_ratio = windows.width_ratio(entity).unwrap_or(0.5);
+        // FullWidthMarker restores against the usable viewport, whereas
+        // WidthRatio is maintained against the display's raw bounds.
+        let width_ratio = windows.moving_frame(entity).map_or(0.5, |frame| {
+            f64::from(frame.width()) / f64::from(viewport.width())
+        });
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(FullWidthMarker { width_ratio });
         }
@@ -1101,6 +1260,7 @@ fn full_width_window(
 fn manage_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
+    apps: Query<&Application>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     mut commands: Commands,
 ) {
@@ -1117,6 +1277,22 @@ fn manage_window(
     else {
         return;
     };
+    // The focus mark stays on the last managed window while macOS focuses a
+    // window the engine does not manage. Only skip when macOS reports another
+    // window, so an app too busy to answer can still float its window.
+    let focused_elsewhere = windows
+        .find_parent(window.id())
+        .and_then(|(_, _, parent)| apps.get(parent).ok())
+        .is_some_and(|app| {
+            !app.is_frontmost() || app.focused_window_id().is_ok_and(|id| id != window.id())
+        });
+    if focused_elsewhere {
+        debug!(
+            "not toggling window {}: macOS has focused another window",
+            window.id()
+        );
+        return;
+    }
     debug!(
         "window: {} {entity} unmanaged: {}.",
         window.id(),
@@ -1216,12 +1392,14 @@ fn to_next_display(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let Some(Operation::ToNextDisplay(move_focus)) =
-        filter_window_operations(&mut messages, |op| {
-            matches!(op, Operation::ToNextDisplay(_))
-        })
-        .next()
-    else {
+    let Some((target, move_focus)) = filter_window_operations(&mut messages, |op| {
+        matches!(op, Operation::ToNextDisplay(_) | Operation::ToDisplay(..))
+    })
+    .find_map(|op| match op {
+        Operation::ToNextDisplay(move_focus) => Some((None, *move_focus)),
+        Operation::ToDisplay(id, move_focus) => Some((Some(*id), *move_focus)),
+        _ => None,
+    }) else {
         return;
     };
 
@@ -1242,8 +1420,12 @@ fn to_next_display(
     // for on both the source and target displays.
     let source_viewport_width = active_display.actual_bounds(&config).width();
 
-    let Some(other) = active_display.other().next() else {
-        debug!("no other display to move window to.");
+    let other = match target {
+        Some(id) => active_display.other().find(|display| display.id() == id),
+        None => active_display.other().next(),
+    };
+    let Some(other) = other else {
+        debug!("no other display to move window to: {target:?}.");
         return;
     };
 
@@ -1262,26 +1444,34 @@ fn to_next_display(
     let width_ratio =
         (source_viewport_width > 0).then(|| f64::from(size.x) / f64::from(source_viewport_width));
     let dest = other.bounds().min.with_x(center - size.x / 2);
-    commands.reposition_entity(entity, dest);
 
-    if matches!(move_focus, MoveFocus::Follow) {
+    if matches!(move_focus, MoveFocus::Follow) && config.mouse_follows_focus() {
         window_manager.warp_mouse(other.bounds().center());
     }
 
-    // Remove the window from the source strip.
-    let source_neighbour = active_display
-        .active_strip()
-        .left_neighbour(entity)
-        .or_else(|| active_display.active_strip().right_neighbour(entity));
-    active_display.active_strip().remove(entity);
-    if let Some(neighbour) = source_neighbour {
-        commands.reshuffle_around(neighbour);
+    // Move a tabbed or native-tab group as one unit. Computed before removal,
+    // since the group can't be determined once its members are gone.
+    let group = active_display.strip().relocation_group(entity);
+    let moving_entities = group
+        .as_ref()
+        .map_or_else(|| vec![entity], |group| group.members().to_vec());
+    for &moving_entity in &moving_entities {
+        commands.reposition_entity(moving_entity, dest);
     }
 
-    if matches!(move_focus, MoveFocus::Stay)
-        && let Some(neighbour) = source_neighbour
-    {
-        commands.focus_entity(neighbour, false);
+    // Remove the group from the source strip.
+    let source_neighbour = active_display
+        .strip()
+        .left_neighbour(entity)
+        .or_else(|| active_display.strip().right_neighbour(entity));
+    for &moving_entity in &moving_entities {
+        active_display.active_strip().remove(moving_entity);
+    }
+    if let Some(neighbour) = source_neighbour {
+        commands.reshuffle_around(neighbour);
+        if matches!(move_focus, MoveFocus::Stay) {
+            commands.focus_entity(neighbour, false);
+        }
     }
 
     // Insert into the target display's selected strip.
@@ -1290,7 +1480,7 @@ fn to_next_display(
             .iter_mut()
             .find(|(strip, _)| strip.id() == target_space_id)
     {
-        target_strip.append(entity);
+        target_strip.append_relocation_group(entity, group.as_ref());
         commands.reshuffle_around(entity);
 
         // Add a delayed refresh of the window size - because the other display can have different bounds.
@@ -1306,14 +1496,15 @@ fn to_next_display(
             let viewport_bounds = display.actual_display_bounds(dock, &config);
             if let Ok(Bounds(bounds)) = windows.get(moved_window) {
                 debug!("Refreshing size of window {entity}");
-                // Preserve the window's width ratio relative to the target
-                // display's usable viewport (dock- and padding-adjusted), so a
-                // fixed dock is accounted for consistently with the source.
-                let width = width_ratio.map_or(bounds.x, |ratio| {
-                    round_px(ratio * f64::from(viewport_bounds.width()))
-                });
+                let width = width_ratio
+                    .map_or(bounds.x, |ratio| {
+                        round_px(ratio * f64::from(viewport_bounds.width()))
+                    })
+                    .min(viewport_bounds.width());
                 let size = Size::new(width, viewport_bounds.height());
-                commands.resize_entity(moved_window, size);
+                for &member in &moving_entities {
+                    commands.resize_entity(member, size);
+                }
                 commands.reshuffle_around(moved_window);
             }
         };
@@ -1322,7 +1513,7 @@ fn to_next_display(
     }
 }
 
-/// Moves the mouse pointer to the next available display.
+/// Moves the mouse pointer to the next available display, or to a named one.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn mouse_to_next_display(
     mut messages: MessageReader<Event>,
@@ -1332,25 +1523,30 @@ fn mouse_to_next_display(
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
-    if !messages.read().any(|event| {
-        matches!(
-            event,
-            Event::Command {
-                command: Command::Mouse(MouseMove::ToNextDisplay),
-            }
-        )
-    }) {
-        return;
-    }
-
-    let Some(cursor_position) = window_manager.cursor_position().map(origin_from) else {
+    let Some(target) = messages.read().find_map(|event| match &event {
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToNextDisplay),
+        } => Some(None),
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToDisplay(id)),
+        } => Some(Some(*id)),
+        _ => None,
+    }) else {
         return;
     };
-    let Some(other) = displays
-        .into_iter()
-        .find(|display| !display.bounds().contains(cursor_position))
-    else {
-        debug!("no other display to move mouse to.");
+
+    let other = if let Some(id) = target {
+        displays.into_iter().find(|display| display.id() == id)
+    } else {
+        let Some(cursor_position) = window_manager.cursor_position().map(origin_from) else {
+            return;
+        };
+        displays
+            .into_iter()
+            .find(|display| !display.bounds().contains(cursor_position))
+    };
+    let Some(other) = other else {
+        debug!("no other display to move mouse to: {target:?}.");
         return;
     };
     let Some((other_strip, _)) = window_manager
@@ -1370,8 +1566,9 @@ fn mouse_to_next_display(
     let visible_width = |frame: IRect| other.bounds().intersect(frame).width();
     let Some((frame, entity)) = other_strip
         .all_windows()
-        .iter()
-        .filter_map(|entity| windows.frame(*entity).zip(Some(*entity)))
+        .into_iter()
+        .filter(|&entity| !other_strip.is_parked_tab(entity))
+        .filter_map(|entity| windows.frame(entity).zip(Some(entity)))
         .max_by(|left, right| {
             if visible_width(left.0) < visible_width(right.0) {
                 std::cmp::Ordering::Less
@@ -1410,6 +1607,9 @@ fn equalize_column(
 
     let (_, entity) = *current_focus;
     let active_strip = active_display.active_strip();
+    if active_strip.is_tabbed_display(entity) {
+        return;
+    }
     let Ok(column) = active_strip
         .index_of(entity)
         .and_then(|index| active_strip.get(index))
@@ -1609,11 +1809,20 @@ pub fn stack_windows_handler(
         {
             entity_commands.try_remove::<FullWidthMarker>();
         }
+        let strip_entity = active_display.active_strip_entity();
         let strip = active_display.active_strip();
-        if *stack {
-            _ = strip.stack(entity);
+        let changed = if *stack {
+            strip.stack(entity)
         } else {
-            _ = strip.unstack(entity);
+            strip.unstack(entity)
+        };
+        if changed.is_err() {
+            return;
+        }
+
+        // A layout command replaces the touchpad's placement target.
+        if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+            entity_commands.try_remove::<Scrolling>();
         }
 
         // Stacking/unstacking moves the focused window to a new column slot
@@ -1622,6 +1831,116 @@ pub fn stack_windows_handler(
         // edge-clamp in reshuffle_layout_strip keeps the strip pinned so the
         // leftmost window touches the left edge and the rightmost the right.
         commands.reshuffle_around(entity);
+    }
+}
+
+/// Pulls the column to the right of the focused window's column into it —
+/// the mirror of `window_stack` in the opposite direction. The focused
+/// window's own column survives at its position and never moves, so
+/// (unlike `window_stack`/`window_unstack`) focus doesn't need to be
+/// touched here at all.
+#[instrument(level = Level::DEBUG, skip_all)]
+pub fn consume_windows_handler(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    mut active_display: ActiveDisplayMut,
+    mut commands: Commands,
+) {
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::Consume))
+        .next()
+        .is_none()
+    {
+        return;
+    }
+
+    if let Some((_, entity, unmanaged)) = windows
+        .focused()
+        .and_then(|(_, entity)| windows.get_managed(entity))
+        && unmanaged.is_none()
+    {
+        let strip = active_display.strip();
+        let Ok(index) = strip.index_of(entity) else {
+            return;
+        };
+        let Ok(own_col) = strip.get(index) else {
+            return;
+        };
+        let Ok(neighbor_col) = strip.get(index + 1) else {
+            return;
+        };
+        if matches!(own_col, Column::Fullscren(_)) || matches!(neighbor_col, Column::Fullscren(_)) {
+            return;
+        }
+        let consumed_entities: Vec<Entity> = neighbor_col.window_iter().collect();
+
+        for target in std::iter::once(entity).chain(consumed_entities) {
+            if windows.full_width(target).is_some()
+                && let Ok(mut entity_commands) = commands.get_entity(target)
+            {
+                entity_commands.try_remove::<FullWidthMarker>();
+            }
+        }
+        let strip_entity = active_display.active_strip_entity();
+        if active_display.active_strip().consume(entity).is_err() {
+            return;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+            entity_commands.try_remove::<Scrolling>();
+        }
+        commands.reshuffle_around(entity);
+    }
+}
+
+/// Pulls the focused window out of its stack into its own column to the
+/// right — mechanically identical to `window_unstack` — but leaves focus
+/// on a sibling remaining in the stack instead of following the ejected
+/// window out.
+#[instrument(level = Level::DEBUG, skip_all)]
+pub fn expel_windows_handler(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    mut active_display: ActiveDisplayMut,
+    mut commands: Commands,
+) {
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::Expel))
+        .next()
+        .is_none()
+    {
+        return;
+    }
+
+    if let Some((_, entity, unmanaged)) = windows
+        .focused()
+        .and_then(|(_, entity)| windows.get_managed(entity))
+        && unmanaged.is_none()
+    {
+        // Compute the sibling to keep focus on *before* unstacking — the
+        // structural position `entity` occupies now is exactly what's
+        // needed to find it, and it's gone once `unstack` removes `entity`
+        // from the stack. Prefer the next item, falling back to the
+        // previous one when `entity` is last — same order
+        // `tab_display_sibling` uses for the analogous tabbed-display case.
+        let strip = active_display.strip();
+        let Some(sibling) = get_window_in_direction(&Direction::South, entity, strip)
+            .or_else(|| get_window_in_direction(&Direction::North, entity, strip))
+        else {
+            return;
+        };
+
+        if windows.full_width(entity).is_some()
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<FullWidthMarker>();
+        }
+        let strip_entity = active_display.active_strip_entity();
+        if active_display.active_strip().unstack(entity).is_err() {
+            return;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+            entity_commands.try_remove::<Scrolling>();
+        }
+        focus_with_verification(sibling, Some(entity), None, &mut commands);
+        commands.reshuffle_around(sibling);
     }
 }
 
@@ -1650,12 +1969,24 @@ pub fn toggle_tabbed_display_handler(
         .and_then(|(_, entity)| windows.get_managed(entity))
         && unmanaged.is_none()
     {
-        let strip = active_display.active_strip();
-        // `None` means the toggle wasn't applicable (not in a multi-window
-        // Stack) — stay silent rather than reporting it the same way as a
-        // real "turned tabs off", which previously made repeated presses on
-        // a non-stacked window look like a stuck toggle.
-        if let Some(now_tabbed) = strip.toggle_tabbed_display(entity) {
+        // Check via `&LayoutStrip` first so a no-op press on a non-stacked
+        // window doesn't mark `LayoutStrip` changed or flash a message.
+        let strip = active_display.strip();
+        let Some(Column::Stack(items)) = strip
+            .index_of(entity)
+            .ok()
+            .and_then(|idx| strip.get(idx).ok())
+            .filter(|col| matches!(col, Column::Stack(items) if items.len() >= 2))
+        else {
+            return;
+        };
+        for member in items.iter().flat_map(StackItem::window_iter) {
+            if let Ok(mut entity_commands) = commands.get_entity(member) {
+                entity_commands
+                    .try_remove::<(RepositionMarker, ResizeMarker, ResizeAnchor, AwaitResize)>();
+            }
+        }
+        if let Some(now_tabbed) = active_display.active_strip().toggle_tabbed_display(entity) {
             commands.reshuffle_around(entity);
             commands.flash_message(
                 if now_tabbed { "Tabs on" } else { "Tabs off" }.to_string(),

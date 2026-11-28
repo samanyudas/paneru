@@ -11,7 +11,7 @@ use crate::events::{DestroySource, Event};
 use crate::manager::app::MockApplicationApi;
 use crate::manager::{
     Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
-    Window, origin_from, origin_to,
+    Window, WindowPadding, origin_from, origin_to,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 
@@ -44,7 +44,20 @@ pub(crate) struct MockWindowData {
     pub(crate) border_radius: Option<f64>,
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
+    /// The last horizontal and vertical padding the engine set, which the
+    /// mock does not apply to its frames.
+    pub(crate) padding_set: (Option<i32>, Option<i32>),
     pub(crate) child_role: bool,
+    /// The narrowest width the app accepts, like an `NSWindow.minSize`.
+    pub(crate) min_width: i32,
+    /// The widest width the app accepts, or no limit when zero.
+    pub(crate) max_width: i32,
+    /// When true, `resize()` clamps the window's bottom edge to the active
+    /// display's bottom edge and rejects height growth while parked off-screen,
+    /// modelling macOS WindowServer/AppKit frame constraints.
+    pub(crate) clamp_height_to_display: bool,
+    pub(crate) extra_workspaces: HashSet<WorkspaceId>,
+    pub(crate) sticky: bool,
 }
 
 impl Default for MockWindowData {
@@ -64,39 +77,60 @@ impl Default for MockWindowData {
             border_radius: None,
             horizontal_padding: 0,
             vertical_padding: 0,
+            padding_set: (None, None),
             child_role: false,
+            min_width: 0,
+            max_width: 0,
+            clamp_height_to_display: false,
+            extra_workspaces: HashSet::new(),
+            sticky: false,
         }
     }
 }
 
 /// Data for a mocked display.
-struct MockDisplayData {
-    id: u32,
-    bounds: IRect,
-    workspaces: Vec<WorkspaceId>,
+pub(super) struct MockDisplayData {
+    pub(super) id: u32,
+    pub(super) bounds: IRect,
+    pub(super) workspaces: Vec<WorkspaceId>,
+    pub(super) current_workspace: WorkspaceId,
 }
 
+pub(super) type DeferredDesktopMockOp = Box<dyn FnOnce(&MockState) + Send + Sync>;
+
 /// The internal state of our "Virtual macOS".
-struct MockStateInner {
-    apps: HashMap<Pid, MockAppData>,
-    windows: HashMap<WinID, MockWindowData>,
-    displays: HashMap<u32, MockDisplayData>,
-    fullscreen_spaces: HashSet<WorkspaceId>,
-    active_display_id: u32,
-    cursor_position: Origin,
-    event_queue: VecDeque<Event>,
+pub(super) struct MockStateInner {
+    pub(super) apps: HashMap<Pid, MockAppData>,
+    pub(super) windows: HashMap<WinID, MockWindowData>,
+    pub(super) displays: HashMap<u32, MockDisplayData>,
+    pub(super) fullscreen_spaces: HashSet<WorkspaceId>,
+    pub(super) fullscreen_owners: HashMap<WorkspaceId, WinID>,
+    pub(super) associated_windows: HashMap<WinID, Vec<WinID>>,
+    pub(super) active_display_id: u32,
+    pub(super) cursor_position: Origin,
+    pub(super) event_queue: VecDeque<Event>,
     /// Windows that are gone but which the app's AX window list still reports,
     /// modelling the lag real apps show right after a window closes.
-    stale_window_ids: HashMap<WinID, Pid>,
-    unordered_windows: HashSet<WinID>,
+    pub(super) stale_window_ids: HashMap<WinID, Pid>,
+    pub(super) unordered_windows: HashSet<WinID>,
     /// Windows the app keeps out of its accessibility window list while the
     /// window server still reports them on screen: a background native tab.
-    background_tabs: HashSet<WinID>,
+    pub(super) background_tabs: HashSet<WinID>,
+    /// Windows raised without focus, in order, so a test can check what ends
+    /// up in front of what.
+    pub(super) raised: Vec<WinID>,
+    /// How many times each app has been asked for its focused window or its
+    /// window list, so a test can check who a lookup bothers.
+    pub(super) app_reads: HashMap<Pid, usize>,
+    pub(super) next_space_id: WorkspaceId,
+    pub(super) screen_locked: bool,
+    pub(super) defer_desktop_ops: bool,
+    pub(super) deferred_desktop_ops: Vec<DeferredDesktopMockOp>,
 }
 
 #[derive(Clone)]
 pub struct MockState {
-    inner: Arc<RwLock<MockStateInner>>,
+    pub(super) inner: Arc<RwLock<MockStateInner>>,
 }
 
 impl MockState {
@@ -107,14 +141,27 @@ impl MockState {
                 windows: HashMap::new(),
                 displays: HashMap::new(),
                 fullscreen_spaces: HashSet::new(),
+                fullscreen_owners: HashMap::new(),
+                associated_windows: HashMap::new(),
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
                 background_tabs: HashSet::new(),
+                raised: Vec::new(),
+                app_reads: HashMap::new(),
+                next_space_id: 500,
+                screen_locked: false,
+                defer_desktop_ops: false,
+                deferred_desktop_ops: Vec::new(),
             })),
         }
+    }
+
+    /// The windows raised since this was last called, in the order they were.
+    pub fn take_raised(&self) -> Vec<WinID> {
+        std::mem::take(&mut self.inner.force_write().raised)
     }
 
     #[allow(dead_code)]
@@ -125,6 +172,12 @@ impl MockState {
         } else {
             inner.unordered_windows.remove(&window_id);
         }
+    }
+
+    /// How many times `pid` has been asked for its focused window or window
+    /// list since this was last called.
+    pub fn take_app_reads(&self, pid: Pid) -> usize {
+        self.inner.force_write().app_reads.remove(&pid).unwrap_or(0)
     }
 
     /// Makes `window_id` a background native tab: on screen as far as the
@@ -222,12 +275,14 @@ impl MockState {
         if inner.displays.is_empty() {
             inner.active_display_id = id;
         }
+        let current_workspace = workspaces.first().copied().unwrap_or(0);
         inner.displays.insert(
             id,
             MockDisplayData {
                 id,
                 bounds,
                 workspaces,
+                current_workspace,
             },
         );
     }
@@ -269,8 +324,10 @@ impl MockState {
                 .displays
                 .get_mut(&display_id)
                 .expect("finding display");
-            display.workspaces.retain(|id| *id != workspace_id);
-            display.workspaces.insert(0, workspace_id);
+            if !display.workspaces.contains(&workspace_id) {
+                display.workspaces.push(workspace_id);
+            }
+            display.current_workspace = workspace_id;
         }
         if fullscreen {
             inner.fullscreen_spaces.insert(workspace_id);
@@ -392,10 +449,12 @@ impl MockState {
         let point = CGPoint::new(point.x.into(), point.y.into());
         inner.event_queue.push_back(Event::MouseDown {
             point,
+            button: crate::events::MouseButton::Left,
             modifiers: Modifiers::empty(),
         });
         inner.event_queue.push_back(Event::MouseUp {
             point,
+            button: crate::events::MouseButton::Left,
             modifiers: Modifiers::empty(),
         });
     }
@@ -417,14 +476,17 @@ impl MockState {
         let end_p = CGPoint::new(end.x.into(), end.y.into());
         inner.event_queue.push_back(Event::MouseDown {
             point: start_p,
+            button: crate::events::MouseButton::Left,
             modifiers: Modifiers::empty(),
         });
         inner.event_queue.push_back(Event::MouseDragged {
             point: end_p,
+            button: crate::events::MouseButton::Left,
             modifiers: Modifiers::empty(),
         });
         inner.event_queue.push_back(Event::MouseUp {
             point: end_p,
+            button: crate::events::MouseButton::Left,
             modifiers: Modifiers::empty(),
         });
     }
@@ -464,8 +526,31 @@ impl MockState {
         let s = self.clone();
         mw.expect_resize().returning(move |size| {
             let mut inner = s.inner.force_write();
+            let display_bounds = inner
+                .displays
+                .get(&inner.active_display_id)
+                .map(|d| d.bounds);
             if let Some(w) = inner.windows.get_mut(&id) {
-                w.frame.max = w.frame.min + size;
+                let max_width = if w.max_width > 0 {
+                    w.max_width
+                } else {
+                    i32::MAX
+                };
+                let width = size.x.max(w.min_width).min(max_width);
+                let height = if w.clamp_height_to_display
+                    && let Some(bounds) = display_bounds
+                {
+                    let on_screen_horizontally =
+                        w.frame.max.x > bounds.min.x + 20 && w.frame.min.x < bounds.max.x - 20;
+                    if !on_screen_horizontally && size.y > w.frame.height() {
+                        w.frame.height()
+                    } else {
+                        size.y.min((bounds.max.y - w.frame.min.y).max(1))
+                    }
+                } else {
+                    size.y
+                };
+                w.frame.max = w.frame.min + Size::new(width, height);
             }
         });
 
@@ -624,7 +709,9 @@ impl MockState {
 
         // Fill in remaining defaults
         mw.expect_element().return_const(None);
-        mw.expect_raise_without_focus().return_const(());
+        let s = self.clone();
+        mw.expect_raise_without_focus()
+            .returning(move || s.inner.force_write().raised.push(id));
 
         // Focusing without raising still moves the OS focus, it just leaves the
         // window order alone. Only the app's idea of its focused window changes
@@ -638,12 +725,28 @@ impl MockState {
             .returning(move |_psn, _focused, _focused_psn| {
                 s.set_focused_window(id);
             });
-        mw.expect_set_padding().return_const(());
+        let s = self.clone();
+        mw.expect_set_padding().returning(move |padding| {
+            if let Some(window) = s.inner.force_write().windows.get_mut(&id) {
+                match padding {
+                    WindowPadding::Horizontal(padding) => window.padding_set.0 = Some(padding),
+                    WindowPadding::Vertical(padding) => window.padding_set.1 = Some(padding),
+                }
+            }
+        });
 
         Window::new(Box::new(mw))
     }
 
     pub fn create_application(&self, pid: Pid) -> Application {
+        self.create_application_with_observer(pid, || Ok(true))
+    }
+
+    pub fn create_application_with_observer(
+        &self,
+        pid: Pid,
+        observe: impl FnMut() -> crate::errors::Result<bool> + Send + 'static,
+    ) -> Application {
         let mut ma = MockApplicationApi::new();
         let s = self.clone();
 
@@ -663,6 +766,7 @@ impl MockState {
 
         let s = self.clone();
         ma.expect_focused_window().returning(move |_config| {
+            *s.inner.force_write().app_reads.entry(pid).or_default() += 1;
             let inner = s.inner.force_read();
             let focused_id = inner.apps.get(&pid).and_then(|a| a.focused_window_id)?;
             if inner.windows.contains_key(&focused_id) {
@@ -708,7 +812,7 @@ impl MockState {
                 .and_then(|a| a.connection)
         });
 
-        ma.expect_observe().returning(|| Ok(true));
+        ma.expect_observe().returning(observe);
         ma.expect_observe_window().returning(|_| Ok(true));
         ma.expect_unobserve_window().return_const(());
         let s = self.clone();
@@ -730,8 +834,10 @@ impl MockState {
         };
 
         let (s, ids) = (self.clone(), window_ids.clone());
-        ma.expect_window_list()
-            .returning(move |_| ids().into_iter().map(|id| s.create_window(id)).collect());
+        ma.expect_window_list().returning(move |_| {
+            *s.inner.force_write().app_reads.entry(pid).or_default() += 1;
+            ids().into_iter().map(|id| s.create_window(id)).collect()
+        });
 
         let (s, ids) = (self.clone(), window_ids.clone());
         ma.expect_ax_window_ids().returning(move || {
@@ -749,6 +855,8 @@ impl MockState {
     pub fn create_window_manager(&self) -> MockWindowManagerApi {
         let mut wm = MockWindowManagerApi::new();
 
+        wm.expect_dim_windows().returning(|_, _| ());
+
         let s = self.clone();
         wm.expect_window_is_unordered().returning(move |window_id| {
             let inner = s.inner.force_read();
@@ -765,7 +873,8 @@ impl MockState {
                 .force_read()
                 .displays
                 .get(&id)
-                .map(|d| d.workspaces[0])
+                .map(|d| d.current_workspace)
+                .filter(|&ws| ws != 0)
                 .ok_or(Error::InvalidWindow)
         });
 
@@ -773,14 +882,14 @@ impl MockState {
         wm.expect_is_fullscreen_space()
             .returning(move |display_id| {
                 let inner = s.inner.force_read();
-                inner
-                    .displays
-                    .get(&display_id)
-                    .and_then(|display| display.workspaces.first())
-                    .is_some_and(|workspace_id| inner.fullscreen_spaces.contains(workspace_id))
+                inner.displays.get(&display_id).is_some_and(|display| {
+                    inner.fullscreen_spaces.contains(&display.current_workspace)
+                })
             });
 
         let s = self.clone();
+        wm.expect_display_uuid()
+            .returning(|display_id| Some(format!("display-{display_id}")));
         wm.expect_present_displays().returning(move || {
             s.inner
                 .force_read()
@@ -805,8 +914,10 @@ impl MockState {
                     .windows
                     .values()
                     .filter_map(|w| {
-                        (w.pid == pid && spaces.contains(&w.workspace_id))
-                            .then_some(s.create_window(w.id))
+                        (w.pid == pid
+                            && (spaces.contains(&w.workspace_id)
+                                || w.extra_workspaces.iter().any(|ws| spaces.contains(ws))))
+                        .then_some(s.create_window(w.id))
                     })
                     .collect::<Vec<_>>();
                 windows.sort_unstable_by_key(|window| window.id());
@@ -821,7 +932,11 @@ impl MockState {
                     .force_read()
                     .windows
                     .values()
-                    .filter_map(|w| (w.workspace_id == workspace_id).then_some(w.id))
+                    .filter_map(|w| {
+                        (w.workspace_id == workspace_id
+                            || w.extra_workspaces.contains(&workspace_id))
+                        .then_some(w.id)
+                    })
                     .collect::<Vec<_>>();
                 // Sort the windows to keep the tests consistent
                 windows.sort_unstable();
@@ -842,6 +957,16 @@ impl MockState {
         });
 
         let s = self.clone();
+        wm.expect_window_owner().returning(move |window_id| {
+            let inner = s.inner.force_read();
+            inner
+                .windows
+                .get(&window_id)
+                .map(|w| w.pid)
+                .or_else(|| inner.stale_window_ids.get(&window_id).copied())
+        });
+
+        let s = self.clone();
         wm.expect_warp_mouse()
             .returning(move |origin| s.inner.force_write().cursor_position = origin);
 
@@ -850,6 +975,7 @@ impl MockState {
             .returning(move || Some(origin_to(s.inner.force_read().cursor_position)));
 
         wm.expect_get_associated_windows().return_const(vec![]);
+        wm.expect_dim_windows().return_const(());
 
         let s = self.clone();
         wm.expect_find_window_at_point().returning(move |at_point| {
@@ -870,20 +996,18 @@ impl MockState {
         let mut mp = MockProcessApi::new();
         let s = self.clone();
 
-        let name = self
-            .inner
-            .force_read()
-            .apps
-            .get(&pid)
-            .map(|a| a.name.clone())
-            .unwrap();
+        let (name, bundle_id) = {
+            let inner = self.inner.force_read();
+            let app = inner.apps.get(&pid).unwrap();
+            (app.name.clone(), app.bundle_id.clone())
+        };
         mp.expect_name().return_const(name);
 
         mp.expect_pid().return_const(pid);
         mp.expect_psn()
             .returning(move || s.inner.force_read().apps.get(&pid).map(|a| a.psn).unwrap());
         mp.expect_is_observable().returning(|| true);
-        mp.expect_application().return_const(None);
+        mp.expect_bundle_id().return_const(Some(bundle_id));
         mp.expect_ready().return_const(true);
         mp.expect_force_manage().return_const(());
 
