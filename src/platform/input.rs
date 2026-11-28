@@ -1641,10 +1641,14 @@ impl InputHandler {
                 }
                 self.config.find_keybind(keycode, mask)
             })
-            .map(|command| command.for_keypress(repeat))
             .and_then(|command| {
+                if repeat && matches!(command, Command::Window(Operation::FocusPrevious)) {
+                    return Some(());
+                }
                 events
-                    .send(Event::Command { command })
+                    .send(Event::Command {
+                        command: command.for_keypress(repeat),
+                    })
                     .inspect_err(|err| error!("Error sending command: {err}"))
                     .ok()
             })

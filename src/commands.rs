@@ -139,6 +139,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
         PreUpdate,
         (
             copy_window_rule,
+            command_focus_window,
             toggle_tabbed_display_handler,
             focus_display.after(command_move_focus),
             check_desktop_focus.after(focus_display),
@@ -312,6 +313,116 @@ fn touching_display<T>(
 fn focus_into_view(entity: Entity, focused: Option<Entity>, commands: &mut Commands) {
     focus_with_verification(entity, focused, None, FocusSource::Command, commands);
     commands.reshuffle_around(entity);
+}
+
+/// Direct focus and previous-window focus share the same eligibility and reveal path.
+fn command_focus_window(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    apps: Query<&Application>,
+    workspaces: Query<&LayoutStrip>,
+    history: Res<FocusHistory>,
+    mut commands: Commands,
+) {
+    #[derive(Clone, Copy)]
+    struct FocusCandidate {
+        id: i32,
+        entity: Entity,
+        tiled: bool,
+    }
+
+    let events: Vec<&Event> = messages.read().collect();
+    let has_focus_cmd = events.iter().any(|event| {
+        matches!(
+            event,
+            Event::Command {
+                command: Command::Window(Operation::FocusPrevious | Operation::FocusId(_))
+            }
+        )
+    });
+    if !has_focus_cmd {
+        return;
+    }
+
+    let app_of = |entity| windows.parent_of(entity).and_then(|app| apps.get(app).ok());
+    let candidates: Vec<FocusCandidate> = windows
+        .iter()
+        .filter_map(|(window, entity)| {
+            let tiled = match windows.get_managed(entity)?.2 {
+                None if workspaces.iter().any(|strip| strip.contains(entity)) => true,
+                Some(Unmanaged::Floating) if !app_of(entity).is_some_and(|app| app.is_hidden()) => {
+                    false
+                }
+                _ => return None,
+            };
+            Some(FocusCandidate {
+                id: window.id(),
+                entity,
+                tiled,
+            })
+        })
+        .collect();
+
+    let focused = windows.focused().map(|(_, entity)| entity);
+    let find_id = |id| candidates.iter().copied().find(|c| c.id == id);
+    let mut current = focused.and_then(|e| candidates.iter().copied().find(|c| c.entity == e));
+    let mut previous = candidates
+        .iter()
+        .copied()
+        .filter(|c| Some(c.entity) != focused)
+        .filter_map(|c| Some((history.window_recency(c.entity)?, c)))
+        .max_by_key(|(recency, _)| *recency)
+        .map(|(_, c)| c);
+
+    let mut target = None;
+    for event in events {
+        match event {
+            Event::WindowFocused { window_id } => {
+                if let Some(next) = find_id(*window_id)
+                    && app_of(next.entity).is_some_and(|app| app.is_frontmost())
+                    && current.map(|c| c.entity) != Some(next.entity)
+                {
+                    previous = current;
+                    current = Some(next);
+                }
+            }
+            Event::Command {
+                command: Command::Window(Operation::FocusPrevious),
+            } => {
+                if let Some(prev) = previous {
+                    previous = current;
+                    current = Some(prev);
+                    target = Some(prev);
+                }
+            }
+            Event::Command {
+                command: Command::Window(Operation::FocusId(id)),
+            } => {
+                if let Some(next) = find_id(*id) {
+                    if current.map(|c| c.entity) != Some(next.entity) {
+                        previous = current;
+                        current = Some(next);
+                    }
+                    target = Some(next);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(candidate) = target {
+        if candidate.tiled {
+            focus_into_view(candidate.entity, focused, &mut commands);
+        } else {
+            focus_with_verification(
+                candidate.entity,
+                focused,
+                None,
+                FocusSource::Command,
+                &mut commands,
+            );
+        }
+    }
 }
 
 /// A plain focus step that crossed toward `crossed` to display `display`.

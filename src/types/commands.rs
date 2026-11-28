@@ -291,6 +291,10 @@ pub fn parse_virtual_workspace_number(input: &str) -> Result<u32, ParseError> {
 pub enum Operation {
     /// Focuses on a window in the specified `Direction`.
     Focus(Direction),
+    /// Focuses the most recently focused available window other than the current one.
+    FocusPrevious,
+    /// Focuses a tracked window by its native window ID.
+    FocusId(i32),
     /// Swaps the current window with another in the specified `Direction`.
     Swap(Direction),
     /// Centers the currently focused window on the display.
