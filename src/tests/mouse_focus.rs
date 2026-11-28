@@ -627,9 +627,46 @@ fn focus_follows_mouse_uses_final_sample_of_a_move_burst() {
         );
     }
     pumped.extend(pending_mouse.take());
-    assert_eq!(pumped.len(), 2);
+    assert_eq!(pumped.len(), 1);
 
     harness.world().write_message_batch(pumped);
     harness.advance(Duration::from_millis(100));
     assert_focused!(harness.world(), 2);
+}
+
+#[test]
+fn pump_flushes_mouse_move_before_non_input_window_resized() {
+    let mut pumped = Vec::new();
+    let mut pending_mouse = None;
+    let raw = vec![
+        Event::MouseMoved {
+            point: CGPoint { x: 100.0, y: 100.0 },
+            delta_y: 0,
+            modifiers: Modifiers::empty(),
+        },
+        Event::WindowResized { window_id: 0 },
+        Event::MouseMoved {
+            point: CGPoint { x: 500.0, y: 100.0 },
+            delta_y: 0,
+            modifiers: Modifiers::LALT,
+        },
+    ];
+    for event in raw {
+        crate::ecs::systems::push_pumped_event(event, &mut pending_mouse, &mut pumped);
+    }
+    pumped.extend(pending_mouse.take());
+    assert_eq!(
+        pumped.len(),
+        3,
+        "a non-input WindowResized event must flush the earlier MouseMoved so modifier releases are not dropped"
+    );
+    assert!(matches!(
+        pumped[0],
+        Event::MouseMoved { modifiers, .. } if modifiers.is_empty()
+    ));
+    assert!(matches!(pumped[1], Event::WindowResized { window_id: 0 }));
+    assert!(matches!(
+        pumped[2],
+        Event::MouseMoved { modifiers, .. } if modifiers == Modifiers::LALT
+    ));
 }

@@ -997,15 +997,15 @@ pub(crate) fn demux_input_events(
     }
 }
 
-/// Coalesces consecutive zero-`delta_y` `MouseMoved` events to the latest
-/// sample while keeping every non-zero vertical delta paired with its original
-/// point in order.
+/// Coalesces consecutive `MouseMoved` events to the latest sample, flushing
+/// any pending move whenever another event (including non-input notifications
+/// like `WindowResized`) arrives.
 pub(crate) fn push_pumped_event(
     event: Event,
     pending_mouse: &mut Option<Event>,
     received_events: &mut Vec<Event>,
 ) {
-    if matches!(event, Event::MouseMoved { delta_y: 0, .. }) {
+    if matches!(event, Event::MouseMoved { .. }) {
         *pending_mouse = Some(event);
     } else {
         received_events.extend(pending_mouse.take());

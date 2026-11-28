@@ -80,34 +80,6 @@ fn is_in_corner_dead_zone(
     point.x >= bounds.max.x - CORNER_DEAD_ZONE_PX && point.y >= bounds.max.y - CORNER_DEAD_ZONE_PX
 }
 
-/// Keeps only the final sample of each consecutive `MouseMoved` burst so
-/// focus-follows-mouse and mouse-resize see coalesced moves while
-/// `horizontal_warp_mouse_trigger` still receives every ordered vertical-delta
-/// sample.
-fn coalesced_mouse_moves<'a>(
-    events: impl IntoIterator<Item = &'a InputEvent>,
-) -> Vec<(
-    &'a objc2_core_foundation::CGPoint,
-    crate::platform::Modifiers,
-)> {
-    let mut out = Vec::new();
-    let mut pending = None;
-    for InputEvent(event) in events {
-        if let Event::MouseMoved {
-            point, modifiers, ..
-        } = event
-        {
-            pending = Some((point, *modifiers));
-        } else if let Some(move_event) = pending.take() {
-            out.push(move_event);
-        }
-    }
-    if let Some(move_event) = pending {
-        out.push(move_event);
-    }
-    out
-}
-
 /// Handles mouse moved events.
 ///
 /// If "focus follows mouse" is enabled, this function finds the window under the cursor and
@@ -138,10 +110,17 @@ fn mouse_moved_trigger(
 ) {
     const FIND_WINDOW_THROTTLE: Duration = Duration::from_millis(50);
 
-    for (point, modifiers) in coalesced_mouse_moves(messages.read()) {
+    for InputEvent(event) in messages.read() {
+        let Event::MouseMoved {
+            point, modifiers, ..
+        } = event
+        else {
+            continue;
+        };
+
         if config
             .mouse_resize_modifier()
-            .is_some_and(|modifier| modifier.matches(modifiers))
+            .is_some_and(|modifier| modifier.matches(*modifiers))
         {
             // Resizing is handled by a separate trigger or logic.
             // For now, let's just intercept it here to prevent focus changes during resize.
@@ -404,10 +383,17 @@ fn mouse_resize_trigger(
     mut state: Local<MouseResizeState>,
     mut commands: Commands,
 ) {
-    for (point, modifiers) in coalesced_mouse_moves(messages.read()) {
+    for InputEvent(event) in messages.read() {
+        let Event::MouseMoved {
+            point, modifiers, ..
+        } = event
+        else {
+            continue;
+        };
+
         if config
             .mouse_resize_modifier()
-            .is_none_or(|modifier| !modifier.matches(modifiers))
+            .is_none_or(|modifier| !modifier.matches(*modifiers))
         {
             state.last_point = None;
             state.window_id = None;

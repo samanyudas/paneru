@@ -321,8 +321,8 @@ fn coalescing_downward_push_outside_laptop_before_sideways_slide_does_not_warp()
     pumped.extend(pending_mouse.take());
     assert_eq!(
         pumped.len(),
-        2,
-        "non-zero delta_y must stay paired with its original point instead of coalescing onto the sideways move"
+        1,
+        "coalescing keeps only the latest move without attaching the earlier point's delta_y"
     );
 
     let (before, cursor) = pointer_events(harness, pumped);
