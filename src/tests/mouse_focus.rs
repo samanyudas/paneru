@@ -580,3 +580,56 @@ fn clicking_partially_offscreen_focused_window_brings_it_into_view() {
         })
         .run(commands);
 }
+
+#[test]
+fn focus_follows_mouse_uses_final_sample_of_a_move_burst() {
+    let config: Config = (
+        MainOptions {
+            focus_follows_mouse: Some(true),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_millis(200));
+    assert_focused!(harness.world(), 0);
+
+    let (center_1, center_2) = {
+        let world = harness.world();
+        let e1 = find_window_entity(1, world);
+        let e2 = find_window_entity(2, world);
+        (
+            world.get::<Window>(e1).unwrap().frame().center(),
+            world.get::<Window>(e2).unwrap().frame().center(),
+        )
+    };
+
+    // Deliver two consecutive MouseMoved samples in the same tick (as
+    // `pump_events` now does when the earlier sample has a non-zero `delta_y`):
+    // focus-follows-mouse must focus window 2 (the final sample), not window 1.
+    let mut pumped = Vec::new();
+    let mut pending_mouse = None;
+    for (center, delta_y) in [(center_1, 4), (center_2, 0)] {
+        crate::ecs::systems::push_pumped_event(
+            Event::MouseMoved {
+                point: CGPoint {
+                    x: f64::from(center.x),
+                    y: f64::from(center.y),
+                },
+                delta_y,
+                modifiers: Modifiers::empty(),
+            },
+            &mut pending_mouse,
+            &mut pumped,
+        );
+    }
+    pumped.extend(pending_mouse.take());
+    assert_eq!(pumped.len(), 2);
+
+    harness.world().write_message_batch(pumped);
+    harness.advance(Duration::from_millis(100));
+    assert_focused!(harness.world(), 2);
+}
