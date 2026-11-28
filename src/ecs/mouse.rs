@@ -527,9 +527,10 @@ impl WarpDesk {
         edge: i32,
         inset: i32,
     ) -> Option<Origin> {
-        previous
-            .and_then(|previous| self.row_crossing(previous, point, inset))
-            .or_else(|| self.up_from_lowest(point, edge, inset))
+        previous.and_then(|previous| {
+            self.row_crossing(previous, point, edge, inset)
+                .or_else(|| self.up_from_lowest(previous, point, edge, inset))
+        })
     }
 
     fn member(&self, point: Origin) -> Option<RowDisplay> {
@@ -541,14 +542,40 @@ impl WarpDesk {
 
     // macOS moves the pointer across a shared edge without a stop at the edge.
     // Thus only the previous point shows that the pointer left a row display.
-    fn row_crossing(&self, previous: Origin, point: Origin, inset: i32) -> Option<Origin> {
+    fn row_crossing(
+        &self,
+        previous: Origin,
+        point: Origin,
+        edge: i32,
+        inset: i32,
+    ) -> Option<Origin> {
         // An event from before a sideways warp still has the old position.
         // It jumps by the width of a display, which a real crossing does not.
         const MAX_CROSSING_STEP_X: i32 = 400;
         let from = self.member(previous)?;
         let to = self.member(point)?;
-        if to.frame == from.frame || (point.x - previous.x).abs() >= MAX_CROSSING_STEP_X {
+        if (point.x - previous.x).abs() >= MAX_CROSSING_STEP_X {
             return None;
+        }
+        if to.frame == from.frame {
+            // When an upper row display overhangs the monitor beneath it in
+            // macOS's virtual layout, downward motion clamps at its bottom
+            // edge without entering another row display.
+            let at_bottom_edge = point.y > previous.y && from.frame.max.y - point.y <= edge;
+            let below = Origin::new(point.x, from.frame.max.y);
+            let native_below = rect_contains(self.lowest, below) || self.member(below).is_some();
+            if !at_bottom_edge || native_below {
+                return None;
+            }
+            let row_x = point.x + from.row_offset_x;
+            return (self.lowest.min.x..self.lowest.max.x)
+                .contains(&row_x)
+                .then(|| {
+                    Origin::new(
+                        row_x.clamp(self.lowest.min.x + inset, self.lowest.max.x - 1 - inset),
+                        self.lowest.min.y + inset,
+                    )
+                });
         }
         let row_x = previous.x + from.row_offset_x;
         let over_lowest = (self.lowest.min.x..self.lowest.max.x).contains(&row_x);
@@ -566,12 +593,19 @@ impl WarpDesk {
         }
     }
 
-    fn up_from_lowest(&self, point: Origin, edge: i32, inset: i32) -> Option<Origin> {
+    fn up_from_lowest(
+        &self,
+        previous: Origin,
+        point: Origin,
+        edge: i32,
+        inset: i32,
+    ) -> Option<Origin> {
         let on_top_edge = rect_contains(self.lowest, point) && point.y - self.lowest.min.y < edge;
+        let moving_up_from_lowest = rect_contains(self.lowest, previous) && point.y < previous.y;
         let native_above = self
             .member(Origin::new(point.x, self.lowest.min.y - 1))
             .is_some();
-        if !on_top_edge || native_above {
+        if !on_top_edge || !moving_up_from_lowest || native_above {
             return None;
         }
         self.row

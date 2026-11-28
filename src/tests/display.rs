@@ -3666,6 +3666,62 @@ fn test_destroyed_space_on_a_present_display_is_not_orphaned() {
 }
 
 #[test]
+fn test_destroyed_space_removes_all_strips_sharing_the_space() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {});
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    let ext_display = {
+        let world = harness.world();
+        world
+            .query::<(Entity, &Display)>()
+            .iter(world)
+            .find_map(|(entity, display)| (display.id() == EXT_DISPLAY_ID).then_some(entity))
+            .expect("external display should exist")
+    };
+    harness
+        .world()
+        .spawn((LayoutStrip::new(EXT_WORKSPACE_ID, 1), ChildOf(ext_display)));
+
+    let before = {
+        let world = harness.world();
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .filter(|strip| strip.id() == EXT_WORKSPACE_ID)
+            .count()
+    };
+    assert_eq!(
+        before, 2,
+        "both strips sharing the native Space must exist before SpaceDestroyed"
+    );
+
+    harness.world().write_message(Event::SpaceDestroyed {
+        space_id: EXT_WORKSPACE_ID,
+    });
+    harness.world().run_schedule(PostUpdate);
+
+    let after = {
+        let world = harness.world();
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .filter(|strip| strip.id() == EXT_WORKSPACE_ID)
+            .count()
+    };
+    assert_eq!(
+        after, 0,
+        "SpaceDestroyed must remove every strip belonging to the destroyed native Space"
+    );
+}
+
+#[test]
 fn test_horizontal_mouse_warp_also_warps_a_drag() {
     let config: Config = (
         MainOptions {
@@ -3807,6 +3863,27 @@ fn test_display_send_moves_the_window_and_keeps_the_source_active() {
             assert_on_workspace!(world, 0, THIRD_WORKSPACE_ID);
             assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
             assert_on_workspace!(world, 1, TEST_WORKSPACE_ID);
+            assert_eq!(state.active_display(), TEST_DISPLAY_ID);
+        })
+        .run(display_window_commands(Operation::ToDisplay(
+            THIRD_DISPLAY_ID,
+            MoveFocus::Stay,
+        )));
+}
+
+#[test]
+fn test_display_send_of_last_column_focuses_source_desktop() {
+    let source_bounds = IRect::new(
+        0,
+        TEST_MENUBAR_HEIGHT,
+        TEST_DISPLAY_WIDTH,
+        TEST_DISPLAY_HEIGHT,
+    );
+    with_stacked_displays(TestHarness::new().with_windows(1))
+        .on_iteration(2, move |world, state| {
+            assert_on_workspace!(world, 0, THIRD_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_eq!(state.focused_desktop(), Some(source_bounds));
             assert_eq!(state.active_display(), TEST_DISPLAY_ID);
         })
         .run(display_window_commands(Operation::ToDisplay(

@@ -251,3 +251,43 @@ fn test_expel_is_a_noop_on_a_single_window_column() {
         })
         .run(commands);
 }
+
+#[test]
+fn test_expel_raises_focused_sibling_in_tabbed_stack() {
+    let mut commands = vec![Event::MenuOpened { window_id: 0 }];
+    stack_first_three(&mut commands);
+    commands.extend([
+        Event::Command {
+            command: Command::Window(Operation::ToggleTabbedDisplay),
+        },
+        // Raise window 0 above window 2, then focus window 1 (middle) so the
+        // stack z-order is [2, 0, 1] before expelling 1.
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::North)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::North)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::South)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Expel),
+        },
+    ]);
+    let after_expel = commands.len() - 1;
+
+    TestHarness::new()
+        .with_windows(4)
+        .on_iteration(after_expel, |world, state| {
+            assert!(!same_column(world, 0, 1));
+            assert!(same_column(world, 0, 2));
+            assert_focused!(world, 2);
+            assert_eq!(
+                state.window_order(&[0, 2]),
+                vec![0, 2],
+                "expelling a tab must raise the focused sibling above the remaining tab"
+            );
+        })
+        .run(commands);
+}

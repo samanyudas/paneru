@@ -184,3 +184,47 @@ fn top_pixel_row_of_laptop_belongs_to_laptop_not_monitor_above() {
         "y = 0 is the top pixel row of the laptop, not the bottom edge of the left monitor"
     );
 }
+
+#[test]
+fn moving_sideways_along_the_laptop_top_edge_does_not_warp_up() {
+    let (before, cursor) = pointer_moves(desk(true), &[(800, 1), (810, 1)]);
+    assert_eq!(
+        cursor, before,
+        "horizontal motion along the laptop top edge must not warp to an upper monitor"
+    );
+}
+
+#[test]
+fn moving_down_from_a_staggered_upper_monitor_overhang_reaches_the_laptop() {
+    let config: Config = (
+        MainOptions {
+            horizontal_mouse_warp: Some(1),
+            horizontal_mouse_warp_lowest_below: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    // Upper right monitor is staggered 300 px left of the lower left monitor in
+    // macOS's virtual layout, so x = -1600 has no display natively beneath it
+    // even though its row position (620) sits over the laptop (0..1024).
+    let staggered_left = IRect::new(-1408, -EXT_DISPLAY_HEIGHT, 512, 0);
+    let staggered_right = IRect::new(-1708, -2 * EXT_DISPLAY_HEIGHT, 212, -EXT_DISPLAY_HEIGHT);
+    let harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_display(EXT_DISPLAY_ID, staggered_left, vec![EXT_WORKSPACE_ID])
+        .with_display(RIGHT_DISPLAY_ID, staggered_right, vec![RIGHT_WORKSPACE_ID]);
+    let (_, cursor) = pointer_moves(
+        harness,
+        &[
+            (-1608, -EXT_DISPLAY_HEIGHT - 30),
+            (-1608, -EXT_DISPLAY_HEIGHT - 1),
+        ],
+    );
+    assert_eq!(
+        cursor,
+        IVec2::new(612, 6),
+        "downward motion into the clamped overhang edge must reach the laptop below it"
+    );
+}

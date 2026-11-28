@@ -1933,6 +1933,7 @@ fn to_next_display(
     let Some(source) = moves.active_display() else {
         return;
     };
+    let source_id = source.id();
     let source_bounds = source.bounds();
     let move_focus = request.focus;
     let target = match &request.target {
@@ -2019,10 +2020,12 @@ fn to_next_display(
     if matches!(move_focus, MoveFocus::Follow) && config.mouse_follows_focus() {
         window_manager.warp_mouse(bounds.center());
     }
-    if matches!(move_focus, MoveFocus::Stay)
-        && let Some(neighbour) = arrival.left_behind
-    {
-        commands.focus_entity_for_command(neighbour, false);
+    if matches!(move_focus, MoveFocus::Stay) {
+        if let Some(neighbour) = arrival.left_behind {
+            commands.focus_entity_for_command(neighbour, false);
+        } else if let Err(err) = window_manager.focus_desktop(source_bounds) {
+            warn!("can not focus the desktop of display {source_id}: {err}");
+        }
     }
     if let Some(strip) = arrival.strip {
         if matches!(move_focus, MoveFocus::Follow)
@@ -2662,8 +2665,7 @@ pub fn expel_windows_handler(
         if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
             entity_commands.try_remove::<crate::ecs::Scrolling>();
         }
-        commands.focus_entity_for_command(sibling, false);
-        commands.reshuffle_around(sibling);
+        focus_into_view(sibling, Some(entity), &mut commands);
     }
 }
 
