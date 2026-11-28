@@ -412,3 +412,96 @@ fn same_frame_window_close_and_neighbor_app_quit_focuses_surviving_neighbor() {
     harness2.advance(Duration::from_secs(1));
     crate::assert_focused!(harness2.world(), 1);
 }
+
+#[test]
+fn closing_unfocused_floating_window_does_not_steal_focus_from_focused_floating_window() {
+    let mut harness = started();
+    let state = harness.mock_state.clone();
+    let floating_settings = state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        10,
+        IRect::new(200, 100, 1080, 740),
+    );
+    let floating_transient = state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        11,
+        IRect::new(500, 30, 800, 280),
+    );
+    harness.world().trigger(SpawnWindowTrigger(vec![
+        floating_settings,
+        floating_transient,
+    ]));
+    harness.advance(Duration::from_millis(200));
+
+    // Mark both windows floating, as Miri Settings and its helper windows are.
+    let world = harness.world();
+    let mut to_float = Vec::new();
+    for (window, entity) in world.query::<(&Window, Entity)>().iter(world) {
+        if window.id() == 10 || window.id() == 11 {
+            to_float.push(entity);
+        }
+    }
+    for entity in to_float {
+        world
+            .entity_mut(entity)
+            .insert(crate::ecs::Unmanaged::Floating);
+    }
+    harness.advance(Duration::from_millis(200));
+
+    state.focus_window(10);
+    harness.advance(Duration::from_millis(200));
+    crate::assert_focused!(harness.world(), 10);
+
+    let raises_before = state.raise_count();
+    close_window(&mut harness, 11);
+    crate::assert_focused!(harness.world(), 10);
+    assert_eq!(state.raise_count(), raises_before);
+
+    // Closing an unfocused tiled window must also leave the focused floating window alone.
+    close_window(&mut harness, 1);
+    crate::assert_focused!(harness.world(), 10);
+    assert_eq!(state.raise_count(), raises_before);
+}
+
+#[test]
+fn closing_unfocused_floating_window_with_no_focused_marker_does_not_steal_focus() {
+    let mut harness = started();
+    let state = harness.mock_state.clone();
+    let floating_transient = state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        11,
+        IRect::new(500, 30, 800, 280),
+    );
+    harness
+        .world()
+        .trigger(SpawnWindowTrigger(vec![floating_transient]));
+    harness.advance(Duration::from_millis(200));
+
+    let world = harness.world();
+    let entity_11 = world
+        .query::<(&Window, Entity)>()
+        .iter(world)
+        .find_map(|(w, e)| (w.id() == 11).then_some(e))
+        .expect("window 11");
+    world
+        .entity_mut(entity_11)
+        .insert(crate::ecs::Unmanaged::Floating);
+    let focused_entities: Vec<Entity> = world
+        .query_filtered::<Entity, bevy::prelude::With<crate::ecs::FocusedMarker>>()
+        .iter(world)
+        .collect();
+    for entity in focused_entities {
+        world
+            .entity_mut(entity)
+            .remove::<crate::ecs::FocusedMarker>();
+    }
+    harness.advance(Duration::from_millis(200));
+
+    let raises_before = state.raise_count();
+    close_window(&mut harness, 11);
+
+    assert_eq!(state.raise_count(), raises_before);
+}
