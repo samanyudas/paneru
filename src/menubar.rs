@@ -1230,7 +1230,7 @@ mod tests {
     #[test]
     fn menu_commands_apply_in_the_same_tick_as_pumped_events() {
         use crate::tests::TestHarness;
-        use bevy::app::PreUpdate;
+        use bevy::app::First;
         use bevy::ecs::{message::MessageWriter, schedule::IntoScheduleConfigs, system::Local};
 
         // Inject a command immediately before the real pump. The handler must
@@ -1244,9 +1244,12 @@ mod tests {
             }
         }
         let mut harness = TestHarness::new();
-        harness
-            .app
-            .add_systems(PreUpdate, incoming.before(crate::ecs::systems::pump_events));
+        harness.app.add_systems(
+            First,
+            incoming
+                .in_set(crate::ecs::FirstSet::Pump)
+                .before(crate::ecs::systems::pump_events),
+        );
         harness.app.update();
         let world = harness.world();
         assert!(

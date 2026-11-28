@@ -4276,3 +4276,108 @@ index = 0
         "a background app's left-edge window must not shift the focused window"
     );
 }
+
+/// Closing a column between the settle destination (column 1) and the focused
+/// column (column 4) during an active window-landing settle leaves column 1's
+/// slot unchanged, so `scrolling.settle` must stay at column 1's target rather
+/// than shifting rightward by the closed column's width.
+#[test]
+fn test_removal_before_focus_during_settle_to_earlier_column_keeps_destination_target() {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(false),
+            animation_speed: Some(8.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut harness = TestHarness::new().with_config(config).with_windows(5);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_millis(500));
+
+    harness.mock_state.set_focused_window(4);
+    harness
+        .world()
+        .write_message(Event::WindowFocused { window_id: 4 });
+    harness.advance(Duration::from_millis(500));
+
+    let (strip_entity, before_x, col_1, col_2_width) = {
+        let world = harness.world();
+        let strip_entity = active_strip_entity(world);
+        let strip_x = world.get::<Position>(strip_entity).unwrap().x;
+        let col_1 = find_window_entity(1, world);
+        let col_2 = find_window_entity(2, world);
+        let col_2_width = world.get::<crate::ecs::Bounds>(col_2).unwrap().0.x;
+        (strip_entity, strip_x, col_1, col_2_width)
+    };
+    let last_event = harness.world().resource::<Time>().elapsed();
+    let target_1 = -400.0;
+    harness
+        .world()
+        .entity_mut(strip_entity)
+        .insert(crate::ecs::Scrolling {
+            velocity: 0.0,
+            position: f64::from(before_x),
+            is_user_swiping: false,
+            last_event,
+            moved_at: last_event,
+            input: crate::ecs::ScrollInput::Gesture,
+            anchor: f64::from(before_x),
+            settle: Some(target_1),
+            ease: Some(crate::ecs::SettleEase {
+                from: f64::from(before_x),
+                start: 0.0,
+                elapsed: 0.05,
+                animation_speed: 8.0,
+                flick: None,
+            }),
+            detent: None,
+            origin: f64::from(before_x),
+            landing_focus: Some(col_1),
+            focus_at_start: None,
+            start: None,
+            fingers_down: false,
+            lifted_at: None,
+            caught: None,
+            slope: 1.0,
+            excess: None,
+        });
+
+    harness.world().write_message(Event::WindowDestroyed {
+        window_id: 2,
+        source: crate::events::DestroySource::Accessibility { element: None },
+    });
+    harness.advance(Duration::from_millis(16));
+
+    let world = harness.world();
+    let scrolling = world
+        .get::<crate::ecs::Scrolling>(strip_entity)
+        .expect("strip still settling toward column 1");
+    assert_eq!(
+        scrolling.settle,
+        Some(target_1),
+        "column 1's slot did not move when closing column 2, so the settle target must stay at {target_1}"
+    );
+    let min_from = f64::from((before_x + col_2_width).min(0));
+    let ease = scrolling.ease.expect("ease must retarget toward column 1");
+    assert!(
+        ease.from >= min_from - 1.0,
+        "retargeted ease must start from the compensated strip position (got {}, before_x {}, width {})",
+        ease.from,
+        before_x,
+        col_2_width
+    );
+
+    harness.advance(Duration::from_secs(2));
+    let world = harness.world();
+    assert_eq!(
+        world
+            .get::<Position>(strip_entity)
+            .map(|position| position.x),
+        Some(-400),
+        "strip must still land at column 1's target offset"
+    );
+    assert_focused!(world, 1);
+}
