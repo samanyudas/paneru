@@ -997,6 +997,22 @@ pub(crate) fn demux_input_events(
     }
 }
 
+/// Coalesces consecutive zero-`delta_y` `MouseMoved` events to the latest
+/// sample while keeping every non-zero vertical delta paired with its original
+/// point in order.
+pub(crate) fn push_pumped_event(
+    event: Event,
+    pending_mouse: &mut Option<Event>,
+    received_events: &mut Vec<Event>,
+) {
+    if matches!(event, Event::MouseMoved { delta_y: 0, .. }) {
+        *pending_mouse = Some(event);
+    } else {
+        received_events.extend(pending_mouse.take());
+        received_events.push(event);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pump_events(
     mut exit: MessageWriter<AppExit>,
@@ -1047,28 +1063,7 @@ pub(crate) fn pump_events(
             }
             Ok(event) => {
                 woke |= matches!(event, Event::SystemWoke { .. });
-                if let Event::MouseMoved {
-                    point,
-                    delta_y,
-                    modifiers,
-                } = event
-                {
-                    let accumulated = match pending_mouse {
-                        Some(Event::MouseMoved {
-                            delta_y: prev_delta_y,
-                            ..
-                        }) => prev_delta_y.saturating_add(delta_y),
-                        _ => delta_y,
-                    };
-                    pending_mouse = Some(Event::MouseMoved {
-                        point,
-                        delta_y: accumulated,
-                        modifiers,
-                    });
-                } else {
-                    received_events.extend(pending_mouse.take());
-                    received_events.push(event);
-                }
+                push_pumped_event(event, &mut pending_mouse, &mut received_events);
                 *timeout = LOOP_TIMEOUT_STEP;
             }
             Err(TryRecvError::Empty) => break true,

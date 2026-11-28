@@ -282,3 +282,52 @@ fn moving_up_from_the_laptop_after_a_pause_still_reaches_the_upper_monitor() {
     let (_, cursor) = pointer_events(desk(true), moves_with_delta(&[(800, 0, -5)]));
     assert_eq!(cursor, IVec2::new(800 - 1920, -EXT_DISPLAY_HEIGHT - 7));
 }
+
+#[test]
+fn coalescing_downward_push_outside_laptop_before_sideways_slide_does_not_warp() {
+    let config: Config = (
+        MainOptions {
+            horizontal_mouse_warp: Some(1),
+            horizontal_mouse_warp_lowest_below: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    // With `staggered_left` at (-1000..920) and `staggered_right` at
+    // (-1600..320), `staggered_right` overhangs left for x in -1600..-1000
+    // with `row_offset_x = 2520`:
+    // - x = -1480 maps to row_x = 1040 (outside laptop 0..1024)
+    // - x = -1520 maps to row_x = 1000 (inside laptop 0..1024)
+    let staggered_left = IRect::new(-1000, -EXT_DISPLAY_HEIGHT, 920, 0);
+    let staggered_right = IRect::new(-1600, -2 * EXT_DISPLAY_HEIGHT, 320, -EXT_DISPLAY_HEIGHT);
+    let harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_display(EXT_DISPLAY_ID, staggered_left, vec![EXT_WORKSPACE_ID])
+        .with_display(RIGHT_DISPLAY_ID, staggered_right, vec![RIGHT_WORKSPACE_ID]);
+
+    // Simulate `pump_events` receiving a downward push outside the laptop's
+    // mapped range followed by a sideways slide into it within the same frame.
+    let raw = moves_with_delta(&[
+        (-1480, -EXT_DISPLAY_HEIGHT - 1, 4),
+        (-1520, -EXT_DISPLAY_HEIGHT - 1, 0),
+    ]);
+    let mut pumped = Vec::new();
+    let mut pending_mouse = None;
+    for event in raw {
+        crate::ecs::systems::push_pumped_event(event, &mut pending_mouse, &mut pumped);
+    }
+    pumped.extend(pending_mouse.take());
+    assert_eq!(
+        pumped.len(),
+        2,
+        "non-zero delta_y must stay paired with its original point instead of coalescing onto the sideways move"
+    );
+
+    let (before, cursor) = pointer_events(harness, pumped);
+    assert_eq!(
+        cursor, before,
+        "a downward push outside the laptop followed by sideways motion into its range must not warp"
+    );
+}
