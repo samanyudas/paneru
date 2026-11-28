@@ -610,9 +610,8 @@ fn focus_follows_mouse_uses_final_sample_of_a_move_burst() {
         )
     };
 
-    // Deliver two consecutive MouseMoved samples in the same tick (as
-    // `pump_events` now does when the earlier sample has a non-zero `delta_y`):
-    // focus-follows-mouse must focus window 2 (the final sample), not window 1.
+    // Two consecutive MouseMoved samples in one pump coalesce to the final
+    // sample, so focus-follows-mouse focuses window 2 (not window 1).
     let mut pumped = Vec::new();
     let mut motion = Vec::new();
     let mut pending_mouse = None;

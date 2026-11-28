@@ -458,6 +458,16 @@ fn mouse_resize_trigger(
 #[derive(Default)]
 pub(super) struct WarpVelocityState {
     last: Option<(Origin, Instant)>,
+    warped_at: Option<Instant>,
+}
+
+impl WarpVelocityState {
+    fn record_warp(&mut self, landing: Origin, window_manager: &WindowManager) {
+        let warp_time = Instant::now();
+        window_manager.warp_mouse(landing);
+        self.last = Some((landing, warp_time));
+        self.warped_at = Some(warp_time);
+    }
 }
 
 fn rect_contains(rect: IRect, point: Origin) -> bool {
@@ -668,16 +678,26 @@ fn horizontal_warp_mouse_trigger(
     config: Res<Config>,
     mut state: Local<WarpVelocityState>,
 ) {
-    let mut desk: Option<Option<WarpDesk>> = None;
+    let Some(warp_direction) = config.horizontal_mouse_warp() else {
+        messages.clear();
+        return;
+    };
+    if displays.count() < 2 {
+        messages.clear();
+        return;
+    }
+
+    let desk = WarpDesk::from_displays(&displays, &config, warp_direction);
+    let desk = desk.as_ref();
     let mut warped = false;
     for motion in messages.read() {
-        // Once a warp succeeds, any remaining samples from this drain were
-        // queued before the warp and must be discarded so the landing point
+        let now = motion.timestamp;
+        // Discard remaining pre-warp samples in this drain and any stale
+        // pre-warp HID events arriving in a later drain so the landing point
         // stays the baseline for subsequent motion.
-        if warped {
+        if warped || state.warped_at.is_some_and(|warped_at| now < warped_at) {
             continue;
         }
-        let now = motion.timestamp;
         let point = origin_from(motion.point);
         let delta_y = motion.delta_y;
 
@@ -697,22 +717,10 @@ fn horizontal_warp_mouse_trigger(
         let previous = recent_previous.map(|(previous, _)| previous);
         state.last = Some((point, now));
 
-        let Some(warp_direction) = config.horizontal_mouse_warp() else {
-            return;
-        };
-        if displays.count() < 2 {
-            return;
-        }
-
-        let desk = desk
-            .get_or_insert_with(|| WarpDesk::from_displays(&displays, &config, warp_direction))
-            .as_ref();
-
         if let Some(landing) = desk
             .and_then(|desk| desk.landing(previous, point, delta_y, EDGE_THRESHOLD, LANDING_INSET))
         {
-            window_manager.warp_mouse(landing);
-            state.last = Some((landing, now));
+            state.record_warp(landing, &window_manager);
             warped = true;
             continue;
         }
@@ -796,10 +804,7 @@ fn horizontal_warp_mouse_trigger(
         }
 
         let landing = Origin::new(target_x, target_y);
-        window_manager.warp_mouse(landing);
-        // Reset the velocity sample to the landing point so the next motion
-        // event computes velocity from the new position, not the pre-warp one.
-        state.last = Some((landing, now));
+        state.record_warp(landing, &window_manager);
         warped = true;
     }
 }

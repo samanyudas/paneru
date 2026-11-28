@@ -241,7 +241,7 @@ impl Pointer {
 }
 
 /// Time since startup, not counting sleep, as `CLOCK_UPTIME_RAW` counts it.
-fn uptime() -> Duration {
+pub(crate) fn uptime() -> Duration {
     from_ticks(unsafe { mach_absolute_time() })
 }
 

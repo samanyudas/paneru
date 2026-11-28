@@ -446,45 +446,53 @@ fn velocity_carry_uses_event_timestamps_within_a_single_drain() {
     // Physical HID devices report Mach ticks (24 MHz on Apple silicon:
     // numer = 125, denom = 3 -> 240_000 ticks == 10 ms), while software-posted
     // events report nanoseconds above `mach_absolute_time()`. Even if a
-    // main-run-loop stall dispatches both events 50 us apart, a 1 px move over
-    // 10 ms = 100 px/s -> 30 ms carry = 3 px -> landing at -1408 + 6 + 3 = -1399.
+    // main-run-loop stall dispatches both events 50 us apart (25 ms after the
+    // first event), mapping directly against `uptime()` preserves the true
+    // 10 ms interval: 1 px rightward over 10 ms = 100 px/s -> 30 ms carry =
+    // 3 px -> landing at -1408 + 6 + 3 = -1399.
     let stalled_dispatch = std::time::Instant::now();
     let burst_second = stalled_dispatch + std::time::Duration::from_micros(50);
 
     // 1. Mach-tick timestamps (Apple silicon 125/3 timebase: 240_000 ticks = 10 ms).
     let now_ticks = 10_000_000_000;
-    let mut mach_anchor = None;
-    let t1_mach = crate::platform::input::anchor_event_time(
-        crate::platform::slice_tap::made_at_with_timebase(now_ticks - 240_000, now_ticks, 125, 3),
-        &mut mach_anchor,
+    let t1_uptime =
+        crate::platform::slice_tap::made_at_with_timebase(now_ticks - 240_000, now_ticks, 125, 3);
+    let t2_uptime = crate::platform::slice_tap::made_at_with_timebase(now_ticks, now_ticks, 125, 3);
+    let stall = std::time::Duration::from_millis(25);
+    let t1_mach = crate::platform::input::event_timestamp_from_uptime(
+        t1_uptime,
+        t2_uptime + stall,
         stalled_dispatch,
     );
-    let t2_mach = crate::platform::input::anchor_event_time(
-        crate::platform::slice_tap::made_at_with_timebase(now_ticks, now_ticks, 125, 3),
-        &mut mach_anchor,
+    let t2_mach = crate::platform::input::event_timestamp_from_uptime(
+        t2_uptime,
+        t2_uptime + stall + std::time::Duration::from_micros(50),
         burst_second,
     );
     assert_eq!(
         t2_mach.saturating_duration_since(t1_mach),
         std::time::Duration::from_millis(10)
     );
+    assert!(
+        t1_mach < stalled_dispatch && t2_mach < burst_second,
+        "delayed events must map to their creation instants prior to dispatch"
+    );
 
-    // 2. Software-posted nanosecond timestamps through `cg_event_timestamp_to_instant`,
-    //    plus zero-timestamp fallback to `dispatch_now`.
-    let mut ns_anchor = None;
-    let far_ns = u64::MAX / 4;
-    let t1_ns = crate::platform::input::cg_event_timestamp_to_instant(
-        far_ns,
-        &mut ns_anchor,
+    // 2. Software-posted nanosecond timestamps through `event_timestamp_from_uptime`,
+    //    plus zero-timestamp fallback through `cg_event_timestamp_to_instant`.
+    let base_ns = std::time::Duration::from_secs(500);
+    let t1_ns = crate::platform::input::event_timestamp_from_uptime(
+        base_ns,
+        base_ns + std::time::Duration::from_millis(35),
         stalled_dispatch,
     );
-    let t2_ns = crate::platform::input::cg_event_timestamp_to_instant(
-        far_ns + 10_000_000,
-        &mut ns_anchor,
+    let t2_ns = crate::platform::input::event_timestamp_from_uptime(
+        base_ns + std::time::Duration::from_millis(10),
+        base_ns + std::time::Duration::from_millis(35) + std::time::Duration::from_micros(50),
         burst_second,
     );
     assert_eq!(
-        crate::platform::input::cg_event_timestamp_to_instant(0, &mut ns_anchor, burst_second),
+        crate::platform::input::cg_event_timestamp_to_instant(0, burst_second),
         burst_second
     );
 
@@ -519,4 +527,66 @@ fn velocity_carry_uses_event_timestamps_within_a_single_drain() {
             "carry-over ({label}) must use normalized CGEvent timestamps even when run-loop dispatch stalls into a burst"
         );
     }
+}
+
+#[test]
+fn pre_warp_edge_sample_arriving_in_next_drain_does_not_re_warp() {
+    // Drain 1 warps from the right edge of `left_monitor` onto `right_monitor`.
+    // Drain 2 (next frame) delivers a stale HID event created BEFORE Drain 1's
+    // warp still carrying the source display's edge coordinate `(511, -600)`.
+    // Comparing `motion.timestamp < warped_at` must drop it without re-warping.
+    let pre_warp = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(20))
+        .unwrap_or_else(std::time::Instant::now);
+    let drain_1 = [Event::MouseMoved {
+        point: objc2_core_foundation::CGPoint {
+            x: 511.0,
+            y: -600.0,
+        },
+        delta_y: 0,
+        timestamp: pre_warp,
+        modifiers: crate::platform::Modifiers::empty(),
+    }];
+    let drain_2_stale = [Event::MouseMoved {
+        point: objc2_core_foundation::CGPoint {
+            x: 511.0,
+            y: -600.0,
+        },
+        delta_y: 0,
+        timestamp: pre_warp + std::time::Duration::from_millis(5),
+        modifiers: crate::platform::Modifiers::empty(),
+    }];
+
+    let seen = Arc::new(Mutex::new((IVec2::ZERO, IVec2::ZERO)));
+    let after_1 = Arc::clone(&seen);
+    let after_2 = Arc::clone(&seen);
+    desk(true)
+        .on_iteration(1, move |world, _state| {
+            world.write_message_batch(drain_1.iter().cloned());
+        })
+        .on_iteration(2, move |world, state| {
+            after_1.lock().expect("cursor record").0 = state.cursor_position();
+            world.write_message_batch(drain_2_stale.iter().cloned());
+        })
+        .on_iteration(3, move |_world, state| {
+            after_2.lock().expect("cursor record").1 = state.cursor_position();
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+    let (landing_1, landing_2) = *seen.lock().expect("cursor record");
+    assert_eq!(landing_1, IVec2::new(-1402, -1800));
+    assert_eq!(
+        landing_2, landing_1,
+        "a stale pre-warp sample arriving in the next drain must not trigger a second warp"
+    );
 }
